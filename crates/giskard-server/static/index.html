@@ -23,8 +23,12 @@
   #login .card { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:28px; width:320px; }
   #login h1 { margin:0 0 4px; }
 
-  /* app grid — flanking column widths are user-resizable (persisted) via CSS vars. */
+  /* app grid — flanking column widths are user-resizable (persisted) via CSS vars.
+     Display is toggled via `.open` (not inline style) so the mobile media query can override it. */
   #app { display:none; grid-template-columns:var(--col-left,260px) 6px minmax(360px,1fr) 6px var(--col-right,300px); height:100vh; }
+  #app.open { display:grid; }
+  #mobileBar { display:none; }
+  #backdrop { display:none; }
   .col { height:100vh; overflow-y:auto; }
   .resizer { cursor:col-resize; background:transparent; transition:background .12s; }
   .resizer:hover, .resizer.active { background:var(--accent); }
@@ -64,7 +68,10 @@
   .composer textarea:disabled { opacity:.65; cursor:not-allowed; }
   button:disabled { opacity:.55; cursor:not-allowed; }
 
-  .notice { margin:8px 0; padding:8px 10px; border-radius:8px; border:1px solid var(--border); font-size:13px; }
+  /* Floating toast stack, anchored to the viewport so it's visible in every layout. */
+  #notices { position:fixed; right:16px; bottom:16px; width:340px; max-width:calc(100vw - 32px); z-index:80; display:flex; flex-direction:column; gap:8px; pointer-events:none; }
+  #notices:empty { display:none; }
+  .notice { margin:0; padding:8px 10px; border-radius:8px; border:1px solid var(--border); background:var(--panel); box-shadow:0 4px 16px rgba(0,0,0,.35); font-size:13px; pointer-events:auto; }
   .notice.err { border-color:#f85149; color:#ffb4ae; }
   .notice.warn { border-color:#d29922; color:#f0d98c; }
   h3.sec { margin:16px 0 8px; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
@@ -160,6 +167,44 @@
   [data-appearance="terminal"] .msg.reasoning { background:transparent; border:0; color:var(--muted); }
   [data-appearance="terminal"] .msg.error { background:transparent; border:0; color:#ff9d96; }
   [data-appearance="terminal"] .msg.error .role { color:#ff6b63; }
+
+  /* =================== Mobile / responsive ===================
+     The same page adapts to the viewport (no separate mobile build). On narrow screens the three
+     columns collapse to a single full-width transcript; the projects list and the usage/appearance
+     panel become slide-in drawers reached from a top bar. Desktop (>820px) is unchanged. */
+  #mobileBar { align-items:center; gap:10px; padding:8px 12px; border-bottom:1px solid var(--border); background:var(--panel); }
+  #mobileBar button { font-size:18px; line-height:1; padding:3px 11px; }
+  #mobileBar .mbTitle { flex:1; min-width:0; text-align:center; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #mobileBar .mbTitle .crumb { color:var(--muted); font-weight:500; }
+  #backdrop { position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:55; }
+
+  @media (max-width:820px) {
+    #login .card { max-width:90vw; }
+    #app.open { display:block; }
+    .resizer { display:none; }
+    .center { border:0; height:100vh; height:100dvh; }
+    #mobileBar { display:flex; }
+    header.thr .badge#thrTitle { display:none; }   /* title already shown in the mobile bar */
+
+    /* Side columns become off-canvas drawers. */
+    .sidebar, .ctx {
+      position:fixed; top:0; bottom:0; width:84%; max-width:340px; z-index:60;
+      transition:transform .22s ease; will-change:transform;
+    }
+    .sidebar { left:0; transform:translateX(-100%); border-right:1px solid var(--border); }
+    .ctx { right:0; transform:translateX(100%); border-left:1px solid var(--border); }
+    #app.drawer-left .sidebar { transform:translateX(0); box-shadow:0 0 40px rgba(0,0,0,.55); }
+    #app.drawer-right .ctx { transform:translateX(0); box-shadow:0 0 40px rgba(0,0,0,.55); }
+    #app.drawer-left #backdrop, #app.drawer-right #backdrop { display:block; }
+
+    .msg { max-width:100%; }
+    [data-appearance="bubbles"] .msg { max-width:100%; }
+    [data-appearance="bubbles"] .msg.user { max-width:88%; }
+
+    /* Full-screen dialog on phones. */
+    .dialog { width:100%; max-width:100%; height:100vh; height:100dvh; max-height:none; border-radius:0; }
+    #notices { left:8px; right:8px; bottom:8px; width:auto; }
+  }
 </style>
 </head>
 <body>
@@ -182,6 +227,11 @@
     <div class="resizer" id="resizeLeft" title="Drag to resize"></div>
 
     <div class="col center">
+      <div id="mobileBar">
+        <button id="btnMenu" title="Projects & threads" aria-label="Projects">☰</button>
+        <div class="mbTitle" id="mbTitle">Giskard</div>
+        <button id="btnInfo" title="Usage & appearance" aria-label="Info">ⓘ</button>
+      </div>
       <header class="thr" id="thrHeader" style="display:none">
         <span class="badge mono" id="thrTitle">—</span>
         <button id="modeBtn" class="badge" title="Toggle Plan/Build">build</button>
@@ -208,9 +258,15 @@
       </div>
       <h3 class="sec">Usage</h3>
       <div id="ctxTokens" class="muted">No thread open.</div>
-      <div id="notices"></div>
     </div>
+
+    <!-- Tap-to-dismiss backdrop shown behind an open mobile drawer. -->
+    <div id="backdrop"></div>
   </div>
+
+  <!-- Toast/notice stack: a body-level fixed overlay so it stays visible on mobile (where the
+       right column becomes a closed drawer) and isn't clipped by the drawer's transform. -->
+  <div id="notices"></div>
 
   <!-- New-project dialog with a directory picker -->
   <div class="overlay" id="projectModal">
@@ -278,7 +334,7 @@ $("loginForm").onsubmit = async (e) => {
 
 async function startApp() {
   $("login").style.display="none";
-  $("app").style.display="grid";
+  $("app").classList.add("open");
   try { state.models = (await api("GET","/api/models")).models || []; } catch { state.models=[]; }
   renderModelSelect();
   await loadProjects();
@@ -288,8 +344,10 @@ async function startApp() {
 async function loadProjects() {
   const { projects } = await api("GET","/api/projects");
   const box = $("projects"); box.innerHTML="";
+  state.projectNames = {};   // id → name, for the mobile "project / thread" breadcrumb
   const pending = [];
   for (const p of projects) {
+    state.projectNames[p.id] = p.name;
     const d = document.createElement("div"); d.className="proj";
     const name = document.createElement("div"); name.className="name";
     const label = document.createElement("span"); label.textContent = p.name;
@@ -334,6 +392,7 @@ async function loadThreads(pid) {
 $("newProj").onclick = () => openProjectModal();
 
 function openProjectModal() {
+  closeDrawers();
   $("pmErr").textContent = "";
   // Populate the model picker from the loaded models.
   const sel = $("pmModel"); sel.innerHTML = "";
@@ -440,8 +499,9 @@ async function openThread(pid, tid, title, opts) {
   resetRenderState();
   document.querySelectorAll(".thread").forEach(e => e.classList.toggle("active", e.dataset.tid===tid));
   $("thrHeader").style.display="flex"; $("composer").style.display="flex";
-  $("thrTitle").textContent = title || tid.slice(0,8);
+  setThreadTitle(title || tid.slice(0,8));
   $("transcript").className=""; $("transcript").innerHTML=""; $("notices").innerHTML="";
+  closeDrawers();   // on mobile, reveal the transcript after picking a thread
   if (res.warning) notice(res.warning.message || "warning", res.warning.severity || "warning");
   connectWs();
 }
@@ -551,7 +611,7 @@ function renderThreadState(s) {
   $("modeBtn").textContent = state.mode;
   if (s.current_model) setModel(`${s.current_model.provider}/${s.current_model.model}`);
   // The header already owns title / mode / model; the right column is usage-only now.
-  if (s.title) $("thrTitle").textContent = s.title;
+  if (s.title) setThreadTitle(s.title);
   if (s.tokens) renderTokens(s.tokens);
   updateGauge(s.tokens ? s.tokens.total.total : 0, s.context_window || 0);
   // History now arrives separately via `history_page` (H6); clear the transcript ready for it.
@@ -886,6 +946,27 @@ function renderModelSelect() {
   };
 }
 function setModel(key) { const sel=$("modelSel"); for (const o of sel.options) if (o.value===key) { o.selected=true; break; } }
+
+/* ---------- mobile drawers ---------- */
+// Desktop keeps the thread name alone (the sidebar shows the active project); the mobile bar has no
+// visible sidebar, so it shows a "project / thread" breadcrumb to make the current project clear.
+function setThreadTitle(t) {
+  $("thrTitle").textContent = t;
+  const proj = state.projectNames && state.projectNames[state.projectId];
+  $("mbTitle").innerHTML = proj
+    ? `<span class="crumb">${escapeHtml(proj)}</span> / ${escapeHtml(t)}`
+    : escapeHtml(t);
+}
+function closeDrawers() { $("app").classList.remove("drawer-left","drawer-right"); }
+function toggleDrawer(side) {
+  const app = $("app"), cls = side==="left" ? "drawer-left" : "drawer-right", other = side==="left" ? "drawer-right" : "drawer-left";
+  app.classList.remove(other);
+  app.classList.toggle(cls);
+}
+$("btnMenu").onclick = () => toggleDrawer("left");
+$("btnInfo").onclick = () => toggleDrawer("right");
+$("backdrop").onclick = closeDrawers;
+document.addEventListener("keydown", (e) => { if (e.key==="Escape") closeDrawers(); });
 
 function renderTokens(led) {
   if (!led || !led.total) return;
