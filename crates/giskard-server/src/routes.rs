@@ -45,6 +45,7 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
         .route("/api/projects/{id}/raw", get(download_file))
         .route("/api/projects/{id}/linkify", post(linkify))
         .route("/api/browse", get(browse))
+        .route("/api/browse/mkdir", post(browse_mkdir))
         .route("/api/models", get(list_models))
         .route("/api/models/refresh", post(refresh_models))
         .route("/api/tokens", get(global_tokens))
@@ -398,15 +399,8 @@ async fn browse(
         .canonicalize()
         .map_err(|e| ApiError::BadRequest(format!("cannot canonicalize path: {e}")))?;
 
-    if !config.browse.roots.is_empty() {
-        let allowed = config.browse.roots.iter().any(|root| {
-            let root = PathBuf::from(root);
-            let root_canonical = root.canonicalize().unwrap_or(root);
-            canonical.starts_with(&root_canonical)
-        });
-        if !allowed {
-            return Err(ApiError::Forbidden("path outside allowed roots".into()));
-        }
+    if !within_browse_roots(&canonical, &config.browse.roots) {
+        return Err(ApiError::Forbidden("path outside allowed roots".into()));
     }
 
     let mut entries = Vec::new();
@@ -446,6 +440,49 @@ async fn browse(
     Ok(Json(BrowseResponse {
         path: canonical.to_string_lossy().to_string(),
         entries,
+    }))
+}
+
+/// True when `path` is inside one of the configured browse roots, or when no roots are configured
+/// (empty ⇒ the whole filesystem is browsable, spec Appendix C / `BrowseConfig`).
+fn within_browse_roots(path: &Path, roots: &[String]) -> bool {
+    if roots.is_empty() {
+        return true;
+    }
+    roots.iter().any(|root| {
+        let root = PathBuf::from(root);
+        let root_canonical = root.canonicalize().unwrap_or(root);
+        path.starts_with(&root_canonical)
+    })
+}
+
+/// Create a single directory under `parent` for the filesystem picker's "New folder" action. The
+/// name must be one path segment (no separators, not `.`/`..`), and `parent` must resolve inside
+/// the configured browse roots — the same confinement the `browse` listing enforces.
+async fn browse_mkdir(
+    State(state): State<AppState>,
+    Json(req): Json<MkdirRequest>,
+) -> Result<Json<MkdirResponse>, ApiError> {
+    let name = req.name.trim();
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+        return Err(ApiError::BadRequest("invalid directory name".into()));
+    }
+
+    let config = state.store.load_config().await?;
+    let parent = PathBuf::from(&req.parent)
+        .canonicalize()
+        .map_err(|e| ApiError::BadRequest(format!("cannot canonicalize parent: {e}")))?;
+    if !within_browse_roots(&parent, &config.browse.roots) {
+        return Err(ApiError::Forbidden("path outside allowed roots".into()));
+    }
+
+    let target = parent.join(name);
+    tokio::fs::create_dir(&target)
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("cannot create directory: {e}")))?;
+    let canonical = target.canonicalize().unwrap_or(target);
+    Ok(Json(MkdirResponse {
+        path: canonical.to_string_lossy().to_string(),
     }))
 }
 

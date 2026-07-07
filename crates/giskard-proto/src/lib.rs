@@ -308,6 +308,20 @@ pub struct LinkifyRequest {
     pub text: String,
 }
 
+/// Request to create a directory under `parent` (filesystem picker "New folder"). `name` is a
+/// single path segment; the server rejects separators and `.`/`..` and enforces the browse roots.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MkdirRequest {
+    pub parent: String,
+    pub name: String,
+}
+
+/// The canonical path of the directory created via [`MkdirRequest`].
+#[derive(Debug, Clone, Serialize)]
+pub struct MkdirResponse {
+    pub path: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

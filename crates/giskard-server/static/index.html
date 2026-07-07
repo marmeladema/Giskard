@@ -23,10 +23,12 @@
   #login .card { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:28px; width:320px; }
   #login h1 { margin:0 0 4px; }
 
-  /* app grid */
-  #app { display:none; grid-template-columns:260px 1fr 300px; height:100vh; }
+  /* app grid — flanking column widths are user-resizable (persisted) via CSS vars. */
+  #app { display:none; grid-template-columns:var(--col-left,260px) 6px minmax(360px,1fr) 6px var(--col-right,300px); height:100vh; }
   .col { height:100vh; overflow-y:auto; border-right:1px solid var(--border); }
   .col:last-child { border-right:0; }
+  .resizer { cursor:col-resize; background:transparent; transition:background .12s; }
+  .resizer:hover, .resizer.active { background:var(--accent); }
   .sidebar { background:var(--panel); padding:12px; }
   .center { display:flex; flex-direction:column; }
   .ctx { background:var(--panel); padding:12px; }
@@ -72,6 +74,34 @@
   .msg.failed { border:1px solid #f85149; }
   .msg.error { background:#2a1416; border:1px solid #f85149; color:#ffb4ae; max-width:100%; }
   .msg.error .role { color:#f85149; opacity:1; }
+
+  /* usage stat tiles (right column) */
+  .stats { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
+  .stat { background:var(--panel2); border:1px solid var(--border); border-radius:8px; padding:8px 10px; }
+  .statlabel { font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+  .statval { font-size:16px; font-variant-numeric:tabular-nums; margin-top:2px; }
+
+  /* modal dialog + directory picker */
+  .overlay { position:fixed; inset:0; background:rgba(0,0,0,.55); display:none; align-items:center; justify-content:center; z-index:50; }
+  .overlay.open { display:flex; }
+  .dialog { background:var(--panel); border:1px solid var(--border); border-radius:10px; width:580px; max-width:92vw; max-height:88vh; display:flex; flex-direction:column; }
+  .dialog h2 { margin:0; padding:16px 18px; border-bottom:1px solid var(--border); font-size:16px; }
+  .dialog .content { padding:16px 18px; overflow-y:auto; }
+  .dialog .foot { padding:12px 18px; border-top:1px solid var(--border); display:flex; gap:8px; justify-content:flex-end; align-items:center; }
+  .dialog .foot .err { color:#ffb4ae; margin-right:auto; font-size:13px; }
+  .pathbar { display:flex; gap:6px; align-items:center; justify-content:space-between; font-size:12px; color:var(--muted); margin-bottom:6px; }
+  .pathbar .cur { word-break:break-all; }
+  .dirlist { border:1px solid var(--border); border-radius:8px; height:240px; overflow-y:auto; background:var(--panel2); }
+  .direntry { padding:6px 10px; display:flex; gap:8px; align-items:center; cursor:pointer; font-size:13px; border-bottom:1px solid rgba(255,255,255,.03); }
+  .direntry:last-child { border-bottom:0; }
+  .direntry:hover { background:var(--bg); }
+  .direntry.file { color:var(--muted); cursor:default; }
+  .direntry.file:hover { background:transparent; }
+  .direntry .ic { width:16px; text-align:center; opacity:.85; }
+  .field { margin-top:12px; }
+  .field label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
+  .field input, .field select { width:100%; }
+  .field .hint { font-size:11px; color:var(--muted); margin-top:4px; }
 </style>
 </head>
 <body>
@@ -91,6 +121,8 @@
       <div id="projects"></div>
     </div>
 
+    <div class="resizer" id="resizeLeft" title="Drag to resize"></div>
+
     <div class="col center">
       <header class="thr" id="thrHeader" style="display:none">
         <span class="badge mono" id="thrTitle">—</span>
@@ -105,12 +137,48 @@
       </div>
     </div>
 
+    <div class="resizer" id="resizeRight" title="Drag to resize"></div>
+
     <div class="col ctx">
-      <h3 class="sec">Thread</h3>
-      <div id="ctxInfo" class="muted">No thread open.</div>
-      <h3 class="sec">Tokens</h3>
-      <div id="ctxTokens" class="muted">—</div>
+      <h3 class="sec">Usage</h3>
+      <div id="ctxTokens" class="muted">No thread open.</div>
       <div id="notices"></div>
+    </div>
+  </div>
+
+  <!-- New-project dialog with a directory picker -->
+  <div class="overlay" id="projectModal">
+    <div class="dialog">
+      <h2>New project</h2>
+      <div class="content">
+        <div class="pathbar">
+          <span class="cur mono" id="pmPath">/</span>
+          <button id="pmNewFolder" title="Create a folder here">New folder</button>
+        </div>
+        <div class="dirlist" id="pmList"></div>
+        <div class="field">
+          <label for="pmName">Project name</label>
+          <input id="pmName" placeholder="Project name" />
+          <div class="hint">Defaults to the folder name; edit to distinguish same-named folders.</div>
+        </div>
+        <div class="field">
+          <label for="pmModel">Default model</label>
+          <select id="pmModel" class="mono"></select>
+        </div>
+        <div class="field">
+          <label for="pmApproval">Approval policy</label>
+          <select id="pmApproval">
+            <option value="auto">auto — run without asking</option>
+            <option value="ask">ask — prompt before actions</option>
+            <option value="read_only">read only</option>
+          </select>
+        </div>
+      </div>
+      <div class="foot">
+        <span class="err" id="pmErr"></span>
+        <button id="pmCancel">Cancel</button>
+        <button class="primary" id="pmCreate">Create project</button>
+      </div>
     </div>
   </div>
 
@@ -154,6 +222,7 @@ async function startApp() {
 async function loadProjects() {
   const { projects } = await api("GET","/api/projects");
   const box = $("projects"); box.innerHTML="";
+  const pending = [];
   for (const p of projects) {
     const d = document.createElement("div"); d.className="proj";
     const name = document.createElement("div"); name.className="name";
@@ -163,8 +232,22 @@ async function loadProjects() {
     name.append(label, add); d.append(name);
     const threads = document.createElement("div"); threads.id = "threads-"+p.id; d.append(threads);
     box.append(d);
-    loadThreads(p.id);
+    pending.push(loadThreads(p.id));
   }
+  await Promise.all(pending);
+  restoreLastThread();
+}
+
+// Reopen the thread that was last active in this browser (H: persisted client-side, not on the
+// server). Silently ignored if it no longer exists (e.g. deleted since).
+function restoreLastThread() {
+  if (state.threadId) return;   // already viewing a thread
+  let last;
+  try { last = JSON.parse(localStorage.getItem("giskard.lastThread") || "null"); } catch { last = null; }
+  if (!last || !last.pid || !last.tid) return;
+  const el = document.querySelector(`.thread[data-tid="${last.tid}"]`);
+  if (!el) { localStorage.removeItem("giskard.lastThread"); return; }
+  openThread(last.pid, last.tid, el.textContent, { silent:true });
 }
 
 async function loadThreads(pid) {
@@ -181,16 +264,84 @@ async function loadThreads(pid) {
   } catch {}
 }
 
-$("newProj").onclick = async () => {
-  const name = prompt("Project name?"); if (!name) return;
-  const dir = prompt("Project directory (absolute path on the server)?"); if (!dir) return;
-  const model = state.models[0]
-    ? { provider: state.models[0].provider, model: state.models[0].model, reasoning_effort:null }
-    : { provider:"openai", model:"gpt-5.5", reasoning_effort:null };
+/* ---------- new-project modal + directory picker ---------- */
+$("newProj").onclick = () => openProjectModal();
+
+function openProjectModal() {
+  $("pmErr").textContent = "";
+  // Populate the model picker from the loaded models.
+  const sel = $("pmModel"); sel.innerHTML = "";
+  for (const m of state.models) {
+    const o = document.createElement("option");
+    o.value = `${m.provider}/${m.model}`; o.textContent = m.display_name || m.model;
+    o.dataset.provider = m.provider; o.dataset.model = m.model;
+    sel.append(o);
+  }
+  if (!state.models.length) { const o=document.createElement("option"); o.textContent="(no models configured)"; sel.append(o); }
+  $("projectModal").classList.add("open");
+  // Start browsing where we last were, falling back to the filesystem root.
+  browsePicker(localStorage.getItem("giskard.lastBrowse") || "/");
+}
+function closeProjectModal() { $("projectModal").classList.remove("open"); }
+$("pmCancel").onclick = closeProjectModal;
+$("projectModal").addEventListener("click", (e) => { if (e.target === $("projectModal")) closeProjectModal(); });
+
+function basename(p) { const s = String(p).replace(/\/+$/,""); const i = s.lastIndexOf("/"); return i>=0 ? s.slice(i+1) : s; }
+function parentOf(p) { const s = String(p).replace(/\/+$/,""); const i = s.lastIndexOf("/"); return i>0 ? s.slice(0,i) : "/"; }
+
+async function browsePicker(path) {
+  let res;
+  try { res = await api("GET", `/api/browse?path=${encodeURIComponent(path)}`); }
+  catch (e) { $("pmErr").textContent = "Cannot open folder: "+e.message; return; }
+  state.pickerDir = res.path;
+  localStorage.setItem("giskard.lastBrowse", res.path);
+  $("pmPath").textContent = res.path;
+  // Prefill the project name from the current folder's basename (still editable).
+  $("pmName").value = basename(res.path) || res.path;
+  $("pmErr").textContent = "";
+
+  const list = $("pmList"); list.innerHTML = "";
+  if (res.path !== "/") {
+    const up = document.createElement("div"); up.className = "direntry";
+    up.innerHTML = `<span class="ic">↰</span><span>..</span>`;
+    up.onclick = () => browsePicker(parentOf(res.path));
+    list.append(up);
+  }
+  for (const e of res.entries) {
+    const row = document.createElement("div");
+    row.className = "direntry" + (e.is_dir ? "" : " file");
+    row.innerHTML = `<span class="ic">${e.is_dir ? "📁" : "📄"}</span><span>${escapeHtml(e.name)}</span>`;
+    if (e.is_dir) {
+      const child = res.path.replace(/\/+$/,"") + "/" + e.name;
+      row.onclick = () => browsePicker(child);
+    }
+    list.append(row);
+  }
+}
+
+$("pmNewFolder").onclick = async () => {
+  const name = prompt("New folder name:"); if (!name) return;
   try {
-    await api("POST","/api/projects",{ name, dir, default_model:model, approval_policy:"auto" });
+    const res = await api("POST","/api/browse/mkdir",{ parent: state.pickerDir, name });
+    await browsePicker(res.path);   // navigate into the folder we just created
+  } catch (e) { $("pmErr").textContent = "Create folder failed: "+e.message; }
+};
+
+$("pmCreate").onclick = async () => {
+  const dir = state.pickerDir;
+  const name = $("pmName").value.trim();
+  if (!dir) { $("pmErr").textContent = "Pick a folder first."; return; }
+  if (!name) { $("pmErr").textContent = "Enter a project name."; return; }
+  const opt = $("pmModel").selectedOptions[0];
+  const model = opt && opt.dataset.model
+    ? { provider: opt.dataset.provider, model: opt.dataset.model, reasoning_effort:null }
+    : { provider:"openai", model:"gpt-5.5", reasoning_effort:null };
+  const approval_policy = $("pmApproval").value;
+  try {
+    await api("POST","/api/projects",{ name, dir, default_model:model, approval_policy });
+    closeProjectModal();
     await loadProjects();
-  } catch (e) { alert("Create project failed: "+e.message); }
+  } catch (e) { $("pmErr").textContent = "Create project failed: "+e.message; }
 };
 
 async function newThread(pid) {
@@ -202,15 +353,20 @@ async function newThread(pid) {
 }
 
 /* ---------- thread view + websocket ---------- */
-async function openThread(pid, tid, title) {
+async function openThread(pid, tid, title, opts) {
+  opts = opts || {};
   let res;
   try {
     res = await api("POST",`/api/projects/${pid}/threads`,{ thread_id:tid, resume:null });
     tid = res.thread_id || tid;
   } catch (e) {
+    if (opts.silent) { localStorage.removeItem("giskard.lastThread"); return; }
     alert("Open thread failed: "+e.message);
     return;
   }
+
+  // Remember this thread so a browser reload resumes it (client-side only).
+  try { localStorage.setItem("giskard.lastThread", JSON.stringify({ pid, tid })); } catch {}
 
   state.projectId = pid; state.threadId = tid; state.pendingUserEl = null; state.pendingUserText = null;
   state.historyLoaded = false; state.oldestTurnId = null; state.hasMoreHistory = false;
@@ -328,10 +484,8 @@ function renderThreadState(s) {
   state.mode = s.mode || "build";
   $("modeBtn").textContent = state.mode;
   if (s.current_model) setModel(`${s.current_model.provider}/${s.current_model.model}`);
-  $("ctxInfo").innerHTML =
-    `<div class="kv"><b>title</b> ${escapeHtml(s.title||"")}</div>` +
-    `<div class="kv"><b>mode</b> ${s.mode}</div>` +
-    `<div class="kv mono"><b>model</b> ${s.current_model? s.current_model.provider+"/"+s.current_model.model : "—"}</div>`;
+  // The header already owns title / mode / model; the right column is usage-only now.
+  if (s.title) $("thrTitle").textContent = s.title;
   if (s.tokens) renderTokens(s.tokens);
   updateGauge(s.tokens ? s.tokens.total.total : 0, s.context_window || 0);
   // History now arrives separately via `history_page` (H6); clear the transcript ready for it.
@@ -669,10 +823,12 @@ function setModel(key) { const sel=$("modelSel"); for (const o of sel.options) i
 
 function renderTokens(led) {
   if (!led || !led.total) return;
+  const t = led.total;
+  const tile = (label, val) =>
+    `<div class="stat"><div class="statlabel">${label}</div><div class="statval">${val.toLocaleString()}</div></div>`;
   $("ctxTokens").innerHTML =
-    `<div class="kv"><b>total</b> ${led.total.total.toLocaleString()}</div>` +
-    `<div class="kv"><b>in / out</b> ${led.total.input.toLocaleString()} / ${led.total.output.toLocaleString()}</div>`;
-  updateGauge(led.total.total, state.contextWindow||0);
+    `<div class="stats">${tile("Input", t.input)}${tile("Output", t.output)}${tile("Total", t.total)}</div>`;
+  updateGauge(t.total, state.contextWindow||0);
 }
 function updateGauge(used, window) {
   state.contextWindow = window || state.contextWindow || 0;
@@ -689,6 +845,44 @@ function escapeHtml(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt
 
 /* Infinite scroll: load older history when the transcript is scrolled near the top. */
 $("transcript").addEventListener("scroll", onTranscriptScroll);
+
+/* ---------- resizable side columns (persisted client-side) ---------- */
+function initResizers() {
+  const app = $("app");
+  const savedL = localStorage.getItem("giskard.colLeft");
+  const savedR = localStorage.getItem("giskard.colRight");
+  if (savedL) app.style.setProperty("--col-left", savedL);
+  if (savedR) app.style.setProperty("--col-right", savedR);
+  setupResizer($("resizeLeft"), "--col-left", "giskard.colLeft", true, 260);
+  setupResizer($("resizeRight"), "--col-right", "giskard.colRight", false, 300);
+}
+function setupResizer(handle, cssVar, storeKey, isLeft, fallback) {
+  handle.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    handle.classList.add("active");
+    const app = $("app");
+    const startX = e.clientX;
+    const startW = parseInt(getComputedStyle(app).getPropertyValue(cssVar)) || fallback;
+    const onMove = (ev) => {
+      // Left handle grows the left column as you drag right; right handle grows the right
+      // column as you drag left. Clamp so neither side can crowd out the center transcript.
+      const delta = ev.clientX - startX;
+      const w = Math.max(180, Math.min(560, isLeft ? startW + delta : startW - delta));
+      app.style.setProperty(cssVar, w + "px");
+    };
+    const onUp = () => {
+      handle.classList.remove("active");
+      localStorage.setItem(storeKey, getComputedStyle(app).getPropertyValue(cssVar).trim());
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.body.style.userSelect = "";
+    };
+    document.body.style.userSelect = "none";
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  });
+}
+initResizers();
 
 /* Try to enter the app directly if already authenticated. */
 (async () => { try { await api("GET","/api/projects"); startApp(); } catch {} })();
