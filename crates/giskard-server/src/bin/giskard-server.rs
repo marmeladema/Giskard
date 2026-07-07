@@ -1,81 +1,32 @@
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use giskard_core::error::HarnessError;
-use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ItemId, ThreadId, TurnId};
-use giskard_core::item::{Item, ItemDelta, ItemKind, ItemPayload, ItemStart};
-use giskard_core::token::TokenUsage;
-use giskard_core::turn::{TurnStatus, TurnStatusKind};
-use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 use giskard_persist::store::ProjectConfig;
 use giskard_server::{AppState, HarnessFactory, build_app};
-use tracing::info;
+use tracing::{error, info, warn};
 
-struct ReplayFactory {
-    fixture: ReplayFixture,
-}
+struct CodexFactory;
 
-impl HarnessFactory for ReplayFactory {
-    fn create(
+#[async_trait]
+impl HarnessFactory for CodexFactory {
+    async fn create(
         &self,
-        _config: &ProjectConfig,
+        config: &ProjectConfig,
     ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
-        Ok(Arc::new(ReplayHarness::from_fixture(self.fixture.clone())))
+        if config.harness != "codex" {
+            return Err(HarnessError::Unsupported(format!(
+                "unsupported harness kind: {}",
+                config.harness
+            )));
+        }
+
+        let workspace_root =
+            std::path::PathBuf::from(config.workspace_root.as_deref().unwrap_or(&config.dir));
+        let harness = giskard_harness_codex::CodexHarness::start(workspace_root).await?;
+        Ok(harness)
     }
-}
-
-fn make_demo_fixture() -> ReplayFixture {
-    let thread = ThreadId::new();
-    let turn = TurnId::new();
-    let it_1 = ItemId::new();
-    let now = chrono::Utc::now();
-
-    ReplayFixture::from_events(vec![
-        AgentEvent::ThreadOpened {
-            thread,
-            harness_thread_id: "th_demo".into(),
-        },
-        AgentEvent::TurnStarted { thread, turn },
-        AgentEvent::ItemStarted {
-            thread,
-            turn,
-            item: ItemStart {
-                id: it_1,
-                harness_item_id: "it_1".into(),
-                kind: ItemKind::AgentMessage,
-            },
-        },
-        AgentEvent::ItemDelta {
-            thread,
-            turn,
-            item_id: it_1,
-            delta: ItemDelta::Text {
-                text: "Hello! I'm a replay harness in demo mode. ".into(),
-            },
-        },
-        AgentEvent::ItemCompleted {
-            thread,
-            turn,
-            item: Item {
-                id: it_1,
-                harness_item_id: "it_1".into(),
-                payload: ItemPayload::AgentMessage {
-                    text: "Hello! I'm a replay harness in demo mode.".into(),
-                },
-                created_at: now,
-            },
-        },
-        AgentEvent::TurnCompleted {
-            thread,
-            turn,
-            usage: TokenUsage::new(100, 50),
-            status: TurnStatus {
-                kind: TurnStatusKind::Completed,
-                message: None,
-            },
-        },
-    ])
 }
 
 fn default_data_dir() -> std::path::PathBuf {
@@ -86,25 +37,31 @@ fn default_data_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{home}/.local/share/giskard"))
 }
 
-fn load_or_create_session_key(data_dir: &std::path::Path) -> Vec<u8> {
+fn load_or_create_session_key(data_dir: &std::path::Path) -> std::io::Result<Vec<u8>> {
     let key_path = data_dir.join("session.key");
     if key_path.exists() {
-        if let Ok(key) = std::fs::read(&key_path) {
-            if key.len() == 32 {
-                return key;
+        match std::fs::read(&key_path) {
+            Ok(key) if key.len() == 32 => return Ok(key),
+            Ok(key) => {
+                warn!(
+                    path = ?key_path,
+                    len = key.len(),
+                    "ignoring invalid session key length"
+                );
+            }
+            Err(e) => {
+                warn!(path = ?key_path, "failed to read session key: {e}");
             }
         }
     }
     use rand::RngCore;
     let mut key = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut key);
-    std::fs::create_dir_all(data_dir).ok();
-    let perms = std::fs::Permissions::from_mode(0o700);
-    std::fs::set_permissions(data_dir, std::fs::Permissions::clone(&perms)).ok();
-    std::fs::write(&key_path, key).ok();
-    let _ = std::fs::Permissions::from_mode(0o600);
-    std::fs::set_permissions(&key_path, perms).ok();
-    key.to_vec()
+    std::fs::create_dir_all(data_dir)?;
+    std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))?;
+    std::fs::write(&key_path, key)?;
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(key.to_vec())
 }
 
 #[tokio::main]
@@ -116,25 +73,42 @@ async fn main() {
         )
         .init();
 
+    if let Err(e) = run().await {
+        error!("{e}");
+        eprintln!("giskard-server: {e}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), String> {
     let data_dir = default_data_dir();
-    std::fs::create_dir_all(&data_dir).expect("cannot create data dir");
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| format!("cannot create data dir {}: {e}", data_dir.display()))?;
     info!(data_dir = ?data_dir, "starting giskard server");
 
     let store = Arc::new(giskard_persist::PersistStore::new(data_dir.clone()));
-    let session_key = load_or_create_session_key(&data_dir);
-    let config = store.load_config().await.unwrap_or_default();
+    let session_key = load_or_create_session_key(&data_dir)
+        .map_err(|e| format!("cannot load session key from {}: {e}", data_dir.display()))?;
+    let config = match store.load_config().await {
+        Ok(config) => config,
+        Err(e) => {
+            warn!("failed to load config, using defaults: {e}");
+            Default::default()
+        }
+    };
     let bind = config.server.bind.clone();
 
-    let factory = Arc::new(ReplayFactory {
-        fixture: make_demo_fixture(),
-    });
+    let factory = Arc::new(CodexFactory);
 
     let state = AppState::new_with_config(store, factory, session_key, Some(&config.viz));
 
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
-        .expect("cannot bind");
+        .map_err(|e| format!("cannot bind {bind}: {e}"))?;
     info!(bind = %bind, "listening");
-    axum::serve(listener, app).await.expect("server error");
+    axum::serve(listener, app)
+        .await
+        .map_err(|e| format!("server error: {e}"))?;
+    Ok(())
 }

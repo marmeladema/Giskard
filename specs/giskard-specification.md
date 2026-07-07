@@ -8,7 +8,7 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.4
+**Version:** 1.5
 
 **Changelog (1.0 → 1.1), from review:**
 - Resolved thread token schema vs §10.2: thread `tokens` now carries `total` + `by_model` (§5.3).
@@ -112,6 +112,26 @@
   `FileDiff` parsing is deferred to Phase 4 (§9.2, §15).
 - **S7:** When `plan_build_modes = false`, `Mode` resolves to the Build-equivalent (workspace-write)
   single mode, so `TurnOverrides` is well-defined for every harness (§7.5, §13.5).
+
+**Changelog (1.4 → 1.5), from usability/debugging pass:**
+- **E1:** Added structured, flattened server errors with stable `code`, `severity`, `message`,
+  optional `detail`, `thread_id`, and `action`, and required WebSocket parse/handler failures to be
+  sent to the browser and logged without panicking (§13.6).
+- **E2:** Added degraded-open warnings: `ThreadHandle.warning` / `OpenThreadResponse.warning`
+  surface non-fatal resume/attach failures while keeping the persisted Giskard thread usable (§4.5,
+  §13.6).
+- **E3:** Defined persisted-thread reopen semantics: opening or subscribing to an existing thread
+  reattaches the harness using the stored native thread id and preserves the durable Giskard
+  `ThreadId`; if native resume fails, Giskard starts a fresh native session and warns (§4.5, §7.1).
+- **E4:** Added a short-lived signed WebSocket ticket endpoint for browser clients that cannot rely
+  on the session cookie during upgrade; `/api/ws` accepts either the session cookie or the ticket
+  (§12.1, §13.6).
+- **E5:** Required model refs loaded from projects/threads to be normalized against configured
+  providers when a stale provider id names a model that exists under exactly one configured provider;
+  unsupported reasoning effort is cleared during normalization (§8.3, §8.4).
+- **E6:** Required live UI rendering to de-duplicate completed items by Giskard `ItemId` and
+  harness-native `harness_item_id`, so streamed deltas finalize in place instead of duplicating the
+  completed agent response (§13.6).
 
 ---
 
@@ -529,10 +549,18 @@ pub struct ApprovalId(pub String);   // harness-native request id (opaque; short
 pub struct ThreadHandle {
     pub thread: ThreadId,
     pub harness_thread_id: String,    // native id used for resume
+    pub warning: Option<HarnessNotice>, // non-fatal attach/open warning to surface to the user
+}
+
+pub struct HarnessNotice {
+    pub code: String,
+    pub message: String,
+    pub detail: Option<String>,
 }
 
 pub struct OpenThreadOptions {
     pub project: ProjectId,
+    pub thread: Option<ThreadId>,     // Some(existing id) ⇒ resume/attach to persisted thread
     pub workspace_root: PathBuf,      // effective sandbox root (§6.3)
     pub resume: Option<String>,       // Some(native id) ⇒ resume; None ⇒ fresh thread
     pub initial_model: ModelRef,
@@ -983,6 +1011,10 @@ Flow: user clicks "New project" → names it → picks a directory via the file 
 
 - **Create:** user starts a new thread in a project; server calls `open_thread` (Codex
   `thread/start`), stores the returned `harness_thread_id`, writes `<thread_id>.json`.
+- **Open existing:** selecting a persisted thread calls the same open endpoint with
+  `thread_id = Some(existing_id)`. The server reattaches the harness using the stored native
+  `harness_thread_id` but preserves the durable Giskard `ThreadId`; opening a thread is
+  idempotent if it is already attached and its model/provider state is still current.
 - **Send input:** user submits a message; server builds a `TurnOverrides` snapshot from the
   thread's persisted state (mode, current model — which carries effort) and calls `start_turn`.
   A turn begins.
@@ -1144,6 +1176,12 @@ LiteLLM gateway fronting Cloudflare Workers AI.
   4. a **conservative fallback** (`context_window = 128000`, `supports_reasoning_effort =
      false`) with a UI warning badge ("context size unknown — using default"), so an unknown
      model is still usable and the gauge still renders.
+- **Stale-provider normalization (E5).** When a persisted/project `ModelRef` names a provider
+  that is no longer configured, but its `model` id appears under exactly one configured provider,
+  the server rewrites the provider to that configured provider before opening/resuming or starting
+  a turn. If the matched model does not support reasoning effort, `reasoning_effort` is cleared.
+  If zero or multiple configured providers match, the model ref is left unchanged and normal
+  error/reporting paths apply.
 
 ### 8.4 Changing model within a thread
 
@@ -1154,6 +1192,10 @@ LiteLLM gateway fronting Cloudflare Workers AI.
   model's descriptor and the context gauge (§10.3) recomputes. Because the value is a cache derived
   from `current_model`, it is also recomputed on load, so a corrected config `context_window` takes
   effect without a migration.
+- On project/thread load, open/resume, `SendInput`, and `SelectModel`, the server applies
+  stale-provider normalization (E5) before computing the context window or passing the model to the
+  harness. This allows a project saved with an old provider id to recover when the configured
+  provider set now contains the model under one unambiguous provider.
 - **Per-model effort retention (C7).** When switching from a reasoning model (e.g.
   `effort = high`) to one with `supports_reasoning_effort = false`, the old model's effort value is
   **retained** in a per-thread `model_efforts` map keyed by `(provider, model)`. Switching back to
@@ -1362,7 +1404,9 @@ alongside raw token counts. Off by default; raw token counts are the primary met
   configurable (default 30 days, sliding). A signing key is generated on first run and stored
   in the data dir (`session.key`, 0600).
 - **All routes except the login page and static assets require a valid session.** The
-  WebSocket upgrade also validates the session cookie before accepting.
+  WebSocket upgrade validates either the session cookie or a short-lived signed ticket from
+  authenticated `GET /api/ws-ticket`. The ticket is only for WebSocket upgrade compatibility
+  and carries the same session signing key semantics as the cookie.
 - TLS is terminated upstream (Nginx). Giskard assumes HTTPS in production; the `Secure`
   cookie flag is on by default and can be disabled via config for local HTTP dev.
 
@@ -1480,6 +1524,10 @@ This guarantees a coherent experience when a future, less-capable harness is plu
 - **One WebSocket per browser client**, multiplexing all projects/threads (chosen for lowest
   CPU/memory: one connection, one server-side fan-out task, no per-thread sockets).
 - Messages are tagged with `project_id` / `thread_id`. Defined once in `giskard-proto`.
+- **Thread open is REST-backed:** `POST /api/projects/{project_id}/threads` accepts
+  `{ thread_id?: ThreadId, resume?: String }`. `thread_id = None` creates a new Giskard thread;
+  `thread_id = Some(existing)` reopens/reattaches a persisted Giskard thread; `resume` is the
+  optional native harness id for explicit resume/create flows.
 
 **Client → server** (examples): `Subscribe { thread_id }`, `Unsubscribe { thread_id }`,
 `SendInput { thread_id, text }`, `SwitchMode { thread_id, mode }`,
@@ -1504,7 +1552,17 @@ This guarantees a coherent experience when a future, less-capable harness is plu
 `LiveTurnSnapshot { thread_id, turn_id, accumulated, pending_approval? }` (in-flight turn
 reconstruction on reconnect, carrying `WireAgentEvent`s + a `WireApprovalRequest`),
 `TokenUpdate { scope, ledger }`, `ApprovalRequest { thread_id, request }` (a `WireApprovalRequest`),
-`Error { … }`, `Pong`.
+`Error { code, severity, message, detail?, thread_id?, action? }`, `Pong`.
+
+`OpenThreadResponse` may also carry `warning: ErrorInfo?` with the same `code` / `severity` /
+`message` shape when the requested thread was opened but degraded (for example, Codex resume
+failed and Giskard started a fresh native session while keeping persisted history).
+
+**Client rendering invariant (E6):** `ItemDelta { item_id }` and the later `ItemCompleted`
+for the same `Item.id` are one lifecycle. The UI must finalize or replace the streamed body in
+place when the completed item arrives, and must de-duplicate rendered items by both Giskard
+`ItemId` and harness-native `harness_item_id` when replaying persisted state or receiving live
+events.
 
 > **Wire types (C1/§3.5).** Everything the server emits that could carry a filesystem path
 > (`Event`, `ApprovalRequest`, the `LiveTurnSnapshot` contents) is mapped `core → Wire*` at the

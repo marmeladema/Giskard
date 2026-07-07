@@ -64,11 +64,12 @@ impl AgentHarness for CapturingHarness {
     }
 
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
-        let tid = ThreadId::new();
+        let tid = opts.thread.unwrap_or_default();
         *self.thread_id.lock().unwrap() = Some(tid);
         Ok(ThreadHandle {
             thread: tid,
             harness_thread_id: opts.resume.unwrap_or_else(|| "cap".into()),
+            warning: None,
         })
     }
 
@@ -120,8 +121,9 @@ struct CapFactory {
     captured: Arc<TokioMutex<Vec<TurnOverrides>>>,
 }
 
+#[async_trait::async_trait]
 impl HarnessFactory for CapFactory {
-    fn create(&self, _config: &ProjectConfig) -> Result<Arc<dyn AgentHarness>, HarnessError> {
+    async fn create(&self, _config: &ProjectConfig) -> Result<Arc<dyn AgentHarness>, HarnessError> {
         Ok(Arc::new(CapturingHarness::new(self.captured.clone())))
     }
 }

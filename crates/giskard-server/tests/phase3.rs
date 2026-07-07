@@ -21,8 +21,9 @@ struct TestFactory {
     fixture: ReplayFixture,
 }
 
+#[async_trait::async_trait]
 impl HarnessFactory for TestFactory {
-    fn create(
+    async fn create(
         &self,
         _config: &ProjectConfig,
     ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {

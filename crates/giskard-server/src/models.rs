@@ -32,6 +32,34 @@ pub fn resolve_descriptor(config: &Config, model: &ModelRef) -> ModelDescriptor 
         .unwrap_or_else(|| ModelDescriptor::conservative(&model.provider, &model.model))
 }
 
+pub fn normalize_model_ref(config: &Config, model: &ModelRef) -> ModelRef {
+    if config.providers.is_empty() || from_config(config, &model.provider, &model.model).is_some() {
+        return model.clone();
+    }
+
+    let mut matches = config.providers.iter().filter_map(|provider| {
+        provider
+            .models
+            .iter()
+            .find(|candidate| candidate.id == model.model)
+            .map(|candidate| (provider, candidate))
+    });
+
+    let Some((provider, candidate)) = matches.next() else {
+        return model.clone();
+    };
+    if matches.next().is_some() {
+        return model.clone();
+    }
+
+    let mut normalized = model.clone();
+    normalized.provider = provider.id.clone();
+    if !candidate.supports_reasoning_effort {
+        normalized.reasoning_effort = None;
+    }
+    normalized
+}
+
 /// The context window (gauge denominator, §10.3) for a model, per the §8.3 precedence.
 pub fn context_window_for(config: &Config, model: &ModelRef) -> u32 {
     resolve_descriptor(config, model).context_window
@@ -229,5 +257,45 @@ model_listing = true
             ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
             "dynamic-only id gets a conservative descriptor"
         );
+    }
+
+    #[test]
+    fn normalizes_stale_provider_when_model_has_one_configured_provider() {
+        let config = config_with_glm();
+        let normalized = normalize_model_ref(
+            &config,
+            &ModelRef {
+                provider: "openai".into(),
+                model: "@cf/z-ai/glm-4.7".into(),
+                reasoning_effort: Some(giskard_core::model::Effort::High),
+            },
+        );
+        assert_eq!(normalized.provider, "cloudflare-litellm");
+        assert_eq!(normalized.model, "@cf/z-ai/glm-4.7");
+        assert_eq!(normalized.reasoning_effort, None);
+    }
+
+    #[test]
+    fn does_not_normalize_ambiguous_model_provider() {
+        let mut config = config_with_glm();
+        config.providers.push(giskard_persist::ProviderConfig {
+            id: "other".into(),
+            name: "Other".into(),
+            base_url: None,
+            wire_api: "responses".into(),
+            model_listing: false,
+            models: vec![giskard_persist::ModelConfig {
+                id: "@cf/z-ai/glm-4.7".into(),
+                display_name: None,
+                context_window: 131_072,
+                supports_reasoning_effort: false,
+            }],
+        });
+        let original = ModelRef {
+            provider: "openai".into(),
+            model: "@cf/z-ai/glm-4.7".into(),
+            reasoning_effort: None,
+        };
+        assert_eq!(normalize_model_ref(&config, &original), original);
     }
 }

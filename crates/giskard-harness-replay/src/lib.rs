@@ -85,6 +85,10 @@ pub struct ReplayHarness {
 impl ReplayHarness {
     /// Create a new replay harness with full Codex-like capabilities.
     pub fn new() -> Self {
+        Self::with_fixtures(HashMap::new())
+    }
+
+    fn with_fixtures(fixtures: HashMap<String, PreloadedFixture>) -> Self {
         Self {
             capabilities: HarnessCapabilities {
                 live_approvals: true,
@@ -97,7 +101,7 @@ impl ReplayHarness {
                 token_usage: true,
             },
             threads: Mutex::new(Vec::new()),
-            fixtures: Mutex::new(HashMap::new()),
+            fixtures: Mutex::new(fixtures),
             shutdown_called: AtomicBool::new(false),
         }
     }
@@ -105,7 +109,6 @@ impl ReplayHarness {
     /// Load a fixture and create a harness pre-loaded with those events
     /// for a single thread.
     pub fn from_fixture(fixture: ReplayFixture) -> Self {
-        let harness = Self::new();
         let (thread_id, harness_thread_id) = fixture
             .events
             .iter()
@@ -118,14 +121,15 @@ impl ReplayHarness {
             })
             .unwrap_or_else(|| (ThreadId::new(), format!("replay_{}", ThreadId::new())));
 
-        harness.fixtures.try_lock().unwrap().insert(
+        let mut fixtures = HashMap::new();
+        fixtures.insert(
             harness_thread_id,
             PreloadedFixture {
                 thread_id,
                 events: fixture.events,
             },
         );
-        harness
+        Self::with_fixtures(fixtures)
     }
 }
 
@@ -154,12 +158,12 @@ impl AgentHarness for ReplayHarness {
         let (thread_id, pending) = if let Some(resume) = &opts.resume {
             let mut fixtures = self.fixtures.lock().await;
             if let Some(fixture) = fixtures.remove(resume) {
-                (fixture.thread_id, fixture.events)
+                (opts.thread.unwrap_or(fixture.thread_id), fixture.events)
             } else {
-                (ThreadId::new(), Vec::new())
+                (opts.thread.unwrap_or_default(), Vec::new())
             }
         } else {
-            (ThreadId::new(), Vec::new())
+            (opts.thread.unwrap_or_default(), Vec::new())
         };
 
         let (tx, _) = broadcast::channel(256);
@@ -175,6 +179,7 @@ impl AgentHarness for ReplayHarness {
         Ok(ThreadHandle {
             thread: thread_id,
             harness_thread_id,
+            warning: None,
         })
     }
 
@@ -319,6 +324,7 @@ mod tests {
         let handle = harness
             .open_thread(giskard_harness::OpenThreadOptions {
                 project: giskard_core::ProjectId::new(),
+                thread: None,
                 workspace_root: "/tmp".into(),
                 resume: Some("th_test".into()),
                 initial_model: ModelRef {

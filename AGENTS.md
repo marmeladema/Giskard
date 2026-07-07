@@ -5,7 +5,7 @@ Giskard: a local-first, single-user web UI for agentic coding CLIs (Codex CLI fi
 Built in Rust (Dioxus fullstack + Axum). No npm/Node/JS toolchain.
 
 ## Specification
-`specs/giskard-specification.md` (v1.4) is the authoritative spec. Read it before making changes.
+`specs/giskard-specification.md` (v1.5) is the authoritative spec. Read it before making changes.
 
 ## Build & Test
 
@@ -37,4 +37,15 @@ Cargo workspace with 8 crates under `crates/`:
 - All Codex-specific types confined to `giskard-harness-codex`.
 - Atomic writes for all persistence (temp file + fsync + rename).
 - IDs are ULIDs.
-- No comments in code unless explicitly requested.
+- Comments are welcome when they explain intent, invariants, protocol contracts, or non-obvious
+  failure handling. Avoid comments that only restate the code.
+- Do not use `unwrap`, `expect`, `panic!`, `todo!`, or `unreachable!` in runtime paths unless the
+  condition is proven infallible in local context. Prefer returning typed errors, logging, or
+  surfacing a structured browser error. Test-only assertions may use panics normally.
+- Errors and failures must be visible at the right boundary:
+  - browser-action failures should produce a user-visible message over HTTP or WebSocket;
+  - server/operator failures should be logged with enough context to diagnose the action, thread,
+    project, and underlying error when available;
+  - degraded-but-usable flows should surface warnings rather than fail silently.
+- Error paths need tests too. When adding or changing a failure mode, add focused coverage for the
+  structured error, warning, log-adjacent behavior, or persisted recovery path as appropriate.

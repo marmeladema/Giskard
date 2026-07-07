@@ -15,6 +15,13 @@ use argon2::PasswordHasher;
 
 #[tokio::main]
 async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         usage(&args[0]);
@@ -33,13 +40,13 @@ async fn main() {
     match cmd.as_str() {
         "set-password" => {
             let password =
-                rpassword::prompt_password("Enter password: ").expect("failed to read password");
+                rpassword::prompt_password("Enter password: ").map_err(|e| e.to_string())?;
             let hash = argon2::Argon2::default()
                 .hash_password(
                     password.as_bytes(),
                     &argon2::password_hash::SaltString::generate(&mut rand::rngs::OsRng),
                 )
-                .expect("hashing failed")
+                .map_err(|e| format!("hashing failed: {e}"))?
                 .to_string();
             println!("{hash}");
             println!("\nAdd this to config.toml under [auth]: password_hash = \"{hash}\"");
@@ -49,7 +56,7 @@ async fn main() {
             let index = store
                 .load_project_index()
                 .await
-                .expect("failed to load index");
+                .map_err(|e| format!("failed to load index: {e}"))?;
             if index.projects.is_empty() {
                 println!("No projects.");
             } else {
@@ -60,20 +67,21 @@ async fn main() {
         }
         "list-threads" => {
             let pid = expect_arg(&args, 2, "project id");
-            let pid: giskard_core::ProjectId = pid
-                .parse::<ulid::Ulid>()
-                .map(giskard_core::ProjectId)
-                .expect("invalid project id");
+            let pid = parse_project_id(pid)?;
             let store = giskard_persist::PersistStore::new(data_dir);
             let threads = store
                 .list_threads(pid)
                 .await
-                .expect("failed to list threads");
+                .map_err(|e| format!("failed to list threads: {e}"))?;
             if threads.is_empty() {
                 println!("No threads.");
             } else {
                 for tid in threads {
-                    if let Some(thread) = store.load_thread(pid, tid).await.unwrap() {
+                    if let Some(thread) = store
+                        .load_thread(pid, tid)
+                        .await
+                        .map_err(|e| format!("failed to load thread {tid}: {e}"))?
+                    {
                         println!("{}  {}  [{:?}]", tid, thread.title, thread.mode);
                     }
                 }
@@ -82,18 +90,13 @@ async fn main() {
         "dump-thread" => {
             let pid = expect_arg(&args, 2, "project id");
             let tid = expect_arg(&args, 3, "thread id");
-            let pid = pid
-                .parse::<ulid::Ulid>()
-                .map(giskard_core::ProjectId)
-                .expect("invalid project id");
-            let tid = tid
-                .parse::<ulid::Ulid>()
-                .map(giskard_core::ThreadId)
-                .expect("invalid thread id");
+            let pid = parse_project_id(pid)?;
+            let tid = parse_thread_id(tid)?;
             let store = giskard_persist::PersistStore::new(data_dir);
             match store.load_thread(pid, tid).await {
                 Ok(Some(thread)) => {
-                    let json = serde_json::to_string_pretty(&thread).unwrap();
+                    let json = serde_json::to_string_pretty(&thread)
+                        .map_err(|e| format!("failed to serialize thread: {e}"))?;
                     println!("{json}");
                 }
                 Ok(None) => {
@@ -109,32 +112,23 @@ async fn main() {
         "delete-thread" => {
             let pid = expect_arg(&args, 2, "project id");
             let tid = expect_arg(&args, 3, "thread id");
-            let pid = pid
-                .parse::<ulid::Ulid>()
-                .map(giskard_core::ProjectId)
-                .expect("invalid project id");
-            let tid = tid
-                .parse::<ulid::Ulid>()
-                .map(giskard_core::ThreadId)
-                .expect("invalid thread id");
+            let pid = parse_project_id(pid)?;
+            let tid = parse_thread_id(tid)?;
             let store = giskard_persist::PersistStore::new(data_dir);
             store
                 .delete_thread(pid, tid)
                 .await
-                .expect("failed to delete thread");
+                .map_err(|e| format!("failed to delete thread: {e}"))?;
             println!("Deleted thread {tid}");
         }
         "delete-project" => {
             let pid = expect_arg(&args, 2, "project id");
-            let pid = pid
-                .parse::<ulid::Ulid>()
-                .map(giskard_core::ProjectId)
-                .expect("invalid project id");
+            let pid = parse_project_id(pid)?;
             let store = giskard_persist::PersistStore::new(data_dir);
             store
                 .delete_project(pid)
                 .await
-                .expect("failed to delete project");
+                .map_err(|e| format!("failed to delete project: {e}"))?;
             println!("Deleted project {pid}");
         }
         "validate" => {
@@ -158,6 +152,7 @@ async fn main() {
             std::process::exit(1);
         }
     }
+    Ok(())
 }
 
 fn expect_arg<'a>(args: &'a [String], idx: usize, name: &str) -> &'a str {
@@ -166,6 +161,18 @@ fn expect_arg<'a>(args: &'a [String], idx: usize, name: &str) -> &'a str {
         usage(&args[0]);
         std::process::exit(1);
     })
+}
+
+fn parse_project_id(raw: &str) -> Result<giskard_core::ProjectId, String> {
+    raw.parse::<ulid::Ulid>()
+        .map(giskard_core::ProjectId)
+        .map_err(|e| format!("invalid project id {raw}: {e}"))
+}
+
+fn parse_thread_id(raw: &str) -> Result<giskard_core::ThreadId, String> {
+    raw.parse::<ulid::Ulid>()
+        .map(giskard_core::ThreadId)
+        .map_err(|e| format!("invalid thread id {raw}: {e}"))
 }
 
 fn usage(prog: &str) {

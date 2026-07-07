@@ -644,6 +644,7 @@ dependencies = [
  "futures-util",
  "giskard-core",
  "giskard-harness",
+ "giskard-harness-codex",
  "giskard-harness-replay",
  "giskard-persist",
  "giskard-proto",

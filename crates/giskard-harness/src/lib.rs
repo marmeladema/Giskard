@@ -40,6 +40,7 @@ pub struct HarnessCapabilities {
 #[derive(Debug, Clone)]
 pub struct OpenThreadOptions {
     pub project: ProjectId,
+    pub thread: Option<ThreadId>,
     pub workspace_root: PathBuf,
     /// Some(native id) ⇒ resume; None ⇒ fresh thread.
     pub resume: Option<String>,
@@ -51,6 +52,14 @@ pub struct OpenThreadOptions {
 pub struct ThreadHandle {
     pub thread: ThreadId,
     pub harness_thread_id: String,
+    pub warning: Option<HarnessNotice>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HarnessNotice {
+    pub code: String,
+    pub message: String,
+    pub detail: Option<String>,
 }
 
 /// A typed wrapper around a `broadcast::Receiver<AgentEvent>`.
