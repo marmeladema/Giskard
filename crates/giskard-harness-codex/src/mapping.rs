@@ -1,5 +1,6 @@
 //! Mapping between `codex-codes` types and `giskard-core` types (spec §4.6).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use chrono::Utc;
@@ -8,8 +9,8 @@ use serde_json::Value;
 use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalRequest};
 use giskard_core::diff::{DiffHunk, DiffLine, FileDiff};
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ApprovalId, ItemId, ThreadId};
-use giskard_core::item::{FileChangeKind, Item, ItemDelta, ItemKind, ItemPayload, ItemStarted};
+use giskard_core::ids::{ApprovalId, ItemId, ThreadId, TurnId};
+use giskard_core::item::{FileChangeKind, Item, ItemDelta, ItemKind, ItemPayload, ItemStart};
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{ApprovalPolicy, Mode, TurnStatus, TurnStatusKind};
 
@@ -21,55 +22,120 @@ use codex_codes::protocol::{
     TurnDiffUpdatedNotification, TurnStartedNotification,
 };
 
+/// Maps Codex app-server messages onto `giskard-core` events, owning the id-translation registries
+/// (spec §4.7): native `threadId → ThreadId` (B4), native `turnId → TurnId`, and native
+/// `itemId → ItemId` (B2). The Giskard-owned ids are minted once and reused for every subsequent
+/// delta/completion carrying the same native id, so events for one turn/item stay correlated.
 pub struct CodexMapper {
     _workspace_root: PathBuf,
+    thread_ids: HashMap<String, ThreadId>,
+    turn_ids: HashMap<String, TurnId>,
+    item_ids: HashMap<String, ItemId>,
 }
 
 impl CodexMapper {
     pub fn new(workspace_root: PathBuf) -> Self {
         Self {
             _workspace_root: workspace_root,
+            thread_ids: HashMap::new(),
+            turn_ids: HashMap::new(),
+            item_ids: HashMap::new(),
         }
     }
 
-    pub fn map_notification(&self, notif: &Notification, thread: ThreadId) -> Option<AgentEvent> {
+    /// B4: bind a native thread id to its owned `ThreadId`. Called at `open_thread` for both fresh
+    /// `thread/start` and `thread/resume` (and re-bound after a resume-fallback, §4.7/C5).
+    pub fn register_thread(&mut self, harness_thread_id: String, thread: ThreadId) {
+        self.thread_ids.insert(harness_thread_id, thread);
+    }
+
+    /// Resolve a native thread id to its owned `ThreadId`, falling back to the thread in scope
+    /// when the message omits the id or it is not yet registered.
+    fn resolve_thread(&self, native: &str, fallback: ThreadId) -> ThreadId {
+        if native.is_empty() {
+            return fallback;
+        }
+        self.thread_ids.get(native).copied().unwrap_or(fallback)
+    }
+
+    /// Resolve (get-or-mint) the owned `TurnId` for a native turn id.
+    fn resolve_turn(&mut self, native: &str) -> TurnId {
+        if native.is_empty() {
+            return TurnId::new();
+        }
+        *self.turn_ids.entry(native.to_string()).or_default()
+    }
+
+    /// Resolve (get-or-mint) the owned `ItemId` for a native item id (B2).
+    fn resolve_item(&mut self, native: &str) -> ItemId {
+        if native.is_empty() {
+            return ItemId::new();
+        }
+        *self.item_ids.entry(native.to_string()).or_default()
+    }
+
+    pub fn map_notification(
+        &mut self,
+        notif: &Notification,
+        fallback_thread: ThreadId,
+    ) -> Option<AgentEvent> {
         match notif {
-            Notification::TurnStarted(TurnStartedNotification { .. }) => {
+            Notification::TurnStarted(TurnStartedNotification { thread_id, turn }) => {
+                let thread = self.resolve_thread(thread_id, fallback_thread);
                 Some(AgentEvent::TurnStarted {
                     thread,
-                    turn: giskard_core::TurnId::new(),
+                    turn: self.resolve_turn(&turn.id),
                 })
             }
 
-            Notification::TurnCompleted(TurnCompletedNotification { turn, .. }) => {
+            Notification::TurnCompleted(TurnCompletedNotification { thread_id, turn }) => {
+                let thread = self.resolve_thread(thread_id, fallback_thread);
                 let usage = extract_token_usage(turn);
                 let status = map_turn_status(&turn.status);
                 Some(AgentEvent::TurnCompleted {
                     thread,
-                    turn: giskard_core::TurnId::new(),
+                    turn: self.resolve_turn(&turn.id),
                     usage,
                     status,
                 })
             }
 
-            Notification::ItemStarted(ItemStartedNotification { item, .. }) => {
-                let (id, kind) = map_thread_item_start(item);
+            Notification::ItemStarted(ItemStartedNotification {
+                item,
+                thread_id,
+                turn_id,
+                ..
+            }) => {
+                let thread = self.resolve_thread(thread_id, fallback_thread);
+                let turn = self.resolve_turn(turn_id);
+                let (harness_item_id, kind) = map_thread_item_start(item);
+                let id = self.resolve_item(&harness_item_id);
                 Some(AgentEvent::ItemStarted {
                     thread,
-                    turn: giskard_core::TurnId::new(),
-                    item: ItemStarted { id, kind },
+                    turn,
+                    item: ItemStart {
+                        id,
+                        harness_item_id,
+                        kind,
+                    },
                 })
             }
 
             Notification::ItemCompleted(ItemCompletedNotification {
                 item,
                 completed_at_ms,
-                ..
+                thread_id,
+                turn_id,
             }) => {
-                let giskard_item = map_thread_item_complete(item, *completed_at_ms);
+                let thread = self.resolve_thread(thread_id, fallback_thread);
+                let turn = self.resolve_turn(turn_id);
+                let harness_item_id = thread_item_id(item);
+                let id = self.resolve_item(&harness_item_id);
+                let giskard_item =
+                    map_thread_item_complete(item, id, harness_item_id, *completed_at_ms);
                 Some(AgentEvent::ItemCompleted {
                     thread,
-                    turn: giskard_core::TurnId::new(),
+                    turn,
                     item: giskard_item,
                 })
             }
@@ -77,42 +143,64 @@ impl CodexMapper {
             Notification::AgentMessageDelta(AgentMessageDeltaNotification {
                 delta,
                 item_id,
-                ..
-            }) => Some(AgentEvent::ItemDelta {
-                thread,
-                turn: giskard_core::TurnId::new(),
-                item_id: ItemId(item_id.clone()),
-                delta: ItemDelta::Text {
-                    text: delta.clone(),
-                },
-            }),
+                thread_id,
+                turn_id,
+            }) => {
+                let thread = self.resolve_thread(thread_id, fallback_thread);
+                let turn = self.resolve_turn(turn_id);
+                Some(AgentEvent::ItemDelta {
+                    thread,
+                    turn,
+                    item_id: self.resolve_item(item_id),
+                    delta: ItemDelta::Text {
+                        text: delta.clone(),
+                    },
+                })
+            }
 
             Notification::CmdOutputDelta(CommandExecutionOutputDeltaNotification {
                 delta,
                 item_id,
+                thread_id,
+                turn_id,
                 ..
-            }) => Some(AgentEvent::ItemDelta {
-                thread,
-                turn: giskard_core::TurnId::new(),
-                item_id: ItemId(item_id.clone()),
-                delta: ItemDelta::CommandOutput {
-                    chunk: delta.clone(),
-                },
-            }),
+            }) => {
+                let thread = self.resolve_thread(thread_id, fallback_thread);
+                let turn = self.resolve_turn(turn_id);
+                Some(AgentEvent::ItemDelta {
+                    thread,
+                    turn,
+                    item_id: self.resolve_item(item_id),
+                    delta: ItemDelta::CommandOutput {
+                        chunk: delta.clone(),
+                    },
+                })
+            }
 
-            Notification::ReasoningDelta(n) => Some(AgentEvent::ItemDelta {
-                thread,
-                turn: giskard_core::TurnId::new(),
-                item_id: ItemId(String::new()),
-                delta: ItemDelta::Text {
-                    text: n.delta.clone(),
-                },
-            }),
+            Notification::ReasoningDelta(n) => {
+                let thread = self.resolve_thread(&n.thread_id, fallback_thread);
+                let turn = self.resolve_turn(&n.turn_id);
+                Some(AgentEvent::ItemDelta {
+                    thread,
+                    turn,
+                    item_id: self.resolve_item(&n.item_id),
+                    delta: ItemDelta::Text {
+                        text: n.delta.clone(),
+                    },
+                })
+            }
 
-            Notification::TurnDiffUpdated(TurnDiffUpdatedNotification { diff, .. }) => {
+            Notification::TurnDiffUpdated(TurnDiffUpdatedNotification {
+                diff,
+                thread_id,
+                turn_id,
+                ..
+            }) => {
+                let thread = self.resolve_thread(thread_id, fallback_thread);
+                let turn = self.resolve_turn(turn_id);
                 Some(AgentEvent::DiffUpdated {
                     thread,
-                    turn: giskard_core::TurnId::new(),
+                    turn,
                     diff: FileDiff {
                         path: PathBuf::new(),
                         change: FileChangeKind::Modified,
@@ -131,8 +219,8 @@ impl CodexMapper {
                     .clone()
                     .unwrap_or_else(|| "error".into());
                 Some(AgentEvent::Error {
-                    thread,
-                    turn: Some(giskard_core::TurnId::new()),
+                    thread: fallback_thread,
+                    turn: None,
                     error: giskard_core::error::HarnessError::Protocol(msg),
                 })
             }
@@ -142,10 +230,10 @@ impl CodexMapper {
     }
 
     pub fn map_server_request(
-        &self,
+        &mut self,
         id: &RequestId,
         request: &ServerRequest,
-        thread: ThreadId,
+        fallback_thread: ThreadId,
     ) -> Option<AgentEvent> {
         let req_id = match id {
             RequestId::Integer(i) => ApprovalId(i.to_string()),
@@ -153,46 +241,54 @@ impl CodexMapper {
         };
 
         match request {
-            ServerRequest::CmdExecApproval(params) => Some(AgentEvent::ApprovalRequested {
-                thread,
-                turn: giskard_core::TurnId::new(),
-                request: ApprovalRequest {
-                    id: req_id,
-                    kind: ApprovalKind::CommandExecution {
-                        command: params.command.clone().unwrap_or_default(),
-                        cwd: params
-                            .cwd
-                            .as_ref()
-                            .map(|c| PathBuf::from(&c.0))
-                            .unwrap_or_default(),
+            ServerRequest::CmdExecApproval(params) => {
+                let thread = self.resolve_thread(&params.thread_id, fallback_thread);
+                let turn = self.resolve_turn(&params.turn_id);
+                Some(AgentEvent::ApprovalRequested {
+                    thread,
+                    turn,
+                    request: ApprovalRequest {
+                        id: req_id,
+                        kind: ApprovalKind::CommandExecution {
+                            command: params.command.clone().unwrap_or_default(),
+                            cwd: params
+                                .cwd
+                                .as_ref()
+                                .map(|c| PathBuf::from(&c.0))
+                                .unwrap_or_default(),
+                        },
+                        reason: params.reason.clone(),
+                        available: vec![
+                            ApprovalDecision::Accept,
+                            ApprovalDecision::AcceptForSession,
+                            ApprovalDecision::Decline,
+                            ApprovalDecision::Cancel,
+                        ],
                     },
-                    reason: params.reason.clone(),
-                    available: vec![
-                        ApprovalDecision::Accept,
-                        ApprovalDecision::AcceptForSession,
-                        ApprovalDecision::Decline,
-                        ApprovalDecision::Cancel,
-                    ],
-                },
-            }),
-            ServerRequest::FileChangeApproval(params) => Some(AgentEvent::ApprovalRequested {
-                thread,
-                turn: giskard_core::TurnId::new(),
-                request: ApprovalRequest {
-                    id: req_id,
-                    kind: ApprovalKind::FileChange {
-                        path: PathBuf::new(),
-                        change: FileChangeKind::Modified,
+                })
+            }
+            ServerRequest::FileChangeApproval(params) => {
+                let thread = self.resolve_thread(&params.thread_id, fallback_thread);
+                let turn = self.resolve_turn(&params.turn_id);
+                Some(AgentEvent::ApprovalRequested {
+                    thread,
+                    turn,
+                    request: ApprovalRequest {
+                        id: req_id,
+                        kind: ApprovalKind::FileChange {
+                            path: PathBuf::new(),
+                            change: FileChangeKind::Modified,
+                        },
+                        reason: params.reason.clone(),
+                        available: vec![
+                            ApprovalDecision::Accept,
+                            ApprovalDecision::AcceptForSession,
+                            ApprovalDecision::Decline,
+                            ApprovalDecision::Cancel,
+                        ],
                     },
-                    reason: params.reason.clone(),
-                    available: vec![
-                        ApprovalDecision::Accept,
-                        ApprovalDecision::AcceptForSession,
-                        ApprovalDecision::Decline,
-                        ApprovalDecision::Cancel,
-                    ],
-                },
-            }),
+                })
+            }
             _ => None,
         }
     }
@@ -234,11 +330,16 @@ pub fn map_approval_policy(policy: ApprovalPolicy) -> codex_codes::AskForApprova
 }
 
 pub fn map_effort(effort: giskard_core::model::Effort) -> codex_codes::ReasoningEffort {
-    match effort {
-        giskard_core::model::Effort::Medium => codex_codes::ReasoningEffort("medium".into()),
-        giskard_core::model::Effort::High => codex_codes::ReasoningEffort("high".into()),
-        giskard_core::model::Effort::XHigh => codex_codes::ReasoningEffort("xhigh".into()),
-    }
+    use giskard_core::model::Effort;
+    // Matches Codex `ModelReasoningEffort` (minimal | low | medium | high | xhigh), S4.
+    let s = match effort {
+        Effort::Minimal => "minimal",
+        Effort::Low => "low",
+        Effort::Medium => "medium",
+        Effort::High => "high",
+        Effort::XHigh => "xhigh",
+    };
+    codex_codes::ReasoningEffort(s.into())
 }
 
 pub fn map_approval_decision(decision: &ApprovalDecision) -> Value {
@@ -284,24 +385,41 @@ fn extract_token_usage(_turn: &codex_codes::Turn) -> TokenUsage {
     TokenUsage::default()
 }
 
-fn map_thread_item_start(item: &codex_codes::ThreadItem) -> (ItemId, ItemKind) {
-    let (id, kind) = match item {
-        codex_codes::ThreadItem::UserMessage { id, .. } => (id.as_str(), ItemKind::UserMessage),
-        codex_codes::ThreadItem::AgentMessage { id, .. } => (id.as_str(), ItemKind::AgentMessage),
-        codex_codes::ThreadItem::Reasoning { id, .. } => (id.as_str(), ItemKind::Reasoning),
-        codex_codes::ThreadItem::CommandExecution { id, .. } => {
-            (id.as_str(), ItemKind::CommandExecution)
-        }
-        codex_codes::ThreadItem::FileChange { id, .. } => (id.as_str(), ItemKind::FileChange),
-        codex_codes::ThreadItem::McpToolCall { id, .. } => (id.as_str(), ItemKind::ToolCall),
-        _ => ("", ItemKind::AgentMessage),
-    };
-    (ItemId(id.to_string()), kind)
+/// Extract the native item id string from a Codex `ThreadItem`.
+fn thread_item_id(item: &codex_codes::ThreadItem) -> String {
+    match item {
+        codex_codes::ThreadItem::UserMessage { id, .. }
+        | codex_codes::ThreadItem::AgentMessage { id, .. }
+        | codex_codes::ThreadItem::Reasoning { id, .. }
+        | codex_codes::ThreadItem::CommandExecution { id, .. }
+        | codex_codes::ThreadItem::FileChange { id, .. }
+        | codex_codes::ThreadItem::McpToolCall { id, .. } => id.clone(),
+        _ => String::new(),
+    }
 }
 
-fn map_thread_item_complete(item: &codex_codes::ThreadItem, completed_at_ms: i64) -> Item {
-    let (id, payload) = match item {
-        codex_codes::ThreadItem::UserMessage { id, content, .. } => {
+/// Returns the native item id + Giskard `ItemKind` for an item at `item/started`.
+fn map_thread_item_start(item: &codex_codes::ThreadItem) -> (String, ItemKind) {
+    let kind = match item {
+        codex_codes::ThreadItem::UserMessage { .. } => ItemKind::UserMessage,
+        codex_codes::ThreadItem::AgentMessage { .. } => ItemKind::AgentMessage,
+        codex_codes::ThreadItem::Reasoning { .. } => ItemKind::Reasoning,
+        codex_codes::ThreadItem::CommandExecution { .. } => ItemKind::CommandExecution,
+        codex_codes::ThreadItem::FileChange { .. } => ItemKind::FileChange,
+        codex_codes::ThreadItem::McpToolCall { .. } => ItemKind::ToolCall,
+        _ => ItemKind::AgentMessage,
+    };
+    (thread_item_id(item), kind)
+}
+
+fn map_thread_item_complete(
+    item: &codex_codes::ThreadItem,
+    id: ItemId,
+    harness_item_id: String,
+    completed_at_ms: i64,
+) -> Item {
+    let payload = match item {
+        codex_codes::ThreadItem::UserMessage { content, .. } => {
             let text = content
                 .iter()
                 .filter_map(|c| match c {
@@ -310,17 +428,16 @@ fn map_thread_item_complete(item: &codex_codes::ThreadItem, completed_at_ms: i64
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            (id.clone(), ItemPayload::UserMessage { text })
+            ItemPayload::UserMessage { text }
         }
-        codex_codes::ThreadItem::AgentMessage { id, text, .. } => {
-            (id.clone(), ItemPayload::AgentMessage { text: text.clone() })
+        codex_codes::ThreadItem::AgentMessage { text, .. } => {
+            ItemPayload::AgentMessage { text: text.clone() }
         }
-        codex_codes::ThreadItem::Reasoning { id, summary, .. } => {
+        codex_codes::ThreadItem::Reasoning { summary, .. } => {
             let text = summary.as_ref().map(|s| s.join("\n")).unwrap_or_default();
-            (id.clone(), ItemPayload::Reasoning { text })
+            ItemPayload::Reasoning { text }
         }
         codex_codes::ThreadItem::CommandExecution {
-            id,
             command,
             cwd,
             aggregated_output,
@@ -329,50 +446,39 @@ fn map_thread_item_complete(item: &codex_codes::ThreadItem, completed_at_ms: i64
         } => {
             let output = aggregated_output.clone().unwrap_or_default();
             let exit = exit_code.map(|c| c as i32);
-            (
-                id.clone(),
-                ItemPayload::CommandExecution {
-                    command: command.clone(),
-                    cwd: PathBuf::from(cwd.to_string()),
-                    output,
-                    exit_code: exit,
-                },
-            )
+            ItemPayload::CommandExecution {
+                command: command.clone(),
+                cwd: PathBuf::from(cwd.to_string()),
+                output,
+                exit_code: exit,
+            }
         }
-        codex_codes::ThreadItem::FileChange { id, changes, .. } => {
+        codex_codes::ThreadItem::FileChange { changes, .. } => {
             let path = changes
                 .first()
                 .map(|c| PathBuf::from(&c.path))
                 .unwrap_or_default();
-            (
-                id.clone(),
-                ItemPayload::FileChange {
-                    path,
-                    change: FileChangeKind::Modified,
-                },
-            )
+            ItemPayload::FileChange {
+                path,
+                change: FileChangeKind::Modified,
+            }
         }
-        codex_codes::ThreadItem::McpToolCall { id, .. } => (
-            id.clone(),
-            ItemPayload::ToolCall {
-                name: String::new(),
-                input: Value::Null,
-                output: None,
-            },
-        ),
-        _ => (
-            String::new(),
-            ItemPayload::AgentMessage {
-                text: String::new(),
-            },
-        ),
+        codex_codes::ThreadItem::McpToolCall { .. } => ItemPayload::ToolCall {
+            name: String::new(),
+            input: Value::Null,
+            output: None,
+        },
+        _ => ItemPayload::AgentMessage {
+            text: String::new(),
+        },
     };
 
     let created_at =
         chrono::DateTime::from_timestamp_millis(completed_at_ms).unwrap_or_else(Utc::now);
 
     Item {
-        id: ItemId(id),
+        id,
+        harness_item_id,
         payload,
         created_at,
     }

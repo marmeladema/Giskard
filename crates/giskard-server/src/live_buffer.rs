@@ -4,7 +4,7 @@ use tokio::sync::Mutex;
 
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ThreadId, TurnId};
-use giskard_proto::LiveTurnSnapshot;
+use giskard_proto::{LiveTurnSnapshot, WireAgentEvent, WireApprovalRequest};
 
 struct LiveTurn {
     turn_id: TurnId,
@@ -56,17 +56,21 @@ impl LiveBufferStore {
     pub async fn snapshot(&self, thread_id: ThreadId) -> Option<LiveTurnSnapshot> {
         let buffers = self.buffers.lock().await;
         buffers.get(&thread_id).map(|turn| {
-            let pending_approval = turn.events.iter().rev().find_map(|e| {
-                if let AgentEvent::ApprovalRequested { request, .. } = e {
-                    Some(request.clone())
-                } else {
-                    None
-                }
-            });
+            // C1/§3.5: the snapshot crosses the wire, so narrow core → wire here too.
+            let pending_approval: Option<WireApprovalRequest> =
+                turn.events.iter().rev().find_map(|e| {
+                    if let AgentEvent::ApprovalRequested { request, .. } = e {
+                        Some(request.clone().into())
+                    } else {
+                        None
+                    }
+                });
+            let accumulated: Vec<WireAgentEvent> =
+                turn.events.iter().cloned().map(Into::into).collect();
             LiveTurnSnapshot {
                 thread_id,
                 turn_id: turn.turn_id,
-                accumulated: turn.events.clone(),
+                accumulated,
                 pending_approval,
             }
         })

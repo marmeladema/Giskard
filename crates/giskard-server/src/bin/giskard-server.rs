@@ -4,7 +4,7 @@ use std::sync::Arc;
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ItemId, ThreadId, TurnId};
-use giskard_core::item::{Item, ItemDelta, ItemKind, ItemPayload, ItemStarted};
+use giskard_core::item::{Item, ItemDelta, ItemKind, ItemPayload, ItemStart};
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnStatus, TurnStatusKind};
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
@@ -28,6 +28,7 @@ impl HarnessFactory for ReplayFactory {
 fn make_demo_fixture() -> ReplayFixture {
     let thread = ThreadId::new();
     let turn = TurnId::new();
+    let it_1 = ItemId::new();
     let now = chrono::Utc::now();
 
     ReplayFixture::from_events(vec![
@@ -39,15 +40,16 @@ fn make_demo_fixture() -> ReplayFixture {
         AgentEvent::ItemStarted {
             thread,
             turn,
-            item: ItemStarted {
-                id: ItemId("it_1".into()),
+            item: ItemStart {
+                id: it_1,
+                harness_item_id: "it_1".into(),
                 kind: ItemKind::AgentMessage,
             },
         },
         AgentEvent::ItemDelta {
             thread,
             turn,
-            item_id: ItemId("it_1".into()),
+            item_id: it_1,
             delta: ItemDelta::Text {
                 text: "Hello! I'm a replay harness in demo mode. ".into(),
             },
@@ -56,7 +58,8 @@ fn make_demo_fixture() -> ReplayFixture {
             thread,
             turn,
             item: Item {
-                id: ItemId("it_1".into()),
+                id: it_1,
+                harness_item_id: "it_1".into(),
                 payload: ItemPayload::AgentMessage {
                     text: "Hello! I'm a replay harness in demo mode.".into(),
                 },

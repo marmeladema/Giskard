@@ -73,11 +73,12 @@ impl Hub {
     }
 
     pub async fn broadcast_event(&self, thread_id: ThreadId, event: AgentEvent) {
+        // C1/§3.5: narrow core → wire (lossy `PathBuf → String`) at the outbound edge.
         self.broadcast(
             thread_id,
             ServerMessage::Event {
                 thread_id,
-                agent_event: event,
+                agent_event: event.into(),
             },
         )
         .await;

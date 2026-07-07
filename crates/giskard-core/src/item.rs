@@ -25,17 +25,24 @@ pub enum FileChangeKind {
     Deleted,
 }
 
-/// Sent on `AgentEvent::ItemStarted`.
+/// Sent on `AgentEvent::ItemStarted` (spec §4.5, B5: renamed from `ItemStarted` to avoid
+/// colliding with the `AgentEvent::ItemStarted` variant).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ItemStarted {
+pub struct ItemStart {
+    /// Giskard-owned id (B2), stable across resume.
     pub id: ItemId,
+    /// Harness-native item id, used to correlate deltas/completion.
+    pub harness_item_id: String,
     pub kind: ItemKind,
 }
 
 /// The finalized item persisted in thread history and sent on `ItemCompleted`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Item {
+    /// Giskard-owned id (B2): stable across resume, addressable by the diff viewer and code overlay.
     pub id: ItemId,
+    /// Harness-native item id (opaque; not relied on for stability).
+    pub harness_item_id: String,
     pub payload: ItemPayload,
     pub created_at: DateTime<Utc>,
 }
@@ -101,7 +108,8 @@ mod tests {
     #[test]
     fn item_payload_serde_roundtrip() {
         let item = Item {
-            id: ItemId("it_1".into()),
+            id: ItemId::new(),
+            harness_item_id: "it_1".into(),
             payload: ItemPayload::AgentMessage {
                 text: "Hello!".into(),
             },

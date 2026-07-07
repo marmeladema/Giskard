@@ -1,6 +1,11 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::ids::TurnId;
+use crate::item::Item;
 use crate::model::{Effort, ModelRef};
+use crate::token::TokenUsage;
+use crate::user_input::UserInput;
 
 /// Thread-level mode (spec §7.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -49,13 +54,39 @@ pub struct TurnStatus {
 }
 
 /// Kind of turn outcome.
+///
+/// S2: no `Declined` — the pinned Codex `TurnStatus` is `Completed | Interrupted | Failed |
+/// InProgress` (the last is non-terminal). Re-add a variant only when a real producer exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TurnStatusKind {
     Completed,
     Interrupted,
     Failed,
-    Declined,
+}
+
+/// One unit of agent work initiated by a single user input (spec §4.5, B1).
+///
+/// Persisted inside the thread file (§5.3) as an element of `Thread.turns`, and the unit the
+/// diff viewer / token gauge read from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Turn {
+    pub id: TurnId,
+    pub user_input: UserInput,
+    /// Completed items, in order.
+    #[serde(default)]
+    pub items: Vec<Item>,
+    /// Model used for this turn (may differ across turns of one thread, §8.4).
+    pub model: ModelRef,
+    /// Plan | build applied to this turn (§7.4).
+    pub mode: Mode,
+    pub status: TurnStatus,
+    /// Per-turn usage; the same `TokenUsage` struct is reused in the ledgers (B3).
+    pub usage: TokenUsage,
+    pub started_at: DateTime<Utc>,
+    /// `None` while the turn is still live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
 }
 
 #[cfg(test)]

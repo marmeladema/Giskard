@@ -5,11 +5,25 @@
 use serde::{Deserialize, Serialize};
 
 use chrono::{DateTime, Utc};
-use giskard_core::approval::{ApprovalDecision, ApprovalRequest};
-use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ProjectId, ThreadId, TurnId};
-use giskard_core::model::ModelRef;
-use giskard_core::turn::{ApprovalPolicy, Mode};
+
+pub mod wire;
+pub use wire::{
+    WireAgentEvent, WireApprovalKind, WireApprovalRequest, WireFileDiff, WireItem, WireItemPayload,
+};
+
+// C1/§3.5: `giskard-proto` is the single wire vocabulary. Path-free `giskard-core` domain types
+// are re-exported here so `giskard-ui` depends only on this crate; path-bearing streamed types are
+// mirrored in `wire` above.
+pub use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalRequest};
+pub use giskard_core::diff::{DiffHunk, DiffLine};
+pub use giskard_core::error::HarnessError;
+pub use giskard_core::event::AgentEvent;
+pub use giskard_core::ids::{ApprovalId, ItemId};
+pub use giskard_core::item::{FileChangeKind, ItemDelta, ItemKind, ItemStart};
+pub use giskard_core::model::{Effort, ModelDescriptor, ModelRef};
+pub use giskard_core::token::{ByModel, DailyTokenLedger, TokenLedger, TokenUsage};
+pub use giskard_core::turn::{ApprovalPolicy, Mode, TurnStatus, TurnStatusKind};
 
 // ---- Client → Server ----
 
@@ -57,13 +71,13 @@ pub struct ThreadState {
     pub state: serde_json::Value,
 }
 
-/// In-flight turn reconstruction on reconnect (spec §13.6).
+/// In-flight turn reconstruction on reconnect (spec §13.6). Carries wire types (§3.5).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveTurnSnapshot {
     pub thread_id: ThreadId,
     pub turn_id: TurnId,
-    pub accumulated: Vec<AgentEvent>,
-    pub pending_approval: Option<ApprovalRequest>,
+    pub accumulated: Vec<WireAgentEvent>,
+    pub pending_approval: Option<WireApprovalRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,7 +85,7 @@ pub struct LiveTurnSnapshot {
 pub enum ServerMessage {
     Event {
         thread_id: ThreadId,
-        agent_event: AgentEvent,
+        agent_event: WireAgentEvent,
     },
     ThreadState(ThreadState),
     LiveTurnSnapshot(LiveTurnSnapshot),
@@ -81,7 +95,7 @@ pub enum ServerMessage {
     },
     ApprovalRequest {
         thread_id: ThreadId,
-        request: ApprovalRequest,
+        request: WireApprovalRequest,
     },
     Error {
         message: String,

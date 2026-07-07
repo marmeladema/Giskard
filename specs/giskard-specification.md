@@ -8,7 +8,7 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.2
+**Version:** 1.3
 
 **Changelog (1.0 → 1.1), from review:**
 - Resolved thread token schema vs §10.2: thread `tokens` now carries `total` + `by_model` (§5.3).
@@ -38,6 +38,47 @@
   JSONL test captures. Reordered §3.3 + App. A to put `codex-codes` first; updated App. D item 2
   from "open" to "resolved". Fallback (`codex-app-server-sdk` v0.5.1 or hand-rolled) only if a
   future CLI version diverges.
+
+**Changelog (1.2 → 1.3), from review (integration pass over v1.2):**
+- **B1:** Added the normative `Turn` type sketch (§4.5); `Thread.turns` persists `Vec<Turn>` (§5.3).
+- **B2:** Split the Giskard-owned item id from the harness-native id: `ItemId(Ulid)` + a separate
+  `harness_item_id: String` field on `Item`/`ItemStart` (§4.5). Applies the thread-id pattern to items,
+  so persistence, the diff viewer, and the code overlay no longer depend on Codex item-id stability
+  across resume.
+- **B3:** Documented that the single `TokenUsage { input, output, total }` struct is reused for both
+  per-turn usage and cumulative ledger/`by_model` sums — no parallel `TokenTotals` type (§4.5, §10.2).
+- **B4:** Required `CodexHarness` to maintain an explicit `harness_thread_id ↔ ThreadId` map,
+  populated at `open_thread` and used to translate inbound notifications, including the resume case
+  where the native id is re-established (§4.7).
+- **B5:** Renamed the `ItemStarted` **struct** to `ItemStart` to remove the collision with the
+  `AgentEvent::ItemStarted` **variant** (§4.4, §4.5).
+- **C1 (most important):** Resolved the core-vs-proto ownership contradiction at the WASM boundary.
+  `giskard-core` stays native/authoritative; `giskard-proto` owns the wire vocabulary and defines
+  `Wire*` mirror types for every payload that carries a `PathBuf` (paths become `String` via a
+  server-side lossy conversion); path-free domain types are re-exported through `giskard-proto`. The
+  server maps `core → wire` at the outbound boundary. `giskard-ui` depends only on `giskard-proto`
+  (§3.2, §3.5, §13.6).
+- **C2:** `ApprovalDecision` is path-free (its `AcceptWithExecPolicyAmendment { amendment: Vec<String> }`
+  round-trips as JSON), so it is re-exported through `giskard-proto` rather than mirrored — consistent
+  with the C1 decision (§3.5, §9.2).
+- **C3:** The per-model token breakdown is stored as a **nested object** (`by_model[provider][model]`),
+  not an interpolated `"provider/model"` string key, because provider/model ids can contain slashes
+  (e.g. `@cf/z-ai/glm-4.7`) and would be ambiguous to re-split (§5.3, §10.2).
+- **C4:** Thread `context_window` is a **cache**, not a source of truth: it is derived from the current
+  model's descriptor and recomputed from `current_model` on load, so a corrected config value is
+  honored (§5.3, §8.4, §10.3).
+- **C5:** Defined the resume-failure policy: if resume-by-id fails (Codex thread store purged/rotated),
+  start a fresh native thread, keep the Giskard-side history, and warn the user that agent context was
+  lost (§4.7, §7.1).
+- **S1:** Corrected the §4.6 mapping table — the `initialize`/`initialized` handshake happens once per
+  process (per project), not per thread; `thread/start` maps to `open_thread`.
+- **S2:** Removed `TurnStatusKind::Declined` (no producer; the pinned Codex `TurnStatus` is
+  `Completed | Interrupted | Failed | InProgress`) (§4.5).
+- **S3:** Renamed `HarnessError::Timed` → `HarnessError::Timeout` (§4.5).
+- **S4:** Aligned `Effort` to the pinned Codex `ModelReasoningEffort`
+  (`minimal | low | medium | high | xhigh`) instead of hardcoding three values (§4.5, §8.5).
+- **S5:** Documented that project ordering defaults to ULID creation order; the `projects.json`
+  `order` field is reserved for a future manual/drag reorder and is not yet surfaced by the UI (§5.3).
 
 ---
 
@@ -198,14 +239,23 @@ A single Cargo workspace with focused crates. Names are prefixed `giskard-`.
 | `giskard-persist` | Flat-file persistence: load/save projects, threads, token ledgers; atomic writes; a small maintenance/debug API (list/inspect/delete). |
 | `giskard-server` | Axum app: routes, auth/session, WebSocket hub, application services orchestrating harness + persistence, syntax highlighting, filesystem browser. |
 | `giskard-ui` | Dioxus frontend (compiled to WASM). Components, client-side state, WS client. |
-| `giskard-proto` | Shared client↔server message types (serde), used by both `giskard-server` and `giskard-ui` so the wire protocol is defined once. |
+| `giskard-proto` | Shared client↔server **wire vocabulary** (serde), used by both `giskard-server` and `giskard-ui` so the wire protocol is defined once. Owns `Wire*` mirror types for any payload that carries a `PathBuf` (§3.5) and re-exports the path-free `giskard-core` domain types. This is the **only** crate `giskard-ui` depends on. |
 
 > Dioxus "fullstack" can colocate server and client in one crate, but splitting `giskard-ui`
 > (client) from `giskard-server` (backend) with a shared `giskard-proto` crate keeps the
 > harness/persistence layers free of any WASM-target constraints and makes the backend
 > independently testable. The implementer may merge `giskard-ui` into a fullstack crate if
 > Dioxus tooling makes the split awkward, provided `giskard-proto`, `giskard-core`,
-> `giskard-harness*`, and `giskard-persist` remain separate, native-only crates.
+> `giskard-harness*`, and `giskard-persist` remain separate crates.
+>
+> **`giskard-core` is authoritative and native-facing** (it holds `PathBuf` and `serde_json::Value`
+> internally). The browser never consumes `giskard-core` directly; it consumes `giskard-proto`.
+> `giskard-proto` re-exports the pure, path-free `giskard-core` types (ids, `ModelRef`, `TokenUsage`,
+> `Mode`, `ApprovalPolicy`, `ApprovalDecision`, `Effort`, `TurnStatus`, `DiffHunk`/`DiffLine`,
+> `HarnessError`) — these are trivial serde structs that compile to `wasm32` cleanly — and defines
+> its own `Wire*` mirrors for the path-bearing streamed tree (§3.5). This keeps `giskard-core` clean
+> and its persisted/internal path representation lossless, while the wire representation is UTF-8
+> `String` and cross-platform-safe.
 
 ### 3.3 Runtime & key dependencies
 
@@ -261,6 +311,34 @@ A single Cargo workspace with focused crates. Names are prefixed `giskard-`.
 5. Server-initiated approval requests flow the same way in reverse: harness → `AgentEvent`
    (approval requested) → WS → UI prompt → user decision → WS → harness response (§9).
 6. On `turn/completed`, token usage is recorded in the ledger (§10) and persisted.
+
+### 3.5 Core-vs-proto ownership at the WASM boundary (decision — resolves C1/C2)
+
+The frontend (WASM) and the backend (native) both need to speak about `AgentEvent`s, `Item`s, diffs,
+and approval requests. Two of the core types are hostile to a naïve shared-crate approach:
+
+- `PathBuf` serializes losslessly on the native side but a non-UTF-8 path (legal on Linux) round-trips
+  **lossily** through JSON and back, so a shared `PathBuf` on the wire is a latent cross-platform bug.
+- `serde_json::Value` is fine in `wasm32` but is an untyped escape hatch.
+
+**Decision.** `giskard-proto` is the single wire vocabulary and the **only** crate `giskard-ui` links:
+
+1. **Path-free domain types stay in `giskard-core` and are re-exported by `giskard-proto`.** IDs,
+   `ModelRef`/`Effort`, `TokenUsage`, `Mode`, `ApprovalPolicy`, `ApprovalDecision`, `TurnStatus`,
+   `DiffHunk`/`DiffLine`, `FileChangeKind`, `HarnessError`. They contain no `PathBuf`, so there is no
+   lossiness and no reason to duplicate them.
+2. **Path-bearing streamed types are mirrored in `giskard-proto` as `Wire*` types with `String`
+   paths.** Concretely: `WireAgentEvent`, `WireItem`, `WireItemPayload`, `WireFileDiff`,
+   `WireApprovalRequest`, `WireApprovalKind`. `serde_json::Value` payloads (`ToolCall`) stay `Value`
+   (wasm-safe).
+3. **The server maps `core → wire` at the outbound edge** (the WS fan-out and the live-turn snapshot),
+   performing the lossy `PathBuf → String` conversion **once, server-side**, with
+   `Path::to_string_lossy()`. Inbound client messages are already path-free (`SendInput` is text;
+   `SavePlan` carries a `String` path validated server-side against the workspace root).
+
+**C2 corollary.** `ApprovalDecision` — including `AcceptWithExecPolicyAmendment { amendment: Vec<String> }`
+— is path-free and round-trips as JSON, so it is re-exported (case 1), not mirrored. It travels
+client→server in `ClientMessage::ApprovalDecision` and server→client inside `WireApprovalRequest`.
 
 
 ---
@@ -372,7 +450,7 @@ pub enum AgentEvent {
     ThreadOpened { thread: ThreadId, harness_thread_id: String },
     TurnStarted  { thread: ThreadId, turn: TurnId },
 
-    ItemStarted   { thread: ThreadId, turn: TurnId, item: ItemStarted },
+    ItemStarted   { thread: ThreadId, turn: TurnId, item: ItemStart },
     ItemDelta     { thread: ThreadId, turn: TurnId, item_id: ItemId, delta: ItemDelta },
     ItemCompleted { thread: ThreadId, turn: TurnId, item: Item },
 
@@ -388,9 +466,14 @@ pub enum AgentEvent {
 }
 ```
 
-`ItemStarted`/`Item` variants cover: user message, agent message (with streaming text
-deltas), reasoning note, command execution (with output deltas), file change, and MCP/tool
-calls. `ItemDelta` carries incremental text or command output.
+`ItemStart`/`Item` cover: user message, agent message (with streaming text deltas), reasoning
+note, command execution (with output deltas), file change, and MCP/tool calls. `ItemDelta` carries
+incremental text or command output, keyed by the Giskard-owned `ItemId` (the `CodexHarness`
+translates the harness-native item id to the owned `ItemId` via the map established at `ItemStarted`;
+§4.7).
+
+> **Note (B5):** the `ItemStarted` above is an `AgentEvent` **variant**; the payload struct it carries
+> is named `ItemStart` (§4.5), not `ItemStarted`, to avoid the name collision.
 
 ### 4.5 Supporting types (normative sketches)
 
@@ -404,8 +487,9 @@ fields but must not rename or drop the ones shown, so that persistence (§5), th
 pub struct ProjectId(pub Ulid);
 pub struct ThreadId(pub Ulid);
 pub struct TurnId(pub Ulid);
-pub struct ItemId(pub String);       // harness-native item id (opaque)
-pub struct ApprovalId(pub String);   // harness-native request id (opaque)
+pub struct ItemId(pub Ulid);         // Giskard-owned item id (B2); the harness-native id
+                                     // lives in `harness_item_id` on Item/ItemStart
+pub struct ApprovalId(pub String);   // harness-native request id (opaque; short-lived, not persisted)
 
 // ---- Handles / options ----
 pub struct ThreadHandle {
@@ -421,14 +505,33 @@ pub struct OpenThreadOptions {
 }
 
 pub struct TurnStatus {              // outcome of a completed turn
-    pub kind: TurnStatusKind,        // Completed | Interrupted | Failed | Declined
+    pub kind: TurnStatusKind,        // Completed | Interrupted | Failed
     pub message: Option<String>,
 }
-pub enum TurnStatusKind { Completed, Interrupted, Failed, Declined }
+// S2: no `Declined` — the pinned Codex `TurnStatus` is Completed | Interrupted | Failed | InProgress
+// (InProgress is not a terminal outcome and maps to no completed-turn kind). Re-add a variant here
+// only when a real producer exists (and wire it in §7/§9).
+pub enum TurnStatusKind { Completed, Interrupted, Failed }
+
+// ---- Turn (B1) ----
+/// One unit of agent work initiated by a single user input. Persisted inside the thread file
+/// (§5.3) as an element of `Thread.turns`, and the unit the diff viewer / token gauge read from.
+pub struct Turn {
+    pub id: TurnId,
+    pub user_input: UserInput,
+    pub items: Vec<Item>,             // completed items, in order
+    pub model: ModelRef,              // model used for this turn (may differ across turns, §8.4)
+    pub mode: Mode,                   // plan | build applied to this turn (§7.4)
+    pub status: TurnStatus,
+    pub usage: TokenUsage,            // per-turn usage (same struct reused in ledgers, B3)
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,   // None while the turn is still live
+}
 
 // ---- Items ----
-pub struct ItemStarted {
-    pub id: ItemId,
+pub struct ItemStart {                // B5: renamed from `ItemStarted` (collides with the event variant)
+    pub id: ItemId,                   // Giskard-owned (B2)
+    pub harness_item_id: String,      // native id, used to correlate deltas/completion
     pub kind: ItemKind,               // discriminant only; payload fills in on completion
 }
 
@@ -443,7 +546,9 @@ pub enum ItemKind {
 
 /// The finalized item persisted in thread history and sent on `ItemCompleted`.
 pub struct Item {
-    pub id: ItemId,
+    pub id: ItemId,                   // Giskard-owned (B2): stable across resume, addressable by
+                                      // the diff viewer and linked by the code overlay
+    pub harness_item_id: String,      // native id (opaque; not relied on for stability)
     pub payload: ItemPayload,
     pub created_at: DateTime<Utc>,
 }
@@ -510,7 +615,11 @@ pub struct ModelRef {
     pub model: String,
     pub reasoning_effort: Option<Effort>,
 }
-pub enum Effort { Medium, High, XHigh }
+// S4: mirrors the pinned Codex `ModelReasoningEffort` (verified against codex-codes 0.143.0:
+// minimal | low | medium | high | xhigh). Do not hardcode a smaller set; a future harness with a
+// different vocabulary should map onto (or extend) this enum at its boundary, and the effort
+// selector is only shown when the chosen model advertises `supports_reasoning_effort` (§8.5).
+pub enum Effort { Minimal, Low, Medium, High, XHigh }
 
 pub struct ModelDescriptor {
     pub provider: String,
@@ -520,6 +629,9 @@ pub struct ModelDescriptor {
     pub display_name: Option<String>,
 }
 
+// B3: this ONE struct is reused everywhere usage is expressed — the per-turn usage on `Turn`/
+// `TurnCompleted`, and the cumulative sums in the thread/project/global ledgers and their
+// `by_model` breakdowns (§10.2). Do not introduce a parallel `TokenTotals` type.
 pub struct TokenUsage { pub input: u64, pub output: u64, pub total: u64 }
 
 // ---- User input ----
@@ -538,7 +650,7 @@ pub enum HarnessError {
     Overloaded,               // JSON-RPC -32001 after retries exhausted
     Unsupported(String),      // capability not offered by this harness
     ThreadNotFound(ThreadId),
-    Timed(String),            // operation timed out
+    Timeout(String),          // operation timed out (S3: renamed from `Timed`)
 }
 ```
 
@@ -552,8 +664,8 @@ The `CodexHarness` maps the Codex app-server JSON-RPC protocol onto the above. K
 
 | Codex app-server | Giskard |
 |------------------|---------|
-| `initialize` + `initialized` handshake | done inside `open`/process spawn |
-| `thread/start`, `thread/resume` | `open_thread` |
+| `initialize` + `initialized` handshake | **once per process** (per project), during process spawn — not per thread (S1) |
+| `thread/start`, `thread/resume` | `open_thread` (S1: this is the per-thread call, distinct from the handshake) |
 | `turn/start` (with model/effort/sandbox per turn) | `start_turn` + `TurnOverrides` |
 | `item/started`, `item/*/delta`, `item/completed` | `ItemStarted` / `ItemDelta` / `ItemCompleted` |
 | `turn/diff/updated` | `DiffUpdated` |
@@ -581,6 +693,25 @@ Plan vs build maps to the Codex per-turn sandbox policy: **Plan → `read-only`*
 - **Crash handling:** if the child exits unexpectedly, the server marks the project's active
   threads as "disconnected", surfaces an `Error` event to the UI, and offers a "reconnect"
   action that respawns and resumes.
+- **Native-thread-id registry (B4).** `AgentEvent` is tagged by the Giskard `ThreadId` (a ULID),
+  but Codex notifications arrive tagged with the **native** `threadId` string. `CodexHarness` MUST
+  maintain an explicit `harness_thread_id → ThreadId` map:
+  - populated at `open_thread` (both fresh `thread/start` and `thread/resume`), and
+  - consulted when mapping every inbound notification/request to route it to the correct owned
+    `ThreadId` (falling back to the handle in scope when a message omits the id).
+
+  This matters especially on **resume**: the native id is re-established (possibly different from the
+  previous run), and the map re-binds it to the same durable `ThreadId` so history stays continuous.
+  The mapper similarly keeps `harness_item_id → ItemId` (B2) and `harness_turn_id → TurnId` maps,
+  established at `ItemStarted`/`TurnStarted`, so streamed deltas and completions resolve to the
+  owned ids rather than minting a fresh id per message.
+- **Resume-failure fallback (C5).** `thread/resume {threadId}` can fail even though Giskard has the
+  stored native id — Codex's own thread store may have been purged or rotated. On a resume-by-id
+  failure the harness MUST **not** hard-error the thread: it starts a **fresh** native thread
+  (`thread/start`), re-binds the new native id to the existing `ThreadId` in the B4 map, preserves
+  the Giskard-side display history (already on disk), and surfaces a non-fatal `Error`/warning event
+  so the UI can tell the user "agent context was lost — continuing with a new session; your history
+  is intact." This is Phase-1 behavior.
 - **Version check:** on spawn, record the Codex CLI version. If it differs from the version
   the protocol mapping was written/tested against, log a warning surfaced in the UI (the
   app-server protocol is versioned and can drift). The implementer should generate and vendor
@@ -625,6 +756,10 @@ giskard/
 - **IDs** are ULIDs (sortable, timestamp-prefixed) rendered as strings. Filenames use the ID.
 - **`projects.json`** is the small, frequently-read index. Individual project/thread files
   hold the bulk, so no single giant file must be parsed to render the project list.
+- **`order` field (S5):** project ordering defaults to **ULID creation order** (ULIDs already sort
+  by creation time). The `order` field is **reserved** for a future explicit/drag reorder and is not
+  yet surfaced by the UI; until then it is written as the creation index and the list is sorted by
+  id. Keep the field (cheap to persist now) rather than migrating the schema later.
 
 ### 5.3 Core persisted types (serde JSON)
 
@@ -666,21 +801,27 @@ All defined in `giskard-core`, serialized by `giskard-persist`. Illustrative sha
   "harness_thread_id": "th_abc123",     // native id used for resume
   "mode": "build",                       // "plan" | "build"
   "current_model": { "provider": "openai", "model": "gpt-5.5", "reasoning_effort": "high" },
-  "context_window": 262144,              // tokens; from active model descriptor
+  "context_window": 262144,              // CACHE ONLY (C4): derived from current_model's descriptor;
+                                         //   recomputed from current_model on load — not a source of
+                                         //   truth. May be omitted; a corrected config value wins.
   "tokens": {
     "total": { "input": 12000, "output": 3400, "total": 15400 },
-    "by_model": {                        // per-(provider/model) breakdown (§10.2)
-      "openai/gpt-5.5": { "input": 12000, "output": 3400, "total": 15400 }
+    "by_model": {                        // nested object (C3): provider → model → usage.
+      "openai": {                        //   NOT an interpolated "provider/model" string key, which
+        "gpt-5.5": { "input": 12000, "output": 3400, "total": 15400 }   // is ambiguous when the
+      }                                  //   model id contains slashes (e.g. "@cf/z-ai/glm-4.7").
     }
   },
   "created_at": "…", "updated_at": "…",
-  "turns": [ /* ordered Turn objects, each holding its completed Items */ ]
+  "turns": [ /* ordered `Turn` objects (§4.5, B1), each holding its completed `Item`s */ ]
 }
 ```
 
 > The thread `tokens` object carries both the aggregate (`total`) **and** the per-model
-> breakdown (`by_model`), matching §10.2. A thread accumulates a distinct `by_model` entry
-> whenever its model changes mid-thread (§8.4).
+> breakdown (`by_model`), matching §10.2. A thread accumulates a distinct `by_model[provider][model]`
+> entry whenever its model changes mid-thread (§8.4). `context_window` is a cache (C4): on load the
+> server resolves the current model's descriptor and recomputes it, so it never goes stale relative
+> to config.
 
 ```jsonc
 // projects/<id>/tokens.json  and  tokens-global.json
@@ -688,7 +829,7 @@ All defined in `giskard-core`, serialized by `giskard-persist`. Illustrative sha
   "version": 1,
   "total": { "input": 0, "output": 0, "total": 0 },
   "by_day":   { "2026-07-06": { "input": …, "output": …, "total": … } },
-  "by_model": { "openai/gpt-5.5": { "input": …, "output": …, "total": … } }
+  "by_model": { "openai": { "gpt-5.5": { "input": …, "output": …, "total": … } } }  // nested (C3)
 }
 ```
 Weekly/monthly aggregates are **derived on read** from `by_day` (no separate storage), so
@@ -810,7 +951,9 @@ Flow: user clicks "New project" → names it → picks a directory via the file 
   thread file is rewritten atomically.
 - **Resume (after restart):** on startup or first access, `open_thread` with the stored
   `harness_thread_id` (Codex `thread/resume`) rehydrates the native session; Giskard already
-  holds the display history from disk.
+  holds the display history from disk. If resume-by-id fails (Codex store purged/rotated), the
+  harness falls back to a fresh native thread and warns that agent context was lost, keeping the
+  Giskard history intact (C5, §4.7).
 - **Interrupt:** user can interrupt an in-flight turn (`turn/interrupt`).
 - **Rename / delete:** thread title editable; delete removes the thread file (§5.5).
 
@@ -934,14 +1077,18 @@ LiteLLM gateway fronting Cloudflare Workers AI.
 - Supported and expected. Selecting a different model updates the thread's `current_model`;
   it takes effect on the **next turn** (Codex accepts model per `turn/start`). This satisfies
   "change model during a thread".
-- When the model changes, the thread's `context_window` is updated from the new model's
-  descriptor and the context gauge (§10.3) recomputes.
+- When the model changes, the thread's cached `context_window` (C4) is updated from the new
+  model's descriptor and the context gauge (§10.3) recomputes. Because the value is a cache derived
+  from `current_model`, it is also recomputed on load, so a corrected config `context_window` takes
+  effect without a migration.
 
 ### 8.5 Reasoning effort
 
-- Effort (medium/high/xhigh) is selectable **only when the chosen model supports it**
-  (`supports_reasoning_effort`); otherwise the selector is hidden and no effort param is sent
-  (avoids sending unsupported parameters).
+- Effort (`minimal | low | medium | high | xhigh`, matching the pinned Codex `ModelReasoningEffort`,
+  S4) is selectable **only when the chosen model supports it** (`supports_reasoning_effort`);
+  otherwise the selector is hidden and no effort param is sent (avoids sending unsupported
+  parameters). The concrete set offered per model should ideally be driven by the harness/model
+  descriptor rather than a hardcoded list.
 
 ---
 
@@ -1028,6 +1175,10 @@ Recorded and viewable at:
 - **Thread** — running totals in `<thread_id>.json` (`tokens`), plus per-model breakdown.
 - **Project** — `projects/<id>/tokens.json`: `total`, `by_day`, `by_model`.
 - **Global** — `tokens-global.json`: `total`, `by_day`, `by_model`.
+
+Every `total` / `by_day[…]` / `by_model[provider][model]` value is the same `TokenUsage`
+struct (B3). `by_model` is a **nested** `provider → model → TokenUsage` object (C3), never a
+`"provider/model"` string key, so slash-bearing model ids stay unambiguous.
 
 **Time windows** for the global (and project) views: **day / week / month / total**. Weekly
 and monthly figures are derived on read by summing `by_day` buckets (single source of truth,
@@ -1238,10 +1389,17 @@ This guarantees a coherent experience when a future, less-capable harness is plu
 > `UserInput` in §4.5). If added later, extend both `UserInput` and this message together.
 
 **Server → client** (examples): `Event { thread_id, agent_event }` (a serialized
-`AgentEvent`), `ThreadState { thread_id, state }` (persisted snapshot on subscribe/resync),
+`WireAgentEvent` — the path-mirrored wire form of `AgentEvent`, §3.5),
+`ThreadState { thread_id, state }` (persisted snapshot on subscribe/resync),
 `LiveTurnSnapshot { thread_id, turn_id, accumulated, pending_approval? }` (in-flight turn
-reconstruction on reconnect, per the resync policy above), `TokenUpdate { scope, ledger }`,
-`ApprovalRequest { thread_id, request }`, `Error { … }`, `Pong`.
+reconstruction on reconnect, carrying `WireAgentEvent`s + a `WireApprovalRequest`),
+`TokenUpdate { scope, ledger }`, `ApprovalRequest { thread_id, request }` (a `WireApprovalRequest`),
+`Error { … }`, `Pong`.
+
+> **Wire types (C1/§3.5).** Everything the server emits that could carry a filesystem path
+> (`Event`, `ApprovalRequest`, the `LiveTurnSnapshot` contents) is mapped `core → Wire*` at the
+> fan-out boundary, so paths are UTF-8 `String`s on the wire. Client→server messages are path-free
+> (`SendInput` is text; `SavePlan.path` is a `String` re-validated server-side).
 
 - **Fan-out:** the server keeps `thread_id → set<client_conn>`. An `AgentEvent` is serialized
   once and sent only to subscribed clients. Background threads keep producing events; a client
@@ -1528,6 +1686,9 @@ default already stated in-line:
    if a future CLI version diverges.
 3. **Dioxus fullstack single-crate vs split `giskard-ui`/`giskard-server`** — keep split
    unless tooling friction dictates otherwise; non-WASM crates stay separate regardless (§3.2).
+   **Resolved (C1/C2):** `giskard-proto` is the sole crate `giskard-ui` links; it owns `Wire*`
+   mirrors for path-bearing streamed types and re-exports the path-free `giskard-core` types; the
+   server maps `core → wire` at the fan-out edge (§3.5).
 4. **Plan-content extraction rule** — spec defaults to "latest Plan-mode turn's agent
    messages" with a preview before saving (§7.4.1); confirm this matches intent in practice.
 5. **Headless-browser runner choice** — pick a Rust-drivable headless option for §14.3 that

@@ -243,7 +243,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use giskard_core::ids::{ItemId, ThreadId, TurnId};
-    use giskard_core::item::{Item, ItemDelta, ItemKind, ItemPayload, ItemStarted};
+    use giskard_core::item::{Item, ItemDelta, ItemKind, ItemPayload, ItemStart};
     use giskard_core::model::ModelRef;
     use giskard_core::token::TokenUsage;
     use giskard_core::turn::{Mode, TurnStatus, TurnStatusKind};
@@ -252,6 +252,7 @@ mod tests {
     fn make_simple_fixture() -> ReplayFixture {
         let thread = ThreadId::new();
         let turn = TurnId::new();
+        let item_id = ItemId::new();
         let now = Utc::now();
 
         ReplayFixture::from_events(vec![
@@ -263,15 +264,16 @@ mod tests {
             AgentEvent::ItemStarted {
                 thread,
                 turn,
-                item: ItemStarted {
-                    id: ItemId("it_1".into()),
+                item: ItemStart {
+                    id: item_id,
+                    harness_item_id: "it_1".into(),
                     kind: ItemKind::AgentMessage,
                 },
             },
             AgentEvent::ItemDelta {
                 thread,
                 turn,
-                item_id: ItemId("it_1".into()),
+                item_id,
                 delta: ItemDelta::Text {
                     text: "Hello!".into(),
                 },
@@ -280,7 +282,8 @@ mod tests {
                 thread,
                 turn,
                 item: Item {
-                    id: ItemId("it_1".into()),
+                    id: item_id,
+                    harness_item_id: "it_1".into(),
                     payload: ItemPayload::AgentMessage {
                         text: "Hello!".into(),
                     },

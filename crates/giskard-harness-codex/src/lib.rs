@@ -212,7 +212,7 @@ async fn background_task(
     senders: SenderMap,
     workspace_root: PathBuf,
 ) {
-    let mapper = CodexMapper::new(workspace_root);
+    let mut mapper = CodexMapper::new(workspace_root);
 
     loop {
         let cmd = match cmd_rx.recv().await {
@@ -222,7 +222,7 @@ async fn background_task(
 
         match cmd {
             HarnessCommand::OpenThread { opts, response } => {
-                let result = handle_open_thread(&mut client, &mapper, &opts, &senders).await;
+                let result = handle_open_thread(&mut client, &mut mapper, &opts, &senders).await;
                 let _ = response.send(result);
             }
             HarnessCommand::StartTurn {
@@ -235,7 +235,8 @@ async fn background_task(
                 let ok = result.is_ok();
                 let _ = response.send(result);
                 if ok {
-                    stream_turn_events(&mut client, &mapper, &thread, &senders, &mut cmd_rx).await;
+                    stream_turn_events(&mut client, &mut mapper, &thread, &senders, &mut cmd_rx)
+                        .await;
                 }
             }
             HarnessCommand::RespondApproval {
@@ -261,38 +262,33 @@ async fn background_task(
 
 async fn handle_open_thread(
     client: &mut codex_codes::AsyncClient,
-    _mapper: &CodexMapper,
+    mapper: &mut CodexMapper,
     opts: &OpenThreadOptions,
     senders: &SenderMap,
 ) -> Result<ThreadHandle, HarnessError> {
     let cwd = opts.workspace_root.to_string_lossy().to_string();
 
-    let (harness_thread_id, _) = if let Some(ref resume_id) = opts.resume {
-        let params: codex_codes::ThreadResumeParams = serde_json::from_value(serde_json::json!({
-            "threadId": resume_id,
-            "cwd": cwd,
-        }))
-        .map_err(|e| HarnessError::Protocol(e.to_string()))?;
-        let resp = client
-            .thread_resume(&params)
-            .await
-            .map_err(|e| HarnessError::Transport(e.to_string()))?;
-        (resp.thread.id, ())
+    // Track whether resume-by-id failed and we fell back to a fresh native thread (C5), so we can
+    // warn the caller that agent context was lost while keeping the Giskard-side history.
+    let mut resume_failed = false;
+
+    let harness_thread_id = if let Some(ref resume_id) = opts.resume {
+        match resume_thread(client, resume_id, &cwd).await {
+            Ok(id) => id,
+            Err(_) => {
+                // C5: Codex thread store purged/rotated. Start fresh instead of hard-failing.
+                resume_failed = true;
+                start_thread(client, &cwd, &opts.initial_model).await?
+            }
+        }
     } else {
-        let params: codex_codes::ThreadStartParams = serde_json::from_value(serde_json::json!({
-            "cwd": cwd,
-            "model": opts.initial_model.model,
-            "modelProvider": opts.initial_model.provider,
-        }))
-        .map_err(|e| HarnessError::Protocol(e.to_string()))?;
-        let resp = client
-            .thread_start(&params)
-            .await
-            .map_err(|e| HarnessError::Transport(e.to_string()))?;
-        (resp.thread.id, ())
+        start_thread(client, &cwd, &opts.initial_model).await?
     };
 
     let thread_id = ThreadId::new();
+    // B4: bind the (possibly re-established) native id to the durable ThreadId.
+    mapper.register_thread(harness_thread_id.clone(), thread_id);
+
     let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
     senders.lock().await.insert(thread_id, tx);
 
@@ -302,10 +298,58 @@ async fn handle_open_thread(
     })
     .await;
 
+    if resume_failed {
+        let _ = broadcast_event(senders, thread_id, || AgentEvent::Error {
+            thread: thread_id,
+            turn: None,
+            error: HarnessError::Transport(
+                "resume failed; started a fresh agent session — history is intact but agent \
+                 context was lost"
+                    .into(),
+            ),
+        })
+        .await;
+    }
+
     Ok(ThreadHandle {
         thread: thread_id,
         harness_thread_id,
     })
+}
+
+async fn resume_thread(
+    client: &mut codex_codes::AsyncClient,
+    resume_id: &str,
+    cwd: &str,
+) -> Result<String, HarnessError> {
+    let params: codex_codes::ThreadResumeParams = serde_json::from_value(serde_json::json!({
+        "threadId": resume_id,
+        "cwd": cwd,
+    }))
+    .map_err(|e| HarnessError::Protocol(e.to_string()))?;
+    let resp = client
+        .thread_resume(&params)
+        .await
+        .map_err(|e| HarnessError::Transport(e.to_string()))?;
+    Ok(resp.thread.id)
+}
+
+async fn start_thread(
+    client: &mut codex_codes::AsyncClient,
+    cwd: &str,
+    initial_model: &giskard_core::model::ModelRef,
+) -> Result<String, HarnessError> {
+    let params: codex_codes::ThreadStartParams = serde_json::from_value(serde_json::json!({
+        "cwd": cwd,
+        "model": initial_model.model,
+        "modelProvider": initial_model.provider,
+    }))
+    .map_err(|e| HarnessError::Protocol(e.to_string()))?;
+    let resp = client
+        .thread_start(&params)
+        .await
+        .map_err(|e| HarnessError::Transport(e.to_string()))?;
+    Ok(resp.thread.id)
 }
 
 async fn handle_start_turn(
@@ -339,7 +383,7 @@ async fn handle_start_turn(
 
 async fn stream_turn_events(
     client: &mut codex_codes::AsyncClient,
-    mapper: &CodexMapper,
+    mapper: &mut CodexMapper,
     thread: &ThreadHandle,
     senders: &SenderMap,
     cmd_rx: &mut mpsc::Receiver<HarnessCommand>,

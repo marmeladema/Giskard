@@ -4,12 +4,12 @@ use futures_util::{SinkExt, StreamExt};
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ItemId, ThreadId, TurnId};
-use giskard_core::item::{Item, ItemDelta, ItemKind, ItemPayload, ItemStarted};
+use giskard_core::item::{Item, ItemDelta, ItemKind, ItemPayload, ItemStart};
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnStatus, TurnStatusKind};
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 use giskard_persist::store::ProjectConfig;
-use giskard_proto::{ClientMessage, ServerMessage};
+use giskard_proto::{ClientMessage, ServerMessage, WireAgentEvent};
 use giskard_server::{AppState, HarnessFactory, build_app};
 
 struct TestFactory {
@@ -28,6 +28,7 @@ impl HarnessFactory for TestFactory {
 fn make_fixture() -> ReplayFixture {
     let thread = ThreadId::new();
     let turn = TurnId::new();
+    let it_1 = ItemId::new();
     let now = chrono::Utc::now();
 
     ReplayFixture::from_events(vec![
@@ -39,15 +40,16 @@ fn make_fixture() -> ReplayFixture {
         AgentEvent::ItemStarted {
             thread,
             turn,
-            item: ItemStarted {
-                id: ItemId("it_1".into()),
+            item: ItemStart {
+                id: it_1,
+                harness_item_id: "it_1".into(),
                 kind: ItemKind::AgentMessage,
             },
         },
         AgentEvent::ItemDelta {
             thread,
             turn,
-            item_id: ItemId("it_1".into()),
+            item_id: it_1,
             delta: ItemDelta::Text {
                 text: "Hello from replay!".into(),
             },
@@ -56,7 +58,8 @@ fn make_fixture() -> ReplayFixture {
             thread,
             turn,
             item: Item {
-                id: ItemId("it_1".into()),
+                id: it_1,
+                harness_item_id: "it_1".into(),
                 payload: ItemPayload::AgentMessage {
                     text: "Hello from replay!".into(),
                 },
@@ -267,7 +270,7 @@ async fn login_project_thread_message() {
                 if let tokio_tungstenite::tungstenite::Message::Text(t) = msg {
                     let server_msg: ServerMessage = serde_json::from_str(&t).unwrap();
                     if let ServerMessage::Event { agent_event, .. } = server_msg {
-                        let is_done = matches!(agent_event, AgentEvent::TurnCompleted { .. });
+                        let is_done = matches!(agent_event, WireAgentEvent::TurnCompleted { .. });
                         events.push(agent_event);
                         if is_done {
                             break;
@@ -283,13 +286,13 @@ async fn login_project_thread_message() {
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, AgentEvent::TurnCompleted { .. })),
+            .any(|e| matches!(e, WireAgentEvent::TurnCompleted { .. })),
         "should receive TurnCompleted"
     );
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, AgentEvent::ItemDelta { .. })),
+            .any(|e| matches!(e, WireAgentEvent::ItemDelta { .. })),
         "should receive ItemDelta"
     );
 }

@@ -24,7 +24,7 @@ pub enum HarnessError {
     #[error("thread not found: {0}")]
     ThreadNotFound(ThreadId),
     #[error("operation timed out: {0}")]
-    Timed(String),
+    Timeout(String),
 }
 
 /// Errors from the persistence layer (spec §5).
