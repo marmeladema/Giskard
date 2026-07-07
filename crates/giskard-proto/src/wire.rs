@@ -20,8 +20,10 @@ use giskard_core::ids::{ApprovalId, ItemId, ThreadId, TurnId};
 use giskard_core::item::{
     FileChangeEntry, FileChangeKind, Item, ItemDelta, ItemPayload, ItemStart,
 };
+use giskard_core::model::ModelRef;
 use giskard_core::token::TokenUsage;
-use giskard_core::turn::TurnStatus;
+use giskard_core::turn::{Mode, Turn, TurnStatus};
+use giskard_core::user_input::UserInput;
 
 fn path_to_wire(p: &std::path::Path) -> String {
     p.to_string_lossy().into_owned()
@@ -399,6 +401,40 @@ impl From<ApprovalKind> for WireApprovalKind {
                 change,
             },
             ApprovalKind::Permission { detail } => Self::Permission { detail },
+        }
+    }
+}
+
+/// Wire-mirror of [`Turn`] (§4.5), used by paged history (`HistoryPage`, H6). Items and diffs use
+/// their path-mirrored wire forms (C1/§3.5).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireTurn {
+    pub id: TurnId,
+    pub user_input: UserInput,
+    pub items: Vec<WireItem>,
+    pub model: ModelRef,
+    pub mode: Mode,
+    pub status: TurnStatus,
+    pub usage: TokenUsage,
+    pub diffs: Vec<WireFileDiff>,
+    pub started_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+impl From<Turn> for WireTurn {
+    fn from(t: Turn) -> Self {
+        Self {
+            id: t.id,
+            user_input: t.user_input,
+            items: t.items.into_iter().map(Into::into).collect(),
+            model: t.model,
+            mode: t.mode,
+            status: t.status,
+            usage: t.usage,
+            diffs: t.diffs.into_iter().map(Into::into).collect(),
+            started_at: t.started_at,
+            completed_at: t.completed_at,
         }
     }
 }

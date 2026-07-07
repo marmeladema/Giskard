@@ -535,21 +535,26 @@ async fn websocket_serializes_harness_error_events() {
         )
         .await;
 
-    let msg = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let server_msg: ServerMessage = serde_json::from_str(msg.to_text().unwrap()).unwrap();
-    match server_msg {
-        ServerMessage::Event { agent_event, .. } => match agent_event {
-            WireAgentEvent::Error { error, .. } => {
-                assert_eq!(error.code, "harness_protocol_error");
-                assert_eq!(error.message, "protocol error: bad frame");
-            }
-            other => panic!("expected error event, got {other:?}"),
-        },
-        other => panic!("expected event, got {other:?}"),
+    // Skip the snapshot messages sent on subscribe (HistoryPage / LiveTurnSnapshot) and wait for
+    // the broadcast Error event.
+    loop {
+        let msg = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        match serde_json::from_str::<ServerMessage>(msg.to_text().unwrap()).unwrap() {
+            ServerMessage::Event { agent_event, .. } => match agent_event {
+                WireAgentEvent::Error { error, .. } => {
+                    assert_eq!(error.code, "harness_protocol_error");
+                    assert_eq!(error.message, "protocol error: bad frame");
+                    break;
+                }
+                other => panic!("expected error event, got {other:?}"),
+            },
+            ServerMessage::HistoryPage { .. } | ServerMessage::LiveTurnSnapshot(_) => continue,
+            other => panic!("expected event, got {other:?}"),
+        }
     }
 }
 
@@ -627,7 +632,6 @@ async fn subscribe_reopens_persisted_thread() {
                 tokens: Default::default(),
                 created_at: now,
                 updated_at: now,
-                turns: vec![],
             },
         )
         .await
@@ -753,7 +757,6 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
                 tokens: Default::default(),
                 created_at: now,
                 updated_at: now,
-                turns: vec![],
             },
         )
         .await
@@ -904,38 +907,47 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
                 tokens: Default::default(),
                 created_at: now,
                 updated_at: now,
-                turns: vec![giskard_core::turn::Turn {
-                    id: old_turn,
-                    user_input: giskard_core::user_input::UserInput::text("old input"),
-                    items: vec![
-                        Item {
-                            id: ItemId::new(),
-                            harness_item_id: "old_user".into(),
-                            payload: ItemPayload::UserMessage {
-                                text: "old input".into(),
-                            },
-                            created_at: now,
+            },
+        )
+        .await
+        .unwrap();
+    // The persisted turn lives in the authoritative JSONL history (H1), not the metadata file.
+    state
+        .store
+        .append_turn(
+            pid,
+            tid,
+            &giskard_core::turn::Turn {
+                id: old_turn,
+                user_input: giskard_core::user_input::UserInput::text("old input"),
+                items: vec![
+                    Item {
+                        id: ItemId::new(),
+                        harness_item_id: "old_user".into(),
+                        payload: ItemPayload::UserMessage {
+                            text: "old input".into(),
                         },
-                        Item {
-                            id: ItemId::new(),
-                            harness_item_id: "old_agent".into(),
-                            payload: ItemPayload::AgentMessage {
-                                text: "old answer".into(),
-                            },
-                            created_at: now,
-                        },
-                    ],
-                    model: model.clone(),
-                    mode: Mode::Build,
-                    status: TurnStatus {
-                        kind: TurnStatusKind::Completed,
-                        message: None,
+                        created_at: now,
                     },
-                    usage: TokenUsage::new(10, 10),
-                    diffs: vec![],
-                    started_at: now,
-                    completed_at: Some(now),
-                }],
+                    Item {
+                        id: ItemId::new(),
+                        harness_item_id: "old_agent".into(),
+                        payload: ItemPayload::AgentMessage {
+                            text: "old answer".into(),
+                        },
+                        created_at: now,
+                    },
+                ],
+                model: model.clone(),
+                mode: Mode::Build,
+                status: TurnStatus {
+                    kind: TurnStatusKind::Completed,
+                    message: None,
+                },
+                usage: TokenUsage::new(10, 10),
+                diffs: vec![],
+                started_at: now,
+                completed_at: Some(now),
             },
         )
         .await
@@ -1023,12 +1035,11 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
     );
     assert!(seen_new, "new turn should still be streamed");
 
-    let saved = state.store.load_thread(pid, tid).await.unwrap().unwrap();
-    assert_eq!(saved.turns.len(), 2);
-    assert_eq!(saved.turns[0].id, old_turn);
-    assert_eq!(saved.turns[1].id, new_turn);
+    let saved = state.store.load_all_turns(pid, tid).await.unwrap();
+    assert_eq!(saved.len(), 2);
+    assert_eq!(saved[0].id, old_turn);
+    assert_eq!(saved[1].id, new_turn);
     let old_item_count = saved
-        .turns
         .iter()
         .flat_map(|turn| &turn.items)
         .filter(|item| item.harness_item_id.starts_with("old_"))
@@ -1127,7 +1138,6 @@ wire_api = "responses"
                 tokens: Default::default(),
                 created_at: now,
                 updated_at: now,
-                turns: vec![],
             },
         )
         .await

@@ -10,7 +10,7 @@ use giskard_core::ids::{ProjectId, ThreadId, TurnId};
 pub mod wire;
 pub use wire::{
     WireAgentEvent, WireApprovalKind, WireApprovalRequest, WireFileDiff, WireHarnessError,
-    WireItem, WireItemPayload,
+    WireItem, WireItemPayload, WireTurn,
 };
 
 // C1/§3.5: `giskard-proto` is the single wire vocabulary. Path-free `giskard-core` domain types
@@ -65,6 +65,15 @@ pub enum ClientMessage {
         thread_id: ThreadId,
         path: String,
     },
+    /// Request an older page of history (H6): the `limit` turns before `before` (a `TurnId`
+    /// cursor); `before: None` requests the most recent page.
+    LoadHistory {
+        thread_id: ThreadId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<TurnId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
     Ping,
 }
 
@@ -115,6 +124,12 @@ pub enum ServerMessage {
         agent_event: WireAgentEvent,
     },
     ThreadState(ThreadState),
+    /// A page of persisted history (H6), oldest-first; `has_more` if older turns exist before it.
+    HistoryPage {
+        thread_id: ThreadId,
+        turns: Vec<WireTurn>,
+        has_more: bool,
+    },
     LiveTurnSnapshot(LiveTurnSnapshot),
     TokenUpdate {
         scope: TokenScope,

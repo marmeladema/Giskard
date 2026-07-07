@@ -12,6 +12,7 @@ pub struct Config {
     pub plan: PlanConfig,
     pub tokens: TokensConfig,
     pub viz: VizConfig,
+    pub history: HistoryConfig,
     pub providers: Vec<ProviderConfig>,
     pub harness: HarnessConfig,
 }
@@ -88,6 +89,25 @@ pub struct TokensConfig {
 pub struct ModelRate {
     pub input_per_mtok_eur: f64,
     pub output_per_mtok_eur: f64,
+}
+
+/// History paging configuration (spec §13.6, H4/H6).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HistoryConfig {
+    /// Turns loaded when a thread is first opened.
+    pub initial: usize,
+    /// Turns loaded per "scroll up" page.
+    pub page: usize,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            initial: 50,
+            page: 50,
+        }
+    }
 }
 
 /// Visualization configuration (spec §11.3).

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use giskard_core::ids::{ProjectId, ThreadId};
+use giskard_core::ids::{ProjectId, ThreadId, TurnId};
 use giskard_core::model::{Effort, ModelRef};
 use giskard_core::token::{DailyTokenLedger, TokenLedger};
 use giskard_core::turn::{ApprovalPolicy, Mode, Turn};
@@ -75,12 +75,11 @@ pub struct ThreadFile {
     /// back to a reasoning model restores the user's last effort choice.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub model_efforts: HashMap<String, Effort>,
+    /// Token aggregates (total + nested by_model). A **recomputable cache** (H3): the authoritative
+    /// history is the `.jsonl`, so these can be rebuilt by folding it (`recompute_aggregates`).
     pub tokens: TokenLedger,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    /// Ordered `Turn` objects, each holding its completed items (B1).
-    #[serde(default)]
-    pub turns: Vec<Turn>,
 }
 
 // ---- Store ----
@@ -153,6 +152,10 @@ impl PersistStore {
 
     fn thread_json_path(&self, project: ProjectId, thread: ThreadId) -> PathBuf {
         self.threads_dir(project).join(format!("{}.json", thread))
+    }
+
+    fn thread_jsonl_path(&self, project: ProjectId, thread: ThreadId) -> PathBuf {
+        self.threads_dir(project).join(format!("{}.jsonl", thread))
     }
 
     fn tokens_json_path(&self, project: ProjectId) -> PathBuf {
@@ -300,6 +303,131 @@ impl PersistStore {
         Ok(Some(tf))
     }
 
+    // ---- Authoritative turn history (`<thread_id>.jsonl`, one Turn per line, spec §5.4 H1) ----
+
+    /// Append a completed `Turn` as one line to the thread's authoritative JSONL history (H1/H2).
+    ///
+    /// The pre-serialized `JSON + "\n"` is written with a **single** `write_all` to a file opened
+    /// `O_APPEND`, so on a local POSIX filesystem the offset-seek + write is atomic against
+    /// concurrent writers and a process kill leaves the line all-or-nothing (no app lock needed for
+    /// append ordering). This does not survive power loss (page cache) — the tolerant loader
+    /// (`load_all_turns`) handles a torn final line. On NFS/network storage the atomicity guarantee
+    /// does not hold (out of scope, §1.2 local-first).
+    pub async fn append_turn(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+        turn: &Turn,
+    ) -> Result<(), PersistError> {
+        let path = self.thread_jsonl_path(project, thread);
+        let mut line =
+            serde_json::to_string(turn).map_err(|e| PersistError::Serialize(e.to_string()))?;
+        line.push('\n');
+
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| PersistError::Io(e.to_string()))?;
+        }
+
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+            file.write_all(line.as_bytes())
+        })
+        .await
+        .map_err(|e| PersistError::Io(e.to_string()))?
+        .map_err(|e| PersistError::Io(e.to_string()))
+    }
+
+    /// Load every persisted turn from the JSONL history, in order (H4).
+    ///
+    /// Tolerates a single unparseable **final** line (a torn append after power loss): it is
+    /// skipped with a warning. A bad **interior** line is real corruption and returns `Corrupt`.
+    pub async fn load_all_turns(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+    ) -> Result<Vec<Turn>, PersistError> {
+        let path = self.thread_jsonl_path(project, thread);
+        let data = match tokio::fs::read_to_string(&path).await {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) => return Err(PersistError::Io(e.to_string())),
+        };
+
+        let lines: Vec<&str> = data.lines().filter(|l| !l.trim().is_empty()).collect();
+        let mut turns = Vec::with_capacity(lines.len());
+        let last = lines.len().saturating_sub(1);
+        for (i, line) in lines.iter().enumerate() {
+            match serde_json::from_str::<Turn>(line) {
+                Ok(turn) => turns.push(turn),
+                Err(e) if i == last => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "skipping torn final turn line in history"
+                    );
+                }
+                Err(e) => {
+                    return Err(PersistError::Corrupt(format!(
+                        "{}: line {}: {}",
+                        path.display(),
+                        i + 1,
+                        e
+                    )));
+                }
+            }
+        }
+        Ok(turns)
+    }
+
+    /// Load a page of history for display (H4): the last `limit` turns ending just before the
+    /// `before` cursor (a `TurnId`), or the tail when `before` is `None`. Returns the page (oldest
+    /// first) and `has_more` (whether older turns exist before the page).
+    pub async fn load_history(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+        before: Option<TurnId>,
+        limit: usize,
+    ) -> Result<(Vec<Turn>, bool), PersistError> {
+        let all = self.load_all_turns(project, thread).await?;
+        let end = match before {
+            Some(cursor) => all.iter().position(|t| t.id == cursor).unwrap_or(all.len()),
+            None => all.len(),
+        };
+        let start = end.saturating_sub(limit);
+        Ok((all[start..end].to_vec(), start > 0))
+    }
+
+    /// Rebuild the metadata token aggregates from the authoritative JSONL history (H3), for repair
+    /// when a crash landed between the history append and the metadata update.
+    pub async fn recompute_aggregates(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+    ) -> Result<Option<ThreadFile>, PersistError> {
+        let turns = self.load_all_turns(project, thread).await?;
+        self.update_thread(project, thread, move |tf| {
+            let mut ledger = TokenLedger::default();
+            for t in &turns {
+                if matches!(
+                    t.status.kind,
+                    giskard_core::turn::TurnStatusKind::Completed
+                        | giskard_core::turn::TurnStatusKind::Interrupted
+                ) {
+                    ledger.record(&t.model.provider, &t.model.model, &t.usage);
+                }
+            }
+            tf.tokens = ledger;
+        })
+        .await
+    }
+
     /// List all thread files for a project (by reading the directory).
     pub async fn list_threads(&self, project: ProjectId) -> Result<Vec<ThreadId>, PersistError> {
         let dir = self.threads_dir(project);
@@ -331,12 +459,18 @@ impl PersistStore {
         project: ProjectId,
         thread: ThreadId,
     ) -> Result<(), PersistError> {
-        let path = self.thread_json_path(project, thread);
-        match tokio::fs::remove_file(&path).await {
-            Ok(_) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(PersistError::Io(e.to_string())),
+        // Remove both the metadata and the authoritative history (H1).
+        for path in [
+            self.thread_json_path(project, thread),
+            self.thread_jsonl_path(project, thread),
+        ] {
+            match tokio::fs::remove_file(&path).await {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(PersistError::Io(e.to_string())),
+            }
         }
+        Ok(())
     }
 
     // ---- Token ledgers ----
@@ -392,11 +526,15 @@ impl PersistStore {
                 errors.push((self.project_json_path(entry.id), e.to_string()));
             }
 
-            // Thread files.
+            // Thread metadata + authoritative history (H7: report the first bad JSONL line per
+            // thread rather than quarantining whole histories).
             if let Ok(thread_ids) = self.list_threads(entry.id).await {
                 for tid in thread_ids {
                     if let Err(e) = self.load_thread(entry.id, tid).await {
                         errors.push((self.thread_json_path(entry.id, tid), e.to_string()));
+                    }
+                    if let Err(e) = self.load_all_turns(entry.id, tid).await {
+                        errors.push((self.thread_jsonl_path(entry.id, tid), e.to_string()));
                     }
                 }
             }
@@ -497,7 +635,6 @@ mod tests {
             tokens: TokenLedger::default(),
             created_at: now,
             updated_at: now,
-            turns: vec![],
         };
         store.save_thread(pid, &thread).await.unwrap();
 
@@ -534,7 +671,6 @@ mod tests {
                 tokens: TokenLedger::default(),
                 created_at: now,
                 updated_at: now,
-                turns: vec![],
             };
             store.save_thread(pid, &thread).await.unwrap();
         }
@@ -624,6 +760,97 @@ mod tests {
         assert!(index.projects.is_empty());
     }
 
+    fn make_turn(usage: giskard_core::token::TokenUsage) -> Turn {
+        Turn {
+            id: TurnId::new(),
+            user_input: giskard_core::user_input::UserInput::text("hi"),
+            items: vec![],
+            model: test_model(),
+            mode: Mode::Build,
+            status: giskard_core::turn::TurnStatus {
+                kind: giskard_core::turn::TurnStatusKind::Completed,
+                message: None,
+            },
+            usage,
+            diffs: vec![],
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+        }
+    }
+
+    #[tokio::test]
+    async fn jsonl_history_append_load_page_and_recompute() {
+        use giskard_core::token::TokenUsage;
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+
+        // Three appended turns become three JSONL lines.
+        let mut ids = vec![];
+        for i in 0..3 {
+            let t = make_turn(TokenUsage::new(100 * (i + 1), 10));
+            ids.push(t.id);
+            store.append_turn(pid, tid, &t).await.unwrap();
+        }
+        let all = store.load_all_turns(pid, tid).await.unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all.iter().map(|t| t.id).collect::<Vec<_>>(), ids);
+
+        // Tail page + cursor pagination.
+        let (tail, more) = store.load_history(pid, tid, None, 2).await.unwrap();
+        assert_eq!(tail.len(), 2);
+        assert!(more, "an older turn remains before the tail");
+        let (older, more2) = store
+            .load_history(pid, tid, Some(tail[0].id), 2)
+            .await
+            .unwrap();
+        assert_eq!(older.len(), 1);
+        assert!(!more2);
+
+        // A torn final line is tolerated, not fatal.
+        let path = store.thread_jsonl_path(pid, tid);
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .await
+            .unwrap();
+        tokio::fs::write(&path, {
+            let mut s = tokio::fs::read_to_string(&path).await.unwrap();
+            s.push_str("{ this is a torn half-written line");
+            s
+        })
+        .await
+        .unwrap();
+        assert_eq!(store.load_all_turns(pid, tid).await.unwrap().len(), 3);
+
+        // recompute_aggregates rebuilds the metadata token totals from the JSONL.
+        store
+            .save_thread(
+                pid,
+                &ThreadFile {
+                    version: SCHEMA_VERSION,
+                    id: tid,
+                    project_id: pid,
+                    title: "t".into(),
+                    harness_thread_id: "th".into(),
+                    mode: Mode::Build,
+                    current_model: test_model(),
+                    context_window: 0,
+                    approval_policy: None,
+                    model_efforts: HashMap::new(),
+                    tokens: TokenLedger::default(),
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        let tf = store.recompute_aggregates(pid, tid).await.unwrap().unwrap();
+        // 100+200+300 input, 30 output.
+        assert_eq!(tf.tokens.total.input, 600);
+        assert_eq!(tf.tokens.total.output, 30);
+    }
+
     #[tokio::test]
     async fn update_thread_serializes_concurrent_writes() {
         let (_tmp, store) = make_store();
@@ -652,7 +879,6 @@ mod tests {
                     tokens: TokenLedger::default(),
                     created_at: now,
                     updated_at: now,
-                    turns: vec![],
                 },
             )
             .await

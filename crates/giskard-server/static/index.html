@@ -211,6 +211,8 @@ async function openThread(pid, tid, title) {
   }
 
   state.projectId = pid; state.threadId = tid; state.pendingUserEl = null; state.pendingUserText = null;
+  state.historyLoaded = false; state.oldestTurnId = null; state.hasMoreHistory = false;
+  state.loadingHistory = false; state.pendingOlder = false;
   resetRenderState();
   document.querySelectorAll(".thread").forEach(e => e.classList.toggle("active", e.dataset.tid===tid));
   $("thrHeader").style.display="flex"; $("composer").style.display="flex";
@@ -305,6 +307,7 @@ function failPendingUserMessage(text) {
 function handleServer(msg) {
   switch (msg.type) {
     case "thread_state": renderThreadState(msg.state); break;
+    case "history_page": renderHistoryPage(msg); break;
     case "live_turn_snapshot": renderLiveTurnSnapshot(msg); break;
     case "event": handleEvent(msg.agent_event); break;
     case "token_update": renderTokens(msg.ledger); break;
@@ -329,11 +332,47 @@ function renderThreadState(s) {
     `<div class="kv mono"><b>model</b> ${s.current_model? s.current_model.provider+"/"+s.current_model.model : "—"}</div>`;
   if (s.tokens) renderTokens(s.tokens);
   updateGauge(s.tokens ? s.tokens.total.total : 0, s.context_window || 0);
-  // Replay persisted history.
+  // History now arrives separately via `history_page` (H6); clear the transcript ready for it.
   $("transcript").innerHTML="";
   resetRenderState();
-  for (const turn of (s.turns||[])) {
-    for (const it of (turn.items||[])) addItem(it);
+}
+
+// Render the most recent page of persisted history (H6), oldest-first. Older pages are available
+// via LoadHistory { before: oldestTurnId } when has_more is set (wired to the "Load older" button).
+function renderHistoryPage(msg) {
+  const older = state.pendingOlder;       // was this page requested by a scroll-up LoadHistory?
+  state.pendingOlder = false;
+  state.loadingHistory = false;
+  state.hasMoreHistory = !!msg.has_more;
+  const turns = msg.turns || [];
+  if (turns.length) state.oldestTurnId = turns[0].id;   // turns are oldest-first
+
+  if (older) {
+    // Render into a detached container, then prepend to the top and preserve the scroll position
+    // so the viewport doesn't jump while older content is inserted (infinite scroll).
+    const container = document.createElement("div");
+    const prev = state.renderTarget;
+    state.renderTarget = container;
+    for (const turn of turns) for (const it of (turn.items||[])) addItem(it);
+    state.renderTarget = prev;
+
+    const t = $("transcript");
+    const heightBefore = t.scrollHeight;
+    const anchor = t.firstChild;
+    while (container.firstChild) t.insertBefore(container.firstChild, anchor);
+    t.scrollTop += t.scrollHeight - heightBefore;
+  } else {
+    for (const turn of turns) for (const it of (turn.items||[])) addItem(it);
+  }
+}
+
+// Load older history when the user scrolls near the top (H4/H6 infinite scroll).
+function onTranscriptScroll() {
+  const t = $("transcript");
+  if (t.scrollTop < 80 && state.hasMoreHistory && !state.loadingHistory && state.oldestTurnId && state.threadId) {
+    state.loadingHistory = true;
+    state.pendingOlder = true;
+    send({ type:"load_history", thread_id: state.threadId, before: state.oldestTurnId });
   }
 }
 
@@ -371,12 +410,17 @@ function renderLiveTurnSnapshot(snap) {
   if (snap.pending_approval) notice("Approval requested: "+JSON.stringify(snap.pending_approval.kind));
 }
 
+// Where new bubbles are appended: the live transcript, or a detached container when rendering an
+// older history page for prepending (infinite scroll).
+function renderTarget() { return state.renderTarget || $("transcript"); }
 function bubble(cls, role) {
   const el = document.createElement("div"); el.className="msg "+cls;
   const r = document.createElement("div"); r.className="role"; r.textContent=role;
   const body = document.createElement("div"); body.className="body";
-  el.append(r, body); $("transcript").append(el);
-  $("transcript").scrollTop = $("transcript").scrollHeight;
+  el.append(r, body);
+  const t = renderTarget();
+  t.append(el);
+  if (!state.renderTarget) t.scrollTop = t.scrollHeight;
   return body;
 }
 function appendStream(text, itemId, deltaType) {
@@ -606,6 +650,9 @@ function notice(text, severity) {
   $("notices").prepend(el); setTimeout(()=>el.remove(), 8000);
 }
 function escapeHtml(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+
+/* Infinite scroll: load older history when the transcript is scrolled near the top. */
+$("transcript").addEventListener("scroll", onTranscriptScroll);
 
 /* Try to enter the app directly if already authenticated. */
 (async () => { try { await api("GET","/api/projects"); startApp(); } catch {} })();
