@@ -236,6 +236,7 @@
         <span class="badge mono" id="thrTitle">—</span>
         <button id="modeBtn" class="badge" title="Toggle Plan/Build">build</button>
         <select id="modelSel" class="mono"></select>
+        <button id="refreshModels" class="badge" title="Refresh model list from provider /v1/models">↻</button>
         <span class="gauge muted mono" id="gauge">0 / 0</span>
       </header>
       <div id="transcript" class="muted" style="padding:24px">Select or create a thread to begin.</div>
@@ -338,7 +339,31 @@ async function startApp() {
   try { state.models = (await api("GET","/api/models")).models || []; } catch { state.models=[]; }
   renderModelSelect();
   await loadProjects();
+  refreshModels();   // background: merge in any provider /v1/models discovery (§8.3)
 }
+
+// Re-pull the model list, merging each `model_listing` provider's /v1/models over the static list,
+// then re-render the pickers. Best-effort; on failure the current list stays.
+let _refreshingModels = false;
+async function refreshModels() {
+  if (_refreshingModels) return;
+  _refreshingModels = true;
+  const btn = $("refreshModels"); if (btn) btn.disabled = true;
+  try {
+    const res = await api("POST","/api/models/refresh");
+    if (res && Array.isArray(res.models)) {
+      state.models = res.models;
+      renderModelSelect();
+      populateModalModels();
+    }
+  } catch (e) {
+    notice("Could not refresh models: "+e.message, "warning");
+  } finally {
+    _refreshingModels = false;
+    if (btn) btn.disabled = false;
+  }
+}
+$("refreshModels").onclick = refreshModels;
 
 /* ---------- projects & threads ---------- */
 async function loadProjects() {
@@ -391,11 +416,10 @@ async function loadThreads(pid) {
 /* ---------- new-project modal + directory picker ---------- */
 $("newProj").onclick = () => openProjectModal();
 
-function openProjectModal() {
-  closeDrawers();
-  $("pmErr").textContent = "";
-  // Populate the model picker from the loaded models.
-  const sel = $("pmModel"); sel.innerHTML = "";
+function populateModalModels() {
+  const sel = $("pmModel"); if (!sel) return;
+  const prev = sel.value;
+  sel.innerHTML = "";
   for (const m of state.models) {
     const o = document.createElement("option");
     o.value = `${m.provider}/${m.model}`; o.textContent = m.display_name || m.model;
@@ -403,9 +427,16 @@ function openProjectModal() {
     sel.append(o);
   }
   if (!state.models.length) { const o=document.createElement("option"); o.textContent="(no models configured)"; sel.append(o); }
+  if (prev) sel.value = prev;
+}
+function openProjectModal() {
+  closeDrawers();
+  $("pmErr").textContent = "";
+  populateModalModels();
   $("projectModal").classList.add("open");
   // Start browsing where we last were, falling back to the filesystem root.
   browsePicker(localStorage.getItem("giskard.lastBrowse") || "/");
+  refreshModels();   // pull discovered models so a just-added provider shows up
 }
 function closeProjectModal() { $("projectModal").classList.remove("open"); }
 $("pmCancel").onclick = closeProjectModal;
@@ -933,13 +964,14 @@ $("modeBtn").onclick = () => {
 };
 
 function renderModelSelect() {
-  const sel = $("modelSel"); sel.innerHTML="";
+  const sel = $("modelSel"); const prev = sel.value; sel.innerHTML="";
   for (const m of state.models) {
     const o = document.createElement("option");
     o.value = `${m.provider}/${m.model}`; o.textContent = m.display_name || m.model; o.dataset.provider=m.provider; o.dataset.model=m.model;
     sel.append(o);
   }
   if (!state.models.length) { const o=document.createElement("option"); o.textContent="(no models configured)"; sel.append(o); }
+  if (prev) sel.value = prev;   // preserve the current selection across a refresh
   sel.onchange = () => {
     const opt = sel.selectedOptions[0]; if (!opt || !opt.dataset.model) return;
     send({ type:"select_model", thread_id: state.threadId, model_ref:{ provider:opt.dataset.provider, model:opt.dataset.model, reasoning_effort:null } });
