@@ -190,6 +190,19 @@ pub struct BrowseResponse {
     pub entries: Vec<DirEntry>,
 }
 
+/// Static model list for the model picker (spec §8.3).
+#[derive(Debug, Clone, Serialize)]
+pub struct ListModelsResponse {
+    pub models: Vec<ModelDescriptor>,
+}
+
+/// Result of a "Save plan to project" action (spec §7.4.1).
+#[derive(Debug, Clone, Serialize)]
+pub struct SavePlanResponse {
+    /// Path the plan markdown was written to (relative to the project dir when possible).
+    pub path: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

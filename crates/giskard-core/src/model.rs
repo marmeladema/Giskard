@@ -45,6 +45,48 @@ impl ModelRef {
     }
 }
 
+impl ModelDescriptor {
+    /// Conservative context window used when the model's size is unknown (spec §8.3 step 4).
+    pub const CONSERVATIVE_CONTEXT_WINDOW: u32 = 128_000;
+
+    /// A conservative fallback descriptor for an otherwise-unknown model (spec §8.3 step 4).
+    ///
+    /// The UI shows a "context size unknown — using default" badge for such a descriptor
+    /// (which is any descriptor whose `context_window == CONSERVATIVE_CONTEXT_WINDOW` produced by
+    /// this constructor); the gauge still renders and the model is still usable.
+    pub fn conservative(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+            context_window: Self::CONSERVATIVE_CONTEXT_WINDOW,
+            supports_reasoning_effort: false,
+            display_name: None,
+        }
+    }
+}
+
+/// Built-in defaults table keyed by well-known model ids (spec §8.3 step 3).
+///
+/// This is the third precedence source (after a typed config entry and a `/v1/models` response),
+/// before the conservative fallback. Returns `None` for unknown models so the caller can fall
+/// back. Provider is preserved on the returned descriptor since the same model id may be served by
+/// several providers (§8.1).
+pub fn default_descriptor(provider: &str, model: &str) -> Option<ModelDescriptor> {
+    let (context_window, supports_reasoning_effort, display_name) = match model {
+        "gpt-5.5" => (262_144, true, "GPT-5.5"),
+        "gpt-5.4" => (262_144, true, "GPT-5.4"),
+        "@cf/z-ai/glm-4.7" => (131_072, false, "GLM-4.7 (Workers AI)"),
+        _ => return None,
+    };
+    Some(ModelDescriptor {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        context_window,
+        supports_reasoning_effort,
+        display_name: Some(display_name.to_string()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,6 +123,25 @@ mod tests {
         assert_eq!(json, "\"xhigh\"");
         let back: Effort = serde_json::from_str(&json).unwrap();
         assert_eq!(e, back);
+    }
+
+    #[test]
+    fn default_descriptor_known_and_unknown() {
+        let d = default_descriptor("openai", "gpt-5.5").unwrap();
+        assert_eq!(d.context_window, 262_144);
+        assert!(d.supports_reasoning_effort);
+        assert!(default_descriptor("openai", "totally-unknown").is_none());
+    }
+
+    #[test]
+    fn conservative_fallback() {
+        let d = ModelDescriptor::conservative("acme", "mystery-1");
+        assert_eq!(
+            d.context_window,
+            ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW
+        );
+        assert!(!d.supports_reasoning_effort);
+        assert_eq!(d.provider, "acme");
     }
 
     #[test]

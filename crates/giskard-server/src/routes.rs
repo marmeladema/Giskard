@@ -16,7 +16,7 @@ use tracing::{debug, error, warn};
 
 use futures::{SinkExt, StreamExt};
 use giskard_core::ids::ProjectId;
-use giskard_core::turn::{ApprovalPolicy, Mode, TurnOverrides};
+use giskard_core::turn::{Mode, TurnOverrides};
 use giskard_core::user_input::UserInput;
 use giskard_persist::store::ThreadFile;
 use giskard_proto::*;
@@ -40,6 +40,7 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
             get(list_threads).post(open_thread),
         )
         .route("/api/browse", get(browse))
+        .route("/api/models", get(list_models))
         .route("/api/logout", post(logout))
         .route("/api/ws", get(ws_handler))
         .layer(middleware::from_fn_with_state(state, auth_middleware))
@@ -313,6 +314,13 @@ async fn browse(
     }))
 }
 
+async fn list_models(State(state): State<AppState>) -> Result<Json<ListModelsResponse>, ApiError> {
+    let config = state.store.load_config().await?;
+    Ok(Json(ListModelsResponse {
+        models: crate::models::list_descriptors(&config),
+    }))
+}
+
 async fn ws_handler(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -408,26 +416,192 @@ async fn handle_client_msg(
             state.hub.unsubscribe(thread_id, client_id).await;
         }
         ClientMessage::SendInput { thread_id, text } => {
-            let overrides = TurnOverrides {
-                model: None,
-                reasoning_effort: None,
-                mode: Mode::Build,
-                approval_policy: ApprovalPolicy::Auto,
+            let (project_id, mut tf) = load_thread(state, thread_id).await?;
+            let project = state
+                .store
+                .load_project(project_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("project not found")?;
+            let config = state.store.load_config().await.map_err(|e| e.to_string())?;
+
+            let effective_model = tf.current_model.clone();
+            let descriptor = crate::models::resolve_descriptor(&config, &effective_model);
+            let reasoning_effort = if descriptor.supports_reasoning_effort {
+                effective_model.reasoning_effort
+            } else {
+                None
             };
+
+            let overrides = TurnOverrides {
+                model: Some(effective_model.clone()),
+                reasoning_effort,
+                mode: tf.mode,
+                approval_policy: project.approval_policy,
+            };
+
+            // Record the user's message as the first item of the turn's history is deferred to the
+            // harness stream; here we only bump updated_at so the sidebar reflects activity.
+            tf.updated_at = chrono::Utc::now();
+            let _ = state.store.save_thread(project_id, &tf).await;
+
             state
                 .registry
-                .start_turn(thread_id, UserInput::text(text), overrides)
+                .start_turn(thread_id, UserInput::text(text), overrides, effective_model)
                 .await
                 .map_err(|e| e.to_string())?;
+        }
+        ClientMessage::SwitchMode { thread_id, mode } => {
+            let (project_id, mut tf) = load_thread(state, thread_id).await?;
+            tf.mode = mode;
+            tf.updated_at = chrono::Utc::now();
+            state
+                .store
+                .save_thread(project_id, &tf)
+                .await
+                .map_err(|e| e.to_string())?;
+            broadcast_thread_state(state, thread_id, &tf).await;
+        }
+        ClientMessage::SelectModel {
+            thread_id,
+            model_ref,
+        } => {
+            let (project_id, mut tf) = load_thread(state, thread_id).await?;
+            let config = state.store.load_config().await.map_err(|e| e.to_string())?;
+            tf.context_window = crate::models::context_window_for(&config, &model_ref);
+            tf.current_model = model_ref;
+            tf.updated_at = chrono::Utc::now();
+            state
+                .store
+                .save_thread(project_id, &tf)
+                .await
+                .map_err(|e| e.to_string())?;
+            broadcast_thread_state(state, thread_id, &tf).await;
+        }
+        ClientMessage::ApprovalDecision {
+            request_id,
+            decision,
+        } => {
+            state
+                .registry
+                .respond_approval(giskard_core::ids::ApprovalId(request_id), decision)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        ClientMessage::Interrupt { thread_id } => {
+            state
+                .registry
+                .interrupt(thread_id)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        ClientMessage::SavePlan { thread_id, path } => {
+            match save_plan(state, thread_id, &path).await {
+                Ok(written) => {
+                    debug!(%thread_id, path = %written, "plan saved");
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(ServerMessage::Error {
+                            message: format!("save plan failed: {e}"),
+                        })
+                        .await;
+                }
+            }
         }
         ClientMessage::Ping => {
             let _ = tx.send(ServerMessage::Pong).await;
         }
-        _ => {
-            debug!("ignoring client message (Phase 3+)");
-        }
     }
     Ok(())
+}
+
+/// Load a thread file plus the project it belongs to (via the harness registry).
+async fn load_thread(
+    state: &AppState,
+    thread_id: giskard_core::ids::ThreadId,
+) -> Result<(ProjectId, ThreadFile), String> {
+    let project_id = state
+        .registry
+        .get_project_for_thread(thread_id)
+        .await
+        .ok_or("thread not open")?;
+    let tf = state
+        .store
+        .load_thread(project_id, thread_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("thread not found")?;
+    Ok((project_id, tf))
+}
+
+/// Push the updated persisted thread snapshot to all subscribers (§13.6).
+async fn broadcast_thread_state(
+    state: &AppState,
+    thread_id: giskard_core::ids::ThreadId,
+    tf: &ThreadFile,
+) {
+    if let Ok(value) = serde_json::to_value(tf) {
+        state
+            .hub
+            .broadcast(
+                thread_id,
+                ServerMessage::ThreadState(giskard_proto::ThreadState {
+                    thread_id,
+                    state: value,
+                }),
+            )
+            .await;
+    }
+}
+
+/// Write the current plan to a markdown file inside the workspace root (§7.4.1). Returns the
+/// path actually written (workspace-relative when possible).
+async fn save_plan(
+    state: &AppState,
+    thread_id: giskard_core::ids::ThreadId,
+    requested_path: &str,
+) -> Result<String, String> {
+    let (project_id, tf) = load_thread(state, thread_id).await?;
+    let project = state
+        .store
+        .load_project(project_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("project not found")?;
+    let workspace_root = PathBuf::from(project.workspace_root.as_deref().unwrap_or(&project.dir));
+
+    let markdown = crate::plan::extract_plan_markdown(&tf).ok_or("no plan-mode content to save")?;
+
+    let config = state.store.load_config().await.map_err(|e| e.to_string())?;
+    let path = if requested_path.trim().is_empty() {
+        let ts = chrono::Utc::now().format("%Y%m%d-%H%M").to_string();
+        crate::plan::default_plan_path(
+            &config.plan.default_dir,
+            &config.plan.filename_template,
+            &tf.title,
+            &ts,
+        )
+    } else {
+        requested_path.to_string()
+    };
+
+    let target =
+        crate::plan::safe_plan_path(&workspace_root, &path).ok_or("path escapes workspace root")?;
+
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    tokio::fs::write(&target, markdown)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(target
+        .strip_prefix(&workspace_root)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| target.to_string_lossy().to_string()))
 }
 
 #[derive(Debug)]
