@@ -75,6 +75,19 @@ impl Default for PlanConfig {
 #[serde(default)]
 pub struct TokensConfig {
     pub cost_estimation: bool,
+    /// Per-model €/Mtok rates, keyed by `"provider/model"` (spec §10.4, Appendix C). Only used
+    /// when `cost_estimation` is true. Human-authored config, so the interpolated string key is
+    /// fine here (unlike the persisted `by_model` ledger, which is nested — C3).
+    #[serde(default)]
+    pub rates: std::collections::HashMap<String, ModelRate>,
+}
+
+/// Per-model cost rate in euros per million tokens (spec §10.4).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelRate {
+    pub input_per_mtok_eur: f64,
+    pub output_per_mtok_eur: f64,
 }
 
 /// Visualization configuration (spec §11.3).

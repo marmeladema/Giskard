@@ -6,6 +6,7 @@ use giskard_persist::PersistStore;
 
 use crate::highlight::Highlighter;
 use crate::hub::Hub;
+use crate::ledger::{self, LedgerHandle};
 use crate::live_buffer::LiveBufferStore;
 use crate::registry::{HarnessFactory, HarnessRegistry};
 use crate::routes::{protected_routes, public_routes};
@@ -21,6 +22,8 @@ pub struct AppState {
     pub registry: Arc<HarnessRegistry>,
     pub live_buffers: Arc<LiveBufferStore>,
     pub highlighter: Arc<Highlighter>,
+    /// Single-writer token-ledger actor handle (§5.4).
+    pub ledger: LedgerHandle,
     pub session_key: Arc<[u8]>,
 }
 
@@ -49,11 +52,13 @@ impl AppState {
             Some(viz) => Arc::new(Highlighter::with_max_size(viz.max_highlight_size)),
             None => Arc::new(Highlighter::new()),
         };
+        let ledger = ledger::spawn(store.clone());
         let registry = Arc::new(HarnessRegistry::new(
             factory,
             hub.clone(),
             live_buffers.clone(),
             store.clone(),
+            ledger.clone(),
         ));
         Self {
             store,
@@ -61,6 +66,7 @@ impl AppState {
             registry,
             live_buffers,
             highlighter,
+            ledger,
             session_key: session_key.into(),
         }
     }
