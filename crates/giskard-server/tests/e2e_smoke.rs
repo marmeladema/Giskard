@@ -173,6 +173,34 @@ fn duplicate_history_fixture(
     ])
 }
 
+/// A turn that starts, hits a fatal (non-retryable) error, and produces no agent output — the
+/// sequence the Codex harness synthesizes for e.g. a quota rejection. The `Failed` `TurnCompleted`
+/// carries the real message so it can be persisted to history rather than lost as a toast.
+fn failed_turn_fixture(thread: ThreadId, turn: TurnId) -> ReplayFixture {
+    let message = "usageLimitExceeded: Quota exceeded. Check your plan and billing details.";
+    ReplayFixture::from_events(vec![
+        AgentEvent::ThreadOpened {
+            thread,
+            harness_thread_id: "th_fail".into(),
+        },
+        AgentEvent::TurnStarted { thread, turn },
+        AgentEvent::Error {
+            thread,
+            turn: Some(turn),
+            error: HarnessError::Protocol(message.into()),
+        },
+        AgentEvent::TurnCompleted {
+            thread,
+            turn,
+            usage: TokenUsage::default(),
+            status: TurnStatus {
+                kind: TurnStatusKind::Failed,
+                message: Some(message.into()),
+            },
+        },
+    ])
+}
+
 fn generate_password_hash(password: &str) -> String {
     use argon2::password_hash::SaltString;
     use argon2::{Argon2, PasswordHasher};
@@ -1045,6 +1073,152 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
         .filter(|item| item.harness_item_id.starts_with("old_"))
         .count();
     assert_eq!(old_item_count, 2);
+}
+
+/// A turn that fails without producing agent output must still be persisted as a `Failed` turn
+/// carrying the user's input and the real error message, so history explains why the message got
+/// no response (rather than the error only flashing by as a transient toast).
+#[tokio::test]
+async fn failed_turn_is_persisted_with_error_message() {
+    let tid = ThreadId::new();
+    let turn = TurnId::new();
+    let fixture = failed_turn_fixture(tid, turn);
+    let (_tmp, state, port) =
+        start_server_with_fixture_and_extra_config_on_available_port(fixture, "").await;
+    let base = format!("http://127.0.0.1:{port}");
+    let ws_base = format!("ws://127.0.0.1:{port}");
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let resp = client
+        .post(format!("{base}/api/login"))
+        .json(&serde_json::json!({"password": "testpass"}))
+        .send()
+        .await
+        .unwrap();
+    let cookie = resp
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let resp = client
+        .post(format!("{base}/api/projects"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({
+            "name": "test-project",
+            "dir": "/tmp/test",
+            "default_model": {"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null},
+            "approval_policy": "auto"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let project_id = resp.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pid: ProjectId = project_id.parse().unwrap();
+
+    // Open the thread (resume triggers the replay fixture).
+    let resp = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"resume": "th_fail"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let thread_id = resp.json::<serde_json::Value>().await.unwrap()["thread_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(thread_id, tid.to_string());
+
+    use tokio_tungstenite::tungstenite::http::Request;
+    let ws_request = Request::builder()
+        .uri(format!("{ws_base}/api/ws"))
+        .header("host", format!("127.0.0.1:{port}"))
+        .header("cookie", &cookie)
+        .header("upgrade", "websocket")
+        .header("connection", "upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .body(())
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request)
+        .await
+        .expect("WS connect");
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::Subscribe { thread_id: tid })
+            .unwrap()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SendInput {
+            thread_id: tid,
+            text: "please summarize the repo".into(),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    // Drive the WS until the failed turn completes, asserting the error surfaces live too.
+    let mut saw_error = false;
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
+                if let ServerMessage::Event { agent_event, .. } =
+                    serde_json::from_str::<ServerMessage>(&t).unwrap()
+                {
+                    match agent_event {
+                        WireAgentEvent::Error { error, .. } => {
+                            assert!(error.message.contains("usageLimitExceeded"));
+                            saw_error = true;
+                        }
+                        WireAgentEvent::TurnCompleted { .. } => break,
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => break,
+        }
+    }
+    assert!(saw_error, "the error event should reach the client live");
+
+    // The failed attempt is persisted: one turn, Failed, with the real message and the user input.
+    let saved = state.store.load_all_turns(pid, tid).await.unwrap();
+    assert_eq!(saved.len(), 1, "the failed turn should be persisted once");
+    let failed = &saved[0];
+    assert_eq!(failed.status.kind, TurnStatusKind::Failed);
+    assert_eq!(
+        failed.status.message.as_deref(),
+        Some("usageLimitExceeded: Quota exceeded. Check your plan and billing details.")
+    );
+    assert_eq!(
+        failed.user_input.as_text(),
+        Some("please summarize the repo")
+    );
+    assert!(
+        failed.items.is_empty(),
+        "a turn that failed before output has no items"
+    );
 }
 
 #[tokio::test]

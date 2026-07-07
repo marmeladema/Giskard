@@ -439,6 +439,10 @@ async fn stream_turn_events(
 
         match msg {
             codex_codes::ServerMessage::Notification(notif) => {
+                // A non-retryable error ends the turn without Codex sending `turn/completed`.
+                // Capture its message so we can synthesize a terminal Failed turn below (§7.1),
+                // giving history a persistent record of why the turn produced no agent output.
+                let terminal_error = mapping::fatal_turn_error(&notif);
                 let event = mapper.map_notification(&notif, thread_id);
                 if let Some(event) = event {
                     if let AgentEvent::TurnStarted { turn, .. } = &event {
@@ -449,6 +453,22 @@ async fn stream_turn_events(
                     if is_completed {
                         break;
                     }
+                }
+                if let Some(message) = terminal_error {
+                    // Mint a turn id when the error arrived before any `turn/started` (e.g. an
+                    // immediate quota rejection) so the failed attempt is still persisted.
+                    let turn = active_turn.unwrap_or_else(TurnId::new);
+                    let _ = broadcast_event(senders, thread_id, || AgentEvent::TurnCompleted {
+                        thread: thread_id,
+                        turn,
+                        usage: TokenUsage::default(),
+                        status: TurnStatus {
+                            kind: TurnStatusKind::Failed,
+                            message: Some(message),
+                        },
+                    })
+                    .await;
+                    break;
                 }
             }
             codex_codes::ServerMessage::Request { id, request } => {
