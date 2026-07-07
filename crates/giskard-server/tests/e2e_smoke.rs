@@ -1534,3 +1534,65 @@ async fn login_rejected_wrong_password() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["ok"], false);
 }
+
+/// The directory picker's "New folder" endpoint creates a directory under the given parent and
+/// rejects path-segment escapes (`..`, separators).
+#[tokio::test]
+async fn browse_mkdir_creates_directory_and_rejects_escapes() {
+    let (_tmp, _state, port) = start_server_with_extra_config_on_available_port("").await;
+    let base = format!("http://127.0.0.1:{port}");
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let resp = client
+        .post(format!("{base}/api/login"))
+        .json(&serde_json::json!({"password": "testpass"}))
+        .send()
+        .await
+        .unwrap();
+    let cookie = resp
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let parent = tempfile::TempDir::new().unwrap();
+    let parent_path = parent.path().to_string_lossy().to_string();
+
+    // Happy path: a new folder is created and its path returned.
+    let resp = client
+        .post(format!("{base}/api/browse/mkdir"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"parent": parent_path, "name": "my-project"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let created = resp.json::<serde_json::Value>().await.unwrap()["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(created.ends_with("my-project"));
+    assert!(parent.path().join("my-project").is_dir());
+
+    // Escape attempts are rejected without touching the filesystem.
+    for bad in ["../evil", "a/b", "..", "."] {
+        let resp = client
+            .post(format!("{base}/api/browse/mkdir"))
+            .header("cookie", &cookie)
+            .json(&serde_json::json!({"parent": parent_path, "name": bad}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "name {bad:?} should be rejected");
+    }
+    assert!(!parent.path().parent().unwrap().join("evil").exists());
+}
