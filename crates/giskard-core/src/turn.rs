@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::diff::FileDiff;
 use crate::ids::TurnId;
 use crate::item::Item;
 use crate::model::ModelRef;
@@ -87,6 +88,9 @@ pub struct Turn {
     pub status: TurnStatus,
     /// Per-turn usage; the same `TokenUsage` struct is reused in the ledgers (B3).
     pub usage: TokenUsage,
+    /// File diffs produced during this turn (spec §11.1, fed by `DiffUpdated` events).
+    #[serde(default)]
+    pub diffs: Vec<FileDiff>,
     pub started_at: DateTime<Utc>,
     /// `None` while the turn is still live.
     #[serde(default, skip_serializing_if = "Option::is_none")]
