@@ -201,6 +201,21 @@ pub struct ListModelsResponse {
     pub models: Vec<ModelDescriptor>,
 }
 
+/// Token dashboard report for a project or the global scope (spec §10.2). All figures reuse the
+/// one [`TokenUsage`] struct (B3); the day/week/month windows are derived from `by_day` on read.
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenReport {
+    pub total: TokenUsage,
+    pub today: TokenUsage,
+    pub this_week: TokenUsage,
+    pub this_month: TokenUsage,
+    pub by_day: std::collections::BTreeMap<String, TokenUsage>,
+    pub by_model: ByModel,
+    /// Estimated spend in euros, present only when cost estimation is enabled (§10.4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_eur: Option<f64>,
+}
+
 /// Result of a "Save plan to project" action (spec §7.4.1).
 #[derive(Debug, Clone, Serialize)]
 pub struct SavePlanResponse {

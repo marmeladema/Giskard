@@ -1,3 +1,4 @@
+use chrono::Datelike;
 use serde::{Deserialize, Serialize};
 
 /// Token usage reported on turn completion (spec §4.5).
@@ -128,6 +129,41 @@ impl DailyTokenLedger {
         }
         months
     }
+
+    /// Total for a single day (`date` = "YYYY-MM-DD"); zero if absent (§10.2 windows).
+    pub fn day_total(&self, date: &str) -> TokenUsage {
+        self.by_day.get(date).copied().unwrap_or_default()
+    }
+
+    /// Total for a calendar month (`ym` = "YYYY-MM"), summed from daily buckets (§10.2).
+    pub fn month_total(&self, ym: &str) -> TokenUsage {
+        let mut total = TokenUsage::default();
+        for (date, usage) in &self.by_day {
+            if date.starts_with(ym) {
+                total.add(usage);
+            }
+        }
+        total
+    }
+
+    /// Total for one ISO week (`iso_week` = "YYYY-Www"), summed from daily buckets (§10.2).
+    pub fn iso_week_total(&self, iso_week: &str) -> TokenUsage {
+        let mut total = TokenUsage::default();
+        for (date, usage) in &self.by_day {
+            if iso_week_of(date).as_deref() == Some(iso_week) {
+                total.add(usage);
+            }
+        }
+        total
+    }
+}
+
+/// Map a "YYYY-MM-DD" date to its ISO-8601 week key "YYYY-Www" (spec §10.2). Returns `None` if
+/// the date does not parse.
+pub fn iso_week_of(date: &str) -> Option<String> {
+    let d = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+    let iso = d.iso_week();
+    Some(format!("{:04}-W{:02}", iso.year(), iso.week()))
 }
 
 #[cfg(test)]
@@ -192,6 +228,25 @@ mod tests {
             back.by_model.get("cloudflare-litellm", "@cf/z-ai/glm-4.7"),
             Some(&TokenUsage::new(10, 5))
         );
+    }
+
+    #[test]
+    fn window_totals() {
+        let mut ledger = DailyTokenLedger::default();
+        // Same ISO week (2026-07-06 is Mon of W28; 07-08 is Wed of W28).
+        ledger.record("2026-07-06", "openai", "gpt-5.5", &TokenUsage::new(100, 10));
+        ledger.record("2026-07-08", "openai", "gpt-5.5", &TokenUsage::new(200, 20));
+        ledger.record("2026-08-01", "openai", "gpt-5.5", &TokenUsage::new(50, 5));
+
+        assert_eq!(ledger.day_total("2026-07-06"), TokenUsage::new(100, 10));
+        assert_eq!(ledger.day_total("2026-01-01"), TokenUsage::default());
+        assert_eq!(ledger.month_total("2026-07").input, 300);
+        assert_eq!(ledger.month_total("2026-08").input, 50);
+
+        let wk = iso_week_of("2026-07-06").unwrap();
+        assert_eq!(wk, "2026-W28");
+        assert_eq!(ledger.iso_week_total(&wk).input, 300);
+        assert_eq!(ledger.total.total, 385);
     }
 
     #[test]

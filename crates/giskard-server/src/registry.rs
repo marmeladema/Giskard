@@ -19,6 +19,7 @@ use giskard_persist::store::ProjectConfig;
 use giskard_proto::{ServerMessage, TokenScope};
 
 use crate::hub::Hub;
+use crate::ledger::LedgerHandle;
 use crate::live_buffer::LiveBufferStore;
 use crate::models::context_window_for;
 
@@ -48,6 +49,7 @@ pub struct HarnessRegistry {
     hub: Arc<Hub>,
     live_buffers: Arc<LiveBufferStore>,
     store: Arc<PersistStore>,
+    ledger: LedgerHandle,
 }
 
 impl HarnessRegistry {
@@ -56,6 +58,7 @@ impl HarnessRegistry {
         hub: Arc<Hub>,
         live_buffers: Arc<LiveBufferStore>,
         store: Arc<PersistStore>,
+        ledger: LedgerHandle,
     ) -> Self {
         Self {
             harnesses: Mutex::new(HashMap::new()),
@@ -65,6 +68,7 @@ impl HarnessRegistry {
             hub,
             live_buffers,
             store,
+            ledger,
         }
     }
 
@@ -138,6 +142,7 @@ impl HarnessRegistry {
         let live_buffers = self.live_buffers.clone();
         let store = self.store.clone();
         let approvals_map = self.approvals.clone();
+        let ledger = self.ledger.clone();
 
         let stream = harness.subscribe(&handle);
         let turn_id = harness.start_turn(&handle, input, overrides).await?;
@@ -151,6 +156,7 @@ impl HarnessRegistry {
                 live_buffers,
                 store,
                 approvals_map,
+                ledger,
                 ctx,
             )
             .await;
@@ -231,6 +237,7 @@ async fn forward_events(
     live_buffers: Arc<LiveBufferStore>,
     store: Arc<PersistStore>,
     approvals: ApprovalMap,
+    ledger: LedgerHandle,
     ctx: TurnContext,
 ) {
     let mut turn_id: Option<TurnId> = None;
@@ -297,7 +304,7 @@ async fn forward_events(
                         started_at,
                         completed_at: Some(Utc::now()),
                     };
-                    persist_turn(&store, &hub, project_id, thread_id, turn).await;
+                    persist_turn(&store, &hub, &ledger, project_id, thread_id, turn).await;
                     live_buffers.clear_turn(thread_id).await;
                     turn_id = None;
                 }
@@ -311,10 +318,12 @@ async fn forward_events(
 }
 
 /// Append a completed `Turn` to the thread file, fold its usage into the thread ledger, recompute
-/// the cached context window, and persist atomically (§7.1). Best-effort: logs on failure.
+/// the cached context window, persist atomically (§7.1), and hand the usage delta to the global +
+/// project ledger actor (§10.2). Best-effort: logs on failure.
 async fn persist_turn(
     store: &PersistStore,
     hub: &Hub,
+    ledger: &LedgerHandle,
     project_id: ProjectId,
     thread_id: ThreadId,
     turn: Turn,
@@ -322,14 +331,22 @@ async fn persist_turn(
     // C4: recompute the cached context window from the current model on write.
     let config = store.load_config().await.ok();
 
+    // Only completed/interrupted turns carry real usage; capture the bits we need before `turn`
+    // moves into the closure.
+    let should_record = matches!(
+        turn.status.kind,
+        TurnStatusKind::Completed | TurnStatusKind::Interrupted
+    );
+    let provider = turn.model.provider.clone();
+    let model = turn.model.model.clone();
+    let usage = turn.usage;
+
     // Single-writer RMW (§5.4): appending the turn + folding tokens happens under the per-thread
     // lock, so a concurrent model/mode/policy change can't clobber the completed turn (and vice
     // versa).
     let updated = store
         .update_thread(project_id, thread_id, move |tf| {
-            if turn.status.kind == TurnStatusKind::Completed
-                || turn.status.kind == TurnStatusKind::Interrupted
-            {
+            if should_record {
                 tf.tokens
                     .record(&turn.model.provider, &turn.model.model, &turn.usage);
             }
@@ -353,13 +370,21 @@ async fn persist_turn(
         }
     };
 
+    // Fold the same usage into the project + global ledgers via the single-writer actor (§10.2).
+    if should_record {
+        let date = Utc::now().format("%Y-%m-%d").to_string();
+        ledger
+            .record(project_id, date, provider, model, usage)
+            .await;
+    }
+
     // Push a thread-scoped token update to subscribers (§13.6).
-    if let Ok(ledger) = serde_json::to_value(&tf.tokens) {
+    if let Ok(ledger_json) = serde_json::to_value(&tf.tokens) {
         hub.broadcast(
             thread_id,
             ServerMessage::TokenUpdate {
                 scope: TokenScope::Thread,
-                ledger,
+                ledger: ledger_json,
             },
         )
         .await;

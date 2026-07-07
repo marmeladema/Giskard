@@ -44,6 +44,9 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
         .route("/api/projects/{id}/linkify", post(linkify))
         .route("/api/browse", get(browse))
         .route("/api/models", get(list_models))
+        .route("/api/models/refresh", post(refresh_models))
+        .route("/api/tokens", get(global_tokens))
+        .route("/api/projects/{id}/tokens", get(project_tokens))
         .route("/api/logout", post(logout))
         .route("/api/ws", get(ws_handler))
         .layer(middleware::from_fn_with_state(state, auth_middleware))
@@ -470,6 +473,38 @@ async fn list_models(State(state): State<AppState>) -> Result<Json<ListModelsRes
     Ok(Json(ListModelsResponse {
         models: crate::models::list_descriptors(&config),
     }))
+}
+
+/// `POST /api/models/refresh` — merge each listing-enabled provider's `/v1/models` over the static
+/// list (spec §8.3). Best-effort: always returns at least the static list.
+async fn refresh_models(
+    State(state): State<AppState>,
+) -> Result<Json<ListModelsResponse>, ApiError> {
+    let config = state.store.load_config().await?;
+    Ok(Json(ListModelsResponse {
+        models: crate::models::refresh_models(&config).await,
+    }))
+}
+
+/// `GET /api/tokens` — the global token dashboard (day/week/month/total, §10.2).
+async fn global_tokens(State(state): State<AppState>) -> Result<Json<TokenReport>, ApiError> {
+    let config = state.store.load_config().await?;
+    let ledger = state.store.load_global_tokens().await?.unwrap_or_default();
+    Ok(Json(crate::tokens::build_report(&ledger, &config.tokens)))
+}
+
+/// `GET /api/projects/{id}/tokens` — a project's token dashboard (§10.2).
+async fn project_tokens(
+    State(state): State<AppState>,
+    AxumPath(project_id): AxumPath<ProjectId>,
+) -> Result<Json<TokenReport>, ApiError> {
+    let config = state.store.load_config().await?;
+    let ledger = state
+        .store
+        .load_project_tokens(project_id)
+        .await?
+        .unwrap_or_default();
+    Ok(Json(crate::tokens::build_report(&ledger, &config.tokens)))
 }
 
 async fn ws_handler(
