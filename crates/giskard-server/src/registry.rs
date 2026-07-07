@@ -411,12 +411,12 @@ async fn persisted_turn_ids(
     thread_id: ThreadId,
 ) -> HashSet<TurnId> {
     store
-        .load_thread(project_id, thread_id)
+        .load_all_turns(project_id, thread_id)
         .await
-        .ok()
-        .flatten()
-        .map(|tf| tf.turns.into_iter().map(|turn| turn.id).collect())
         .unwrap_or_default()
+        .into_iter()
+        .map(|turn| turn.id)
+        .collect()
 }
 
 async fn persisted_harness_item_ids(
@@ -425,24 +425,19 @@ async fn persisted_harness_item_ids(
     thread_id: ThreadId,
 ) -> HashSet<String> {
     store
-        .load_thread(project_id, thread_id)
+        .load_all_turns(project_id, thread_id)
         .await
-        .ok()
-        .flatten()
-        .map(|tf| {
-            tf.turns
-                .into_iter()
-                .flat_map(|turn| turn.items)
-                .filter_map(|item| {
-                    if item.harness_item_id.is_empty() {
-                        None
-                    } else {
-                        Some(item.harness_item_id)
-                    }
-                })
-                .collect()
-        })
         .unwrap_or_default()
+        .into_iter()
+        .flat_map(|turn| turn.items)
+        .filter_map(|item| {
+            if item.harness_item_id.is_empty() {
+                None
+            } else {
+                Some(item.harness_item_id)
+            }
+        })
+        .collect()
 }
 
 /// Append a completed `Turn` to the thread file, fold its usage into the thread ledger, recompute
@@ -469,16 +464,22 @@ async fn persist_turn(
     let model = turn.model.model.clone();
     let usage = turn.usage;
 
-    // Single-writer RMW (§5.4): appending the turn + folding tokens happens under the per-thread
-    // lock, so a concurrent model/mode/policy change can't clobber the completed turn (and vice
-    // versa).
+    // H3 ordering: append the turn to the authoritative JSONL history FIRST, then update the
+    // metadata aggregates. A crash between the two leaves the turn in history but not yet in the
+    // aggregates cache — recoverable via `recompute_aggregates`.
+    if let Err(e) = store.append_turn(project_id, thread_id, &turn).await {
+        warn!(%thread_id, %e, "failed to append turn to history; skipping metadata update");
+        return;
+    }
+
+    // Metadata-only RMW under the per-thread lock (§5.4): fold usage into the aggregates cache and
+    // refresh the context window. The history no longer lives here.
     let updated = store
         .update_thread(project_id, thread_id, move |tf| {
             if should_record {
                 tf.tokens
                     .record(&turn.model.provider, &turn.model.model, &turn.usage);
             }
-            tf.turns.push(turn);
             tf.updated_at = Utc::now();
             if let Some(config) = &config {
                 tf.context_window = context_window_for(config, &tf.current_model);

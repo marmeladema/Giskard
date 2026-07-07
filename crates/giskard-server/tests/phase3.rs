@@ -297,11 +297,12 @@ async fn modes_models_approvals_and_plan_dump() {
     }
     assert!(saw_completed, "should observe TurnCompleted");
 
-    // Turn persisted: one Plan-mode turn with the agent item, tokens folded.
-    let tf = poll_thread(&state, pid, tid, |tf| !tf.turns.is_empty()).await;
-    assert_eq!(tf.turns.len(), 1);
-    assert_eq!(tf.turns[0].mode, Mode::Plan);
-    assert!(!tf.turns[0].items.is_empty());
+    // Turn persisted to the authoritative JSONL history (H1); tokens folded into metadata.
+    let tf = poll_thread(&state, pid, tid, |tf| tf.tokens.total.total == 1540).await;
+    let turns = state.store.load_all_turns(pid, tid).await.unwrap();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].mode, Mode::Plan);
+    assert!(!turns[0].items.is_empty());
     assert_eq!(
         tf.tokens.total.total, 1540,
         "usage folded into thread ledger"

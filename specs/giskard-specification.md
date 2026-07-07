@@ -8,7 +8,7 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.6
+**Version:** 1.7
 
 **Changelog (1.0 → 1.1), from review:**
 - Resolved thread token schema vs §10.2: thread `tokens` now carries `total` + `by_model` (§5.3).
@@ -132,6 +132,33 @@
 - **E6:** Required live UI rendering to de-duplicate completed items by Giskard `ItemId` and
   harness-native `harness_item_id`, so streamed deltas finalize in place instead of duplicating the
   completed agent response (§13.6).
+
+**Changelog (1.6 → 1.7), split thread persistence into metadata + JSONL history:**
+- **Motivation:** history previously lived inside `<thread_id>.json` as a `turns[]` array, rewritten
+  in full on every turn — so listing/restoring parsed whole histories and per-turn write cost was
+  O(history). The `.jsonl` (formerly "disposable") is now the **authoritative** history and the
+  `.json` a small metadata/aggregates file.
+- **H1:** Two files. `<thread_id>.json` = metadata only (version, id, project_id, title,
+  harness_thread_id, mode, current_model, context_window cache, token aggregates, timestamps — no
+  `turns[]`). `<thread_id>.jsonl` = authoritative history, **one `Turn` per line**, append-only
+  (§5.2, §5.3, §5.4).
+- **H2:** Append path is a single `write()` of `JSON + "\n"` to an `O_APPEND` file — atomic against
+  concurrent writers and process-kill on local POSIX (no app lock for append ordering); the loader
+  tolerates a torn final line (skips it) for the power-loss case. NFS/network storage is out of
+  scope (§1.2 local-first).
+- **H3:** Append history first, then update metadata aggregates. Aggregates are a recomputable
+  cache (like `context_window`, C4); `recompute_aggregates(thread)` folds the JSONL to repair after a
+  crash between the two writes.
+- **H4/H6:** Restore/list read only `.json` (no history parse). Opening a thread loads the last N
+  turns; older pages load on demand via `LoadHistory { thread_id, before: TurnId, limit }` →
+  `HistoryPage { thread_id, turns: [WireTurn], has_more }`, decoupled from the `ThreadState`
+  snapshot (§13.6). Page sizes are config (`[history] initial`/`page`, §16.3). `TurnId` (ULID) is the
+  pagination cursor — no index file.
+- **H5:** The loader composes `[last N turns from JSONL] + [live turn from the live buffer]`; the
+  in-flight turn is not in the JSONL until `TurnCompleted`.
+- **H7:** `giskard-admin`: `compact_thread`/`dump_thread` operate on the `.jsonl`, plus
+  `recompute_aggregates`; `validate` parses the JSONL line-by-line and reports the first bad line
+  rather than quarantining whole histories (§5.5).
 
 **Changelog (1.5 → 1.6), from typed transcript rendering pass:**
 - **E7:** File-change and tool-call items are visible transcript items, not hidden/empty agent
@@ -840,8 +867,8 @@ giskard/
 │       ├── project.json        # ProjectConfig: workspace root, default model,
 │       │                       #   approval policy, provider defaults, harness kind
 │       ├── threads/
-│       │   ├── <thread_id>.json        # ThreadState + ordered turns/items (history)
-│       │   └── <thread_id>.jsonl       # optional append-only event log (see §5.4)
+│       │   ├── <thread_id>.json        # thread metadata + token aggregates (cache) — no history
+│       │   └── <thread_id>.jsonl       # authoritative turn history, one Turn per line (§5.4)
 │       └── tokens.json         # per-project token ledger (aggregates + daily buckets)
 └── tokens-global.json          # global token ledger (daily/weekly/monthly/total)
 ```
@@ -910,8 +937,8 @@ All defined in `giskard-core`, serialized by `giskard-persist`. Illustrative sha
       }                                  //   model id contains slashes (e.g. "@cf/z-ai/glm-4.7").
     }
   },
-  "created_at": "…", "updated_at": "…",
-  "turns": [ /* ordered `Turn` objects (§4.5, B1), each holding its completed `Item`s */ ]
+  "created_at": "…", "updated_at": "…"
+  // NB: no `turns[]` — history is the authoritative `<thread_id>.jsonl`, one `Turn` per line (H1).
 }
 ```
 
@@ -948,11 +975,17 @@ there is one source of truth to correct if needed.
   close together into one atomic write). The same actor owns per-project `tokens.json` writes,
   or those may be delegated to per-project sub-tasks — either is acceptable, but the global
   file must have exactly one writer.
-- **Turn history growth:** a thread's history lives in its `<thread_id>.json`. To bound
-  rewrite cost, completed turns are appended and the file is rewritten atomically on each
-  turn completion (acceptable at this scale). The optional `<thread_id>.jsonl` append-only
-  event log (raw `AgentEvent`s) is written for debugging/replay-recording and is **not** the
-  authoritative store; it can be truncated/deleted safely.
+- **Turn history (authoritative JSONL, H1/H2/H3):** a thread's history is `<thread_id>.jsonl`,
+  the **source of truth** — one `Turn` per line, append-only. On `TurnCompleted` the server appends
+  one line via a single `write()` (JSON + `\n`) to an `O_APPEND` file: on a local POSIX filesystem
+  this is atomic against concurrent writers without an application lock, and a process kill leaves
+  the line all-or-nothing. It does **not** survive power loss (page cache), so the loader tolerates a
+  single unparseable **final** line (torn append) — skipping it — while a bad interior line is real
+  corruption. This atomicity holds on local storage only; NFS/network `GISKARD_DATA_DIR` is out of
+  scope (§1.2). After appending, the server updates `<thread_id>.json` (token aggregates,
+  `updated_at`) — history-first, so a crash between the two leaves the turn recoverable and the
+  aggregates rebuildable from the JSONL (`recompute_aggregates`, treating aggregates as a cache like
+  `context_window`, C4). The metadata `.json` never holds `turns[]`.
 - **Crash consistency:** because writes are atomic renames, a crash leaves either the old or
   the new complete file, never a partial one. On startup the server validates each JSON file;
   a corrupt file is moved aside to `<file>.corrupt-<ts>` and logged, and the app continues

@@ -6,14 +6,14 @@
 use std::path::{Component, Path, PathBuf};
 
 use giskard_core::item::ItemPayload;
-use giskard_core::turn::Mode;
-use giskard_persist::store::ThreadFile;
+use giskard_core::turn::{Mode, Turn};
 
 /// Extract "the current plan" as markdown: the concatenation of the agent-message items of the
-/// **most recent Plan-mode turn** in the thread (spec §7.4.1). Returns `None` if there is no
-/// Plan-mode turn with agent text yet.
-pub fn extract_plan_markdown(thread: &ThreadFile) -> Option<String> {
-    let turn = thread.turns.iter().rev().find(|t| t.mode == Mode::Plan)?;
+/// **most recent Plan-mode turn** in `turns` (spec §7.4.1). `turns` is the thread's persisted
+/// history (from the authoritative JSONL, H1). Returns `None` if there is no Plan-mode turn with
+/// agent text yet.
+pub fn extract_plan_markdown(title: &str, turns: &[Turn]) -> Option<String> {
+    let turn = turns.iter().rev().find(|t| t.mode == Mode::Plan)?;
 
     let body = turn
         .items
@@ -29,7 +29,7 @@ pub fn extract_plan_markdown(thread: &ThreadFile) -> Option<String> {
         return None;
     }
 
-    let title = thread.title.trim();
+    let title = title.trim();
     if title.is_empty() {
         Some(body)
     } else {
@@ -103,10 +103,9 @@ mod tests {
     use giskard_core::ids::TurnId;
     use giskard_core::item::{Item, ItemPayload};
     use giskard_core::model::ModelRef;
-    use giskard_core::token::{TokenLedger, TokenUsage};
+    use giskard_core::token::TokenUsage;
     use giskard_core::turn::{Mode, Turn, TurnStatus, TurnStatusKind};
     use giskard_core::user_input::UserInput;
-    use giskard_persist::store::ThreadFile;
 
     fn model() -> ModelRef {
         ModelRef {
@@ -143,33 +142,14 @@ mod tests {
         }
     }
 
-    fn thread_with(turns: Vec<Turn>) -> ThreadFile {
-        ThreadFile {
-            version: 1,
-            id: giskard_core::ids::ThreadId::new(),
-            project_id: giskard_core::ids::ProjectId::new(),
-            title: "Fix auth".into(),
-            harness_thread_id: "th".into(),
-            mode: Mode::Plan,
-            current_model: model(),
-            context_window: 0,
-            approval_policy: None,
-            model_efforts: std::collections::HashMap::new(),
-            tokens: TokenLedger::default(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            turns,
-        }
-    }
-
     #[test]
     fn extracts_latest_plan_turn() {
-        let thread = thread_with(vec![
+        let turns = vec![
             turn(Mode::Plan, vec![agent_item("old plan")]),
             turn(Mode::Build, vec![agent_item("building")]),
             turn(Mode::Plan, vec![agent_item("step 1"), agent_item("step 2")]),
-        ]);
-        let md = extract_plan_markdown(&thread).unwrap();
+        ];
+        let md = extract_plan_markdown("Fix auth", &turns).unwrap();
         assert!(md.contains("step 1"));
         assert!(md.contains("step 2"));
         assert!(!md.contains("old plan"));
@@ -178,8 +158,8 @@ mod tests {
 
     #[test]
     fn no_plan_turn_returns_none() {
-        let thread = thread_with(vec![turn(Mode::Build, vec![agent_item("building")])]);
-        assert!(extract_plan_markdown(&thread).is_none());
+        let turns = vec![turn(Mode::Build, vec![agent_item("building")])];
+        assert!(extract_plan_markdown("Fix auth", &turns).is_none());
     }
 
     #[test]

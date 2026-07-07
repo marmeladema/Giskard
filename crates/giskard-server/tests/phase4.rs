@@ -485,9 +485,9 @@ session_days = 30
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
     loop {
-        if let Ok(Some(tf)) = state.store.load_thread(pid, thread_id).await {
-            if !tf.turns.is_empty() {
-                let turn = &tf.turns[0];
+        if let Ok(turns) = state.store.load_all_turns(pid, thread_id).await {
+            if !turns.is_empty() {
+                let turn = &turns[0];
                 assert_eq!(
                     turn.diffs.len(),
                     2,

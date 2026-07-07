@@ -362,7 +362,6 @@ async fn open_thread(
         tokens: giskard_core::token::TokenLedger::default(),
         created_at: now,
         updated_at: now,
-        turns: vec![],
     };
     state.store.save_thread(project_id, &thread_file).await?;
 
@@ -902,9 +901,58 @@ async fn handle_client_msg(
                 }))
                 .await;
 
+            // H4/H6: send the most recent page of history (not the whole thread). Older pages are
+            // fetched on demand via `LoadHistory`.
+            let limit = state
+                .store
+                .load_config()
+                .await
+                .map(|c| c.history.initial)
+                .unwrap_or(50);
+            if let Ok((turns, has_more)) = state
+                .store
+                .load_history(access.project_id, thread_id, None, limit)
+                .await
+            {
+                let _ = tx
+                    .send(ServerMessage::HistoryPage {
+                        thread_id,
+                        turns: turns.into_iter().map(Into::into).collect(),
+                        has_more,
+                    })
+                    .await;
+            }
+
+            // H5: the in-flight turn is not in the JSONL yet — reconstruct it from the live buffer.
             if let Some(snap) = state.live_buffers.snapshot(thread_id).await {
                 let _ = tx.send(ServerMessage::LiveTurnSnapshot(snap)).await;
             }
+        }
+        ClientMessage::LoadHistory {
+            thread_id,
+            before,
+            limit,
+        } => {
+            let project_id = project_for(state, thread_id, "load_history").await?;
+            let default_limit = state
+                .store
+                .load_config()
+                .await
+                .map(|c| c.history.page)
+                .unwrap_or(50);
+            let limit = limit.unwrap_or(default_limit);
+            let (turns, has_more) = state
+                .store
+                .load_history(project_id, thread_id, before, limit)
+                .await
+                .map_err(|e| WsError::from_persist(e, "load_history", Some(thread_id)))?;
+            let _ = tx
+                .send(ServerMessage::HistoryPage {
+                    thread_id,
+                    turns: turns.into_iter().map(Into::into).collect(),
+                    has_more,
+                })
+                .await;
         }
         ClientMessage::Unsubscribe { thread_id } => {
             state.hub.unsubscribe(thread_id, client_id).await;
@@ -1389,7 +1437,14 @@ async fn save_plan(
         .ok_or("project not found")?;
     let workspace_root = PathBuf::from(project.workspace_root.as_deref().unwrap_or(&project.dir));
 
-    let markdown = crate::plan::extract_plan_markdown(&tf).ok_or("no plan-mode content to save")?;
+    // Plan extraction reads the authoritative JSONL history (H1), not the metadata file.
+    let turns = state
+        .store
+        .load_all_turns(project_id, thread_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let markdown = crate::plan::extract_plan_markdown(&tf.title, &turns)
+        .ok_or("no plan-mode content to save")?;
 
     let config = state.store.load_config().await.map_err(|e| e.to_string())?;
     let path = if requested_path.trim().is_empty() {
