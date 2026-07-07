@@ -254,15 +254,14 @@ impl CodexMapper {
             }
 
             Notification::Error(n) => {
-                let msg = n
-                    .error
-                    .additional_details
-                    .clone()
-                    .unwrap_or_else(|| "error".into());
+                let thread = self.resolve_thread(&n.thread_id, fallback_thread);
                 Some(AgentEvent::Error {
-                    thread: fallback_thread,
+                    thread,
                     turn: None,
-                    error: giskard_core::error::HarnessError::Protocol(msg),
+                    error: giskard_core::error::HarnessError::Protocol(compose_turn_error(
+                        &n.error,
+                        n.will_retry,
+                    )),
                 })
             }
 
@@ -859,6 +858,70 @@ fn enum_string<T: Serialize>(value: &T) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
+/// Compose a human-readable message from a Codex `TurnError` (spec §12.2).
+///
+/// Codex puts the primary text in `message`, optional supplementary text in `additional_details`,
+/// and a structured classification (e.g. `unauthorized`, `badRequest`, `contextWindowExceeded`) in
+/// `codex_error_info`. The earlier code read only `additional_details` and fell back to a bare
+/// `"error"`, discarding the real cause — so a Codex rejection surfaced in the browser as the
+/// useless `protocol error: error`. Here we keep all three, preferring the most specific.
+fn compose_turn_error(err: &codex_codes::protocol::TurnError, will_retry: bool) -> String {
+    let mut body = String::new();
+    let message = err.message.trim();
+    if !message.is_empty() {
+        body.push_str(message);
+    }
+    if let Some(details) = err.additional_details.as_deref() {
+        let details = details.trim();
+        // Skip details already contained in the message to avoid duplication.
+        if !details.is_empty() && !message.contains(details) {
+            if !body.is_empty() {
+                body.push_str(": ");
+            }
+            body.push_str(details);
+        }
+    }
+    if body.is_empty() {
+        body.push_str("Codex reported an unspecified error");
+    }
+
+    // Prefix the structured classification when present, e.g. "unauthorized: <message>".
+    let mut msg = match &err.codex_error_info {
+        Some(info) => format!("{}: {body}", describe_codex_error_info(info)),
+        None => body,
+    };
+    if will_retry {
+        msg.push_str(" (retrying)");
+    }
+    msg
+}
+
+/// Short label for a Codex error classification. Unit variants serialize to their camelCase tag
+/// (e.g. `unauthorized`); the connection-failure variants also carry an HTTP status we surface.
+fn describe_codex_error_info(info: &codex_codes::protocol::CodexErrorInfo) -> String {
+    use codex_codes::protocol::CodexErrorInfo as E;
+    match info {
+        E::HttpConnectionFailed { http_status_code }
+        | E::ResponseStreamConnectionFailed { http_status_code }
+        | E::ResponseStreamDisconnected { http_status_code }
+        | E::ResponseTooManyFailedAttempts { http_status_code } => match http_status_code {
+            Some(code) => format!("{} (HTTP {code})", enum_label(info)),
+            None => enum_label(info),
+        },
+        other => enum_label(other),
+    }
+}
+
+/// The variant tag of a serde-tagged enum value: the string itself for a unit variant, or the
+/// first (tag) key for a struct variant — avoids dumping a whole JSON object into the message.
+fn enum_label<T: Serialize>(value: &T) -> String {
+    match json_value(value) {
+        Some(Value::String(s)) => s,
+        Some(Value::Object(map)) => map.keys().next().cloned().unwrap_or_else(|| "error".into()),
+        _ => "error".into(),
+    }
+}
+
 fn path_from_json_value(value: &Value) -> PathBuf {
     match value {
         Value::String(s) => PathBuf::from(s),
@@ -1206,6 +1269,68 @@ mod tests {
         assert_eq!(
             text_delta(mapper.map_notification(&progress, fallback).unwrap()),
             "running"
+        );
+    }
+
+    fn error_message(event: AgentEvent) -> String {
+        match event {
+            AgentEvent::Error {
+                error: giskard_core::error::HarnessError::Protocol(msg),
+                ..
+            } => msg,
+            other => panic!("expected protocol error, got {other:?}"),
+        }
+    }
+
+    /// An `error` notification must surface Codex's real message and classification — not the old
+    /// `protocol error: error` placeholder that discarded `message`/`codexErrorInfo`.
+    #[test]
+    fn error_notification_surfaces_message_and_classification() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let fallback = ThreadId::new();
+
+        // Real cause available in `message` + structured `codexErrorInfo`.
+        let unauthorized = Notification::Error(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "th1",
+                "turnId": "t1",
+                "willRetry": false,
+                "error": {
+                    "message": "No API key configured for provider openai",
+                    "codexErrorInfo": "unauthorized"
+                }
+            }))
+            .unwrap(),
+        );
+        let msg = error_message(mapper.map_notification(&unauthorized, fallback).unwrap());
+        assert_eq!(
+            msg,
+            "unauthorized: No API key configured for provider openai"
+        );
+
+        // Connection failure carries an HTTP status; retry is flagged.
+        let http = Notification::Error(
+            serde_json::from_value(serde_json::json!({
+                "willRetry": true,
+                "error": {
+                    "message": "stream failed",
+                    "codexErrorInfo": { "httpConnectionFailed": { "httpStatusCode": 503 } }
+                }
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            error_message(mapper.map_notification(&http, fallback).unwrap()),
+            "httpConnectionFailed (HTTP 503): stream failed (retrying)"
+        );
+
+        // Even with an empty error object we never emit a bare "error".
+        let empty = Notification::Error(
+            serde_json::from_value(serde_json::json!({ "error": {} })).unwrap(),
+        );
+        assert_eq!(
+            error_message(mapper.map_notification(&empty, fallback).unwrap()),
+            "Codex reported an unspecified error"
         );
     }
 
