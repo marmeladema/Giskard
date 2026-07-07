@@ -14,6 +14,7 @@ pub enum ItemKind {
     CommandExecution,
     FileChange,
     ToolCall,
+    Activity,
 }
 
 /// What kind of file change occurred.
@@ -23,6 +24,15 @@ pub enum FileChangeKind {
     Created,
     Modified,
     Deleted,
+}
+
+/// One file touched by a finalized file-change item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChangeEntry {
+    pub path: PathBuf,
+    pub change: FileChangeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
 }
 
 /// Sent on `AgentEvent::ItemStarted` (spec §4.5, B5: renamed from `ItemStarted` to avoid
@@ -68,14 +78,32 @@ pub enum ItemPayload {
         exit_code: Option<i32>,
     },
     FileChange {
+        /// Back-compat summary path for older persisted files and compact renderers.
         path: PathBuf,
         change: FileChangeKind,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        changes: Vec<FileChangeEntry>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
     },
     ToolCall {
         name: String,
         input: serde_json::Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    Activity {
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
     },
 }
 
@@ -97,6 +125,7 @@ impl ItemKind {
             Self::CommandExecution => "command_execution",
             Self::FileChange => "file_change",
             Self::ToolCall => "tool_call",
+            Self::Activity => "activity",
         }
     }
 }
@@ -133,6 +162,21 @@ mod tests {
         let json = serde_json::to_string(&payload).unwrap();
         let back: ItemPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(payload, back);
+    }
+
+    #[test]
+    fn old_file_change_payload_deserializes() {
+        let json = r#"{"kind":"file_change","path":"/tmp/a.rs","change":"modified"}"#;
+        let back: ItemPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            back,
+            ItemPayload::FileChange {
+                path: PathBuf::from("/tmp/a.rs"),
+                change: FileChangeKind::Modified,
+                changes: vec![],
+                status: None,
+            }
+        );
     }
 
     #[test]

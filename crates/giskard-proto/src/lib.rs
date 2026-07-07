@@ -21,7 +21,7 @@ pub use giskard_core::diff::{DiffHunk, DiffLine};
 pub use giskard_core::error::HarnessError;
 pub use giskard_core::event::AgentEvent;
 pub use giskard_core::ids::{ApprovalId, ItemId};
-pub use giskard_core::item::{FileChangeKind, ItemDelta, ItemKind, ItemStart};
+pub use giskard_core::item::{FileChangeEntry, FileChangeKind, ItemDelta, ItemKind, ItemStart};
 pub use giskard_core::model::{Effort, ModelDescriptor, ModelRef};
 pub use giskard_core::token::{ByModel, DailyTokenLedger, TokenLedger, TokenUsage};
 pub use giskard_core::turn::{ApprovalPolicy, Mode, TurnStatus, TurnStatusKind};
