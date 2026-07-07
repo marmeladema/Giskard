@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use giskard_core::ids::{ProjectId, ThreadId};
@@ -87,11 +88,14 @@ pub struct ThreadFile {
 /// The flat-file persistence store.
 ///
 /// Owns the data directory path. Each file is guarded by a per-file async mutex
-/// for single-writer discipline (spec §5.4).
+/// for single-writer discipline (spec §5.4): the project index has its own lock, and thread
+/// files are serialized per id via [`PersistStore::update_thread`].
 pub struct PersistStore {
     data_dir: PathBuf,
     config: Mutex<Option<Config>>,
     project_index_lock: Mutex<()>,
+    /// Per-thread-id write locks so read-modify-write of a thread file is single-writer (§5.4).
+    thread_locks: Mutex<HashMap<ThreadId, Arc<Mutex<()>>>>,
 }
 
 impl PersistStore {
@@ -101,6 +105,7 @@ impl PersistStore {
             data_dir,
             config: Mutex::new(None),
             project_index_lock: Mutex::new(()),
+            thread_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -258,6 +263,41 @@ impl PersistStore {
         thread: &ThreadFile,
     ) -> Result<(), PersistError> {
         atomic_write_json(&self.thread_json_path(project, thread.id), thread).await
+    }
+
+    /// Acquire (creating if needed) the per-thread write lock.
+    async fn thread_lock(&self, thread: ThreadId) -> Arc<Mutex<()>> {
+        self.thread_locks
+            .lock()
+            .await
+            .entry(thread)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Atomically read-modify-write a thread file under its per-thread lock (spec §5.4
+    /// single-writer discipline). `f` mutates the loaded [`ThreadFile`]; the result is written
+    /// back atomically before the lock is released, so concurrent mutations (a turn completing
+    /// while the user switches model/mode/policy) cannot lose each other's updates.
+    ///
+    /// Returns the updated file, or `Ok(None)` if the thread file does not exist.
+    pub async fn update_thread<F>(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+        f: F,
+    ) -> Result<Option<ThreadFile>, PersistError>
+    where
+        F: FnOnce(&mut ThreadFile),
+    {
+        let lock = self.thread_lock(thread).await;
+        let _guard = lock.lock().await;
+        let Some(mut tf) = self.load_thread(project, thread).await? else {
+            return Ok(None);
+        };
+        f(&mut tf);
+        self.save_thread(project, &tf).await?;
+        Ok(Some(tf))
     }
 
     /// List all thread files for a project (by reading the directory).
@@ -582,5 +622,59 @@ mod tests {
         let (_tmp, store) = make_store();
         let index = store.load_project_index().await.unwrap();
         assert!(index.projects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_thread_serializes_concurrent_writes() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        store
+            .create_project(pid, "proj", "/tmp/test", test_model(), ApprovalPolicy::Ask)
+            .await
+            .unwrap();
+
+        let tid = ThreadId::new();
+        let now = Utc::now();
+        store
+            .save_thread(
+                pid,
+                &ThreadFile {
+                    version: SCHEMA_VERSION,
+                    id: tid,
+                    project_id: pid,
+                    title: "t".into(),
+                    harness_thread_id: "th".into(),
+                    mode: Mode::Build,
+                    current_model: test_model(),
+                    context_window: 0,
+                    approval_policy: None,
+                    model_efforts: HashMap::new(),
+                    tokens: TokenLedger::default(),
+                    created_at: now,
+                    updated_at: now,
+                    turns: vec![],
+                },
+            )
+            .await
+            .unwrap();
+
+        // 20 concurrent read-modify-write increments. Without the per-thread lock these would
+        // race on load→save and lose updates; with it, every increment lands.
+        let store = std::sync::Arc::new(store);
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let s = store.clone();
+            handles.push(tokio::spawn(async move {
+                s.update_thread(pid, tid, |tf| tf.context_window += 1)
+                    .await
+                    .unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let tf = store.load_thread(pid, tid).await.unwrap().unwrap();
+        assert_eq!(tf.context_window, 20, "all concurrent increments must land");
     }
 }

@@ -4,6 +4,11 @@
 //! cached per `(path, mtime)` pair so repeated requests for the same file (e.g.
 //! when paginating through line ranges) avoid re-tokenizing.
 //!
+//! Highlighting is done **one source line at a time** (via [`HighlightLines`]) and
+//! the per-line HTML fragments are cached. A range request slices those fragments
+//! and re-wraps them in a `<pre>` element, so line ranges map exactly to source
+//! lines and always produce well-formed HTML (§11.3 pagination).
+//!
 //! Binary files (detected via null-byte check in the first 8 KiB) and files
 //! exceeding the configurable size threshold return an empty HTML body with
 //! metadata only, so the UI can show a fallback message.
@@ -11,9 +16,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use syntect::highlighting::ThemeSet;
-use syntect::html::highlighted_html_for_string;
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{Color, ThemeSet};
+use syntect::html::{IncludeBackground, styled_line_to_highlighted_html};
 use syntect::parsing::SyntaxSet;
+use syntect::util::LinesWithEndings;
 use tokio::sync::Mutex;
 use tracing::warn;
 
@@ -23,10 +30,23 @@ const DEFAULT_MAX_HIGHLIGHT_SIZE: usize = 10 * 1024 * 1024;
 /// Maximum number of cached highlight results before FIFO eviction kicks in.
 const MAX_CACHE_ENTRIES: usize = 128;
 
+/// The cached, fully-highlighted form of a file: one HTML fragment per source line
+/// plus the `<pre …>` opener carrying the theme background. Range requests slice
+/// `lines` and re-wrap, so one cache entry serves every range of the file.
+struct CachedHighlight {
+    /// Per-source-line highlighted HTML (each fragment includes the line's trailing newline).
+    lines: Vec<String>,
+    /// `<pre style="background-color:#…;">` opener matching the theme.
+    pre_open: String,
+    language: Option<String>,
+    is_binary: bool,
+    file_size: u64,
+}
+
 /// A cached highlight result keyed by file mtime.
 struct CacheEntry {
     mtime: std::time::SystemTime,
-    result: Arc<HighlightResult>,
+    cached: Arc<CachedHighlight>,
 }
 
 /// Syntax highlighter with per-file caching (spec §11.2).
@@ -49,7 +69,8 @@ pub struct Highlighter {
 /// alongside its syntax-highlighted content.
 #[derive(Debug, Clone)]
 pub struct HighlightResult {
-    /// Syntax-highlighted HTML (empty for binary or oversized files).
+    /// Syntax-highlighted HTML (empty for binary or oversized files). For a line-range
+    /// request this is a complete `<pre>…</pre>` containing only the requested lines.
     pub html: String,
     /// Language name detected from the file extension (e.g. "Rust", "Python").
     pub language: Option<String>,
@@ -79,11 +100,11 @@ impl Highlighter {
 
     /// Highlight a file, returning cached HTML if the file hasn't changed.
     ///
-    /// `start_line` / `end_line` are 1-based and inclusive. When both are
-    /// `None`, the entire file is returned. The cache stores the full-file
-    /// result; range slicing is applied on every call (cheap — just string
-    /// line splitting) so different ranges of the same file share one cache
-    /// entry.
+    /// `start_line` / `end_line` are 1-based and inclusive. When both are `None`,
+    /// the entire file is returned. Range slicing operates on the cached per-line
+    /// HTML, so different ranges of the same file share one cache entry and the
+    /// output is always a well-formed `<pre>` block containing exactly the
+    /// requested source lines.
     pub async fn highlight_file(
         &self,
         path: &Path,
@@ -98,7 +119,7 @@ impl Highlighter {
             .modified()
             .map_err(|e| format!("cannot read mtime: {e}"))?;
 
-        let file_size = metadata.len() as u64;
+        let file_size = metadata.len();
 
         if (file_size as usize) > self.max_size {
             return Ok(HighlightResult {
@@ -115,8 +136,7 @@ impl Highlighter {
             let cache = self.cache.lock().await;
             if let Some((_, entry)) = cache.iter().find(|(k, _)| *k == cache_key) {
                 if entry.mtime == mtime {
-                    let result = entry.result.clone();
-                    return Ok(apply_range(&result, start_line, end_line));
+                    return Ok(apply_range(&entry.cached, start_line, end_line));
                 }
             }
         }
@@ -126,19 +146,18 @@ impl Highlighter {
             .map_err(|e| format!("cannot read file: {e}"))?;
 
         if is_binary(&bytes) {
-            let result = Arc::new(HighlightResult {
-                html: String::new(),
+            let cached = Arc::new(CachedHighlight {
+                lines: Vec::new(),
+                pre_open: String::new(),
                 language: detect_language(path),
                 is_binary: true,
-                total_lines: 0,
                 file_size,
             });
-            self.store_cache(cache_key, mtime, result.clone()).await;
-            return Ok(apply_range(&result, start_line, end_line));
+            self.store_cache(cache_key, mtime, cached.clone()).await;
+            return Ok(apply_range(&cached, start_line, end_line));
         }
 
         let text = String::from_utf8_lossy(&bytes).to_string();
-        let total_lines = text.lines().count();
 
         let syntax = self
             .syntax_set
@@ -146,7 +165,6 @@ impl Highlighter {
             .ok()
             .flatten()
             .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
-
         let language = syntax.name.clone();
 
         let theme = self
@@ -156,38 +174,56 @@ impl Highlighter {
             .or_else(|| self.theme_set.themes.values().next())
             .ok_or("no syntax theme available")?;
 
-        let html = match highlighted_html_for_string(&text, &self.syntax_set, syntax, theme) {
-            Ok(html) => html,
-            Err(e) => {
-                warn!(?path, %e, "syntax highlighting failed, serving plain text");
-                escape_html(&text)
-            }
-        };
+        let bg = theme.settings.background.unwrap_or(Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0,
+        });
+        let pre_open = format!(
+            "<pre style=\"background-color:#{:02x}{:02x}{:02x};\">",
+            bg.r, bg.g, bg.b
+        );
 
-        let result = Arc::new(HighlightResult {
-            html,
+        // Highlight one source line at a time so a range request maps exactly to source lines.
+        let mut highlighter = HighlightLines::new(syntax, theme);
+        let mut lines = Vec::new();
+        for line in LinesWithEndings::from(&text) {
+            let fragment = match highlighter.highlight_line(line, &self.syntax_set) {
+                Ok(ranges) => styled_line_to_highlighted_html(&ranges, IncludeBackground::No)
+                    .unwrap_or_else(|_| escape_html(line)),
+                Err(e) => {
+                    warn!(?path, %e, "line highlighting failed, escaping");
+                    escape_html(line)
+                }
+            };
+            lines.push(fragment);
+        }
+
+        let cached = Arc::new(CachedHighlight {
+            lines,
+            pre_open,
             language: Some(language),
             is_binary: false,
-            total_lines,
             file_size,
         });
 
-        self.store_cache(cache_key, mtime, result.clone()).await;
-        Ok(apply_range(&result, start_line, end_line))
+        self.store_cache(cache_key, mtime, cached.clone()).await;
+        Ok(apply_range(&cached, start_line, end_line))
     }
 
-    /// Store a highlight result in the cache, evicting the oldest entry if full.
+    /// Store a cached highlight, evicting the oldest entry (FIFO) if full.
     async fn store_cache(
         &self,
         key: std::path::PathBuf,
         mtime: std::time::SystemTime,
-        result: Arc<HighlightResult>,
+        cached: Arc<CachedHighlight>,
     ) {
         let mut cache = self.cache.lock().await;
         if cache.len() >= MAX_CACHE_ENTRIES {
             cache.remove(0);
         }
-        cache.push((key, CacheEntry { mtime, result }));
+        cache.push((key, CacheEntry { mtime, cached }));
     }
 }
 
@@ -197,36 +233,39 @@ impl Default for Highlighter {
     }
 }
 
-/// Slice a cached highlight result to the requested 1-based line range.
+/// Build a [`HighlightResult`] for the requested 1-based inclusive line range from a cached file.
 ///
-/// The `file_size` field is always preserved from the cached full-file result,
-/// since range slicing doesn't change the underlying file size.
+/// Slicing operates on whole per-line HTML fragments, so the result is always a complete
+/// `<pre>…</pre>` and the returned lines correspond exactly to the requested source lines.
 fn apply_range(
-    result: &HighlightResult,
+    cached: &CachedHighlight,
     start: Option<usize>,
     end: Option<usize>,
 ) -> HighlightResult {
-    if result.is_binary || start.is_none() && end.is_none() {
-        return result.clone();
+    let total_lines = cached.lines.len();
+
+    if cached.is_binary || cached.file_size == 0 {
+        return HighlightResult {
+            html: String::new(),
+            language: cached.language.clone(),
+            is_binary: cached.is_binary,
+            total_lines,
+            file_size: cached.file_size,
+        };
     }
 
-    let start = start.unwrap_or(1).saturating_sub(1);
-    let end = end.unwrap_or(result.total_lines);
+    let start_idx = start.unwrap_or(1).saturating_sub(1).min(total_lines);
+    let end_idx = end.unwrap_or(total_lines).min(total_lines).max(start_idx);
 
-    let lines: Vec<&str> = result.html.lines().collect();
-    let slice: Vec<&str> = lines
-        .iter()
-        .skip(start)
-        .take(end.saturating_sub(start))
-        .copied()
-        .collect();
+    let body: String = cached.lines[start_idx..end_idx].concat();
+    let html = format!("{}{}</pre>", cached.pre_open, body);
 
     HighlightResult {
-        html: slice.join("\n"),
-        language: result.language.clone(),
-        is_binary: result.is_binary,
-        total_lines: result.total_lines,
-        file_size: result.file_size,
+        html,
+        language: cached.language.clone(),
+        is_binary: false,
+        total_lines,
+        file_size: cached.file_size,
     }
 }
 
@@ -306,6 +345,8 @@ mod tests {
         assert!(!result.is_binary);
         assert_eq!(result.total_lines, 3);
         assert!(result.html.contains("fn"));
+        assert!(result.html.starts_with("<pre"));
+        assert!(result.html.ends_with("</pre>"));
         assert_eq!(result.file_size, content.len() as u64);
     }
 
@@ -335,18 +376,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn highlight_line_range() {
+    async fn highlight_line_range_is_well_formed_and_correct() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        tokio::fs::write(tmp.path(), "line1\nline2\nline3\nline4\nline5\n")
+        // Distinct, easily-identifiable content per line.
+        tokio::fs::write(tmp.path(), "alpha\nbravo\ncharlie\ndelta\necho\n")
             .await
             .unwrap();
 
         let h = Highlighter::new();
-        let result = h
+        let full = h.highlight_file(tmp.path(), None, None).await.unwrap();
+        assert_eq!(full.total_lines, 5);
+        for word in ["alpha", "bravo", "charlie", "delta", "echo"] {
+            assert!(full.html.contains(word));
+        }
+
+        // Lines 2..=4 only.
+        let ranged = h
             .highlight_file(tmp.path(), Some(2), Some(4))
             .await
             .unwrap();
-        assert_eq!(result.total_lines, 5);
+        assert_eq!(ranged.total_lines, 5, "total_lines reflects the whole file");
+        assert!(
+            ranged.html.starts_with("<pre"),
+            "range output is well-formed"
+        );
+        assert!(ranged.html.ends_with("</pre>"));
+        assert!(ranged.html.contains("bravo"));
+        assert!(ranged.html.contains("charlie"));
+        assert!(ranged.html.contains("delta"));
+        assert!(
+            !ranged.html.contains("alpha"),
+            "line 1 must be excluded from range 2..=4"
+        );
+        assert!(
+            !ranged.html.contains("echo"),
+            "line 5 must be excluded from range 2..=4"
+        );
     }
 
     #[tokio::test]
