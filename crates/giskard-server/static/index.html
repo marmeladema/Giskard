@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Giskard</title>
+<style>
+  :root {
+    --bg:#0e1116; --panel:#161b22; --panel2:#1c2230; --border:#2b3240;
+    --fg:#e6edf3; --muted:#8b949e; --accent:#4f8cff; --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--fg); height:100vh; overflow:hidden; }
+  button { font:inherit; color:var(--fg); background:var(--panel2); border:1px solid var(--border); border-radius:6px; padding:6px 10px; cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  input,select,textarea { font:inherit; color:var(--fg); background:var(--panel2); border:1px solid var(--border); border-radius:6px; padding:6px 8px; }
+  .mono { font-family:var(--mono); }
+  .muted { color:var(--muted); }
+
+  /* login */
+  #login { display:flex; height:100vh; align-items:center; justify-content:center; }
+  #login .card { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:28px; width:320px; }
+  #login h1 { margin:0 0 4px; }
+
+  /* app grid */
+  #app { display:none; grid-template-columns:260px 1fr 300px; height:100vh; }
+  .col { height:100vh; overflow-y:auto; border-right:1px solid var(--border); }
+  .col:last-child { border-right:0; }
+  .sidebar { background:var(--panel); padding:12px; }
+  .center { display:flex; flex-direction:column; }
+  .ctx { background:var(--panel); padding:12px; }
+
+  .proj { margin-bottom:10px; }
+  .proj > .name { font-weight:600; display:flex; justify-content:space-between; align-items:center; }
+  .thread { padding:5px 8px; margin:3px 0 3px 8px; border-radius:6px; cursor:pointer; color:var(--muted); font-size:13px; }
+  .thread:hover { background:var(--panel2); }
+  .thread.active { background:var(--panel2); color:var(--fg); }
+
+  header.thr { display:flex; gap:12px; align-items:center; padding:10px 14px; border-bottom:1px solid var(--border); background:var(--panel); flex-wrap:wrap; }
+  header.thr .badge { font-size:12px; padding:2px 8px; border:1px solid var(--border); border-radius:20px; }
+  header.thr .gauge { margin-left:auto; font-size:12px; }
+
+  #transcript { flex:1; overflow-y:auto; padding:16px; }
+  .msg { max-width:80%; margin:10px 0; padding:10px 12px; border-radius:10px; white-space:pre-wrap; word-wrap:break-word; }
+  .msg.user { background:var(--accent); color:#fff; margin-left:auto; }
+  .msg.agent { background:var(--panel2); }
+  .msg.reasoning { background:transparent; border:1px dashed var(--border); color:var(--muted); font-size:13px; }
+  .msg.cmd { background:#0b0e13; border:1px solid var(--border); }
+  .msg .role { font-size:11px; text-transform:uppercase; letter-spacing:.05em; opacity:.7; margin-bottom:4px; }
+  pre.out { margin:0; font-family:var(--mono); font-size:12.5px; white-space:pre-wrap; }
+
+  .composer { display:flex; gap:8px; padding:12px; border-top:1px solid var(--border); background:var(--panel); }
+  .composer textarea { flex:1; resize:none; height:52px; }
+
+  .notice { margin:8px 0; padding:8px 10px; border-radius:8px; border:1px solid var(--border); font-size:13px; }
+  .notice.err { border-color:#f85149; color:#ffb4ae; }
+  h3.sec { margin:16px 0 8px; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  .row { display:flex; gap:6px; margin:6px 0; }
+  .kv { font-size:13px; margin:4px 0; }
+  .kv b { color:var(--muted); font-weight:500; }
+</style>
+</head>
+<body>
+  <div id="login">
+    <form class="card" id="loginForm">
+      <h1>Giskard</h1>
+      <p class="muted">Enter the app password to continue.</p>
+      <div class="row"><input id="pw" type="password" placeholder="Password" style="flex:1" autofocus /></div>
+      <div class="row"><button class="primary" type="submit" style="flex:1">Log in</button></div>
+      <div id="loginErr" class="muted"></div>
+    </form>
+  </div>
+
+  <div id="app">
+    <div class="col sidebar">
+      <div class="row"><b style="flex:1">Projects</b><button id="newProj" title="New project">+</button></div>
+      <div id="projects"></div>
+    </div>
+
+    <div class="col center">
+      <header class="thr" id="thrHeader" style="display:none">
+        <span class="badge mono" id="thrTitle">—</span>
+        <button id="modeBtn" class="badge" title="Toggle Plan/Build">build</button>
+        <select id="modelSel" class="mono"></select>
+        <span class="gauge muted mono" id="gauge">0 / 0</span>
+      </header>
+      <div id="transcript" class="muted" style="padding:24px">Select or create a thread to begin.</div>
+      <div class="composer" id="composer" style="display:none">
+        <textarea id="input" placeholder="Message the agent…  (Enter to send, Shift+Enter for newline)"></textarea>
+        <button class="primary" id="sendBtn">Send</button>
+      </div>
+    </div>
+
+    <div class="col ctx">
+      <h3 class="sec">Thread</h3>
+      <div id="ctxInfo" class="muted">No thread open.</div>
+      <h3 class="sec">Tokens</h3>
+      <div id="ctxTokens" class="muted">—</div>
+      <div id="notices"></div>
+    </div>
+  </div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let state = { projectId:null, threadId:null, mode:"build", ws:null, models:[], streamEl:null };
+
+async function api(method, path, body) {
+  const opts = { method, headers:{} };
+  if (body !== undefined) { opts.headers["Content-Type"]="application/json"; opts.body=JSON.stringify(body); }
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error((await r.text()) || r.status);
+  const ct = r.headers.get("content-type")||"";
+  return ct.includes("json") ? r.json() : r.text();
+}
+
+/* ---------- auth ---------- */
+$("loginForm").onsubmit = async (e) => {
+  e.preventDefault();
+  try {
+    const res = await api("POST","/api/login",{ password:$("pw").value });
+    if (res && res.ok === false) { $("loginErr").textContent="Wrong password."; return; }
+    startApp();
+  } catch (err) { $("loginErr").textContent = "Login failed: "+err.message; }
+};
+
+async function startApp() {
+  $("login").style.display="none";
+  $("app").style.display="grid";
+  try { state.models = (await api("GET","/api/models")).models || []; } catch { state.models=[]; }
+  renderModelSelect();
+  await loadProjects();
+}
+
+/* ---------- projects & threads ---------- */
+async function loadProjects() {
+  const { projects } = await api("GET","/api/projects");
+  const box = $("projects"); box.innerHTML="";
+  for (const p of projects) {
+    const d = document.createElement("div"); d.className="proj";
+    const name = document.createElement("div"); name.className="name";
+    const label = document.createElement("span"); label.textContent = p.name;
+    const add = document.createElement("button"); add.textContent="+"; add.title="New thread";
+    add.onclick = () => newThread(p.id);
+    name.append(label, add); d.append(name);
+    const threads = document.createElement("div"); threads.id = "threads-"+p.id; d.append(threads);
+    box.append(d);
+    loadThreads(p.id);
+  }
+}
+
+async function loadThreads(pid) {
+  const box = $("threads-"+pid); if (!box) return;
+  try {
+    const { threads } = await api("GET",`/api/projects/${pid}/threads`);
+    box.innerHTML="";
+    for (const t of threads) {
+      const el = document.createElement("div"); el.className="thread mono";
+      el.textContent = t.title || t.id.slice(0,8); el.dataset.tid = t.id;
+      el.onclick = () => openThread(pid, t.id, t.title);
+      box.append(el);
+    }
+  } catch {}
+}
+
+$("newProj").onclick = async () => {
+  const name = prompt("Project name?"); if (!name) return;
+  const dir = prompt("Project directory (absolute path on the server)?"); if (!dir) return;
+  const model = state.models[0]
+    ? { provider: state.models[0].provider, model: state.models[0].model, reasoning_effort:null }
+    : { provider:"openai", model:"gpt-5.5", reasoning_effort:null };
+  try {
+    await api("POST","/api/projects",{ name, dir, default_model:model, approval_policy:"auto" });
+    await loadProjects();
+  } catch (e) { alert("Create project failed: "+e.message); }
+};
+
+async function newThread(pid) {
+  try {
+    const res = await api("POST",`/api/projects/${pid}/threads`,{ resume:null });
+    await loadThreads(pid);
+    openThread(pid, res.thread_id, "New thread");
+  } catch (e) { alert("New thread failed: "+e.message); }
+}
+
+/* ---------- thread view + websocket ---------- */
+function openThread(pid, tid, title) {
+  state.projectId = pid; state.threadId = tid; state.streamEl = null;
+  document.querySelectorAll(".thread").forEach(e => e.classList.toggle("active", e.dataset.tid===tid));
+  $("thrHeader").style.display="flex"; $("composer").style.display="flex";
+  $("thrTitle").textContent = title || tid.slice(0,8);
+  $("transcript").className=""; $("transcript").innerHTML=""; $("notices").innerHTML="";
+  connectWs();
+}
+
+function connectWs() {
+  if (state.ws) { try { state.ws.close(); } catch {} }
+  const proto = location.protocol==="https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/api/ws`);
+  state.ws = ws;
+  ws.onopen = () => send({ type:"subscribe", thread_id: state.threadId });
+  ws.onmessage = (m) => handleServer(JSON.parse(m.data));
+  ws.onclose = () => {};
+}
+function send(obj) { if (state.ws && state.ws.readyState===1) state.ws.send(JSON.stringify(obj)); }
+
+function handleServer(msg) {
+  switch (msg.type) {
+    case "thread_state": renderThreadState(msg.state); break;
+    case "event": handleEvent(msg.agent_event); break;
+    case "token_update": renderTokens(msg.ledger); break;
+    case "approval_request": notice("Approval requested: "+JSON.stringify(msg.request.kind)); break;
+    case "error": notice(msg.message||"error", true); break;
+  }
+}
+
+function renderThreadState(s) {
+  if (!s) return;
+  state.mode = s.mode || "build";
+  $("modeBtn").textContent = state.mode;
+  if (s.current_model) setModel(`${s.current_model.provider}/${s.current_model.model}`);
+  $("ctxInfo").innerHTML =
+    `<div class="kv"><b>title</b> ${escapeHtml(s.title||"")}</div>` +
+    `<div class="kv"><b>mode</b> ${s.mode}</div>` +
+    `<div class="kv mono"><b>model</b> ${s.current_model? s.current_model.provider+"/"+s.current_model.model : "—"}</div>`;
+  if (s.tokens) renderTokens(s.tokens);
+  updateGauge(s.tokens ? s.tokens.total.total : 0, s.context_window || 0);
+  // Replay persisted history.
+  $("transcript").innerHTML="";
+  for (const turn of (s.turns||[])) {
+    for (const it of (turn.items||[])) addItem(it.payload);
+  }
+}
+
+function handleEvent(ev) {
+  switch (ev.kind) {
+    case "turn_started": state.streamEl = null; break;
+    case "item_delta":
+      if (ev.delta && ev.delta.type==="text") appendStream(ev.delta.text);
+      else if (ev.delta && ev.delta.type==="command_output") appendStream(ev.delta.chunk);
+      break;
+    case "item_completed": state.streamEl=null; addItem(ev.item.payload); break;
+    case "turn_completed": state.streamEl=null; break;
+    case "approval_requested": notice("Approval requested"); break;
+    case "error": notice(ev.error ? JSON.stringify(ev.error) : "error", true); break;
+  }
+}
+
+function bubble(cls, role) {
+  const el = document.createElement("div"); el.className="msg "+cls;
+  const r = document.createElement("div"); r.className="role"; r.textContent=role;
+  const body = document.createElement("div"); body.className="body";
+  el.append(r, body); $("transcript").append(el);
+  $("transcript").scrollTop = $("transcript").scrollHeight;
+  return body;
+}
+function appendStream(text) {
+  if (!state.streamEl) state.streamEl = bubble("agent","agent");
+  state.streamEl.textContent += text;
+  $("transcript").scrollTop = $("transcript").scrollHeight;
+}
+function addItem(p) {
+  if (!p) return;
+  if (p.kind==="user_message") bubble("user","you").textContent = p.text;
+  else if (p.kind==="agent_message") bubble("agent","agent").textContent = p.text;
+  else if (p.kind==="reasoning") bubble("reasoning","reasoning").textContent = p.text;
+  else if (p.kind==="command_execution") {
+    const b = bubble("cmd","command");
+    b.innerHTML = `<div class="mono">$ ${escapeHtml(p.command)}</div><pre class="out">${escapeHtml(p.output||"")}</pre>`;
+  }
+}
+
+/* ---------- composer + controls ---------- */
+function sendInput() {
+  const ta = $("input"); const text = ta.value.trim(); if (!text || !state.threadId) return;
+  bubble("user","you").textContent = text;
+  send({ type:"send_input", thread_id: state.threadId, text });
+  ta.value="";
+}
+$("sendBtn").onclick = sendInput;
+$("input").addEventListener("keydown", (e) => { if (e.key==="Enter" && !e.shiftKey) { e.preventDefault(); sendInput(); } });
+
+$("modeBtn").onclick = () => {
+  state.mode = state.mode==="build" ? "plan" : "build";
+  $("modeBtn").textContent = state.mode;
+  send({ type:"switch_mode", thread_id: state.threadId, mode: state.mode });
+};
+
+function renderModelSelect() {
+  const sel = $("modelSel"); sel.innerHTML="";
+  for (const m of state.models) {
+    const o = document.createElement("option");
+    o.value = `${m.provider}/${m.model}`; o.textContent = m.display_name || m.model; o.dataset.provider=m.provider; o.dataset.model=m.model;
+    sel.append(o);
+  }
+  if (!state.models.length) { const o=document.createElement("option"); o.textContent="(no models configured)"; sel.append(o); }
+  sel.onchange = () => {
+    const opt = sel.selectedOptions[0]; if (!opt || !opt.dataset.model) return;
+    send({ type:"select_model", thread_id: state.threadId, model_ref:{ provider:opt.dataset.provider, model:opt.dataset.model, reasoning_effort:null } });
+  };
+}
+function setModel(key) { const sel=$("modelSel"); for (const o of sel.options) if (o.value===key) { o.selected=true; break; } }
+
+function renderTokens(led) {
+  if (!led || !led.total) return;
+  $("ctxTokens").innerHTML =
+    `<div class="kv"><b>total</b> ${led.total.total.toLocaleString()}</div>` +
+    `<div class="kv"><b>in / out</b> ${led.total.input.toLocaleString()} / ${led.total.output.toLocaleString()}</div>`;
+  updateGauge(led.total.total, state.contextWindow||0);
+}
+function updateGauge(used, window) {
+  state.contextWindow = window || state.contextWindow || 0;
+  const w = state.contextWindow;
+  $("gauge").textContent = w ? `${fmt(used)} / ${fmt(w)}` : `${fmt(used)} tokens`;
+}
+function fmt(n) { return n>=1000 ? (n/1000).toFixed(1)+"k" : String(n); }
+function notice(text, err) {
+  const el = document.createElement("div"); el.className="notice"+(err?" err":""); el.textContent=text;
+  $("notices").prepend(el); setTimeout(()=>el.remove(), 8000);
+}
+function escapeHtml(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+
+/* Try to enter the app directly if already authenticated. */
+(async () => { try { await api("GET","/api/projects"); startApp(); } catch {} })();
+</script>
+</body>
+</html>

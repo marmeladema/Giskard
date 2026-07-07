@@ -50,7 +50,15 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
 }
 
 pub fn public_routes() -> Router<AppState> {
-    Router::new().route("/api/login", post(login))
+    Router::new()
+        .route("/", get(index))
+        .route("/api/login", post(login))
+}
+
+/// Serve the single-page desktop UI (§13). Self-contained HTML/CSS/JS (no npm); it authenticates
+/// via `/api/login` and drives the app through the same REST + WS API as any client.
+async fn index() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("../static/index.html"))
 }
 
 async fn login(
