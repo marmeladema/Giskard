@@ -1,0 +1,36 @@
+[package]
+name = "giskard-persist"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+giskard-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+chrono = { workspace = true }
+tracing = "0.1"
+fastrand = "2"
+ulid = { workspace = true }
+
+[dependencies.argon2]
+version = "0.5"
+features = ["std"]
+
+[dependencies.rand]
+version = "0.8"
+
+[dependencies.rpassword]
+version = "7"
+
+[dependencies.dirs-next]
+version = "2"
+
+[[bin]]
+name = "giskard-admin"
+path = "src/bin/giskard_admin.rs"

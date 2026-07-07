@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/giskard-core",
+    "crates/giskard-harness",
+    "crates/giskard-harness-codex",
+    "crates/giskard-harness-replay",
+    "crates/giskard-persist",
+    "crates/giskard-server",
+    "crates/giskard-ui",
+    "crates/giskard-proto",
+]
+default-members = [
+    "crates/giskard-core",
+    "crates/giskard-harness",
+    "crates/giskard-persist",
+    "crates/giskard-proto",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+giskard-core = { path = "crates/giskard-core" }
+giskard-harness = { path = "crates/giskard-harness" }
+giskard-harness-codex = { path = "crates/giskard-harness-codex" }
+giskard-harness-replay = { path = "crates/giskard-harness-replay" }
+giskard-persist = { path = "crates/giskard-persist" }
+giskard-proto = { path = "crates/giskard-proto" }
+giskard-server = { path = "crates/giskard-server" }
+giskard-ui = { path = "crates/giskard-ui" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ulid = { version = "1", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+tempfile = "3"
+toml = "0.8"
+futures = "0.3"
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-cookies = "0.11"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+argon2 = "0.5"
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hex = "0.4"
