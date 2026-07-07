@@ -339,7 +339,6 @@ mod tests {
                 UserInput::text("test"),
                 TurnOverrides {
                     model: None,
-                    reasoning_effort: None,
                     mode: Mode::Build,
                     approval_policy: giskard_core::turn::ApprovalPolicy::Auto,
                 },

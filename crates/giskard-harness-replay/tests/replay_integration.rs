@@ -135,7 +135,6 @@ async fn open_thread_one_turn_assert_state() {
                     model: "gpt-5.5".into(),
                     reasoning_effort: None,
                 }),
-                reasoning_effort: None,
                 mode: Mode::Build,
                 approval_policy: ApprovalPolicy::Auto,
             },
@@ -260,7 +259,6 @@ async fn replay_persisted_state_roundtrip() {
             UserInput::text("test"),
             giskard_core::turn::TurnOverrides {
                 model: None,
-                reasoning_effort: None,
                 mode: Mode::Plan,
                 approval_policy: ApprovalPolicy::ReadOnly,
             },
@@ -315,6 +313,8 @@ async fn replay_persisted_state_roundtrip() {
             reasoning_effort: None,
         },
         context_window: 262_144,
+        approval_policy: None,
+        model_efforts: std::collections::HashMap::new(),
         tokens: giskard_core::token::TokenLedger {
             total: usage,
             by_model: Default::default(),

@@ -152,6 +152,8 @@ mod tests {
             mode: Mode::Plan,
             current_model: model(),
             context_window: 0,
+            approval_policy: None,
+            model_efforts: std::collections::HashMap::new(),
             tokens: TokenLedger::default(),
             created_at: Utc::now(),
             updated_at: Utc::now(),

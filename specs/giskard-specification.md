@@ -8,7 +8,7 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.3
+**Version:** 1.4
 
 **Changelog (1.0 → 1.1), from review:**
 - Resolved thread token schema vs §10.2: thread `tokens` now carries `total` + `by_model` (§5.3).
@@ -79,6 +79,39 @@
   (`minimal | low | medium | high | xhigh`) instead of hardcoding three values (§4.5, §8.5).
 - **S5:** Documented that project ordering defaults to ULID creation order; the `projects.json`
   `order` field is reserved for a future manual/drag reorder and is not yet surfaced by the UI (§5.3).
+
+**Changelog (1.3 → 1.4), from review (Phase 3 contract hardening):**
+- **P1:** Removed the effort double-home: `TurnOverrides.reasoning_effort` is dropped — effort
+  lives only in `ModelRef.reasoning_effort` (§8.1). `TurnOverrides` is now a **resolved snapshot**
+  (not a delta): the server builds it at `start_turn` from the thread's current mode, current model
+  (which carries effort), and effective approval policy. `TurnOverrides.model = None` means "reuse
+  the thread's current model." `TurnOverrides.approval_policy` remains in the struct but is now the
+  **resolved effective policy** (read from project/thread config or coerced), not a per-turn
+  override — see P3 (§7.5).
+- **P2:** `SwitchMode` and `SelectModel` now **persist immediately** and echo state: the new
+  mode/current_model is written to `<thread_id>.json` before the server returns, then a
+  `ThreadState` is broadcast to all connected tabs so they stay in sync. The sandbox/model effect
+  still takes hold at the next turn; only the stored intent is now durable (§7.4, §13.6).
+- **P3:** Downgraded the "overridable per turn" approval-policy claim: policy is now **per-project**
+  (optionally per-thread), settable via a new `SetApprovalPolicy { thread_id | project_id, policy }`
+  client message that persists + echoes like P2. `TurnOverrides.approval_policy` is no longer a
+  per-turn override — it is the resolved effective policy the server reads from config and includes
+  in the snapshot so the harness can pass it to `turn/start` (§9.1, §13.6).
+- **P4:** The plan-dump write path (§7.4.1) now explicitly cross-references §6.2's path-confinement:
+  the resolved path is canonicalized and anything escaping the workspace root is rejected before
+  writing.
+- **C6:** Confirmed "current plan" = strictly the single most recent Plan-mode turn; no
+  concatenation of earlier plan turns, even when they held content the user might expect (§7.4.1).
+- **C7:** Per-model effort retention: switching away from a reasoning model preserves its effort
+  value; switching back restores it. The effort param is never sent when the active model doesn't
+  support it (§8.5 already handles the send-side) (§8.4).
+- **C8:** Policy coercion for degraded harnesses: on harness attach, if the harness lacks
+  `live_approvals` and the stored policy is `ask`, the effective policy is coerced to `read_only`
+  for that session without overwriting the stored value, and a notice is surfaced (§9.4).
+- **S6:** Approval diff preview in Phase 3 uses the **raw diff string** from the harness; structured
+  `FileDiff` parsing is deferred to Phase 4 (§9.2, §15).
+- **S7:** When `plan_build_modes = false`, `Mode` resolves to the Build-equivalent (workspace-write)
+  single mode, so `TurnOverrides` is well-defined for every harness (§7.5, §13.5).
 
 ---
 
@@ -273,7 +306,8 @@ A single Cargo workspace with focused crates. Names are prefixed `giskard-`.
   - **`codex-codes`** (v0.143.0) — **recommended first choice.** Typed Rust SDK for the Codex
     CLI app-server JSON-RPC protocol, tested against Codex CLI 0.143.0 (≈ installed 0.142.5).
     Provides `AsyncClient` (Tokio) with `start()` (process spawn), `thread_start`, `turn_start`
-    (accepting `model`, `reasoning_effort`, `sandbox_policy` — mapping 1:1 to `TurnOverrides`),
+    (accepting `model`, `reasoning_effort`, `sandbox_policy` — mapping onto `TurnOverrides`
+    + `ModelRef.reasoning_effort`, P1),
     `next_message()` (streaming `ServerMessage::Notification/Request`), `respond()` (approval
     decisions), and `shutdown()`. Feature flags: `async-client` (Tokio), `types` (WASM-compatible
     serde models only). Includes a **schema coverage scorecard** that validates typed structs
@@ -403,7 +437,7 @@ pub trait AgentHarness: Send + Sync {
         opts: OpenThreadOptions,
     ) -> Result<ThreadHandle, HarnessError>;
 
-    /// Start a turn: send user input, applying per-turn overrides (model, mode, effort).
+    /// Start a turn: send user input, applying per-turn overrides (model, mode).
     async fn start_turn(
         &self,
         thread: &ThreadHandle,
@@ -666,7 +700,7 @@ The `CodexHarness` maps the Codex app-server JSON-RPC protocol onto the above. K
 |------------------|---------|
 | `initialize` + `initialized` handshake | **once per process** (per project), during process spawn — not per thread (S1) |
 | `thread/start`, `thread/resume` | `open_thread` (S1: this is the per-thread call, distinct from the handshake) |
-| `turn/start` (with model/effort/sandbox per turn) | `start_turn` + `TurnOverrides` |
+| `turn/start` (with model/effort/sandbox per turn) | `start_turn` + `TurnOverrides` (P1: effort lives in `ModelRef`, not `TurnOverrides`) |
 | `item/started`, `item/*/delta`, `item/completed` | `ItemStarted` / `ItemDelta` / `ItemCompleted` |
 | `turn/diff/updated` | `DiffUpdated` |
 | `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval` | `ApprovalRequested` |
@@ -804,6 +838,11 @@ All defined in `giskard-core`, serialized by `giskard-persist`. Illustrative sha
   "context_window": 262144,              // CACHE ONLY (C4): derived from current_model's descriptor;
                                          //   recomputed from current_model on load — not a source of
                                          //   truth. May be omitted; a corrected config value wins.
+  "model_efforts": {                     // C7: per-model effort retention. Maps "provider/model"
+    "openai/gpt-5.5": "high"             //   → stored Effort, so switching back to a reasoning model
+  },                                     //   restores the user's last effort choice. Entries are
+                                         //   created/updated on SelectModel when the outgoing model
+                                         //   supports reasoning_effort.
   "tokens": {
     "total": { "input": 12000, "output": 3400, "total": 15400 },
     "by_model": {                        // nested object (C3): provider → model → usage.
@@ -944,8 +983,9 @@ Flow: user clicks "New project" → names it → picks a directory via the file 
 
 - **Create:** user starts a new thread in a project; server calls `open_thread` (Codex
   `thread/start`), stores the returned `harness_thread_id`, writes `<thread_id>.json`.
-- **Send input:** user submits a message; server calls `start_turn` with the thread's current
-  mode/model/effort as `TurnOverrides`. A turn begins.
+- **Send input:** user submits a message; server builds a `TurnOverrides` snapshot from the
+  thread's persisted state (mode, current model — which carries effort) and calls `start_turn`.
+  A turn begins.
 - **Stream:** `AgentEvent`s flow to the UI (§13.6) and update persisted state.
 - **Complete:** on `TurnCompleted`, token usage is folded into the ledgers (§10) and the
   thread file is rewritten atomically.
@@ -981,6 +1021,12 @@ Auto-generate an initial title from the first user message (truncated); user-edi
 - The mode applied to a turn is the thread's mode **at the moment `start_turn` is called**
   (Codex takes sandbox per turn). Switching mode takes effect on the next turn; the UI makes
   this explicit ("Plan mode — next message will be read-only").
+- **Durable switch (P2).** `SwitchMode` and `SelectModel` **persist immediately**: the new
+  `mode` / `current_model` is written to `<thread_id>.json` before the server acknowledges, then
+  a `ThreadState` is broadcast to all connected tabs so they stay in sync. This satisfies the §5
+  "same state after restart" requirement — a switch is not lost if the app restarts before the user
+  sends the next message. The sandbox/model *effect* still takes hold at the next turn (Codex
+  accepts these per `turn/start`); only the stored *intent* is durable now.
 - **Switching back and forth** is fully supported (Plan → Build → Plan …).
 
 #### 7.4.1 Plan dump to markdown
@@ -992,24 +1038,51 @@ Auto-generate an initial title from the first user message (truncated); user-edi
   created.
 - **What constitutes "the current plan":** the concatenation of the agent-message items of
   the **most recent Plan-mode turn** in the thread (i.e. the latest plan the agent produced),
-  rendered to markdown. If multiple plan turns exist, the latest wins; the dialog shows a
-  preview so the user can confirm. (Rationale: simplest unambiguous rule; avoids trying to
-  detect "the plan" heuristically across the whole thread.)
+  rendered to markdown. This is **strictly the single most recent Plan-mode turn** — no
+  concatenation of earlier plan turns, even when earlier plan turns held content the user might
+  expect (C6). If multiple plan turns exist, the latest wins; the dialog shows a preview so the
+  user can confirm. (Rationale: simplest unambiguous rule; avoids trying to detect "the plan"
+  heuristically across the whole thread.)
 - Writing the plan file is a normal file write within the workspace root; it is **not** gated
   by the agent approval flow (it's a user action, not an agent action), but it respects the
-  workspace-root boundary.
+  workspace-root boundary. **Path confinement (P4):** the resolved path is canonicalized and
+  anything escaping the workspace root (via `..` or symlink) is rejected before writing, using
+  the same hardening specified for the browse endpoint in §6.2. A user-edited path like
+  `../../etc/foo.md` must hit this check on write, not just on browse.
 - After saving, the UI links the new file (openable in the code overlay, §11.2).
 
 ### 7.5 `TurnOverrides`
 
 ```rust
 pub struct TurnOverrides {
-    pub model: Option<ModelRef>,          // per-turn model (change between turns)
-    pub reasoning_effort: Option<Effort>, // medium | high | xhigh (model-dependent)
+    pub model: Option<ModelRef>,          // None ⇒ reuse the thread's current model
     pub mode: Mode,                       // plan | build → sandbox policy
-    pub approval_policy: ApprovalPolicy,  // from project config, overridable per turn
+    pub approval_policy: ApprovalPolicy,  // resolved effective policy (NOT a per-turn override, P3)
 }
 ```
+
+`TurnOverrides` is a **resolved snapshot**, not a delta. The server constructs it at
+`start_turn` by reading the thread's persisted state:
+
+- **`mode`** — from `thread.mode` (the thread's current mode, switchable via `SwitchMode`, §7.4).
+- **`model`** — `None` means "reuse the thread's `current_model`." The server always resolves it
+  to the effective `ModelRef` (which carries `reasoning_effort` in itself, §8.1) before passing it
+  to the harness, so there is exactly one home for effort. A non-`None` value would override the
+  thread's model for this turn only (not persisted); in practice the UI persists model changes via
+  `SelectModel` (P2) and sends `None` here.
+- **`approval_policy`** — the **resolved effective policy**, read from the project config (or
+  thread-level override, or coerced value for a degraded harness, §9.4). This is **not** a per-turn
+  override (P3): the user cannot set it per turn. It appears in the snapshot because the harness
+  needs it to pass to `turn/start`. It is set persistently via `SetApprovalPolicy` (§13.6).
+
+**Effort lives only in `ModelRef.reasoning_effort`** (P1). There is no standalone
+`TurnOverrides.reasoning_effort` field — it was removed to eliminate the double-home. The
+effective effort is read from `current_model.reasoning_effort` and is sent to the harness only when
+the active model advertises `supports_reasoning_effort` (§8.5).
+
+**When `plan_build_modes = false`** (S7): `Mode` resolves to `Build` (the workspace-write
+single mode), so `TurnOverrides` is well-defined for every harness regardless of capability.
+The Plan/Build toggle is hidden in the UI (§13.5) and `Mode::Build` is always used.
 
 ---
 
@@ -1081,6 +1154,13 @@ LiteLLM gateway fronting Cloudflare Workers AI.
   model's descriptor and the context gauge (§10.3) recomputes. Because the value is a cache derived
   from `current_model`, it is also recomputed on load, so a corrected config `context_window` takes
   effect without a migration.
+- **Per-model effort retention (C7).** When switching from a reasoning model (e.g.
+  `effort = high`) to one with `supports_reasoning_effort = false`, the old model's effort value is
+  **retained** in a per-thread `model_efforts` map keyed by `(provider, model)`. Switching back to
+  the reasoning model restores the stored effort automatically. The effort parameter is never sent
+  to the harness when the active model doesn't support it (§8.5 already handles the send-side). This
+  means a user can toggle between a reasoning and a non-reasoning model without losing their effort
+  preference on the reasoning model.
 
 ### 8.5 Reasoning effort
 
@@ -1096,14 +1176,20 @@ LiteLLM gateway fronting Cloudflare Workers AI.
 
 > "Permissions" here = **agent action approvals**, not user roles. There is exactly one user.
 
-### 9.1 Policy per project (overridable per turn)
+### 9.1 Policy per project (optionally per thread)
 
-`ApprovalPolicy` (stored in `project.json`, overridable in `TurnOverrides`):
+`ApprovalPolicy` (stored in `project.json`, optionally overridden per thread):
 
 - **`read_only`** — strictly no writes/exec (natural companion to Plan mode).
 - **`ask`** — the agent must request approval for each command execution and file change;
   the UI prompts the user.
 - **`auto`** — approvals are granted automatically (full-auto within the workspace sandbox).
+
+Policy is a **project-level** setting (and optionally thread-level), **not** a per-turn override
+(P3). It is settable via the `SetApprovalPolicy` client message (§13.6), which persists immediately
+and echoes a `ThreadState` to all connected tabs — the same durable-switch pattern as
+`SwitchMode`/`SelectModel` (P2). The `ask` policy is only offered when the active harness
+advertises `live_approvals` (§9.4); otherwise it is coerced at attach time.
 
 **Interaction with Plan mode.** Mode (Plan/Build) and approval policy are **orthogonal
 settings**, but Plan mode makes the policy largely moot: in Plan mode the harness sandbox is
@@ -1120,6 +1206,10 @@ the project's `approval_policy`.
    `CodexHarness` maps it to `AgentEvent::ApprovalRequested` with the details (command, cwd,
    reason, target path, and the set of available decisions).
 2. UI shows a non-blocking prompt scoped to the thread (with the command/diff preview).
+   **Phase 3 (S6):** the preview uses the **raw diff string** from the harness (the text carried
+   in the `ApprovalRequest`'s reason/detail). Structured `FileDiff` parsing and the side-by-side
+   diff viewer are Phase 4 (§11, §15); the dependency is stated here so it is not discovered as a
+   gap later.
 3. User chooses a decision; server calls `respond_approval`.
 
 **Decision granularity** (mirrors Codex):
@@ -1157,6 +1247,16 @@ Concretely:
 If the active harness lacks `live_approvals`, the UI hides live prompts and the project must
 run in `auto` or `read_only` (the picker disables `ask`). This keeps the experience coherent
 across harnesses.
+
+**Policy coercion (C8).** `approval_policy` is persisted per project, so a project created under
+Codex (which supports `live_approvals`) may store `ask`, then later be opened under a degraded
+harness that lacks `live_approvals`. On harness attach, if the harness lacks `live_approvals` and
+the stored policy is `ask`, the server coerces the **effective** policy to `read_only` for that
+session **without overwriting the stored value**, and surfaces a notice to the UI ("Approval policy
+'ask' is not supported by this harness — running as read-only for this session"). If the harness
+later regains the capability (e.g. after a reconnect to a full-capability harness), the stored
+`ask` policy takes effect again. This is latent under v1 (Codex only) but is specified now while
+the approvals design is fresh.
 
 
 ---
@@ -1367,7 +1467,8 @@ The UI reads `HarnessCapabilities` for the active harness and adapts:
 
 - No `live_approvals` ⇒ hide approval prompts; approval-policy picker offers only
   `auto`/`read_only`.
-- No `plan_build_modes` ⇒ hide the Plan/Build toggle (thread is single-mode).
+- No `plan_build_modes` ⇒ hide the Plan/Build toggle (thread is single-mode). `Mode` resolves to
+  `Build` (workspace-write) so `TurnOverrides` is always well-defined (S7).
 - No `per_turn_model` ⇒ model is fixed at thread creation (picker disabled mid-thread).
 - No `reasoning_effort` or model doesn't support it ⇒ hide the effort selector.
 - No `structured_diffs` ⇒ hide the Diffs tab (or show a plain textual change summary).
@@ -1382,8 +1483,17 @@ This guarantees a coherent experience when a future, less-capable harness is plu
 
 **Client → server** (examples): `Subscribe { thread_id }`, `Unsubscribe { thread_id }`,
 `SendInput { thread_id, text }`, `SwitchMode { thread_id, mode }`,
-`SelectModel { thread_id, model_ref }`, `Interrupt { thread_id }`,
-`ApprovalDecision { request_id, decision }`, `SavePlan { thread_id, path }`.
+`SelectModel { thread_id, model_ref }`, `SetApprovalPolicy { thread_id?, project_id?, policy }`,
+`Interrupt { thread_id }`, `ApprovalDecision { request_id, decision }`,
+`SavePlan { thread_id, path }`.
+
+> **Durable settings switches (P2/P3).** `SwitchMode`, `SelectModel`, and `SetApprovalPolicy`
+> persist immediately to `<thread_id>.json` (or `project.json` for project-scoped policy) before
+> the server acknowledges, then broadcast a `ThreadState` to all connected tabs. This guarantees
+> the §5 "same state after restart" requirement: a switch is not lost if the app restarts before
+> the user sends the next message. The sandbox/model/policy *effect* still takes hold at the next
+> turn; only the stored *intent* is durable now. `SetApprovalPolicy` accepts either a `thread_id`
+> (thread-scoped override) or a `project_id` (project-level default); exactly one must be set.
 
 > **`SendInput` carries text only in v1.** Image/file attachments are out of scope (matching
 > `UserInput` in §4.5). If added later, extend both `UserInput` and this message together.
@@ -1508,7 +1618,8 @@ open thread; send input; streamed transcript. E2E smoke: login → project → t
 
 **Phase 3 — Modes, models, approvals.** Plan/Build toggle + per-turn sandbox mapping; plan
 dump to markdown; model picker (static list) + per-turn model change + reasoning effort;
-approval policy + live approval prompts + decision routing. Tests for each via replay.
+approval policy + live approval prompts + decision routing. Approval diff preview uses the raw
+diff string (S6); structured `FileDiff` parsing is deferred to Phase 4. Tests for each via replay.
 
 **Phase 4 — Visualization.** Side-by-side diff viewer from `DiffUpdated`; path linkification;
 code overlay with `syntect` highlighting + download; large-file virtualization/pagination.
@@ -1571,8 +1682,10 @@ codex app-server generate-ts          --out schemas/   # reference only; not use
 Artifacts are version-pinned to the Codex binary that produced them; regenerate on upgrade.
 
 > Sandbox/mode mapping: **Plan ⇒ `read-only`**, **Build ⇒ `workspace-write`**. Approval policy
-> maps to Codex's approval configuration. `TurnOverrides.model` / `reasoning_effort` map to the
-> per-turn `turn/start` model & effort fields.
+> maps to Codex's approval configuration. `TurnOverrides.model` maps to the per-turn `turn/start`
+> model field; reasoning effort is carried inside `ModelRef.reasoning_effort` (P1: no standalone
+> effort field on `TurnOverrides`). `TurnOverrides.approval_policy` is the resolved effective
+> policy (P3: not a per-turn override).
 
 **Client library:** use `codex-codes` (v0.143.0, tested against Codex CLI 0.143.0) with the
 `async-client` feature — its `AsyncClient` API (`start`, `thread_start`, `turn_start`,
@@ -1592,6 +1705,7 @@ preserve the raw-JSON fallback for unknown/drifted messages.
 { "type": "SelectModel", "thread_id": "01J…",
   "model_ref": { "provider": "cloudflare-litellm", "model": "@cf/z-ai/glm-4.7",
                  "reasoning_effort": null } }
+{ "type": "SetApprovalPolicy", "project_id": "01J…", "policy": "auto" }
 { "type": "ApprovalDecision", "request_id": "ap_7", "decision": "accept_for_session" }
 { "type": "SavePlan", "thread_id": "01J…", "path": "docs/plan-auth-20260706-1030.md" }
 
@@ -1690,7 +1804,8 @@ default already stated in-line:
    mirrors for path-bearing streamed types and re-exports the path-free `giskard-core` types; the
    server maps `core → wire` at the fan-out edge (§3.5).
 4. **Plan-content extraction rule** — spec defaults to "latest Plan-mode turn's agent
-   messages" with a preview before saving (§7.4.1); confirm this matches intent in practice.
+   messages" with a preview before saving (§7.4.1); confirmed (C6): strictly the single most
+   recent Plan-mode turn, no concatenation of earlier plan turns.
 5. **Headless-browser runner choice** — pick a Rust-drivable headless option for §14.3 that
    introduces no npm dependency.
 
