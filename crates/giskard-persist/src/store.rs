@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use giskard_core::ids::{ProjectId, ThreadId};
 use giskard_core::model::ModelRef;
 use giskard_core::token::{DailyTokenLedger, TokenLedger};
-use giskard_core::turn::{ApprovalPolicy, Mode};
+use giskard_core::turn::{ApprovalPolicy, Mode, Turn};
 
 use crate::PersistError;
 use crate::atomic::{atomic_write_json, read_json, read_json_or_quarantine};
@@ -61,12 +61,17 @@ pub struct ThreadFile {
     pub harness_thread_id: String,
     pub mode: Mode,
     pub current_model: ModelRef,
+    /// Cache only (C4): derived from `current_model`'s descriptor and recomputed on load — not a
+    /// source of truth. `#[serde(default)]` so older files (or a deliberately omitted value) load;
+    /// callers should recompute it from `current_model` against the live model config.
+    #[serde(default)]
     pub context_window: u32,
     pub tokens: TokenLedger,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Ordered `Turn` objects, each holding its completed items (B1).
     #[serde(default)]
-    pub turns: Vec<serde_json::Value>,
+    pub turns: Vec<Turn>,
 }
 
 // ---- Store ----
@@ -519,7 +524,8 @@ mod tests {
         let mut ledger = DailyTokenLedger::default();
         ledger.record(
             "2026-07-06",
-            "openai/gpt-5.5",
+            "openai",
+            "gpt-5.5",
             &giskard_core::token::TokenUsage::new(1000, 500),
         );
 
@@ -536,7 +542,8 @@ mod tests {
         let mut ledger = DailyTokenLedger::default();
         ledger.record(
             "2026-07-06",
-            "openai/gpt-5.5",
+            "openai",
+            "gpt-5.5",
             &giskard_core::token::TokenUsage::new(2000, 1000),
         );
 

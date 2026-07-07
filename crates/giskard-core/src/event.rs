@@ -4,7 +4,7 @@ use crate::approval::ApprovalRequest;
 use crate::diff::FileDiff;
 use crate::error::HarnessError;
 use crate::ids::{ItemId, ThreadId, TurnId};
-use crate::item::{Item, ItemDelta, ItemStarted};
+use crate::item::{Item, ItemDelta, ItemStart};
 use crate::token::TokenUsage;
 use crate::turn::TurnStatus;
 
@@ -25,7 +25,7 @@ pub enum AgentEvent {
     ItemStarted {
         thread: ThreadId,
         turn: TurnId,
-        item: ItemStarted,
+        item: ItemStart,
     },
     ItemDelta {
         thread: ThreadId,

@@ -37,21 +37,53 @@ impl TokenUsage {
     }
 }
 
+/// Per-model token breakdown keyed by `(provider, model)` as a **nested object** (spec §5.3 /
+/// §10.2, C3): `provider → model → TokenUsage`.
+///
+/// This deliberately avoids an interpolated `"provider/model"` string key, which is ambiguous to
+/// re-split when a model id contains slashes (e.g. `@cf/z-ai/glm-4.7`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ByModel(
+    pub std::collections::BTreeMap<String, std::collections::BTreeMap<String, TokenUsage>>,
+);
+
+impl ByModel {
+    pub fn record(&mut self, provider: &str, model: &str, usage: &TokenUsage) {
+        self.0
+            .entry(provider.to_string())
+            .or_default()
+            .entry(model.to_string())
+            .or_default()
+            .add(usage);
+    }
+
+    pub fn get(&self, provider: &str, model: &str) -> Option<&TokenUsage> {
+        self.0.get(provider)?.get(model)
+    }
+
+    /// Number of distinct `(provider, model)` pairs recorded.
+    pub fn len(&self) -> usize {
+        self.0.values().map(|m| m.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.values().all(|m| m.is_empty())
+    }
+}
+
 /// Aggregated token usage with per-model breakdown (spec §5.3 / §10.2).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenLedger {
     pub total: TokenUsage,
     #[serde(default)]
-    pub by_model: std::collections::BTreeMap<String, TokenUsage>,
+    pub by_model: ByModel,
 }
 
 impl TokenLedger {
-    pub fn record(&mut self, model_key: &str, usage: &TokenUsage) {
+    pub fn record(&mut self, provider: &str, model: &str, usage: &TokenUsage) {
         self.total.add(usage);
-        self.by_model
-            .entry(model_key.to_string())
-            .or_default()
-            .add(usage);
+        self.by_model.record(provider, model, usage);
     }
 }
 
@@ -62,17 +94,14 @@ pub struct DailyTokenLedger {
     #[serde(default)]
     pub by_day: std::collections::BTreeMap<String, TokenUsage>,
     #[serde(default)]
-    pub by_model: std::collections::BTreeMap<String, TokenUsage>,
+    pub by_model: ByModel,
 }
 
 impl DailyTokenLedger {
-    pub fn record(&mut self, date: &str, model_key: &str, usage: &TokenUsage) {
+    pub fn record(&mut self, date: &str, provider: &str, model: &str, usage: &TokenUsage) {
         self.total.add(usage);
         self.by_day.entry(date.to_string()).or_default().add(usage);
-        self.by_model
-            .entry(model_key.to_string())
-            .or_default()
-            .add(usage);
+        self.by_model.record(provider, model, usage);
     }
 
     /// Derive weekly totals from `by_day` buckets (spec §10.2).
@@ -131,25 +160,46 @@ mod tests {
     #[test]
     fn ledger_record_by_model() {
         let mut ledger = TokenLedger::default();
-        ledger.record("openai/gpt-5.5", &TokenUsage::new(1000, 500));
-        ledger.record("openai/gpt-5.5", &TokenUsage::new(2000, 100));
-        ledger.record("cf/glm-4.7", &TokenUsage::new(50, 20));
+        ledger.record("openai", "gpt-5.5", &TokenUsage::new(1000, 500));
+        ledger.record("openai", "gpt-5.5", &TokenUsage::new(2000, 100));
+        ledger.record("cf", "glm-4.7", &TokenUsage::new(50, 20));
 
         assert_eq!(ledger.total.input, 3050);
         assert_eq!(ledger.total.output, 620);
         assert_eq!(ledger.total.total, 3670);
         assert_eq!(ledger.by_model.len(), 2);
-        let gpt = &ledger.by_model["openai/gpt-5.5"];
+        let gpt = ledger.by_model.get("openai", "gpt-5.5").unwrap();
         assert_eq!(gpt.input, 3000);
         assert_eq!(gpt.output, 600);
     }
 
     #[test]
+    fn by_model_slash_in_id_unambiguous() {
+        // C3: a model id with slashes must round-trip without ambiguity.
+        let mut ledger = TokenLedger::default();
+        ledger.record(
+            "cloudflare-litellm",
+            "@cf/z-ai/glm-4.7",
+            &TokenUsage::new(10, 5),
+        );
+        let json = serde_json::to_value(&ledger).unwrap();
+        assert_eq!(
+            json["by_model"]["cloudflare-litellm"]["@cf/z-ai/glm-4.7"]["input"],
+            10
+        );
+        let back: TokenLedger = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            back.by_model.get("cloudflare-litellm", "@cf/z-ai/glm-4.7"),
+            Some(&TokenUsage::new(10, 5))
+        );
+    }
+
+    #[test]
     fn monthly_totals_derived() {
         let mut ledger = DailyTokenLedger::default();
-        ledger.record("2026-07-01", "openai/gpt-5.5", &TokenUsage::new(100, 10));
-        ledger.record("2026-07-15", "openai/gpt-5.5", &TokenUsage::new(200, 20));
-        ledger.record("2026-08-01", "openai/gpt-5.5", &TokenUsage::new(50, 5));
+        ledger.record("2026-07-01", "openai", "gpt-5.5", &TokenUsage::new(100, 10));
+        ledger.record("2026-07-15", "openai", "gpt-5.5", &TokenUsage::new(200, 20));
+        ledger.record("2026-08-01", "openai", "gpt-5.5", &TokenUsage::new(50, 5));
 
         let months = ledger.monthly_totals();
         assert_eq!(months.len(), 2);

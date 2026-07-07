@@ -7,7 +7,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ItemId, ThreadId, TurnId};
-use giskard_core::item::{Item, ItemDelta, ItemKind, ItemPayload, ItemStarted};
+use giskard_core::item::{Item, ItemDelta, ItemKind, ItemPayload, ItemStart};
 use giskard_core::model::ModelRef;
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{ApprovalPolicy, Mode, TurnStatus, TurnStatusKind};
@@ -18,6 +18,8 @@ use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 fn make_fixture() -> (ReplayFixture, ThreadId, TurnId) {
     let thread = ThreadId::new();
     let turn = TurnId::new();
+    let it_1 = ItemId::new();
+    let it_2 = ItemId::new();
     let now = Utc::now();
 
     let events = vec![
@@ -29,8 +31,9 @@ fn make_fixture() -> (ReplayFixture, ThreadId, TurnId) {
         AgentEvent::ItemStarted {
             thread,
             turn,
-            item: ItemStarted {
-                id: ItemId("it_1".into()),
+            item: ItemStart {
+                id: it_1,
+                harness_item_id: "it_1".into(),
                 kind: ItemKind::UserMessage,
             },
         },
@@ -38,7 +41,8 @@ fn make_fixture() -> (ReplayFixture, ThreadId, TurnId) {
             thread,
             turn,
             item: Item {
-                id: ItemId("it_1".into()),
+                id: it_1,
+                harness_item_id: "it_1".into(),
                 payload: ItemPayload::UserMessage {
                     text: "Fix the auth module".into(),
                 },
@@ -48,15 +52,16 @@ fn make_fixture() -> (ReplayFixture, ThreadId, TurnId) {
         AgentEvent::ItemStarted {
             thread,
             turn,
-            item: ItemStarted {
-                id: ItemId("it_2".into()),
+            item: ItemStart {
+                id: it_2,
+                harness_item_id: "it_2".into(),
                 kind: ItemKind::AgentMessage,
             },
         },
         AgentEvent::ItemDelta {
             thread,
             turn,
-            item_id: ItemId("it_2".into()),
+            item_id: it_2,
             delta: ItemDelta::Text {
                 text: "I'll start by reading auth.rs".into(),
             },
@@ -65,7 +70,8 @@ fn make_fixture() -> (ReplayFixture, ThreadId, TurnId) {
             thread,
             turn,
             item: Item {
-                id: ItemId("it_2".into()),
+                id: it_2,
+                harness_item_id: "it_2".into(),
                 payload: ItemPayload::AgentMessage {
                     text: "I'll start by reading auth.rs".into(),
                 },

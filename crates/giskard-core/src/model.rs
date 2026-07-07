@@ -12,9 +12,14 @@ pub struct ModelRef {
 }
 
 /// Reasoning effort level (model-dependent).
+///
+/// S4: mirrors the pinned Codex `ModelReasoningEffort` (verified against codex-codes 0.143.0:
+/// minimal | low | medium | high | xhigh). Not hardcoded to a smaller set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Effort {
+    Minimal,
+    Low,
     Medium,
     High,
     XHigh,
