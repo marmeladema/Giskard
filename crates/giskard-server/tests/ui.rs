@@ -75,6 +75,34 @@ async fn index_page_is_served_and_public() {
         "UI finalizes streamed agent messages instead of duplicating them"
     );
     assert!(
+        body.contains("hasVisiblePayload"),
+        "UI has an explicit visibility gate for transcript items"
+    );
+    assert!(
+        body.contains("p.kind===\"file_change\""),
+        "UI has explicit file-change transcript handling"
+    );
+    assert!(
+        body.contains("renderFileChange"),
+        "UI renders file-change items"
+    );
+    assert!(
+        body.contains("renderToolCall"),
+        "UI renders tool-call items"
+    );
+    assert!(
+        body.contains("renderActivity"),
+        "UI renders generic activity items"
+    );
+    assert!(
+        body.contains("live_turn_snapshot"),
+        "UI replays active-turn snapshots on reconnect"
+    );
+    assert!(
+        body.contains("itemKindsByItemId"),
+        "UI tracks item kinds for streamed deltas"
+    );
+    assert!(
         body.contains("addItem(ev.item)"),
         "UI renders completed events with full item metadata"
     );

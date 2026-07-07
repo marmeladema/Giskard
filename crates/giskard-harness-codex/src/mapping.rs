@@ -4,13 +4,16 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use chrono::Utc;
-use serde_json::Value;
+use serde::Serialize;
+use serde_json::{Value, json};
 
 use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalRequest};
 use giskard_core::diff::{DiffHunk, DiffLine, FileDiff};
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ThreadId, TurnId};
-use giskard_core::item::{FileChangeKind, Item, ItemDelta, ItemKind, ItemPayload, ItemStart};
+use giskard_core::item::{
+    FileChangeEntry, FileChangeKind, Item, ItemDelta, ItemKind, ItemPayload, ItemStart,
+};
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{ApprovalPolicy, Mode, TurnStatus, TurnStatusKind};
 
@@ -162,18 +165,7 @@ impl CodexMapper {
                 item_id,
                 thread_id,
                 turn_id,
-            }) => {
-                let thread = self.resolve_thread(thread_id, fallback_thread);
-                let turn = self.resolve_turn(turn_id);
-                Some(AgentEvent::ItemDelta {
-                    thread,
-                    turn,
-                    item_id: self.resolve_item(item_id),
-                    delta: ItemDelta::Text {
-                        text: delta.clone(),
-                    },
-                })
-            }
+            }) => self.map_text_delta(thread_id, turn_id, item_id, delta, fallback_thread),
 
             Notification::CmdOutputDelta(CommandExecutionOutputDeltaNotification {
                 delta,
@@ -194,18 +186,50 @@ impl CodexMapper {
                 })
             }
 
-            Notification::ReasoningDelta(n) => {
-                let thread = self.resolve_thread(&n.thread_id, fallback_thread);
-                let turn = self.resolve_turn(&n.turn_id);
-                Some(AgentEvent::ItemDelta {
-                    thread,
-                    turn,
-                    item_id: self.resolve_item(&n.item_id),
-                    delta: ItemDelta::Text {
-                        text: n.delta.clone(),
-                    },
-                })
+            Notification::FileChangeOutputDelta(n) => self.map_text_delta(
+                &n.thread_id,
+                &n.turn_id,
+                &n.item_id,
+                &n.delta,
+                fallback_thread,
+            ),
+
+            Notification::FileChangePatchUpdated(n) => {
+                let text = summarize_file_changes(&n.changes);
+                self.map_text_delta(&n.thread_id, &n.turn_id, &n.item_id, &text, fallback_thread)
             }
+
+            Notification::ReasoningDelta(n) => self.map_text_delta(
+                &n.thread_id,
+                &n.turn_id,
+                &n.item_id,
+                &n.delta,
+                fallback_thread,
+            ),
+
+            Notification::ReasoningTextDelta(n) => self.map_text_delta(
+                &n.thread_id,
+                &n.turn_id,
+                &n.item_id,
+                &n.delta,
+                fallback_thread,
+            ),
+
+            Notification::PlanDelta(n) => self.map_text_delta(
+                &n.thread_id,
+                &n.turn_id,
+                &n.item_id,
+                &n.delta,
+                fallback_thread,
+            ),
+
+            Notification::McpToolCallProgress(n) => self.map_text_delta(
+                &n.thread_id,
+                &n.turn_id,
+                &n.item_id,
+                &n.message,
+                fallback_thread,
+            ),
 
             Notification::TurnDiffUpdated(TurnDiffUpdatedNotification {
                 diff,
@@ -242,7 +266,159 @@ impl CodexMapper {
                 })
             }
 
+            Notification::TurnPlanUpdated(n) => {
+                let thread = self.resolve_thread(&n.thread_id, fallback_thread);
+                let turn = self.resolve_turn(&n.turn_id);
+                let mut lines = Vec::new();
+                if let Some(explanation) = &n.explanation {
+                    if !explanation.trim().is_empty() {
+                        lines.push(explanation.clone());
+                    }
+                }
+                for step in &n.plan {
+                    lines.push(format!("{}: {}", enum_string(&step.status), step.step));
+                }
+                Some(self.activity_event(
+                    thread,
+                    turn,
+                    format!("turn_plan:{}", n.turn_id),
+                    "Plan updated",
+                    lines.join("\n"),
+                    &n.plan,
+                ))
+            }
+
+            Notification::ModelRerouted(n) => {
+                let thread = self.resolve_thread(&n.thread_id, fallback_thread);
+                let turn = self.resolve_turn(&n.turn_id);
+                Some(self.activity_event(
+                    thread,
+                    turn,
+                    format!("model_rerouted:{}", n.turn_id),
+                    "Model rerouted",
+                    format!("{} -> {}", n.from_model, n.to_model),
+                    n,
+                ))
+            }
+
+            Notification::ContextCompacted(n) => {
+                let thread = self.resolve_thread(&n.thread_id, fallback_thread);
+                let turn = self.resolve_turn(&n.turn_id);
+                Some(self.activity_event(
+                    thread,
+                    turn,
+                    format!("context_compacted:{}", n.turn_id),
+                    "Context compacted",
+                    "",
+                    n,
+                ))
+            }
+
+            Notification::Warning(n) => {
+                let thread = n
+                    .thread_id
+                    .as_deref()
+                    .map(|id| self.resolve_thread(id, fallback_thread))
+                    .unwrap_or(fallback_thread);
+                Some(AgentEvent::Error {
+                    thread,
+                    turn: None,
+                    error: giskard_core::error::HarnessError::Protocol(format!(
+                        "warning: {}",
+                        n.message
+                    )),
+                })
+            }
+
+            Notification::ConfigWarning(n) => Some(AgentEvent::Error {
+                thread: fallback_thread,
+                turn: None,
+                error: giskard_core::error::HarnessError::Protocol(format!(
+                    "configuration warning: {}{}",
+                    n.summary,
+                    n.details
+                        .as_ref()
+                        .map(|d| format!(": {d}"))
+                        .unwrap_or_default()
+                )),
+            }),
+
+            Notification::GuardianWarning(n) => {
+                let thread = self.resolve_thread(&n.thread_id, fallback_thread);
+                Some(AgentEvent::Error {
+                    thread,
+                    turn: None,
+                    error: giskard_core::error::HarnessError::Protocol(format!(
+                        "guardian warning: {}",
+                        n.message
+                    )),
+                })
+            }
+
+            Notification::DeprecationNotice(n) => Some(AgentEvent::Error {
+                thread: fallback_thread,
+                turn: None,
+                error: giskard_core::error::HarnessError::Protocol(format!(
+                    "deprecation notice: {}{}",
+                    n.summary,
+                    n.details
+                        .as_ref()
+                        .map(|d| format!(": {d}"))
+                        .unwrap_or_default()
+                )),
+            }),
+
             _ => None,
+        }
+    }
+
+    fn map_text_delta(
+        &mut self,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+        text: &str,
+        fallback_thread: ThreadId,
+    ) -> Option<AgentEvent> {
+        if text.is_empty() {
+            return None;
+        }
+        let thread = self.resolve_thread(thread_id, fallback_thread);
+        let turn = self.resolve_turn(turn_id);
+        Some(AgentEvent::ItemDelta {
+            thread,
+            turn,
+            item_id: self.resolve_item(item_id),
+            delta: ItemDelta::Text {
+                text: text.to_owned(),
+            },
+        })
+    }
+
+    fn activity_event<T: Serialize>(
+        &mut self,
+        thread: ThreadId,
+        turn: TurnId,
+        harness_item_id: String,
+        title: impl Into<String>,
+        detail: impl Into<String>,
+        metadata: &T,
+    ) -> AgentEvent {
+        let id = self.resolve_item(&harness_item_id);
+        let detail = detail.into();
+        AgentEvent::ItemCompleted {
+            thread,
+            turn,
+            item: Item {
+                id,
+                harness_item_id,
+                payload: ItemPayload::Activity {
+                    title: title.into(),
+                    detail: (!detail.trim().is_empty()).then_some(detail),
+                    metadata: serde_json::to_value(metadata).ok(),
+                },
+                created_at: Utc::now(),
+            },
         }
     }
 
@@ -414,12 +590,23 @@ fn breakdown_to_usage(b: &codex_codes::protocol::TokenUsageBreakdown) -> TokenUs
 fn thread_item_id(item: &codex_codes::ThreadItem) -> String {
     match item {
         codex_codes::ThreadItem::UserMessage { id, .. }
+        | codex_codes::ThreadItem::HookPrompt { id, .. }
         | codex_codes::ThreadItem::AgentMessage { id, .. }
+        | codex_codes::ThreadItem::Plan { id, .. }
         | codex_codes::ThreadItem::Reasoning { id, .. }
         | codex_codes::ThreadItem::CommandExecution { id, .. }
         | codex_codes::ThreadItem::FileChange { id, .. }
-        | codex_codes::ThreadItem::McpToolCall { id, .. } => id.clone(),
-        _ => String::new(),
+        | codex_codes::ThreadItem::McpToolCall { id, .. }
+        | codex_codes::ThreadItem::DynamicToolCall { id, .. }
+        | codex_codes::ThreadItem::CollabAgentToolCall { id, .. }
+        | codex_codes::ThreadItem::SubAgentActivity { id, .. }
+        | codex_codes::ThreadItem::WebSearch { id, .. }
+        | codex_codes::ThreadItem::ImageView { id, .. }
+        | codex_codes::ThreadItem::Sleep { id, .. }
+        | codex_codes::ThreadItem::ImageGeneration { id, .. }
+        | codex_codes::ThreadItem::EnteredReviewMode { id, .. }
+        | codex_codes::ThreadItem::ExitedReviewMode { id, .. }
+        | codex_codes::ThreadItem::ContextCompaction { id, .. } => id.clone(),
     }
 }
 
@@ -427,12 +614,24 @@ fn thread_item_id(item: &codex_codes::ThreadItem) -> String {
 fn map_thread_item_start(item: &codex_codes::ThreadItem) -> (String, ItemKind) {
     let kind = match item {
         codex_codes::ThreadItem::UserMessage { .. } => ItemKind::UserMessage,
-        codex_codes::ThreadItem::AgentMessage { .. } => ItemKind::AgentMessage,
+        codex_codes::ThreadItem::AgentMessage { .. } | codex_codes::ThreadItem::Plan { .. } => {
+            ItemKind::AgentMessage
+        }
         codex_codes::ThreadItem::Reasoning { .. } => ItemKind::Reasoning,
         codex_codes::ThreadItem::CommandExecution { .. } => ItemKind::CommandExecution,
         codex_codes::ThreadItem::FileChange { .. } => ItemKind::FileChange,
-        codex_codes::ThreadItem::McpToolCall { .. } => ItemKind::ToolCall,
-        _ => ItemKind::AgentMessage,
+        codex_codes::ThreadItem::McpToolCall { .. }
+        | codex_codes::ThreadItem::DynamicToolCall { .. }
+        | codex_codes::ThreadItem::CollabAgentToolCall { .. } => ItemKind::ToolCall,
+        codex_codes::ThreadItem::HookPrompt { .. }
+        | codex_codes::ThreadItem::SubAgentActivity { .. }
+        | codex_codes::ThreadItem::WebSearch { .. }
+        | codex_codes::ThreadItem::ImageView { .. }
+        | codex_codes::ThreadItem::Sleep { .. }
+        | codex_codes::ThreadItem::ImageGeneration { .. }
+        | codex_codes::ThreadItem::EnteredReviewMode { .. }
+        | codex_codes::ThreadItem::ExitedReviewMode { .. }
+        | codex_codes::ThreadItem::ContextCompaction { .. } => ItemKind::Activity,
     };
     (thread_item_id(item), kind)
 }
@@ -458,8 +657,17 @@ fn map_thread_item_complete(
         codex_codes::ThreadItem::AgentMessage { text, .. } => {
             ItemPayload::AgentMessage { text: text.clone() }
         }
-        codex_codes::ThreadItem::Reasoning { summary, .. } => {
-            let text = summary.as_ref().map(|s| s.join("\n")).unwrap_or_default();
+        codex_codes::ThreadItem::Plan { text, .. } => {
+            ItemPayload::AgentMessage { text: text.clone() }
+        }
+        codex_codes::ThreadItem::Reasoning {
+            content, summary, ..
+        } => {
+            let text = summary
+                .as_ref()
+                .or(content.as_ref())
+                .map(|s| s.join("\n"))
+                .unwrap_or_default();
             ItemPayload::Reasoning { text }
         }
         codex_codes::ThreadItem::CommandExecution {
@@ -473,28 +681,150 @@ fn map_thread_item_complete(
             let exit = exit_code.map(|c| c as i32);
             ItemPayload::CommandExecution {
                 command: command.clone(),
-                cwd: PathBuf::from(cwd.to_string()),
+                cwd: path_from_json_value(cwd),
                 output,
                 exit_code: exit,
             }
         }
-        codex_codes::ThreadItem::FileChange { changes, .. } => {
-            let path = changes
-                .first()
-                .map(|c| PathBuf::from(&c.path))
-                .unwrap_or_default();
+        codex_codes::ThreadItem::FileChange {
+            changes, status, ..
+        } => {
+            let changes = map_file_changes(changes);
+            let first = changes.first().cloned();
             ItemPayload::FileChange {
-                path,
-                change: FileChangeKind::Modified,
+                path: first.as_ref().map(|c| c.path.clone()).unwrap_or_default(),
+                change: first
+                    .as_ref()
+                    .map(|c| c.change)
+                    .unwrap_or(FileChangeKind::Modified),
+                changes,
+                status: Some(enum_string(status)),
             }
         }
-        codex_codes::ThreadItem::McpToolCall { .. } => ItemPayload::ToolCall {
-            name: String::new(),
-            input: Value::Null,
-            output: None,
+        codex_codes::ThreadItem::McpToolCall {
+            server,
+            tool,
+            arguments,
+            result,
+            error,
+            status,
+            ..
+        } => ItemPayload::ToolCall {
+            name: tool.clone(),
+            input: arguments.clone(),
+            output: result.as_ref().and_then(json_value),
+            server: Some(server.clone()),
+            status: Some(enum_string(status)),
+            error: error.as_ref().map(|e| e.message.clone()),
         },
-        _ => ItemPayload::AgentMessage {
-            text: String::new(),
+        codex_codes::ThreadItem::DynamicToolCall {
+            tool,
+            arguments,
+            content_items,
+            status,
+            namespace,
+            success,
+            ..
+        } => ItemPayload::ToolCall {
+            name: tool.clone(),
+            input: arguments.clone(),
+            output: content_items
+                .as_ref()
+                .and_then(json_value)
+                .or_else(|| success.map(|s| json!({ "success": s }))),
+            server: namespace.clone(),
+            status: Some(enum_string(status)),
+            error: None,
+        },
+        codex_codes::ThreadItem::CollabAgentToolCall {
+            tool,
+            status,
+            prompt,
+            model,
+            ..
+        } => ItemPayload::ToolCall {
+            name: json_display(tool),
+            input: json!({
+                "prompt": prompt,
+                "model": model,
+            }),
+            output: Some(status.clone()),
+            server: Some("collab-agent".into()),
+            status: Some(json_display(status)),
+            error: None,
+        },
+        codex_codes::ThreadItem::HookPrompt { fragments, .. } => ItemPayload::Activity {
+            title: "Hook prompt".into(),
+            detail: Some(
+                fragments
+                    .iter()
+                    .map(|f| f.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            metadata: json_value(fragments),
+        },
+        codex_codes::ThreadItem::SubAgentActivity {
+            agent_path,
+            agent_thread_id,
+            kind,
+            ..
+        } => ItemPayload::Activity {
+            title: format!("Sub-agent {}", enum_string(kind)),
+            detail: Some(format!("{agent_path} ({agent_thread_id})")),
+            metadata: json_value(item),
+        },
+        codex_codes::ThreadItem::WebSearch { query, action, .. } => ItemPayload::Activity {
+            title: "Web search".into(),
+            detail: Some(query.clone()),
+            metadata: action.as_ref().and_then(json_value),
+        },
+        codex_codes::ThreadItem::ImageView { path, .. } => ItemPayload::Activity {
+            title: "Image viewed".into(),
+            detail: Some(path.0.clone()),
+            metadata: json_value(item),
+        },
+        codex_codes::ThreadItem::Sleep { duration_ms, .. } => ItemPayload::Activity {
+            title: "Sleep".into(),
+            detail: Some(format!("{duration_ms} ms")),
+            metadata: json_value(item),
+        },
+        codex_codes::ThreadItem::ImageGeneration {
+            status,
+            result,
+            revised_prompt,
+            saved_path,
+            ..
+        } => ItemPayload::Activity {
+            title: "Image generation".into(),
+            detail: Some(
+                [
+                    Some(format!("status: {status}")),
+                    saved_path.as_ref().map(|p| format!("saved: {}", p.0)),
+                    revised_prompt.as_ref().map(|p| format!("prompt: {p}")),
+                    (!result.trim().is_empty()).then(|| format!("result: {result}")),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("\n"),
+            ),
+            metadata: json_value(item),
+        },
+        codex_codes::ThreadItem::EnteredReviewMode { review, .. } => ItemPayload::Activity {
+            title: "Entered review mode".into(),
+            detail: Some(review.clone()),
+            metadata: None,
+        },
+        codex_codes::ThreadItem::ExitedReviewMode { review, .. } => ItemPayload::Activity {
+            title: "Exited review mode".into(),
+            detail: Some(review.clone()),
+            metadata: None,
+        },
+        codex_codes::ThreadItem::ContextCompaction { .. } => ItemPayload::Activity {
+            title: "Context compaction".into(),
+            detail: None,
+            metadata: json_value(item),
         },
     };
 
@@ -506,6 +836,77 @@ fn map_thread_item_complete(
         harness_item_id,
         payload,
         created_at,
+    }
+}
+
+fn json_value<T: Serialize>(value: &T) -> Option<Value> {
+    serde_json::to_value(value).ok()
+}
+
+fn json_display(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        _ => value.to_string(),
+    }
+}
+
+fn enum_string<T: Serialize>(value: &T) -> String {
+    json_value(value)
+        .map(|v| match v {
+            Value::String(s) => s,
+            other => other.to_string(),
+        })
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn path_from_json_value(value: &Value) -> PathBuf {
+    match value {
+        Value::String(s) => PathBuf::from(s),
+        other => PathBuf::from(other.to_string()),
+    }
+}
+
+fn map_file_changes(changes: &[codex_codes::FileUpdateChange]) -> Vec<FileChangeEntry> {
+    changes
+        .iter()
+        .map(|change| FileChangeEntry {
+            path: PathBuf::from(&change.path),
+            change: map_patch_change_kind(&change.kind),
+            diff: (!change.diff.is_empty()).then(|| change.diff.clone()),
+        })
+        .collect()
+}
+
+fn map_patch_change_kind(kind: &codex_codes::PatchChangeKind) -> FileChangeKind {
+    match kind {
+        codex_codes::PatchChangeKind::Add => FileChangeKind::Created,
+        codex_codes::PatchChangeKind::Delete => FileChangeKind::Deleted,
+        codex_codes::PatchChangeKind::Update { .. } => FileChangeKind::Modified,
+    }
+}
+
+fn summarize_file_changes(changes: &[codex_codes::FileUpdateChange]) -> String {
+    if changes.is_empty() {
+        return "File changes updated.".into();
+    }
+    changes
+        .iter()
+        .map(|change| {
+            format!(
+                "{} {}",
+                file_change_label(map_patch_change_kind(&change.kind)),
+                change.path
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn file_change_label(change: FileChangeKind) -> &'static str {
+    match change {
+        FileChangeKind::Created => "created",
+        FileChangeKind::Modified => "modified",
+        FileChangeKind::Deleted => "deleted",
     }
 }
 
@@ -587,6 +988,28 @@ fn parse_hunk_header(line: &str) -> Option<(u32, u32, u32, u32)> {
 mod tests {
     use super::*;
 
+    fn completed_item(item: Value) -> Notification {
+        Notification::ItemCompleted(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "th1",
+                "turnId": "t1",
+                "completedAtMs": 1000,
+                "item": item,
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn text_delta(event: AgentEvent) -> String {
+        match event {
+            AgentEvent::ItemDelta {
+                delta: ItemDelta::Text { text },
+                ..
+            } => text,
+            other => panic!("expected text delta, got {other:?}"),
+        }
+    }
+
     /// Usage from a `thread/tokenUsage/updated` notification is cached per turn and surfaced on the
     /// matching `TurnCompleted` (spec §10.1) — regression guard for the previous zero stub.
     #[test]
@@ -629,6 +1052,161 @@ mod tests {
             }
             other => panic!("expected TurnCompleted, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn file_change_item_preserves_all_changed_paths() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let notif = completed_item(serde_json::json!({
+            "type": "fileChange",
+            "id": "fc1",
+            "status": "completed",
+            "changes": [
+                { "path": "src/main.rs", "kind": { "type": "update" }, "diff": "@@ -1 +1 @@\n-old\n+new" },
+                { "path": "src/lib.rs", "kind": { "type": "add" }, "diff": "" }
+            ]
+        }));
+
+        match mapper.map_notification(&notif, ThreadId::new()).unwrap() {
+            AgentEvent::ItemCompleted { item, .. } => match item.payload {
+                ItemPayload::FileChange {
+                    path,
+                    change,
+                    changes,
+                    status,
+                } => {
+                    assert_eq!(path, PathBuf::from("src/main.rs"));
+                    assert_eq!(change, FileChangeKind::Modified);
+                    assert_eq!(changes.len(), 2);
+                    assert_eq!(changes[0].change, FileChangeKind::Modified);
+                    assert_eq!(changes[1].change, FileChangeKind::Created);
+                    assert_eq!(status.as_deref(), Some("completed"));
+                }
+                other => panic!("expected file change, got {other:?}"),
+            },
+            other => panic!("expected item completion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_tool_call_item_preserves_tool_fields() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let notif = completed_item(serde_json::json!({
+            "type": "mcpToolCall",
+            "id": "tool1",
+            "server": "cf-tools",
+            "tool": "jira_search",
+            "arguments": { "jql": "project = ERE" },
+            "status": "failed",
+            "error": { "message": "bad query" }
+        }));
+
+        match mapper.map_notification(&notif, ThreadId::new()).unwrap() {
+            AgentEvent::ItemCompleted { item, .. } => match item.payload {
+                ItemPayload::ToolCall {
+                    name,
+                    input,
+                    server,
+                    status,
+                    error,
+                    ..
+                } => {
+                    assert_eq!(name, "jira_search");
+                    assert_eq!(input["jql"], "project = ERE");
+                    assert_eq!(server.as_deref(), Some("cf-tools"));
+                    assert_eq!(status.as_deref(), Some("failed"));
+                    assert_eq!(error.as_deref(), Some("bad query"));
+                }
+                other => panic!("expected tool call, got {other:?}"),
+            },
+            other => panic!("expected item completion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_non_chat_item_maps_to_activity() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let notif = completed_item(serde_json::json!({
+            "type": "webSearch",
+            "id": "search1",
+            "query": "rust serde",
+            "action": { "type": "search", "query": "rust serde" }
+        }));
+
+        match mapper.map_notification(&notif, ThreadId::new()).unwrap() {
+            AgentEvent::ItemCompleted { item, .. } => match item.payload {
+                ItemPayload::Activity { title, detail, .. } => {
+                    assert_eq!(title, "Web search");
+                    assert_eq!(detail.as_deref(), Some("rust serde"));
+                }
+                other => panic!("expected activity, got {other:?}"),
+            },
+            other => panic!("expected item completion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn additional_item_deltas_are_mapped() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let fallback = ThreadId::new();
+
+        let plan = Notification::PlanDelta(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "th1",
+                "turnId": "t1",
+                "itemId": "plan1",
+                "delta": "step one"
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            text_delta(mapper.map_notification(&plan, fallback).unwrap()),
+            "step one"
+        );
+
+        let patch = Notification::FileChangePatchUpdated(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "th1",
+                "turnId": "t1",
+                "itemId": "fc1",
+                "changes": [
+                    { "path": "src/main.rs", "kind": { "type": "delete" }, "diff": "" }
+                ]
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            text_delta(mapper.map_notification(&patch, fallback).unwrap()),
+            "deleted src/main.rs"
+        );
+
+        let reasoning = Notification::ReasoningTextDelta(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "th1",
+                "turnId": "t1",
+                "itemId": "r1",
+                "delta": "thinking"
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            text_delta(mapper.map_notification(&reasoning, fallback).unwrap()),
+            "thinking"
+        );
+
+        let progress = Notification::McpToolCallProgress(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "th1",
+                "turnId": "t1",
+                "itemId": "tool1",
+                "message": "running"
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            text_delta(mapper.map_notification(&progress, fallback).unwrap()),
+            "running"
+        );
     }
 
     /// With no usage notification, a completed turn reports zero (not a panic).

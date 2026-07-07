@@ -8,7 +8,7 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.5
+**Version:** 1.6
 
 **Changelog (1.0 → 1.1), from review:**
 - Resolved thread token schema vs §10.2: thread `tokens` now carries `total` + `by_model` (§5.3).
@@ -132,6 +132,18 @@
 - **E6:** Required live UI rendering to de-duplicate completed items by Giskard `ItemId` and
   harness-native `harness_item_id`, so streamed deltas finalize in place instead of duplicating the
   completed agent response (§13.6).
+
+**Changelog (1.5 → 1.6), from typed transcript rendering pass:**
+- **E7:** File-change and tool-call items are visible transcript items, not hidden/empty agent
+  bubbles. `FileChange` keeps a backward-compatible summary `path`/`change` plus optional
+  per-file `changes` and `status`; `ToolCall` preserves server, status, and error metadata
+  (§4.5, §13.6).
+- **E8:** Added a generic `Activity` item kind/payload for Codex app-server items that are not chat
+  text but must still be surfaced, such as web searches, image events, sub-agent activity, context
+  compaction, and model reroutes (§4.5).
+- **E9:** The browser must replay `LiveTurnSnapshot` accumulated events on subscribe/reconnect and
+  track `ItemStarted.kind` so streamed deltas are styled as command, file-change, tool-call,
+  reasoning, or activity rows before finalization (§13.6).
 
 ---
 
@@ -604,6 +616,7 @@ pub enum ItemKind {
     CommandExecution,
     FileChange,
     ToolCall,                          // MCP/other tool invocations
+    Activity,                          // non-chat Codex activity surfaced in the transcript
 }
 
 /// The finalized item persisted in thread history and sent on `ItemCompleted`.
@@ -625,9 +638,27 @@ pub enum ItemPayload {
         output: String,               // accumulated stdout+stderr
         exit_code: Option<i32>,
     },
-    FileChange     { path: PathBuf, change: FileChangeKind },
-    ToolCall       { name: String, input: serde_json::Value, output: Option<serde_json::Value> },
+    FileChange {
+        path: PathBuf,                  // summary/back-compat path
+        change: FileChangeKind,         // summary/back-compat change
+        changes: Vec<FileChangeEntry>,  // optional per-file details
+        status: Option<String>,
+    },
+    ToolCall {
+        name: String,
+        input: serde_json::Value,
+        output: Option<serde_json::Value>,
+        server: Option<String>,
+        status: Option<String>,
+        error: Option<String>,
+    },
+    Activity {
+        title: String,
+        detail: Option<String>,
+        metadata: Option<serde_json::Value>,
+    },
 }
+pub struct FileChangeEntry { path: PathBuf, change: FileChangeKind, diff: Option<String> }
 pub enum FileChangeKind { Created, Modified, Deleted }
 
 pub enum ItemDelta {
@@ -1563,6 +1594,13 @@ for the same `Item.id` are one lifecycle. The UI must finalize or replace the st
 place when the completed item arrives, and must de-duplicate rendered items by both Giskard
 `ItemId` and harness-native `harness_item_id` when replaying persisted state or receiving live
 events.
+
+**Transcript visibility invariant (E7/E8/E9):** every finalized item payload with user-observable
+meaning is rendered as a transcript row. `FileChange`, `ToolCall`, and `Activity` are visible rows;
+they must not fall through to empty agent bubbles or be silently hidden. The client records
+`ItemStarted.kind` and uses it to style streamed deltas before completion. On reconnect, the client
+replays `LiveTurnSnapshot.accumulated` events through the same event handler used for live
+WebSocket events.
 
 > **Wire types (C1/§3.5).** Everything the server emits that could carry a filesystem path
 > (`Event`, `ApprovalRequest`, the `LiveTurnSnapshot` contents) is mapped `core → Wire*` at the

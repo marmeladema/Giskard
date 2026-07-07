@@ -47,8 +47,14 @@
   .msg.agent { background:var(--panel2); }
   .msg.reasoning { background:transparent; border:1px dashed var(--border); color:var(--muted); font-size:13px; }
   .msg.cmd { background:#0b0e13; border:1px solid var(--border); }
+  .msg.file { background:#101820; border:1px solid #28445f; }
+  .msg.tool { background:#151521; border:1px solid #3b3b67; }
+  .msg.activity { background:#13181c; border:1px solid var(--border); color:#c9d1d9; }
   .msg .role { font-size:11px; text-transform:uppercase; letter-spacing:.05em; opacity:.7; margin-bottom:4px; }
   pre.out { margin:0; font-family:var(--mono); font-size:12.5px; white-space:pre-wrap; }
+  .item-list { margin:6px 0 0; padding-left:18px; }
+  .item-list li { margin:2px 0; }
+  .meta { margin-top:6px; color:var(--muted); font-size:12px; }
 
   .composer { display:flex; gap:8px; padding:12px; border-top:1px solid var(--border); background:var(--panel); }
   .composer textarea { flex:1; resize:none; height:52px; }
@@ -112,7 +118,7 @@ const $ = (id) => document.getElementById(id);
 let state = {
   projectId:null, threadId:null, mode:"build", ws:null, wsStatus:"closed", wsConnectId:0,
   models:[], streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null, pendingClientMsgs:[],
-  streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set()
+  streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), itemKindsByItemId:new Map()
 };
 
 async function api(method, path, body) {
@@ -299,6 +305,7 @@ function failPendingUserMessage(text) {
 function handleServer(msg) {
   switch (msg.type) {
     case "thread_state": renderThreadState(msg.state); break;
+    case "live_turn_snapshot": renderLiveTurnSnapshot(msg); break;
     case "event": handleEvent(msg.agent_event); break;
     case "token_update": renderTokens(msg.ledger); break;
     case "approval_request": notice("Approval requested: "+JSON.stringify(msg.request.kind)); break;
@@ -336,10 +343,14 @@ function handleEvent(ev) {
       state.streamEl = null;
       state.streamItemId = null;
       state.streamElsByItemId.clear();
+      state.itemKindsByItemId.clear();
+      break;
+    case "item_started":
+      if (ev.item) state.itemKindsByItemId.set(idKey(ev.item.id), ev.item.kind);
       break;
     case "item_delta":
-      if (ev.delta && ev.delta.type==="text") appendStream(ev.delta.text, ev.item_id);
-      else if (ev.delta && ev.delta.type==="command_output") appendStream(ev.delta.chunk, ev.item_id);
+      if (ev.delta && ev.delta.type==="text") appendStream(ev.delta.text, ev.item_id, ev.delta.type);
+      else if (ev.delta && ev.delta.type==="command_output") appendStream(ev.delta.chunk, ev.item_id, ev.delta.type);
       break;
     case "item_completed":
       if (!finalizeStreamedItem(ev.item)) addItem(ev.item);
@@ -348,10 +359,16 @@ function handleEvent(ev) {
       state.streamEl=null;
       state.streamItemId=null;
       state.streamElsByItemId.clear();
+      state.itemKindsByItemId.clear();
       break;
     case "approval_requested": notice("Approval requested"); break;
     case "error": notice(ev.error ? JSON.stringify(ev.error) : "error", "error"); break;
   }
+}
+
+function renderLiveTurnSnapshot(snap) {
+  for (const ev of (snap.accumulated||[])) handleEvent(ev);
+  if (snap.pending_approval) notice("Approval requested: "+JSON.stringify(snap.pending_approval.kind));
 }
 
 function bubble(cls, role) {
@@ -362,12 +379,13 @@ function bubble(cls, role) {
   $("transcript").scrollTop = $("transcript").scrollHeight;
   return body;
 }
-function appendStream(text, itemId) {
+function appendStream(text, itemId, deltaType) {
   const key = idKey(itemId);
   if (key && state.renderedItemIds.has(key)) return;
   let body = key ? state.streamElsByItemId.get(key) : state.streamEl;
   if (!body) {
-    body = bubble("agent","agent");
+    const kind = key ? state.itemKindsByItemId.get(key) : null;
+    body = bubble(classForStream(kind, deltaType), roleForStream(kind, deltaType));
     if (key) state.streamElsByItemId.set(key, body);
   }
   state.streamEl = body;
@@ -379,6 +397,15 @@ function finalizeStreamedItem(item) {
   if (!item || !item.payload) return false;
   const key = idKey(item.id);
   const body = (key && state.streamElsByItemId.get(key)) || (state.streamItemId===key ? state.streamEl : null);
+  if (!hasVisiblePayload(item.payload)) {
+    if (body && !body.textContent.trim()) body.parentElement.remove();
+    markRenderedItem(item);
+    if (state.streamEl === body) {
+      state.streamEl = null;
+      state.streamItemId = null;
+    }
+    return true;
+  }
   if (!body) return false;
   renderItemBody(body, item.payload);
   markRenderedItem(item);
@@ -393,6 +420,10 @@ function addItem(item) {
   const p = item && item.payload ? item.payload : item;
   if (!p) return;
   if (isRenderedItem(item)) return;
+  if (!hasVisiblePayload(p)) {
+    markRenderedItem(item);
+    return;
+  }
   if (p.kind==="user_message") {
     if (state.pendingUserEl && p.text===state.pendingUserText) {
       state.pendingUserEl.classList.remove("pending");
@@ -413,6 +444,7 @@ function resetRenderState() {
   state.streamElsByItemId = new Map();
   state.renderedItemIds = new Set();
   state.renderedHarnessItemIds = new Set();
+  state.itemKindsByItemId = new Map();
 }
 function idKey(id) {
   return id === undefined || id === null ? "" : String(id);
@@ -428,8 +460,18 @@ function markRenderedItem(item) {
   if (itemId) {
     state.renderedItemIds.add(itemId);
     state.streamElsByItemId.delete(itemId);
+    state.itemKindsByItemId.delete(itemId);
   }
   if (item && item.harness_item_id) state.renderedHarnessItemIds.add(item.harness_item_id);
+}
+function hasVisiblePayload(p) {
+  if (!p || !p.kind) return false;
+  if (p.kind==="command_execution") return Boolean((p.command||"").trim() || (p.output||"").trim());
+  if (p.kind==="agent_message" || p.kind==="reasoning" || p.kind==="user_message") return Boolean((p.text||"").trim());
+  if (p.kind==="file_change") return Boolean((p.path||"").trim() || (p.changes||[]).length || p.status);
+  if (p.kind==="tool_call") return Boolean((p.name||"").trim() || (p.server||"").trim() || p.status || p.error || p.input || p.output);
+  if (p.kind==="activity") return Boolean((p.title||"").trim() || (p.detail||"").trim() || p.metadata);
+  return false;
 }
 function renderItemBody(body, p) {
   const msg = body.parentElement;
@@ -439,19 +481,70 @@ function renderItemBody(body, p) {
     body.innerHTML = `<div class="mono">$ ${escapeHtml(p.command)}</div><pre class="out">${escapeHtml(p.output||"")}</pre>`;
   } else if (p.kind==="agent_message" || p.kind==="reasoning" || p.kind==="user_message") {
     body.textContent = p.text;
+  } else if (p.kind==="file_change") {
+    body.innerHTML = renderFileChange(p);
+  } else if (p.kind==="tool_call") {
+    body.innerHTML = renderToolCall(p);
+  } else if (p.kind==="activity") {
+    body.innerHTML = renderActivity(p);
   }
 }
 function classForPayload(p) {
   if (p.kind==="user_message") return "user";
   if (p.kind==="reasoning") return "reasoning";
   if (p.kind==="command_execution") return "cmd";
+  if (p.kind==="file_change") return "file";
+  if (p.kind==="tool_call") return "tool";
+  if (p.kind==="activity") return "activity";
   return "agent";
 }
 function roleForPayload(p) {
   if (p.kind==="user_message") return "you";
   if (p.kind==="reasoning") return "reasoning";
   if (p.kind==="command_execution") return "command";
+  if (p.kind==="file_change") return "files";
+  if (p.kind==="tool_call") return "tool";
+  if (p.kind==="activity") return "activity";
   return "agent";
+}
+function classForStream(kind, deltaType) {
+  if (deltaType==="command_output" || kind==="command_execution") return "cmd";
+  if (kind==="reasoning") return "reasoning";
+  if (kind==="file_change") return "file";
+  if (kind==="tool_call") return "tool";
+  if (kind==="activity") return "activity";
+  return "agent";
+}
+function roleForStream(kind, deltaType) {
+  if (deltaType==="command_output" || kind==="command_execution") return "command";
+  if (kind==="reasoning") return "reasoning";
+  if (kind==="file_change") return "files";
+  if (kind==="tool_call") return "tool";
+  if (kind==="activity") return "activity";
+  return "agent";
+}
+function renderFileChange(p) {
+  const changes = (p.changes && p.changes.length) ? p.changes : [{ path:p.path, change:p.change }];
+  const items = changes.map(c => `<li><span class="mono">${escapeHtml(c.change||"modified")}</span> ${escapeHtml(c.path||"")}</li>`).join("");
+  const status = p.status ? `<div class="meta">status: ${escapeHtml(p.status)}</div>` : "";
+  return `<div>File change${changes.length===1 ? "" : "s"}</div><ul class="item-list">${items}</ul>${status}`;
+}
+function renderToolCall(p) {
+  const head = `${p.server ? escapeHtml(p.server)+":" : ""}${escapeHtml(p.name||"tool")}`;
+  const status = p.status ? ` <span class="muted">(${escapeHtml(p.status)})</span>` : "";
+  const input = p.input!==undefined && p.input!==null ? `<pre class="out">${escapeHtml(jsonPreview(p.input))}</pre>` : "";
+  const output = p.output!==undefined && p.output!==null ? `<pre class="out">${escapeHtml(jsonPreview(p.output))}</pre>` : "";
+  const err = p.error ? `<div class="meta">error: ${escapeHtml(p.error)}</div>` : "";
+  return `<div class="mono">${head}${status}</div>${input}${output}${err}`;
+}
+function renderActivity(p) {
+  const detail = p.detail ? `<div>${escapeHtml(p.detail)}</div>` : "";
+  const meta = p.metadata ? `<pre class="out">${escapeHtml(jsonPreview(p.metadata))}</pre>` : "";
+  return `<div>${escapeHtml(p.title||"Activity")}</div>${detail}${meta}`;
+}
+function jsonPreview(v) {
+  try { return typeof v==="string" ? v : JSON.stringify(v, null, 2); }
+  catch { return String(v); }
 }
 
 /* ---------- composer + controls ---------- */

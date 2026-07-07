@@ -17,7 +17,9 @@ use giskard_core::diff::{DiffHunk, FileDiff};
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ThreadId, TurnId};
-use giskard_core::item::{FileChangeKind, Item, ItemDelta, ItemPayload, ItemStart};
+use giskard_core::item::{
+    FileChangeEntry, FileChangeKind, Item, ItemDelta, ItemPayload, ItemStart,
+};
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::TurnStatus;
 
@@ -117,13 +119,38 @@ pub enum WireItemPayload {
     FileChange {
         path: String,
         change: FileChangeKind,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        changes: Vec<WireFileChangeEntry>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
     },
     ToolCall {
         name: String,
         input: serde_json::Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
+    Activity {
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireFileChangeEntry {
+    pub path: String,
+    pub change: FileChangeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
 }
 
 /// Wire-mirror of [`FileDiff`].
@@ -287,19 +314,51 @@ impl From<ItemPayload> for WireItemPayload {
                 output,
                 exit_code,
             },
-            ItemPayload::FileChange { path, change } => Self::FileChange {
+            ItemPayload::FileChange {
+                path,
+                change,
+                changes,
+                status,
+            } => Self::FileChange {
                 path: path_to_wire(&path),
                 change,
+                changes: changes.into_iter().map(Into::into).collect(),
+                status,
             },
             ItemPayload::ToolCall {
                 name,
                 input,
                 output,
+                server,
+                status,
+                error,
             } => Self::ToolCall {
                 name,
                 input,
                 output,
+                server,
+                status,
+                error,
             },
+            ItemPayload::Activity {
+                title,
+                detail,
+                metadata,
+            } => Self::Activity {
+                title,
+                detail,
+                metadata,
+            },
+        }
+    }
+}
+
+impl From<FileChangeEntry> for WireFileChangeEntry {
+    fn from(entry: FileChangeEntry) -> Self {
+        Self {
+            path: path_to_wire(&entry.path),
+            change: entry.change,
+            diff: entry.diff,
         }
     }
 }
@@ -367,10 +426,18 @@ mod tests {
         let core = ItemPayload::FileChange {
             path: PathBuf::from("/src/main.rs"),
             change: FileChangeKind::Modified,
+            changes: vec![FileChangeEntry {
+                path: PathBuf::from("/src/lib.rs"),
+                change: FileChangeKind::Created,
+                diff: None,
+            }],
+            status: Some("completed".into()),
         };
         let wire: WireItemPayload = core.into();
         let json = serde_json::to_value(&wire).unwrap();
         assert_eq!(json["path"], "/src/main.rs");
+        assert_eq!(json["changes"][0]["path"], "/src/lib.rs");
+        assert_eq!(json["status"], "completed");
     }
 
     #[test]
