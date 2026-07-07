@@ -567,7 +567,7 @@ async fn handle_client_msg(
             state.hub.unsubscribe(thread_id, client_id).await;
         }
         ClientMessage::SendInput { thread_id, text } => {
-            let (project_id, mut tf) = load_thread(state, thread_id).await?;
+            let project_id = project_for(state, thread_id).await?;
             let project = state
                 .store
                 .load_project(project_id)
@@ -575,16 +575,28 @@ async fn handle_client_msg(
                 .map_err(|e| e.to_string())?
                 .ok_or("project not found")?;
 
+            // RMW under the per-thread lock: bump activity and read back the resolved state.
+            let tf = state
+                .store
+                .update_thread(project_id, thread_id, |tf| {
+                    tf.updated_at = chrono::Utc::now();
+                })
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("thread not found")?;
+
             let effective_model = tf.current_model.clone();
 
+            // Resolved snapshot the harness applies to `turn/start` (§7.5, §8.4/§8.5):
+            //  - the thread's current model (carrying its reasoning effort), so a mid-thread
+            //    model/effort change actually reaches the agent. Passing `None` here would leave
+            //    Codex on whatever model was set at `thread/start`.
+            //  - the effective approval policy: a per-thread override wins over the project's (§9).
             let overrides = TurnOverrides {
-                model: None,
+                model: Some(effective_model.clone()),
                 mode: tf.mode,
-                approval_policy: project.approval_policy,
+                approval_policy: tf.approval_policy.unwrap_or(project.approval_policy),
             };
-
-            tf.updated_at = chrono::Utc::now();
-            let _ = state.store.save_thread(project_id, &tf).await;
 
             state
                 .registry
@@ -593,48 +605,55 @@ async fn handle_client_msg(
                 .map_err(|e| e.to_string())?;
         }
         ClientMessage::SwitchMode { thread_id, mode } => {
-            let (project_id, mut tf) = load_thread(state, thread_id).await?;
-            tf.mode = mode;
-            tf.updated_at = chrono::Utc::now();
-            state
+            let project_id = project_for(state, thread_id).await?;
+            let tf = state
                 .store
-                .save_thread(project_id, &tf)
+                .update_thread(project_id, thread_id, |tf| {
+                    tf.mode = mode;
+                    tf.updated_at = chrono::Utc::now();
+                })
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| e.to_string())?
+                .ok_or("thread not found")?;
             broadcast_thread_state(state, thread_id, &tf).await;
         }
         ClientMessage::SelectModel {
             thread_id,
             model_ref,
         } => {
-            let (project_id, mut tf) = load_thread(state, thread_id).await?;
+            let project_id = project_for(state, thread_id).await?;
             let config = state.store.load_config().await.map_err(|e| e.to_string())?;
 
-            let old_descriptor = crate::models::resolve_descriptor(&config, &tf.current_model);
-            if old_descriptor.supports_reasoning_effort {
-                if let Some(effort) = tf.current_model.reasoning_effort {
-                    tf.model_efforts.insert(tf.current_model.key(), effort);
-                }
-            }
-
-            let new_descriptor = crate::models::resolve_descriptor(&config, &model_ref);
-            let mut new_model = model_ref;
-            if new_descriptor.supports_reasoning_effort {
-                if new_model.reasoning_effort.is_none() {
-                    new_model.reasoning_effort = tf.model_efforts.get(&new_model.key()).copied();
-                }
-            } else {
-                new_model.reasoning_effort = None;
-            }
-
-            tf.context_window = crate::models::context_window_for(&config, &new_model);
-            tf.current_model = new_model;
-            tf.updated_at = chrono::Utc::now();
-            state
+            // All model/effort resolution happens inside the RMW closure so it sees the
+            // authoritative current model under the per-thread lock (§5.4, C7 effort retention).
+            let tf = state
                 .store
-                .save_thread(project_id, &tf)
+                .update_thread(project_id, thread_id, move |tf| {
+                    let old = crate::models::resolve_descriptor(&config, &tf.current_model);
+                    if old.supports_reasoning_effort {
+                        if let Some(effort) = tf.current_model.reasoning_effort {
+                            tf.model_efforts.insert(tf.current_model.key(), effort);
+                        }
+                    }
+
+                    let new_descriptor = crate::models::resolve_descriptor(&config, &model_ref);
+                    let mut new_model = model_ref.clone();
+                    if new_descriptor.supports_reasoning_effort {
+                        if new_model.reasoning_effort.is_none() {
+                            new_model.reasoning_effort =
+                                tf.model_efforts.get(&new_model.key()).copied();
+                        }
+                    } else {
+                        new_model.reasoning_effort = None;
+                    }
+
+                    tf.context_window = crate::models::context_window_for(&config, &new_model);
+                    tf.current_model = new_model;
+                    tf.updated_at = chrono::Utc::now();
+                })
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| e.to_string())?
+                .ok_or("thread not found")?;
             broadcast_thread_state(state, thread_id, &tf).await;
         }
         ClientMessage::SetApprovalPolicy {
@@ -642,15 +661,20 @@ async fn handle_client_msg(
             project_id,
             policy,
         } => {
+            // Two targets (§9): a `thread_id` sets the per-thread override (consumed by SendInput
+            // via `tf.approval_policy.unwrap_or(project)`); a `project_id` changes the project
+            // default that applies to threads without an override. `thread_id` wins if both are set.
             if let Some(tid) = thread_id {
-                let (pid, mut tf) = load_thread(state, tid).await?;
-                tf.approval_policy = Some(policy);
-                tf.updated_at = chrono::Utc::now();
-                state
+                let pid = project_for(state, tid).await?;
+                let tf = state
                     .store
-                    .save_thread(pid, &tf)
+                    .update_thread(pid, tid, |tf| {
+                        tf.approval_policy = Some(policy);
+                        tf.updated_at = chrono::Utc::now();
+                    })
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| e.to_string())?
+                    .ok_or("thread not found")?;
                 broadcast_thread_state(state, tid, &tf).await;
             } else if let Some(pid) = project_id {
                 let mut config = state
@@ -706,6 +730,18 @@ async fn handle_client_msg(
         }
     }
     Ok(())
+}
+
+/// Resolve the project a currently-open thread belongs to (via the harness registry).
+async fn project_for(
+    state: &AppState,
+    thread_id: giskard_core::ids::ThreadId,
+) -> Result<ProjectId, String> {
+    state
+        .registry
+        .get_project_for_thread(thread_id)
+        .await
+        .ok_or_else(|| "thread not open".to_string())
 }
 
 /// Load a thread file plus the project it belongs to (via the harness registry).

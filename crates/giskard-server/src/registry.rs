@@ -319,36 +319,39 @@ async fn persist_turn(
     thread_id: ThreadId,
     turn: Turn,
 ) {
-    let mut tf = match store.load_thread(project_id, thread_id).await {
+    // C4: recompute the cached context window from the current model on write.
+    let config = store.load_config().await.ok();
+
+    // Single-writer RMW (§5.4): appending the turn + folding tokens happens under the per-thread
+    // lock, so a concurrent model/mode/policy change can't clobber the completed turn (and vice
+    // versa).
+    let updated = store
+        .update_thread(project_id, thread_id, move |tf| {
+            if turn.status.kind == TurnStatusKind::Completed
+                || turn.status.kind == TurnStatusKind::Interrupted
+            {
+                tf.tokens
+                    .record(&turn.model.provider, &turn.model.model, &turn.usage);
+            }
+            tf.turns.push(turn);
+            tf.updated_at = Utc::now();
+            if let Some(config) = &config {
+                tf.context_window = context_window_for(config, &tf.current_model);
+            }
+        })
+        .await;
+
+    let tf = match updated {
         Ok(Some(tf)) => tf,
         Ok(None) => {
             warn!(%thread_id, "thread file missing on turn completion");
             return;
         }
         Err(e) => {
-            warn!(%thread_id, %e, "failed to load thread on turn completion");
+            warn!(%thread_id, %e, "failed to persist thread on turn completion");
             return;
         }
     };
-
-    if turn.status.kind == TurnStatusKind::Completed
-        || turn.status.kind == TurnStatusKind::Interrupted
-    {
-        tf.tokens
-            .record(&turn.model.provider, &turn.model.model, &turn.usage);
-    }
-    tf.turns.push(turn);
-    tf.updated_at = Utc::now();
-
-    // C4: keep the cached context window in sync with the (possibly changed) current model.
-    if let Ok(config) = store.load_config().await {
-        tf.context_window = context_window_for(&config, &tf.current_model);
-    }
-
-    if let Err(e) = store.save_thread(project_id, &tf).await {
-        warn!(%thread_id, %e, "failed to persist thread on turn completion");
-        return;
-    }
 
     // Push a thread-scoped token update to subscribers (§13.6).
     if let Ok(ledger) = serde_json::to_value(&tf.tokens) {

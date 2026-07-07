@@ -143,6 +143,23 @@ mod tests {
         }
     }
 
+    /// The returned span byte-offsets must bracket exactly the path token (the client slices the
+    /// original text with them), excluding any leading boundary character the regex consumed.
+    #[test]
+    fn linkify_span_offsets_are_exact() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::write(root.join("main.rs"), "").unwrap();
+
+        let text = "edit main.rs now";
+        let spans = linkify_text(text, &root);
+        assert_eq!(spans.len(), 1);
+        let s = &spans[0];
+        assert_eq!(s.start, 5);
+        assert_eq!(s.end, 12);
+        assert_eq!(&text[s.start..s.end], "main.rs");
+    }
+
     /// Relative paths prefixed with `./` should still be linkified.
     #[test]
     fn linkify_relative_path() {

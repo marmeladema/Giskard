@@ -31,6 +31,10 @@ pub struct CodexMapper {
     thread_ids: HashMap<String, ThreadId>,
     turn_ids: HashMap<String, TurnId>,
     item_ids: HashMap<String, ItemId>,
+    /// Latest per-turn token usage, keyed by native turn id. Codex reports usage via a separate
+    /// `thread/tokenUsage/updated` notification (not on `turn/completed`), so we cache the most
+    /// recent value per turn and attach it when the turn completes (spec §10.1).
+    turn_usage: HashMap<String, TokenUsage>,
 }
 
 impl CodexMapper {
@@ -40,6 +44,7 @@ impl CodexMapper {
             thread_ids: HashMap::new(),
             turn_ids: HashMap::new(),
             item_ids: HashMap::new(),
+            turn_usage: HashMap::new(),
         }
     }
 
@@ -90,7 +95,9 @@ impl CodexMapper {
 
             Notification::TurnCompleted(TurnCompletedNotification { thread_id, turn }) => {
                 let thread = self.resolve_thread(thread_id, fallback_thread);
-                let usage = extract_token_usage(turn);
+                // Attach the usage cached from the last `thread/tokenUsage/updated` for this turn
+                // (spec §10.1). Defaults to zero if Codex sent no usage update for the turn.
+                let usage = self.turn_usage.remove(&turn.id).unwrap_or_default();
                 let status = map_turn_status(&turn.status);
                 Some(AgentEvent::TurnCompleted {
                     thread,
@@ -98,6 +105,16 @@ impl CodexMapper {
                     usage,
                     status,
                 })
+            }
+
+            Notification::ThreadTokenUsageUpdated(n) => {
+                // Cache the last-turn usage breakdown; emit no Giskard event for the intermediate
+                // update (the usage is surfaced on `TurnCompleted`).
+                if !n.turn_id.is_empty() {
+                    self.turn_usage
+                        .insert(n.turn_id.clone(), breakdown_to_usage(&n.token_usage.last));
+                }
+                None
             }
 
             Notification::ItemStarted(ItemStartedNotification {
@@ -380,9 +397,17 @@ fn map_turn_status(status: &codex_codes::TurnStatus) -> TurnStatus {
     }
 }
 
-fn extract_token_usage(_turn: &codex_codes::Turn) -> TokenUsage {
-    // TODO: inspect the pinned schema for the exact field name (spec §10.3).
-    TokenUsage::default()
+/// Convert a Codex `TokenUsageBreakdown` into the neutral `TokenUsage` (spec §10.1).
+///
+/// `input`/`output`/`total` map to Codex's `input_tokens`/`output_tokens`/`total_tokens`
+/// (cached-input and reasoning-output sub-counts are folded into those totals by Codex and are
+/// not tracked separately in v1).
+fn breakdown_to_usage(b: &codex_codes::protocol::TokenUsageBreakdown) -> TokenUsage {
+    TokenUsage {
+        input: b.input_tokens.max(0) as u64,
+        output: b.output_tokens.max(0) as u64,
+        total: b.total_tokens.max(0) as u64,
+    }
 }
 
 /// Extract the native item id string from a Codex `ThreadItem`.
@@ -556,4 +581,73 @@ fn parse_hunk_header(line: &str) -> Option<(u32, u32, u32, u32)> {
     let (os, ol) = parse(old_part)?;
     let (ns, nl) = parse(new_part)?;
     Some((os, ol, ns, nl))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Usage from a `thread/tokenUsage/updated` notification is cached per turn and surfaced on the
+    /// matching `TurnCompleted` (spec §10.1) — regression guard for the previous zero stub.
+    #[test]
+    fn token_usage_attached_on_turn_completed() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let fallback = ThreadId::new();
+
+        let usage_notif = Notification::ThreadTokenUsageUpdated(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "th1",
+                "turnId": "t1",
+                "tokenUsage": {
+                    "last": {
+                        "cachedInputTokens": 10, "inputTokens": 100,
+                        "outputTokens": 40, "reasoningOutputTokens": 5, "totalTokens": 140
+                    },
+                    "total": {
+                        "cachedInputTokens": 10, "inputTokens": 100,
+                        "outputTokens": 40, "reasoningOutputTokens": 5, "totalTokens": 140
+                    }
+                }
+            }))
+            .unwrap(),
+        );
+        // The intermediate update emits no Giskard event.
+        assert!(mapper.map_notification(&usage_notif, fallback).is_none());
+
+        let completed = Notification::TurnCompleted(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "th1",
+                "turn": { "id": "t1", "status": "completed" }
+            }))
+            .unwrap(),
+        );
+        match mapper.map_notification(&completed, fallback).unwrap() {
+            AgentEvent::TurnCompleted { usage, .. } => {
+                assert_eq!(usage.input, 100);
+                assert_eq!(usage.output, 40);
+                assert_eq!(usage.total, 140);
+            }
+            other => panic!("expected TurnCompleted, got {other:?}"),
+        }
+    }
+
+    /// With no usage notification, a completed turn reports zero (not a panic).
+    #[test]
+    fn token_usage_defaults_to_zero() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let completed = Notification::TurnCompleted(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "th1",
+                "turn": { "id": "t9", "status": "completed" }
+            }))
+            .unwrap(),
+        );
+        match mapper
+            .map_notification(&completed, ThreadId::new())
+            .unwrap()
+        {
+            AgentEvent::TurnCompleted { usage, .. } => assert_eq!(usage.total, 0),
+            other => panic!("expected TurnCompleted, got {other:?}"),
+        }
+    }
 }
