@@ -70,6 +70,8 @@
   .kv b { color:var(--muted); font-weight:500; }
   .msg.pending { opacity:.7; }
   .msg.failed { border:1px solid #f85149; }
+  .msg.error { background:#2a1416; border:1px solid #f85149; color:#ffb4ae; max-width:100%; }
+  .msg.error .role { color:#f85149; opacity:1; }
 </style>
 </head>
 <body>
@@ -353,7 +355,7 @@ function renderHistoryPage(msg) {
     const container = document.createElement("div");
     const prev = state.renderTarget;
     state.renderTarget = container;
-    for (const turn of turns) for (const it of (turn.items||[])) addItem(it);
+    for (const turn of turns) renderPersistedTurn(turn);
     state.renderTarget = prev;
 
     const t = $("transcript");
@@ -362,7 +364,25 @@ function renderHistoryPage(msg) {
     while (container.firstChild) t.insertBefore(container.firstChild, anchor);
     t.scrollTop += t.scrollHeight - heightBefore;
   } else {
-    for (const turn of turns) for (const it of (turn.items||[])) addItem(it);
+    for (const turn of turns) renderPersistedTurn(turn);
+  }
+}
+
+// Render one persisted turn from history: its items, plus the user message and any failure that
+// aren't captured as items. A turn that failed before producing output (e.g. a quota rejection)
+// has no user_message item, so we render `user_input` directly; its `status.message` then explains
+// why the message got no agent response — the record that a transient toast used to lose.
+function renderPersistedTurn(turn) {
+  const items = turn.items || [];
+  const hasUserItem = items.some(it => ((it.payload||it).kind) === "user_message");
+  const inputText = turn.user_input && turn.user_input.text;
+  if (!hasUserItem && inputText) {
+    renderItemBody(bubble("user","you"), { kind:"user_message", text: inputText });
+  }
+  for (const it of items) addItem(it);
+  const st = turn.status;
+  if (st && (st.kind==="failed" || st.kind==="interrupted")) {
+    errorBubble(st.message || (st.kind==="interrupted" ? "Turn interrupted." : "Turn failed."));
   }
 }
 
@@ -401,8 +421,24 @@ function handleEvent(ev) {
       state.itemKindsByItemId.clear();
       break;
     case "approval_requested": notice("Approval requested"); break;
-    case "error": notice(ev.error ? JSON.stringify(ev.error) : "error", "error"); break;
+    // Render errors as a persistent transcript entry (tied to the turn/message that caused them)
+    // rather than a toast that vanishes — so looking back at a thread explains why a message got
+    // no agent response. The matching failed turn is also persisted server-side (§7.1).
+    case "error":
+      failPendingUserMessage(null);   // resolve the optimistic bubble to a failed state
+      errorBubble(errorText(ev.error));
+      break;
   }
+}
+
+// A persistent, transcript-anchored error entry (respects renderTarget for history prepends).
+function errorBubble(message) {
+  bubble("error","error").textContent = message || "error";
+}
+function errorText(e) {
+  if (!e) return "error";
+  if (typeof e === "string") return e;
+  return e.message || e.detail || JSON.stringify(e);
 }
 
 function renderLiveTurnSnapshot(snap) {

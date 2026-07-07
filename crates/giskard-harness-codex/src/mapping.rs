@@ -858,6 +858,19 @@ fn enum_string<T: Serialize>(value: &T) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
+/// If `notif` is a non-retryable turn error, return its composed message.
+///
+/// Codex sends no `turn/completed` after a fatal error, so the harness uses this to synthesize a
+/// terminal `Failed` turn (persisted to history, §7.1) instead of leaving the turn hanging with
+/// only an ephemeral error event. Retryable errors (`will_retry`) are left alone — Codex retries
+/// internally and eventually emits its own `turn/completed` or a final non-retryable error.
+pub(crate) fn fatal_turn_error(notif: &Notification) -> Option<String> {
+    match notif {
+        Notification::Error(n) if !n.will_retry => Some(compose_turn_error(&n.error, false)),
+        _ => None,
+    }
+}
+
 /// Compose a human-readable message from a Codex `TurnError` (spec §12.2).
 ///
 /// Codex puts the primary text in `message`, optional supplementary text in `additional_details`,
@@ -1332,6 +1345,40 @@ mod tests {
             error_message(mapper.map_notification(&empty, fallback).unwrap()),
             "Codex reported an unspecified error"
         );
+    }
+
+    /// A non-retryable `error` is fatal (drives a synthesized Failed turn); a retryable one is not.
+    #[test]
+    fn fatal_turn_error_detects_non_retryable_errors() {
+        let fatal: Notification = Notification::Error(
+            serde_json::from_value(serde_json::json!({
+                "willRetry": false,
+                "error": { "message": "Quota exceeded", "codexErrorInfo": "usageLimitExceeded" }
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            fatal_turn_error(&fatal).as_deref(),
+            Some("usageLimitExceeded: Quota exceeded")
+        );
+
+        let retryable: Notification = Notification::Error(
+            serde_json::from_value(serde_json::json!({
+                "willRetry": true,
+                "error": { "message": "transient blip" }
+            }))
+            .unwrap(),
+        );
+        assert!(fatal_turn_error(&retryable).is_none());
+
+        // A non-error notification is never fatal.
+        let plan = Notification::PlanDelta(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "th1", "turnId": "t1", "itemId": "p1", "delta": "x"
+            }))
+            .unwrap(),
+        );
+        assert!(fatal_turn_error(&plan).is_none());
     }
 
     /// With no usage notification, a completed turn reports zero (not a panic).
