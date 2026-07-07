@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use axum::{
     Router,
@@ -39,6 +39,9 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
             "/api/projects/{id}/threads",
             get(list_threads).post(open_thread),
         )
+        .route("/api/projects/{id}/highlight", get(highlight_file))
+        .route("/api/projects/{id}/raw", get(download_file))
+        .route("/api/projects/{id}/linkify", post(linkify))
         .route("/api/browse", get(browse))
         .route("/api/models", get(list_models))
         .route("/api/logout", post(logout))
@@ -314,6 +317,152 @@ async fn browse(
         path: canonical.to_string_lossy().to_string(),
         entries,
     }))
+}
+
+/// Query parameters for the highlight endpoint.
+#[derive(Deserialize)]
+struct HighlightQuery {
+    /// Relative or absolute path to the file (confined to workspace root).
+    path: String,
+    /// 1-based start line (inclusive) for pagination.
+    start: Option<usize>,
+    /// 1-based end line (inclusive) for pagination.
+    end: Option<usize>,
+}
+
+/// `GET /api/projects/{id}/highlight` — syntax-highlighted file content (spec §11.2).
+///
+/// Returns highlighted HTML, detected language, binary flag, total line count,
+/// and file size. The `start`/`end` query params enable line-range pagination
+/// for large files. Path is confined to the project's workspace root.
+async fn highlight_file(
+    State(state): State<AppState>,
+    AxumPath(project_id): AxumPath<ProjectId>,
+    Query(q): Query<HighlightQuery>,
+) -> Result<Json<HighlightResponse>, ApiError> {
+    let project = state
+        .store
+        .load_project(project_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+    let workspace_root = PathBuf::from(project.workspace_root.as_deref().unwrap_or(&project.dir));
+    let resolved = resolve_confined_path(&workspace_root, &q.path)
+        .ok_or(ApiError::Forbidden("path escapes workspace root".into()))?;
+
+    let result = state
+        .highlighter
+        .highlight_file(&resolved, q.start, q.end)
+        .await
+        .map_err(ApiError::BadRequest)?;
+
+    Ok(Json(HighlightResponse {
+        html: result.html,
+        language: result.language,
+        is_binary: result.is_binary,
+        total_lines: result.total_lines,
+        file_size: result.file_size,
+    }))
+}
+
+/// Query parameters for the raw file download endpoint.
+#[derive(Deserialize)]
+struct RawQuery {
+    /// Relative or absolute path to the file (confined to workspace root).
+    path: String,
+}
+
+/// `GET /api/projects/{id}/raw` — download a raw file (spec §11.2).
+///
+/// Returns the file contents as `application/octet-stream` with a
+/// `Content-Disposition: attachment` header. Path is confined to the
+/// project's workspace root.
+async fn download_file(
+    State(state): State<AppState>,
+    AxumPath(project_id): AxumPath<ProjectId>,
+    Query(q): Query<RawQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let project = state
+        .store
+        .load_project(project_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+    let workspace_root = PathBuf::from(project.workspace_root.as_deref().unwrap_or(&project.dir));
+    let resolved = resolve_confined_path(&workspace_root, &q.path)
+        .ok_or(ApiError::Forbidden("path escapes workspace root".into()))?;
+
+    let bytes = tokio::fs::read(&resolved)
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("cannot read file: {e}")))?;
+
+    let filename = resolved
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".into());
+
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        [(
+            axum::http::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )],
+        bytes,
+    )
+        .into_response())
+}
+
+/// `POST /api/projects/{id}/linkify` — detect file paths in agent text (spec §11.2).
+///
+/// Scans the request body's `text` field for strings that look like file paths,
+/// resolves them against the project's workspace root, and returns byte-offset
+/// spans for each path that points to an existing file. The client uses these
+/// spans to render clickable links in agent messages.
+async fn linkify(
+    State(state): State<AppState>,
+    AxumPath(project_id): AxumPath<ProjectId>,
+    Json(req): Json<LinkifyRequest>,
+) -> Result<Json<LinkifyResponse>, ApiError> {
+    let project = state
+        .store
+        .load_project(project_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+    let workspace_root = PathBuf::from(project.workspace_root.as_deref().unwrap_or(&project.dir));
+    let root_canonical = workspace_root.canonicalize().unwrap_or(workspace_root);
+
+    let spans = crate::linkify::linkify_text(&req.text, &root_canonical);
+    let links = spans
+        .into_iter()
+        .map(|s| LinkSpanResponse {
+            start: s.start,
+            end: s.end,
+            path: s.path,
+        })
+        .collect();
+
+    Ok(Json(LinkifyResponse { links }))
+}
+
+/// Canonicalize a requested path and verify it stays within the workspace root.
+///
+/// Returns `None` if the path escapes the workspace root after symlink
+/// resolution. Used by the highlight, raw download, and linkify endpoints to
+/// prevent path traversal attacks.
+fn resolve_confined_path(workspace_root: &Path, requested: &str) -> Option<PathBuf> {
+    let root_canonical = workspace_root.canonicalize().ok()?;
+    let candidate = if Path::new(requested).is_absolute() {
+        PathBuf::from(requested)
+    } else {
+        root_canonical.join(requested)
+    };
+    let canonical = candidate.canonicalize().ok()?;
+    if canonical.starts_with(&root_canonical) {
+        Some(canonical)
+    } else {
+        None
+    }
 }
 
 async fn list_models(State(state): State<AppState>) -> Result<Json<ListModelsResponse>, ApiError> {

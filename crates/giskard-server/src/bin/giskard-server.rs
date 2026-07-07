@@ -122,14 +122,14 @@ async fn main() {
 
     let store = Arc::new(giskard_persist::PersistStore::new(data_dir.clone()));
     let session_key = load_or_create_session_key(&data_dir);
+    let config = store.load_config().await.unwrap_or_default();
+    let bind = config.server.bind.clone();
 
     let factory = Arc::new(ReplayFactory {
         fixture: make_demo_fixture(),
     });
 
-    let state = AppState::new(store, factory, session_key);
-    let config = state.store.load_config().await.unwrap_or_default();
-    let bind = config.server.bind.clone();
+    let state = AppState::new_with_config(store, factory, session_key, Some(&config.viz));
 
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind(&bind)

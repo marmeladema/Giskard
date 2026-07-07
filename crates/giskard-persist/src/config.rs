@@ -11,6 +11,7 @@ pub struct Config {
     pub browse: BrowseConfig,
     pub plan: PlanConfig,
     pub tokens: TokensConfig,
+    pub viz: VizConfig,
     pub providers: Vec<ProviderConfig>,
     pub harness: HarnessConfig,
 }
@@ -74,6 +75,25 @@ impl Default for PlanConfig {
 #[serde(default)]
 pub struct TokensConfig {
     pub cost_estimation: bool,
+}
+
+/// Visualization configuration (spec §11.3).
+///
+/// Controls the maximum file size for syntax highlighting. Files exceeding
+/// this threshold return an empty HTML body with metadata only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VizConfig {
+    /// Maximum file size in bytes for syntax highlighting (default: 10 MiB).
+    pub max_highlight_size: usize,
+}
+
+impl Default for VizConfig {
+    fn default() -> Self {
+        Self {
+            max_highlight_size: 10 * 1024 * 1024,
+        }
+    }
 }
 
 /// A provider declaration (spec Appendix C).

@@ -208,6 +208,45 @@ pub struct SavePlanResponse {
     pub path: String,
 }
 
+/// Syntax-highlighted file content (spec §11.2).
+///
+/// The overlay displays the file's path, size, and language alongside the
+/// highlighted HTML. When `is_binary` is true or the file exceeds the size
+/// threshold, `html` is empty and the UI shows a fallback message.
+#[derive(Debug, Clone, Serialize)]
+pub struct HighlightResponse {
+    /// Syntax-highlighted HTML (empty for binary or oversized files).
+    pub html: String,
+    /// Detected language name (e.g. "Rust", "Python").
+    pub language: Option<String>,
+    /// True if the file contains null bytes (§11.3 binary detection).
+    pub is_binary: bool,
+    /// Total number of lines in the file (before range slicing).
+    pub total_lines: usize,
+    /// File size in bytes (spec §11.2: overlay shows path, size, and language).
+    pub file_size: u64,
+}
+
+/// A linkified span within agent text (spec §11.2).
+#[derive(Debug, Clone, Serialize)]
+pub struct LinkSpanResponse {
+    pub start: usize,
+    pub end: usize,
+    pub path: String,
+}
+
+/// Result of path linkification (spec §11.2).
+#[derive(Debug, Clone, Serialize)]
+pub struct LinkifyResponse {
+    pub links: Vec<LinkSpanResponse>,
+}
+
+/// Request body for linkification (spec §11.2).
+#[derive(Debug, Clone, Deserialize)]
+pub struct LinkifyRequest {
+    pub text: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

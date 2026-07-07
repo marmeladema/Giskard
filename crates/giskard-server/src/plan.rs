@@ -137,6 +137,7 @@ mod tests {
                 message: None,
             },
             usage: TokenUsage::default(),
+            diffs: Vec::new(),
             started_at: Utc::now(),
             completed_at: Some(Utc::now()),
         }

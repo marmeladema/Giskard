@@ -236,6 +236,7 @@ async fn forward_events(
     let mut turn_id: Option<TurnId> = None;
     let mut started_at = Utc::now();
     let mut items: Vec<Item> = Vec::new();
+    let mut diffs: Vec<giskard_core::FileDiff> = Vec::new();
 
     loop {
         match stream.recv().await {
@@ -246,6 +247,14 @@ async fn forward_events(
                         started_at = Utc::now();
                     }
                     AgentEvent::ItemCompleted { item, .. } => items.push(item.clone()),
+                    AgentEvent::DiffUpdated { diff, .. } => {
+                        let existing = diffs.iter_mut().find(|d| d.path == diff.path);
+                        if let Some(existing) = existing {
+                            *existing = diff.clone();
+                        } else {
+                            diffs.push(diff.clone());
+                        }
+                    }
                     AgentEvent::ApprovalRequested { request, .. } => {
                         approvals.lock().await.insert(request.id.clone(), thread_id);
                     }
@@ -284,6 +293,7 @@ async fn forward_events(
                         mode: ctx.mode,
                         status: status.clone(),
                         usage,
+                        diffs: std::mem::take(&mut diffs),
                         started_at,
                         completed_at: Some(Utc::now()),
                     };
