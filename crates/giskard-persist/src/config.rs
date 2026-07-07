@@ -258,4 +258,18 @@ idle_shutdown_secs = 0
         assert_eq!(config.server.bind, "127.0.0.1:8787");
         assert_eq!(config.harness.kind, "codex");
     }
+
+    /// The annotated `config.example.toml` shipped at the repo root must always parse against the
+    /// current `Config` structs, so the documented example can't silently drift from the code.
+    #[test]
+    fn shipped_example_config_parses() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.example.toml");
+        let toml = std::fs::read_to_string(path).expect("read config.example.toml");
+        let config: Config = toml::from_str(&toml).expect("config.example.toml parses as Config");
+        assert_eq!(config.server.bind, "127.0.0.1:8787");
+        // Example intentionally documents plain-HTTP local dev.
+        assert!(!config.server.secure_cookies);
+        assert_eq!(config.harness.kind, "codex");
+        assert_eq!(config.providers.len(), 2);
+    }
 }

@@ -1,0 +1,91 @@
+# Giskard configuration — annotated example.
+#
+# Copy this to your data directory and edit:
+#   ${GISKARD_DATA_DIR:-~/.local/share/giskard}/config.toml
+#
+# Every section is optional; omitted keys fall back to the defaults shown here. Generate the
+# password hash with:  cargo run -p giskard-persist --bin giskard-admin -- set-password
+
+[server]
+# Address the HTTP/WebSocket server binds to.
+bind = "127.0.0.1:8787"
+# The session cookie's `Secure` flag. MUST be false when serving over plain HTTP (e.g. local dev):
+# with `true`, browsers refuse to send the cookie over http:// and login "succeeds" but nothing
+# loads. Set true in production behind HTTPS/TLS.
+secure_cookies = false
+
+[auth]
+# Argon2 hash of the single shared app password (never the plaintext). Generate via
+# `giskard-admin set-password`. May instead be provided via the GISKARD_PASSWORD_HASH env var.
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$REPLACE_ME"
+# Session lifetime in days (sliding).
+session_days = 30
+
+[browse]
+# Filesystem-picker scope. Empty ⇒ the whole filesystem is browsable. Set to a list of absolute
+# paths to confine the picker (and reject `..`/symlink escapes) to those subtrees.
+roots = []
+# e.g. roots = ["/home/you/dev"]
+
+[plan]
+# "Save plan to project" default location and filename template ({slug} = thread-title slug,
+# {ts} = timestamp). The file is written inside the project's workspace root.
+default_dir = "docs"
+filename_template = "plan-{slug}-{ts}.md"
+
+[tokens]
+# Turn on to compute an estimated euro cost alongside raw token counts.
+cost_estimation = false
+# Per-model rates in euros per million tokens, keyed by "provider/model". Only used when
+# cost_estimation = true.
+# [tokens.rates."openai/gpt-5.5"]
+# input_per_mtok_eur = 3.0
+# output_per_mtok_eur = 10.0
+
+[viz]
+# Files larger than this (bytes) are not syntax-highlighted; the code overlay shows metadata only.
+max_highlight_size = 10485760   # 10 MiB
+
+[history]
+# Turns loaded when a thread is opened, and per "scroll up" page (infinite scroll).
+initial = 50
+page = 50
+
+[harness]
+# Which agent harness backs projects. v1 ships "codex".
+kind = "codex"
+# Terminate an idle project's harness process after N seconds (0 = keep alive while the app runs).
+idle_shutdown_secs = 0
+
+# ---- Providers ----
+# What the model picker offers and (optionally) which endpoints expose GET /v1/models. Codex reads
+# its own ~/.codex/config.toml for actual auth; the ModelRef Giskard sends per turn must correspond
+# to a model/provider Codex is configured to reach.
+
+[[providers]]
+id = "openai"
+name = "OpenAI (Codex built-in)"
+wire_api = "responses"
+model_listing = false
+  [[providers.models]]
+  id = "gpt-5.5"
+  display_name = "GPT-5.5"
+  context_window = 262144
+  supports_reasoning_effort = true
+  [[providers.models]]
+  id = "gpt-5.4"
+  display_name = "GPT-5.4"
+  context_window = 262144
+  supports_reasoning_effort = true
+
+[[providers]]
+id = "cloudflare-litellm"
+name = "Cloudflare Workers AI (via LiteLLM)"
+base_url = "http://127.0.0.1:4000/v1"   # GET {base_url}/models is merged over the static list
+wire_api = "responses"
+model_listing = true
+  [[providers.models]]
+  id = "@cf/z-ai/glm-4.7"
+  display_name = "GLM-4.7 (Workers AI)"
+  context_window = 131072
+  supports_reasoning_effort = false
