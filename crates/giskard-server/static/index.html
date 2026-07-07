@@ -25,12 +25,13 @@
 
   /* app grid — flanking column widths are user-resizable (persisted) via CSS vars. */
   #app { display:none; grid-template-columns:var(--col-left,260px) 6px minmax(360px,1fr) 6px var(--col-right,300px); height:100vh; }
-  .col { height:100vh; overflow-y:auto; border-right:1px solid var(--border); }
-  .col:last-child { border-right:0; }
+  .col { height:100vh; overflow-y:auto; }
   .resizer { cursor:col-resize; background:transparent; transition:background .12s; }
   .resizer:hover, .resizer.active { background:var(--accent); }
   .sidebar { background:var(--panel); padding:12px; }
-  .center { display:flex; flex-direction:column; }
+  /* The center column owns both dividers, so each delimiter line hugs the thread and the drag
+     bar sits just outside it — symmetric on the left and right. */
+  .center { display:flex; flex-direction:column; border-left:1px solid var(--border); border-right:1px solid var(--border); }
   .ctx { background:var(--panel); padding:12px; }
 
   .proj { margin-bottom:10px; }
@@ -102,6 +103,63 @@
   .field label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
   .field input, .field select { width:100%; }
   .field .hint { font-size:11px; color:var(--muted); margin-top:4px; }
+
+  /* =================== Appearance themes ===================
+     Three selectable looks (persisted client-side). Each sets a palette; IDE and Terminal also
+     restyle the transcript into role-gutter rows. The DOM is identical across themes (.msg holds
+     .role + .body), so switching is pure CSS. */
+  :root[data-appearance="ide"] {
+    --bg:#0d1117; --panel:#0f141b; --panel2:#161d28; --border:#222b38;
+    --fg:#dbe2ea; --muted:#79838f; --accent:#3b82f6;
+  }
+  :root[data-appearance="bubbles"] {
+    --bg:#0e1116; --panel:#161b22; --panel2:#1c2230; --border:#2b3240;
+    --fg:#e6edf3; --muted:#8b949e; --accent:#5b8def;
+  }
+  :root[data-appearance="terminal"] {
+    --bg:#0a0d0b; --panel:#0d110e; --panel2:#131813; --border:#212a20;
+    --fg:#cdd6cd; --muted:#7f8c7f; --accent:#5ec27e;
+  }
+
+  /* Bubbles — a softer, less saturated take on the default chat bubbles. */
+  [data-appearance="bubbles"] .msg { border-radius:14px; }
+  [data-appearance="bubbles"] .msg.user { box-shadow:none; }
+
+  /* IDE — flat, full-width rows with a right-aligned role gutter; no chat bubbles. */
+  [data-appearance="ide"] #transcript { padding:0; }
+  [data-appearance="ide"] .msg {
+    max-width:100%; margin:0; padding:11px 18px; border-radius:0; background:transparent;
+    border:0; border-bottom:1px solid var(--border);
+    display:grid; grid-template-columns:78px 1fr; column-gap:16px; align-items:start;
+  }
+  [data-appearance="ide"] .msg .role { margin:0; padding-top:1px; text-align:right; opacity:1; color:var(--muted); }
+  [data-appearance="ide"] .msg.user { background:rgba(59,130,246,.07); color:var(--fg); }
+  [data-appearance="ide"] .msg.user .role { color:var(--accent); }
+  [data-appearance="ide"] .msg.reasoning { border:0; border-bottom:1px solid var(--border); font-style:italic; color:var(--muted); }
+  [data-appearance="ide"] .msg.cmd,
+  [data-appearance="ide"] .msg.file,
+  [data-appearance="ide"] .msg.tool,
+  [data-appearance="ide"] .msg.activity { border:0; border-bottom:1px solid var(--border); }
+  [data-appearance="ide"] .msg.cmd { background:var(--panel2); }
+  [data-appearance="ide"] .msg.error { background:rgba(248,81,73,.09); border:0; border-bottom:1px solid var(--border); }
+  [data-appearance="ide"] .msg.error .role { color:#f85149; }
+
+  /* Terminal — dense, monospace, log-style rows. */
+  [data-appearance="terminal"] body { font-family:var(--mono); }
+  [data-appearance="terminal"] #transcript { padding:10px 12px; }
+  [data-appearance="terminal"] .msg {
+    max-width:100%; margin:0; padding:1px 0; border:0; border-radius:0; background:transparent;
+    display:grid; grid-template-columns:66px 1fr; column-gap:10px;
+    font-family:var(--mono); font-size:12.5px; line-height:1.55;
+  }
+  [data-appearance="terminal"] .msg .role { margin:0; text-align:right; text-transform:lowercase; letter-spacing:0; opacity:1; color:var(--muted); }
+  [data-appearance="terminal"] .msg.user, [data-appearance="terminal"] .msg.agent,
+  [data-appearance="terminal"] .msg.cmd, [data-appearance="terminal"] .msg.file,
+  [data-appearance="terminal"] .msg.tool, [data-appearance="terminal"] .msg.activity { background:transparent; border:0; color:var(--fg); }
+  [data-appearance="terminal"] .msg.user .role { color:var(--accent); }
+  [data-appearance="terminal"] .msg.reasoning { background:transparent; border:0; color:var(--muted); }
+  [data-appearance="terminal"] .msg.error { background:transparent; border:0; color:#ff9d96; }
+  [data-appearance="terminal"] .msg.error .role { color:#ff6b63; }
 </style>
 </head>
 <body>
@@ -140,6 +198,14 @@
     <div class="resizer" id="resizeRight" title="Drag to resize"></div>
 
     <div class="col ctx">
+      <div class="field" style="margin-top:0">
+        <label for="appearanceSel">Appearance</label>
+        <select id="appearanceSel">
+          <option value="ide">Professional (IDE)</option>
+          <option value="bubbles">Bubbles</option>
+          <option value="terminal">Terminal</option>
+        </select>
+      </div>
       <h3 class="sec">Usage</h3>
       <div id="ctxTokens" class="muted">No thread open.</div>
       <div id="notices"></div>
@@ -883,6 +949,17 @@ function setupResizer(handle, cssVar, storeKey, isLeft, fallback) {
   });
 }
 initResizers();
+
+/* ---------- appearance theme (persisted client-side) ---------- */
+const APPEARANCES = ["ide","bubbles","terminal"];
+function applyAppearance(a) {
+  if (!APPEARANCES.includes(a)) a = "ide";
+  document.documentElement.setAttribute("data-appearance", a);
+  localStorage.setItem("giskard.appearance", a);
+  const sel = $("appearanceSel"); if (sel) sel.value = a;
+}
+$("appearanceSel").onchange = () => applyAppearance($("appearanceSel").value);
+applyAppearance(localStorage.getItem("giskard.appearance") || "ide");
 
 /* Try to enter the app directly if already authenticated. */
 (async () => { try { await api("GET","/api/projects"); startApp(); } catch {} })();
