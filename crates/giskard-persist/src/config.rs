@@ -139,8 +139,36 @@ pub struct ProviderConfig {
     pub wire_api: String,
     #[serde(default)]
     pub model_listing: bool,
+    /// API key sent as `Authorization: Bearer …` on the `/v1/models` discovery request (§8.3),
+    /// for endpoints that require auth (e.g. a LiteLLM proxy with a master key). Inline secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// Name of an environment variable to read the discovery API key from, so the secret can be
+    /// kept out of `config.toml`. Used only when `api_key` is unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelConfig>,
+}
+
+impl ProviderConfig {
+    /// Resolve the discovery API key: the inline `api_key`, else the value of the env var named by
+    /// `api_key_env`. Empty values are treated as unset.
+    pub fn resolve_api_key(&self) -> Option<String> {
+        if let Some(key) = self.api_key.as_deref() {
+            if !key.is_empty() {
+                return Some(key.to_string());
+            }
+        }
+        if let Some(var) = self.api_key_env.as_deref() {
+            if let Ok(val) = std::env::var(var) {
+                if !val.is_empty() {
+                    return Some(val);
+                }
+            }
+        }
+        None
+    }
 }
 
 /// A typed model entry within a provider (spec §8.3 / Appendix C).

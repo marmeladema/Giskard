@@ -147,7 +147,13 @@ pub async fn refresh_models(config: &Config) -> Vec<ModelDescriptor> {
             continue;
         };
         let url = format!("{}/models", base_url.trim_end_matches('/'));
-        match client.get(&url).send().await {
+        // Attach the provider's discovery key (inline or from an env var) for endpoints that
+        // require auth — e.g. a LiteLLM proxy with a master key returns 401 otherwise.
+        let mut request = client.get(&url);
+        if let Some(key) = p.resolve_api_key() {
+            request = request.bearer_auth(key);
+        }
+        match request.send().await {
             Ok(resp) => match resp.json::<OpenAiModelsResponse>().await {
                 Ok(body) => {
                     for m in body.data {
@@ -284,6 +290,8 @@ model_listing = true
             base_url: None,
             wire_api: "responses".into(),
             model_listing: false,
+            api_key: None,
+            api_key_env: None,
             models: vec![giskard_persist::ModelConfig {
                 id: "@cf/z-ai/glm-4.7".into(),
                 display_name: None,

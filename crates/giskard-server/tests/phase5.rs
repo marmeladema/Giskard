@@ -364,6 +364,95 @@ model_listing = true
     );
 }
 
+/// A provider's `api_key` is sent as `Authorization: Bearer …` on the `/models` discovery request,
+/// so endpoints that require auth (e.g. a LiteLLM proxy with a master key) can be listed.
+#[tokio::test]
+async fn dynamic_model_refresh_sends_api_key() {
+    // Mock only returns the model when the correct bearer token is presented.
+    let mock = Router::new().route(
+        "/models",
+        get(|headers: axum::http::HeaderMap| async move {
+            let authorized = headers.get("authorization").and_then(|v| v.to_str().ok())
+                == Some("Bearer secret-key");
+            let data = if authorized {
+                serde_json::json!([{ "id": "secured-model" }])
+            } else {
+                serde_json::json!([])
+            };
+            AxumJson(serde_json::json!({ "data": data }))
+        }),
+    );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(mock_listener, mock).await.unwrap() });
+
+    let port = 19209;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let hash = password_hash("testpass");
+    tokio::fs::write(
+        tmp.path().join("config.toml"),
+        format!(
+            r#"
+[server]
+bind = "127.0.0.1:{port}"
+secure_cookies = false
+
+[auth]
+password_hash = "{hash}"
+session_days = 30
+
+[[providers]]
+id = "secured"
+name = "Secured"
+base_url = "http://{mock_addr}"
+wire_api = "responses"
+model_listing = true
+api_key = "secret-key"
+"#
+        ),
+    )
+    .await
+    .unwrap();
+
+    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
+    let state = AppState::new(
+        store,
+        Arc::new(DiffFactory {
+            fixture: make_fixture(),
+        }),
+        (0..32u8).collect(),
+    );
+    let app = build_app(state);
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let base = format!("http://127.0.0.1:{port}");
+    let (client, cookie) = login(&base).await;
+
+    let refreshed: serde_json::Value = client
+        .post(format!("{base}/api/models/refresh"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let ids: Vec<&str> = refreshed["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["model"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&"secured-model"),
+        "authorized discovery should list the model (bearer key sent): {ids:?}"
+    );
+}
+
 #[tokio::test]
 async fn history_pagination_over_websocket() {
     use futures_util::StreamExt;

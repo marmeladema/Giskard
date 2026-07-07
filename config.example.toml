@@ -84,6 +84,14 @@ name = "Cloudflare Workers AI (via LiteLLM)"
 base_url = "http://127.0.0.1:4000/v1"   # GET {base_url}/models is merged over the static list
 wire_api = "responses"
 model_listing = true
+# Auth for the /v1/models discovery request (e.g. a LiteLLM master key). Sent as
+# `Authorization: Bearer <key>`. Use `api_key` for an inline secret, or `api_key_env` to read it
+# from an environment variable so it stays out of this file (api_key wins if both are set). Omit
+# both for an endpoint that needs no auth.
+# api_key = "sk-litellm-..."
+api_key_env = "LITELLM_KEY"
+# With model_listing = true you can omit [[providers.models]] entirely and let the models come from
+# the endpoint; declare entries only to give a model accurate metadata (context window, etc.).
   [[providers.models]]
   id = "@cf/z-ai/glm-4.7"
   display_name = "GLM-4.7 (Workers AI)"
