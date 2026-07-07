@@ -5,7 +5,14 @@ Giskard: a local-first, single-user web UI for agentic coding CLIs (Codex CLI fi
 Built in Rust (Dioxus fullstack + Axum). No npm/Node/JS toolchain.
 
 ## Specification
-`specs/giskard-specification.md` (v1.5) is the authoritative spec. Read it before making changes.
+`specs/giskard-specification.md` (v1.7) is the authoritative spec. Read it before making changes.
+
+## Documentation
+`README.md` is the practical setup/usage guide and MUST be kept in sync with the code. Update it
+(and `config.example.toml`) in the same change whenever you touch config keys/defaults, the
+`giskard-admin` commands, HTTP/WS endpoints, the run/quick-start steps, the storage layout, or the
+crate list. The spec stays the authoritative design source; the README must never contradict it or
+the code.
 
 ## Build & Test
 
