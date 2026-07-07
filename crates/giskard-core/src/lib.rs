@@ -20,7 +20,7 @@ pub use error::{GiskardError, HarnessError, PersistError};
 pub use event::AgentEvent;
 pub use ids::{ApprovalId, ItemId, ProjectId, ThreadId, TurnId};
 pub use item::{FileChangeKind, Item, ItemDelta, ItemKind, ItemPayload, ItemStart};
-pub use model::{Effort, ModelDescriptor, ModelRef};
+pub use model::{Effort, ModelDescriptor, ModelRef, default_descriptor};
 pub use token::{ByModel, DailyTokenLedger, TokenLedger, TokenUsage};
 pub use turn::{ApprovalPolicy, Mode, Turn, TurnOverrides, TurnStatus, TurnStatusKind};
 pub use user_input::UserInput;

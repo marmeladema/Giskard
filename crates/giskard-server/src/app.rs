@@ -30,6 +30,7 @@ impl AppState {
             factory,
             hub.clone(),
             live_buffers.clone(),
+            store.clone(),
         ));
         Self {
             store,
