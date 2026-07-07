@@ -234,6 +234,8 @@ async fn open_thread(
         mode: Mode::Build,
         current_model: project_config.default_model.clone(),
         context_window: 128_000,
+        approval_policy: None,
+        model_efforts: std::collections::HashMap::new(),
         tokens: giskard_core::token::TokenLedger::default(),
         created_at: now,
         updated_at: now,
@@ -423,25 +425,15 @@ async fn handle_client_msg(
                 .await
                 .map_err(|e| e.to_string())?
                 .ok_or("project not found")?;
-            let config = state.store.load_config().await.map_err(|e| e.to_string())?;
 
             let effective_model = tf.current_model.clone();
-            let descriptor = crate::models::resolve_descriptor(&config, &effective_model);
-            let reasoning_effort = if descriptor.supports_reasoning_effort {
-                effective_model.reasoning_effort
-            } else {
-                None
-            };
 
             let overrides = TurnOverrides {
-                model: Some(effective_model.clone()),
-                reasoning_effort,
+                model: None,
                 mode: tf.mode,
                 approval_policy: project.approval_policy,
             };
 
-            // Record the user's message as the first item of the turn's history is deferred to the
-            // harness stream; here we only bump updated_at so the sidebar reflects activity.
             tf.updated_at = chrono::Utc::now();
             let _ = state.store.save_thread(project_id, &tf).await;
 
@@ -468,8 +460,26 @@ async fn handle_client_msg(
         } => {
             let (project_id, mut tf) = load_thread(state, thread_id).await?;
             let config = state.store.load_config().await.map_err(|e| e.to_string())?;
-            tf.context_window = crate::models::context_window_for(&config, &model_ref);
-            tf.current_model = model_ref;
+
+            let old_descriptor = crate::models::resolve_descriptor(&config, &tf.current_model);
+            if old_descriptor.supports_reasoning_effort {
+                if let Some(effort) = tf.current_model.reasoning_effort {
+                    tf.model_efforts.insert(tf.current_model.key(), effort);
+                }
+            }
+
+            let new_descriptor = crate::models::resolve_descriptor(&config, &model_ref);
+            let mut new_model = model_ref;
+            if new_descriptor.supports_reasoning_effort {
+                if new_model.reasoning_effort.is_none() {
+                    new_model.reasoning_effort = tf.model_efforts.get(&new_model.key()).copied();
+                }
+            } else {
+                new_model.reasoning_effort = None;
+            }
+
+            tf.context_window = crate::models::context_window_for(&config, &new_model);
+            tf.current_model = new_model;
             tf.updated_at = chrono::Utc::now();
             state
                 .store
@@ -477,6 +487,39 @@ async fn handle_client_msg(
                 .await
                 .map_err(|e| e.to_string())?;
             broadcast_thread_state(state, thread_id, &tf).await;
+        }
+        ClientMessage::SetApprovalPolicy {
+            thread_id,
+            project_id,
+            policy,
+        } => {
+            if let Some(tid) = thread_id {
+                let (pid, mut tf) = load_thread(state, tid).await?;
+                tf.approval_policy = Some(policy);
+                tf.updated_at = chrono::Utc::now();
+                state
+                    .store
+                    .save_thread(pid, &tf)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                broadcast_thread_state(state, tid, &tf).await;
+            } else if let Some(pid) = project_id {
+                let mut config = state
+                    .store
+                    .load_project(pid)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .ok_or("project not found")?;
+                config.approval_policy = policy;
+                config.updated_at = chrono::Utc::now();
+                state
+                    .store
+                    .save_project(&config)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            } else {
+                return Err("SetApprovalPolicy requires thread_id or project_id".into());
+            }
         }
         ClientMessage::ApprovalDecision {
             request_id,

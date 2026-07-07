@@ -361,7 +361,11 @@ async fn handle_start_turn(
     let codex_input = mapping::map_user_input(input);
     let sandbox_policy = mapping::map_mode_to_sandbox(overrides.mode);
     let approval_policy = mapping::map_approval_policy(overrides.approval_policy);
-    let effort = overrides.reasoning_effort.map(mapping::map_effort);
+    let effort = overrides
+        .model
+        .as_ref()
+        .and_then(|m| m.reasoning_effort)
+        .map(mapping::map_effort);
 
     let params: codex_codes::TurnStartParams = serde_json::from_value(serde_json::json!({
         "threadId": thread.harness_thread_id,

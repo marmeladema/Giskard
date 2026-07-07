@@ -4,10 +4,11 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use tokio::sync::Mutex;
 
 use giskard_core::ids::{ProjectId, ThreadId};
-use giskard_core::model::ModelRef;
+use giskard_core::model::{Effort, ModelRef};
 use giskard_core::token::{DailyTokenLedger, TokenLedger};
 use giskard_core::turn::{ApprovalPolicy, Mode, Turn};
 
@@ -66,6 +67,13 @@ pub struct ThreadFile {
     /// callers should recompute it from `current_model` against the live model config.
     #[serde(default)]
     pub context_window: u32,
+    /// Per-thread approval-policy override (P3). `None` ⇒ use the project's `approval_policy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<ApprovalPolicy>,
+    /// Per-model effort retention (C7): maps `"provider/model"` → stored `Effort`, so switching
+    /// back to a reasoning model restores the user's last effort choice.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub model_efforts: HashMap<String, Effort>,
     pub tokens: TokenLedger,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -444,6 +452,8 @@ mod tests {
             mode: Mode::Build,
             current_model: test_model(),
             context_window: 262_144,
+            approval_policy: None,
+            model_efforts: HashMap::new(),
             tokens: TokenLedger::default(),
             created_at: now,
             updated_at: now,
@@ -479,6 +489,8 @@ mod tests {
                 mode: Mode::Plan,
                 current_model: test_model(),
                 context_window: 128_000,
+                approval_policy: None,
+                model_efforts: HashMap::new(),
                 tokens: TokenLedger::default(),
                 created_at: now,
                 updated_at: now,

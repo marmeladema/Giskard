@@ -48,6 +48,11 @@ pub enum ClientMessage {
         thread_id: ThreadId,
         model_ref: ModelRef,
     },
+    SetApprovalPolicy {
+        thread_id: Option<ThreadId>,
+        project_id: Option<ProjectId>,
+        policy: ApprovalPolicy,
+    },
     Interrupt {
         thread_id: ThreadId,
     },
