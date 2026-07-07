@@ -20,8 +20,9 @@ struct DiffFactory {
     fixture: ReplayFixture,
 }
 
+#[async_trait::async_trait]
 impl HarnessFactory for DiffFactory {
-    fn create(
+    async fn create(
         &self,
         _config: &ProjectConfig,
     ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {

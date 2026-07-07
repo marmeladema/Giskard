@@ -6,8 +6,8 @@
 //! maps `core → wire` once, at the outbound fan-out boundary, via `Path::to_string_lossy()`.
 //!
 //! Path-free domain types (ids, `ItemStart`, `ItemDelta`, `DiffHunk`/`DiffLine`, `FileChangeKind`,
-//! `TokenUsage`, `TurnStatus`, `HarnessError`, `ApprovalDecision`) are **not** mirrored — they are
-//! re-exported from `giskard-core` by this crate's `lib.rs`.
+//! `TokenUsage`, `TurnStatus`, `ApprovalDecision`) are **not** mirrored — they are re-exported
+//! from `giskard-core` by this crate's `lib.rs`.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -73,8 +73,16 @@ pub enum WireAgentEvent {
         thread: ThreadId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn: Option<TurnId>,
-        error: HarnessError,
+        error: WireHarnessError,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireHarnessError {
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// Wire-mirror of [`Item`].
@@ -224,8 +232,29 @@ impl From<AgentEvent> for WireAgentEvent {
             } => Self::Error {
                 thread,
                 turn,
-                error,
+                error: error.into(),
             },
+        }
+    }
+}
+
+impl From<HarnessError> for WireHarnessError {
+    fn from(error: HarnessError) -> Self {
+        let code = match &error {
+            HarnessError::Spawn(_) => "harness_spawn_failed",
+            HarnessError::NotInitialized => "harness_not_initialized",
+            HarnessError::Unauthenticated => "harness_unauthenticated",
+            HarnessError::Transport(_) => "harness_transport_error",
+            HarnessError::Protocol(_) => "harness_protocol_error",
+            HarnessError::Overloaded => "harness_overloaded",
+            HarnessError::Unsupported(_) => "harness_unsupported",
+            HarnessError::ThreadNotFound(_) => "thread_not_open",
+            HarnessError::Timeout(_) => "harness_timeout",
+        };
+        Self {
+            code: code.into(),
+            message: error.to_string(),
+            detail: None,
         }
     }
 }
@@ -342,5 +371,19 @@ mod tests {
         let wire: WireItemPayload = core.into();
         let json = serde_json::to_value(&wire).unwrap();
         assert_eq!(json["path"], "/src/main.rs");
+    }
+
+    #[test]
+    fn agent_event_error_is_serializable() {
+        let core = AgentEvent::Error {
+            thread: ThreadId::new(),
+            turn: None,
+            error: HarnessError::Protocol("bad frame".into()),
+        };
+        let wire: WireAgentEvent = core.into();
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(json["kind"], "error");
+        assert_eq!(json["error"]["code"], "harness_protocol_error");
+        assert_eq!(json["error"]["message"], "protocol error: bad frame");
     }
 }

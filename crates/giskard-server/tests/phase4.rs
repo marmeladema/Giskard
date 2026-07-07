@@ -20,8 +20,9 @@ use giskard_server::{AppState, HarnessFactory, build_app};
 
 struct DummyFactory;
 
+#[async_trait::async_trait]
 impl HarnessFactory for DummyFactory {
-    fn create(
+    async fn create(
         &self,
         _config: &ProjectConfig,
     ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
@@ -34,8 +35,9 @@ struct DiffFactory {
     fixture: ReplayFixture,
 }
 
+#[async_trait::async_trait]
 impl HarnessFactory for DiffFactory {
-    fn create(
+    async fn create(
         &self,
         _config: &ProjectConfig,
     ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {

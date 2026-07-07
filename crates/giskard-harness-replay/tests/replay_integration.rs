@@ -107,6 +107,7 @@ async fn open_thread_one_turn_assert_state() {
     let handle = harness
         .open_thread(OpenThreadOptions {
             project: giskard_core::ProjectId::new(),
+            thread: None,
             workspace_root: "/tmp/test".into(),
             resume: Some("th_test_001".into()),
             initial_model: ModelRef {
@@ -241,6 +242,7 @@ async fn replay_persisted_state_roundtrip() {
     let handle = harness
         .open_thread(OpenThreadOptions {
             project: giskard_core::ProjectId::new(),
+            thread: None,
             workspace_root: "/tmp/test".into(),
             resume: Some("th_test_001".into()),
             initial_model: ModelRef {

@@ -1,3 +1,4 @@
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use axum::{
@@ -15,17 +16,18 @@ use serde::Deserialize;
 use tracing::{debug, error, warn};
 
 use futures::{SinkExt, StreamExt};
-use giskard_core::ids::ProjectId;
+use giskard_core::error::{HarnessError, PersistError};
+use giskard_core::ids::{ProjectId, ThreadId};
 use giskard_core::turn::{Mode, TurnOverrides};
 use giskard_core::user_input::UserInput;
-use giskard_persist::store::ThreadFile;
+use giskard_persist::store::{ProjectConfig, ThreadFile};
 use giskard_proto::*;
 use tokio::sync::mpsc;
 
 use crate::AppState;
 use crate::auth::{
     SESSION_COOKIE, auth_middleware, create_session_cookie, get_session_token_from_header,
-    verify_session,
+    sign_session, verify_session,
 };
 
 pub fn protected_routes(state: AppState) -> Router<AppState> {
@@ -48,6 +50,7 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
         .route("/api/tokens", get(global_tokens))
         .route("/api/projects/{id}/tokens", get(project_tokens))
         .route("/api/logout", post(logout))
+        .route("/api/ws-ticket", get(ws_ticket))
         .route("/api/ws", get(ws_handler))
         .layer(middleware::from_fn_with_state(state, auth_middleware))
 }
@@ -93,13 +96,26 @@ async fn login(
     }
 
     let expiry = (Utc::now().timestamp() as u64) + (config.auth.session_days as u64) * 86400;
-    let cookie = create_session_cookie(expiry, &state.session_key, config.server.secure_cookies);
+    let cookie = create_session_cookie(expiry, &state.session_key, config.server.secure_cookies)
+        .map_err(|e| {
+            error!("failed to sign session cookie: {e}");
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to create session cookie".to_string(),
+            )
+        })?;
 
     let mut response = Json(LoginResponse { ok: true }).into_response();
-    response.headers_mut().insert(
-        axum::http::header::SET_COOKIE,
-        axum::http::HeaderValue::from_str(&cookie).unwrap(),
-    );
+    let cookie = axum::http::HeaderValue::from_str(&cookie).map_err(|e| {
+        error!("failed to create session cookie header: {e}");
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to create session cookie".to_string(),
+        )
+    })?;
+    response
+        .headers_mut()
+        .insert(axum::http::header::SET_COOKIE, cookie);
     Ok(response)
 }
 
@@ -146,15 +162,11 @@ async fn create_project(
     Json(req): Json<CreateProjectRequest>,
 ) -> Result<Json<CreateProjectResponse>, ApiError> {
     let id = ProjectId::new();
+    let config = state.store.load_config().await?;
+    let default_model = crate::models::normalize_model_ref(&config, &req.default_model);
     state
         .store
-        .create_project(
-            id,
-            &req.name,
-            &req.dir,
-            req.default_model.clone(),
-            req.approval_policy,
-        )
+        .create_project(id, &req.name, &req.dir, default_model, req.approval_policy)
         .await?;
 
     if let Some(ws_root) = &req.workspace_root {
@@ -179,7 +191,9 @@ async fn get_project(
         .load_project(id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    Ok(Json(serde_json::to_value(config).unwrap()))
+    let value = serde_json::to_value(config)
+        .map_err(|e| ApiError::Internal(format!("failed to serialize project: {e}")))?;
+    Ok(Json(value))
 }
 
 async fn delete_project(
@@ -216,22 +230,114 @@ async fn open_thread(
     AxumPath(project_id): AxumPath<ProjectId>,
     Json(req): Json<OpenThreadRequest>,
 ) -> Result<Json<OpenThreadResponse>, ApiError> {
-    let project_config = state
+    let app_config = state.store.load_config().await?;
+    let mut project_config = state
         .store
         .load_project(project_id)
         .await?
         .ok_or(ApiError::NotFound)?;
+    let default_model =
+        crate::models::normalize_model_ref(&app_config, &project_config.default_model);
+    if default_model != project_config.default_model {
+        project_config.default_model = default_model;
+        project_config.updated_at = Utc::now();
+        state.store.save_project(&project_config).await?;
+    }
 
     let ws_root = project_config
         .workspace_root
         .as_deref()
         .unwrap_or(&project_config.dir);
+    debug!(
+        %project_id,
+        thread_id = ?req.thread_id,
+        resume = ?req.resume,
+        action = "open_thread",
+        "open thread request"
+    );
+
+    if let Some(thread_id) = req.thread_id {
+        let thread_file = state
+            .store
+            .load_thread(project_id, thread_id)
+            .await?
+            .ok_or(ApiError::NotFound)?;
+        let current_model =
+            crate::models::normalize_model_ref(&app_config, &thread_file.current_model);
+        let model_changed = current_model != thread_file.current_model;
+        if model_changed {
+            state
+                .store
+                .update_thread(project_id, thread_id, |tf| {
+                    tf.current_model = current_model.clone();
+                    tf.context_window =
+                        crate::models::context_window_for(&app_config, &current_model);
+                    tf.updated_at = Utc::now();
+                })
+                .await?;
+        }
+        if !model_changed {
+            if let Some(handle) = state.registry.get_thread_handle(thread_id).await {
+                return Ok(Json(OpenThreadResponse {
+                    thread_id: handle.thread,
+                    harness_thread_id: handle.harness_thread_id,
+                    warning: None,
+                }));
+            }
+        }
+
+        let handle = state
+            .registry
+            .open_thread(
+                &project_config,
+                ws_root,
+                Some(thread_id),
+                Some(thread_file.harness_thread_id.clone()),
+                current_model.clone(),
+            )
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+        if handle.thread != thread_id {
+            return Err(ApiError::Internal(format!(
+                "harness resumed wrong thread: expected {thread_id}, got {}",
+                handle.thread
+            )));
+        }
+
+        if handle.harness_thread_id != thread_file.harness_thread_id {
+            state
+                .store
+                .update_thread(project_id, thread_id, |tf| {
+                    tf.harness_thread_id = handle.harness_thread_id.clone();
+                    tf.updated_at = Utc::now();
+                })
+                .await?;
+        }
+
+        let warning = handle.warning.as_ref().map(|warning| {
+            warning_info(
+                warning.code.clone(),
+                warning.message.clone(),
+                warning.detail.clone(),
+                thread_id,
+                "open_thread",
+            )
+        });
+
+        return Ok(Json(OpenThreadResponse {
+            thread_id,
+            harness_thread_id: handle.harness_thread_id,
+            warning,
+        }));
+    }
 
     let handle = state
         .registry
         .open_thread(
             &project_config,
             ws_root,
+            None,
             req.resume,
             project_config.default_model.clone(),
         )
@@ -247,7 +353,10 @@ async fn open_thread(
         harness_thread_id: handle.harness_thread_id.clone(),
         mode: Mode::Build,
         current_model: project_config.default_model.clone(),
-        context_window: 128_000,
+        context_window: crate::models::context_window_for(
+            &app_config,
+            &project_config.default_model,
+        ),
         approval_policy: None,
         model_efforts: std::collections::HashMap::new(),
         tokens: giskard_core::token::TokenLedger::default(),
@@ -257,9 +366,20 @@ async fn open_thread(
     };
     state.store.save_thread(project_id, &thread_file).await?;
 
+    let warning = handle.warning.as_ref().map(|warning| {
+        warning_info(
+            warning.code.clone(),
+            warning.message.clone(),
+            warning.detail.clone(),
+            handle.thread,
+            "open_thread",
+        )
+    });
+
     Ok(Json(OpenThreadResponse {
         thread_id: handle.thread,
         harness_thread_id: handle.harness_thread_id,
+        warning,
     }))
 }
 
@@ -515,9 +635,22 @@ async fn project_tokens(
     Ok(Json(crate::tokens::build_report(&ledger, &config.tokens)))
 }
 
+async fn ws_ticket(State(state): State<AppState>) -> Result<Json<WsTicketResponse>, ApiError> {
+    let expiry = (Utc::now().timestamp() as u64) + 60;
+    let ticket = sign_session(expiry, &state.session_key)
+        .map_err(|e| ApiError::Internal(format!("failed to sign websocket ticket: {e}")))?;
+    Ok(Json(WsTicketResponse { ticket }))
+}
+
+#[derive(Deserialize)]
+struct WsQuery {
+    ticket: Option<String>,
+}
+
 async fn ws_handler(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
+    Query(q): Query<WsQuery>,
     ws: WebSocketUpgrade,
 ) -> Result<axum::response::Response, axum::http::StatusCode> {
     let cookie_header = headers
@@ -528,13 +661,128 @@ async fn ws_handler(
         .and_then(get_session_token_from_header)
         .as_ref()
         .map(|t| verify_session(t, &state.session_key))
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || q.ticket
+            .as_deref()
+            .map(|t| verify_session(t, &state.session_key))
+            .unwrap_or(false);
 
     if !valid {
         return Err(axum::http::StatusCode::UNAUTHORIZED);
     }
 
     Ok(ws.on_upgrade(move |socket| handle_ws(socket, state)))
+}
+
+#[derive(Debug, Clone)]
+struct WsError {
+    info: ErrorInfo,
+}
+
+impl WsError {
+    fn new(code: impl Into<String>, severity: ErrorSeverity, message: impl Into<String>) -> Self {
+        Self {
+            info: ErrorInfo {
+                code: code.into(),
+                severity,
+                message: message.into(),
+                detail: None,
+                thread_id: None,
+                action: None,
+            },
+        }
+    }
+
+    fn detail(mut self, detail: impl Into<String>) -> Self {
+        self.info.detail = Some(detail.into());
+        self
+    }
+
+    fn thread(mut self, thread_id: ThreadId) -> Self {
+        self.info.thread_id = Some(thread_id);
+        self
+    }
+
+    fn action(mut self, action: impl Into<String>) -> Self {
+        self.info.action = Some(action.into());
+        self
+    }
+
+    fn from_harness(error: HarnessError, action: &str, thread_id: Option<ThreadId>) -> Self {
+        let (code, message) = match &error {
+            HarnessError::Spawn(_) => ("harness_spawn_failed", "Codex CLI could not start."),
+            HarnessError::NotInitialized => (
+                "harness_not_initialized",
+                "Codex is not ready for this request.",
+            ),
+            HarnessError::Unauthenticated => {
+                ("harness_unauthenticated", "Codex is not authenticated.")
+            }
+            HarnessError::Transport(_) => ("harness_transport_error", "Codex transport failed."),
+            HarnessError::Protocol(_) => ("harness_protocol_error", "Codex protocol error."),
+            HarnessError::Overloaded => ("harness_overloaded", "Codex is overloaded."),
+            HarnessError::Unsupported(_) => (
+                "harness_unsupported",
+                "The active harness does not support this action.",
+            ),
+            HarnessError::ThreadNotFound(_) => {
+                ("thread_not_open", "Thread is not open in the harness.")
+            }
+            HarnessError::Timeout(_) => ("harness_timeout", "Codex operation timed out."),
+        };
+        let mut ws_error = Self::new(code, ErrorSeverity::Error, message)
+            .detail(error.to_string())
+            .action(action);
+        if let Some(thread_id) = thread_id {
+            ws_error = ws_error.thread(thread_id);
+        }
+        ws_error
+    }
+
+    fn from_persist(error: PersistError, action: &str, thread_id: Option<ThreadId>) -> Self {
+        let mut ws_error = Self::new(
+            "persistence_error",
+            ErrorSeverity::Error,
+            "Persistence failed.",
+        )
+        .detail(error.to_string())
+        .action(action);
+        if let Some(thread_id) = thread_id {
+            ws_error = ws_error.thread(thread_id);
+        }
+        ws_error
+    }
+
+    fn into_server_message(self) -> ServerMessage {
+        ServerMessage::Error { error: self.info }
+    }
+}
+
+impl fmt::Display for WsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.info.code, self.info.message)?;
+        if let Some(detail) = &self.info.detail {
+            write!(f, " ({detail})")?;
+        }
+        Ok(())
+    }
+}
+
+fn warning_info(
+    code: impl Into<String>,
+    message: impl Into<String>,
+    detail: Option<String>,
+    thread_id: ThreadId,
+    action: &str,
+) -> ErrorInfo {
+    ErrorInfo {
+        code: code.into(),
+        severity: ErrorSeverity::Warning,
+        message: message.into(),
+        detail,
+        thread_id: Some(thread_id),
+        action: Some(action.to_string()),
+    }
 }
 
 async fn handle_ws(socket: WebSocket, state: AppState) {
@@ -545,7 +793,13 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
 
     let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            let json = serde_json::to_string(&msg).unwrap();
+            let json = match serde_json::to_string(&msg) {
+                Ok(json) => json,
+                Err(e) => {
+                    error!("failed to serialize WS message: {e}");
+                    continue;
+                }
+            };
             if ws_sender.send(Message::Text(json.into())).await.is_err() {
                 break;
             }
@@ -561,11 +815,32 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
                     Ok(m) => m,
                     Err(e) => {
                         warn!("invalid WS message: {e}");
+                        let _ = tx
+                            .send(
+                                WsError::new(
+                                    "invalid_ws_message",
+                                    ErrorSeverity::Error,
+                                    "Browser sent an invalid WebSocket message.",
+                                )
+                                .detail(e.to_string())
+                                .action("parse_ws_message")
+                                .into_server_message(),
+                            )
+                            .await;
                         continue;
                     }
                 };
                 if let Err(e) = handle_client_msg(&state, client_id, &tx, msg).await {
-                    error!("WS handler error: {e}");
+                    error!(
+                        code = %e.info.code,
+                        severity = ?e.info.severity,
+                        thread_id = ?e.info.thread_id,
+                        action = ?e.info.action,
+                        detail = ?e.info.detail,
+                        "WS handler error: {}",
+                        e.info.message
+                    );
+                    let _ = tx.send(e.into_server_message()).await;
                 }
             }
             Some(Ok(_)) => {}
@@ -586,21 +861,46 @@ async fn handle_client_msg(
     client_id: usize,
     tx: &mpsc::Sender<ServerMessage>,
     msg: ClientMessage,
-) -> Result<(), String> {
+) -> Result<(), WsError> {
     match msg {
         ClientMessage::Subscribe { thread_id } => {
+            let access = ensure_thread_open(state, thread_id, "subscribe").await?;
             state.hub.subscribe(thread_id, client_id, tx.clone()).await;
 
-            if let Some(project_id) = state.registry.get_project_for_thread(thread_id).await {
-                if let Ok(Some(tf)) = state.store.load_thread(project_id, thread_id).await {
-                    let _ = tx
-                        .send(ServerMessage::ThreadState(giskard_proto::ThreadState {
-                            thread_id,
-                            state: serde_json::to_value(&tf).unwrap(),
-                        }))
-                        .await;
-                }
+            if let Some(warning) = access.warning {
+                let _ = tx.send(ServerMessage::Error { error: warning }).await;
             }
+
+            let tf = state
+                .store
+                .load_thread(access.project_id, thread_id)
+                .await
+                .map_err(|e| WsError::from_persist(e, "subscribe", Some(thread_id)))?
+                .ok_or_else(|| {
+                    WsError::new(
+                        "thread_not_found",
+                        ErrorSeverity::Error,
+                        "Thread not found.",
+                    )
+                    .thread(thread_id)
+                    .action("subscribe")
+                })?;
+            let thread_state = serde_json::to_value(&tf).map_err(|e| {
+                WsError::new(
+                    "thread_state_serialize_failed",
+                    ErrorSeverity::Error,
+                    "Thread state could not be serialized.",
+                )
+                .detail(e.to_string())
+                .thread(thread_id)
+                .action("subscribe")
+            })?;
+            let _ = tx
+                .send(ServerMessage::ThreadState(giskard_proto::ThreadState {
+                    thread_id,
+                    state: thread_state,
+                }))
+                .await;
 
             if let Some(snap) = state.live_buffers.snapshot(thread_id).await {
                 let _ = tx.send(ServerMessage::LiveTurnSnapshot(snap)).await;
@@ -610,23 +910,51 @@ async fn handle_client_msg(
             state.hub.unsubscribe(thread_id, client_id).await;
         }
         ClientMessage::SendInput { thread_id, text } => {
-            let project_id = project_for(state, thread_id).await?;
+            let project_id = project_for(state, thread_id, "send_input").await?;
+            let app_config = state
+                .store
+                .load_config()
+                .await
+                .map_err(|e| WsError::from_persist(e, "send_input", Some(thread_id)))?;
             let project = state
                 .store
                 .load_project(project_id)
                 .await
-                .map_err(|e| e.to_string())?
-                .ok_or("project not found")?;
+                .map_err(|e| WsError::from_persist(e, "send_input", Some(thread_id)))?
+                .ok_or_else(|| {
+                    WsError::new(
+                        "project_not_found",
+                        ErrorSeverity::Error,
+                        "Project not found.",
+                    )
+                    .thread(thread_id)
+                    .action("send_input")
+                })?;
 
             // RMW under the per-thread lock: bump activity and read back the resolved state.
             let tf = state
                 .store
                 .update_thread(project_id, thread_id, |tf| {
+                    let normalized =
+                        crate::models::normalize_model_ref(&app_config, &tf.current_model);
+                    if normalized != tf.current_model {
+                        tf.current_model = normalized;
+                        tf.context_window =
+                            crate::models::context_window_for(&app_config, &tf.current_model);
+                    }
                     tf.updated_at = chrono::Utc::now();
                 })
                 .await
-                .map_err(|e| e.to_string())?
-                .ok_or("thread not found")?;
+                .map_err(|e| WsError::from_persist(e, "send_input", Some(thread_id)))?
+                .ok_or_else(|| {
+                    WsError::new(
+                        "thread_not_found",
+                        ErrorSeverity::Error,
+                        "Thread not found.",
+                    )
+                    .thread(thread_id)
+                    .action("send_input")
+                })?;
 
             let effective_model = tf.current_model.clone();
 
@@ -645,10 +973,10 @@ async fn handle_client_msg(
                 .registry
                 .start_turn(thread_id, UserInput::text(text), overrides, effective_model)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| WsError::from_harness(e, "send_input", Some(thread_id)))?;
         }
         ClientMessage::SwitchMode { thread_id, mode } => {
-            let project_id = project_for(state, thread_id).await?;
+            let project_id = project_for(state, thread_id, "switch_mode").await?;
             let tf = state
                 .store
                 .update_thread(project_id, thread_id, |tf| {
@@ -656,16 +984,29 @@ async fn handle_client_msg(
                     tf.updated_at = chrono::Utc::now();
                 })
                 .await
-                .map_err(|e| e.to_string())?
-                .ok_or("thread not found")?;
+                .map_err(|e| WsError::from_persist(e, "switch_mode", Some(thread_id)))?
+                .ok_or_else(|| {
+                    WsError::new(
+                        "thread_not_found",
+                        ErrorSeverity::Error,
+                        "Thread not found.",
+                    )
+                    .thread(thread_id)
+                    .action("switch_mode")
+                })?;
             broadcast_thread_state(state, thread_id, &tf).await;
         }
         ClientMessage::SelectModel {
             thread_id,
             model_ref,
         } => {
-            let project_id = project_for(state, thread_id).await?;
-            let config = state.store.load_config().await.map_err(|e| e.to_string())?;
+            let project_id = project_for(state, thread_id, "select_model").await?;
+            let config = state
+                .store
+                .load_config()
+                .await
+                .map_err(|e| WsError::from_persist(e, "select_model", Some(thread_id)))?;
+            let model_ref = crate::models::normalize_model_ref(&config, &model_ref);
 
             // All model/effort resolution happens inside the RMW closure so it sees the
             // authoritative current model under the per-thread lock (§5.4, C7 effort retention).
@@ -695,8 +1036,16 @@ async fn handle_client_msg(
                     tf.updated_at = chrono::Utc::now();
                 })
                 .await
-                .map_err(|e| e.to_string())?
-                .ok_or("thread not found")?;
+                .map_err(|e| WsError::from_persist(e, "select_model", Some(thread_id)))?
+                .ok_or_else(|| {
+                    WsError::new(
+                        "thread_not_found",
+                        ErrorSeverity::Error,
+                        "Thread not found.",
+                    )
+                    .thread(thread_id)
+                    .action("select_model")
+                })?;
             broadcast_thread_state(state, thread_id, &tf).await;
         }
         ClientMessage::SetApprovalPolicy {
@@ -708,7 +1057,7 @@ async fn handle_client_msg(
             // via `tf.approval_policy.unwrap_or(project)`); a `project_id` changes the project
             // default that applies to threads without an override. `thread_id` wins if both are set.
             if let Some(tid) = thread_id {
-                let pid = project_for(state, tid).await?;
+                let pid = project_for(state, tid, "set_approval_policy").await?;
                 let tf = state
                     .store
                     .update_thread(pid, tid, |tf| {
@@ -716,25 +1065,45 @@ async fn handle_client_msg(
                         tf.updated_at = chrono::Utc::now();
                     })
                     .await
-                    .map_err(|e| e.to_string())?
-                    .ok_or("thread not found")?;
+                    .map_err(|e| WsError::from_persist(e, "set_approval_policy", Some(tid)))?
+                    .ok_or_else(|| {
+                        WsError::new(
+                            "thread_not_found",
+                            ErrorSeverity::Error,
+                            "Thread not found.",
+                        )
+                        .thread(tid)
+                        .action("set_approval_policy")
+                    })?;
                 broadcast_thread_state(state, tid, &tf).await;
             } else if let Some(pid) = project_id {
                 let mut config = state
                     .store
                     .load_project(pid)
                     .await
-                    .map_err(|e| e.to_string())?
-                    .ok_or("project not found")?;
+                    .map_err(|e| WsError::from_persist(e, "set_approval_policy", None))?
+                    .ok_or_else(|| {
+                        WsError::new(
+                            "project_not_found",
+                            ErrorSeverity::Error,
+                            "Project not found.",
+                        )
+                        .action("set_approval_policy")
+                    })?;
                 config.approval_policy = policy;
                 config.updated_at = chrono::Utc::now();
                 state
                     .store
                     .save_project(&config)
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| WsError::from_persist(e, "set_approval_policy", None))?;
             } else {
-                return Err("SetApprovalPolicy requires thread_id or project_id".into());
+                return Err(WsError::new(
+                    "invalid_request",
+                    ErrorSeverity::Error,
+                    "SetApprovalPolicy requires thread_id or project_id.",
+                )
+                .action("set_approval_policy"));
             }
         }
         ClientMessage::ApprovalDecision {
@@ -745,14 +1114,14 @@ async fn handle_client_msg(
                 .registry
                 .respond_approval(giskard_core::ids::ApprovalId(request_id), decision)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| WsError::from_harness(e, "approval_decision", None))?;
         }
         ClientMessage::Interrupt { thread_id } => {
             state
                 .registry
                 .interrupt(thread_id)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| WsError::from_harness(e, "interrupt", Some(thread_id)))?;
         }
         ClientMessage::SavePlan { thread_id, path } => {
             match save_plan(state, thread_id, &path).await {
@@ -761,9 +1130,17 @@ async fn handle_client_msg(
                 }
                 Err(e) => {
                     let _ = tx
-                        .send(ServerMessage::Error {
-                            message: format!("save plan failed: {e}"),
-                        })
+                        .send(
+                            WsError::new(
+                                "save_plan_failed",
+                                ErrorSeverity::Error,
+                                "Save plan failed.",
+                            )
+                            .detail(e)
+                            .thread(thread_id)
+                            .action("save_plan")
+                            .into_server_message(),
+                        )
                         .await;
                 }
             }
@@ -775,16 +1152,181 @@ async fn handle_client_msg(
     Ok(())
 }
 
-/// Resolve the project a currently-open thread belongs to (via the harness registry).
+struct ThreadAccess {
+    project_id: ProjectId,
+    warning: Option<ErrorInfo>,
+}
+
+async fn ensure_thread_open(
+    state: &AppState,
+    thread_id: ThreadId,
+    action: &str,
+) -> Result<ThreadAccess, WsError> {
+    if let Some(project_id) = state.registry.get_project_for_thread(thread_id).await {
+        return Ok(ThreadAccess {
+            project_id,
+            warning: None,
+        });
+    }
+
+    let Some((project_config, thread_file)) =
+        find_persisted_thread(state, thread_id, action).await?
+    else {
+        return Err(WsError::new(
+            "thread_not_found",
+            ErrorSeverity::Error,
+            "Thread not found.",
+        )
+        .thread(thread_id)
+        .action(action));
+    };
+
+    let ws_root = project_config
+        .workspace_root
+        .as_deref()
+        .unwrap_or(&project_config.dir);
+    let app_config = state
+        .store
+        .load_config()
+        .await
+        .map_err(|e| WsError::from_persist(e, action, Some(thread_id)))?;
+    let current_model = crate::models::normalize_model_ref(&app_config, &thread_file.current_model);
+    if current_model != thread_file.current_model {
+        state
+            .store
+            .update_thread(project_config.id, thread_id, |tf| {
+                tf.current_model = current_model.clone();
+                tf.context_window = crate::models::context_window_for(&app_config, &current_model);
+                tf.updated_at = Utc::now();
+            })
+            .await
+            .map_err(|e| WsError::from_persist(e, action, Some(thread_id)))?;
+    }
+    debug!(
+        project_id = %project_config.id,
+        %thread_id,
+        harness_thread_id = %thread_file.harness_thread_id,
+        %action,
+        "reopening persisted thread"
+    );
+    let handle = state
+        .registry
+        .open_thread(
+            &project_config,
+            ws_root,
+            Some(thread_id),
+            Some(thread_file.harness_thread_id.clone()),
+            current_model,
+        )
+        .await
+        .map_err(|e| WsError::from_harness(e, action, Some(thread_id)))?;
+
+    if handle.thread != thread_id {
+        return Err(WsError::new(
+            "thread_resume_mismatch",
+            ErrorSeverity::Error,
+            "Harness resumed the wrong thread.",
+        )
+        .detail(format!("expected {thread_id}, got {}", handle.thread))
+        .thread(thread_id)
+        .action(action));
+    }
+
+    if handle.harness_thread_id != thread_file.harness_thread_id {
+        let harness_thread_id = handle.harness_thread_id.clone();
+        state
+            .store
+            .update_thread(project_config.id, thread_id, |tf| {
+                tf.harness_thread_id = harness_thread_id;
+                tf.updated_at = Utc::now();
+            })
+            .await
+            .map_err(|e| WsError::from_persist(e, action, Some(thread_id)))?;
+    }
+
+    let warning = handle.warning.map(|warning| {
+        warning_info(
+            warning.code,
+            warning.message,
+            warning.detail,
+            thread_id,
+            action,
+        )
+    });
+
+    if let Some(warning) = &warning {
+        warn!(
+            project_id = %project_config.id,
+            %thread_id,
+            code = %warning.code,
+            %action,
+            "thread reopened with warning: {}",
+            warning.message
+        );
+        state
+            .hub
+            .broadcast(
+                thread_id,
+                ServerMessage::Error {
+                    error: warning.clone(),
+                },
+            )
+            .await;
+    }
+
+    Ok(ThreadAccess {
+        project_id: project_config.id,
+        warning,
+    })
+}
+
+async fn find_persisted_thread(
+    state: &AppState,
+    thread_id: ThreadId,
+    action: &str,
+) -> Result<Option<(ProjectConfig, ThreadFile)>, WsError> {
+    let index = state
+        .store
+        .load_project_index()
+        .await
+        .map_err(|e| WsError::from_persist(e, action, Some(thread_id)))?;
+
+    for project in index.projects {
+        match state.store.load_thread(project.id, thread_id).await {
+            Ok(Some(thread_file)) => {
+                let project_config = state
+                    .store
+                    .load_project(project.id)
+                    .await
+                    .map_err(|e| WsError::from_persist(e, action, Some(thread_id)))?
+                    .ok_or_else(|| {
+                        WsError::new(
+                            "project_not_found",
+                            ErrorSeverity::Error,
+                            "Project not found for persisted thread.",
+                        )
+                        .thread(thread_id)
+                        .action(action)
+                    })?;
+                return Ok(Some((project_config, thread_file)));
+            }
+            Ok(None) => {}
+            Err(e) => return Err(WsError::from_persist(e, action, Some(thread_id))),
+        }
+    }
+
+    Ok(None)
+}
+
+/// Resolve the project a thread belongs to, reopening it from persistence on first access.
 async fn project_for(
     state: &AppState,
-    thread_id: giskard_core::ids::ThreadId,
-) -> Result<ProjectId, String> {
-    state
-        .registry
-        .get_project_for_thread(thread_id)
+    thread_id: ThreadId,
+    action: &str,
+) -> Result<ProjectId, WsError> {
+    ensure_thread_open(state, thread_id, action)
         .await
-        .ok_or_else(|| "thread not open".to_string())
+        .map(|access| access.project_id)
 }
 
 /// Load a thread file plus the project it belongs to (via the harness registry).
@@ -812,18 +1354,23 @@ async fn broadcast_thread_state(
     thread_id: giskard_core::ids::ThreadId,
     tf: &ThreadFile,
 ) {
-    if let Ok(value) = serde_json::to_value(tf) {
-        state
-            .hub
-            .broadcast(
+    let value = match serde_json::to_value(tf) {
+        Ok(value) => value,
+        Err(e) => {
+            error!(%thread_id, "failed to serialize thread state: {e}");
+            return;
+        }
+    };
+    state
+        .hub
+        .broadcast(
+            thread_id,
+            ServerMessage::ThreadState(giskard_proto::ThreadState {
                 thread_id,
-                ServerMessage::ThreadState(giskard_proto::ThreadState {
-                    thread_id,
-                    state: value,
-                }),
-            )
-            .await;
-    }
+                state: value,
+            }),
+        )
+        .await;
 }
 
 /// Write the current plan to a markdown file inside the workspace root (§7.4.1). Returns the

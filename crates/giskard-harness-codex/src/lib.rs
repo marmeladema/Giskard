@@ -19,10 +19,12 @@ use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ThreadId, TurnId};
 use giskard_core::model::ModelDescriptor;
-use giskard_core::turn::TurnOverrides;
+use giskard_core::token::TokenUsage;
+use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+    AgentEventStream, AgentHarness, HarnessCapabilities, HarnessNotice, OpenThreadOptions,
+    ThreadHandle,
 };
 
 use mapping::CodexMapper;
@@ -270,14 +272,20 @@ async fn handle_open_thread(
 
     // Track whether resume-by-id failed and we fell back to a fresh native thread (C5), so we can
     // warn the caller that agent context was lost while keeping the Giskard-side history.
-    let mut resume_failed = false;
+    let mut resume_warning = None;
 
     let harness_thread_id = if let Some(ref resume_id) = opts.resume {
-        match resume_thread(client, resume_id, &cwd).await {
+        match resume_thread(client, resume_id, &cwd, &opts.initial_model).await {
             Ok(id) => id,
-            Err(_) => {
+            Err(e) => {
                 // C5: Codex thread store purged/rotated. Start fresh instead of hard-failing.
-                resume_failed = true;
+                resume_warning = Some(HarnessNotice {
+                    code: "codex_resume_failed".into(),
+                    message:
+                        "Agent context was lost; started a fresh Codex session. History is intact."
+                            .into(),
+                    detail: Some(e.to_string()),
+                });
                 start_thread(client, &cwd, &opts.initial_model).await?
             }
         }
@@ -285,7 +293,7 @@ async fn handle_open_thread(
         start_thread(client, &cwd, &opts.initial_model).await?
     };
 
-    let thread_id = ThreadId::new();
+    let thread_id = opts.thread.unwrap_or_default();
     // B4: bind the (possibly re-established) native id to the durable ThreadId.
     mapper.register_thread(harness_thread_id.clone(), thread_id);
 
@@ -298,15 +306,12 @@ async fn handle_open_thread(
     })
     .await;
 
-    if resume_failed {
+    if let Some(warning) = &resume_warning {
+        let message = warning.message.clone();
         let _ = broadcast_event(senders, thread_id, || AgentEvent::Error {
             thread: thread_id,
             turn: None,
-            error: HarnessError::Transport(
-                "resume failed; started a fresh agent session — history is intact but agent \
-                 context was lost"
-                    .into(),
-            ),
+            error: HarnessError::Transport(message),
         })
         .await;
     }
@@ -314,6 +319,7 @@ async fn handle_open_thread(
     Ok(ThreadHandle {
         thread: thread_id,
         harness_thread_id,
+        warning: resume_warning,
     })
 }
 
@@ -321,10 +327,13 @@ async fn resume_thread(
     client: &mut codex_codes::AsyncClient,
     resume_id: &str,
     cwd: &str,
+    model: &giskard_core::model::ModelRef,
 ) -> Result<String, HarnessError> {
     let params: codex_codes::ThreadResumeParams = serde_json::from_value(serde_json::json!({
         "threadId": resume_id,
         "cwd": cwd,
+        "model": model.model,
+        "modelProvider": model.provider,
     }))
     .map_err(|e| HarnessError::Protocol(e.to_string()))?;
     let resp = client
@@ -393,17 +402,36 @@ async fn stream_turn_events(
     cmd_rx: &mut mpsc::Receiver<HarnessCommand>,
 ) {
     let thread_id = thread.thread;
+    let mut active_turn: Option<TurnId> = None;
 
     loop {
         let msg = match client.next_message().await {
             Ok(Some(msg)) => msg,
-            Ok(None) => break,
+            Ok(None) => {
+                emit_incomplete_turn(
+                    senders,
+                    thread_id,
+                    active_turn,
+                    "Codex stream ended before turn completion",
+                )
+                .await;
+                break;
+            }
             Err(e) => {
+                let message = e.to_string();
+                let event_message = message.clone();
                 let _ = broadcast_event(senders, thread_id, || AgentEvent::Error {
                     thread: thread_id,
                     turn: None,
-                    error: HarnessError::Transport(e.to_string()),
+                    error: HarnessError::Transport(event_message),
                 })
+                .await;
+                emit_incomplete_turn(
+                    senders,
+                    thread_id,
+                    active_turn,
+                    format!("Codex stream failed before turn completion: {message}"),
+                )
                 .await;
                 break;
             }
@@ -413,6 +441,9 @@ async fn stream_turn_events(
             codex_codes::ServerMessage::Notification(notif) => {
                 let event = mapper.map_notification(&notif, thread_id);
                 if let Some(event) = event {
+                    if let AgentEvent::TurnStarted { turn, .. } = &event {
+                        active_turn = Some(*turn);
+                    }
                     let is_completed = matches!(event, AgentEvent::TurnCompleted { .. });
                     let _ = broadcast_event(senders, thread_id, || event).await;
                     if is_completed {
@@ -462,6 +493,27 @@ async fn broadcast_event<F: FnOnce() -> AgentEvent>(senders: &SenderMap, thread:
     let sender = senders.lock().await.get(&thread).cloned();
     if let Some(sender) = sender {
         let _ = sender.send(f());
+    }
+}
+
+async fn emit_incomplete_turn(
+    senders: &SenderMap,
+    thread: ThreadId,
+    turn: Option<TurnId>,
+    message: impl Into<String>,
+) {
+    if let Some(turn) = turn {
+        let message = message.into();
+        let _ = broadcast_event(senders, thread, || AgentEvent::TurnCompleted {
+            thread,
+            turn,
+            usage: TokenUsage::default(),
+            status: TurnStatus {
+                kind: TurnStatusKind::Failed,
+                message: Some(message),
+            },
+        })
+        .await;
     }
 }
 

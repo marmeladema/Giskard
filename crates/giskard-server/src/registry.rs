@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use chrono::Utc;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
@@ -8,7 +9,7 @@ use tracing::{debug, warn};
 use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ApprovalId, ProjectId, ThreadId, TurnId};
+use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ThreadId, TurnId};
 use giskard_core::item::Item;
 use giskard_core::model::ModelRef;
 use giskard_core::turn::{Mode, Turn, TurnOverrides, TurnStatusKind};
@@ -23,8 +24,9 @@ use crate::ledger::LedgerHandle;
 use crate::live_buffer::LiveBufferStore;
 use crate::models::context_window_for;
 
+#[async_trait]
 pub trait HarnessFactory: Send + Sync {
-    fn create(&self, config: &ProjectConfig) -> Result<Arc<dyn AgentHarness>, HarnessError>;
+    async fn create(&self, config: &ProjectConfig) -> Result<Arc<dyn AgentHarness>, HarnessError>;
 }
 
 /// Context describing the turn being started, used to persist a `Turn` on completion (§7.1).
@@ -81,7 +83,7 @@ impl HarnessRegistry {
         if let Some(h) = harnesses.get(&project) {
             return Ok(h.clone());
         }
-        let h = self.factory.create(config)?;
+        let h = self.factory.create(config).await?;
         harnesses.insert(project, h.clone());
         Ok(h)
     }
@@ -90,14 +92,22 @@ impl HarnessRegistry {
         &self,
         config: &ProjectConfig,
         workspace_root: &str,
+        thread: Option<ThreadId>,
         resume: Option<String>,
         initial_model: ModelRef,
     ) -> Result<ThreadHandle, HarnessError> {
+        debug!(
+            project_id = %config.id,
+            thread_id = ?thread,
+            resume = ?resume,
+            "opening harness thread"
+        );
         let harness = self.get_or_create_harness(config.id, config).await?;
 
         let handle = harness
             .open_thread(OpenThreadOptions {
                 project: config.id,
+                thread,
                 workspace_root: workspace_root.into(),
                 resume,
                 initial_model: initial_model.clone(),
@@ -106,6 +116,13 @@ impl HarnessRegistry {
 
         let mut threads = self.threads.lock().await;
         threads.insert(handle.thread, (config.id, handle.clone()));
+        debug!(
+            project_id = %config.id,
+            thread_id = %handle.thread,
+            harness_thread_id = %handle.harness_thread_id,
+            warning = handle.warning.as_ref().map(|w| w.code.as_str()).unwrap_or(""),
+            "harness thread opened"
+        );
 
         Ok(handle)
     }
@@ -124,6 +141,15 @@ impl HarnessRegistry {
         let project_id = *project_id;
         let handle = handle.clone();
         drop(threads);
+        debug!(
+            %project_id,
+            %thread_id,
+            harness_thread_id = %handle.harness_thread_id,
+            mode = ?overrides.mode,
+            provider = %effective_model.provider,
+            model = %effective_model.model,
+            "starting harness turn"
+        );
 
         let harnesses = self.harnesses.lock().await;
         let harness = harnesses
@@ -244,10 +270,26 @@ async fn forward_events(
     let mut started_at = Utc::now();
     let mut items: Vec<Item> = Vec::new();
     let mut diffs: Vec<giskard_core::FileDiff> = Vec::new();
+    let mut seen_turn_ids = persisted_turn_ids(&store, project_id, thread_id).await;
+    let mut seen_harness_item_ids = persisted_harness_item_ids(&store, project_id, thread_id).await;
+    let mut duplicate_item_ids = HashSet::new();
 
     loop {
         match stream.recv().await {
             Ok(event) => {
+                if let Some(turn) = event_turn_id(&event) {
+                    if seen_turn_ids.contains(&turn) {
+                        continue;
+                    }
+                }
+                if should_skip_duplicate_item(
+                    &event,
+                    &mut seen_harness_item_ids,
+                    &mut duplicate_item_ids,
+                ) {
+                    continue;
+                }
+
                 match &event {
                     AgentEvent::TurnStarted { turn, .. } => {
                         turn_id = Some(*turn);
@@ -292,6 +334,7 @@ async fn forward_events(
 
                 if let Some((completed_turn, usage, status)) = completed {
                     let tid = turn_id.unwrap_or(completed_turn);
+                    seen_turn_ids.insert(tid);
                     let turn = Turn {
                         id: tid,
                         user_input: ctx.user_input.clone(),
@@ -315,6 +358,91 @@ async fn forward_events(
             }
         }
     }
+}
+
+fn event_turn_id(event: &AgentEvent) -> Option<TurnId> {
+    match event {
+        AgentEvent::TurnStarted { turn, .. }
+        | AgentEvent::ItemStarted { turn, .. }
+        | AgentEvent::ItemDelta { turn, .. }
+        | AgentEvent::ItemCompleted { turn, .. }
+        | AgentEvent::DiffUpdated { turn, .. }
+        | AgentEvent::ApprovalRequested { turn, .. }
+        | AgentEvent::TurnCompleted { turn, .. } => Some(*turn),
+        AgentEvent::ThreadOpened { .. } | AgentEvent::Error { turn: None, .. } => None,
+        AgentEvent::Error {
+            turn: Some(turn), ..
+        } => Some(*turn),
+    }
+}
+
+fn should_skip_duplicate_item(
+    event: &AgentEvent,
+    seen_harness_item_ids: &mut HashSet<String>,
+    duplicate_item_ids: &mut HashSet<ItemId>,
+) -> bool {
+    match event {
+        AgentEvent::ItemStarted { item, .. } => {
+            if !item.harness_item_id.is_empty()
+                && seen_harness_item_ids.contains(&item.harness_item_id)
+            {
+                duplicate_item_ids.insert(item.id);
+                return true;
+            }
+            false
+        }
+        AgentEvent::ItemDelta { item_id, .. } => duplicate_item_ids.contains(item_id),
+        AgentEvent::ItemCompleted { item, .. } => {
+            if duplicate_item_ids.remove(&item.id) {
+                return true;
+            }
+            if item.harness_item_id.is_empty() {
+                return false;
+            }
+            !seen_harness_item_ids.insert(item.harness_item_id.clone())
+        }
+        _ => false,
+    }
+}
+
+async fn persisted_turn_ids(
+    store: &PersistStore,
+    project_id: ProjectId,
+    thread_id: ThreadId,
+) -> HashSet<TurnId> {
+    store
+        .load_thread(project_id, thread_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|tf| tf.turns.into_iter().map(|turn| turn.id).collect())
+        .unwrap_or_default()
+}
+
+async fn persisted_harness_item_ids(
+    store: &PersistStore,
+    project_id: ProjectId,
+    thread_id: ThreadId,
+) -> HashSet<String> {
+    store
+        .load_thread(project_id, thread_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|tf| {
+            tf.turns
+                .into_iter()
+                .flat_map(|turn| turn.items)
+                .filter_map(|item| {
+                    if item.harness_item_id.is_empty() {
+                        None
+                    } else {
+                        Some(item.harness_item_id)
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Append a completed `Turn` to the thread file, fold its usage into the thread ledger, recompute

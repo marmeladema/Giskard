@@ -3,21 +3,23 @@ use std::sync::Arc;
 use futures_util::{SinkExt, StreamExt};
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ItemId, ThreadId, TurnId};
+use giskard_core::ids::{ItemId, ProjectId, ThreadId, TurnId};
 use giskard_core::item::{Item, ItemDelta, ItemKind, ItemPayload, ItemStart};
+use giskard_core::model::ModelRef;
 use giskard_core::token::TokenUsage;
-use giskard_core::turn::{TurnStatus, TurnStatusKind};
+use giskard_core::turn::{Mode, TurnStatus, TurnStatusKind};
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 use giskard_persist::store::ProjectConfig;
-use giskard_proto::{ClientMessage, ServerMessage, WireAgentEvent};
+use giskard_proto::{ClientMessage, ErrorSeverity, ServerMessage, WireAgentEvent};
 use giskard_server::{AppState, HarnessFactory, build_app};
 
 struct TestFactory {
     fixture: ReplayFixture,
 }
 
+#[async_trait::async_trait]
 impl HarnessFactory for TestFactory {
-    fn create(
+    async fn create(
         &self,
         _config: &ProjectConfig,
     ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
@@ -78,6 +80,99 @@ fn make_fixture() -> ReplayFixture {
     ])
 }
 
+fn duplicate_history_fixture(
+    thread: ThreadId,
+    old_turn: TurnId,
+    new_turn: TurnId,
+) -> ReplayFixture {
+    let now = chrono::Utc::now();
+    let old_user = ItemId::new();
+    let old_agent = ItemId::new();
+    let new_user = ItemId::new();
+    let new_agent = ItemId::new();
+
+    ReplayFixture::from_events(vec![
+        AgentEvent::ThreadOpened {
+            thread,
+            harness_thread_id: "th_dupe".into(),
+        },
+        AgentEvent::TurnStarted {
+            thread,
+            turn: old_turn,
+        },
+        AgentEvent::ItemCompleted {
+            thread,
+            turn: old_turn,
+            item: Item {
+                id: old_user,
+                harness_item_id: "old_user".into(),
+                payload: ItemPayload::UserMessage {
+                    text: "old input".into(),
+                },
+                created_at: now,
+            },
+        },
+        AgentEvent::ItemCompleted {
+            thread,
+            turn: old_turn,
+            item: Item {
+                id: old_agent,
+                harness_item_id: "old_agent".into(),
+                payload: ItemPayload::AgentMessage {
+                    text: "old answer".into(),
+                },
+                created_at: now,
+            },
+        },
+        AgentEvent::TurnCompleted {
+            thread,
+            turn: old_turn,
+            usage: TokenUsage::new(10, 10),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        },
+        AgentEvent::TurnStarted {
+            thread,
+            turn: new_turn,
+        },
+        AgentEvent::ItemCompleted {
+            thread,
+            turn: new_turn,
+            item: Item {
+                id: new_user,
+                harness_item_id: "new_user".into(),
+                payload: ItemPayload::UserMessage {
+                    text: "new input".into(),
+                },
+                created_at: now,
+            },
+        },
+        AgentEvent::ItemCompleted {
+            thread,
+            turn: new_turn,
+            item: Item {
+                id: new_agent,
+                harness_item_id: "new_agent".into(),
+                payload: ItemPayload::AgentMessage {
+                    text: "new answer".into(),
+                },
+                created_at: now,
+            },
+        },
+        AgentEvent::TurnCompleted {
+            thread,
+            turn: new_turn,
+            usage: TokenUsage::new(20, 20),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        },
+    ])
+}
+
 fn generate_password_hash(password: &str) -> String {
     use argon2::password_hash::SaltString;
     use argon2::{Argon2, PasswordHasher};
@@ -89,7 +184,18 @@ fn generate_password_hash(password: &str) -> String {
         .to_string()
 }
 
-async fn start_server(port: u16) -> (tempfile::TempDir, Arc<AppState>) {
+async fn start_server_with_extra_config(
+    port: u16,
+    extra_config: &str,
+) -> (tempfile::TempDir, Arc<AppState>) {
+    start_server_with_fixture_and_extra_config(port, make_fixture(), extra_config).await
+}
+
+async fn start_server_with_fixture_and_extra_config(
+    port: u16,
+    fixture: ReplayFixture,
+    extra_config: &str,
+) -> (tempfile::TempDir, Arc<AppState>) {
     let tmp = tempfile::TempDir::new().unwrap();
 
     let hash = generate_password_hash("testpass");
@@ -102,6 +208,8 @@ secure_cookies = false
 [auth]
 password_hash = "{hash}"
 session_days = 30
+
+{extra_config}
 "#
     );
     tokio::fs::write(tmp.path().join("config.toml"), config_toml)
@@ -110,9 +218,7 @@ session_days = 30
 
     let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
     let session_key: Vec<u8> = (0..32u8).collect();
-    let factory = Arc::new(TestFactory {
-        fixture: make_fixture(),
-    });
+    let factory = Arc::new(TestFactory { fixture });
 
     let state = AppState::new(store, factory, session_key);
 
@@ -125,6 +231,920 @@ session_days = 30
     });
 
     (tmp, Arc::new(state))
+}
+
+async fn start_server(port: u16) -> (tempfile::TempDir, Arc<AppState>) {
+    start_server_with_extra_config(port, "").await
+}
+
+async fn start_server_with_extra_config_on_available_port(
+    extra_config: &str,
+) -> (tempfile::TempDir, Arc<AppState>, u16) {
+    start_server_with_fixture_and_extra_config_on_available_port(make_fixture(), extra_config).await
+}
+
+async fn start_server_with_fixture_and_extra_config_on_available_port(
+    fixture: ReplayFixture,
+    extra_config: &str,
+) -> (tempfile::TempDir, Arc<AppState>, u16) {
+    let tmp = tempfile::TempDir::new().unwrap();
+
+    let hash = generate_password_hash("testpass");
+    let config_toml = format!(
+        r#"
+[server]
+bind = "127.0.0.1:0"
+secure_cookies = false
+
+[auth]
+password_hash = "{hash}"
+session_days = 30
+
+{extra_config}
+"#
+    );
+    tokio::fs::write(tmp.path().join("config.toml"), config_toml)
+        .await
+        .unwrap();
+
+    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
+    let session_key: Vec<u8> = (0..32u8).collect();
+    let factory = Arc::new(TestFactory { fixture });
+
+    let state = AppState::new(store, factory, session_key);
+
+    let app = build_app(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    (tmp, Arc::new(state), port)
+}
+
+#[tokio::test]
+async fn subscribe_unknown_thread_returns_structured_error() {
+    let port = 18791;
+    let (_tmp, _state) = start_server(port).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let ws_base = format!("ws://127.0.0.1:{port}");
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let resp = client
+        .post(format!("{base}/api/login"))
+        .json(&serde_json::json!({"password": "testpass"}))
+        .send()
+        .await
+        .unwrap();
+    let cookie = resp
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    use tokio_tungstenite::tungstenite::http::Request;
+    let ws_request = Request::builder()
+        .uri(format!("{ws_base}/api/ws"))
+        .header("host", format!("127.0.0.1:{port}"))
+        .header("cookie", &cookie)
+        .header("upgrade", "websocket")
+        .header("connection", "upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .body(())
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request)
+        .await
+        .expect("WS connect");
+
+    let tid = ThreadId::new();
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::Subscribe { thread_id: tid })
+            .unwrap()
+            .into(),
+    ))
+    .await
+    .unwrap();
+
+    let msg = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
+        panic!("expected text WS frame");
+    };
+    let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
+    match server_msg {
+        ServerMessage::Error { error } => {
+            assert_eq!(error.code, "thread_not_found");
+            assert_eq!(error.severity, ErrorSeverity::Error);
+            assert_eq!(error.thread_id, Some(tid));
+            assert_eq!(error.action.as_deref(), Some("subscribe"));
+            assert!(!error.message.is_empty());
+        }
+        other => panic!("expected structured error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn websocket_accepts_ticket_without_cookie_header() {
+    let port = 18793;
+    let (_tmp, _state) = start_server(port).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let ws_base = format!("ws://127.0.0.1:{port}");
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let resp = client
+        .post(format!("{base}/api/login"))
+        .json(&serde_json::json!({"password": "testpass"}))
+        .send()
+        .await
+        .unwrap();
+    let cookie = resp
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let ticket_resp: serde_json::Value = client
+        .get(format!("{base}/api/ws-ticket"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ticket = ticket_resp["ticket"].as_str().unwrap();
+
+    use tokio_tungstenite::tungstenite::http::Request;
+    let ws_request = Request::builder()
+        .uri(format!("{ws_base}/api/ws?ticket={ticket}"))
+        .header("host", format!("127.0.0.1:{port}"))
+        .header("upgrade", "websocket")
+        .header("connection", "upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .body(())
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request)
+        .await
+        .expect("WS connect with ticket");
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::Ping).unwrap().into(),
+    ))
+    .await
+    .unwrap();
+
+    let msg = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
+        panic!("expected text WS frame");
+    };
+    let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
+    assert!(matches!(server_msg, ServerMessage::Pong));
+}
+
+#[tokio::test]
+async fn websocket_serializes_harness_error_events() {
+    let port = 18794;
+    let (_tmp, state) = start_server(port).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let ws_base = format!("ws://127.0.0.1:{port}");
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let resp = client
+        .post(format!("{base}/api/login"))
+        .json(&serde_json::json!({"password": "testpass"}))
+        .send()
+        .await
+        .unwrap();
+    let cookie = resp
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let resp = client
+        .post(format!("{base}/api/projects"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({
+            "name": "test-project",
+            "dir": "/tmp/test",
+            "default_model": {"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null},
+            "approval_policy": "auto"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let project_id = resp.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"resume": "th_test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let tid: ThreadId = resp.json::<serde_json::Value>().await.unwrap()["thread_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    use tokio_tungstenite::tungstenite::http::Request;
+    let ws_request = Request::builder()
+        .uri(format!("{ws_base}/api/ws"))
+        .header("host", format!("127.0.0.1:{port}"))
+        .header("cookie", &cookie)
+        .header("upgrade", "websocket")
+        .header("connection", "upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .body(())
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request)
+        .await
+        .expect("WS connect");
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::Subscribe { thread_id: tid })
+            .unwrap()
+            .into(),
+    ))
+    .await
+    .unwrap();
+
+    let msg = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        serde_json::from_str::<ServerMessage>(msg.to_text().unwrap()).unwrap(),
+        ServerMessage::ThreadState(_)
+    ));
+
+    state
+        .hub
+        .broadcast_event(
+            tid,
+            AgentEvent::Error {
+                thread: tid,
+                turn: None,
+                error: HarnessError::Protocol("bad frame".into()),
+            },
+        )
+        .await;
+
+    let msg = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let server_msg: ServerMessage = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+    match server_msg {
+        ServerMessage::Event { agent_event, .. } => match agent_event {
+            WireAgentEvent::Error { error, .. } => {
+                assert_eq!(error.code, "harness_protocol_error");
+                assert_eq!(error.message, "protocol error: bad frame");
+            }
+            other => panic!("expected error event, got {other:?}"),
+        },
+        other => panic!("expected event, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn subscribe_reopens_persisted_thread() {
+    let port = 18792;
+    let (_tmp, state) = start_server(port).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let ws_base = format!("ws://127.0.0.1:{port}");
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let resp = client
+        .post(format!("{base}/api/login"))
+        .json(&serde_json::json!({"password": "testpass"}))
+        .send()
+        .await
+        .unwrap();
+    let cookie = resp
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let model = ModelRef {
+        provider: "openai".into(),
+        model: "gpt-5.5".into(),
+        reasoning_effort: None,
+    };
+
+    let resp = client
+        .post(format!("{base}/api/projects"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({
+            "name": "test-project",
+            "dir": "/tmp/test",
+            "default_model": model,
+            "approval_policy": "auto"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let project_id = resp.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pid: ProjectId = project_id.parse().unwrap();
+
+    let tid = ThreadId::new();
+    let now = chrono::Utc::now();
+    state
+        .store
+        .save_thread(
+            pid,
+            &giskard_persist::store::ThreadFile {
+                version: 1,
+                id: tid,
+                project_id: pid,
+                title: "Saved thread".into(),
+                harness_thread_id: "th_test".into(),
+                mode: Mode::Build,
+                current_model: model.clone(),
+                context_window: 128_000,
+                approval_policy: None,
+                model_efforts: Default::default(),
+                tokens: Default::default(),
+                created_at: now,
+                updated_at: now,
+                turns: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(state.registry.get_project_for_thread(tid).await, None);
+
+    use tokio_tungstenite::tungstenite::http::Request;
+    let ws_request = Request::builder()
+        .uri(format!("{ws_base}/api/ws"))
+        .header("host", format!("127.0.0.1:{port}"))
+        .header("cookie", &cookie)
+        .header("upgrade", "websocket")
+        .header("connection", "upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .body(())
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request)
+        .await
+        .expect("WS connect");
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::Subscribe { thread_id: tid })
+            .unwrap()
+            .into(),
+    ))
+    .await
+    .unwrap();
+
+    let mut got_thread_state = false;
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(2), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
+                let server_msg: ServerMessage = serde_json::from_str(&t).unwrap();
+                if let ServerMessage::ThreadState(state) = server_msg {
+                    assert_eq!(state.thread_id, tid);
+                    got_thread_state = true;
+                    break;
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => break,
+        }
+    }
+
+    assert!(got_thread_state, "subscribe should return ThreadState");
+    assert_eq!(state.registry.get_project_for_thread(tid).await, Some(pid));
+}
+
+#[tokio::test]
+async fn persisted_thread_can_be_reopened_before_ws_send() {
+    let port = 18790;
+    let (_tmp, state) = start_server(port).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let ws_base = format!("ws://127.0.0.1:{port}");
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let resp = client
+        .post(format!("{base}/api/login"))
+        .json(&serde_json::json!({"password": "testpass"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let cookie = resp
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let model = ModelRef {
+        provider: "openai".into(),
+        model: "gpt-5.5".into(),
+        reasoning_effort: None,
+    };
+
+    let resp = client
+        .post(format!("{base}/api/projects"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({
+            "name": "test-project",
+            "dir": "/tmp/test",
+            "default_model": model,
+            "approval_policy": "auto"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let project_id = resp.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pid: ProjectId = project_id.parse().unwrap();
+
+    let tid = ThreadId::new();
+    let now = chrono::Utc::now();
+    state
+        .store
+        .save_thread(
+            pid,
+            &giskard_persist::store::ThreadFile {
+                version: 1,
+                id: tid,
+                project_id: pid,
+                title: "Saved thread".into(),
+                harness_thread_id: "th_test".into(),
+                mode: Mode::Build,
+                current_model: model.clone(),
+                context_window: 128_000,
+                approval_policy: None,
+                model_efforts: Default::default(),
+                tokens: Default::default(),
+                created_at: now,
+                updated_at: now,
+                turns: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(state.registry.get_project_for_thread(tid).await, None);
+
+    let resp = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"thread_id": tid, "resume": null}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["thread_id"].as_str().unwrap(), tid.to_string());
+    assert_eq!(state.registry.get_project_for_thread(tid).await, Some(pid));
+
+    use tokio_tungstenite::tungstenite::http::Request;
+    let ws_request = Request::builder()
+        .uri(format!("{ws_base}/api/ws"))
+        .header("host", format!("127.0.0.1:{port}"))
+        .header("cookie", &cookie)
+        .header("upgrade", "websocket")
+        .header("connection", "upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .body(())
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request)
+        .await
+        .expect("WS connect");
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::Subscribe { thread_id: tid })
+            .unwrap()
+            .into(),
+    ))
+    .await
+    .unwrap();
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SendInput {
+            thread_id: tid,
+            text: "Hello".into(),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    let mut saw_completed = false;
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
+                let server_msg: ServerMessage = serde_json::from_str(&t).unwrap();
+                if let ServerMessage::Event { agent_event, .. } = server_msg {
+                    if matches!(agent_event, WireAgentEvent::TurnCompleted { .. }) {
+                        saw_completed = true;
+                        break;
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => break,
+        }
+    }
+
+    assert!(saw_completed, "reopened persisted thread should run a turn");
+}
+
+#[tokio::test]
+async fn replayed_persisted_turn_events_are_not_duplicated() {
+    let tid = ThreadId::new();
+    let old_turn = TurnId::new();
+    let new_turn = TurnId::new();
+    let fixture = duplicate_history_fixture(tid, old_turn, new_turn);
+    let (_tmp, state, port) =
+        start_server_with_fixture_and_extra_config_on_available_port(fixture, "").await;
+    let base = format!("http://127.0.0.1:{port}");
+    let ws_base = format!("ws://127.0.0.1:{port}");
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let resp = client
+        .post(format!("{base}/api/login"))
+        .json(&serde_json::json!({"password": "testpass"}))
+        .send()
+        .await
+        .unwrap();
+    let cookie = resp
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let model = ModelRef {
+        provider: "openai".into(),
+        model: "gpt-5.5".into(),
+        reasoning_effort: None,
+    };
+
+    let resp = client
+        .post(format!("{base}/api/projects"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({
+            "name": "test-project",
+            "dir": "/tmp/test",
+            "default_model": model,
+            "approval_policy": "auto"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let project_id = resp.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pid: ProjectId = project_id.parse().unwrap();
+
+    let now = chrono::Utc::now();
+    state
+        .store
+        .save_thread(
+            pid,
+            &giskard_persist::store::ThreadFile {
+                version: 1,
+                id: tid,
+                project_id: pid,
+                title: "Saved thread".into(),
+                harness_thread_id: "th_dupe".into(),
+                mode: Mode::Build,
+                current_model: model.clone(),
+                context_window: 128_000,
+                approval_policy: None,
+                model_efforts: Default::default(),
+                tokens: Default::default(),
+                created_at: now,
+                updated_at: now,
+                turns: vec![giskard_core::turn::Turn {
+                    id: old_turn,
+                    user_input: giskard_core::user_input::UserInput::text("old input"),
+                    items: vec![
+                        Item {
+                            id: ItemId::new(),
+                            harness_item_id: "old_user".into(),
+                            payload: ItemPayload::UserMessage {
+                                text: "old input".into(),
+                            },
+                            created_at: now,
+                        },
+                        Item {
+                            id: ItemId::new(),
+                            harness_item_id: "old_agent".into(),
+                            payload: ItemPayload::AgentMessage {
+                                text: "old answer".into(),
+                            },
+                            created_at: now,
+                        },
+                    ],
+                    model: model.clone(),
+                    mode: Mode::Build,
+                    status: TurnStatus {
+                        kind: TurnStatusKind::Completed,
+                        message: None,
+                    },
+                    usage: TokenUsage::new(10, 10),
+                    diffs: vec![],
+                    started_at: now,
+                    completed_at: Some(now),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+
+    let resp = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"thread_id": tid, "resume": null}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    use tokio_tungstenite::tungstenite::http::Request;
+    let ws_request = Request::builder()
+        .uri(format!("{ws_base}/api/ws"))
+        .header("host", format!("127.0.0.1:{port}"))
+        .header("cookie", &cookie)
+        .header("upgrade", "websocket")
+        .header("connection", "upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .body(())
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request)
+        .await
+        .expect("WS connect");
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::Subscribe { thread_id: tid })
+            .unwrap()
+            .into(),
+    ))
+    .await
+    .unwrap();
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SendInput {
+            thread_id: tid,
+            text: "new input".into(),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    let mut seen_old = false;
+    let mut seen_new = false;
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline && !seen_new {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
+                let server_msg: ServerMessage = serde_json::from_str(&t).unwrap();
+                if let ServerMessage::Event { agent_event, .. } = server_msg {
+                    match agent_event {
+                        WireAgentEvent::ItemCompleted { item, .. } => match item.payload {
+                            giskard_proto::WireItemPayload::AgentMessage { text }
+                            | giskard_proto::WireItemPayload::UserMessage { text } => {
+                                if text.starts_with("old ") {
+                                    seen_old = true;
+                                }
+                                if text == "new answer" {
+                                    seen_new = true;
+                                }
+                            }
+                            _ => {}
+                        },
+                        WireAgentEvent::TurnCompleted { turn, .. } if turn == new_turn => {
+                            seen_new = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => break,
+        }
+    }
+
+    assert!(
+        !seen_old,
+        "persisted replay items should not be rebroadcast"
+    );
+    assert!(seen_new, "new turn should still be streamed");
+
+    let saved = state.store.load_thread(pid, tid).await.unwrap().unwrap();
+    assert_eq!(saved.turns.len(), 2);
+    assert_eq!(saved.turns[0].id, old_turn);
+    assert_eq!(saved.turns[1].id, new_turn);
+    let old_item_count = saved
+        .turns
+        .iter()
+        .flat_map(|turn| &turn.items)
+        .filter(|item| item.harness_item_id.starts_with("old_"))
+        .count();
+    assert_eq!(old_item_count, 2);
+}
+
+#[tokio::test]
+async fn open_thread_normalizes_stale_provider_from_configured_model() {
+    let extra_config = r#"
+[[providers]]
+id = "proxy"
+name = "proxy"
+wire_api = "responses"
+
+  [[providers.models]]
+  id = "gpt-5.5"
+  display_name = "GPT-5.5"
+  context_window = 262144
+  supports_reasoning_effort = true
+"#;
+    let (_tmp, state, port) = start_server_with_extra_config_on_available_port(extra_config).await;
+    let base = format!("http://127.0.0.1:{port}");
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let resp = client
+        .post(format!("{base}/api/login"))
+        .json(&serde_json::json!({"password": "testpass"}))
+        .send()
+        .await
+        .unwrap();
+    let cookie = resp
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let stale_model = ModelRef {
+        provider: "openai".into(),
+        model: "gpt-5.5".into(),
+        reasoning_effort: None,
+    };
+
+    let resp = client
+        .post(format!("{base}/api/projects"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({
+            "name": "test-project",
+            "dir": "/tmp/test",
+            "default_model": stale_model,
+            "approval_policy": "auto"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let project_id = resp.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pid: ProjectId = project_id.parse().unwrap();
+
+    let saved_project = state.store.load_project(pid).await.unwrap().unwrap();
+    assert_eq!(saved_project.default_model.provider, "proxy");
+
+    let tid = ThreadId::new();
+    let now = chrono::Utc::now();
+    state
+        .store
+        .save_thread(
+            pid,
+            &giskard_persist::store::ThreadFile {
+                version: 1,
+                id: tid,
+                project_id: pid,
+                title: "Saved thread".into(),
+                harness_thread_id: "th_test".into(),
+                mode: Mode::Build,
+                current_model: ModelRef {
+                    provider: "openai".into(),
+                    model: "gpt-5.5".into(),
+                    reasoning_effort: None,
+                },
+                context_window: 128_000,
+                approval_policy: None,
+                model_efforts: Default::default(),
+                tokens: Default::default(),
+                created_at: now,
+                updated_at: now,
+                turns: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+    let resp = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"thread_id": tid, "resume": null}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let saved_thread = state.store.load_thread(pid, tid).await.unwrap().unwrap();
+    assert_eq!(saved_thread.current_model.provider, "proxy");
+    assert_eq!(saved_thread.context_window, 262_144);
 }
 
 #[tokio::test]

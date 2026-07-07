@@ -9,7 +9,8 @@ use giskard_core::ids::{ProjectId, ThreadId, TurnId};
 
 pub mod wire;
 pub use wire::{
-    WireAgentEvent, WireApprovalKind, WireApprovalRequest, WireFileDiff, WireItem, WireItemPayload,
+    WireAgentEvent, WireApprovalKind, WireApprovalRequest, WireFileDiff, WireHarnessError,
+    WireItem, WireItemPayload,
 };
 
 // C1/§3.5: `giskard-proto` is the single wire vocabulary. Path-free `giskard-core` domain types
@@ -85,6 +86,27 @@ pub struct LiveTurnSnapshot {
     pub pending_approval: Option<WireApprovalRequest>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorInfo {
+    pub code: String,
+    pub severity: ErrorSeverity,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<ThreadId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
@@ -103,7 +125,8 @@ pub enum ServerMessage {
         request: WireApprovalRequest,
     },
     Error {
-        message: String,
+        #[serde(flatten)]
+        error: ErrorInfo,
     },
     Pong,
 }
@@ -127,6 +150,11 @@ pub struct LoginRequest {
 #[derive(Debug, Clone, Serialize)]
 pub struct LoginResponse {
     pub ok: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WsTicketResponse {
+    pub ticket: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -172,6 +200,7 @@ pub struct ListThreadsResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct OpenThreadRequest {
+    pub thread_id: Option<ThreadId>,
     pub resume: Option<String>,
 }
 
@@ -179,6 +208,8 @@ pub struct OpenThreadRequest {
 pub struct OpenThreadResponse {
     pub thread_id: ThreadId,
     pub harness_thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<ErrorInfo>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -291,5 +322,33 @@ mod tests {
     fn server_message_pong() {
         let json = serde_json::to_string(&ServerMessage::Pong).unwrap();
         assert_eq!(json, "{\"type\":\"pong\"}");
+    }
+
+    #[test]
+    fn server_message_error_is_flattened() {
+        let tid = ThreadId::new();
+        let msg = ServerMessage::Error {
+            error: ErrorInfo {
+                code: "thread_not_found".into(),
+                severity: ErrorSeverity::Error,
+                message: "Thread not found.".into(),
+                detail: Some("missing".into()),
+                thread_id: Some(tid),
+                action: Some("subscribe".into()),
+            },
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["code"], "thread_not_found");
+        assert_eq!(json["message"], "Thread not found.");
+        assert_eq!(json["thread_id"], tid.to_string());
+        let back: ServerMessage = serde_json::from_value(json).unwrap();
+        match back {
+            ServerMessage::Error { error } => {
+                assert_eq!(error.code, "thread_not_found");
+                assert_eq!(error.action.as_deref(), Some("subscribe"));
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }

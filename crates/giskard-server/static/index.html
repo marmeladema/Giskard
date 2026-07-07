@@ -52,13 +52,18 @@
 
   .composer { display:flex; gap:8px; padding:12px; border-top:1px solid var(--border); background:var(--panel); }
   .composer textarea { flex:1; resize:none; height:52px; }
+  .composer textarea:disabled { opacity:.65; cursor:not-allowed; }
+  button:disabled { opacity:.55; cursor:not-allowed; }
 
   .notice { margin:8px 0; padding:8px 10px; border-radius:8px; border:1px solid var(--border); font-size:13px; }
   .notice.err { border-color:#f85149; color:#ffb4ae; }
+  .notice.warn { border-color:#d29922; color:#f0d98c; }
   h3.sec { margin:16px 0 8px; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
   .row { display:flex; gap:6px; margin:6px 0; }
   .kv { font-size:13px; margin:4px 0; }
   .kv b { color:var(--muted); font-weight:500; }
+  .msg.pending { opacity:.7; }
+  .msg.failed { border:1px solid #f85149; }
 </style>
 </head>
 <body>
@@ -104,7 +109,11 @@
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
-let state = { projectId:null, threadId:null, mode:"build", ws:null, models:[], streamEl:null };
+let state = {
+  projectId:null, threadId:null, mode:"build", ws:null, wsStatus:"closed", wsConnectId:0,
+  models:[], streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null, pendingClientMsgs:[],
+  streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set()
+};
 
 async function api(method, path, body) {
   const opts = { method, headers:{} };
@@ -180,30 +189,112 @@ async function newThread(pid) {
   try {
     const res = await api("POST",`/api/projects/${pid}/threads`,{ resume:null });
     await loadThreads(pid);
-    openThread(pid, res.thread_id, "New thread");
+    await openThread(pid, res.thread_id, "New thread");
   } catch (e) { alert("New thread failed: "+e.message); }
 }
 
 /* ---------- thread view + websocket ---------- */
-function openThread(pid, tid, title) {
-  state.projectId = pid; state.threadId = tid; state.streamEl = null;
+async function openThread(pid, tid, title) {
+  let res;
+  try {
+    res = await api("POST",`/api/projects/${pid}/threads`,{ thread_id:tid, resume:null });
+    tid = res.thread_id || tid;
+  } catch (e) {
+    alert("Open thread failed: "+e.message);
+    return;
+  }
+
+  state.projectId = pid; state.threadId = tid; state.pendingUserEl = null; state.pendingUserText = null;
+  resetRenderState();
   document.querySelectorAll(".thread").forEach(e => e.classList.toggle("active", e.dataset.tid===tid));
   $("thrHeader").style.display="flex"; $("composer").style.display="flex";
   $("thrTitle").textContent = title || tid.slice(0,8);
   $("transcript").className=""; $("transcript").innerHTML=""; $("notices").innerHTML="";
+  if (res.warning) notice(res.warning.message || "warning", res.warning.severity || "warning");
   connectWs();
 }
 
-function connectWs() {
-  if (state.ws) { try { state.ws.close(); } catch {} }
+async function connectWs() {
+  const oldWs = state.ws;
+  state.ws = null;
+  if (oldWs) { try { oldWs.close(); } catch {} }
+  const connectId = ++state.wsConnectId;
+  state.pendingClientMsgs = [];
+  setWsStatus("connecting");
   const proto = location.protocol==="https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${proto}://${location.host}/api/ws`);
+  let ticket;
+  try {
+    ticket = (await api("GET","/api/ws-ticket")).ticket;
+  } catch (e) {
+    if (connectId !== state.wsConnectId) return;
+    setWsStatus("closed");
+    failPendingUserMessage("Message not sent: could not authorize WebSocket.");
+    notice("WebSocket authorization failed: "+e.message, "error");
+    return;
+  }
+  if (connectId !== state.wsConnectId) return;
+  const ws = new WebSocket(`${proto}://${location.host}/api/ws?ticket=${encodeURIComponent(ticket)}`);
   state.ws = ws;
-  ws.onopen = () => send({ type:"subscribe", thread_id: state.threadId });
-  ws.onmessage = (m) => handleServer(JSON.parse(m.data));
-  ws.onclose = () => {};
+  ws.onopen = () => {
+    if (state.ws !== ws) return;
+    setWsStatus("open");
+    send({ type:"subscribe", thread_id: state.threadId });
+    flushPendingClientMsgs();
+  };
+  ws.onmessage = (m) => {
+    try {
+      handleServer(JSON.parse(m.data));
+    } catch (e) {
+      notice("Invalid WebSocket message from server: "+e.message, "error");
+    }
+  };
+  ws.onerror = () => {
+    if (state.ws !== ws) return;
+    notice("WebSocket connection failed.", "error");
+  };
+  ws.onclose = (ev) => {
+    if (state.ws !== ws) return;
+    setWsStatus("closed");
+    failPendingUserMessage("Message not sent: WebSocket closed.");
+    const reason = ev.reason ? ` ${ev.reason}` : "";
+    const code = ev.code ? ` (${ev.code})` : "";
+    notice(`WebSocket closed${code}.${reason}`, "error");
+  };
 }
-function send(obj) { if (state.ws && state.ws.readyState===1) state.ws.send(JSON.stringify(obj)); }
+function setWsStatus(status) {
+  state.wsStatus = status;
+  const ready = status==="open";
+  $("sendBtn").disabled = !ready && status!=="connecting";
+  $("input").disabled = status==="closed";
+  $("input").placeholder =
+    status==="open" ? "Message the agent…  (Enter to send, Shift+Enter for newline)" :
+    status==="connecting" ? "Connecting to agent…" :
+    "WebSocket disconnected";
+}
+function flushPendingClientMsgs() {
+  const pending = state.pendingClientMsgs.splice(0);
+  for (const msg of pending) send(msg);
+}
+function send(obj, opts) {
+  opts = opts || {};
+  if (state.ws && state.ws.readyState===1) {
+    state.ws.send(JSON.stringify(obj));
+    return true;
+  }
+  if (opts.queue && state.wsStatus==="connecting") {
+    state.pendingClientMsgs.push(obj);
+    return true;
+  }
+  return false;
+}
+function failPendingUserMessage(text) {
+  if (!state.pendingUserEl) return;
+  state.pendingUserEl.classList.remove("pending");
+  state.pendingUserEl.classList.add("failed");
+  state.pendingUserEl = null;
+  state.pendingUserText = null;
+  if (text) notice(text, "error");
+}
 
 function handleServer(msg) {
   switch (msg.type) {
@@ -211,7 +302,12 @@ function handleServer(msg) {
     case "event": handleEvent(msg.agent_event); break;
     case "token_update": renderTokens(msg.ledger); break;
     case "approval_request": notice("Approval requested: "+JSON.stringify(msg.request.kind)); break;
-    case "error": notice(msg.message||"error", true); break;
+    case "error":
+      if (msg.action==="send_input" && state.pendingUserEl) {
+        failPendingUserMessage(null);
+      }
+      notice(msg.message||"error", msg.severity||"error");
+      break;
   }
 }
 
@@ -228,22 +324,33 @@ function renderThreadState(s) {
   updateGauge(s.tokens ? s.tokens.total.total : 0, s.context_window || 0);
   // Replay persisted history.
   $("transcript").innerHTML="";
+  resetRenderState();
   for (const turn of (s.turns||[])) {
-    for (const it of (turn.items||[])) addItem(it.payload);
+    for (const it of (turn.items||[])) addItem(it);
   }
 }
 
 function handleEvent(ev) {
   switch (ev.kind) {
-    case "turn_started": state.streamEl = null; break;
-    case "item_delta":
-      if (ev.delta && ev.delta.type==="text") appendStream(ev.delta.text);
-      else if (ev.delta && ev.delta.type==="command_output") appendStream(ev.delta.chunk);
+    case "turn_started":
+      state.streamEl = null;
+      state.streamItemId = null;
+      state.streamElsByItemId.clear();
       break;
-    case "item_completed": state.streamEl=null; addItem(ev.item.payload); break;
-    case "turn_completed": state.streamEl=null; break;
+    case "item_delta":
+      if (ev.delta && ev.delta.type==="text") appendStream(ev.delta.text, ev.item_id);
+      else if (ev.delta && ev.delta.type==="command_output") appendStream(ev.delta.chunk, ev.item_id);
+      break;
+    case "item_completed":
+      if (!finalizeStreamedItem(ev.item)) addItem(ev.item);
+      break;
+    case "turn_completed":
+      state.streamEl=null;
+      state.streamItemId=null;
+      state.streamElsByItemId.clear();
+      break;
     case "approval_requested": notice("Approval requested"); break;
-    case "error": notice(ev.error ? JSON.stringify(ev.error) : "error", true); break;
+    case "error": notice(ev.error ? JSON.stringify(ev.error) : "error", "error"); break;
   }
 }
 
@@ -255,27 +362,112 @@ function bubble(cls, role) {
   $("transcript").scrollTop = $("transcript").scrollHeight;
   return body;
 }
-function appendStream(text) {
-  if (!state.streamEl) state.streamEl = bubble("agent","agent");
-  state.streamEl.textContent += text;
+function appendStream(text, itemId) {
+  const key = idKey(itemId);
+  if (key && state.renderedItemIds.has(key)) return;
+  let body = key ? state.streamElsByItemId.get(key) : state.streamEl;
+  if (!body) {
+    body = bubble("agent","agent");
+    if (key) state.streamElsByItemId.set(key, body);
+  }
+  state.streamEl = body;
+  state.streamItemId = key || null;
+  body.textContent += text;
   $("transcript").scrollTop = $("transcript").scrollHeight;
 }
-function addItem(p) {
-  if (!p) return;
-  if (p.kind==="user_message") bubble("user","you").textContent = p.text;
-  else if (p.kind==="agent_message") bubble("agent","agent").textContent = p.text;
-  else if (p.kind==="reasoning") bubble("reasoning","reasoning").textContent = p.text;
-  else if (p.kind==="command_execution") {
-    const b = bubble("cmd","command");
-    b.innerHTML = `<div class="mono">$ ${escapeHtml(p.command)}</div><pre class="out">${escapeHtml(p.output||"")}</pre>`;
+function finalizeStreamedItem(item) {
+  if (!item || !item.payload) return false;
+  const key = idKey(item.id);
+  const body = (key && state.streamElsByItemId.get(key)) || (state.streamItemId===key ? state.streamEl : null);
+  if (!body) return false;
+  renderItemBody(body, item.payload);
+  markRenderedItem(item);
+  if (state.streamEl === body) {
+    state.streamEl = null;
+    state.streamItemId = null;
   }
+  $("transcript").scrollTop = $("transcript").scrollHeight;
+  return true;
+}
+function addItem(item) {
+  const p = item && item.payload ? item.payload : item;
+  if (!p) return;
+  if (isRenderedItem(item)) return;
+  if (p.kind==="user_message") {
+    if (state.pendingUserEl && p.text===state.pendingUserText) {
+      state.pendingUserEl.classList.remove("pending");
+      state.pendingUserEl.querySelector(".body").textContent = p.text;
+      state.pendingUserEl = null;
+      state.pendingUserText = null;
+      markRenderedItem(item);
+      return;
+    }
+    renderItemBody(bubble("user","you"), p);
+  }
+  else renderItemBody(bubble(classForPayload(p), roleForPayload(p)), p);
+  markRenderedItem(item);
+}
+function resetRenderState() {
+  state.streamEl = null;
+  state.streamItemId = null;
+  state.streamElsByItemId = new Map();
+  state.renderedItemIds = new Set();
+  state.renderedHarnessItemIds = new Set();
+}
+function idKey(id) {
+  return id === undefined || id === null ? "" : String(id);
+}
+function isRenderedItem(item) {
+  const itemId = idKey(item && item.id);
+  const harnessItemId = item && item.harness_item_id;
+  return (itemId && state.renderedItemIds.has(itemId)) ||
+    (harnessItemId && state.renderedHarnessItemIds.has(harnessItemId));
+}
+function markRenderedItem(item) {
+  const itemId = idKey(item && item.id);
+  if (itemId) {
+    state.renderedItemIds.add(itemId);
+    state.streamElsByItemId.delete(itemId);
+  }
+  if (item && item.harness_item_id) state.renderedHarnessItemIds.add(item.harness_item_id);
+}
+function renderItemBody(body, p) {
+  const msg = body.parentElement;
+  msg.className = "msg " + classForPayload(p);
+  msg.querySelector(".role").textContent = roleForPayload(p);
+  if (p.kind==="command_execution") {
+    body.innerHTML = `<div class="mono">$ ${escapeHtml(p.command)}</div><pre class="out">${escapeHtml(p.output||"")}</pre>`;
+  } else if (p.kind==="agent_message" || p.kind==="reasoning" || p.kind==="user_message") {
+    body.textContent = p.text;
+  }
+}
+function classForPayload(p) {
+  if (p.kind==="user_message") return "user";
+  if (p.kind==="reasoning") return "reasoning";
+  if (p.kind==="command_execution") return "cmd";
+  return "agent";
+}
+function roleForPayload(p) {
+  if (p.kind==="user_message") return "you";
+  if (p.kind==="reasoning") return "reasoning";
+  if (p.kind==="command_execution") return "command";
+  return "agent";
 }
 
 /* ---------- composer + controls ---------- */
 function sendInput() {
   const ta = $("input"); const text = ta.value.trim(); if (!text || !state.threadId) return;
-  bubble("user","you").textContent = text;
-  send({ type:"send_input", thread_id: state.threadId, text });
+  const body = bubble("user pending","you");
+  body.textContent = text;
+  const msgEl = body.parentElement;
+  if (!send({ type:"send_input", thread_id: state.threadId, text }, { queue:true })) {
+    msgEl.classList.remove("pending");
+    msgEl.classList.add("failed");
+    notice(`Message not sent: WebSocket is ${state.wsStatus}.`, "error");
+    return;
+  }
+  state.pendingUserEl = msgEl;
+  state.pendingUserText = text;
   ta.value="";
 }
 $("sendBtn").onclick = sendInput;
@@ -315,8 +507,9 @@ function updateGauge(used, window) {
   $("gauge").textContent = w ? `${fmt(used)} / ${fmt(w)}` : `${fmt(used)} tokens`;
 }
 function fmt(n) { return n>=1000 ? (n/1000).toFixed(1)+"k" : String(n); }
-function notice(text, err) {
-  const el = document.createElement("div"); el.className="notice"+(err?" err":""); el.textContent=text;
+function notice(text, severity) {
+  const cls = severity===true || severity==="error" ? " err" : severity==="warning" ? " warn" : "";
+  const el = document.createElement("div"); el.className="notice"+cls; el.textContent=text;
   $("notices").prepend(el); setTimeout(()=>el.remove(), 8000);
 }
 function escapeHtml(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
