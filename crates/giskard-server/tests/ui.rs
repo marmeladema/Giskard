@@ -51,8 +51,32 @@ async fn index_page_is_served_and_public() {
         "stop button sends the Interrupt client message"
     );
     assert!(
+        body.contains("msg.action===\"interrupt\""),
+        "interrupt errors are handled explicitly"
+    );
+    assert!(
+        body.contains("state.interruptPending = false"),
+        "interrupt errors re-enable the stop control"
+    );
+    assert!(
         body.contains("activeTurn"),
         "UI tracks active turns for interrupt controls"
+    );
+    assert!(
+        body.contains("renderApprovalRequest"),
+        "UI renders approval requests as actionable transcript cards"
+    );
+    assert!(
+        body.contains("type:\"approval_decision\""),
+        "approval cards send approval decisions over the WebSocket"
+    );
+    assert!(
+        body.contains("accept_for_session"),
+        "approval cards expose session-scoped approval"
+    );
+    assert!(
+        body.contains("pendingApprovals"),
+        "UI de-duplicates pending approval cards"
     );
     assert!(
         body.contains("awaitingInitialThreadState"),
@@ -235,6 +259,22 @@ async fn index_page_is_served_and_public() {
     assert!(
         body.contains("renderToolCall"),
         "UI renders tool-call items"
+    );
+    assert!(
+        body.contains("startToolCall"),
+        "UI renders pending tool-call starts before completion"
+    );
+    assert!(
+        body.contains("ev.item.kind===\"tool_call\" && ev.item.tool"),
+        "UI recognizes tool-call start metadata"
+    );
+    assert!(
+        body.contains("appendToolProgress"),
+        "UI appends tool progress deltas to the pending tool row"
+    );
+    assert!(
+        body.contains("toolVisualStateFromStatus"),
+        "UI gives tool-call rows lifecycle state styling"
     );
     assert!(
         body.contains("renderActivity"),

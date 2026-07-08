@@ -226,6 +226,7 @@ mod tests {
                 process_id: Some("proc_1".into()),
                 started_at_ms: Some(1_700_000_000_000),
             }),
+            tool: None,
         }
     }
 

@@ -13,7 +13,7 @@ use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ThreadId, TurnId};
 use giskard_core::item::{
     CommandExecutionStart, FileChangeEntry, FileChangeKind, Item, ItemDelta, ItemKind, ItemPayload,
-    ItemStart, command_status_is_running,
+    ItemStart, ToolCallStart, command_status_is_running, normalized_command_status,
 };
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{ApprovalPolicy, Mode, TurnStatus, TurnStatusKind};
@@ -43,6 +43,7 @@ pub struct CodexMapper {
     running_command_turns: HashMap<String, (ThreadId, String)>,
     running_commands: HashSet<String>,
     running_command_threads: HashMap<String, ThreadId>,
+    pending_approval_responses: HashMap<ApprovalId, PendingApprovalResponse>,
 }
 
 impl CodexMapper {
@@ -57,6 +58,7 @@ impl CodexMapper {
             running_command_turns: HashMap::new(),
             running_commands: HashSet::new(),
             running_command_threads: HashMap::new(),
+            pending_approval_responses: HashMap::new(),
         }
     }
 
@@ -166,7 +168,8 @@ impl CodexMapper {
             }) => {
                 let thread = self.resolve_thread(thread_id, fallback_thread);
                 let turn = self.resolve_turn(turn_id);
-                let (harness_item_id, kind, command) = map_thread_item_start(item, *started_at_ms);
+                let (harness_item_id, kind, command, tool) =
+                    map_thread_item_start(item, *started_at_ms);
                 let id = self.resolve_item(&harness_item_id);
                 self.track_command_start(&harness_item_id, command.as_ref(), thread, turn_id);
                 Some(AgentEvent::ItemStarted {
@@ -177,6 +180,7 @@ impl CodexMapper {
                         harness_item_id,
                         kind,
                         command,
+                        tool,
                     },
                 })
             }
@@ -530,13 +534,15 @@ impl CodexMapper {
             ServerRequest::CmdExecApproval(params) => {
                 let thread = self.resolve_thread(&params.thread_id, fallback_thread);
                 let turn = self.resolve_turn(&params.turn_id);
+                self.pending_approval_responses
+                    .insert(req_id.clone(), PendingApprovalResponse::Decision);
                 Some(AgentEvent::ApprovalRequested {
                     thread,
                     turn,
                     request: ApprovalRequest {
                         id: req_id,
                         kind: ApprovalKind::CommandExecution {
-                            command: params.command.clone().unwrap_or_default(),
+                            command: command_approval_preview(params),
                             cwd: params
                                 .cwd
                                 .as_ref()
@@ -556,6 +562,8 @@ impl CodexMapper {
             ServerRequest::FileChangeApproval(params) => {
                 let thread = self.resolve_thread(&params.thread_id, fallback_thread);
                 let turn = self.resolve_turn(&params.turn_id);
+                self.pending_approval_responses
+                    .insert(req_id.clone(), PendingApprovalResponse::Decision);
                 Some(AgentEvent::ApprovalRequested {
                     thread,
                     turn,
@@ -575,9 +583,62 @@ impl CodexMapper {
                     },
                 })
             }
+            ServerRequest::PermissionsRequestApproval(params) => {
+                let thread = self.resolve_thread(&params.thread_id, fallback_thread);
+                let turn = self.resolve_turn(&params.turn_id);
+                let permissions = serde_json::to_value(&params.permissions).unwrap_or_default();
+                self.pending_approval_responses.insert(
+                    req_id.clone(),
+                    PendingApprovalResponse::Permissions {
+                        permissions: permissions.clone(),
+                    },
+                );
+                Some(AgentEvent::ApprovalRequested {
+                    thread,
+                    turn,
+                    request: ApprovalRequest {
+                        id: req_id,
+                        kind: ApprovalKind::Permission {
+                            detail: format_permissions_detail(&permissions),
+                        },
+                        reason: params.reason.clone(),
+                        available: vec![
+                            ApprovalDecision::Accept,
+                            ApprovalDecision::AcceptForSession,
+                            ApprovalDecision::Decline,
+                            ApprovalDecision::Cancel,
+                        ],
+                    },
+                })
+            }
             _ => None,
         }
     }
+
+    pub fn map_approval_response(
+        &mut self,
+        id: &ApprovalId,
+        decision: &ApprovalDecision,
+    ) -> ApprovalResponse {
+        match self.pending_approval_responses.remove(id) {
+            Some(PendingApprovalResponse::Permissions { permissions }) => {
+                map_permissions_approval_decision(decision, permissions)
+            }
+            Some(PendingApprovalResponse::Decision) | None => {
+                ApprovalResponse::Result(map_approval_decision(decision))
+            }
+        }
+    }
+}
+
+enum PendingApprovalResponse {
+    Decision,
+    Permissions { permissions: Value },
+}
+
+pub enum ApprovalResponse {
+    Result(Value),
+    Error { code: i64, message: String },
 }
 
 // ---- Free functions ----
@@ -596,12 +657,12 @@ pub fn map_user_input(input: &giskard_core::user_input::UserInput) -> Vec<codex_
 pub fn map_mode_to_sandbox(mode: Mode) -> codex_codes::SandboxPolicy {
     match mode {
         Mode::Plan => codex_codes::SandboxPolicy::ReadOnly {
-            network_access: None,
+            network_access: Some(true),
         },
         Mode::Build => codex_codes::SandboxPolicy::WorkspaceWrite {
             exclude_slash_tmp: None,
             exclude_tmpdir_env_var: None,
-            network_access: None,
+            network_access: Some(true),
             writable_roots: None,
         },
     }
@@ -628,6 +689,55 @@ pub fn map_effort(effort: giskard_core::model::Effort) -> codex_codes::Reasoning
     codex_codes::ReasoningEffort(s.into())
 }
 
+fn map_permissions_approval_decision(
+    decision: &ApprovalDecision,
+    permissions: Value,
+) -> ApprovalResponse {
+    match decision {
+        ApprovalDecision::Accept => ApprovalResponse::Result(serde_json::json!({
+            "permissions": permissions,
+            "scope": "turn",
+        })),
+        ApprovalDecision::AcceptForSession => ApprovalResponse::Result(serde_json::json!({
+            "permissions": permissions,
+            "scope": "session",
+        })),
+        ApprovalDecision::Decline => ApprovalResponse::Error {
+            code: -32000,
+            message: "Permissions request declined.".into(),
+        },
+        ApprovalDecision::Cancel => ApprovalResponse::Error {
+            code: -32000,
+            message: "Permissions request cancelled.".into(),
+        },
+        ApprovalDecision::AcceptWithExecPolicyAmendment { .. } => ApprovalResponse::Error {
+            code: -32000,
+            message: "Exec policy amendments are not valid for permissions requests.".into(),
+        },
+    }
+}
+
+fn command_approval_preview(
+    params: &codex_codes::protocol::CommandExecutionRequestApprovalParams,
+) -> String {
+    params
+        .command_actions
+        .as_ref()
+        .and_then(|actions| actions.iter().find_map(command_action_command))
+        .or_else(|| params.command.clone())
+        .unwrap_or_default()
+}
+
+fn command_action_command(action: &codex_codes::protocol::CommandAction) -> Option<String> {
+    let command = match action {
+        codex_codes::protocol::CommandAction::Read { command, .. }
+        | codex_codes::protocol::CommandAction::ListFiles { command, .. }
+        | codex_codes::protocol::CommandAction::Search { command, .. }
+        | codex_codes::protocol::CommandAction::Unknown { command } => command,
+    };
+    (!command.trim().is_empty()).then(|| command.clone())
+}
+
 pub fn map_approval_decision(decision: &ApprovalDecision) -> Value {
     match decision {
         ApprovalDecision::Accept => serde_json::json!({"decision": "accept"}),
@@ -642,6 +752,21 @@ pub fn map_approval_decision(decision: &ApprovalDecision) -> Value {
                 "amendedExecPolicy": amendment,
             })
         }
+    }
+}
+
+fn format_permissions_detail(permissions: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(file_system) = permissions.get("fileSystem").filter(|v| !v.is_null()) {
+        parts.push(format!("fileSystem: {file_system}"));
+    }
+    if let Some(network) = permissions.get("network").filter(|v| !v.is_null()) {
+        parts.push(format!("network: {network}"));
+    }
+    if parts.is_empty() {
+        permissions.to_string()
+    } else {
+        parts.join("; ")
     }
 }
 
@@ -707,7 +832,12 @@ fn thread_item_id(item: &codex_codes::ThreadItem) -> String {
 fn map_thread_item_start(
     item: &codex_codes::ThreadItem,
     started_at_ms: i64,
-) -> (String, ItemKind, Option<CommandExecutionStart>) {
+) -> (
+    String,
+    ItemKind,
+    Option<CommandExecutionStart>,
+    Option<ToolCallStart>,
+) {
     let kind = match item {
         codex_codes::ThreadItem::UserMessage { .. } => ItemKind::UserMessage,
         codex_codes::ThreadItem::AgentMessage { .. } | codex_codes::ThreadItem::Plan { .. } => {
@@ -745,7 +875,53 @@ fn map_thread_item_start(
         }),
         _ => None,
     };
-    (thread_item_id(item), kind, command)
+    let started_at_ms = (started_at_ms > 0).then_some(started_at_ms);
+    let tool = match item {
+        codex_codes::ThreadItem::McpToolCall {
+            server,
+            tool,
+            arguments,
+            status,
+            ..
+        } => Some(ToolCallStart {
+            name: tool.clone(),
+            input: arguments.clone(),
+            server: Some(server.clone()),
+            status: Some(tool_status_string(status)),
+            started_at_ms,
+        }),
+        codex_codes::ThreadItem::DynamicToolCall {
+            tool,
+            arguments,
+            status,
+            namespace,
+            ..
+        } => Some(ToolCallStart {
+            name: tool.clone(),
+            input: arguments.clone(),
+            server: namespace.clone(),
+            status: Some(tool_status_string(status)),
+            started_at_ms,
+        }),
+        codex_codes::ThreadItem::CollabAgentToolCall {
+            tool,
+            status,
+            prompt,
+            model,
+            ..
+        } => Some(ToolCallStart {
+            name: json_display(tool),
+            input: json!({
+                "prompt": prompt,
+                "model": model,
+            }),
+            server: Some("collab-agent".into()),
+            status: Some(json_display(status)),
+            started_at_ms,
+        }),
+        _ => None,
+    };
+    (thread_item_id(item), kind, command, tool)
 }
 
 fn map_thread_item_complete(
@@ -985,6 +1161,13 @@ fn command_status_string(status: &codex_codes::CommandExecutionStatus) -> String
         codex_codes::CommandExecutionStatus::Declined => "declined",
     }
     .into()
+}
+
+fn tool_status_string<T: Serialize>(status: &T) -> String {
+    match normalized_command_status(&enum_string(status)).as_str() {
+        "inprogress" => "in_progress".into(),
+        other => other.into(),
+    }
 }
 
 /// If `notif` is a non-retryable turn error, return its composed message.
@@ -1330,6 +1513,139 @@ mod tests {
     }
 
     #[test]
+    fn build_mode_enables_workspace_network_access() {
+        match map_mode_to_sandbox(Mode::Build) {
+            codex_codes::SandboxPolicy::WorkspaceWrite { network_access, .. } => {
+                assert_eq!(network_access, Some(true));
+            }
+            other => panic!("expected workspace-write sandbox, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_mode_enables_read_only_network_access() {
+        match map_mode_to_sandbox(Mode::Plan) {
+            codex_codes::SandboxPolicy::ReadOnly { network_access } => {
+                assert_eq!(network_access, Some(true));
+            }
+            other => panic!("expected read-only sandbox, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn permissions_request_maps_to_approval_and_codex_response_shape() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let request = ServerRequest::PermissionsRequestApproval(
+            serde_json::from_value(serde_json::json!({
+                "cwd": "/tmp/project",
+                "itemId": "perm1",
+                "permissions": {
+                    "network": { "enabled": true }
+                },
+                "reason": "Need network access",
+                "threadId": "thread1",
+                "turnId": "turn1",
+                "startedAtMs": 123
+            }))
+            .unwrap(),
+        );
+        let request_id = RequestId::String("perm_req".into());
+
+        match mapper
+            .map_server_request(&request_id, &request, ThreadId::new())
+            .unwrap()
+        {
+            AgentEvent::ApprovalRequested { request, .. } => {
+                assert_eq!(request.id, ApprovalId("perm_req".into()));
+                assert!(matches!(request.kind, ApprovalKind::Permission { .. }));
+                assert_eq!(request.reason.as_deref(), Some("Need network access"));
+            }
+            other => panic!("expected permissions approval, got {other:?}"),
+        }
+
+        match mapper.map_approval_response(
+            &ApprovalId("perm_req".into()),
+            &ApprovalDecision::AcceptForSession,
+        ) {
+            ApprovalResponse::Result(result) => {
+                assert_eq!(result["permissions"]["network"]["enabled"], true);
+                assert_eq!(result["scope"], "session");
+            }
+            ApprovalResponse::Error { .. } => panic!("accept should grant requested permissions"),
+        }
+    }
+
+    #[test]
+    fn declined_permissions_request_maps_to_json_rpc_error() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let request = ServerRequest::PermissionsRequestApproval(
+            serde_json::from_value(serde_json::json!({
+                "cwd": "/tmp/project",
+                "itemId": "perm1",
+                "permissions": {
+                    "network": { "enabled": true }
+                },
+                "threadId": "thread1",
+                "turnId": "turn1",
+                "startedAtMs": 123
+            }))
+            .unwrap(),
+        );
+        let request_id = RequestId::String("perm_req".into());
+        mapper.map_server_request(&request_id, &request, ThreadId::new());
+
+        match mapper
+            .map_approval_response(&ApprovalId("perm_req".into()), &ApprovalDecision::Decline)
+        {
+            ApprovalResponse::Error { code, message } => {
+                assert_eq!(code, -32000);
+                assert!(message.contains("declined"));
+            }
+            ApprovalResponse::Result(_) => panic!("decline should use a JSON-RPC error"),
+        }
+    }
+
+    #[test]
+    fn command_approval_uses_command_actions_for_preview() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let request = ServerRequest::CmdExecApproval(
+            serde_json::from_value(serde_json::json!({
+                "commandActions": [
+                    {
+                        "type": "search",
+                        "command": "rg marmeladema tf",
+                        "path": "tf",
+                        "query": "marmeladema"
+                    }
+                ],
+                "cwd": "/tmp/project",
+                "itemId": "cmd1",
+                "threadId": "thread1",
+                "turnId": "turn1",
+                "startedAtMs": 123
+            }))
+            .unwrap(),
+        );
+
+        match mapper
+            .map_server_request(
+                &RequestId::String("cmd_req".into()),
+                &request,
+                ThreadId::new(),
+            )
+            .unwrap()
+        {
+            AgentEvent::ApprovalRequested { request, .. } => match request.kind {
+                ApprovalKind::CommandExecution { command, .. } => {
+                    assert_eq!(command, "rg marmeladema tf");
+                }
+                other => panic!("expected command approval, got {other:?}"),
+            },
+            other => panic!("expected command approval event, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn command_item_preserves_running_metadata() {
         let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
         let start = started_item(serde_json::json!({
@@ -1489,6 +1805,32 @@ mod tests {
                 other => panic!("expected tool call, got {other:?}"),
             },
             other => panic!("expected item completion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_tool_call_started_preserves_pending_tool_metadata() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let notif = started_item(serde_json::json!({
+            "type": "mcpToolCall",
+            "id": "tool1",
+            "server": "cf-tools",
+            "tool": "gitlab_get_merge_request",
+            "arguments": { "project_path": "cloudflare/iac/terraform-github-cloudflare", "mr_iid": 1534 },
+            "status": "inProgress"
+        }));
+
+        match mapper.map_notification(&notif, ThreadId::new()).unwrap() {
+            AgentEvent::ItemStarted { item, .. } => {
+                assert_eq!(item.kind, ItemKind::ToolCall);
+                let tool = item.tool.expect("tool metadata should be present");
+                assert_eq!(tool.name, "gitlab_get_merge_request");
+                assert_eq!(tool.server.as_deref(), Some("cf-tools"));
+                assert_eq!(tool.status.as_deref(), Some("in_progress"));
+                assert_eq!(tool.input["mr_iid"], 1534);
+                assert_eq!(tool.started_at_ms, Some(500));
+            }
+            other => panic!("expected item start, got {other:?}"),
         }
     }
 

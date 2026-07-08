@@ -1,5 +1,6 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use axum::{
     Router,
@@ -29,6 +30,8 @@ use crate::auth::{
     SESSION_COOKIE, auth_middleware, create_session_cookie, get_session_token_from_header,
     sign_session, verify_session,
 };
+
+const HARNESS_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn protected_routes(state: AppState) -> Router<AppState> {
     Router::new()
@@ -1250,10 +1253,17 @@ async fn handle_client_msg(
                 .map_err(|e| WsError::from_harness(e, "approval_decision", None))?;
         }
         ClientMessage::Interrupt { thread_id } => {
-            state
-                .registry
-                .interrupt(thread_id)
+            tokio::time::timeout(HARNESS_CONTROL_TIMEOUT, state.registry.interrupt(thread_id))
                 .await
+                .map_err(|_| {
+                    WsError::from_harness(
+                        HarnessError::Timeout(
+                            "interrupt request timed out waiting for Codex".into(),
+                        ),
+                        "interrupt",
+                        Some(thread_id),
+                    )
+                })?
                 .map_err(|e| WsError::from_harness(e, "interrupt", Some(thread_id)))?;
         }
         ClientMessage::TerminateCommand {
@@ -1272,11 +1282,17 @@ async fn handle_client_msg(
             {
                 broadcast_running_commands(state, thread_id).await;
             }
-            if let Err(error) = state
-                .registry
-                .terminate_command(thread_id, process_id)
-                .await
-            {
+            let terminate_result = tokio::time::timeout(
+                HARNESS_CONTROL_TIMEOUT,
+                state.registry.terminate_command(thread_id, process_id),
+            )
+            .await
+            .map_err(|_| {
+                HarnessError::Timeout(
+                    "terminate command request timed out waiting for Codex".into(),
+                )
+            });
+            if let Err(error) = terminate_result.and_then(|result| result) {
                 if harness_error_means_no_active_command(&error)
                     && existing_command
                         .as_ref()

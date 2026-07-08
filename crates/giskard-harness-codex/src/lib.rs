@@ -323,7 +323,7 @@ async fn background_task(
                         decision,
                         response,
                     }) => {
-                        let result = handle_respond(&mut client, &id, &decision).await;
+                        let result = handle_respond(&mut client, &mut mapper, &id, &decision).await;
                         let _ = response.send(result);
                     }
                     Some(ControlCommand::Interrupt { thread, response }) => {
@@ -373,6 +373,19 @@ async fn handle_idle_server_message(
             if let Some(event) = event {
                 let thread = event_thread(&event);
                 let _ = broadcast_event(senders, thread, || event).await;
+            } else {
+                if let Err(error) =
+                    reject_unsupported_server_request(client, senders, fallback_thread, id, request)
+                        .await
+                {
+                    let _ = broadcast_event(senders, fallback_thread, || AgentEvent::Error {
+                        thread: fallback_thread,
+                        turn: None,
+                        error,
+                    })
+                    .await;
+                }
+                return StreamOutcome::TurnEnded;
             }
 
             loop {
@@ -382,7 +395,7 @@ async fn handle_idle_server_message(
                         decision,
                         response,
                     }) => {
-                        let result = handle_respond(client, &resp_id, &decision).await;
+                        let result = handle_respond(client, mapper, &resp_id, &decision).await;
                         let _ = response.send(result);
                         return StreamOutcome::TurnEnded;
                     }
@@ -639,6 +652,19 @@ async fn stream_turn_events(
                 let event = mapper.map_server_request(&id, &request, thread_id);
                 if let Some(event) = event {
                     let _ = broadcast_event(senders, thread_id, || event).await;
+                } else {
+                    if let Err(error) =
+                        reject_unsupported_server_request(client, senders, thread_id, id, request)
+                            .await
+                    {
+                        let _ = broadcast_event(senders, thread_id, || AgentEvent::Error {
+                            thread: thread_id,
+                            turn: None,
+                            error,
+                        })
+                        .await;
+                    }
+                    continue;
                 }
 
                 // Wait for the user's approval response. Normal harness commands keep queuing on
@@ -650,7 +676,7 @@ async fn stream_turn_events(
                             decision,
                             response,
                         }) => {
-                            let result = handle_respond(client, &resp_id, &decision).await;
+                            let result = handle_respond(client, mapper, &resp_id, &decision).await;
                             let _ = response.send(result);
                             break;
                         }
@@ -692,7 +718,7 @@ enum StreamControlOutcome {
 
 async fn handle_stream_control(
     client: &mut codex_codes::AsyncClient,
-    mapper: &CodexMapper,
+    mapper: &mut CodexMapper,
     control: Option<ControlCommand>,
 ) -> StreamControlOutcome {
     match control {
@@ -701,7 +727,7 @@ async fn handle_stream_control(
             decision,
             response,
         }) => {
-            let result = handle_respond(client, &id, &decision).await;
+            let result = handle_respond(client, mapper, &id, &decision).await;
             let _ = response.send(result);
             StreamControlOutcome::Continue
         }
@@ -772,15 +798,97 @@ async fn emit_incomplete_turn(
 
 async fn handle_respond(
     client: &mut codex_codes::AsyncClient,
+    mapper: &mut CodexMapper,
     id: &ApprovalId,
     decision: &ApprovalDecision,
 ) -> Result<(), HarnessError> {
-    let response_json = mapping::map_approval_decision(decision);
     let request_id = codex_codes::jsonrpc::RequestId::String(id.0.clone());
-    client
-        .respond(request_id, &response_json)
-        .await
-        .map_err(|e| HarnessError::Transport(e.to_string()))
+    match mapper.map_approval_response(id, decision) {
+        mapping::ApprovalResponse::Result(response_json) => client
+            .respond(request_id, &response_json)
+            .await
+            .map_err(|e| HarnessError::Transport(e.to_string())),
+        mapping::ApprovalResponse::Error { code, message } => client
+            .respond_error(request_id, code, &message)
+            .await
+            .map_err(|e| HarnessError::Transport(e.to_string())),
+    }
+}
+
+async fn reject_unsupported_server_request(
+    client: &mut codex_codes::AsyncClient,
+    senders: &SenderMap,
+    thread: ThreadId,
+    id: codex_codes::jsonrpc::RequestId,
+    request: codex_codes::messages::ServerRequest,
+) -> Result<(), HarnessError> {
+    let message = unsupported_server_request_message(&request);
+    let event_message = message.clone();
+    let _ = broadcast_event(senders, thread, || AgentEvent::Error {
+        thread,
+        turn: None,
+        error: HarnessError::Unsupported(event_message),
+    })
+    .await;
+
+    match unsupported_server_request_response(&request) {
+        UnsupportedRequestResponse::Result(result) => client
+            .respond(id, &result)
+            .await
+            .map_err(|e| HarnessError::Transport(e.to_string())),
+        UnsupportedRequestResponse::Error { code, message } => client
+            .respond_error(id, code, &message)
+            .await
+            .map_err(|e| HarnessError::Transport(e.to_string())),
+    }
+}
+
+enum UnsupportedRequestResponse {
+    Result(serde_json::Value),
+    Error { code: i64, message: String },
+}
+
+fn unsupported_server_request_response(
+    request: &codex_codes::messages::ServerRequest,
+) -> UnsupportedRequestResponse {
+    let message = unsupported_server_request_message(request);
+    match request {
+        codex_codes::messages::ServerRequest::ItemToolCall(_) => {
+            UnsupportedRequestResponse::Result(serde_json::json!({
+                "success": false,
+                "contentItems": [
+                    {
+                        "type": "inputText",
+                        "text": message,
+                    }
+                ],
+            }))
+        }
+        _ => UnsupportedRequestResponse::Error {
+            code: -32000,
+            message,
+        },
+    }
+}
+
+fn unsupported_server_request_message(request: &codex_codes::messages::ServerRequest) -> String {
+    match request {
+        codex_codes::messages::ServerRequest::ItemToolCall(params) => {
+            let prefix = params
+                .namespace
+                .as_ref()
+                .map(|namespace| format!("{namespace}:"))
+                .unwrap_or_default();
+            format!(
+                "Giskard cannot execute client-side tool call `{prefix}{}` yet.",
+                params.tool
+            )
+        }
+        other => format!(
+            "Giskard cannot handle Codex server request `{}` yet.",
+            other.method()
+        ),
+    }
 }
 
 async fn handle_interrupt(
@@ -825,4 +933,61 @@ async fn handle_interrupt_turn(
         .await
         .map_err(|e| HarnessError::Transport(e.to_string()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn item_tool_call_gets_schema_shaped_failure_response() {
+        let request = codex_codes::messages::ServerRequest::ItemToolCall(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "thread_1",
+                "turnId": "turn_1",
+                "callId": "call_1",
+                "namespace": "mcp__cf_mcp",
+                "tool": "gitlab_get_mr_changes",
+                "arguments": {
+                    "project_path": "cloudflare/iac/terraform-github-cloudflare",
+                    "mr_iid": 1534
+                }
+            }))
+            .unwrap(),
+        );
+
+        match unsupported_server_request_response(&request) {
+            UnsupportedRequestResponse::Result(result) => {
+                assert_eq!(result["success"], false);
+                assert_eq!(result["contentItems"][0]["type"], "inputText");
+                assert!(
+                    result["contentItems"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("mcp__cf_mcp:gitlab_get_mr_changes")
+                );
+            }
+            UnsupportedRequestResponse::Error { .. } => {
+                panic!("dynamic tool calls should use a tool failure result")
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_non_tool_request_gets_json_rpc_error_response() {
+        let request = codex_codes::messages::ServerRequest::Unknown {
+            method: "future/request".into(),
+            params: None,
+        };
+
+        match unsupported_server_request_response(&request) {
+            UnsupportedRequestResponse::Error { code, message } => {
+                assert_eq!(code, -32000);
+                assert!(message.contains("future/request"));
+            }
+            UnsupportedRequestResponse::Result(_) => {
+                panic!("non-tool server requests should use a JSON-RPC error")
+            }
+        }
+    }
 }

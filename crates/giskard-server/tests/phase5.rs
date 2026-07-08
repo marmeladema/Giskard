@@ -49,6 +49,7 @@ fn make_fixture() -> ReplayFixture {
                 harness_item_id: "it_1".into(),
                 kind: ItemKind::AgentMessage,
                 command: None,
+                tool: None,
             },
         },
         AgentEvent::ItemCompleted {
