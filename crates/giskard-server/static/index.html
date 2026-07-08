@@ -746,7 +746,7 @@ function handleServer(msg) {
       if (msg.action==="send_input" && state.pendingUserEl) {
         failPendingUserMessage(null);
       }
-      if (msg.action==="terminate_command") resetTerminatingCommands();
+      if (msg.action==="terminate_command") resetTerminatingCommand(msg.process_id);
       notice(msg.message||"error", msg.severity||"error");
       break;
   }
@@ -1360,9 +1360,12 @@ function terminateCommand(id) {
     notice(`Terminate not sent: WebSocket is ${state.wsStatus}.`, "error");
   }
 }
-function resetTerminatingCommands() {
+function resetTerminatingCommand(processId) {
   for (const cmd of state.runningCommands.values()) {
     if (!cmd.terminating) continue;
+    // Scope the optimistic rollback to the command the failed request targeted. Only fall back
+    // to clearing every pending stop request when the server didn't identify a process id.
+    if (processId && cmd.processId !== processId) continue;
     cmd.terminating = false;
     state.commandStopRequestedByItemId.delete(cmd.id);
     const body = commandBodyFor(cmd.id);

@@ -13,7 +13,7 @@ use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ThreadId, TurnId};
 use giskard_core::item::{
     CommandExecutionStart, FileChangeEntry, FileChangeKind, Item, ItemDelta, ItemKind, ItemPayload,
-    ItemStart,
+    ItemStart, command_status_is_running,
 };
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{ApprovalPolicy, Mode, TurnStatus, TurnStatusKind};
@@ -985,13 +985,6 @@ fn command_status_string(status: &codex_codes::CommandExecutionStatus) -> String
         codex_codes::CommandExecutionStatus::Declined => "declined",
     }
     .into()
-}
-
-fn command_status_is_running(status: &str) -> bool {
-    matches!(
-        status.to_ascii_lowercase().replace('-', "_").as_str(),
-        "in_progress" | "inprogress" | "running"
-    )
 }
 
 /// If `notif` is a non-retryable turn error, return its composed message.

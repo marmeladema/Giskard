@@ -6,7 +6,7 @@ use tokio::sync::Mutex;
 
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ItemId, ThreadId};
-use giskard_core::item::{ItemDelta, ItemPayload};
+use giskard_core::item::{ItemDelta, ItemPayload, command_status_is_running};
 use giskard_proto::RunningCommand;
 
 const MAX_OUTPUT_TAIL: usize = 8_000;
@@ -215,13 +215,6 @@ impl RunningCommandStore {
         snapshot.sort_by_key(|cmd| (cmd.turn_id.to_string(), cmd.item_id.to_string()));
         snapshot
     }
-}
-
-fn command_status_is_running(status: &str) -> bool {
-    matches!(
-        status.to_ascii_lowercase().replace('-', "_").as_str(),
-        "in_progress" | "inprogress" | "running"
-    )
 }
 
 fn path_to_display(path: &Path) -> String {

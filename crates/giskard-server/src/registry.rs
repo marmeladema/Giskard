@@ -10,7 +10,7 @@ use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ThreadId, TurnId};
-use giskard_core::item::{Item, ItemPayload};
+use giskard_core::item::{Item, ItemPayload, command_status_is_running, normalized_command_status};
 use giskard_core::model::ModelRef;
 use giskard_core::turn::{Mode, Turn, TurnOverrides, TurnStatusKind};
 use giskard_core::user_input::UserInput;
@@ -525,22 +525,11 @@ fn is_terminal_command_completion(event: &AgentEvent) -> bool {
         .unwrap_or(false)
 }
 
-fn command_status_is_running(status: &str) -> bool {
-    matches!(
-        normalized_command_status(status).as_str(),
-        "in_progress" | "inprogress" | "running"
-    )
-}
-
 fn command_completion_is_normal_success(status: &str, exit_code: Option<i32>) -> bool {
     matches!(
         normalized_command_status(status).as_str(),
         "completed" | "succeeded" | "success"
     ) && exit_code == Some(0)
-}
-
-fn normalized_command_status(status: &str) -> String {
-    status.to_ascii_lowercase().replace('-', "_")
 }
 
 fn should_skip_duplicate_item(

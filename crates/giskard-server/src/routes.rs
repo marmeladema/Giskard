@@ -727,6 +727,7 @@ impl WsError {
                 detail: None,
                 thread_id: None,
                 action: None,
+                process_id: None,
             },
         }
     }
@@ -743,6 +744,11 @@ impl WsError {
 
     fn action(mut self, action: impl Into<String>) -> Self {
         self.info.action = Some(action.into());
+        self
+    }
+
+    fn process_id(mut self, process_id: impl Into<String>) -> Self {
+        self.info.process_id = Some(process_id.into());
         self
     }
 
@@ -820,6 +826,7 @@ fn warning_info(
         detail,
         thread_id: Some(thread_id),
         action: Some(action.to_string()),
+        process_id: None,
     }
 }
 
@@ -1268,11 +1275,10 @@ async fn handle_client_msg(
                 {
                     broadcast_running_commands(state, thread_id).await;
                 }
-                return Err(WsError::from_harness(
-                    error,
-                    "terminate_command",
-                    Some(thread_id),
-                ));
+                return Err(
+                    WsError::from_harness(error, "terminate_command", Some(thread_id))
+                        .process_id(process_id_for_state),
+                );
             }
         }
         ClientMessage::SavePlan { thread_id, path } => {
