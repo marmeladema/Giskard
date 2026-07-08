@@ -823,6 +823,12 @@ fn warning_info(
     }
 }
 
+fn harness_error_means_no_active_command(error: &HarnessError) -> bool {
+    matches!(error, HarnessError::Transport(message) if message
+        .to_ascii_lowercase()
+        .contains("no active command/exec for process id"))
+}
+
 async fn handle_ws(socket: WebSocket, state: AppState) {
     let (tx, mut rx) = mpsc::channel::<ServerMessage>(256);
     let client_id = state.hub.next_client_id();
@@ -966,6 +972,14 @@ async fn handle_client_msg(
             if let Some(snap) = state.live_buffers.snapshot(thread_id).await {
                 let _ = tx.send(ServerMessage::LiveTurnSnapshot(snap)).await;
             }
+
+            let commands = state.running_commands.snapshot(thread_id).await;
+            let _ = tx
+                .send(ServerMessage::RunningCommands {
+                    thread_id,
+                    commands,
+                })
+                .await;
         }
         ClientMessage::LoadHistory {
             thread_id,
@@ -1209,6 +1223,57 @@ async fn handle_client_msg(
                 .interrupt(thread_id)
                 .await
                 .map_err(|e| WsError::from_harness(e, "interrupt", Some(thread_id)))?;
+        }
+        ClientMessage::TerminateCommand {
+            thread_id,
+            process_id,
+        } => {
+            let process_id_for_state = process_id.clone();
+            let existing_command = state
+                .running_commands
+                .get_by_process(thread_id, &process_id_for_state)
+                .await;
+            if state
+                .running_commands
+                .set_terminating_by_process(thread_id, &process_id_for_state, true)
+                .await
+            {
+                broadcast_running_commands(state, thread_id).await;
+            }
+            if let Err(error) = state
+                .registry
+                .terminate_command(thread_id, process_id)
+                .await
+            {
+                if harness_error_means_no_active_command(&error)
+                    && existing_command
+                        .as_ref()
+                        .map(|cmd| cmd.after_turn)
+                        .unwrap_or(false)
+                {
+                    if state
+                        .running_commands
+                        .remove_by_process(thread_id, &process_id_for_state)
+                        .await
+                    {
+                        broadcast_running_commands(state, thread_id).await;
+                    }
+                    return Ok(());
+                }
+
+                if state
+                    .running_commands
+                    .set_terminating_by_process(thread_id, &process_id_for_state, false)
+                    .await
+                {
+                    broadcast_running_commands(state, thread_id).await;
+                }
+                return Err(WsError::from_harness(
+                    error,
+                    "terminate_command",
+                    Some(thread_id),
+                ));
+            }
         }
         ClientMessage::SavePlan { thread_id, path } => {
             match save_plan(state, thread_id, &path).await {
@@ -1456,6 +1521,20 @@ async fn broadcast_thread_state(
                 thread_id,
                 state: value,
             }),
+        )
+        .await;
+}
+
+async fn broadcast_running_commands(state: &AppState, thread_id: ThreadId) {
+    let commands = state.running_commands.snapshot(thread_id).await;
+    state
+        .hub
+        .broadcast(
+            thread_id,
+            ServerMessage::RunningCommands {
+                thread_id,
+                commands,
+            },
         )
         .await;
 }

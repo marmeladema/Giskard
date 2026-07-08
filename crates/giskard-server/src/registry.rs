@@ -10,19 +10,20 @@ use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ThreadId, TurnId};
-use giskard_core::item::Item;
+use giskard_core::item::{Item, ItemPayload};
 use giskard_core::model::ModelRef;
 use giskard_core::turn::{Mode, Turn, TurnOverrides, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{AgentHarness, OpenThreadOptions, ThreadHandle};
 use giskard_persist::PersistStore;
 use giskard_persist::store::ProjectConfig;
-use giskard_proto::{ServerMessage, TokenScope};
+use giskard_proto::{RunningCommand, ServerMessage, TokenScope};
 
 use crate::hub::Hub;
 use crate::ledger::LedgerHandle;
 use crate::live_buffer::LiveBufferStore;
 use crate::models::context_window_for;
+use crate::running_commands::RunningCommandStore;
 
 #[async_trait]
 pub trait HarnessFactory: Send + Sync {
@@ -50,6 +51,7 @@ pub struct HarnessRegistry {
     factory: Arc<dyn HarnessFactory>,
     hub: Arc<Hub>,
     live_buffers: Arc<LiveBufferStore>,
+    running_commands: Arc<RunningCommandStore>,
     store: Arc<PersistStore>,
     ledger: LedgerHandle,
 }
@@ -59,6 +61,7 @@ impl HarnessRegistry {
         factory: Arc<dyn HarnessFactory>,
         hub: Arc<Hub>,
         live_buffers: Arc<LiveBufferStore>,
+        running_commands: Arc<RunningCommandStore>,
         store: Arc<PersistStore>,
         ledger: LedgerHandle,
     ) -> Self {
@@ -69,6 +72,7 @@ impl HarnessRegistry {
             factory,
             hub,
             live_buffers,
+            running_commands,
             store,
             ledger,
         }
@@ -166,6 +170,7 @@ impl HarnessRegistry {
 
         let hub = self.hub.clone();
         let live_buffers = self.live_buffers.clone();
+        let running_commands = self.running_commands.clone();
         let store = self.store.clone();
         let approvals_map = self.approvals.clone();
         let ledger = self.ledger.clone();
@@ -180,6 +185,7 @@ impl HarnessRegistry {
                 stream,
                 hub,
                 live_buffers,
+                running_commands,
                 store,
                 approvals_map,
                 ledger,
@@ -243,6 +249,29 @@ impl HarnessRegistry {
         harness.interrupt(&handle).await
     }
 
+    pub async fn terminate_command(
+        &self,
+        thread_id: ThreadId,
+        process_id: String,
+    ) -> Result<(), HarnessError> {
+        let handle = self
+            .get_thread_handle(thread_id)
+            .await
+            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+        let project_id = self
+            .get_project_for_thread(thread_id)
+            .await
+            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+        let harness = self
+            .harnesses
+            .lock()
+            .await
+            .get(&project_id)
+            .cloned()
+            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+        harness.terminate_command(&handle, &process_id).await
+    }
+
     pub async fn get_thread_handle(&self, thread_id: ThreadId) -> Option<ThreadHandle> {
         let threads = self.threads.lock().await;
         threads.get(&thread_id).map(|(_, h)| h.clone())
@@ -261,6 +290,7 @@ async fn forward_events(
     mut stream: giskard_harness::AgentEventStream,
     hub: Arc<Hub>,
     live_buffers: Arc<LiveBufferStore>,
+    running_commands: Arc<RunningCommandStore>,
     store: Arc<PersistStore>,
     approvals: ApprovalMap,
     ledger: LedgerHandle,
@@ -279,6 +309,14 @@ async fn forward_events(
             Ok(event) => {
                 if let Some(turn) = event_turn_id(&event) {
                     if seen_turn_ids.contains(&turn) {
+                        let command_state_changed =
+                            apply_running_command_event(&running_commands, &event).await;
+                        if command_state_changed {
+                            if is_terminal_command_completion(&event) {
+                                hub.broadcast_event(thread_id, event).await;
+                            }
+                            broadcast_running_commands(&hub, &running_commands, thread_id).await;
+                        }
                         continue;
                     }
                 }
@@ -289,6 +327,9 @@ async fn forward_events(
                 ) {
                     continue;
                 }
+
+                let command_state_changed =
+                    apply_running_command_event(&running_commands, &event).await;
 
                 match &event {
                     AgentEvent::TurnStarted { turn, .. } => {
@@ -331,6 +372,10 @@ async fn forward_events(
                 }
 
                 hub.broadcast_event(thread_id, event).await;
+
+                if command_state_changed {
+                    broadcast_running_commands(&hub, &running_commands, thread_id).await;
+                }
 
                 if let Some((completed_turn, usage, status)) = completed {
                     let tid = turn_id.unwrap_or(completed_turn);
@@ -379,6 +424,123 @@ fn event_turn_id(event: &AgentEvent) -> Option<TurnId> {
             turn: Some(turn), ..
         } => Some(*turn),
     }
+}
+
+async fn apply_running_command_event(
+    running_commands: &RunningCommandStore,
+    event: &AgentEvent,
+) -> bool {
+    let command_before_completion =
+        terminating_command_before_terminal_completion(running_commands, event).await;
+    let changed = running_commands.apply_event(event).await;
+    log_command_completion_after_terminate(command_before_completion.as_ref(), event);
+    changed
+}
+
+async fn terminating_command_before_terminal_completion(
+    running_commands: &RunningCommandStore,
+    event: &AgentEvent,
+) -> Option<RunningCommand> {
+    let AgentEvent::ItemCompleted { thread, item, .. } = event else {
+        return None;
+    };
+    let ItemPayload::CommandExecution { status, .. } = &item.payload else {
+        return None;
+    };
+    if status
+        .as_deref()
+        .map(command_status_is_running)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let command = running_commands.get_by_item(*thread, item.id).await?;
+    command.terminating.then_some(command)
+}
+
+fn log_command_completion_after_terminate(command: Option<&RunningCommand>, event: &AgentEvent) {
+    let Some(command) = command else {
+        return;
+    };
+    let AgentEvent::ItemCompleted { thread, turn, item } = event else {
+        return;
+    };
+    let ItemPayload::CommandExecution {
+        status,
+        exit_code,
+        duration_ms,
+        ..
+    } = &item.payload
+    else {
+        return;
+    };
+    let Some(status) = status else {
+        return;
+    };
+    if !command_completion_is_normal_success(status, *exit_code) {
+        return;
+    }
+
+    warn!(
+        thread_id = %thread,
+        turn_id = %turn,
+        item_id = %item.id,
+        harness_item_id = %item.harness_item_id,
+        process_id = ?command.process_id,
+        command = %command.command,
+        status = %status,
+        exit_code = ?exit_code,
+        duration_ms = ?duration_ms,
+        "command completed normally after stop request; Codex did not terminate the process"
+    );
+}
+
+async fn broadcast_running_commands(
+    hub: &Hub,
+    running_commands: &RunningCommandStore,
+    thread_id: ThreadId,
+) {
+    let commands = running_commands.snapshot(thread_id).await;
+    hub.broadcast(
+        thread_id,
+        ServerMessage::RunningCommands {
+            thread_id,
+            commands,
+        },
+    )
+    .await;
+}
+
+fn is_terminal_command_completion(event: &AgentEvent) -> bool {
+    let AgentEvent::ItemCompleted { item, .. } = event else {
+        return false;
+    };
+    let ItemPayload::CommandExecution { status, .. } = &item.payload else {
+        return false;
+    };
+    !status
+        .as_deref()
+        .map(command_status_is_running)
+        .unwrap_or(false)
+}
+
+fn command_status_is_running(status: &str) -> bool {
+    matches!(
+        normalized_command_status(status).as_str(),
+        "in_progress" | "inprogress" | "running"
+    )
+}
+
+fn command_completion_is_normal_success(status: &str, exit_code: Option<i32>) -> bool {
+    matches!(
+        normalized_command_status(status).as_str(),
+        "completed" | "succeeded" | "success"
+    ) && exit_code == Some(0)
+}
+
+fn normalized_command_status(status: &str) -> String {
+    status.to_ascii_lowercase().replace('-', "_")
 }
 
 fn should_skip_duplicate_item(
@@ -522,5 +684,34 @@ async fn persist_turn(
             },
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{command_completion_is_normal_success, command_status_is_running};
+
+    #[test]
+    fn command_completion_success_requires_success_status_and_zero_exit() {
+        assert!(command_completion_is_normal_success("completed", Some(0)));
+        assert!(command_completion_is_normal_success("succeeded", Some(0)));
+        assert!(command_completion_is_normal_success("success", Some(0)));
+
+        assert!(!command_completion_is_normal_success(
+            "completed",
+            Some(143)
+        ));
+        assert!(!command_completion_is_normal_success("failed", Some(0)));
+        assert!(!command_completion_is_normal_success("interrupted", None));
+    }
+
+    #[test]
+    fn command_status_running_accepts_codex_variants() {
+        assert!(command_status_is_running("in_progress"));
+        assert!(command_status_is_running("in-progress"));
+        assert!(command_status_is_running("running"));
+
+        assert!(!command_status_is_running("completed"));
+        assert!(!command_status_is_running("interrupted"));
     }
 }

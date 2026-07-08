@@ -1,6 +1,6 @@
 //! Mapping between `codex-codes` types and `giskard-core` types (spec §4.6).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use chrono::Utc;
@@ -12,7 +12,8 @@ use giskard_core::diff::{DiffHunk, DiffLine, FileDiff};
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ThreadId, TurnId};
 use giskard_core::item::{
-    FileChangeEntry, FileChangeKind, Item, ItemDelta, ItemKind, ItemPayload, ItemStart,
+    CommandExecutionStart, FileChangeEntry, FileChangeKind, Item, ItemDelta, ItemKind, ItemPayload,
+    ItemStart,
 };
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{ApprovalPolicy, Mode, TurnStatus, TurnStatusKind};
@@ -38,6 +39,10 @@ pub struct CodexMapper {
     /// `thread/tokenUsage/updated` notification (not on `turn/completed`), so we cache the most
     /// recent value per turn and attach it when the turn completes (spec §10.1).
     turn_usage: HashMap<String, TokenUsage>,
+    active_turns: HashMap<ThreadId, String>,
+    running_command_turns: HashMap<String, (ThreadId, String)>,
+    running_commands: HashSet<String>,
+    running_command_threads: HashMap<String, ThreadId>,
 }
 
 impl CodexMapper {
@@ -48,7 +53,30 @@ impl CodexMapper {
             turn_ids: HashMap::new(),
             item_ids: HashMap::new(),
             turn_usage: HashMap::new(),
+            active_turns: HashMap::new(),
+            running_command_turns: HashMap::new(),
+            running_commands: HashSet::new(),
+            running_command_threads: HashMap::new(),
         }
+    }
+
+    pub fn has_running_commands(&self) -> bool {
+        !self.running_commands.is_empty()
+    }
+
+    pub fn running_command_fallback_thread(&self) -> Option<ThreadId> {
+        self.running_command_threads.values().next().copied()
+    }
+
+    pub fn active_native_turn_for_thread(&self, thread: ThreadId) -> Option<&str> {
+        self.active_turns.get(&thread).map(String::as_str)
+    }
+
+    pub fn native_turn_for_process(&self, thread: ThreadId, process_id: &str) -> Option<&str> {
+        self.running_command_turns
+            .get(process_id)
+            .filter(|(owner_thread, _)| *owner_thread == thread)
+            .map(|(_, turn_id)| turn_id.as_str())
     }
 
     /// B4: bind a native thread id to its owned `ThreadId`. Called at `open_thread` for both fresh
@@ -90,6 +118,7 @@ impl CodexMapper {
         match notif {
             Notification::TurnStarted(TurnStartedNotification { thread_id, turn }) => {
                 let thread = self.resolve_thread(thread_id, fallback_thread);
+                self.active_turns.insert(thread, turn.id.clone());
                 Some(AgentEvent::TurnStarted {
                     thread,
                     turn: self.resolve_turn(&turn.id),
@@ -98,6 +127,14 @@ impl CodexMapper {
 
             Notification::TurnCompleted(TurnCompletedNotification { thread_id, turn }) => {
                 let thread = self.resolve_thread(thread_id, fallback_thread);
+                if self
+                    .active_turns
+                    .get(&thread)
+                    .map(|active| active == &turn.id)
+                    .unwrap_or(false)
+                {
+                    self.active_turns.remove(&thread);
+                }
                 // Attach the usage cached from the last `thread/tokenUsage/updated` for this turn
                 // (spec §10.1). Defaults to zero if Codex sent no usage update for the turn.
                 let usage = self.turn_usage.remove(&turn.id).unwrap_or_default();
@@ -122,14 +159,16 @@ impl CodexMapper {
 
             Notification::ItemStarted(ItemStartedNotification {
                 item,
+                started_at_ms,
                 thread_id,
                 turn_id,
                 ..
             }) => {
                 let thread = self.resolve_thread(thread_id, fallback_thread);
                 let turn = self.resolve_turn(turn_id);
-                let (harness_item_id, kind) = map_thread_item_start(item);
+                let (harness_item_id, kind, command) = map_thread_item_start(item, *started_at_ms);
                 let id = self.resolve_item(&harness_item_id);
+                self.track_command_start(&harness_item_id, command.as_ref(), thread, turn_id);
                 Some(AgentEvent::ItemStarted {
                     thread,
                     turn,
@@ -137,6 +176,7 @@ impl CodexMapper {
                         id,
                         harness_item_id,
                         kind,
+                        command,
                     },
                 })
             }
@@ -153,6 +193,7 @@ impl CodexMapper {
                 let id = self.resolve_item(&harness_item_id);
                 let giskard_item =
                     map_thread_item_complete(item, id, harness_item_id, *completed_at_ms);
+                self.track_completed_item(&giskard_item, thread);
                 Some(AgentEvent::ItemCompleted {
                     thread,
                     turn,
@@ -364,6 +405,63 @@ impl CodexMapper {
             }),
 
             _ => None,
+        }
+    }
+
+    fn track_command_start(
+        &mut self,
+        harness_item_id: &str,
+        command: Option<&CommandExecutionStart>,
+        thread: ThreadId,
+        native_turn_id: &str,
+    ) {
+        let Some(command) = command else {
+            return;
+        };
+        if command
+            .status
+            .as_deref()
+            .map(command_status_is_running)
+            .unwrap_or(true)
+        {
+            self.running_commands.insert(harness_item_id.to_owned());
+            self.running_command_threads
+                .insert(harness_item_id.to_owned(), thread);
+            if let Some(process_id) = &command.process_id {
+                let turn_id = if native_turn_id.is_empty() {
+                    self.active_turns.get(&thread).cloned().unwrap_or_default()
+                } else {
+                    native_turn_id.to_owned()
+                };
+                if !turn_id.is_empty() {
+                    self.running_command_turns
+                        .insert(process_id.clone(), (thread, turn_id));
+                }
+            }
+        }
+    }
+
+    fn track_completed_item(&mut self, item: &Item, thread: ThreadId) {
+        let ItemPayload::CommandExecution {
+            status, process_id, ..
+        } = &item.payload
+        else {
+            return;
+        };
+        if status
+            .as_deref()
+            .map(command_status_is_running)
+            .unwrap_or(false)
+        {
+            self.running_commands.insert(item.harness_item_id.clone());
+            self.running_command_threads
+                .insert(item.harness_item_id.clone(), thread);
+        } else {
+            self.running_commands.remove(&item.harness_item_id);
+            self.running_command_threads.remove(&item.harness_item_id);
+            if let Some(process_id) = process_id {
+                self.running_command_turns.remove(process_id);
+            }
         }
     }
 
@@ -605,8 +703,11 @@ fn thread_item_id(item: &codex_codes::ThreadItem) -> String {
     }
 }
 
-/// Returns the native item id + Giskard `ItemKind` for an item at `item/started`.
-fn map_thread_item_start(item: &codex_codes::ThreadItem) -> (String, ItemKind) {
+/// Returns the native item id, Giskard `ItemKind`, and any start-time metadata for an item.
+fn map_thread_item_start(
+    item: &codex_codes::ThreadItem,
+    started_at_ms: i64,
+) -> (String, ItemKind, Option<CommandExecutionStart>) {
     let kind = match item {
         codex_codes::ThreadItem::UserMessage { .. } => ItemKind::UserMessage,
         codex_codes::ThreadItem::AgentMessage { .. } | codex_codes::ThreadItem::Plan { .. } => {
@@ -628,7 +729,23 @@ fn map_thread_item_start(item: &codex_codes::ThreadItem) -> (String, ItemKind) {
         | codex_codes::ThreadItem::ExitedReviewMode { .. }
         | codex_codes::ThreadItem::ContextCompaction { .. } => ItemKind::Activity,
     };
-    (thread_item_id(item), kind)
+    let command = match item {
+        codex_codes::ThreadItem::CommandExecution {
+            command,
+            cwd,
+            process_id,
+            status,
+            ..
+        } => Some(CommandExecutionStart {
+            command: command.clone(),
+            cwd: json_display(cwd),
+            status: Some(command_status_string(status)),
+            process_id: process_id.clone(),
+            started_at_ms: (started_at_ms > 0).then_some(started_at_ms),
+        }),
+        _ => None,
+    };
+    (thread_item_id(item), kind, command)
 }
 
 fn map_thread_item_complete(
@@ -670,6 +787,9 @@ fn map_thread_item_complete(
             cwd,
             aggregated_output,
             exit_code,
+            process_id,
+            status,
+            duration_ms,
             ..
         } => {
             let output = aggregated_output.clone().unwrap_or_default();
@@ -679,6 +799,9 @@ fn map_thread_item_complete(
                 cwd: path_from_json_value(cwd),
                 output,
                 exit_code: exit,
+                status: Some(command_status_string(status)),
+                process_id: process_id.clone(),
+                duration_ms: *duration_ms,
             }
         }
         codex_codes::ThreadItem::FileChange {
@@ -852,6 +975,23 @@ fn enum_string<T: Serialize>(value: &T) -> String {
             other => other.to_string(),
         })
         .unwrap_or_else(|| "unknown".into())
+}
+
+fn command_status_string(status: &codex_codes::CommandExecutionStatus) -> String {
+    match status {
+        codex_codes::CommandExecutionStatus::InProgress => "in_progress",
+        codex_codes::CommandExecutionStatus::Completed => "completed",
+        codex_codes::CommandExecutionStatus::Failed => "failed",
+        codex_codes::CommandExecutionStatus::Declined => "declined",
+    }
+    .into()
+}
+
+fn command_status_is_running(status: &str) -> bool {
+    matches!(
+        status.to_ascii_lowercase().replace('-', "_").as_str(),
+        "in_progress" | "inprogress" | "running"
+    )
 }
 
 /// If `notif` is a non-retryable turn error, return its composed message.
@@ -1072,6 +1212,42 @@ mod tests {
         )
     }
 
+    fn started_item(item: Value) -> Notification {
+        started_item_in_turn(item, "t1")
+    }
+
+    fn started_item_in_turn(item: Value, turn_id: &str) -> Notification {
+        Notification::ItemStarted(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "th1",
+                "turnId": turn_id,
+                "startedAtMs": 500,
+                "item": item,
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn turn_started(turn_id: &str) -> Notification {
+        Notification::TurnStarted(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "th1",
+                "turn": { "id": turn_id, "status": "inProgress" }
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn turn_completed(turn_id: &str) -> Notification {
+        Notification::TurnCompleted(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "th1",
+                "turn": { "id": turn_id, "status": "completed" }
+            }))
+            .unwrap(),
+        )
+    }
+
     fn text_delta(event: AgentEvent) -> String {
         match event {
             AgentEvent::ItemDelta {
@@ -1158,6 +1334,134 @@ mod tests {
             },
             other => panic!("expected item completion, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn command_item_preserves_running_metadata() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let start = started_item(serde_json::json!({
+            "type": "commandExecution",
+            "id": "cmd1",
+            "command": "sleep 60",
+            "cwd": "/tmp/project",
+            "commandActions": [],
+            "status": "inProgress",
+            "processId": "proc_1"
+        }));
+
+        match mapper.map_notification(&start, ThreadId::new()).unwrap() {
+            AgentEvent::ItemStarted { item, .. } => {
+                assert_eq!(item.kind, ItemKind::CommandExecution);
+                let command = item.command.expect("command metadata");
+                assert_eq!(command.command, "sleep 60");
+                assert_eq!(command.cwd, "/tmp/project");
+                assert_eq!(command.status.as_deref(), Some("in_progress"));
+                assert_eq!(command.process_id.as_deref(), Some("proc_1"));
+                assert_eq!(command.started_at_ms, Some(500));
+            }
+            other => panic!("expected command item start, got {other:?}"),
+        }
+        assert!(mapper.has_running_commands());
+
+        let completed = completed_item(serde_json::json!({
+            "type": "commandExecution",
+            "id": "cmd1",
+            "command": "sleep 60",
+            "cwd": "/tmp/project",
+            "commandActions": [],
+            "aggregatedOutput": "",
+            "status": "failed",
+            "exitCode": 130,
+            "processId": "proc_1",
+            "durationMs": 60000
+        }));
+
+        match mapper
+            .map_notification(&completed, ThreadId::new())
+            .unwrap()
+        {
+            AgentEvent::ItemCompleted { item, .. } => match item.payload {
+                ItemPayload::CommandExecution {
+                    command,
+                    cwd,
+                    status,
+                    process_id,
+                    exit_code,
+                    duration_ms,
+                    ..
+                } => {
+                    assert_eq!(command, "sleep 60");
+                    assert_eq!(cwd, PathBuf::from("/tmp/project"));
+                    assert_eq!(status.as_deref(), Some("failed"));
+                    assert_eq!(process_id.as_deref(), Some("proc_1"));
+                    assert_eq!(exit_code, Some(130));
+                    assert_eq!(duration_ms, Some(60000));
+                }
+                other => panic!("expected command execution, got {other:?}"),
+            },
+            other => panic!("expected command item completion, got {other:?}"),
+        }
+        assert!(!mapper.has_running_commands());
+    }
+
+    #[test]
+    fn command_process_tracks_native_turn_for_interrupt() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let thread = ThreadId::new();
+
+        assert!(matches!(
+            mapper.map_notification(&turn_started("native_turn_1"), thread),
+            Some(AgentEvent::TurnStarted { .. })
+        ));
+        assert_eq!(
+            mapper.active_native_turn_for_thread(thread),
+            Some("native_turn_1")
+        );
+
+        let start = started_item_in_turn(
+            serde_json::json!({
+                "type": "commandExecution",
+                "id": "cmd1",
+                "command": "sleep 60",
+                "cwd": "/tmp/project",
+                "commandActions": [],
+                "status": "inProgress",
+                "processId": "proc_1"
+            }),
+            "native_turn_1",
+        );
+        assert!(matches!(
+            mapper.map_notification(&start, thread),
+            Some(AgentEvent::ItemStarted { .. })
+        ));
+        assert_eq!(
+            mapper.native_turn_for_process(thread, "proc_1"),
+            Some("native_turn_1")
+        );
+
+        let completed = completed_item(serde_json::json!({
+            "type": "commandExecution",
+            "id": "cmd1",
+            "command": "sleep 60",
+            "cwd": "/tmp/project",
+            "commandActions": [],
+            "aggregatedOutput": "",
+            "status": "failed",
+            "exitCode": 130,
+            "processId": "proc_1",
+            "durationMs": 60000
+        }));
+        assert!(matches!(
+            mapper.map_notification(&completed, thread),
+            Some(AgentEvent::ItemCompleted { .. })
+        ));
+        assert_eq!(mapper.native_turn_for_process(thread, "proc_1"), None);
+
+        assert!(matches!(
+            mapper.map_notification(&turn_completed("native_turn_1"), thread),
+            Some(AgentEvent::TurnCompleted { .. })
+        ));
+        assert_eq!(mapper.active_native_turn_for_thread(thread), None);
     }
 
     #[test]

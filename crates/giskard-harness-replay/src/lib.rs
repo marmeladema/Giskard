@@ -273,6 +273,7 @@ mod tests {
                     id: item_id,
                     harness_item_id: "it_1".into(),
                     kind: ItemKind::AgentMessage,
+                    command: None,
                 },
             },
             AgentEvent::ItemDelta {

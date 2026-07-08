@@ -35,6 +35,7 @@ fn make_fixture() -> (ReplayFixture, ThreadId, TurnId) {
                 id: it_1,
                 harness_item_id: "it_1".into(),
                 kind: ItemKind::UserMessage,
+                command: None,
             },
         },
         AgentEvent::ItemCompleted {
@@ -56,6 +57,7 @@ fn make_fixture() -> (ReplayFixture, ThreadId, TurnId) {
                 id: it_2,
                 harness_item_id: "it_2".into(),
                 kind: ItemKind::AgentMessage,
+                command: None,
             },
         },
         AgentEvent::ItemDelta {
