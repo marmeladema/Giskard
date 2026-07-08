@@ -340,6 +340,48 @@ async fn linkify_finds_paths() {
 }
 
 #[tokio::test]
+async fn render_endpoint_returns_sanitized_markdown_with_path_links() {
+    let port = 19022;
+    let (_data_dir, _proj_dir, _state, pid, cookie) = start_server(port).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+
+    let text = "See `main.rs` and **open** main.rs now.\n\n<img src=x onerror=alert(1)>";
+    let resp = client
+        .post(format!("{base}/api/projects/{pid}/render"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({ "text": text }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let html = body["html"].as_str().unwrap();
+
+    // Markdown is rendered...
+    assert!(
+        html.contains("<strong>open</strong>"),
+        "bold renders: {html}"
+    );
+    // ...prose paths become path-link buttons, but code spans stay literal...
+    assert!(
+        html.contains("class=\"path-link\" data-path=\"main.rs\""),
+        "prose path is linkified: {html}"
+    );
+    assert!(
+        html.contains("<code>main.rs</code>"),
+        "code stays literal: {html}"
+    );
+    // ...and raw HTML is escaped, never passed through.
+    assert!(
+        !html.contains("<img"),
+        "raw HTML must not pass through: {html}"
+    );
+    assert!(html.contains("&lt;img"), "raw HTML is escaped: {html}");
+}
+
+#[tokio::test]
 async fn linkify_endpoint_returns_only_existing_workspace_files() {
     let port = 19012;
     let (_data_dir, proj_dir, _state, pid, cookie) = start_server(port).await;
@@ -487,6 +529,7 @@ async fn code_overlay_endpoints_return_not_found_for_missing_project() {
         ("GET", "highlight?path=main.rs"),
         ("GET", "raw?path=main.rs"),
         ("POST", "linkify"),
+        ("POST", "render"),
     ] {
         let url = format!("{base}/api/projects/{missing_project}/{endpoint}");
         let request = match method {

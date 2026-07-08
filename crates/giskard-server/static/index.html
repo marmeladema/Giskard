@@ -78,6 +78,29 @@
   }
   .path-link:hover, .path-link:focus { color:#a5d6ff; background:rgba(121,192,255,.12); outline:none; }
 
+  /* Rendered agent Markdown (server-sanitized HTML injected into .body.md). */
+  .msg .body.md { white-space:normal; }
+  .md > :first-child { margin-top:0; }
+  .md > :last-child { margin-bottom:0; }
+  .md p { margin:8px 0; }
+  .md h1,.md h2,.md h3,.md h4,.md h5,.md h6 { margin:14px 0 6px; line-height:1.25; font-weight:600; }
+  .md h1 { font-size:1.5em; } .md h2 { font-size:1.3em; } .md h3 { font-size:1.15em; }
+  .md h4,.md h5,.md h6 { font-size:1em; }
+  .md ul,.md ol { margin:6px 0; padding-left:22px; }
+  .md li { margin:2px 0; }
+  .md li > input[type=checkbox] { margin-right:6px; vertical-align:middle; }
+  .md code { font-family:var(--mono); font-size:.9em; background:rgba(110,118,129,.2); padding:1px 5px; border-radius:4px; }
+  .md pre { max-width:100%; overflow-x:auto; background:#0b0e13; border:1px solid var(--border); border-radius:8px; padding:10px 12px; margin:8px 0; }
+  .md pre code { background:none; padding:0; font-size:12.5px; white-space:pre; }
+  .md blockquote { margin:8px 0; padding:2px 12px; border-left:3px solid var(--border); color:var(--muted); }
+  .md a { color:#79c0ff; text-decoration:underline; text-underline-offset:2px; }
+  .md a:hover { color:#a5d6ff; }
+  .md hr { border:0; border-top:1px solid var(--border); margin:12px 0; }
+  .md table { border-collapse:collapse; margin:8px 0; display:block; overflow-x:auto; max-width:100%; }
+  .md th,.md td { border:1px solid var(--border); padding:4px 8px; text-align:left; }
+  .md th { background:var(--panel2); }
+  .md del { opacity:.7; }
+
   .composer { display:flex; gap:8px; padding:12px; border-top:1px solid var(--border); background:var(--panel); }
   .composer textarea { flex:1; resize:none; height:52px; }
   .composer textarea:disabled { opacity:.65; cursor:not-allowed; }
@@ -402,7 +425,7 @@ let state = {
   streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), itemKindsByItemId:new Map(),
   runningCommands:new Map(), commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null,
   commandPayloadsByItemId:new Map(), endedCommandsByItemId:new Map(), expandedCommandOutputs:new Set(), manuallyToggledCommandOutputs:new Set(),
-  linkifyCache:new Map(), codePath:null, codeLine:null, activeTurn:false, interruptPending:false,
+  linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, activeTurn:false, interruptPending:false,
   awaitingInitialThreadState:false
 };
 const COMMAND_AUTO_COLLAPSE_LINES = 120;
@@ -1558,7 +1581,7 @@ function renderItemBody(body, p) {
     });
   } else if (p.kind==="agent_message" || p.kind==="reasoning" || p.kind==="user_message") {
     if (p.kind==="user_message") body.textContent = p.text || "";
-    else renderLinkedText(body, p.text || "");
+    else renderMarkdown(body, p.text || "");
   } else if (p.kind==="file_change") {
     renderFileChange(body, p);
   } else if (p.kind==="tool_call") {
@@ -1607,6 +1630,50 @@ function roleForStream(kind, deltaType) {
   if (kind==="tool_call") return "tool";
   if (kind==="activity") return "activity";
   return "agent";
+}
+// Agent/reasoning text is Markdown. Render it to sanitized HTML on the server (which also embeds
+// path-link buttons), then inject it. The raw text is shown as-is until the render resolves, so
+// streaming stays readable and a failed request degrades to plain text.
+function renderMarkdown(el, text) {
+  text = String(text || "");
+  el.classList.remove("md");
+  el.textContent = text;
+  if (!text.trim() || !state.projectId) return;
+
+  const projectId = state.projectId;
+  const cacheKey = projectId + "\n" + text;
+  const apply = (html) => {
+    if (!el.isConnected || projectId !== state.projectId) return;
+    if (typeof html !== "string") return;
+    el.innerHTML = html;
+    el.classList.add("md");
+    wirePathLinks(el);
+  };
+
+  if (state.markdownCache.has(cacheKey)) {
+    apply(state.markdownCache.get(cacheKey));
+    return;
+  }
+
+  api("POST", `/api/projects/${projectId}/render`, { text })
+    .then((res) => {
+      const html = res && typeof res.html === "string" ? res.html : "";
+      state.markdownCache.set(cacheKey, html);
+      apply(html);
+    })
+    .catch(() => {});
+}
+// Wire the server-emitted `.path-link` buttons (they arrive with data attributes but no handler).
+function wirePathLinks(el) {
+  el.querySelectorAll("button.path-link[data-path]").forEach((btn) => {
+    const path = btn.dataset.path || "";
+    const line = normalizeLine(btn.dataset.line, null);
+    btn.title = line ? `Open source at line ${line}` : "Open source";
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      openCodeOverlay(path, line);
+    };
+  });
 }
 function renderLinkedText(el, text) {
   text = String(text || "");

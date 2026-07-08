@@ -5,6 +5,7 @@ pub mod hub;
 pub mod ledger;
 pub mod linkify;
 pub mod live_buffer;
+pub mod markdown;
 pub mod models;
 pub mod plan;
 pub mod registry;

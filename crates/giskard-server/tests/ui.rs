@@ -309,8 +309,12 @@ async fn index_page_is_served_and_public() {
         "UI linkifies command output only when the output block is expanded"
     );
     assert!(
-        body.contains("renderLinkedText(body, p.text"),
-        "UI linkifies completed agent/reasoning text through the server"
+        body.contains("renderMarkdown(body, p.text"),
+        "UI renders completed agent/reasoning text as Markdown through the server"
+    );
+    assert!(
+        body.contains("/render`, { text }"),
+        "UI requests server-rendered Markdown for agent text"
     );
     assert!(
         body.contains("openCodeOverlay"),

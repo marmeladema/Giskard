@@ -140,7 +140,8 @@ The browser (and any client) drives everything through a small REST surface plus
 WebSocket. Highlights: `POST /api/login`, `GET/POST /api/projects`, `GET/POST
 /api/projects/{id}/threads`, `GET /api/models` (+ `POST /api/models/refresh`), `GET /api/tokens` and
 `GET /api/projects/{id}/tokens` (dashboards), `GET /api/projects/{id}/highlight|raw`, `POST
-/api/projects/{id}/linkify`, `GET /api/browse`, and `GET /api/ws`. Wire types are defined once in
+/api/projects/{id}/linkify`, `POST /api/projects/{id}/render` (agent Markdown → sanitized HTML),
+`GET /api/browse`, and `GET /api/ws`. Wire types are defined once in
 `giskard-proto`. See [§13.6](specs/giskard-specification.md) for the message protocol.
 
 ---
