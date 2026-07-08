@@ -1,5 +1,7 @@
 # Giskard
 
+[![CI](https://github.com/marmeladema/Giskard/actions/workflows/ci.yml/badge.svg)](https://github.com/marmeladema/Giskard/actions/workflows/ci.yml)
+
 A **local-first, single-user web UI** on top of agentic coding CLIs. Giskard runs on your machine,
 manages projects and durable conversation threads, streams the agent's work to a browser in real
 time, visualizes file diffs and referenced source, and tracks token usage. The first (and current)
@@ -179,6 +181,10 @@ cargo clippy --all-targets -- -D warnings
 Tests never call a real LLM: integration/e2e tests drive the application through the
 `ReplayHarness`. See [AGENTS.md](AGENTS.md) for contributor conventions (error surfacing, panic
 policy, failure-path test expectations) and the spec for the full design.
+
+[GitHub Actions CI](.github/workflows/ci.yml) runs the same three gates on every push to `main` and
+every pull request: `rustfmt` (`--check`), `clippy` (`--workspace --all-targets -- -D warnings`),
+and the full `--workspace` test suite (build + test).
 
 ---
 
