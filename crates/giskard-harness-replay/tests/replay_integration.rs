@@ -300,7 +300,6 @@ async fn replay_persisted_state_roundtrip() {
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
             },
-            ApprovalPolicy::Ask,
         )
         .await
         .unwrap();
@@ -319,7 +318,7 @@ async fn replay_persisted_state_roundtrip() {
             reasoning_effort: None,
         },
         context_window: 262_144,
-        approval_policy: None,
+        approval_policy: ApprovalPolicy::Ask,
         model_efforts: std::collections::HashMap::new(),
         tokens: giskard_core::token::TokenLedger {
             total: usage,

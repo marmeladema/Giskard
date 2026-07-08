@@ -39,9 +39,8 @@ pub enum ApprovalPolicy {
 /// A **resolved snapshot**, not a delta. The server constructs it at `start_turn` from the
 /// thread's persisted state. `model = None` means "reuse the thread's current model."
 /// Effort lives only in `ModelRef.reasoning_effort` (no standalone field).
-/// `approval_policy` is the **resolved** effective policy (from project/thread config, or
-/// coerced for a degraded harness, §9.4) — NOT a per-turn override (P3). The server reads
-/// it and includes it in the snapshot so the harness can pass it to `turn/start`.
+/// `approval_policy` is the thread's persisted policy, included in the snapshot so the harness
+/// can pass it to `turn/start`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]

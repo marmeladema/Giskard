@@ -219,7 +219,6 @@ session_days = 30
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
             },
-            giskard_core::turn::ApprovalPolicy::Auto,
         )
         .await
         .unwrap();
@@ -633,7 +632,6 @@ session_days = 30
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
             },
-            giskard_core::turn::ApprovalPolicy::Auto,
         )
         .await
         .unwrap();

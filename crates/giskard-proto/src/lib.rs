@@ -55,8 +55,7 @@ pub enum ClientMessage {
         model_ref: ModelRef,
     },
     SetApprovalPolicy {
-        thread_id: Option<ThreadId>,
-        project_id: Option<ProjectId>,
+        thread_id: ThreadId,
         policy: ApprovalPolicy,
     },
     Interrupt {
@@ -232,7 +231,6 @@ pub struct CreateProjectRequest {
     pub dir: String,
     pub workspace_root: Option<String>,
     pub default_model: ModelRef,
-    pub approval_policy: ApprovalPolicy,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -426,6 +424,29 @@ mod tests {
         match back {
             ClientMessage::TerminateCommand { process_id, .. } => {
                 assert_eq!(process_id, "proc_1");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn client_message_set_approval_policy_is_thread_scoped() {
+        let tid = ThreadId::new();
+        let msg = ClientMessage::SetApprovalPolicy {
+            thread_id: tid,
+            policy: ApprovalPolicy::ReadOnly,
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "set_approval_policy");
+        assert_eq!(json["thread_id"], tid.to_string());
+        assert_eq!(json["policy"], "read_only");
+        assert!(json.get("project_id").is_none());
+
+        let back: ClientMessage = serde_json::from_value(json).unwrap();
+        match back {
+            ClientMessage::SetApprovalPolicy { thread_id, policy } => {
+                assert_eq!(thread_id, tid);
+                assert_eq!(policy, ApprovalPolicy::ReadOnly);
             }
             _ => panic!("wrong variant"),
         }

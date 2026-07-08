@@ -109,9 +109,9 @@ $GISKARD_DATA_DIR/
 ├── config.toml                  # this config
 ├── projects.json                # project index (id, name, dir, created_at, order)
 ├── projects/<project_id>/
-│   ├── project.json             # workspace root, default model, approval policy, harness kind
+│   ├── project.json             # workspace root, default model, harness kind
 │   ├── threads/
-│   │   ├── <thread_id>.json      # thread metadata + token aggregates (a recomputable cache)
+│   │   ├── <thread_id>.json      # thread metadata, approval policy, token cache
 │   │   └── <thread_id>.jsonl     # authoritative turn history — one Turn per line, append-only
 │   └── tokens.json               # per-project token ledger (total, by_day, by_model)
 └── tokens-global.json            # cross-project token ledger

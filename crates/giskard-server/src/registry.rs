@@ -843,13 +843,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(
-                project_id,
-                "proj",
-                "/tmp/test",
-                model.clone(),
-                ApprovalPolicy::Ask,
-            )
+            .create_project(project_id, "proj", "/tmp/test", model.clone())
             .await
             .unwrap();
         let now = Utc::now();
@@ -865,7 +859,7 @@ mod tests {
                     mode: Mode::Build,
                     current_model: model.clone(),
                     context_window: 128_000,
-                    approval_policy: None,
+                    approval_policy: ApprovalPolicy::Ask,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
                     created_at: now,

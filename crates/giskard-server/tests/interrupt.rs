@@ -16,7 +16,7 @@ use giskard_core::item::{
 use giskard_core::model::{ModelDescriptor, ModelRef};
 use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::token::TokenUsage;
-use giskard_core::turn::{ApprovalPolicy, TurnOverrides, TurnStatus, TurnStatusKind};
+use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
     AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
@@ -351,7 +351,6 @@ async fn spawn_test_app() -> TestApp {
                 model: "gpt-5".into(),
                 reasoning_effort: None,
             },
-            ApprovalPolicy::Ask,
         )
         .await
         .unwrap();

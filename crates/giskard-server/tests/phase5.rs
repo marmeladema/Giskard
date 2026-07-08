@@ -9,7 +9,7 @@ use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ItemId, ProjectId, ThreadId, TurnId};
 use giskard_core::item::{Item, ItemKind, ItemPayload, ItemStart};
 use giskard_core::token::TokenUsage;
-use giskard_core::turn::{ApprovalPolicy, TurnStatus, TurnStatusKind};
+use giskard_core::turn::{TurnStatus, TurnStatusKind};
 use giskard_harness::AgentHarness;
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 use giskard_persist::store::ProjectConfig;
@@ -182,7 +182,6 @@ async fn token_ledgers_and_dashboard() {
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
             },
-            ApprovalPolicy::Auto,
         )
         .await
         .unwrap();
@@ -584,7 +583,6 @@ async fn history_pagination_over_websocket() {
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
             },
-            ApprovalPolicy::Auto,
         )
         .await
         .unwrap();

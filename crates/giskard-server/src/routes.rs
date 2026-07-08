@@ -19,7 +19,7 @@ use tracing::{debug, error, warn};
 use futures::{SinkExt, StreamExt};
 use giskard_core::error::{HarnessError, PersistError};
 use giskard_core::ids::{ProjectId, ThreadId};
-use giskard_core::turn::{Mode, TurnOverrides};
+use giskard_core::turn::{ApprovalPolicy, Mode, TurnOverrides};
 use giskard_core::user_input::UserInput;
 use giskard_persist::store::{ProjectConfig, ThreadFile};
 use giskard_proto::*;
@@ -171,7 +171,7 @@ async fn create_project(
     let default_model = crate::models::normalize_model_ref(&config, &req.default_model);
     state
         .store
-        .create_project(id, &req.name, &req.dir, default_model, req.approval_policy)
+        .create_project(id, &req.name, &req.dir, default_model)
         .await?;
 
     if let Some(ws_root) = &req.workspace_root {
@@ -362,7 +362,7 @@ async fn open_thread(
             &app_config,
             &project_config.default_model,
         ),
-        approval_policy: None,
+        approval_policy: ApprovalPolicy::Ask,
         model_efforts: std::collections::HashMap::new(),
         tokens: giskard_core::token::TokenLedger::default(),
         created_at: now,
@@ -1052,21 +1052,6 @@ async fn handle_client_msg(
                 .load_config()
                 .await
                 .map_err(|e| WsError::from_persist(e, "send_input", Some(thread_id)))?;
-            let project = state
-                .store
-                .load_project(project_id)
-                .await
-                .map_err(|e| WsError::from_persist(e, "send_input", Some(thread_id)))?
-                .ok_or_else(|| {
-                    WsError::new(
-                        "project_not_found",
-                        ErrorSeverity::Error,
-                        "Project not found.",
-                    )
-                    .thread(thread_id)
-                    .action("send_input")
-                })?;
-
             // RMW under the per-thread lock: bump activity and read back the resolved state.
             let tf = state
                 .store
@@ -1098,11 +1083,11 @@ async fn handle_client_msg(
             //  - the thread's current model (carrying its reasoning effort), so a mid-thread
             //    model/effort change actually reaches the agent. Passing `None` here would leave
             //    Codex on whatever model was set at `thread/start`.
-            //  - the effective approval policy: a per-thread override wins over the project's (§9).
+            //  - the thread's persisted approval policy (§9).
             let overrides = TurnOverrides {
                 model: Some(effective_model.clone()),
                 mode: tf.mode,
-                approval_policy: tf.approval_policy.unwrap_or(project.approval_policy),
+                approval_policy: tf.approval_policy,
             };
 
             state
@@ -1184,63 +1169,26 @@ async fn handle_client_msg(
                 })?;
             broadcast_thread_state(state, thread_id, &tf).await;
         }
-        ClientMessage::SetApprovalPolicy {
-            thread_id,
-            project_id,
-            policy,
-        } => {
-            // Two targets (§9): a `thread_id` sets the per-thread override (consumed by SendInput
-            // via `tf.approval_policy.unwrap_or(project)`); a `project_id` changes the project
-            // default that applies to threads without an override. `thread_id` wins if both are set.
-            if let Some(tid) = thread_id {
-                let pid = project_for(state, tid, "set_approval_policy").await?;
-                let tf = state
-                    .store
-                    .update_thread(pid, tid, |tf| {
-                        tf.approval_policy = Some(policy);
-                        tf.updated_at = chrono::Utc::now();
-                    })
-                    .await
-                    .map_err(|e| WsError::from_persist(e, "set_approval_policy", Some(tid)))?
-                    .ok_or_else(|| {
-                        WsError::new(
-                            "thread_not_found",
-                            ErrorSeverity::Error,
-                            "Thread not found.",
-                        )
-                        .thread(tid)
-                        .action("set_approval_policy")
-                    })?;
-                broadcast_thread_state(state, tid, &tf).await;
-            } else if let Some(pid) = project_id {
-                let mut config = state
-                    .store
-                    .load_project(pid)
-                    .await
-                    .map_err(|e| WsError::from_persist(e, "set_approval_policy", None))?
-                    .ok_or_else(|| {
-                        WsError::new(
-                            "project_not_found",
-                            ErrorSeverity::Error,
-                            "Project not found.",
-                        )
-                        .action("set_approval_policy")
-                    })?;
-                config.approval_policy = policy;
-                config.updated_at = chrono::Utc::now();
-                state
-                    .store
-                    .save_project(&config)
-                    .await
-                    .map_err(|e| WsError::from_persist(e, "set_approval_policy", None))?;
-            } else {
-                return Err(WsError::new(
-                    "invalid_request",
-                    ErrorSeverity::Error,
-                    "SetApprovalPolicy requires thread_id or project_id.",
-                )
-                .action("set_approval_policy"));
-            }
+        ClientMessage::SetApprovalPolicy { thread_id, policy } => {
+            let project_id = project_for(state, thread_id, "set_approval_policy").await?;
+            let tf = state
+                .store
+                .update_thread(project_id, thread_id, |tf| {
+                    tf.approval_policy = policy;
+                    tf.updated_at = chrono::Utc::now();
+                })
+                .await
+                .map_err(|e| WsError::from_persist(e, "set_approval_policy", Some(thread_id)))?
+                .ok_or_else(|| {
+                    WsError::new(
+                        "thread_not_found",
+                        ErrorSeverity::Error,
+                        "Thread not found.",
+                    )
+                    .thread(thread_id)
+                    .action("set_approval_policy")
+                })?;
+            broadcast_thread_state(state, thread_id, &tf).await;
         }
         ClientMessage::ApprovalDecision {
             request_id,

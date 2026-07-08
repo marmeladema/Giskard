@@ -211,7 +211,7 @@ async fn modes_models_approvals_and_plan_dump() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    // Create project pointing at the writable dir, approval policy "ask".
+    // Create project pointing at the writable dir.
     let resp = client
         .post(format!("{base}/api/projects"))
         .header("cookie", &cookie)
@@ -219,7 +219,6 @@ async fn modes_models_approvals_and_plan_dump() {
             "name": "proj",
             "dir": proj_dir_path,
             "default_model": {"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null},
-            "approval_policy": "ask"
         }))
         .send()
         .await
