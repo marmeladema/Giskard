@@ -62,8 +62,14 @@
   .msg.file { background:#101820; border:1px solid #28445f; }
   .msg.tool { background:#151521; border:1px solid #3b3b67; }
   .msg.activity { background:#13181c; border:1px solid var(--border); color:#c9d1d9; }
+  .msg.approval { background:#241d10; border:1px solid #d29922; max-width:100%; }
+  .msg.approval.resolved { opacity:.72; }
   .msg .role { font-size:11px; text-transform:uppercase; letter-spacing:.05em; opacity:.7; margin-bottom:4px; }
   .msg .body { min-width:0; max-width:100%; overflow-wrap:anywhere; }
+  .approval-title { font-weight:600; margin-bottom:4px; }
+  .approval-detail { font-family:var(--mono); font-size:12.5px; color:#f0d98c; margin-top:6px; }
+  .approval-actions { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
+  .approval-actions button { font-size:12px; padding:4px 8px; }
   pre.out {
     max-width:100%; margin:0; overflow-x:hidden; font-family:var(--mono); font-size:12.5px;
     white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;
@@ -119,10 +125,14 @@
   .msg.pending { opacity:.7; }
   .msg.failed { border:1px solid #f85149; }
   .msg.selected { box-shadow:inset 3px 0 0 var(--accent); }
-  .msg.cmd.state-running, .msg.running-command { border-color:#d29922; }
+  .msg.cmd.state-running, .msg.running-command,
+  .msg.tool.state-running, .msg.running-tool { border-color:#d29922; }
   .msg.cmd.state-succeeded { border-color:#238636; }
   .msg.cmd.state-failed { border-color:#f85149; }
   .msg.cmd.state-terminated { border-color:#8b949e; }
+  .msg.tool.state-succeeded { border-color:#238636; }
+  .msg.tool.state-failed { border-color:#f85149; }
+  .msg.tool.state-terminated { border-color:#8b949e; }
   .msg.error { background:#2a1416; border:1px solid #f85149; color:#ffb4ae; max-width:100%; }
   .msg.error .role { color:#f85149; opacity:1; }
   .msg.notice { background:#241d10; border:1px solid #d29922; color:#f0d98c; max-width:100%; }
@@ -423,6 +433,7 @@ let state = {
   projectId:null, threadId:null, mode:"build", ws:null, wsStatus:"closed", wsConnectId:0,
   models:[], streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null, pendingClientMsgs:[],
   streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), itemKindsByItemId:new Map(),
+  pendingApprovals:new Map(),
   runningCommands:new Map(), commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null,
   commandPayloadsByItemId:new Map(), endedCommandsByItemId:new Map(), expandedCommandOutputs:new Set(), manuallyToggledCommandOutputs:new Set(),
   linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, activeTurn:false, interruptPending:false,
@@ -766,10 +777,14 @@ function handleServer(msg) {
     case "running_commands": renderRunningCommandSnapshot(msg.commands || []); break;
     case "event": handleEvent(msg.agent_event); break;
     case "token_update": renderTokens(msg.ledger); break;
-    case "approval_request": notice("Approval requested: "+JSON.stringify(msg.request.kind)); break;
+    case "approval_request": renderApprovalRequest(msg.request); break;
     case "error":
       if (msg.action==="send_input" && state.pendingUserEl) {
         failPendingUserMessage(null);
+      }
+      if (msg.action==="interrupt") {
+        state.interruptPending = false;
+        updateComposerControls();
       }
       if (msg.action==="terminate_command") resetTerminatingCommand(msg.process_id);
       notice(msg.message||"error", msg.severity||"error");
@@ -866,11 +881,17 @@ function handleEvent(ev) {
         state.itemKindsByItemId.set(idKey(ev.item.id), ev.item.kind);
         if (ev.item.kind==="command_execution" && ev.item.command) {
           startRunningCommand(ev.item, ev.turn);
+        } else if (ev.item.kind==="tool_call" && ev.item.tool) {
+          startToolCall(ev.item, ev.turn);
         }
       }
       break;
     case "item_delta":
-      if (ev.delta && ev.delta.type==="text") appendStream(ev.delta.text, ev.item_id, ev.delta.type);
+      if (ev.delta && ev.delta.type==="text") {
+        const kind = state.itemKindsByItemId.get(idKey(ev.item_id));
+        if (kind==="tool_call") appendToolProgress(ev.item_id, ev.delta.text);
+        else appendStream(ev.delta.text, ev.item_id, ev.delta.type);
+      }
       else if (ev.delta && ev.delta.type==="command_output") {
         if (!appendRunningCommandOutput(ev.item_id, ev.delta.chunk)) {
           appendStream(ev.delta.chunk, ev.item_id, ev.delta.type);
@@ -888,7 +909,7 @@ function handleEvent(ev) {
       detachRunningCommands();
       setTurnActive(false);
       break;
-    case "approval_requested": notice("Approval requested"); break;
+    case "approval_requested": renderApprovalRequest(ev.request); break;
     // Render errors as a persistent transcript entry (tied to the turn/message that caused them)
     // rather than a toast that vanishes — so looking back at a thread explains why a message got
     // no agent response. The matching failed turn is also persisted server-side (§7.1).
@@ -921,7 +942,93 @@ function errorText(e) {
 
 function renderLiveTurnSnapshot(snap) {
   for (const ev of (snap.accumulated||[])) handleEvent(ev);
-  if (snap.pending_approval) notice("Approval requested: "+JSON.stringify(snap.pending_approval.kind));
+  if (snap.pending_approval) renderApprovalRequest(snap.pending_approval);
+}
+
+function renderApprovalRequest(request) {
+  if (!request || !request.id) return;
+  const id = String(request.id);
+  if (state.pendingApprovals.has(id)) return;
+  const body = bubble("approval","approval");
+  const msg = body.parentElement;
+  msg.dataset.approvalId = id;
+  state.pendingApprovals.set(id, msg);
+
+  const title = document.createElement("div");
+  title.className = "approval-title";
+  title.textContent = approvalTitle(request);
+  body.append(title);
+
+  const reason = (request.reason || "").trim();
+  if (reason) {
+    const reasonEl = document.createElement("div");
+    reasonEl.textContent = reason;
+    body.append(reasonEl);
+  }
+
+  const detail = approvalDetail(request);
+  if (detail) {
+    const detailEl = document.createElement("div");
+    detailEl.className = "approval-detail";
+    detailEl.textContent = detail;
+    body.append(detailEl);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "approval-actions";
+  const available = new Set(request.available || []);
+  addApprovalButton(actions, id, "accept", "Accept", "primary", available);
+  addApprovalButton(actions, id, "accept_for_session", "Session", "", available);
+  addApprovalButton(actions, id, "decline", "Decline", "danger", available);
+  addApprovalButton(actions, id, "cancel", "Cancel", "", available);
+  body.append(actions);
+}
+function approvalTitle(request) {
+  const kind = request.kind || {};
+  if (kind.kind==="command_execution") return "Run command?";
+  if (kind.kind==="file_change") return "Apply file changes?";
+  if (kind.kind==="permission") return "Grant permissions?";
+  return "Approval required";
+}
+function approvalDetail(request) {
+  const kind = request.kind || {};
+  if (kind.kind==="command_execution") {
+    const cwd = kind.cwd ? `\n${kind.cwd}` : "";
+    return `${kind.command || "(empty command)"}${cwd}`;
+  }
+  if (kind.kind==="file_change") return [kind.change, kind.path].filter(Boolean).join(" ");
+  if (kind.kind==="permission") return kind.detail || "";
+  return JSON.stringify(kind);
+}
+function addApprovalButton(container, id, decision, label, cls, available) {
+  if (available.size && !available.has(decision)) return;
+  const btn = document.createElement("button");
+  btn.type = "button";
+  if (cls) btn.className = cls;
+  btn.textContent = label;
+  btn.onclick = () => respondApproval(id, decision);
+  container.append(btn);
+}
+function respondApproval(id, decision) {
+  const msg = state.pendingApprovals.get(id);
+  if (!msg) return;
+  msg.querySelectorAll("button").forEach(btn => btn.disabled = true);
+  if (!send({ type:"approval_decision", request_id:id, decision })) {
+    msg.querySelectorAll("button").forEach(btn => btn.disabled = false);
+    notice(`Approval response not sent: WebSocket is ${state.wsStatus}.`, "error");
+    return;
+  }
+  msg.classList.add("resolved");
+  const body = msg.querySelector(".body");
+  const status = document.createElement("div");
+  status.className = "meta";
+  status.textContent = `Sent: ${approvalDecisionLabel(decision)}`;
+  body.append(status);
+  state.pendingApprovals.delete(id);
+}
+function approvalDecisionLabel(decision) {
+  if (decision==="accept_for_session") return "Session";
+  return decision.charAt(0).toUpperCase() + decision.slice(1);
 }
 
 // Where new bubbles are appended: the live transcript, or a detached container when rendering an
@@ -1402,6 +1509,50 @@ function resetTerminatingCommand(processId) {
   }
   renderRunningCommands();
 }
+function startToolCall(item, turnId) {
+  const key = idKey(item.id); if (!key) return;
+  const tool = item.tool || {};
+  let body = state.streamElsByItemId.get(key);
+  if (!body) body = bubble("tool running-tool state-running","tool");
+  state.streamElsByItemId.set(key, body);
+  body.parentElement.dataset.toolItemId = key;
+  body.parentElement.dataset.toolStartedAtMs = String(normalizeTimestampMs(tool.started_at_ms, Date.now()));
+  renderItemBody(body, {
+    kind:"tool_call",
+    name:tool.name || "tool",
+    input:tool.input,
+    output:null,
+    server:tool.server || null,
+    status:tool.status || "in_progress",
+    error:null
+  });
+}
+function appendToolProgress(itemId, text) {
+  const key = idKey(itemId);
+  let body = key ? state.streamElsByItemId.get(key) : null;
+  if (!body) {
+    body = bubble("tool running-tool state-running","tool");
+    if (key) state.streamElsByItemId.set(key, body);
+    renderItemBody(body, {
+      kind:"tool_call",
+      name:"tool",
+      input:null,
+      output:null,
+      server:null,
+      status:"in_progress",
+      error:null
+    });
+  }
+  let progress = body.querySelector(".tool-progress");
+  if (!progress) {
+    progress = document.createElement("div");
+    progress.className = "meta tool-progress";
+    body.append(progress);
+  }
+  const chunk = String(text || "");
+  progress.textContent += (progress.textContent ? "\n" : "") + chunk;
+  $("transcript").scrollTop = $("transcript").scrollHeight;
+}
 function appendStream(text, itemId, deltaType) {
   const key = idKey(itemId);
   if (key && state.renderedItemIds.has(key)) return;
@@ -1498,6 +1649,7 @@ function resetRenderState() {
   state.renderedItemIds = new Set();
   state.renderedHarnessItemIds = new Set();
   state.itemKindsByItemId = new Map();
+  state.pendingApprovals = new Map();
   state.runningCommands = new Map();
   state.commandBodyElsByItemId = new Map();
   state.commandMsgElsByItemId = new Map();
@@ -1585,6 +1737,9 @@ function renderItemBody(body, p) {
   } else if (p.kind==="file_change") {
     renderFileChange(body, p);
   } else if (p.kind==="tool_call") {
+    const stateName = toolVisualStateFromStatus(p.status, p.error);
+    msg.classList.add(`state-${stateName}`);
+    if (stateName==="running") msg.classList.add("running-tool");
     body.innerHTML = renderToolCall(p);
   } else if (p.kind==="activity") {
     body.innerHTML = renderActivity(p);
@@ -1768,11 +1923,28 @@ function renderFileChange(body, p) {
 }
 function renderToolCall(p) {
   const head = `${p.server ? escapeHtml(p.server)+":" : ""}${escapeHtml(p.name||"tool")}`;
-  const status = p.status ? ` <span class="muted">(${escapeHtml(p.status)})</span>` : "";
+  const stateName = toolVisualStateFromStatus(p.status, p.error);
+  const statusLabel = toolStatusLabel(p.status, p.error);
+  const status = statusLabel ? ` <span class="cmd-status state-${stateName}"><span class="cmd-symbol state-${stateName}">${escapeHtml(commandStateSymbol(stateName))}</span><span>${escapeHtml(statusLabel)}</span></span>` : "";
   const input = p.input!==undefined && p.input!==null ? `<pre class="out">${escapeHtml(jsonPreview(p.input))}</pre>` : "";
   const output = p.output!==undefined && p.output!==null ? `<pre class="out">${escapeHtml(jsonPreview(p.output))}</pre>` : "";
   const err = p.error ? `<div class="meta">error: ${escapeHtml(p.error)}</div>` : "";
   return `<div class="mono">${head}${status}</div>${input}${output}${err}`;
+}
+function toolVisualStateFromStatus(status, error) {
+  if (error) return "failed";
+  const s = commandStatusKey(status);
+  if (s==="completed" || s==="succeeded" || s==="success") return "succeeded";
+  if (s==="failed" || s==="error") return "failed";
+  if (s==="terminated" || s==="declined" || s==="canceled" || s==="cancelled" || s==="interrupted" || s==="unknown") return "terminated";
+  if (commandIsRunningStatus(status)) return "running";
+  return s ? "failed" : "running";
+}
+function toolStatusLabel(status, error) {
+  if (error && !status) return "failed";
+  if (!status) return "";
+  if (commandIsRunningStatus(status)) return "running";
+  return String(status);
 }
 function renderActivity(p) {
   const detail = p.detail ? `<div>${escapeHtml(p.detail)}</div>` : "";

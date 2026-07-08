@@ -8,7 +8,30 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.13
+**Version:** 1.14
+
+**Changelog (1.13 → 1.14), tool calls, approvals, and Codex parity:**
+- **T1:** `ItemStart` carries optional `ToolCallStart` metadata for MCP/dynamic tool calls when
+  the harness can provide it (`name`, `input`, optional `server`, `status`, `started_at_ms`).
+- **T2:** The browser renders started tool calls as visible pending transcript rows immediately,
+  including their server/tool name, status, and input. Progress deltas append to that row, and the
+  later `ItemCompleted` finalizes it in place. A stuck MCP call therefore remains visible instead
+  of looking like an idle active turn.
+- **Q1:** Plan-mode Codex turns send `readOnly { networkAccess: true }`; Build-mode Codex turns
+  send `workspaceWrite { networkAccess: true }`. Network reads are available in Plan mode, while
+  agents remain responsible for avoiding mutating network actions during planning.
+- **Q2:** Every Codex `ServerRequest` must receive a JSON-RPC response. Supported approval requests
+  keep the existing user-decision flow; unsupported request types are surfaced as transcript errors
+  and rejected immediately. `item/tool/call` uses the protocol's structured failure result
+  (`success: false`, `contentItems: [{ type: "inputText", ... }]`) so Codex can continue instead of
+  waiting forever.
+- **A1:** Browser clients render live approval requests as actionable transcript cards, not
+  transient notices. The card sends `ApprovalDecision` messages for command, file, and permissions
+  approvals and is de-duplicated across live-turn snapshots.
+- **A2:** Codex `item/permissions/requestApproval` is a supported approval request. Accept replies
+  with `{ permissions, scope: "turn" }`, accept-for-session replies with
+  `{ permissions, scope: "session" }`, and decline/cancel use JSON-RPC errors, matching CodexUI's
+  app-server contract.
 
 **Changelog (1.12 → 1.13), rendered agent Markdown:**
 - **M1:** Agent and reasoning messages are GitHub-flavored Markdown. The server renders them to
@@ -706,6 +729,7 @@ pub struct ItemStart {                // B5: renamed from `ItemStarted` (collide
     pub harness_item_id: String,      // native id, used to correlate deltas/completion
     pub kind: ItemKind,               // discriminant; payload fills in on completion
     pub command: Option<CommandExecutionStart>, // present for command items when known
+    pub tool: Option<ToolCallStart>,   // present for tool-call items when known
 }
 
 pub struct CommandExecutionStart {
@@ -713,6 +737,14 @@ pub struct CommandExecutionStart {
     pub cwd: String,                  // wire-safe display path
     pub status: Option<String>,       // e.g. in_progress
     pub process_id: Option<String>,   // enables terminate when present
+    pub started_at_ms: Option<i64>,   // Unix epoch ms when supplied by the harness
+}
+
+pub struct ToolCallStart {
+    pub name: String,
+    pub input: serde_json::Value,
+    pub server: Option<String>,
+    pub status: Option<String>,       // e.g. in_progress
     pub started_at_ms: Option<i64>,   // Unix epoch ms when supplied by the harness
 }
 
@@ -892,8 +924,9 @@ The `CodexHarness` maps the Codex app-server JSON-RPC protocol onto the above. K
 | `turn/interrupt` | `interrupt` |
 | JSON-RPC error `-32001` "overloaded" | retry with exponential backoff + jitter, surfaced as transient `Error` only if retries exhausted |
 
-Plan vs build maps to the Codex per-turn sandbox policy: **Plan → `read-only`**,
-**Build → `workspace-write`**. Approval policy maps to Codex's approval configuration (§9).
+Plan vs build maps to the Codex per-turn sandbox policy: **Plan → `readOnly` with
+`networkAccess: true`**, **Build → `workspaceWrite` with `networkAccess: true`**. Approval policy
+maps to Codex's approval configuration (§9).
 
 ### 4.7 Process lifecycle (Codex)
 
@@ -1213,8 +1246,8 @@ Auto-generate an initial title from the first user message (truncated); user-edi
 
 - **Mode is thread state**, persisted, and **switchable at any time within the thread**
   (requires `capabilities.plan_build_modes`).
-- **Plan mode** ⇒ harness runs **read-only**; the agent analyzes and proposes an
-  implementation plan without modifying files.
+- **Plan mode** ⇒ harness runs **read-only with network access**; the agent analyzes and proposes
+  an implementation plan without modifying files or performing mutating network actions.
 - **Build mode** ⇒ harness runs **workspace-write**; the agent implements, subject to the
   approval policy (§9).
 - The mode applied to a turn is the thread's mode **at the moment `start_turn` is called**
@@ -1401,13 +1434,10 @@ and echoes a `ThreadState` to all connected tabs — the same durable-switch pat
 advertises `live_approvals` (§9.4); otherwise it is coerced at attach time.
 
 **Interaction with Plan mode.** Mode (Plan/Build) and approval policy are **orthogonal
-settings**, but Plan mode makes the policy largely moot: in Plan mode the harness sandbox is
-`read-only`, so the agent cannot perform the write/exec actions that trigger approvals in the
-first place. Therefore in Plan mode an `ask` policy will, in practice, rarely (if ever) raise a
-prompt, and `auto` grants nothing meaningful. The UI reflects this: while a thread is in Plan
-mode it shows the policy as "not applicable (read-only)" without changing the stored value, so
-switching back to Build restores the previously chosen policy. Plan mode does **not** overwrite
-the project's `approval_policy`.
+settings**, but Plan mode changes what the sandbox permits: file writes remain blocked while
+network reads are allowed. Therefore in Plan mode an `ask` policy can still matter for commands or
+permission escalations, and those approvals must be surfaced normally. Plan mode does **not**
+overwrite the project's `approval_policy`.
 
 ### 9.2 Live approval flow (requires `capabilities.live_approvals`)
 
@@ -1760,10 +1790,11 @@ events.
 
 **Transcript visibility invariant (E7/E8/E9):** every finalized item payload with user-observable
 meaning is rendered as a transcript row. `FileChange`, `ToolCall`, and `Activity` are visible rows;
-they must not fall through to empty agent bubbles or be silently hidden. The client records
-`ItemStarted.kind` and uses it to style streamed deltas before completion. On reconnect, the client
-replays `LiveTurnSnapshot.accumulated` events through the same event handler used for live
-WebSocket events.
+they must not fall through to empty agent bubbles or be silently hidden. Started tool calls with
+`ToolCallStart` metadata are also visible before completion, so long-running or stuck tool calls
+do not appear as silent active turns. The client records `ItemStarted.kind` and uses it to style
+streamed deltas before completion. On reconnect, the client replays `LiveTurnSnapshot.accumulated`
+events through the same event handler used for live WebSocket events.
 
 > **Wire types (C1/§3.5).** Everything the server emits that could carry a filesystem path
 > (`Event`, `ApprovalRequest`, the `LiveTurnSnapshot` contents) is mapped `core → Wire*` at the

@@ -42,6 +42,7 @@ struct InterruptHarness {
     active: Mutex<Option<(ThreadId, TurnId)>>,
     command: Mutex<Option<(ThreadId, TurnId, ItemId)>>,
     interrupted: Mutex<Vec<ThreadId>>,
+    interrupt_delay: Mutex<Option<Duration>>,
     terminated: Mutex<Vec<String>>,
     terminate_behavior: Mutex<TerminateBehavior>,
 }
@@ -54,6 +55,7 @@ impl InterruptHarness {
             active: Mutex::new(None),
             command: Mutex::new(None),
             interrupted: Mutex::new(Vec::new()),
+            interrupt_delay: Mutex::new(None),
             terminated: Mutex::new(Vec::new()),
             terminate_behavior: Mutex::new(TerminateBehavior::Succeed),
         }
@@ -74,6 +76,10 @@ impl InterruptHarness {
 
     async fn interrupted_threads(&self) -> Vec<ThreadId> {
         self.interrupted.lock().await.clone()
+    }
+
+    async fn set_interrupt_delay(&self, delay: Duration) {
+        *self.interrupt_delay.lock().await = Some(delay);
     }
 
     async fn terminated_processes(&self) -> Vec<String> {
@@ -178,6 +184,7 @@ impl AgentHarness for InterruptHarness {
                     process_id: Some("proc_1".into()),
                     started_at_ms: Some(Utc::now().timestamp_millis()),
                 }),
+                tool: None,
             },
         });
         let _ = self.tx.send(AgentEvent::ItemDelta {
@@ -205,6 +212,9 @@ impl AgentHarness for InterruptHarness {
 
     async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
         self.interrupted.lock().await.push(thread.thread);
+        if let Some(delay) = *self.interrupt_delay.lock().await {
+            tokio::time::sleep(delay).await;
+        }
         let turn = self
             .active
             .lock()
@@ -434,6 +444,35 @@ async fn websocket_interrupt_reaches_live_harness_turn() {
 
     app.harness.wait_until_terminated().await;
     assert_eq!(app.harness.terminated_processes().await, vec!["proc_1"]);
+    assert_eq!(app.harness.interrupted_threads().await, vec![thread_id]);
+}
+
+#[tokio::test]
+async fn websocket_interrupt_timeout_surfaces_error() {
+    let app = spawn_test_app().await;
+    app.harness
+        .set_interrupt_delay(Duration::from_secs(10))
+        .await;
+    let mut ws = app.connect_ws().await;
+    let thread_id = app.thread_id;
+
+    ws.send(ws_text(&ClientMessage::Subscribe { thread_id }))
+        .await
+        .unwrap();
+    ws.send(ws_text(&ClientMessage::SendInput {
+        thread_id,
+        text: "sleep".into(),
+    }))
+    .await
+    .unwrap();
+    app.harness.wait_until_active().await;
+
+    ws.send(ws_text(&ClientMessage::Interrupt { thread_id }))
+        .await
+        .unwrap();
+
+    let error = wait_for_error(&mut ws, "interrupt", "harness_timeout").await;
+    assert_eq!(error.thread_id, Some(thread_id));
     assert_eq!(app.harness.interrupted_threads().await, vec![thread_id]);
 }
 

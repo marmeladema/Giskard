@@ -46,6 +46,8 @@ pub struct ItemStart {
     pub kind: ItemKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<CommandExecutionStart>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<ToolCallStart>,
 }
 
 /// Normalize a command-execution status string for comparison (lowercase, `-` → `_`).
@@ -74,6 +76,19 @@ pub struct CommandExecutionStart {
     pub status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
+}
+
+/// Tool-call metadata available when a tool item starts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallStart {
+    pub name: String,
+    pub input: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at_ms: Option<i64>,
 }
@@ -203,6 +218,31 @@ mod tests {
         let json = serde_json::to_string(&payload).unwrap();
         let back: ItemPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(payload, back);
+    }
+
+    #[test]
+    fn item_start_tool_metadata_is_optional_and_roundtrips() {
+        let minimal =
+            r#"{"id":"01ARYZ6S41TSV4RRFFQ69G5FAV","harness_item_id":"tool_1","kind":"tool_call"}"#;
+        let back: ItemStart = serde_json::from_str(minimal).unwrap();
+        assert_eq!(back.tool, None);
+
+        let start = ItemStart {
+            id: ItemId::new(),
+            harness_item_id: "tool_1".into(),
+            kind: ItemKind::ToolCall,
+            command: None,
+            tool: Some(ToolCallStart {
+                name: "jira_search".into(),
+                input: serde_json::json!({ "jql": "project = ERE" }),
+                server: Some("cf-tools".into()),
+                status: Some("in_progress".into()),
+                started_at_ms: Some(1_700_000_000_000),
+            }),
+        };
+        let json = serde_json::to_string(&start).unwrap();
+        let back: ItemStart = serde_json::from_str(&json).unwrap();
+        assert_eq!(start, back);
     }
 
     #[test]

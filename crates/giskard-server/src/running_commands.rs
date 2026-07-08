@@ -267,6 +267,7 @@ mod tests {
                     process_id: Some(process_id.into()),
                     started_at_ms: Some(1_785_000_000_000),
                 }),
+                tool: None,
             },
         }
     }
@@ -321,6 +322,7 @@ mod tests {
                             process_id: Some("proc_1".into()),
                             started_at_ms: Some(1_785_000_000_000),
                         }),
+                        tool: None,
                     },
                 })
                 .await
@@ -460,6 +462,7 @@ mod tests {
                         process_id: Some("proc_1".into()),
                         started_at_ms: Some(1_785_000_000_123),
                     }),
+                    tool: None,
                 },
             })
             .await;
@@ -549,6 +552,7 @@ mod tests {
                         process_id: Some("proc_1".into()),
                         started_at_ms: Some(1_785_000_000_456),
                     }),
+                    tool: None,
                 },
             })
             .await;
