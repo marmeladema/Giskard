@@ -15,7 +15,7 @@ pub mod token;
 pub mod turn;
 pub mod user_input;
 
-pub use approval::{ApprovalDecision, ApprovalKind, ApprovalRequest};
+pub use approval::{ApprovalDecision, ApprovalKind, ApprovalMetadata, ApprovalRequest};
 pub use diff::{DiffHunk, DiffLine, FileDiff};
 pub use error::{GiskardError, HarnessError, PersistError};
 pub use event::AgentEvent;

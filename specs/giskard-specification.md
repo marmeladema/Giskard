@@ -8,7 +8,16 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.15
+**Version:** 1.16
+
+**Changelog (1.15 → 1.16), approval metadata:**
+- **A3:** `ApprovalRequest` carries structured, card-facing `metadata` entries in addition to the
+  backward-compatible `ApprovalKind` summary. Codex command approvals surface managed-network
+  hosts, proposed network/exec policy amendments, and parsed command action paths; file approvals
+  surface grant roots and changed paths; permissions approvals surface requested filesystem paths,
+  glob/special entries, and network enablement. Path metadata is rendered as plain text unless the
+  harness marks it as a validated workspace source file, in which case the browser uses the normal
+  source-overlay link controls instead of burying it in an opaque detail string.
 
 **Changelog (1.14 → 1.15), pending Codex server requests:**
 - **SR1:** Codex `ServerRequest`s are no longer rejected as the normal unsupported path.
@@ -869,12 +878,24 @@ pub struct ApprovalRequest {
     pub id: ApprovalId,
     pub kind: ApprovalKind,
     pub reason: Option<String>,
+    pub metadata: Vec<ApprovalMetadata>,      // structured host/path/detail rows for the card
     pub available: Vec<ApprovalDecision>,   // decisions the harness will accept
 }
 pub enum ApprovalKind {
     CommandExecution { command: String, cwd: PathBuf },
     FileChange       { path: PathBuf, change: FileChangeKind },
     Permission       { detail: String },    // network / extra-fs escalation
+}
+pub enum ApprovalMetadata {
+    Text { label: String, value: String },
+    Path { label: String, path: PathBuf, source_link: bool },
+    Host {
+        label: String,
+        host: String,
+        protocol: Option<String>,
+        port: Option<i64>,
+        target: Option<String>,
+    },
 }
 pub enum ApprovalDecision {
     Accept,

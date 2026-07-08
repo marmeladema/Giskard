@@ -79,6 +79,44 @@ async fn index_page_is_served_and_public() {
         "UI de-duplicates pending approval cards"
     );
     assert!(
+        body.contains("renderApprovalMetadata(body, request.metadata || [])"),
+        "approval cards render structured approval metadata"
+    );
+    assert!(
+        body.contains("approval-meta-row"),
+        "approval metadata is rendered as dedicated rows"
+    );
+    assert!(
+        body.contains("item.kind === \"path\" && item.source_link"),
+        "approval path metadata only links explicit source paths"
+    );
+    assert!(
+        body.contains("if (item.kind === \"host\") return approvalHostValue(item)"),
+        "approval host metadata is routed through the host formatter"
+    );
+    assert!(
+        body.contains("if (item.kind === \"text\") return String(item.value || \"\")"),
+        "approval text metadata is rendered from the value field"
+    );
+    assert!(
+        body.contains("if (item.protocol) value += `${item.protocol}://`;"),
+        "approval host metadata renders the protocol"
+    );
+    assert!(
+        body.contains(
+            "if (item.port !== undefined && item.port !== null) value += `:${item.port}`;"
+        ),
+        "approval host metadata renders the port"
+    );
+    assert!(
+        body.contains("if (item.target) value += ` (${item.target})`;"),
+        "approval host metadata renders the target URL/detail"
+    );
+    assert!(
+        body.contains("body.textContent = value"),
+        "plain approval metadata stays visible without source-overlay behavior"
+    );
+    assert!(
         body.contains("pendingServerRequests"),
         "UI de-duplicates pending server request cards"
     );

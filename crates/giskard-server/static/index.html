@@ -70,6 +70,10 @@
   .msg .body { min-width:0; max-width:100%; overflow-wrap:anywhere; }
   .approval-title { font-weight:600; margin-bottom:4px; }
   .approval-detail { font-family:var(--mono); font-size:12.5px; color:#f0d98c; margin-top:6px; }
+  .approval-metadata { display:grid; gap:5px; margin-top:8px; }
+  .approval-meta-row { display:grid; grid-template-columns:minmax(120px,max-content) minmax(0,1fr); gap:8px; align-items:start; font-size:12.5px; }
+  .approval-meta-label { color:var(--muted); }
+  .approval-meta-value { font-family:var(--mono); color:#f0d98c; min-width:0; overflow-wrap:anywhere; }
   .approval-actions { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
   .approval-actions button { font-size:12px; padding:4px 8px; }
   .server-request-title { font-weight:600; margin-bottom:4px; }
@@ -994,6 +998,7 @@ function renderApprovalRequest(request) {
     detailEl.textContent = detail;
     body.append(detailEl);
   }
+  renderApprovalMetadata(body, request.metadata || []);
 
   const actions = document.createElement("div");
   actions.className = "approval-actions";
@@ -1020,6 +1025,56 @@ function approvalDetail(request) {
   if (kind.kind==="file_change") return [kind.change, kind.path].filter(Boolean).join(" ");
   if (kind.kind==="permission") return kind.detail || "";
   return JSON.stringify(kind);
+}
+function renderApprovalMetadata(body, metadata) {
+  if (!Array.isArray(metadata) || !metadata.length) return;
+  const list = document.createElement("div");
+  list.className = "approval-metadata";
+  let added = false;
+  for (const item of metadata) {
+    const row = approvalMetadataRow(item || {});
+    if (!row) continue;
+    list.append(row);
+    added = true;
+  }
+  if (added) body.append(list);
+}
+function approvalMetadataRow(item) {
+  const labelText = item.label || approvalMetadataDefaultLabel(item.kind);
+  const value = approvalMetadataValue(item);
+  if (!value) return null;
+  const row = document.createElement("div");
+  row.className = "approval-meta-row";
+  const label = document.createElement("div");
+  label.className = "approval-meta-label";
+  label.textContent = labelText;
+  const body = document.createElement("div");
+  body.className = "approval-meta-value";
+  if (item.kind === "path" && item.source_link) body.append(makePathLink(item.path || "", value, null));
+  else body.textContent = value;
+  row.append(label, body);
+  return row;
+}
+function approvalMetadataDefaultLabel(kind) {
+  if (kind === "path") return "Path";
+  if (kind === "host") return "Host";
+  return "Detail";
+}
+function approvalMetadataValue(item) {
+  if (item.kind === "path") return String(item.path || "");
+  if (item.kind === "host") return approvalHostValue(item);
+  if (item.kind === "text") return String(item.value || "");
+  return "";
+}
+function approvalHostValue(item) {
+  const host = String(item.host || "");
+  if (!host) return "";
+  let value = "";
+  if (item.protocol) value += `${item.protocol}://`;
+  value += host;
+  if (item.port !== undefined && item.port !== null) value += `:${item.port}`;
+  if (item.target) value += ` (${item.target})`;
+  return value;
 }
 function addApprovalButton(container, id, decision, label, cls, available) {
   if (available.size && !available.has(decision)) return;

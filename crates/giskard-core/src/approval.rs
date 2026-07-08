@@ -11,6 +11,8 @@ pub struct ApprovalRequest {
     pub kind: ApprovalKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metadata: Vec<ApprovalMetadata>,
     /// Decisions the harness will accept.
     pub available: Vec<ApprovalDecision>,
 }
@@ -29,6 +31,32 @@ pub enum ApprovalKind {
     },
     Permission {
         detail: String,
+    },
+}
+
+/// Structured, card-facing metadata for approval prompts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ApprovalMetadata {
+    Text {
+        label: String,
+        value: String,
+    },
+    Path {
+        label: String,
+        path: PathBuf,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        source_link: bool,
+    },
+    Host {
+        label: String,
+        host: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        port: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
     },
 }
 
@@ -60,6 +88,24 @@ mod tests {
                 cwd: "/tmp/project".into(),
             },
             reason: Some("Running tests".into()),
+            metadata: vec![
+                ApprovalMetadata::Text {
+                    label: "Environment".into(),
+                    value: "env_1".into(),
+                },
+                ApprovalMetadata::Host {
+                    label: "Network host".into(),
+                    host: "api.example.com".into(),
+                    protocol: Some("https".into()),
+                    port: Some(443),
+                    target: None,
+                },
+                ApprovalMetadata::Path {
+                    label: "Write access".into(),
+                    path: "/tmp/project".into(),
+                    source_link: false,
+                },
+            ],
             available: vec![
                 ApprovalDecision::Accept,
                 ApprovalDecision::AcceptForSession,

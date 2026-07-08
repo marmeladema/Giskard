@@ -9,14 +9,16 @@ use giskard_core::ids::{ProjectId, ThreadId, TurnId};
 
 pub mod wire;
 pub use wire::{
-    WireAgentEvent, WireApprovalKind, WireApprovalRequest, WireFileDiff, WireHarnessError,
-    WireItem, WireItemPayload, WireTurn,
+    WireAgentEvent, WireApprovalKind, WireApprovalMetadata, WireApprovalRequest, WireFileDiff,
+    WireHarnessError, WireItem, WireItemPayload, WireTurn,
 };
 
 // C1/§3.5: `giskard-proto` is the single wire vocabulary. Path-free `giskard-core` domain types
 // are re-exported here so `giskard-ui` depends only on this crate; path-bearing streamed types are
 // mirrored in `wire` above.
-pub use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalRequest};
+pub use giskard_core::approval::{
+    ApprovalDecision, ApprovalKind, ApprovalMetadata, ApprovalRequest,
+};
 pub use giskard_core::diff::{DiffHunk, DiffLine};
 pub use giskard_core::error::HarnessError;
 pub use giskard_core::event::AgentEvent;

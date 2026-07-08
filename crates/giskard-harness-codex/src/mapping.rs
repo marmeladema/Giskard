@@ -1,13 +1,13 @@
 //! Mapping between `codex-codes` types and `giskard-core` types (spec §4.6).
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalRequest};
+use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalMetadata, ApprovalRequest};
 use giskard_core::diff::{DiffHunk, DiffLine, FileDiff};
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, ThreadId, TurnId};
@@ -32,7 +32,7 @@ use codex_codes::protocol::{
 /// `itemId → ItemId` (B2). The Giskard-owned ids are minted once and reused for every subsequent
 /// delta/completion carrying the same native id, so events for one turn/item stay correlated.
 pub struct CodexMapper {
-    _workspace_root: PathBuf,
+    workspace_root: PathBuf,
     thread_ids: HashMap<String, ThreadId>,
     turn_ids: HashMap<String, TurnId>,
     item_ids: HashMap<String, ItemId>,
@@ -51,7 +51,7 @@ pub struct CodexMapper {
 impl CodexMapper {
     pub fn new(workspace_root: PathBuf) -> Self {
         Self {
-            _workspace_root: workspace_root,
+            workspace_root,
             thread_ids: HashMap::new(),
             turn_ids: HashMap::new(),
             item_ids: HashMap::new(),
@@ -556,6 +556,7 @@ impl CodexMapper {
                                 .unwrap_or_default(),
                         },
                         reason: params.reason.clone(),
+                        metadata: command_approval_metadata(&self.workspace_root, params),
                         available: vec![
                             ApprovalDecision::Accept,
                             ApprovalDecision::AcceptForSession,
@@ -582,10 +583,15 @@ impl CodexMapper {
                     request: ApprovalRequest {
                         id: approval_id,
                         kind: ApprovalKind::FileChange {
-                            path: PathBuf::new(),
+                            path: params
+                                .grant_root
+                                .as_ref()
+                                .map(PathBuf::from)
+                                .unwrap_or_default(),
                             change: FileChangeKind::Modified,
                         },
                         reason: params.reason.clone(),
+                        metadata: file_change_approval_metadata(params),
                         available: vec![
                             ApprovalDecision::Accept,
                             ApprovalDecision::AcceptForSession,
@@ -618,6 +624,7 @@ impl CodexMapper {
                             detail: format_permissions_detail(&permissions),
                         },
                         reason: params.reason.clone(),
+                        metadata: permissions_approval_metadata(&self.workspace_root, params),
                         available: vec![
                             ApprovalDecision::Accept,
                             ApprovalDecision::AcceptForSession,
@@ -656,6 +663,7 @@ impl CodexMapper {
                             cwd: PathBuf::from(&params.cwd),
                         },
                         reason: params.reason.clone(),
+                        metadata: legacy_exec_approval_metadata(&self.workspace_root, params),
                         available: vec![
                             ApprovalDecision::Accept,
                             ApprovalDecision::AcceptForSession,
@@ -694,6 +702,7 @@ impl CodexMapper {
                             change: FileChangeKind::Modified,
                         },
                         reason: params.reason.clone(),
+                        metadata: legacy_patch_approval_metadata(&self.workspace_root, params),
                         available: vec![
                             ApprovalDecision::Accept,
                             ApprovalDecision::AcceptForSession,
@@ -954,6 +963,119 @@ fn map_legacy_review_decision(decision: &ApprovalDecision) -> ApprovalResponseBo
     }
 }
 
+fn command_approval_metadata(
+    workspace_root: &Path,
+    params: &codex_codes::protocol::CommandExecutionRequestApprovalParams,
+) -> Vec<ApprovalMetadata> {
+    let mut metadata = Vec::new();
+    if let Some(environment_id) = &params.environment_id {
+        add_text_metadata(&mut metadata, "Environment", environment_id);
+    }
+    if let Some(context) = &params.network_approval_context {
+        add_host_metadata(
+            &mut metadata,
+            "Network host",
+            &context.host,
+            Some(enum_string(&context.protocol)),
+            None,
+            None,
+        );
+    }
+    if let Some(amendments) = &params.proposed_network_policy_amendments {
+        for amendment in amendments {
+            add_host_metadata(
+                &mut metadata,
+                &format!("Proposed network {}", enum_string(&amendment.action)),
+                &amendment.host,
+                None,
+                None,
+                None,
+            );
+        }
+    }
+    if let Some(amendment) = &params.proposed_execpolicy_amendment {
+        let value = amendment
+            .iter()
+            .filter(|part| !part.trim().is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        add_text_metadata(&mut metadata, "Proposed exec policy", &value);
+    }
+    if let Some(actions) = &params.command_actions {
+        for action in actions {
+            add_command_action_metadata(&mut metadata, workspace_root, action);
+        }
+    }
+    metadata
+}
+
+fn file_change_approval_metadata(
+    params: &codex_codes::protocol::FileChangeRequestApprovalParams,
+) -> Vec<ApprovalMetadata> {
+    let mut metadata = Vec::new();
+    if let Some(grant_root) = &params.grant_root {
+        add_path_metadata(&mut metadata, "Grant root", grant_root, false);
+    }
+    metadata
+}
+
+fn permissions_approval_metadata(
+    workspace_root: &Path,
+    params: &codex_codes::protocol::PermissionsRequestApprovalParams,
+) -> Vec<ApprovalMetadata> {
+    let mut metadata = Vec::new();
+    add_path_metadata(&mut metadata, "Working directory", &params.cwd.0, false);
+    if let Some(environment_id) = &params.environment_id {
+        add_text_metadata(&mut metadata, "Environment", environment_id);
+    }
+    add_permission_profile_metadata(&mut metadata, workspace_root, &params.permissions);
+    metadata
+}
+
+fn legacy_exec_approval_metadata(
+    workspace_root: &Path,
+    params: &codex_codes::protocol::ExecCommandApprovalParams,
+) -> Vec<ApprovalMetadata> {
+    let mut metadata = Vec::new();
+    if let Some(approval_id) = &params.approval_id {
+        add_text_metadata(&mut metadata, "Approval id", approval_id);
+    }
+    for parsed in &params.parsed_cmd {
+        add_parsed_command_metadata(&mut metadata, workspace_root, parsed);
+    }
+    metadata
+}
+
+fn legacy_patch_approval_metadata(
+    workspace_root: &Path,
+    params: &codex_codes::protocol::ApplyPatchApprovalParams,
+) -> Vec<ApprovalMetadata> {
+    let mut metadata = Vec::new();
+    if let Some(grant_root) = &params.grant_root {
+        add_path_metadata(&mut metadata, "Grant root", grant_root, false);
+    }
+    for (path, change) in &params.file_changes {
+        add_workspace_path_metadata(
+            &mut metadata,
+            workspace_root,
+            &format!(
+                "File {}",
+                file_change_label(legacy_file_change_kind(change))
+            ),
+            path,
+        );
+        if let codex_codes::protocol::FileChange::Update {
+            move_path: Some(move_path),
+            ..
+        } = change
+        {
+            add_workspace_path_metadata(&mut metadata, workspace_root, "Move target", move_path);
+        }
+    }
+    metadata
+}
+
 fn command_approval_preview(
     params: &codex_codes::protocol::CommandExecutionRequestApprovalParams,
 ) -> String {
@@ -973,6 +1095,124 @@ fn command_action_command(action: &codex_codes::protocol::CommandAction) -> Opti
         | codex_codes::protocol::CommandAction::Unknown { command } => command,
     };
     (!command.trim().is_empty()).then(|| command.clone())
+}
+
+fn add_command_action_metadata(
+    metadata: &mut Vec<ApprovalMetadata>,
+    workspace_root: &Path,
+    action: &codex_codes::protocol::CommandAction,
+) {
+    match action {
+        codex_codes::protocol::CommandAction::Read { name, path, .. } => {
+            add_workspace_path_metadata(metadata, workspace_root, "Read path", &path.0);
+            add_text_metadata(metadata, "Read name", name);
+        }
+        codex_codes::protocol::CommandAction::ListFiles { path, .. } => {
+            if let Some(path) = path {
+                add_workspace_path_metadata(metadata, workspace_root, "List path", path);
+            }
+        }
+        codex_codes::protocol::CommandAction::Search { path, query, .. } => {
+            if let Some(path) = path {
+                add_workspace_path_metadata(metadata, workspace_root, "Search path", path);
+            }
+            if let Some(query) = query {
+                add_text_metadata(metadata, "Search query", query);
+            }
+        }
+        codex_codes::protocol::CommandAction::Unknown { .. } => {}
+    }
+}
+
+fn add_parsed_command_metadata(
+    metadata: &mut Vec<ApprovalMetadata>,
+    workspace_root: &Path,
+    parsed: &codex_codes::protocol::ParsedCommand,
+) {
+    match parsed {
+        codex_codes::protocol::ParsedCommand::Read { name, path, .. } => {
+            add_workspace_path_metadata(metadata, workspace_root, "Read path", path);
+            add_text_metadata(metadata, "Read name", name);
+        }
+        codex_codes::protocol::ParsedCommand::List_files { path, .. } => {
+            if let Some(path) = path {
+                add_workspace_path_metadata(metadata, workspace_root, "List path", path);
+            }
+        }
+        codex_codes::protocol::ParsedCommand::Search { path, query, .. } => {
+            if let Some(path) = path {
+                add_workspace_path_metadata(metadata, workspace_root, "Search path", path);
+            }
+            if let Some(query) = query {
+                add_text_metadata(metadata, "Search query", query);
+            }
+        }
+        codex_codes::protocol::ParsedCommand::Unknown { .. } => {}
+    }
+}
+
+fn add_permission_profile_metadata(
+    metadata: &mut Vec<ApprovalMetadata>,
+    workspace_root: &Path,
+    permissions: &codex_codes::protocol::RequestPermissionProfile,
+) {
+    if let Some(file_system) = &permissions.file_system {
+        add_file_system_permissions_metadata(metadata, workspace_root, file_system);
+    }
+    if let Some(network) = &permissions.network {
+        if let Some(enabled) = network.enabled {
+            add_text_metadata(
+                metadata,
+                "Network access",
+                if enabled { "enabled" } else { "disabled" },
+            );
+        }
+    }
+}
+
+fn add_file_system_permissions_metadata(
+    metadata: &mut Vec<ApprovalMetadata>,
+    workspace_root: &Path,
+    file_system: &codex_codes::protocol::AdditionalFileSystemPermissions,
+) {
+    if let Some(entries) = &file_system.entries {
+        for entry in entries {
+            let label = format!("Filesystem {}", enum_string(&entry.access));
+            add_file_system_path_metadata(metadata, workspace_root, &label, &entry.path);
+        }
+    }
+    if let Some(read_paths) = &file_system.read {
+        for path in read_paths {
+            add_workspace_path_metadata(metadata, workspace_root, "Filesystem read", &path.0);
+        }
+    }
+    if let Some(write_paths) = &file_system.write {
+        for path in write_paths {
+            add_workspace_path_metadata(metadata, workspace_root, "Filesystem write", &path.0);
+        }
+    }
+    if let Some(depth) = file_system.glob_scan_max_depth {
+        add_text_metadata(metadata, "Glob scan max depth", &depth.to_string());
+    }
+}
+
+fn add_file_system_path_metadata(
+    metadata: &mut Vec<ApprovalMetadata>,
+    workspace_root: &Path,
+    label: &str,
+    path: &codex_codes::protocol::FileSystemPath,
+) {
+    match path {
+        codex_codes::protocol::FileSystemPath::Path { path } => {
+            add_workspace_path_metadata(metadata, workspace_root, label, &path.0);
+        }
+        codex_codes::protocol::FileSystemPath::Glob_pattern { pattern } => {
+            add_text_metadata(metadata, label, &format!("glob: {pattern}"));
+        }
+        codex_codes::protocol::FileSystemPath::Special { value } => {
+            add_text_metadata(metadata, label, &format!("special: {}", enum_string(value)));
+        }
+    }
 }
 
 fn request_id_to_string(id: &RequestId) -> String {
@@ -1010,6 +1250,102 @@ fn legacy_patch_preview_path(params: &codex_codes::protocol::ApplyPatchApprovalP
         .next()
         .map(PathBuf::from)
         .unwrap_or_default()
+}
+
+fn legacy_file_change_kind(change: &codex_codes::protocol::FileChange) -> FileChangeKind {
+    match change {
+        codex_codes::protocol::FileChange::Add { .. } => FileChangeKind::Created,
+        codex_codes::protocol::FileChange::Delete { .. } => FileChangeKind::Deleted,
+        codex_codes::protocol::FileChange::Update { .. } => FileChangeKind::Modified,
+    }
+}
+
+fn add_text_metadata(metadata: &mut Vec<ApprovalMetadata>, label: &str, value: &str) {
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+    metadata.push(ApprovalMetadata::Text {
+        label: label.into(),
+        value: value.into(),
+    });
+}
+
+fn add_workspace_path_metadata(
+    metadata: &mut Vec<ApprovalMetadata>,
+    workspace_root: &Path,
+    label: &str,
+    path: &str,
+) {
+    add_path_metadata(
+        metadata,
+        label,
+        path,
+        source_link_for_path(workspace_root, path),
+    );
+}
+
+fn add_path_metadata(
+    metadata: &mut Vec<ApprovalMetadata>,
+    label: &str,
+    path: &str,
+    source_link: bool,
+) {
+    let path = path.trim();
+    if path.is_empty() {
+        return;
+    }
+    metadata.push(ApprovalMetadata::Path {
+        label: label.into(),
+        path: PathBuf::from(path),
+        source_link,
+    });
+}
+
+fn source_link_for_path(workspace_root: &Path, path: &str) -> bool {
+    let path = path.trim();
+    if path.is_empty() {
+        return false;
+    }
+    let Ok(root) = std::fs::canonicalize(workspace_root) else {
+        return false;
+    };
+    let path = Path::new(path);
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace_root.join(path)
+    };
+    let Ok(metadata) = std::fs::metadata(&candidate) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    std::fs::canonicalize(candidate)
+        .map(|path| path.starts_with(root))
+        .unwrap_or(false)
+}
+
+fn add_host_metadata(
+    metadata: &mut Vec<ApprovalMetadata>,
+    label: &str,
+    host: &str,
+    protocol: Option<String>,
+    port: Option<i64>,
+    target: Option<String>,
+) {
+    let host = host.trim();
+    if host.is_empty() {
+        return;
+    }
+    metadata.push(ApprovalMetadata::Host {
+        label: label.into(),
+        host: host.into(),
+        protocol: protocol.filter(|value| !value.trim().is_empty()),
+        port,
+        target: target.filter(|value| !value.trim().is_empty()),
+    });
 }
 
 fn server_request_params(request: &CodexServerRequest) -> Value {
@@ -1751,6 +2087,79 @@ mod tests {
         }
     }
 
+    fn test_workspace(name: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "giskard-approval-metadata-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_test_file(root: &Path, relative: &str, content: &str) -> PathBuf {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    fn metadata_has_host(
+        metadata: &[ApprovalMetadata],
+        label: &str,
+        host: &str,
+        protocol: Option<&str>,
+    ) -> bool {
+        metadata.iter().any(|item| {
+            matches!(
+                item,
+                ApprovalMetadata::Host {
+                    label: got_label,
+                    host: got_host,
+                    protocol: got_protocol,
+                    ..
+                } if got_label == label
+                    && got_host == host
+                    && got_protocol.as_deref() == protocol
+            )
+        })
+    }
+
+    fn metadata_has_path(
+        metadata: &[ApprovalMetadata],
+        label: &str,
+        path: &str,
+        source_link: bool,
+    ) -> bool {
+        metadata.iter().any(|item| {
+            matches!(
+                item,
+                ApprovalMetadata::Path {
+                    label: got_label,
+                    path: got_path,
+                    source_link: got_source_link,
+                } if got_label == label
+                    && got_path == &PathBuf::from(path)
+                    && *got_source_link == source_link
+            )
+        })
+    }
+
+    fn metadata_has_text(metadata: &[ApprovalMetadata], label: &str, value: &str) -> bool {
+        metadata.iter().any(|item| {
+            matches!(
+                item,
+                ApprovalMetadata::Text {
+                    label: got_label,
+                    value: got_value,
+                } if got_label == label && got_value == value
+            )
+        })
+    }
+
     /// Usage from a `thread/tokenUsage/updated` notification is cached per turn and surfaced on the
     /// matching `TurnCompleted` (spec §10.1) — regression guard for the previous zero stub.
     #[test]
@@ -1851,12 +2260,34 @@ mod tests {
 
     #[test]
     fn permissions_request_maps_to_approval_and_codex_response_shape() {
-        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let workspace = test_workspace("permissions");
+        let cwd = workspace.to_string_lossy().to_string();
+        let source_path = write_test_file(&workspace, "src/lib.rs", "pub fn lib() {}\n");
+        let readme_path = write_test_file(&workspace, "README.md", "# Test\n");
+        let generated_path = workspace.join("generated.rs").to_string_lossy().to_string();
+        let outside_workspace = test_workspace("permissions-outside");
+        let outside_path = write_test_file(&outside_workspace, "secret.rs", "fn secret() {}\n");
+        let mut mapper = CodexMapper::new(workspace);
         let request = CodexServerRequest::PermissionsRequestApproval(
             serde_json::from_value(serde_json::json!({
-                "cwd": "/tmp/project",
+                "cwd": cwd,
                 "itemId": "perm1",
                 "permissions": {
+                    "fileSystem": {
+                        "entries": [
+                            {
+                                "access": "write",
+                                "path": { "type": "path", "path": source_path }
+                            },
+                            {
+                                "access": "read",
+                                "path": { "type": "glob_pattern", "pattern": "src/**/*.rs" }
+                            }
+                        ],
+                        "read": [readme_path, outside_path],
+                        "write": [generated_path],
+                        "globScanMaxDepth": 3
+                    },
                     "network": { "enabled": true }
                 },
                 "reason": "Need network access",
@@ -1873,6 +2304,51 @@ mod tests {
                 assert_eq!(request.id, ApprovalId("perm_req".into()));
                 assert!(matches!(request.kind, ApprovalKind::Permission { .. }));
                 assert_eq!(request.reason.as_deref(), Some("Need network access"));
+                assert!(metadata_has_path(
+                    &request.metadata,
+                    "Working directory",
+                    &cwd,
+                    false
+                ));
+                assert!(metadata_has_path(
+                    &request.metadata,
+                    "Filesystem write",
+                    &source_path.to_string_lossy(),
+                    true
+                ));
+                assert!(metadata_has_text(
+                    &request.metadata,
+                    "Filesystem read",
+                    "glob: src/**/*.rs"
+                ));
+                assert!(metadata_has_path(
+                    &request.metadata,
+                    "Filesystem read",
+                    &readme_path.to_string_lossy(),
+                    true
+                ));
+                assert!(metadata_has_path(
+                    &request.metadata,
+                    "Filesystem read",
+                    &outside_path.to_string_lossy(),
+                    false
+                ));
+                assert!(metadata_has_path(
+                    &request.metadata,
+                    "Filesystem write",
+                    &generated_path,
+                    false
+                ));
+                assert!(metadata_has_text(
+                    &request.metadata,
+                    "Network access",
+                    "enabled"
+                ));
+                assert!(metadata_has_text(
+                    &request.metadata,
+                    "Glob scan max depth",
+                    "3"
+                ));
             }
             other => panic!("expected permissions approval, got {other:?}"),
         }
@@ -1931,19 +2407,38 @@ mod tests {
 
     #[test]
     fn command_approval_uses_command_actions_for_preview() {
-        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let workspace = test_workspace("command");
+        let read_path = write_test_file(&workspace, "src/lib.rs", "pub fn lib() {}\n");
+        let search_path = workspace.join("src").to_string_lossy().to_string();
+        let cwd = workspace.to_string_lossy().to_string();
+        let mut mapper = CodexMapper::new(workspace);
         let request = CodexServerRequest::CmdExecApproval(
             serde_json::from_value(serde_json::json!({
                 "commandActions": [
                     {
                         "type": "search",
                         "command": "rg marmeladema tf",
-                        "path": "tf",
+                        "path": search_path,
                         "query": "marmeladema"
+                    },
+                    {
+                        "type": "read",
+                        "command": "cat src/lib.rs",
+                        "name": "lib.rs",
+                        "path": read_path
                     }
                 ],
-                "cwd": "/tmp/project",
+                "cwd": cwd,
+                "environmentId": "env_1",
                 "itemId": "cmd1",
+                "networkApprovalContext": {
+                    "host": "api.openai.com",
+                    "protocol": "https"
+                },
+                "proposedExecpolicyAmendment": ["rg marmeladema tf"],
+                "proposedNetworkPolicyAmendments": [
+                    { "action": "allow", "host": "api.openai.com" }
+                ],
                 "threadId": "thread1",
                 "turnId": "turn1",
                 "startedAtMs": 123
@@ -1959,9 +2454,79 @@ mod tests {
             AgentEvent::ApprovalRequested { request, .. } => match request.kind {
                 ApprovalKind::CommandExecution { command, .. } => {
                     assert_eq!(command, "rg marmeladema tf");
+                    assert!(metadata_has_text(&request.metadata, "Environment", "env_1"));
+                    assert!(metadata_has_host(
+                        &request.metadata,
+                        "Network host",
+                        "api.openai.com",
+                        Some("https")
+                    ));
+                    assert!(metadata_has_host(
+                        &request.metadata,
+                        "Proposed network allow",
+                        "api.openai.com",
+                        None
+                    ));
+                    assert!(metadata_has_text(
+                        &request.metadata,
+                        "Proposed exec policy",
+                        "rg marmeladema tf"
+                    ));
+                    assert!(metadata_has_path(
+                        &request.metadata,
+                        "Search path",
+                        &search_path,
+                        false
+                    ));
+                    assert!(metadata_has_path(
+                        &request.metadata,
+                        "Read path",
+                        &read_path.to_string_lossy(),
+                        true
+                    ));
+                    assert!(metadata_has_text(
+                        &request.metadata,
+                        "Search query",
+                        "marmeladema"
+                    ));
                 }
                 other => panic!("expected command approval, got {other:?}"),
             },
+            other => panic!("expected command approval event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn approval_metadata_skips_empty_values() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let request = CodexServerRequest::CmdExecApproval(
+            serde_json::from_value(serde_json::json!({
+                "commandActions": [],
+                "cwd": "/tmp/project",
+                "itemId": "cmd1",
+                "networkApprovalContext": {
+                    "host": "",
+                    "protocol": "https"
+                },
+                "proposedExecpolicyAmendment": ["", "  "],
+                "proposedNetworkPolicyAmendments": [
+                    { "action": "allow", "host": "" }
+                ],
+                "threadId": "thread1",
+                "turnId": "turn1",
+                "startedAtMs": 123
+            }))
+            .unwrap(),
+        );
+
+        match mapper.map_server_request(
+            &RequestId::String("cmd_req".into()),
+            &request,
+            ThreadId::new(),
+        ) {
+            AgentEvent::ApprovalRequested { request, .. } => {
+                assert!(request.metadata.is_empty());
+            }
             other => panic!("expected command approval event, got {other:?}"),
         }
     }
@@ -2019,11 +2584,26 @@ mod tests {
             }))
             .unwrap(),
         );
-        mapper.map_server_request(
+        match mapper.map_server_request(
             &RequestId::String("file_req".into()),
             &request,
             ThreadId::new(),
-        );
+        ) {
+            AgentEvent::ApprovalRequested { request, .. } => match request.kind {
+                ApprovalKind::FileChange { path, change } => {
+                    assert_eq!(path, PathBuf::from("/tmp/project"));
+                    assert_eq!(change, FileChangeKind::Modified);
+                    assert!(metadata_has_path(
+                        &request.metadata,
+                        "Grant root",
+                        "/tmp/project",
+                        false
+                    ));
+                }
+                other => panic!("expected file-change approval, got {other:?}"),
+            },
+            other => panic!("expected file-change approval event, got {other:?}"),
+        }
 
         let value = approval_result_value(
             mapper
@@ -2043,23 +2623,58 @@ mod tests {
 
     #[test]
     fn legacy_apply_patch_approval_response_matches_codex_schema() {
-        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let workspace = test_workspace("legacy-patch");
+        write_test_file(&workspace, "src/main.rs", "fn main() {}\n");
+        let mut mapper = CodexMapper::new(workspace);
         let request = CodexServerRequest::ApplyPatchApproval(
             serde_json::from_value(serde_json::json!({
                 "callId": "call1",
                 "conversationId": "thread1",
                 "fileChanges": {
-                    "src/lib.rs": { "type": "add", "content": "" }
+                    "src/lib.rs": { "type": "add", "content": "" },
+                    "src/main.rs": {
+                        "type": "update",
+                        "move_path": "src/bin/main.rs",
+                        "unified_diff": "@@ -1 +1 @@\n-old\n+new"
+                    }
                 },
                 "grantRoot": "/tmp/project"
             }))
             .unwrap(),
         );
-        mapper.map_server_request(
+        match mapper.map_server_request(
             &RequestId::String("patch_req".into()),
             &request,
             ThreadId::new(),
-        );
+        ) {
+            AgentEvent::ApprovalRequested { request, .. } => {
+                assert!(metadata_has_path(
+                    &request.metadata,
+                    "Grant root",
+                    "/tmp/project",
+                    false
+                ));
+                assert!(metadata_has_path(
+                    &request.metadata,
+                    "File created",
+                    "src/lib.rs",
+                    false
+                ));
+                assert!(metadata_has_path(
+                    &request.metadata,
+                    "File modified",
+                    "src/main.rs",
+                    true
+                ));
+                assert!(metadata_has_path(
+                    &request.metadata,
+                    "Move target",
+                    "src/bin/main.rs",
+                    false
+                ));
+            }
+            other => panic!("expected patch approval event, got {other:?}"),
+        }
 
         let value = approval_result_value(
             mapper
@@ -2260,13 +2875,24 @@ mod tests {
 
     #[test]
     fn legacy_exec_command_approval_uses_review_decision_shape() {
-        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let workspace = test_workspace("legacy-exec");
+        write_test_file(&workspace, "src/lib.rs", "pub fn lib() {}\n");
+        let cwd_string = workspace.to_string_lossy().to_string();
+        let mut mapper = CodexMapper::new(workspace);
         let request = CodexServerRequest::ExecCommandApproval(
             serde_json::from_value(serde_json::json!({
                 "callId": "call1",
                 "conversationId": "thread1",
                 "command": ["cargo", "test"],
-                "cwd": "/tmp/project"
+                "cwd": cwd_string,
+                "parsedCmd": [
+                    {
+                        "type": "read",
+                        "cmd": "cat src/lib.rs",
+                        "name": "lib.rs",
+                        "path": "src/lib.rs"
+                    }
+                ]
             }))
             .unwrap(),
         );
@@ -2279,7 +2905,14 @@ mod tests {
             AgentEvent::ApprovalRequested { request, .. } => match request.kind {
                 ApprovalKind::CommandExecution { command, cwd } => {
                     assert_eq!(command, "cargo test");
-                    assert_eq!(cwd, PathBuf::from("/tmp/project"));
+                    assert_eq!(cwd, PathBuf::from(&cwd_string));
+                    assert!(metadata_has_path(
+                        &request.metadata,
+                        "Read path",
+                        "src/lib.rs",
+                        true
+                    ));
+                    assert!(metadata_has_text(&request.metadata, "Read name", "lib.rs"));
                 }
                 other => panic!("expected command approval, got {other:?}"),
             },
