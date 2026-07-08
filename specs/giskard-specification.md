@@ -8,7 +8,39 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.11
+**Version:** 1.12
+
+**Changelog (1.11 → 1.12), live-turn interruption and running commands:**
+- **I1:** The browser exposes a Stop control while a turn is live and sends
+  `Interrupt { thread_id }`; the control is disabled while the interrupt request is in flight.
+- **I2:** Harness adapters must be able to process interrupt/control commands while a turn is
+  streaming, not only while waiting for an approval request. Normal queued user messages remain a
+  separate policy decision.
+- **R1:** Command execution items are surfaced as transcript rows with live output, elapsed time,
+  lifecycle status, and a Stop control when the harness supplies a process id.
+- **R2:** The right context panel includes a running-command summary. Selecting a summary row
+  scrolls to and selects the matching transcript command row.
+- **R3:** The server maintains a running-command registry from command start/output/completion
+  events, separate from the live-turn buffer, and broadcasts `RunningCommands` snapshots on
+  subscribe and after registry changes.
+- **R4:** Harness adapters that can observe command lifecycle notifications after `TurnCompleted`
+  continue draining them while commands are known running. Late terminal command completions update
+  the running-command registry and may be broadcast to connected clients without mutating persisted
+  completed turn history.
+- **R5:** Command rows and summaries distinguish running, succeeded, failed, and
+  terminated/declined/interrupted states with both a fixed symbol and subtle state color.
+- **R6:** `TerminateCommand { thread_id, process_id }` is a request to the active harness. Giskard
+  must not terminate local processes directly. For Codex agent `CommandExecution` items, the
+  Codex harness maps stop requests to `turn/interrupt { threadId, turnId }` using the native Codex
+  turn id that owns the command process; it must not use `command/exec/terminate` for these items.
+- **R7:** A command marked `terminating` means "stop requested through the harness", not "process
+  terminated". The browser labels this state as "stop requested" and preserves the later terminal
+  command status reported by Codex. If Codex reports normal successful completion after a stop
+  request, the command row shows the successful completion annotated with "stop requested" and the
+  server logs a structured warning.
+- **R8:** Stop-request failures are surfaced through the normal structured `Error` path and the
+  command remains visible with `terminating: false`. Codex's "no active command/exec for process
+  id" response is treated as stale-state cleanup only for commands already marked `after_turn`.
 
 **Changelog (1.10 → 1.11), source target positioning:**
 - **L7:** Opening a source link with a target line centers that line in the code overlay viewport
@@ -659,7 +691,31 @@ pub struct Turn {
 pub struct ItemStart {                // B5: renamed from `ItemStarted` (collides with the event variant)
     pub id: ItemId,                   // Giskard-owned (B2)
     pub harness_item_id: String,      // native id, used to correlate deltas/completion
-    pub kind: ItemKind,               // discriminant only; payload fills in on completion
+    pub kind: ItemKind,               // discriminant; payload fills in on completion
+    pub command: Option<CommandExecutionStart>, // present for command items when known
+}
+
+pub struct CommandExecutionStart {
+    pub command: String,
+    pub cwd: String,                  // wire-safe display path
+    pub status: Option<String>,       // e.g. in_progress
+    pub process_id: Option<String>,   // enables terminate when present
+    pub started_at_ms: Option<i64>,   // Unix epoch ms when supplied by the harness
+}
+
+pub struct RunningCommand {
+    pub thread_id: ThreadId,
+    pub turn_id: TurnId,
+    pub item_id: ItemId,              // transcript row to select/scroll to
+    pub harness_item_id: String,
+    pub command: String,
+    pub cwd: String,                  // wire-safe display path
+    pub status: String,               // in_progress / running-like while present
+    pub process_id: Option<String>,   // enables terminate when present
+    pub started_at_ms: i64,           // server-observed fallback when harness omits it
+    pub output: String,               // bounded output tail for the right-panel summary
+    pub after_turn: bool,             // true when the turn ended but the command is still known
+    pub terminating: bool,             // true while waiting for a terminal event after terminate
 }
 
 pub enum ItemKind {
@@ -690,6 +746,9 @@ pub enum ItemPayload {
         cwd: PathBuf,
         output: String,               // accumulated stdout+stderr
         exit_code: Option<i32>,
+        status: Option<String>,       // completed / failed / in_progress / declined
+        process_id: Option<String>,   // retained for UI correlation / terminate affordance
+        duration_ms: Option<i64>,     // completed command elapsed time when supplied
     },
     FileChange {
         path: PathBuf,                  // summary/back-compat path
@@ -1116,7 +1175,9 @@ Flow: user clicks "New project" → names it → picks a directory via the file 
   holds the display history from disk. If resume-by-id fails (Codex store purged/rotated), the
   harness falls back to a fresh native thread and warns that agent context was lost, keeping the
   Giskard history intact (C5, §4.7).
-- **Interrupt:** user can interrupt an in-flight turn (`turn/interrupt`).
+- **Interrupt:** user can interrupt an in-flight turn (`turn/interrupt`). The UI exposes this as a
+  live-turn Stop control; sending another user message while a turn is still live is a separate
+  queueing policy and is not implied by interrupt support.
 - **Rename / delete:** thread title editable; delete removes the thread file (§5.5).
 
 ### 7.2 Titles
@@ -1555,7 +1616,11 @@ sessions, so clarity and low visual noise beat flourish. Explicitly avoid the ge
   model names are always monospace so they read as "things you can click / act on".
 - **Structure encodes state,** not decoration: mode (Plan/Build), model, and approval policy
   are always visible and legible at a glance in the thread header; a running turn has a clear
-  live indicator.
+  live indicator. Running commands are shown both inline in the transcript and as a summary in
+  the right context panel; selecting a summary entry scrolls to the transcript command row.
+  Command lifecycle state is shown with a non-color cue plus subtle color: `●` amber for running,
+  `✓` green for succeeded, `✕` red for failed, and `■` muted gray/orange for terminated or
+  declined.
 - **Signature element:** the **thread transcript** treated as a first-class typed document —
   agent text, collapsible reasoning, command blocks with streamed output, and inline
   linkified paths — paired with the **context-window gauge** as a persistent, honest read on
@@ -1593,7 +1658,8 @@ sessions, so clarity and low visual noise beat flourish. Explicitly avoid the ge
   "new project" action.
 - **Center:** thread header (mode, model, approval policy, context gauge, plan-dump &
   interrupt actions) + transcript + composer.
-- **Right context panel:** tabbed — **Diffs** (side-by-side), **Code overlay**, **Tokens**.
+- **Right context panel:** running-command summary plus tabbed **Diffs** (side-by-side), **Code
+  overlay**, **Tokens**.
 
 ### 13.4 Responsive (smartphone)
 
@@ -1634,8 +1700,8 @@ This guarantees a coherent experience when a future, less-capable harness is plu
 **Client → server** (examples): `Subscribe { thread_id }`, `Unsubscribe { thread_id }`,
 `SendInput { thread_id, text }`, `SwitchMode { thread_id, mode }`,
 `SelectModel { thread_id, model_ref }`, `SetApprovalPolicy { thread_id?, project_id?, policy }`,
-`Interrupt { thread_id }`, `ApprovalDecision { request_id, decision }`,
-`SavePlan { thread_id, path }`.
+`Interrupt { thread_id }`, `TerminateCommand { thread_id, process_id }`,
+`ApprovalDecision { request_id, decision }`, `SavePlan { thread_id, path }`.
 
 > **Durable settings switches (P2/P3).** `SwitchMode`, `SelectModel`, and `SetApprovalPolicy`
 > persist immediately to `<thread_id>.json` (or `project.json` for project-scoped policy) before
@@ -1653,6 +1719,8 @@ This guarantees a coherent experience when a future, less-capable harness is plu
 `ThreadState { thread_id, state }` (persisted snapshot on subscribe/resync),
 `LiveTurnSnapshot { thread_id, turn_id, accumulated, pending_approval? }` (in-flight turn
 reconstruction on reconnect, carrying `WireAgentEvent`s + a `WireApprovalRequest`),
+`RunningCommands { thread_id, commands: [RunningCommand] }` (commands still known to be running,
+including commands that outlived an interrupted turn),
 `TokenUpdate { scope, ledger }`, `ApprovalRequest { thread_id, request }` (a `WireApprovalRequest`),
 `Error { code, severity, message, detail?, thread_id?, action? }`, `Pong`.
 
@@ -1701,6 +1769,33 @@ WebSocket events.
   approval prompt (so approvals are never lost across a reconnect). The live buffer is bounded
   (coalesced/truncated for very long command output, keeping head+tail) to cap memory; the
   authoritative full output still lands on disk at `TurnCompleted`.
+- **Running-command resync.** Commands can outlive an interrupted turn even after the live buffer is
+  discarded. The server therefore keeps a separate in-memory running-command registry keyed by
+  `thread_id` + `item_id`, updated from command item start/output/completion events. On subscribe,
+  and after each registry change, the server sends `RunningCommands`; the browser renders these in
+  the right context panel and maps `item_id` back to the transcript command row for select/scroll.
+  `TerminateCommand` requests are forwarded to the active harness. Giskard must not terminate
+  local processes directly; Codex-owned command processes are stopped only through the Codex
+  app-server protocol. Codex agent command executions are not standalone `command/exec` sessions,
+  so the Codex harness maps terminate requests for those items to `turn/interrupt` with the native
+  Codex turn id that owns the command process. It must not use `command/exec/terminate` for agent
+  command execution items. When the harness accepts a terminate request, the matching command
+  remains in the registry with `terminating: true` until a terminal command event arrives, but the
+  browser labels this state as "stop requested" rather than "terminated" or "terminating". A
+  successful terminate request is not itself proof that the process has stopped. If Codex later
+  reports a normal successful completion, the browser preserves the successful status and annotates
+  it with "stop requested"; the server logs a warning that Codex did not terminate the process.
+  Codex's "no active command/exec for process id" response is treated as stale-state cleanup only
+  for commands already marked `after_turn`; for live commands it is surfaced through the normal
+  structured `Error` path and the command remains visible with `terminating: false`.
+  Harness adapters that can observe post-turn command lifecycle messages must keep draining them
+  while any command is known running. When a late terminal command completion arrives for an
+  already-persisted turn, the server updates `RunningCommands` and may broadcast the terminal
+  `ItemCompleted` event to connected clients, but it does not mutate the already-appended JSONL
+  turn record.
+  Running-command snapshots include `started_at_ms`; clients use it to render elapsed time and
+  refresh that display about once per second. Completed command payloads include `duration_ms`
+  when the harness supplies it; clients render terminal outcome text from the status plus duration.
 - **Auth:** the WS upgrade validates the session cookie (§12).
 
 ### 13.7 JavaScript glue policy

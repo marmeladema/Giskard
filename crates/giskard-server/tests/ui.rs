@@ -43,6 +43,138 @@ async fn index_page_is_served_and_public() {
     );
     assert!(body.contains("send_input"), "composer wired to SendInput");
     assert!(
+        body.contains("id=\"stopBtn\""),
+        "UI exposes a stop button for live turns"
+    );
+    assert!(
+        body.contains("type:\"interrupt\""),
+        "stop button sends the Interrupt client message"
+    );
+    assert!(
+        body.contains("activeTurn"),
+        "UI tracks active turns for interrupt controls"
+    );
+    assert!(
+        body.contains("ctxCommands"),
+        "right panel exposes a running command summary"
+    );
+    assert!(
+        body.contains("case \"running_commands\""),
+        "UI consumes server-owned running command snapshots"
+    );
+    assert!(
+        body.contains("commandBodyElsByItemId"),
+        "UI tracks running command transcript rows after finalization"
+    );
+    assert!(
+        body.contains("commandIsRunningStatus"),
+        "UI keeps in-progress completed command items visible"
+    );
+    assert!(
+        body.contains("setInterval(updateRunningCommandDurations, 1000)"),
+        "UI refreshes running command durations once per second"
+    );
+    assert!(
+        body.contains("terminalCommandStatus"),
+        "UI renders terminal command status with elapsed duration"
+    );
+    assert!(
+        body.contains("commandStopRequestedByItemId"),
+        "UI remembers stop requests until terminal command status arrives"
+    );
+    assert!(
+        body.contains("stop requested after"),
+        "UI labels pending command termination as a stop request"
+    );
+    assert!(
+        body.contains("(stop requested)"),
+        "UI annotates terminal command status after a stop request"
+    );
+    assert!(
+        body.contains("No longer tracked"),
+        "UI has a non-terminal fallback for stale stopped command snapshots"
+    );
+    assert!(
+        !body.contains("terminatedByUser && p.status"),
+        "UI must not rewrite successful terminal status to terminated"
+    );
+    assert!(
+        body.contains("commandVisualStateFromStatus"),
+        "UI maps command statuses to visual states"
+    );
+    assert!(
+        body.contains("commandStateSymbol"),
+        "UI renders command state symbols"
+    );
+    assert!(
+        body.contains("cmd-symbol"),
+        "UI includes a non-color command state cue"
+    );
+    assert!(
+        body.contains("state-running"),
+        "UI styles running command state"
+    );
+    assert!(
+        body.contains("state-succeeded"),
+        "UI styles succeeded command state"
+    );
+    assert!(
+        body.contains("state-failed"),
+        "UI styles failed command state"
+    );
+    assert!(
+        body.contains("state-terminated"),
+        "UI styles terminated command state"
+    );
+    assert!(
+        body.contains("s===\"completed\" || s===\"succeeded\" || s===\"success\""),
+        "UI maps successful command statuses to succeeded state"
+    );
+    assert!(
+        body.contains("s===\"failed\" || s===\"error\""),
+        "UI maps failed command statuses to failed state"
+    );
+    assert!(
+        body.contains("s===\"terminated\" || s===\"declined\""),
+        "UI maps terminated and declined command statuses to terminated state"
+    );
+    assert!(
+        body.contains("if (stateName===\"succeeded\") return \"✓\""),
+        "UI renders the succeeded command symbol"
+    );
+    assert!(
+        body.contains("if (stateName===\"failed\") return \"✕\""),
+        "UI renders the failed command symbol"
+    );
+    assert!(
+        body.contains("if (stateName===\"terminated\") return \"■\""),
+        "UI renders the terminated command symbol"
+    );
+    assert!(
+        body.contains("return \"●\""),
+        "UI renders the running command symbol"
+    );
+    assert!(
+        !body.contains(".cmd-status::before"),
+        "command state symbols are DOM content, not CSS-only decoration"
+    );
+    assert!(
+        body.contains("startedAtMs"),
+        "UI tracks command start timestamps for elapsed duration"
+    );
+    assert!(
+        body.contains("selectCommand"),
+        "running command summary can select transcript command rows"
+    );
+    assert!(
+        body.contains("type:\"terminate_command\""),
+        "running command controls send terminate requests"
+    );
+    assert!(
+        body.contains("running-command"),
+        "transcript command rows expose running command state"
+    );
+    assert!(
         body.contains("pendingClientMsgs"),
         "messages are queued while WS connects"
     );

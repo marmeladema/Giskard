@@ -21,7 +21,9 @@ pub use giskard_core::diff::{DiffHunk, DiffLine};
 pub use giskard_core::error::HarnessError;
 pub use giskard_core::event::AgentEvent;
 pub use giskard_core::ids::{ApprovalId, ItemId};
-pub use giskard_core::item::{FileChangeEntry, FileChangeKind, ItemDelta, ItemKind, ItemStart};
+pub use giskard_core::item::{
+    CommandExecutionStart, FileChangeEntry, FileChangeKind, ItemDelta, ItemKind, ItemStart,
+};
 pub use giskard_core::model::{Effort, ModelDescriptor, ModelRef};
 pub use giskard_core::token::{ByModel, DailyTokenLedger, TokenLedger, TokenUsage};
 pub use giskard_core::turn::{ApprovalPolicy, Mode, TurnStatus, TurnStatusKind};
@@ -56,6 +58,10 @@ pub enum ClientMessage {
     },
     Interrupt {
         thread_id: ThreadId,
+    },
+    TerminateCommand {
+        thread_id: ThreadId,
+        process_id: String,
     },
     ApprovalDecision {
         request_id: String,
@@ -95,6 +101,24 @@ pub struct LiveTurnSnapshot {
     pub pending_approval: Option<WireApprovalRequest>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunningCommand {
+    pub thread_id: ThreadId,
+    pub turn_id: TurnId,
+    pub item_id: ItemId,
+    pub harness_item_id: String,
+    pub command: String,
+    pub cwd: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<String>,
+    pub started_at_ms: i64,
+    pub output: String,
+    pub after_turn: bool,
+    #[serde(default)]
+    pub terminating: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorSeverity {
@@ -131,6 +155,10 @@ pub enum ServerMessage {
         has_more: bool,
     },
     LiveTurnSnapshot(LiveTurnSnapshot),
+    RunningCommands {
+        thread_id: ThreadId,
+        commands: Vec<RunningCommand>,
+    },
     TokenUpdate {
         scope: TokenScope,
         ledger: serde_json::Value,
@@ -357,6 +385,26 @@ mod tests {
     }
 
     #[test]
+    fn client_message_terminate_command_serde() {
+        let tid = ThreadId::new();
+        let msg = ClientMessage::TerminateCommand {
+            thread_id: tid,
+            process_id: "proc_1".into(),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "terminate_command");
+        assert_eq!(json["thread_id"], tid.to_string());
+        assert_eq!(json["process_id"], "proc_1");
+        let back: ClientMessage = serde_json::from_value(json).unwrap();
+        match back {
+            ClientMessage::TerminateCommand { process_id, .. } => {
+                assert_eq!(process_id, "proc_1");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn client_message_ping() {
         let json = serde_json::to_string(&ClientMessage::Ping).unwrap();
         assert_eq!(json, "{\"type\":\"ping\"}");
@@ -366,6 +414,45 @@ mod tests {
     fn server_message_pong() {
         let json = serde_json::to_string(&ServerMessage::Pong).unwrap();
         assert_eq!(json, "{\"type\":\"pong\"}");
+    }
+
+    #[test]
+    fn server_message_running_commands_serde() {
+        let tid = ThreadId::new();
+        let turn_id = TurnId::new();
+        let item_id = ItemId::new();
+        let msg = ServerMessage::RunningCommands {
+            thread_id: tid,
+            commands: vec![RunningCommand {
+                thread_id: tid,
+                turn_id,
+                item_id,
+                harness_item_id: "cmd1".into(),
+                command: "sleep 60".into(),
+                cwd: "/tmp/project".into(),
+                status: "in_progress".into(),
+                process_id: Some("proc_1".into()),
+                started_at_ms: 1_785_000_000_000,
+                output: "waiting".into(),
+                after_turn: true,
+                terminating: true,
+            }],
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "running_commands");
+        assert_eq!(json["thread_id"], tid.to_string());
+        assert_eq!(json["commands"][0]["process_id"], "proc_1");
+        assert_eq!(json["commands"][0]["after_turn"], true);
+        assert_eq!(json["commands"][0]["terminating"], true);
+        let back: ServerMessage = serde_json::from_value(json).unwrap();
+        match back {
+            ServerMessage::RunningCommands { commands, .. } => {
+                assert_eq!(commands[0].item_id, item_id);
+                assert_eq!(commands[0].status, "in_progress");
+                assert!(commands[0].terminating);
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]

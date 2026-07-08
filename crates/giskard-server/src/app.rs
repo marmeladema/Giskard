@@ -10,6 +10,7 @@ use crate::ledger::{self, LedgerHandle};
 use crate::live_buffer::LiveBufferStore;
 use crate::registry::{HarnessFactory, HarnessRegistry};
 use crate::routes::{protected_routes, public_routes};
+use crate::running_commands::RunningCommandStore;
 
 /// Shared application state passed to all Axum handlers and middleware.
 ///
@@ -21,6 +22,7 @@ pub struct AppState {
     pub hub: Arc<Hub>,
     pub registry: Arc<HarnessRegistry>,
     pub live_buffers: Arc<LiveBufferStore>,
+    pub running_commands: Arc<RunningCommandStore>,
     pub highlighter: Arc<Highlighter>,
     /// Single-writer token-ledger actor handle (§5.4).
     pub ledger: LedgerHandle,
@@ -48,6 +50,7 @@ impl AppState {
     ) -> Self {
         let hub = Arc::new(Hub::new());
         let live_buffers = Arc::new(LiveBufferStore::new());
+        let running_commands = Arc::new(RunningCommandStore::new());
         let highlighter = match viz_config {
             Some(viz) => Arc::new(Highlighter::with_max_size(viz.max_highlight_size)),
             None => Arc::new(Highlighter::new()),
@@ -57,6 +60,7 @@ impl AppState {
             factory,
             hub.clone(),
             live_buffers.clone(),
+            running_commands.clone(),
             store.clone(),
             ledger.clone(),
         ));
@@ -65,6 +69,7 @@ impl AppState {
             hub,
             registry,
             live_buffers,
+            running_commands,
             highlighter,
             ledger,
             session_key: session_key.into(),

@@ -123,6 +123,12 @@ pub enum WireItemPayload {
         output: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        process_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<i64>,
     },
     FileChange {
         path: String,
@@ -325,11 +331,17 @@ impl From<ItemPayload> for WireItemPayload {
                 cwd,
                 output,
                 exit_code,
+                status,
+                process_id,
+                duration_ms,
             } => Self::CommandExecution {
                 command,
                 cwd: path_to_wire(&cwd),
                 output,
                 exit_code,
+                status,
+                process_id,
+                duration_ms,
             },
             ItemPayload::FileChange {
                 path,
@@ -489,6 +501,27 @@ mod tests {
         assert_eq!(json["path"], "/src/main.rs");
         assert_eq!(json["changes"][0]["path"], "/src/lib.rs");
         assert_eq!(json["status"], "completed");
+    }
+
+    #[test]
+    fn command_execution_payload_metadata_becomes_wire() {
+        let core = ItemPayload::CommandExecution {
+            command: "cargo test".into(),
+            cwd: PathBuf::from("/tmp/project"),
+            output: "ok".into(),
+            exit_code: Some(0),
+            status: Some("completed".into()),
+            process_id: Some("proc_1".into()),
+            duration_ms: Some(1_250),
+        };
+        let wire: WireItemPayload = core.into();
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(json["kind"], "command_execution");
+        assert_eq!(json["command"], "cargo test");
+        assert_eq!(json["cwd"], "/tmp/project");
+        assert_eq!(json["status"], "completed");
+        assert_eq!(json["process_id"], "proc_1");
+        assert_eq!(json["duration_ms"], 1_250);
     }
 
     #[test]

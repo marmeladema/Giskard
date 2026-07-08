@@ -131,6 +131,17 @@ pub trait AgentHarness: Send + Sync {
     /// Interrupt the active turn of a thread.
     async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError>;
 
+    /// Ask the harness to terminate a running command process, if it exposes a process handle.
+    async fn terminate_command(
+        &self,
+        _thread: &ThreadHandle,
+        process_id: &str,
+    ) -> Result<(), HarnessError> {
+        Err(HarnessError::Unsupported(format!(
+            "command termination is not supported for process {process_id}"
+        )))
+    }
+
     /// Cleanly shut down the harness.
     ///
     /// Takes `&self` (not `self: Arc<Self>`) so the trait stays object-safe.

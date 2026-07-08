@@ -46,6 +46,7 @@ fn make_fixture() -> ReplayFixture {
                 id: it_1,
                 harness_item_id: "it_1".into(),
                 kind: ItemKind::AgentMessage,
+                command: None,
             },
         },
         AgentEvent::ItemDelta {
@@ -600,8 +601,7 @@ async fn websocket_serializes_harness_error_events() {
         )
         .await;
 
-    // Skip the snapshot messages sent on subscribe (HistoryPage / LiveTurnSnapshot) and wait for
-    // the broadcast Error event.
+    // Skip the snapshot messages sent on subscribe and wait for the broadcast Error event.
     loop {
         let msg = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next())
             .await
@@ -617,7 +617,9 @@ async fn websocket_serializes_harness_error_events() {
                 }
                 other => panic!("expected error event, got {other:?}"),
             },
-            ServerMessage::HistoryPage { .. } | ServerMessage::LiveTurnSnapshot(_) => continue,
+            ServerMessage::HistoryPage { .. }
+            | ServerMessage::LiveTurnSnapshot(_)
+            | ServerMessage::RunningCommands { .. } => continue,
             other => panic!("expected event, got {other:?}"),
         }
     }

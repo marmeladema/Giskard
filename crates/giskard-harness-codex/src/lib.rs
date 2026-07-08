@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
+use tracing::warn;
 
 use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
@@ -42,6 +43,9 @@ enum HarnessCommand {
         overrides: TurnOverrides,
         response: oneshot::Sender<Result<TurnId, HarnessError>>,
     },
+}
+
+enum ControlCommand {
     RespondApproval {
         id: ApprovalId,
         decision: ApprovalDecision,
@@ -49,6 +53,11 @@ enum HarnessCommand {
     },
     Interrupt {
         thread: ThreadHandle,
+        response: oneshot::Sender<Result<(), HarnessError>>,
+    },
+    TerminateCommand {
+        thread: ThreadHandle,
+        process_id: String,
         response: oneshot::Sender<Result<(), HarnessError>>,
     },
     Shutdown {
@@ -61,6 +70,7 @@ type SenderMap = Arc<Mutex<HashMap<ThreadId, broadcast::Sender<AgentEvent>>>>;
 /// Codex CLI harness adapter (one app-server process per project).
 pub struct CodexHarness {
     cmd_tx: mpsc::Sender<HarnessCommand>,
+    control_tx: mpsc::Sender<ControlCommand>,
     senders: SenderMap,
     shutdown_called: AtomicBool,
     capabilities: HarnessCapabilities,
@@ -90,10 +100,12 @@ impl CodexHarness {
         workspace_root: PathBuf,
     ) -> Result<Arc<Self>, HarnessError> {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
+        let (control_tx, control_rx) = mpsc::channel(64);
         let senders: SenderMap = Arc::new(Mutex::new(HashMap::new()));
 
         let harness = Arc::new(Self {
             cmd_tx,
+            control_tx,
             senders: senders.clone(),
             shutdown_called: AtomicBool::new(false),
             capabilities: HarnessCapabilities {
@@ -108,7 +120,13 @@ impl CodexHarness {
             },
         });
 
-        tokio::spawn(background_task(client, cmd_rx, senders, workspace_root));
+        tokio::spawn(background_task(
+            client,
+            cmd_rx,
+            control_rx,
+            senders,
+            workspace_root,
+        ));
         Ok(harness)
     }
 }
@@ -169,8 +187,8 @@ impl AgentHarness for CodexHarness {
         decision: ApprovalDecision,
     ) -> Result<(), HarnessError> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(HarnessCommand::RespondApproval {
+        self.control_tx
+            .send(ControlCommand::RespondApproval {
                 id,
                 decision,
                 response: tx,
@@ -183,9 +201,27 @@ impl AgentHarness for CodexHarness {
 
     async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(HarnessCommand::Interrupt {
+        self.control_tx
+            .send(ControlCommand::Interrupt {
                 thread: thread.clone(),
+                response: tx,
+            })
+            .await
+            .map_err(|_| HarnessError::Transport("background task closed".into()))?;
+        rx.await
+            .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
+    }
+
+    async fn terminate_command(
+        &self,
+        thread: &ThreadHandle,
+        process_id: &str,
+    ) -> Result<(), HarnessError> {
+        let (tx, rx) = oneshot::channel();
+        self.control_tx
+            .send(ControlCommand::TerminateCommand {
+                thread: thread.clone(),
+                process_id: process_id.to_owned(),
                 response: tx,
             })
             .await
@@ -200,8 +236,8 @@ impl AgentHarness for CodexHarness {
         }
         let (tx, rx) = oneshot::channel();
         let _ = self
-            .cmd_tx
-            .send(HarnessCommand::Shutdown { response: tx })
+            .control_tx
+            .send(ControlCommand::Shutdown { response: tx })
             .await;
         let _ = rx.await;
         Ok(())
@@ -211,55 +247,173 @@ impl AgentHarness for CodexHarness {
 async fn background_task(
     mut client: codex_codes::AsyncClient,
     mut cmd_rx: mpsc::Receiver<HarnessCommand>,
+    mut control_rx: mpsc::Receiver<ControlCommand>,
     senders: SenderMap,
     workspace_root: PathBuf,
 ) {
     let mut mapper = CodexMapper::new(workspace_root);
 
     loop {
-        let cmd = match cmd_rx.recv().await {
-            Some(cmd) => cmd,
-            None => break,
-        };
-
-        match cmd {
-            HarnessCommand::OpenThread { opts, response } => {
-                let result = handle_open_thread(&mut client, &mut mapper, &opts, &senders).await;
-                let _ = response.send(result);
-            }
-            HarnessCommand::StartTurn {
-                thread,
-                input,
-                overrides,
-                response,
-            } => {
-                let result = handle_start_turn(&mut client, &thread, &input, &overrides).await;
-                let ok = result.is_ok();
-                let _ = response.send(result);
-                if ok {
-                    stream_turn_events(&mut client, &mut mapper, &thread, &senders, &mut cmd_rx)
-                        .await;
+        tokio::select! {
+            msg = client.next_message(), if mapper.has_running_commands() => {
+                match msg {
+                    Ok(Some(msg)) => {
+                        if matches!(
+                            handle_idle_server_message(
+                                &mut client,
+                                &mut mapper,
+                                &senders,
+                                &mut control_rx,
+                                msg,
+                            )
+                            .await,
+                            StreamOutcome::Shutdown,
+                        ) {
+                            let _ = client.shutdown().await;
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        warn!("Codex idle stream failed while commands were running: {e}");
+                    }
                 }
             }
-            HarnessCommand::RespondApproval {
-                id,
-                decision,
-                response,
-            } => {
-                let result = handle_respond(&mut client, &id, &decision).await;
-                let _ = response.send(result);
+            cmd = cmd_rx.recv() => {
+                let cmd = match cmd {
+                    Some(cmd) => cmd,
+                    None => break,
+                };
+
+                match cmd {
+                    HarnessCommand::OpenThread { opts, response } => {
+                        let result = handle_open_thread(&mut client, &mut mapper, &opts, &senders).await;
+                        let _ = response.send(result);
+                    }
+                    HarnessCommand::StartTurn {
+                        thread,
+                        input,
+                        overrides,
+                        response,
+                    } => {
+                        let result = handle_start_turn(&mut client, &thread, &input, &overrides).await;
+                        let ok = result.is_ok();
+                        let _ = response.send(result);
+                        if ok && matches!(
+                            stream_turn_events(
+                                &mut client,
+                                &mut mapper,
+                                &thread,
+                                &senders,
+                                &mut control_rx,
+                            )
+                            .await,
+                            StreamOutcome::Shutdown,
+                        ) {
+                            let _ = client.shutdown().await;
+                            break;
+                        }
+                    }
+                }
             }
-            HarnessCommand::Interrupt { thread, response } => {
-                let result = handle_interrupt(&mut client, &thread).await;
-                let _ = response.send(result);
-            }
-            HarnessCommand::Shutdown { response } => {
-                let _ = client.shutdown().await;
-                let _ = response.send(Ok(()));
-                break;
+            control = control_rx.recv() => {
+                match control {
+                    Some(ControlCommand::RespondApproval {
+                        id,
+                        decision,
+                        response,
+                    }) => {
+                        let result = handle_respond(&mut client, &id, &decision).await;
+                        let _ = response.send(result);
+                    }
+                    Some(ControlCommand::Interrupt { thread, response }) => {
+                        let result = handle_interrupt(&mut client, &mapper, &thread).await;
+                        let _ = response.send(result);
+                    }
+                    Some(ControlCommand::TerminateCommand {
+                        thread,
+                        process_id,
+                        response,
+                    }) => {
+                        let result =
+                            handle_terminate_command(&mut client, &mapper, &thread, &process_id)
+                                .await;
+                        let _ = response.send(result);
+                    }
+                    Some(ControlCommand::Shutdown { response }) => {
+                        let _ = client.shutdown().await;
+                        let _ = response.send(Ok(()));
+                        break;
+                    }
+                    None => break,
+                }
             }
         }
     }
+}
+
+async fn handle_idle_server_message(
+    client: &mut codex_codes::AsyncClient,
+    mapper: &mut CodexMapper,
+    senders: &SenderMap,
+    control_rx: &mut mpsc::Receiver<ControlCommand>,
+    msg: codex_codes::ServerMessage,
+) -> StreamOutcome {
+    let fallback_thread = mapper.running_command_fallback_thread().unwrap_or_default();
+    match msg {
+        codex_codes::ServerMessage::Notification(notif) => {
+            if let Some(event) = mapper.map_notification(&notif, fallback_thread) {
+                let thread = event_thread(&event);
+                let _ = broadcast_event(senders, thread, || event).await;
+            }
+            StreamOutcome::TurnEnded
+        }
+        codex_codes::ServerMessage::Request { id, request } => {
+            let event = mapper.map_server_request(&id, &request, fallback_thread);
+            if let Some(event) = event {
+                let thread = event_thread(&event);
+                let _ = broadcast_event(senders, thread, || event).await;
+            }
+
+            loop {
+                match control_rx.recv().await {
+                    Some(ControlCommand::RespondApproval {
+                        id: resp_id,
+                        decision,
+                        response,
+                    }) => {
+                        let result = handle_respond(client, &resp_id, &decision).await;
+                        let _ = response.send(result);
+                        return StreamOutcome::TurnEnded;
+                    }
+                    Some(ControlCommand::Interrupt { thread, response }) => {
+                        let result = handle_interrupt(client, mapper, &thread).await;
+                        let _ = response.send(result);
+                    }
+                    Some(ControlCommand::TerminateCommand {
+                        thread,
+                        process_id,
+                        response,
+                    }) => {
+                        let result =
+                            handle_terminate_command(client, mapper, &thread, &process_id).await;
+                        let _ = response.send(result);
+                    }
+                    Some(ControlCommand::Shutdown { response }) => {
+                        let _ = response.send(Ok(()));
+                        return StreamOutcome::Shutdown;
+                    }
+                    None => return StreamOutcome::TurnEnded,
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamOutcome {
+    TurnEnded,
+    Shutdown,
 }
 
 async fn handle_open_thread(
@@ -399,13 +553,23 @@ async fn stream_turn_events(
     mapper: &mut CodexMapper,
     thread: &ThreadHandle,
     senders: &SenderMap,
-    cmd_rx: &mut mpsc::Receiver<HarnessCommand>,
-) {
+    control_rx: &mut mpsc::Receiver<ControlCommand>,
+) -> StreamOutcome {
     let thread_id = thread.thread;
     let mut active_turn: Option<TurnId> = None;
 
     loop {
-        let msg = match client.next_message().await {
+        let msg = tokio::select! {
+            msg = client.next_message() => msg,
+            control = control_rx.recv() => {
+                match handle_stream_control(client, mapper, control).await {
+                    StreamControlOutcome::Continue => continue,
+                    StreamControlOutcome::Shutdown => return StreamOutcome::Shutdown,
+                }
+            }
+        };
+
+        let msg = match msg {
             Ok(Some(msg)) => msg,
             Ok(None) => {
                 emit_incomplete_turn(
@@ -477,10 +641,11 @@ async fn stream_turn_events(
                     let _ = broadcast_event(senders, thread_id, || event).await;
                 }
 
-                // Wait for the user's approval response.
+                // Wait for the user's approval response. Normal harness commands keep queuing on
+                // the main command channel while this live turn waits for control input.
                 loop {
-                    match cmd_rx.recv().await {
-                        Some(HarnessCommand::RespondApproval {
+                    match control_rx.recv().await {
+                        Some(ControlCommand::RespondApproval {
                             id: resp_id,
                             decision,
                             response,
@@ -489,23 +654,76 @@ async fn stream_turn_events(
                             let _ = response.send(result);
                             break;
                         }
-                        Some(HarnessCommand::Interrupt {
+                        Some(ControlCommand::Interrupt {
                             thread: t,
                             response,
                         }) => {
-                            let result = handle_interrupt(client, &t).await;
+                            let result = handle_interrupt(client, mapper, &t).await;
                             let _ = response.send(result);
                         }
-                        Some(HarnessCommand::Shutdown { response }) => {
-                            let _ = response.send(Ok(()));
-                            return;
+                        Some(ControlCommand::TerminateCommand {
+                            thread,
+                            process_id,
+                            response,
+                        }) => {
+                            let result =
+                                handle_terminate_command(client, mapper, &thread, &process_id)
+                                    .await;
+                            let _ = response.send(result);
                         }
-                        Some(_) => {}
-                        None => return,
+                        Some(ControlCommand::Shutdown { response }) => {
+                            let _ = response.send(Ok(()));
+                            return StreamOutcome::Shutdown;
+                        }
+                        None => return StreamOutcome::TurnEnded,
                     }
                 }
             }
         }
+    }
+
+    StreamOutcome::TurnEnded
+}
+
+enum StreamControlOutcome {
+    Continue,
+    Shutdown,
+}
+
+async fn handle_stream_control(
+    client: &mut codex_codes::AsyncClient,
+    mapper: &CodexMapper,
+    control: Option<ControlCommand>,
+) -> StreamControlOutcome {
+    match control {
+        Some(ControlCommand::RespondApproval {
+            id,
+            decision,
+            response,
+        }) => {
+            let result = handle_respond(client, &id, &decision).await;
+            let _ = response.send(result);
+            StreamControlOutcome::Continue
+        }
+        Some(ControlCommand::Interrupt { thread, response }) => {
+            let result = handle_interrupt(client, mapper, &thread).await;
+            let _ = response.send(result);
+            StreamControlOutcome::Continue
+        }
+        Some(ControlCommand::TerminateCommand {
+            thread,
+            process_id,
+            response,
+        }) => {
+            let result = handle_terminate_command(client, mapper, &thread, &process_id).await;
+            let _ = response.send(result);
+            StreamControlOutcome::Continue
+        }
+        Some(ControlCommand::Shutdown { response }) => {
+            let _ = response.send(Ok(()));
+            StreamControlOutcome::Shutdown
+        }
+        None => StreamControlOutcome::Shutdown,
     }
 }
 
@@ -513,6 +731,21 @@ async fn broadcast_event<F: FnOnce() -> AgentEvent>(senders: &SenderMap, thread:
     let sender = senders.lock().await.get(&thread).cloned();
     if let Some(sender) = sender {
         let _ = sender.send(f());
+    }
+}
+
+fn event_thread(event: &AgentEvent) -> ThreadId {
+    match event {
+        AgentEvent::ThreadOpened { thread, .. }
+        | AgentEvent::TurnStarted { thread, .. }
+        | AgentEvent::ItemStarted { thread, .. }
+        | AgentEvent::ItemDelta { thread, .. }
+        | AgentEvent::ItemCompleted { thread, .. }
+        | AgentEvent::DiffUpdated { thread, .. }
+        | AgentEvent::ApprovalRequested { thread, .. }
+        | AgentEvent::TurnCompleted { thread, .. }
+        | AgentEvent::Error { thread, .. }
+        | AgentEvent::Notice { thread, .. } => *thread,
     }
 }
 
@@ -552,14 +785,41 @@ async fn handle_respond(
 
 async fn handle_interrupt(
     client: &mut codex_codes::AsyncClient,
+    mapper: &CodexMapper,
     thread: &ThreadHandle,
 ) -> Result<(), HarnessError> {
-    let params: codex_codes::TurnInterruptParams = serde_json::from_value(serde_json::json!({
-        "threadId": thread.harness_thread_id,
-        "turnId": "",
-    }))
-    .map_err(|e| HarnessError::Protocol(e.to_string()))?;
+    let native_turn_id = mapper
+        .active_native_turn_for_thread(thread.thread)
+        .ok_or_else(|| HarnessError::Unsupported("no active Codex turn to interrupt".into()))?;
+    handle_interrupt_turn(client, &thread.harness_thread_id, native_turn_id).await
+}
 
+async fn handle_terminate_command(
+    client: &mut codex_codes::AsyncClient,
+    mapper: &CodexMapper,
+    thread: &ThreadHandle,
+    process_id: &str,
+) -> Result<(), HarnessError> {
+    let native_turn_id = mapper
+        .native_turn_for_process(thread.thread, process_id)
+        .or_else(|| mapper.active_native_turn_for_thread(thread.thread))
+        .ok_or_else(|| {
+            HarnessError::Unsupported(format!(
+                "Codex has no active turn for command process {process_id}"
+            ))
+        })?;
+    handle_interrupt_turn(client, &thread.harness_thread_id, native_turn_id).await
+}
+
+async fn handle_interrupt_turn(
+    client: &mut codex_codes::AsyncClient,
+    native_thread_id: &str,
+    native_turn_id: &str,
+) -> Result<(), HarnessError> {
+    let params = codex_codes::TurnInterruptParams {
+        thread_id: native_thread_id.to_owned(),
+        turn_id: native_turn_id.to_owned(),
+    };
     client
         .turn_interrupt(&params)
         .await

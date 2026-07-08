@@ -9,6 +9,7 @@ pub mod models;
 pub mod plan;
 pub mod registry;
 pub mod routes;
+pub mod running_commands;
 pub mod tokens;
 
 pub use app::{AppState, build_app};

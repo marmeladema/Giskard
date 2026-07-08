@@ -44,6 +44,21 @@ pub struct ItemStart {
     /// Harness-native item id, used to correlate deltas/completion.
     pub harness_item_id: String,
     pub kind: ItemKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<CommandExecutionStart>,
+}
+
+/// Command metadata available when a command item starts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandExecutionStart {
+    pub command: String,
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
 }
 
 /// The finalized item persisted in thread history and sent on `ItemCompleted`.
@@ -76,6 +91,12 @@ pub enum ItemPayload {
         output: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        process_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<i64>,
     },
     FileChange {
         /// Back-compat summary path for older persisted files and compact renderers.
@@ -158,6 +179,9 @@ mod tests {
             cwd: "/tmp/project".into(),
             output: "all passed".into(),
             exit_code: Some(0),
+            status: Some("completed".into()),
+            process_id: Some("proc_1".into()),
+            duration_ms: Some(1250),
         };
         let json = serde_json::to_string(&payload).unwrap();
         let back: ItemPayload = serde_json::from_str(&json).unwrap();
