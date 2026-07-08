@@ -66,6 +66,11 @@ enum ControlCommand {
         process_id: String,
         response: oneshot::Sender<Result<(), HarnessError>>,
     },
+    SetThreadName {
+        thread: ThreadHandle,
+        name: String,
+        response: oneshot::Sender<Result<(), HarnessError>>,
+    },
     SetThreadArchived {
         thread: ThreadHandle,
         archived: bool,
@@ -288,6 +293,20 @@ impl AgentHarness for CodexHarness {
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
 
+    async fn set_thread_name(&self, thread: &ThreadHandle, name: &str) -> Result<(), HarnessError> {
+        let (tx, rx) = oneshot::channel();
+        self.control_tx
+            .send(ControlCommand::SetThreadName {
+                thread: thread.clone(),
+                name: name.to_owned(),
+                response: tx,
+            })
+            .await
+            .map_err(|_| HarnessError::Transport("background task closed".into()))?;
+        rx.await
+            .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
+    }
+
     async fn set_thread_archived(
         &self,
         thread: &ThreadHandle,
@@ -446,6 +465,14 @@ async fn background_task(
                                 .await;
                         let _ = response.send(result);
                     }
+                    Some(ControlCommand::SetThreadName {
+                        thread,
+                        name,
+                        response,
+                    }) => {
+                        let result = handle_set_thread_name(&mut client, &thread, &name).await;
+                        let _ = response.send(result);
+                    }
                     Some(ControlCommand::SetThreadArchived {
                         thread,
                         archived,
@@ -543,6 +570,14 @@ async fn handle_idle_server_message(
                     }) => {
                         let result =
                             handle_terminate_command(client, mapper, &thread, &process_id).await;
+                        let _ = response.send(result);
+                    }
+                    Some(ControlCommand::SetThreadName {
+                        thread,
+                        name,
+                        response,
+                    }) => {
+                        let result = handle_set_thread_name(client, &thread, &name).await;
                         let _ = response.send(result);
                     }
                     Some(ControlCommand::SetThreadArchived { response, .. }) => {
@@ -881,6 +916,14 @@ async fn stream_turn_events(
                                     .await;
                             let _ = response.send(result);
                         }
+                        Some(ControlCommand::SetThreadName {
+                            thread,
+                            name,
+                            response,
+                        }) => {
+                            let result = handle_set_thread_name(client, &thread, &name).await;
+                            let _ = response.send(result);
+                        }
                         Some(ControlCommand::SetThreadArchived { response, .. }) => {
                             let _ = response.send(Err(HarnessError::Unsupported(
                                 "thread archiving is not available during an active turn".into(),
@@ -947,6 +990,15 @@ async fn handle_stream_control(
             response,
         }) => {
             let result = handle_terminate_command(client, mapper, &thread, &process_id).await;
+            let _ = response.send(result);
+            StreamControlOutcome::Continue
+        }
+        Some(ControlCommand::SetThreadName {
+            thread,
+            name,
+            response,
+        }) => {
+            let result = handle_set_thread_name(client, &thread, &name).await;
             let _ = response.send(result);
             StreamControlOutcome::Continue
         }
@@ -1123,6 +1175,22 @@ async fn handle_set_thread_archived(
             .await
             .map_err(|e| HarnessError::Transport(e.to_string()))?;
     }
+    Ok(())
+}
+
+async fn handle_set_thread_name(
+    client: &mut codex_codes::AsyncClient,
+    thread: &ThreadHandle,
+    name: &str,
+) -> Result<(), HarnessError> {
+    let params = codex_codes::ThreadSetNameParams {
+        thread_id: thread.harness_thread_id.clone(),
+        name: name.to_owned(),
+    };
+    let _: codex_codes::ThreadSetNameResponse = client
+        .request(codex_codes::protocol::methods::THREAD_NAME_SET, &params)
+        .await
+        .map_err(|e| HarnessError::Transport(e.to_string()))?;
     Ok(())
 }
 

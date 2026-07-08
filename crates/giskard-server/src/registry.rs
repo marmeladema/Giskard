@@ -335,6 +335,25 @@ impl HarnessRegistry {
         harness.set_thread_archived(&handle, archived).await
     }
 
+    pub async fn set_thread_name(
+        &self,
+        config: &ProjectConfig,
+        thread_id: ThreadId,
+        harness_thread_id: String,
+        name: String,
+    ) -> Result<(), HarnessError> {
+        let harness = self.get_or_create_harness(config.id, config).await?;
+        let handle = self
+            .get_thread_handle(thread_id)
+            .await
+            .unwrap_or(ThreadHandle {
+                thread: thread_id,
+                harness_thread_id,
+                warning: None,
+            });
+        harness.set_thread_name(&handle, &name).await
+    }
+
     pub async fn delete_thread(
         &self,
         config: &ProjectConfig,

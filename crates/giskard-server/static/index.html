@@ -46,6 +46,7 @@
   .thread { flex:1; min-width:0; padding:5px 8px; border-radius:6px; cursor:pointer; color:var(--muted); font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .thread:hover { background:var(--panel2); }
   .thread.active { background:var(--panel2); color:var(--fg); }
+  .thread-title-input { flex:1; min-width:0; height:28px; padding:4px 7px; font-size:13px; }
   .thread-menu-btn { width:28px; height:28px; padding:0; border-color:transparent; background:transparent; color:var(--muted); }
   .thread-menu-btn:hover { border-color:var(--border); color:var(--fg); }
   .thread-menu { position:absolute; right:0; top:30px; z-index:20; min-width:130px; padding:4px; border:1px solid var(--border); border-radius:6px; background:var(--panel); box-shadow:0 12px 32px rgba(0,0,0,.35); }
@@ -474,6 +475,7 @@ let state = {
 };
 const COMMAND_AUTO_COLLAPSE_LINES = 120;
 const COMMAND_AUTO_COLLAPSE_BYTES = 16 * 1024;
+const THREAD_TITLE_MAX = 120;
 setInterval(updateRunningCommandDurations, 1000);
 
 async function api(method, path, body) {
@@ -588,8 +590,7 @@ function threadRow(pid, t) {
   const row = document.createElement("div"); row.className="thread-row";
   const title = t.title || t.id.slice(0,8);
   const el = document.createElement("div"); el.className="thread mono";
-  el.textContent = title; el.title = title; el.dataset.tid = t.id;
-  el.onclick = () => openThread(pid, t.id, t.title);
+  applyThreadTitleToElement(el, pid, t.id, title);
 
   const menuBtn = document.createElement("button");
   menuBtn.type = "button"; menuBtn.className = "thread-menu-btn";
@@ -597,6 +598,13 @@ function threadRow(pid, t) {
   menuBtn.setAttribute("aria-label", "Thread actions");
 
   const menu = document.createElement("div"); menu.className = "thread-menu"; menu.hidden = true;
+  const rename = document.createElement("button");
+  rename.type = "button"; rename.textContent = "Rename";
+  rename.onclick = async (e) => {
+    e.stopPropagation();
+    closeThreadMenus();
+    beginRenameThread(el, pid, t.id);
+  };
   const archive = document.createElement("button");
   archive.type = "button"; archive.textContent = t.archived ? "Unarchive" : "Archive";
   archive.onclick = async (e) => {
@@ -609,9 +617,9 @@ function threadRow(pid, t) {
   del.onclick = async (e) => {
     e.stopPropagation();
     closeThreadMenus();
-    await deleteThread(pid, t.id, title);
+    await deleteThread(pid, t.id, currentThreadTitle(el));
   };
-  menu.append(archive, del);
+  menu.append(rename, archive, del);
 
   menuBtn.onclick = (e) => {
     e.stopPropagation();
@@ -621,6 +629,100 @@ function threadRow(pid, t) {
   };
   row.append(el, menuBtn, menu);
   return row;
+}
+
+function applyThreadTitleToElement(el, pid, tid, title) {
+  el.textContent = title;
+  el.title = title;
+  el.dataset.pid = pid;
+  el.dataset.tid = tid;
+  el.onclick = () => openThread(pid, tid, title);
+}
+
+function updateThreadRowTitle(tid, title) {
+  if (!tid || !title) return;
+  document.querySelectorAll(".thread").forEach((el) => {
+    if (el.dataset.tid !== tid) return;
+    const pid = el.dataset.pid || state.projectId;
+    applyThreadTitleToElement(el, pid, tid, title);
+  });
+}
+
+function currentThreadTitle(el) {
+  const title = (el.textContent || "").trim();
+  return title || (el.dataset.tid || "").slice(0,8);
+}
+
+function normalizeThreadTitleInput(value) {
+  return (value || "").trim().replace(/\s+/g, " ");
+}
+
+function beginRenameThread(el, pid, tid) {
+  const currentTitle = currentThreadTitle(el);
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "thread-title-input mono";
+  input.value = currentTitle;
+  input.maxLength = THREAD_TITLE_MAX;
+  input.dataset.tid = tid;
+  input.setAttribute("aria-label", "Thread name");
+
+  let finished = false;
+  const restore = (title) => {
+    applyThreadTitleToElement(el, pid, tid, title);
+    input.replaceWith(el);
+  };
+  const cancel = () => {
+    if (finished) return;
+    finished = true;
+    restore(currentTitle);
+  };
+  const commit = async () => {
+    if (finished) return;
+    const nextTitle = normalizeThreadTitleInput(input.value);
+    if (!nextTitle) {
+      notice("Thread name cannot be empty.", "error");
+      input.focus();
+      input.select();
+      return;
+    }
+    if (nextTitle === currentTitle) {
+      finished = true;
+      restore(currentTitle);
+      return;
+    }
+    finished = true;
+    input.disabled = true;
+    try {
+      const updated = await renameThread(pid, tid, nextTitle);
+      const savedTitle = updated && updated.title ? updated.title : nextTitle;
+      restore(savedTitle);
+      if (state.threadId === tid) setThreadTitle(savedTitle);
+    } catch (e) {
+      finished = false;
+      input.disabled = false;
+      notice("Rename thread failed: " + e.message, "error");
+      input.focus();
+      input.select();
+    }
+  };
+
+  input.onkeydown = (e) => {
+    e.stopPropagation();
+    if (e.key === "Enter") {
+      e.preventDefault();
+      commit();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      cancel();
+    }
+  };
+  input.onclick = (e) => e.stopPropagation();
+  input.onblur = cancel;
+
+  el.replaceWith(input);
+  input.focus();
+  input.select();
 }
 
 function closeThreadMenus() {
@@ -637,6 +739,10 @@ async function setThreadArchived(pid, tid, archived) {
   } catch (e) {
     notice((archived ? "Archive" : "Unarchive") + " thread failed: " + e.message, "error");
   }
+}
+
+async function renameThread(pid, tid, title) {
+  return api("PATCH", `/api/projects/${pid}/threads/${tid}/title`, { title });
 }
 
 async function deleteThread(pid, tid, title) {
@@ -920,8 +1026,10 @@ function renderThreadState(s) {
   setApprovalPolicy(s.approval_policy || "ask");
   $("modeBtn").textContent = state.mode;
   if (s.current_model) setModel(`${s.current_model.provider}/${s.current_model.model}`);
-  // The header already owns title / mode / model; the right column is usage-only now.
-  if (s.title) setThreadTitle(s.title);
+  if (s.title) {
+    updateThreadRowTitle(s.id || s.thread_id || state.threadId, s.title);
+    setThreadTitle(s.title);
+  }
   if (s.tokens) renderTokens(s.tokens);
   updateGauge(state.contextUsed, s.context_window || 0);
   if (initialThreadState) {

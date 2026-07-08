@@ -150,6 +150,14 @@ pub trait AgentHarness: Send + Sync {
         )))
     }
 
+    /// Rename a durable thread in the underlying harness, when supported.
+    async fn set_thread_name(&self, thread: &ThreadHandle, name: &str) -> Result<(), HarnessError> {
+        Err(HarnessError::Unsupported(format!(
+            "renaming thread {} to {name:?} is not supported",
+            thread.harness_thread_id
+        )))
+    }
+
     /// Archive or unarchive a durable thread in the underlying harness, when supported.
     async fn set_thread_archived(
         &self,

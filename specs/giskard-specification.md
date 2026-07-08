@@ -8,7 +8,15 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.19
+**Version:** 1.20
+
+**Changelog (1.19 → 1.20), thread rename lifecycle:**
+- **TN1:** The thread list actions menu includes `Rename`. Activating it edits the row title next
+  to the `...` menu, not the read-only thread header. Enter saves; Escape/blur cancels. A
+  successful rename updates the sidebar row and the header/mobile title when that thread is open.
+- **TN2:** Rename calls the harness lifecycle operation first (Codex `thread/name/set`) and updates
+  local `ThreadFile.title` only after success. Empty titles are rejected, whitespace is normalized
+  to a single line, and native rename failure preserves the old local title.
 
 **Changelog (1.18 → 1.19), thread archive/delete lifecycle:**
 - **TD1:** Threads continue to create/resume their native Codex thread eagerly when opened. Giskard
@@ -667,6 +675,13 @@ pub trait AgentHarness: Send + Sync {
 
     /// Interrupt the active turn of a thread.
     async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError>;
+
+    /// Rename a durable thread in the underlying harness.
+    async fn set_thread_name(
+        &self,
+        thread: &ThreadHandle,
+        name: &str,
+    ) -> Result<(), HarnessError>;
 
     /// Archive or unarchive a durable thread in the underlying harness.
     async fn set_thread_archived(
@@ -1331,7 +1346,10 @@ Flow: user clicks "New project" → names it → picks a directory via the file 
   local `<thread_id>.json` + `<thread_id>.jsonl` only after success. Delete also drops the in-memory
   Giskard harness handle. Archive/delete are rejected while the thread has an active turn or running
   command; the browser surfaces the failure as an error notice.
-- **Rename:** thread title editable.
+- **Rename:** the thread list actions menu exposes `Rename`. It edits the row title next to the
+  `...` menu. Saving calls the harness first (Codex `thread/name/set`) and then persists
+  `ThreadFile.title`; the browser updates both the row title and the open-thread header/mobile
+  breadcrumb after success.
 
 ### 7.2 Titles
 

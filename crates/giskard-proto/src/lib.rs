@@ -272,6 +272,11 @@ pub struct ArchiveThreadRequest {
     pub archived: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct RenameThreadRequest {
+    pub title: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DirEntry {
     pub name: String,
