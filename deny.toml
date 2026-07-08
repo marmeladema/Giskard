@@ -1,0 +1,48 @@
+# cargo-deny configuration — https://embarkstudios.github.io/cargo-deny/
+#
+# Enforced in CI by .github/workflows/audit.yml, which runs:
+#   cargo deny check advisories bans licenses sources
+
+[advisories]
+# RustSec advisory database. Security vulnerabilities fail the check. Add specific advisory IDs to
+# `ignore` (each with a `reason`) only after assessing that they don't apply to how we use the crate.
+ignore = []
+# Vulnerabilities are always reported. For lower-severity "unmaintained" advisories, only flag crates
+# this workspace depends on directly — a newly-unmaintained *transitive* crate we can't act on should
+# not block unrelated PRs.
+unmaintained = "workspace"
+
+[licenses]
+# Permissive, OSI/FSF-approved licenses only (no copyleft). Every crate's SPDX expression in the
+# dependency graph must be satisfiable from this set. Keep it sorted; add a license here (or a
+# per-crate `exceptions` entry) only after confirming it is permissive.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Duplicate transitive versions are common and usually out of our control — surface them, don't fail.
+multiple-versions = "warn"
+# Surface `version = "*"` dependencies, but only warn: the workspace's own crates reference each
+# other via path (`{ workspace = true }`) with no version, which cargo-deny counts as wildcards and
+# can't exempt while the crates are publishable. There are no wildcard *registry* deps, and
+# `--locked` already guards reproducibility, so a warning is sufficient.
+wildcards = "warn"
+
+[sources]
+# Only crates.io is allowed; unknown registries or git sources fail the check.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
