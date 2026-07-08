@@ -12,7 +12,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalRequest};
+use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalMetadata, ApprovalRequest};
 use giskard_core::diff::{DiffHunk, FileDiff};
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
@@ -202,6 +202,8 @@ pub struct WireApprovalRequest {
     pub kind: WireApprovalKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metadata: Vec<WireApprovalMetadata>,
     pub available: Vec<ApprovalDecision>,
 }
 
@@ -219,6 +221,32 @@ pub enum WireApprovalKind {
     },
     Permission {
         detail: String,
+    },
+}
+
+/// Wire-mirror of [`ApprovalMetadata`] (paths as `String`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WireApprovalMetadata {
+    Text {
+        label: String,
+        value: String,
+    },
+    Path {
+        label: String,
+        path: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        source_link: bool,
+    },
+    Host {
+        label: String,
+        host: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        port: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
     },
 }
 
@@ -442,6 +470,7 @@ impl From<ApprovalRequest> for WireApprovalRequest {
             id: r.id,
             kind: r.kind.into(),
             reason: r.reason,
+            metadata: r.metadata.into_iter().map(Into::into).collect(),
             available: r.available,
         }
     }
@@ -459,6 +488,36 @@ impl From<ApprovalKind> for WireApprovalKind {
                 change,
             },
             ApprovalKind::Permission { detail } => Self::Permission { detail },
+        }
+    }
+}
+
+impl From<ApprovalMetadata> for WireApprovalMetadata {
+    fn from(metadata: ApprovalMetadata) -> Self {
+        match metadata {
+            ApprovalMetadata::Text { label, value } => Self::Text { label, value },
+            ApprovalMetadata::Path {
+                label,
+                path,
+                source_link,
+            } => Self::Path {
+                label,
+                path: path_to_wire(&path),
+                source_link,
+            },
+            ApprovalMetadata::Host {
+                label,
+                host,
+                protocol,
+                port,
+                target,
+            } => Self::Host {
+                label,
+                host,
+                protocol,
+                port,
+                target,
+            },
         }
     }
 }
@@ -500,7 +559,7 @@ impl From<Turn> for WireTurn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use giskard_core::approval::ApprovalKind;
+    use giskard_core::approval::{ApprovalKind, ApprovalMetadata};
     use std::path::PathBuf;
 
     #[test]
@@ -513,6 +572,62 @@ mod tests {
         let json = serde_json::to_value(&wire).unwrap();
         assert_eq!(json["cwd"], "/home/elie/dev");
         assert_eq!(json["kind"], "command_execution");
+    }
+
+    #[test]
+    fn approval_metadata_paths_become_strings() {
+        let request = ApprovalRequest {
+            id: ApprovalId("ap_1".into()),
+            kind: ApprovalKind::Permission {
+                detail: "fileSystem".into(),
+            },
+            reason: None,
+            metadata: vec![
+                ApprovalMetadata::Text {
+                    label: "Environment".into(),
+                    value: "env_1".into(),
+                },
+                ApprovalMetadata::Path {
+                    label: "Write".into(),
+                    path: PathBuf::from("/home/elie/dev/src/lib.rs"),
+                    source_link: true,
+                },
+                ApprovalMetadata::Host {
+                    label: "Network host".into(),
+                    host: "api.example.com".into(),
+                    protocol: Some("https".into()),
+                    port: Some(443),
+                    target: Some("https://api.example.com/v1".into()),
+                },
+                ApprovalMetadata::Path {
+                    label: "Grant root".into(),
+                    path: PathBuf::from("/home/elie/dev"),
+                    source_link: false,
+                },
+            ],
+            available: vec![ApprovalDecision::Accept],
+        };
+        let wire: WireApprovalRequest = request.into();
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(json["metadata"][0]["kind"], "text");
+        assert_eq!(json["metadata"][0]["label"], "Environment");
+        assert_eq!(json["metadata"][0]["value"], "env_1");
+        assert_eq!(json["metadata"][1]["kind"], "path");
+        assert_eq!(json["metadata"][1]["path"], "/home/elie/dev/src/lib.rs");
+        assert_eq!(json["metadata"][1]["source_link"], true);
+        assert_eq!(json["metadata"][2]["kind"], "host");
+        assert_eq!(json["metadata"][2]["host"], "api.example.com");
+        assert_eq!(json["metadata"][2]["protocol"], "https");
+        assert_eq!(json["metadata"][2]["port"], 443);
+        assert_eq!(json["metadata"][2]["target"], "https://api.example.com/v1");
+        assert_eq!(json["metadata"][3]["kind"], "path");
+        assert_eq!(json["metadata"][3]["path"], "/home/elie/dev");
+        assert!(
+            !json["metadata"][3]
+                .as_object()
+                .unwrap()
+                .contains_key("source_link")
+        );
     }
 
     #[test]

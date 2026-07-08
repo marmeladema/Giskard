@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
-use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalRequest};
+use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalMetadata, ApprovalRequest};
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ThreadId, TurnId};
 use giskard_core::item::{Item, ItemKind, ItemPayload, ItemStart};
@@ -14,7 +14,7 @@ use giskard_core::turn::{Mode, TurnStatus, TurnStatusKind};
 use giskard_harness::AgentHarness;
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 use giskard_persist::store::ProjectConfig;
-use giskard_proto::{ClientMessage, ServerMessage, WireAgentEvent};
+use giskard_proto::{ClientMessage, ServerMessage, WireAgentEvent, WireApprovalMetadata};
 use giskard_server::{AppState, HarnessFactory, build_app};
 
 struct TestFactory {
@@ -77,6 +77,29 @@ fn make_fixture() -> ReplayFixture {
                     cwd: "/tmp".into(),
                 },
                 reason: None,
+                metadata: vec![
+                    ApprovalMetadata::Text {
+                        label: "Environment".into(),
+                        value: "env_1".into(),
+                    },
+                    ApprovalMetadata::Host {
+                        label: "Network host".into(),
+                        host: "api.example.com".into(),
+                        protocol: Some("https".into()),
+                        port: Some(443),
+                        target: Some("https://api.example.com/v1".into()),
+                    },
+                    ApprovalMetadata::Path {
+                        label: "Read path".into(),
+                        path: "/tmp/src/lib.rs".into(),
+                        source_link: true,
+                    },
+                    ApprovalMetadata::Path {
+                        label: "Grant root".into(),
+                        path: "/tmp".into(),
+                        source_link: false,
+                    },
+                ],
                 available: vec![ApprovalDecision::Accept, ApprovalDecision::Decline],
             },
         },
@@ -283,10 +306,59 @@ async fn modes_models_approvals_and_plan_dump() {
     // Drain WS until TurnCompleted.
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
     let mut saw_completed = false;
+    let mut saw_approval_metadata = false;
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
                 if let Ok(ServerMessage::Event { agent_event, .. }) = serde_json::from_str(&t) {
+                    if let WireAgentEvent::ApprovalRequested { request, .. } = &agent_event {
+                        assert!(request.metadata.iter().any(|metadata| {
+                            matches!(
+                                metadata,
+                                WireApprovalMetadata::Text { label, value }
+                                    if label == "Environment" && value == "env_1"
+                            )
+                        }));
+                        assert!(request.metadata.iter().any(|metadata| {
+                            matches!(
+                                metadata,
+                                WireApprovalMetadata::Host {
+                                    label,
+                                    host,
+                                    protocol,
+                                    port,
+                                    target,
+                                } if label == "Network host"
+                                    && host == "api.example.com"
+                                    && protocol.as_deref() == Some("https")
+                                    && *port == Some(443)
+                                    && target.as_deref() == Some("https://api.example.com/v1")
+                            )
+                        }));
+                        assert!(request.metadata.iter().any(|metadata| {
+                            matches!(
+                                metadata,
+                                WireApprovalMetadata::Path {
+                                    label,
+                                    path,
+                                    source_link,
+                                } if label == "Read path"
+                                    && path == "/tmp/src/lib.rs"
+                                    && *source_link
+                            )
+                        }));
+                        assert!(request.metadata.iter().any(|metadata| {
+                            matches!(
+                                metadata,
+                                WireApprovalMetadata::Path {
+                                    label,
+                                    path,
+                                    source_link,
+                                } if label == "Grant root" && path == "/tmp" && !*source_link
+                            )
+                        }));
+                        saw_approval_metadata = true;
+                    }
                     if matches!(agent_event, WireAgentEvent::TurnCompleted { .. }) {
                         saw_completed = true;
                         break;
@@ -297,6 +369,10 @@ async fn modes_models_approvals_and_plan_dump() {
             _ => break,
         }
     }
+    assert!(
+        saw_approval_metadata,
+        "browser protocol should include approval metadata"
+    );
     assert!(saw_completed, "should observe TurnCompleted");
 
     // Turn persisted to the authoritative JSONL history (H1); tokens folded into metadata.

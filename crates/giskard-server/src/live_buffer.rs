@@ -227,10 +227,14 @@ impl Default for LiveBufferStore {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
+    use giskard_core::approval::{
+        ApprovalDecision, ApprovalKind, ApprovalMetadata, ApprovalRequest,
+    };
+    use giskard_core::ids::ApprovalId;
     use giskard_core::ids::{ItemId, ServerRequestId, ThreadId, TurnId};
     use giskard_core::item::{CommandExecutionStart, Item, ItemKind, ItemStart};
     use giskard_core::server_request::ServerRequest;
-    use giskard_proto::WireItemPayload;
+    use giskard_proto::{WireApprovalMetadata, WireItemPayload};
 
     use super::*;
 
@@ -416,5 +420,73 @@ mod tests {
         let snapshot = store.snapshot(thread).await.expect("snapshot");
         assert_eq!(snapshot.pending_server_requests.len(), 1);
         assert_eq!(snapshot.pending_server_requests[0].id, pending);
+    }
+
+    #[tokio::test]
+    async fn pending_approval_metadata_is_reconstructed_for_live_snapshot() {
+        let store = LiveBufferStore::new();
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+
+        store.start_turn(thread).await;
+        store
+            .append(
+                thread,
+                AgentEvent::ApprovalRequested {
+                    thread,
+                    turn,
+                    request: ApprovalRequest {
+                        id: ApprovalId("ap_1".into()),
+                        kind: ApprovalKind::Permission {
+                            detail: "network".into(),
+                        },
+                        reason: None,
+                        metadata: vec![
+                            ApprovalMetadata::Host {
+                                label: "Network host".into(),
+                                host: "api.example.com".into(),
+                                protocol: Some("https".into()),
+                                port: Some(443),
+                                target: None,
+                            },
+                            ApprovalMetadata::Path {
+                                label: "Grant root".into(),
+                                path: "/tmp/project".into(),
+                                source_link: false,
+                            },
+                        ],
+                        available: vec![ApprovalDecision::Accept, ApprovalDecision::Decline],
+                    },
+                },
+            )
+            .await;
+
+        let snapshot = store.snapshot(thread).await.expect("snapshot");
+        let pending = snapshot.pending_approval.expect("pending approval");
+        assert!(pending.metadata.iter().any(|metadata| {
+            matches!(
+                metadata,
+                WireApprovalMetadata::Host {
+                    label,
+                    host,
+                    protocol,
+                    port,
+                    ..
+                } if label == "Network host"
+                    && host == "api.example.com"
+                    && protocol.as_deref() == Some("https")
+                    && *port == Some(443)
+            )
+        }));
+        assert!(pending.metadata.iter().any(|metadata| {
+            matches!(
+                metadata,
+                WireApprovalMetadata::Path {
+                    label,
+                    path,
+                    source_link,
+                } if label == "Grant root" && path == "/tmp/project" && !*source_link
+            )
+        }));
     }
 }
