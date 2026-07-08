@@ -402,7 +402,8 @@ let state = {
   streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), itemKindsByItemId:new Map(),
   runningCommands:new Map(), commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null,
   commandPayloadsByItemId:new Map(), endedCommandsByItemId:new Map(), expandedCommandOutputs:new Set(), manuallyToggledCommandOutputs:new Set(),
-  linkifyCache:new Map(), codePath:null, codeLine:null, activeTurn:false, interruptPending:false
+  linkifyCache:new Map(), codePath:null, codeLine:null, activeTurn:false, interruptPending:false,
+  awaitingInitialThreadState:false
 };
 const COMMAND_AUTO_COLLAPSE_LINES = 120;
 const COMMAND_AUTO_COLLAPSE_BYTES = 16 * 1024;
@@ -628,6 +629,7 @@ async function openThread(pid, tid, title, opts) {
   setTurnActive(false);
   state.historyLoaded = false; state.oldestTurnId = null; state.hasMoreHistory = false;
   state.loadingHistory = false; state.pendingOlder = false;
+  state.awaitingInitialThreadState = true;
   resetRenderState();
   document.querySelectorAll(".thread").forEach(e => e.classList.toggle("active", e.dataset.tid===tid));
   $("thrHeader").style.display="flex"; $("composer").style.display="flex";
@@ -754,6 +756,8 @@ function handleServer(msg) {
 
 function renderThreadState(s) {
   if (!s) return;
+  const initialThreadState = state.awaitingInitialThreadState;
+  state.awaitingInitialThreadState = false;
   state.mode = s.mode || "build";
   $("modeBtn").textContent = state.mode;
   if (s.current_model) setModel(`${s.current_model.provider}/${s.current_model.model}`);
@@ -761,9 +765,11 @@ function renderThreadState(s) {
   if (s.title) setThreadTitle(s.title);
   if (s.tokens) renderTokens(s.tokens);
   updateGauge(s.tokens ? s.tokens.total.total : 0, s.context_window || 0);
-  // History now arrives separately via `history_page` (H6); clear the transcript ready for it.
-  $("transcript").innerHTML="";
-  resetRenderState();
+  if (initialThreadState) {
+    // History now arrives separately via `history_page` (H6); clear the transcript ready for it.
+    $("transcript").innerHTML="";
+    resetRenderState();
+  }
 }
 
 // Render the most recent page of persisted history (H6), oldest-first. Older pages are available
