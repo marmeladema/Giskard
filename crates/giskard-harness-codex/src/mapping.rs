@@ -10,16 +10,17 @@ use serde_json::{Value, json};
 use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalRequest};
 use giskard_core::diff::{DiffHunk, DiffLine, FileDiff};
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ApprovalId, ItemId, ThreadId, TurnId};
+use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{
     CommandExecutionStart, FileChangeEntry, FileChangeKind, Item, ItemDelta, ItemKind, ItemPayload,
     ItemStart, ToolCallStart, command_status_is_running, normalized_command_status,
 };
+use giskard_core::server_request::ServerRequest as GiskardServerRequest;
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{ApprovalPolicy, Mode, TurnStatus, TurnStatusKind};
 
 use codex_codes::jsonrpc::RequestId;
-use codex_codes::messages::{Notification, ServerRequest};
+use codex_codes::messages::{Notification, ServerRequest as CodexServerRequest};
 use codex_codes::protocol::{
     AgentMessageDeltaNotification, CommandExecutionOutputDeltaNotification,
     ItemCompletedNotification, ItemStartedNotification, TurnCompletedNotification,
@@ -44,6 +45,7 @@ pub struct CodexMapper {
     running_commands: HashSet<String>,
     running_command_threads: HashMap<String, ThreadId>,
     pending_approval_responses: HashMap<ApprovalId, PendingApprovalResponse>,
+    pending_server_requests: HashMap<ServerRequestId, PendingServerRequest>,
 }
 
 impl CodexMapper {
@@ -59,6 +61,7 @@ impl CodexMapper {
             running_commands: HashSet::new(),
             running_command_threads: HashMap::new(),
             pending_approval_responses: HashMap::new(),
+            pending_server_requests: HashMap::new(),
         }
     }
 
@@ -522,25 +525,28 @@ impl CodexMapper {
     pub fn map_server_request(
         &mut self,
         id: &RequestId,
-        request: &ServerRequest,
+        request: &CodexServerRequest,
         fallback_thread: ThreadId,
-    ) -> Option<AgentEvent> {
-        let req_id = match id {
-            RequestId::Integer(i) => ApprovalId(i.to_string()),
-            RequestId::String(s) => ApprovalId(s.clone()),
-        };
+    ) -> AgentEvent {
+        let req_id = request_id_to_string(id);
 
         match request {
-            ServerRequest::CmdExecApproval(params) => {
+            CodexServerRequest::CmdExecApproval(params) => {
                 let thread = self.resolve_thread(&params.thread_id, fallback_thread);
                 let turn = self.resolve_turn(&params.turn_id);
-                self.pending_approval_responses
-                    .insert(req_id.clone(), PendingApprovalResponse::Decision);
-                Some(AgentEvent::ApprovalRequested {
+                let approval_id = ApprovalId(req_id);
+                self.pending_approval_responses.insert(
+                    approval_id.clone(),
+                    PendingApprovalResponse {
+                        request_id: id.clone(),
+                        kind: PendingApprovalResponseKind::Decision,
+                    },
+                );
+                AgentEvent::ApprovalRequested {
                     thread,
                     turn,
                     request: ApprovalRequest {
-                        id: req_id,
+                        id: approval_id,
                         kind: ApprovalKind::CommandExecution {
                             command: command_approval_preview(params),
                             cwd: params
@@ -557,18 +563,24 @@ impl CodexMapper {
                             ApprovalDecision::Cancel,
                         ],
                     },
-                })
+                }
             }
-            ServerRequest::FileChangeApproval(params) => {
+            CodexServerRequest::FileChangeApproval(params) => {
                 let thread = self.resolve_thread(&params.thread_id, fallback_thread);
                 let turn = self.resolve_turn(&params.turn_id);
-                self.pending_approval_responses
-                    .insert(req_id.clone(), PendingApprovalResponse::Decision);
-                Some(AgentEvent::ApprovalRequested {
+                let approval_id = ApprovalId(req_id);
+                self.pending_approval_responses.insert(
+                    approval_id.clone(),
+                    PendingApprovalResponse {
+                        request_id: id.clone(),
+                        kind: PendingApprovalResponseKind::Decision,
+                    },
+                );
+                AgentEvent::ApprovalRequested {
                     thread,
                     turn,
                     request: ApprovalRequest {
-                        id: req_id,
+                        id: approval_id,
                         kind: ApprovalKind::FileChange {
                             path: PathBuf::new(),
                             change: FileChangeKind::Modified,
@@ -581,23 +593,27 @@ impl CodexMapper {
                             ApprovalDecision::Cancel,
                         ],
                     },
-                })
+                }
             }
-            ServerRequest::PermissionsRequestApproval(params) => {
+            CodexServerRequest::PermissionsRequestApproval(params) => {
                 let thread = self.resolve_thread(&params.thread_id, fallback_thread);
                 let turn = self.resolve_turn(&params.turn_id);
                 let permissions = serde_json::to_value(&params.permissions).unwrap_or_default();
+                let approval_id = ApprovalId(req_id);
                 self.pending_approval_responses.insert(
-                    req_id.clone(),
-                    PendingApprovalResponse::Permissions {
-                        permissions: permissions.clone(),
+                    approval_id.clone(),
+                    PendingApprovalResponse {
+                        request_id: id.clone(),
+                        kind: PendingApprovalResponseKind::Permissions {
+                            permissions: permissions.clone(),
+                        },
                     },
                 );
-                Some(AgentEvent::ApprovalRequested {
+                AgentEvent::ApprovalRequested {
                     thread,
                     turn,
                     request: ApprovalRequest {
-                        id: req_id,
+                        id: approval_id,
                         kind: ApprovalKind::Permission {
                             detail: format_permissions_detail(&permissions),
                         },
@@ -609,9 +625,106 @@ impl CodexMapper {
                             ApprovalDecision::Cancel,
                         ],
                     },
-                })
+                }
             }
-            _ => None,
+            CodexServerRequest::ExecCommandApproval(params) => {
+                let thread = self.thread_from_native_value(
+                    serde_json::to_value(&params.conversation_id).ok().as_ref(),
+                    fallback_thread,
+                );
+                let turn = self
+                    .active_turns
+                    .get(&thread)
+                    .cloned()
+                    .map(|native| self.resolve_turn(&native))
+                    .unwrap_or_default();
+                let approval_id = ApprovalId(req_id);
+                self.pending_approval_responses.insert(
+                    approval_id.clone(),
+                    PendingApprovalResponse {
+                        request_id: id.clone(),
+                        kind: PendingApprovalResponseKind::LegacyReviewDecision,
+                    },
+                );
+                AgentEvent::ApprovalRequested {
+                    thread,
+                    turn,
+                    request: ApprovalRequest {
+                        id: approval_id,
+                        kind: ApprovalKind::CommandExecution {
+                            command: legacy_command_preview(&params.command),
+                            cwd: PathBuf::from(&params.cwd),
+                        },
+                        reason: params.reason.clone(),
+                        available: vec![
+                            ApprovalDecision::Accept,
+                            ApprovalDecision::AcceptForSession,
+                            ApprovalDecision::Decline,
+                            ApprovalDecision::Cancel,
+                        ],
+                    },
+                }
+            }
+            CodexServerRequest::ApplyPatchApproval(params) => {
+                let thread = self.thread_from_native_value(
+                    serde_json::to_value(&params.conversation_id).ok().as_ref(),
+                    fallback_thread,
+                );
+                let turn = self
+                    .active_turns
+                    .get(&thread)
+                    .cloned()
+                    .map(|native| self.resolve_turn(&native))
+                    .unwrap_or_default();
+                let approval_id = ApprovalId(req_id);
+                self.pending_approval_responses.insert(
+                    approval_id.clone(),
+                    PendingApprovalResponse {
+                        request_id: id.clone(),
+                        kind: PendingApprovalResponseKind::LegacyReviewDecision,
+                    },
+                );
+                AgentEvent::ApprovalRequested {
+                    thread,
+                    turn,
+                    request: ApprovalRequest {
+                        id: approval_id,
+                        kind: ApprovalKind::FileChange {
+                            path: legacy_patch_preview_path(params),
+                            change: FileChangeKind::Modified,
+                        },
+                        reason: params.reason.clone(),
+                        available: vec![
+                            ApprovalDecision::Accept,
+                            ApprovalDecision::AcceptForSession,
+                            ApprovalDecision::Decline,
+                            ApprovalDecision::Cancel,
+                        ],
+                    },
+                }
+            }
+            _ => {
+                let (thread, turn) = self.server_request_scope(request, fallback_thread);
+                let server_request_id = ServerRequestId(req_id);
+                self.pending_server_requests.insert(
+                    server_request_id.clone(),
+                    PendingServerRequest {
+                        request_id: id.clone(),
+                        thread,
+                        turn,
+                    },
+                );
+                AgentEvent::ServerRequestReceived {
+                    thread,
+                    turn,
+                    request: GiskardServerRequest {
+                        id: server_request_id,
+                        method: request.method().to_owned(),
+                        params: server_request_params(request),
+                        received_at: Utc::now(),
+                    },
+                }
+            }
         }
     }
 
@@ -619,26 +732,124 @@ impl CodexMapper {
         &mut self,
         id: &ApprovalId,
         decision: &ApprovalDecision,
-    ) -> ApprovalResponse {
+    ) -> Result<ApprovalResponse, String> {
         match self.pending_approval_responses.remove(id) {
-            Some(PendingApprovalResponse::Permissions { permissions }) => {
-                map_permissions_approval_decision(decision, permissions)
-            }
-            Some(PendingApprovalResponse::Decision) | None => {
-                ApprovalResponse::Result(map_approval_decision(decision))
-            }
+            Some(PendingApprovalResponse {
+                request_id,
+                kind: PendingApprovalResponseKind::Permissions { permissions },
+            }) => Ok(ApprovalResponse::from_parts(
+                request_id,
+                map_permissions_approval_decision(decision, permissions),
+            )),
+            Some(PendingApprovalResponse {
+                request_id,
+                kind: PendingApprovalResponseKind::LegacyReviewDecision,
+            }) => Ok(ApprovalResponse::from_parts(
+                request_id,
+                map_legacy_review_decision(decision),
+            )),
+            Some(PendingApprovalResponse {
+                request_id,
+                kind: PendingApprovalResponseKind::Decision,
+            }) => Ok(ApprovalResponse::from_parts(
+                request_id,
+                ApprovalResponseBody::Result(map_approval_decision(decision)),
+            )),
+            None => Err(format!("no pending approval for id {id}")),
         }
+    }
+
+    pub fn pending_server_request(
+        &self,
+        id: &ServerRequestId,
+    ) -> Result<PendingServerRequest, String> {
+        self.pending_server_requests
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("no pending server request for id {id}"))
+    }
+
+    pub fn resolve_server_request(&mut self, id: &ServerRequestId) {
+        self.pending_server_requests.remove(id);
+    }
+
+    fn server_request_scope(
+        &mut self,
+        request: &CodexServerRequest,
+        fallback_thread: ThreadId,
+    ) -> (ThreadId, Option<TurnId>) {
+        match request {
+            CodexServerRequest::ToolRequestUserInput(params) => {
+                let thread = self.resolve_thread(&params.thread_id, fallback_thread);
+                let turn = (!params.turn_id.is_empty()).then(|| self.resolve_turn(&params.turn_id));
+                (thread, turn)
+            }
+            CodexServerRequest::ItemToolCall(params) => {
+                let thread = self.resolve_thread(&params.thread_id, fallback_thread);
+                let turn = (!params.turn_id.is_empty()).then(|| self.resolve_turn(&params.turn_id));
+                (thread, turn)
+            }
+            _ => (fallback_thread, None),
+        }
+    }
+
+    fn thread_from_native_value(
+        &self,
+        native_value: Option<&Value>,
+        fallback_thread: ThreadId,
+    ) -> ThreadId {
+        let native = native_value.and_then(Value::as_str).unwrap_or_default();
+        self.resolve_thread(native, fallback_thread)
     }
 }
 
-enum PendingApprovalResponse {
-    Decision,
-    Permissions { permissions: Value },
+#[derive(Debug, Clone)]
+pub struct PendingServerRequest {
+    pub request_id: RequestId,
+    pub thread: ThreadId,
+    pub turn: Option<TurnId>,
 }
 
+#[derive(Debug)]
 pub enum ApprovalResponse {
+    Result {
+        request_id: RequestId,
+        value: Value,
+    },
+    Error {
+        request_id: RequestId,
+        code: i64,
+        message: String,
+    },
+}
+
+struct PendingApprovalResponse {
+    request_id: RequestId,
+    kind: PendingApprovalResponseKind,
+}
+
+enum PendingApprovalResponseKind {
+    Decision,
+    Permissions { permissions: Value },
+    LegacyReviewDecision,
+}
+
+enum ApprovalResponseBody {
     Result(Value),
     Error { code: i64, message: String },
+}
+
+impl ApprovalResponse {
+    fn from_parts(request_id: RequestId, body: ApprovalResponseBody) -> Self {
+        match body {
+            ApprovalResponseBody::Result(value) => Self::Result { request_id, value },
+            ApprovalResponseBody::Error { code, message } => Self::Error {
+                request_id,
+                code,
+                message,
+            },
+        }
+    }
 }
 
 // ---- Free functions ----
@@ -692,28 +903,54 @@ pub fn map_effort(effort: giskard_core::model::Effort) -> codex_codes::Reasoning
 fn map_permissions_approval_decision(
     decision: &ApprovalDecision,
     permissions: Value,
-) -> ApprovalResponse {
+) -> ApprovalResponseBody {
     match decision {
-        ApprovalDecision::Accept => ApprovalResponse::Result(serde_json::json!({
+        ApprovalDecision::Accept => ApprovalResponseBody::Result(serde_json::json!({
             "permissions": permissions,
             "scope": "turn",
         })),
-        ApprovalDecision::AcceptForSession => ApprovalResponse::Result(serde_json::json!({
+        ApprovalDecision::AcceptForSession => ApprovalResponseBody::Result(serde_json::json!({
             "permissions": permissions,
             "scope": "session",
         })),
-        ApprovalDecision::Decline => ApprovalResponse::Error {
+        ApprovalDecision::Decline => ApprovalResponseBody::Error {
             code: -32000,
             message: "Permissions request declined.".into(),
         },
-        ApprovalDecision::Cancel => ApprovalResponse::Error {
+        ApprovalDecision::Cancel => ApprovalResponseBody::Error {
             code: -32000,
             message: "Permissions request cancelled.".into(),
         },
-        ApprovalDecision::AcceptWithExecPolicyAmendment { .. } => ApprovalResponse::Error {
+        ApprovalDecision::AcceptWithExecPolicyAmendment { .. } => ApprovalResponseBody::Error {
             code: -32000,
             message: "Exec policy amendments are not valid for permissions requests.".into(),
         },
+    }
+}
+
+fn map_legacy_review_decision(decision: &ApprovalDecision) -> ApprovalResponseBody {
+    match decision {
+        ApprovalDecision::Accept => {
+            ApprovalResponseBody::Result(serde_json::json!({"decision": "approved"}))
+        }
+        ApprovalDecision::AcceptForSession => {
+            ApprovalResponseBody::Result(serde_json::json!({"decision": "approved_for_session"}))
+        }
+        ApprovalDecision::Decline => {
+            ApprovalResponseBody::Result(serde_json::json!({"decision": "denied"}))
+        }
+        ApprovalDecision::Cancel => {
+            ApprovalResponseBody::Result(serde_json::json!({"decision": "abort"}))
+        }
+        ApprovalDecision::AcceptWithExecPolicyAmendment { amendment } => {
+            ApprovalResponseBody::Result(serde_json::json!({
+                "decision": {
+                    "approved_execpolicy_amendment": {
+                        "proposed_execpolicy_amendment": amendment,
+                    },
+                },
+            }))
+        }
     }
 }
 
@@ -738,6 +975,67 @@ fn command_action_command(action: &codex_codes::protocol::CommandAction) -> Opti
     (!command.trim().is_empty()).then(|| command.clone())
 }
 
+fn request_id_to_string(id: &RequestId) -> String {
+    match id {
+        RequestId::Integer(i) => i.to_string(),
+        RequestId::String(s) => s.clone(),
+    }
+}
+
+fn legacy_command_preview(command: &[String]) -> String {
+    command
+        .iter()
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| {
+            if part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_./:@%+=,-".contains(c))
+            {
+                part.clone()
+            } else {
+                serde_json::to_string(part).unwrap_or_else(|_| part.clone())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn legacy_patch_preview_path(params: &codex_codes::protocol::ApplyPatchApprovalParams) -> PathBuf {
+    if let Some(grant_root) = params.grant_root.as_ref().filter(|s| !s.trim().is_empty()) {
+        return PathBuf::from(grant_root);
+    }
+    params
+        .file_changes
+        .keys()
+        .next()
+        .map(PathBuf::from)
+        .unwrap_or_default()
+}
+
+fn server_request_params(request: &CodexServerRequest) -> Value {
+    match request {
+        CodexServerRequest::ToolRequestUserInput(params) => to_json_value(params),
+        CodexServerRequest::McpServerElicitationRequest(params) => to_json_value(params),
+        CodexServerRequest::ItemToolCall(params) => to_json_value(params),
+        CodexServerRequest::ChatgptAuthTokensRefresh(params) => to_json_value(params),
+        CodexServerRequest::AttestationGenerate(params) => to_json_value(params),
+        CodexServerRequest::Unknown { params, .. } => params.clone().unwrap_or(Value::Null),
+        CodexServerRequest::CmdExecApproval(params) => to_json_value(params),
+        CodexServerRequest::FileChangeApproval(params) => to_json_value(params),
+        CodexServerRequest::PermissionsRequestApproval(params) => to_json_value(params),
+        CodexServerRequest::ApplyPatchApproval(params) => to_json_value(params),
+        CodexServerRequest::ExecCommandApproval(params) => to_json_value(params),
+    }
+}
+
+fn to_json_value<T: Serialize>(value: &T) -> Value {
+    serde_json::to_value(value).unwrap_or_else(|error| {
+        json!({
+            "serializationError": error.to_string(),
+        })
+    })
+}
+
 pub fn map_approval_decision(decision: &ApprovalDecision) -> Value {
     match decision {
         ApprovalDecision::Accept => serde_json::json!({"decision": "accept"}),
@@ -748,8 +1046,11 @@ pub fn map_approval_decision(decision: &ApprovalDecision) -> Value {
         ApprovalDecision::Cancel => serde_json::json!({"decision": "cancel"}),
         ApprovalDecision::AcceptWithExecPolicyAmendment { amendment } => {
             serde_json::json!({
-                "decision": "accept",
-                "amendedExecPolicy": amendment,
+                "decision": {
+                    "acceptWithExecpolicyAmendment": {
+                        "execpolicy_amendment": amendment,
+                    },
+                },
             })
         }
     }
@@ -1376,6 +1677,22 @@ fn parse_hunk_header(line: &str) -> Option<(u32, u32, u32, u32)> {
 mod tests {
     use super::*;
 
+    fn approval_result_value(response: ApprovalResponse) -> Value {
+        match response {
+            ApprovalResponse::Result { value, .. } => value,
+            ApprovalResponse::Error { code, message, .. } => {
+                panic!("expected approval result, got JSON-RPC error {code}: {message}")
+            }
+        }
+    }
+
+    fn assert_response_schema<T>(value: Value) -> T
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        serde_json::from_value(value).expect("response should match Codex schema")
+    }
+
     fn completed_item(item: Value) -> Notification {
         Notification::ItemCompleted(
             serde_json::from_value(serde_json::json!({
@@ -1535,7 +1852,7 @@ mod tests {
     #[test]
     fn permissions_request_maps_to_approval_and_codex_response_shape() {
         let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
-        let request = ServerRequest::PermissionsRequestApproval(
+        let request = CodexServerRequest::PermissionsRequestApproval(
             serde_json::from_value(serde_json::json!({
                 "cwd": "/tmp/project",
                 "itemId": "perm1",
@@ -1551,10 +1868,7 @@ mod tests {
         );
         let request_id = RequestId::String("perm_req".into());
 
-        match mapper
-            .map_server_request(&request_id, &request, ThreadId::new())
-            .unwrap()
-        {
+        match mapper.map_server_request(&request_id, &request, ThreadId::new()) {
             AgentEvent::ApprovalRequested { request, .. } => {
                 assert_eq!(request.id, ApprovalId("perm_req".into()));
                 assert!(matches!(request.kind, ApprovalKind::Permission { .. }));
@@ -1563,13 +1877,17 @@ mod tests {
             other => panic!("expected permissions approval, got {other:?}"),
         }
 
-        match mapper.map_approval_response(
-            &ApprovalId("perm_req".into()),
-            &ApprovalDecision::AcceptForSession,
-        ) {
-            ApprovalResponse::Result(result) => {
-                assert_eq!(result["permissions"]["network"]["enabled"], true);
-                assert_eq!(result["scope"], "session");
+        match mapper
+            .map_approval_response(
+                &ApprovalId("perm_req".into()),
+                &ApprovalDecision::AcceptForSession,
+            )
+            .unwrap()
+        {
+            ApprovalResponse::Result { request_id, value } => {
+                assert_eq!(request_id, RequestId::String("perm_req".into()));
+                assert_eq!(value["permissions"]["network"]["enabled"], true);
+                assert_eq!(value["scope"], "session");
             }
             ApprovalResponse::Error { .. } => panic!("accept should grant requested permissions"),
         }
@@ -1578,7 +1896,7 @@ mod tests {
     #[test]
     fn declined_permissions_request_maps_to_json_rpc_error() {
         let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
-        let request = ServerRequest::PermissionsRequestApproval(
+        let request = CodexServerRequest::PermissionsRequestApproval(
             serde_json::from_value(serde_json::json!({
                 "cwd": "/tmp/project",
                 "itemId": "perm1",
@@ -1596,19 +1914,25 @@ mod tests {
 
         match mapper
             .map_approval_response(&ApprovalId("perm_req".into()), &ApprovalDecision::Decline)
+            .unwrap()
         {
-            ApprovalResponse::Error { code, message } => {
+            ApprovalResponse::Error {
+                request_id,
+                code,
+                message,
+            } => {
+                assert_eq!(request_id, RequestId::String("perm_req".into()));
                 assert_eq!(code, -32000);
                 assert!(message.contains("declined"));
             }
-            ApprovalResponse::Result(_) => panic!("decline should use a JSON-RPC error"),
+            ApprovalResponse::Result { .. } => panic!("decline should use a JSON-RPC error"),
         }
     }
 
     #[test]
     fn command_approval_uses_command_actions_for_preview() {
         let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
-        let request = ServerRequest::CmdExecApproval(
+        let request = CodexServerRequest::CmdExecApproval(
             serde_json::from_value(serde_json::json!({
                 "commandActions": [
                     {
@@ -1627,14 +1951,11 @@ mod tests {
             .unwrap(),
         );
 
-        match mapper
-            .map_server_request(
-                &RequestId::String("cmd_req".into()),
-                &request,
-                ThreadId::new(),
-            )
-            .unwrap()
-        {
+        match mapper.map_server_request(
+            &RequestId::String("cmd_req".into()),
+            &request,
+            ThreadId::new(),
+        ) {
             AgentEvent::ApprovalRequested { request, .. } => match request.kind {
                 ApprovalKind::CommandExecution { command, .. } => {
                     assert_eq!(command, "rg marmeladema tf");
@@ -1642,6 +1963,339 @@ mod tests {
                 other => panic!("expected command approval, got {other:?}"),
             },
             other => panic!("expected command approval event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_approval_response_matches_codex_schema() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let request = CodexServerRequest::CmdExecApproval(
+            serde_json::from_value(serde_json::json!({
+                "commandActions": [],
+                "cwd": "/tmp/project",
+                "itemId": "cmd1",
+                "threadId": "thread1",
+                "turnId": "turn1",
+                "startedAtMs": 123
+            }))
+            .unwrap(),
+        );
+        mapper.map_server_request(
+            &RequestId::String("cmd_req".into()),
+            &request,
+            ThreadId::new(),
+        );
+
+        let value = approval_result_value(
+            mapper
+                .map_approval_response(
+                    &ApprovalId("cmd_req".into()),
+                    &ApprovalDecision::AcceptWithExecPolicyAmendment {
+                        amendment: vec!["cargo test".into()],
+                    },
+                )
+                .unwrap(),
+        );
+        let decoded: codex_codes::protocol::CommandExecutionRequestApprovalResponse =
+            assert_response_schema(value);
+        assert_eq!(
+            decoded.decision,
+            codex_codes::protocol::CommandExecutionApprovalDecision::AcceptWithExecpolicyAmendment {
+                execpolicy_amendment: vec!["cargo test".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn file_change_approval_response_matches_codex_schema() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let request = CodexServerRequest::FileChangeApproval(
+            serde_json::from_value(serde_json::json!({
+                "grantRoot": "/tmp/project",
+                "itemId": "file1",
+                "threadId": "thread1",
+                "turnId": "turn1",
+                "startedAtMs": 123
+            }))
+            .unwrap(),
+        );
+        mapper.map_server_request(
+            &RequestId::String("file_req".into()),
+            &request,
+            ThreadId::new(),
+        );
+
+        let value = approval_result_value(
+            mapper
+                .map_approval_response(
+                    &ApprovalId("file_req".into()),
+                    &ApprovalDecision::AcceptForSession,
+                )
+                .unwrap(),
+        );
+        let decoded: codex_codes::protocol::FileChangeRequestApprovalResponse =
+            assert_response_schema(value);
+        assert_eq!(
+            decoded.decision,
+            codex_codes::protocol::FileChangeApprovalDecision::AcceptForSession
+        );
+    }
+
+    #[test]
+    fn legacy_apply_patch_approval_response_matches_codex_schema() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let request = CodexServerRequest::ApplyPatchApproval(
+            serde_json::from_value(serde_json::json!({
+                "callId": "call1",
+                "conversationId": "thread1",
+                "fileChanges": {
+                    "src/lib.rs": { "type": "add", "content": "" }
+                },
+                "grantRoot": "/tmp/project"
+            }))
+            .unwrap(),
+        );
+        mapper.map_server_request(
+            &RequestId::String("patch_req".into()),
+            &request,
+            ThreadId::new(),
+        );
+
+        let value = approval_result_value(
+            mapper
+                .map_approval_response(
+                    &ApprovalId("patch_req".into()),
+                    &ApprovalDecision::AcceptWithExecPolicyAmendment {
+                        amendment: vec!["apply patch".into()],
+                    },
+                )
+                .unwrap(),
+        );
+        let decoded: codex_codes::protocol::ApplyPatchApprovalResponse =
+            assert_response_schema(value);
+        assert_eq!(
+            decoded.decision,
+            codex_codes::protocol::ReviewDecision::ApprovedExecpolicyAmendment {
+                proposed_execpolicy_amendment: vec!["apply patch".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_approval_response_id_is_an_error() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let err = mapper
+            .map_approval_response(&ApprovalId("missing".into()), &ApprovalDecision::Accept)
+            .unwrap_err();
+        assert!(err.contains("missing"));
+    }
+
+    #[test]
+    fn dynamic_tool_call_maps_to_pending_server_request() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let fallback = ThreadId::new();
+        let request = CodexServerRequest::ItemToolCall(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "thread1",
+                "turnId": "turn1",
+                "callId": "call1",
+                "namespace": "cf-mcp",
+                "tool": "gitlab_get_mr_changes",
+                "arguments": { "mr_iid": 1534 }
+            }))
+            .unwrap(),
+        );
+        mapper.register_thread("thread1".into(), fallback);
+        let event = mapper.map_server_request(&RequestId::Integer(42), &request, ThreadId::new());
+
+        match event {
+            AgentEvent::ServerRequestReceived {
+                thread,
+                turn,
+                request,
+            } => {
+                assert_eq!(thread, fallback);
+                assert!(turn.is_some());
+                assert_eq!(request.id, ServerRequestId("42".into()));
+                assert_eq!(request.method, "item/tool/call");
+                assert_eq!(request.params["tool"], "gitlab_get_mr_changes");
+                assert_eq!(request.params["arguments"]["mr_iid"], 1534);
+            }
+            other => panic!("expected pending server request, got {other:?}"),
+        }
+
+        let pending = mapper
+            .pending_server_request(&ServerRequestId("42".into()))
+            .unwrap();
+        assert_eq!(pending.request_id, RequestId::Integer(42));
+        assert_eq!(pending.thread, fallback);
+        assert!(pending.turn.is_some());
+        mapper.resolve_server_request(&ServerRequestId("42".into()));
+        assert!(
+            mapper
+                .pending_server_request(&ServerRequestId("42".into()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn known_non_approval_server_requests_preserve_method_and_params() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let fallback = ThreadId::new();
+        let scoped_thread = ThreadId::new();
+        mapper.register_thread("thread1".into(), scoped_thread);
+
+        let cases = [
+            (
+                "tool_user_input",
+                CodexServerRequest::ToolRequestUserInput(
+                    serde_json::from_value(serde_json::json!({
+                        "itemId": "input1",
+                        "threadId": "thread1",
+                        "turnId": "turn1",
+                        "questions": [{
+                            "id": "confirm",
+                            "header": "Confirm",
+                            "question": "Continue?"
+                        }]
+                    }))
+                    .unwrap(),
+                ),
+                "item/tool/requestUserInput",
+                Some(scoped_thread),
+            ),
+            (
+                "mcp_elicitation",
+                CodexServerRequest::McpServerElicitationRequest(
+                    serde_json::from_value(serde_json::json!({
+                        "mode": "form",
+                        "message": "Need input",
+                        "requestedSchema": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string", "title": "Name" }
+                            }
+                        }
+                    }))
+                    .unwrap(),
+                ),
+                "mcpServer/elicitation/request",
+                None,
+            ),
+            (
+                "auth_refresh",
+                CodexServerRequest::ChatgptAuthTokensRefresh(
+                    serde_json::from_value(serde_json::json!({
+                        "reason": "unauthorized",
+                        "previousAccountId": "acct_1"
+                    }))
+                    .unwrap(),
+                ),
+                "account/chatgptAuthTokens/refresh",
+                None,
+            ),
+            (
+                "attestation",
+                CodexServerRequest::AttestationGenerate(
+                    serde_json::from_value(serde_json::json!({})).unwrap(),
+                ),
+                "attestation/generate",
+                None,
+            ),
+        ];
+
+        for (id, request, method, expected_thread) in cases {
+            match mapper.map_server_request(&RequestId::String(id.into()), &request, fallback) {
+                AgentEvent::ServerRequestReceived {
+                    thread,
+                    turn,
+                    request,
+                } => {
+                    assert_eq!(request.method, method);
+                    assert!(request.params.get("serializationError").is_none());
+                    assert!(mapper.pending_server_request(&request.id).is_ok());
+                    if let Some(expected_thread) = expected_thread {
+                        assert_eq!(thread, expected_thread);
+                        assert!(turn.is_some());
+                    } else {
+                        assert_eq!(thread, fallback);
+                        assert!(turn.is_none());
+                    }
+                }
+                other => panic!("expected pending server request for {method}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_server_request_preserves_method_and_params() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let request = CodexServerRequest::Unknown {
+            method: "future/request".into(),
+            params: Some(serde_json::json!({ "answer": 42 })),
+        };
+
+        match mapper.map_server_request(
+            &RequestId::String("future_req".into()),
+            &request,
+            ThreadId::new(),
+        ) {
+            AgentEvent::ServerRequestReceived { request, .. } => {
+                assert_eq!(request.id, ServerRequestId("future_req".into()));
+                assert_eq!(request.method, "future/request");
+                assert_eq!(request.params["answer"], 42);
+            }
+            other => panic!("expected pending server request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_server_request_response_id_is_an_error() {
+        let mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let err = mapper
+            .pending_server_request(&ServerRequestId("missing".into()))
+            .unwrap_err();
+        assert!(err.contains("missing"));
+    }
+
+    #[test]
+    fn legacy_exec_command_approval_uses_review_decision_shape() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let request = CodexServerRequest::ExecCommandApproval(
+            serde_json::from_value(serde_json::json!({
+                "callId": "call1",
+                "conversationId": "thread1",
+                "command": ["cargo", "test"],
+                "cwd": "/tmp/project"
+            }))
+            .unwrap(),
+        );
+
+        match mapper.map_server_request(
+            &RequestId::String("legacy_cmd".into()),
+            &request,
+            ThreadId::new(),
+        ) {
+            AgentEvent::ApprovalRequested { request, .. } => match request.kind {
+                ApprovalKind::CommandExecution { command, cwd } => {
+                    assert_eq!(command, "cargo test");
+                    assert_eq!(cwd, PathBuf::from("/tmp/project"));
+                }
+                other => panic!("expected command approval, got {other:?}"),
+            },
+            other => panic!("expected approval event, got {other:?}"),
+        }
+
+        match mapper
+            .map_approval_response(&ApprovalId("legacy_cmd".into()), &ApprovalDecision::Decline)
+            .unwrap()
+        {
+            ApprovalResponse::Result { value, .. } => {
+                assert_eq!(value["decision"], "denied");
+            }
+            ApprovalResponse::Error { .. } => {
+                panic!("legacy review decisions should use result payloads")
+            }
         }
     }
 

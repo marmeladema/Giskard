@@ -3,8 +3,9 @@ use serde::{Deserialize, Serialize};
 use crate::approval::ApprovalRequest;
 use crate::diff::FileDiff;
 use crate::error::HarnessError;
-use crate::ids::{ItemId, ThreadId, TurnId};
+use crate::ids::{ItemId, ServerRequestId, ThreadId, TurnId};
 use crate::item::{Item, ItemDelta, ItemStart};
+use crate::server_request::ServerRequest;
 use crate::token::TokenUsage;
 use crate::turn::TurnStatus;
 
@@ -49,6 +50,20 @@ pub enum AgentEvent {
         thread: ThreadId,
         turn: TurnId,
         request: ApprovalRequest,
+    },
+    /// Server-initiated request that needs a browser response before the harness can continue.
+    ServerRequestReceived {
+        thread: ThreadId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<TurnId>,
+        request: ServerRequest,
+    },
+    /// A previously surfaced server request received a browser response or otherwise resolved.
+    ServerRequestResolved {
+        thread: ThreadId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<TurnId>,
+        request_id: ServerRequestId,
     },
     TurnCompleted {
         thread: ThreadId,
@@ -100,6 +115,40 @@ mod tests {
                 assert_eq!(tn1, tn2);
             }
             _ => panic!("variant mismatch"),
+        }
+    }
+
+    #[test]
+    fn server_request_events_serde_roundtrip() {
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let request_id = ServerRequestId("req_1".into());
+        let event = AgentEvent::ServerRequestReceived {
+            thread,
+            turn: Some(turn),
+            request: crate::server_request::ServerRequest {
+                id: request_id.clone(),
+                method: "item/tool/call".into(),
+                params: serde_json::json!({ "tool": "example" }),
+                received_at: chrono::Utc::now(),
+            },
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["kind"], "server_request_received");
+        assert_eq!(json["request"]["id"], "req_1");
+        let back: AgentEvent = serde_json::from_value(json).unwrap();
+        match back {
+            AgentEvent::ServerRequestReceived {
+                thread: got_thread,
+                turn: got_turn,
+                request,
+            } => {
+                assert_eq!(got_thread, thread);
+                assert_eq!(got_turn, Some(turn));
+                assert_eq!(request.id, request_id);
+                assert_eq!(request.params["tool"], "example");
+            }
+            other => panic!("wrong variant: {other:?}"),
         }
     }
 }

@@ -9,11 +9,12 @@ use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ThreadId, TurnId};
+use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{
     CommandExecutionStart, Item, ItemDelta, ItemKind, ItemPayload, ItemStart,
 };
 use giskard_core::model::{ModelDescriptor, ModelRef};
+use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{ApprovalPolicy, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
@@ -206,6 +207,14 @@ impl AgentHarness for InterruptHarness {
         &self,
         _req: ApprovalId,
         _decision: giskard_core::approval::ApprovalDecision,
+    ) -> Result<(), HarnessError> {
+        Ok(())
+    }
+
+    async fn respond_server_request(
+        &self,
+        _req: ServerRequestId,
+        _response: ServerRequestResponse,
     ) -> Result<(), HarnessError> {
         Ok(())
     }

@@ -18,8 +18,9 @@ use tracing::warn;
 use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ApprovalId, ThreadId, TurnId};
+use giskard_core::ids::{ApprovalId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::model::ModelDescriptor;
+use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
@@ -49,6 +50,11 @@ enum ControlCommand {
     RespondApproval {
         id: ApprovalId,
         decision: ApprovalDecision,
+        response: oneshot::Sender<Result<(), HarnessError>>,
+    },
+    RespondServerRequest {
+        id: ServerRequestId,
+        response_payload: ServerRequestResponse,
         response: oneshot::Sender<Result<(), HarnessError>>,
     },
     Interrupt {
@@ -199,6 +205,24 @@ impl AgentHarness for CodexHarness {
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
 
+    async fn respond_server_request(
+        &self,
+        id: ServerRequestId,
+        response_payload: ServerRequestResponse,
+    ) -> Result<(), HarnessError> {
+        let (tx, rx) = oneshot::channel();
+        self.control_tx
+            .send(ControlCommand::RespondServerRequest {
+                id,
+                response_payload,
+                response: tx,
+            })
+            .await
+            .map_err(|_| HarnessError::Transport("background task closed".into()))?;
+        rx.await
+            .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
+    }
+
     async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
         let (tx, rx) = oneshot::channel();
         self.control_tx
@@ -323,7 +347,24 @@ async fn background_task(
                         decision,
                         response,
                     }) => {
-                        let result = handle_respond(&mut client, &mut mapper, &id, &decision).await;
+                        let result =
+                            handle_respond_approval(&mut client, &mut mapper, &id, &decision)
+                                .await;
+                        let _ = response.send(result);
+                    }
+                    Some(ControlCommand::RespondServerRequest {
+                        id,
+                        response_payload,
+                        response,
+                    }) => {
+                        let result = handle_respond_server_request(
+                            &mut client,
+                            &mut mapper,
+                            &senders,
+                            &id,
+                            response_payload,
+                        )
+                        .await;
                         let _ = response.send(result);
                     }
                     Some(ControlCommand::Interrupt { thread, response }) => {
@@ -369,24 +410,10 @@ async fn handle_idle_server_message(
             StreamOutcome::TurnEnded
         }
         codex_codes::ServerMessage::Request { id, request } => {
+            let waiting_for = id.to_string();
             let event = mapper.map_server_request(&id, &request, fallback_thread);
-            if let Some(event) = event {
-                let thread = event_thread(&event);
-                let _ = broadcast_event(senders, thread, || event).await;
-            } else {
-                if let Err(error) =
-                    reject_unsupported_server_request(client, senders, fallback_thread, id, request)
-                        .await
-                {
-                    let _ = broadcast_event(senders, fallback_thread, || AgentEvent::Error {
-                        thread: fallback_thread,
-                        turn: None,
-                        error,
-                    })
-                    .await;
-                }
-                return StreamOutcome::TurnEnded;
-            }
+            let thread = event_thread(&event);
+            let _ = broadcast_event(senders, thread, || event).await;
 
             loop {
                 match control_rx.recv().await {
@@ -395,9 +422,34 @@ async fn handle_idle_server_message(
                         decision,
                         response,
                     }) => {
-                        let result = handle_respond(client, mapper, &resp_id, &decision).await;
+                        let is_waiting = resp_id.0 == waiting_for;
+                        let result =
+                            handle_respond_approval(client, mapper, &resp_id, &decision).await;
+                        let should_end = is_waiting && result.is_ok();
                         let _ = response.send(result);
-                        return StreamOutcome::TurnEnded;
+                        if should_end {
+                            return StreamOutcome::TurnEnded;
+                        }
+                    }
+                    Some(ControlCommand::RespondServerRequest {
+                        id: resp_id,
+                        response_payload,
+                        response,
+                    }) => {
+                        let is_waiting = resp_id.0 == waiting_for;
+                        let result = handle_respond_server_request(
+                            client,
+                            mapper,
+                            senders,
+                            &resp_id,
+                            response_payload,
+                        )
+                        .await;
+                        let should_end = is_waiting && result.is_ok();
+                        let _ = response.send(result);
+                        if should_end {
+                            return StreamOutcome::TurnEnded;
+                        }
                     }
                     Some(ControlCommand::Interrupt { thread, response }) => {
                         let result = handle_interrupt(client, mapper, &thread).await;
@@ -575,7 +627,7 @@ async fn stream_turn_events(
         let msg = tokio::select! {
             msg = client.next_message() => msg,
             control = control_rx.recv() => {
-                match handle_stream_control(client, mapper, control).await {
+                match handle_stream_control(client, mapper, senders, control).await {
                     StreamControlOutcome::Continue => continue,
                     StreamControlOutcome::Shutdown => return StreamOutcome::Shutdown,
                 }
@@ -649,26 +701,13 @@ async fn stream_turn_events(
                 }
             }
             codex_codes::ServerMessage::Request { id, request } => {
+                let waiting_for = id.to_string();
                 let event = mapper.map_server_request(&id, &request, thread_id);
-                if let Some(event) = event {
-                    let _ = broadcast_event(senders, thread_id, || event).await;
-                } else {
-                    if let Err(error) =
-                        reject_unsupported_server_request(client, senders, thread_id, id, request)
-                            .await
-                    {
-                        let _ = broadcast_event(senders, thread_id, || AgentEvent::Error {
-                            thread: thread_id,
-                            turn: None,
-                            error,
-                        })
-                        .await;
-                    }
-                    continue;
-                }
+                let event_thread_id = event_thread(&event);
+                let _ = broadcast_event(senders, event_thread_id, || event).await;
 
-                // Wait for the user's approval response. Normal harness commands keep queuing on
-                // the main command channel while this live turn waits for control input.
+                // Wait for the browser response. Normal harness commands keep queuing on the main
+                // command channel while this live turn waits for control input.
                 loop {
                     match control_rx.recv().await {
                         Some(ControlCommand::RespondApproval {
@@ -676,9 +715,34 @@ async fn stream_turn_events(
                             decision,
                             response,
                         }) => {
-                            let result = handle_respond(client, mapper, &resp_id, &decision).await;
+                            let is_waiting = resp_id.0 == waiting_for;
+                            let result =
+                                handle_respond_approval(client, mapper, &resp_id, &decision).await;
+                            let should_break = is_waiting && result.is_ok();
                             let _ = response.send(result);
-                            break;
+                            if should_break {
+                                break;
+                            }
+                        }
+                        Some(ControlCommand::RespondServerRequest {
+                            id: resp_id,
+                            response_payload,
+                            response,
+                        }) => {
+                            let is_waiting = resp_id.0 == waiting_for;
+                            let result = handle_respond_server_request(
+                                client,
+                                mapper,
+                                senders,
+                                &resp_id,
+                                response_payload,
+                            )
+                            .await;
+                            let should_break = is_waiting && result.is_ok();
+                            let _ = response.send(result);
+                            if should_break {
+                                break;
+                            }
                         }
                         Some(ControlCommand::Interrupt {
                             thread: t,
@@ -719,6 +783,7 @@ enum StreamControlOutcome {
 async fn handle_stream_control(
     client: &mut codex_codes::AsyncClient,
     mapper: &mut CodexMapper,
+    senders: &SenderMap,
     control: Option<ControlCommand>,
 ) -> StreamControlOutcome {
     match control {
@@ -727,7 +792,17 @@ async fn handle_stream_control(
             decision,
             response,
         }) => {
-            let result = handle_respond(client, mapper, &id, &decision).await;
+            let result = handle_respond_approval(client, mapper, &id, &decision).await;
+            let _ = response.send(result);
+            StreamControlOutcome::Continue
+        }
+        Some(ControlCommand::RespondServerRequest {
+            id,
+            response_payload,
+            response,
+        }) => {
+            let result =
+                handle_respond_server_request(client, mapper, senders, &id, response_payload).await;
             let _ = response.send(result);
             StreamControlOutcome::Continue
         }
@@ -769,6 +844,8 @@ fn event_thread(event: &AgentEvent) -> ThreadId {
         | AgentEvent::ItemCompleted { thread, .. }
         | AgentEvent::DiffUpdated { thread, .. }
         | AgentEvent::ApprovalRequested { thread, .. }
+        | AgentEvent::ServerRequestReceived { thread, .. }
+        | AgentEvent::ServerRequestResolved { thread, .. }
         | AgentEvent::TurnCompleted { thread, .. }
         | AgentEvent::Error { thread, .. }
         | AgentEvent::Notice { thread, .. } => *thread,
@@ -796,99 +873,62 @@ async fn emit_incomplete_turn(
     }
 }
 
-async fn handle_respond(
+async fn handle_respond_approval(
     client: &mut codex_codes::AsyncClient,
     mapper: &mut CodexMapper,
     id: &ApprovalId,
     decision: &ApprovalDecision,
 ) -> Result<(), HarnessError> {
-    let request_id = codex_codes::jsonrpc::RequestId::String(id.0.clone());
-    match mapper.map_approval_response(id, decision) {
-        mapping::ApprovalResponse::Result(response_json) => client
-            .respond(request_id, &response_json)
+    match mapper
+        .map_approval_response(id, decision)
+        .map_err(HarnessError::Protocol)?
+    {
+        mapping::ApprovalResponse::Result { request_id, value } => client
+            .respond(request_id, &value)
             .await
             .map_err(|e| HarnessError::Transport(e.to_string())),
-        mapping::ApprovalResponse::Error { code, message } => client
+        mapping::ApprovalResponse::Error {
+            request_id,
+            code,
+            message,
+        } => client
             .respond_error(request_id, code, &message)
             .await
             .map_err(|e| HarnessError::Transport(e.to_string())),
     }
 }
 
-async fn reject_unsupported_server_request(
+async fn handle_respond_server_request(
     client: &mut codex_codes::AsyncClient,
+    mapper: &mut CodexMapper,
     senders: &SenderMap,
-    thread: ThreadId,
-    id: codex_codes::jsonrpc::RequestId,
-    request: codex_codes::messages::ServerRequest,
+    id: &ServerRequestId,
+    response: ServerRequestResponse,
 ) -> Result<(), HarnessError> {
-    let message = unsupported_server_request_message(&request);
-    let event_message = message.clone();
-    let _ = broadcast_event(senders, thread, || AgentEvent::Error {
+    let pending = mapper
+        .pending_server_request(id)
+        .map_err(HarnessError::Protocol)?;
+    match response {
+        ServerRequestResponse::Result { value } => client
+            .respond(pending.request_id, &value)
+            .await
+            .map_err(|e| HarnessError::Transport(e.to_string()))?,
+        ServerRequestResponse::Error { code, message } => client
+            .respond_error(pending.request_id, code, &message)
+            .await
+            .map_err(|e| HarnessError::Transport(e.to_string()))?,
+    }
+    mapper.resolve_server_request(id);
+    let thread = pending.thread;
+    let turn = pending.turn;
+    let request_id = id.clone();
+    let _ = broadcast_event(senders, thread, || AgentEvent::ServerRequestResolved {
         thread,
-        turn: None,
-        error: HarnessError::Unsupported(event_message),
+        turn,
+        request_id,
     })
     .await;
-
-    match unsupported_server_request_response(&request) {
-        UnsupportedRequestResponse::Result(result) => client
-            .respond(id, &result)
-            .await
-            .map_err(|e| HarnessError::Transport(e.to_string())),
-        UnsupportedRequestResponse::Error { code, message } => client
-            .respond_error(id, code, &message)
-            .await
-            .map_err(|e| HarnessError::Transport(e.to_string())),
-    }
-}
-
-enum UnsupportedRequestResponse {
-    Result(serde_json::Value),
-    Error { code: i64, message: String },
-}
-
-fn unsupported_server_request_response(
-    request: &codex_codes::messages::ServerRequest,
-) -> UnsupportedRequestResponse {
-    let message = unsupported_server_request_message(request);
-    match request {
-        codex_codes::messages::ServerRequest::ItemToolCall(_) => {
-            UnsupportedRequestResponse::Result(serde_json::json!({
-                "success": false,
-                "contentItems": [
-                    {
-                        "type": "inputText",
-                        "text": message,
-                    }
-                ],
-            }))
-        }
-        _ => UnsupportedRequestResponse::Error {
-            code: -32000,
-            message,
-        },
-    }
-}
-
-fn unsupported_server_request_message(request: &codex_codes::messages::ServerRequest) -> String {
-    match request {
-        codex_codes::messages::ServerRequest::ItemToolCall(params) => {
-            let prefix = params
-                .namespace
-                .as_ref()
-                .map(|namespace| format!("{namespace}:"))
-                .unwrap_or_default();
-            format!(
-                "Giskard cannot execute client-side tool call `{prefix}{}` yet.",
-                params.tool
-            )
-        }
-        other => format!(
-            "Giskard cannot handle Codex server request `{}` yet.",
-            other.method()
-        ),
-    }
+    Ok(())
 }
 
 async fn handle_interrupt(
@@ -933,61 +973,4 @@ async fn handle_interrupt_turn(
         .await
         .map_err(|e| HarnessError::Transport(e.to_string()))?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn item_tool_call_gets_schema_shaped_failure_response() {
-        let request = codex_codes::messages::ServerRequest::ItemToolCall(
-            serde_json::from_value(serde_json::json!({
-                "threadId": "thread_1",
-                "turnId": "turn_1",
-                "callId": "call_1",
-                "namespace": "mcp__cf_mcp",
-                "tool": "gitlab_get_mr_changes",
-                "arguments": {
-                    "project_path": "cloudflare/iac/terraform-github-cloudflare",
-                    "mr_iid": 1534
-                }
-            }))
-            .unwrap(),
-        );
-
-        match unsupported_server_request_response(&request) {
-            UnsupportedRequestResponse::Result(result) => {
-                assert_eq!(result["success"], false);
-                assert_eq!(result["contentItems"][0]["type"], "inputText");
-                assert!(
-                    result["contentItems"][0]["text"]
-                        .as_str()
-                        .unwrap()
-                        .contains("mcp__cf_mcp:gitlab_get_mr_changes")
-                );
-            }
-            UnsupportedRequestResponse::Error { .. } => {
-                panic!("dynamic tool calls should use a tool failure result")
-            }
-        }
-    }
-
-    #[test]
-    fn unsupported_non_tool_request_gets_json_rpc_error_response() {
-        let request = codex_codes::messages::ServerRequest::Unknown {
-            method: "future/request".into(),
-            params: None,
-        };
-
-        match unsupported_server_request_response(&request) {
-            UnsupportedRequestResponse::Error { code, message } => {
-                assert_eq!(code, -32000);
-                assert!(message.contains("future/request"));
-            }
-            UnsupportedRequestResponse::Result(_) => {
-                panic!("non-tool server requests should use a JSON-RPC error")
-            }
-        }
-    }
 }

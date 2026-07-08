@@ -12,8 +12,9 @@ use async_trait::async_trait;
 use futures_util::SinkExt;
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ApprovalId, ThreadId, TurnId};
+use giskard_core::ids::{ApprovalId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::model::{Effort, ModelDescriptor, ModelRef};
+use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{ApprovalPolicy, Mode, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
@@ -104,6 +105,14 @@ impl AgentHarness for CapturingHarness {
         &self,
         _req: ApprovalId,
         _decision: giskard_core::approval::ApprovalDecision,
+    ) -> Result<(), HarnessError> {
+        Ok(())
+    }
+
+    async fn respond_server_request(
+        &self,
+        _req: ServerRequestId,
+        _response: ServerRequestResponse,
     ) -> Result<(), HarnessError> {
         Ok(())
     }

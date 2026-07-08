@@ -16,11 +16,12 @@ use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalRequest};
 use giskard_core::diff::{DiffHunk, FileDiff};
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ApprovalId, ItemId, ThreadId, TurnId};
+use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{
     FileChangeEntry, FileChangeKind, Item, ItemDelta, ItemPayload, ItemStart,
 };
 use giskard_core::model::ModelRef;
+use giskard_core::server_request::ServerRequest;
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{Mode, Turn, TurnStatus};
 use giskard_core::user_input::UserInput;
@@ -66,6 +67,18 @@ pub enum WireAgentEvent {
         thread: ThreadId,
         turn: TurnId,
         request: WireApprovalRequest,
+    },
+    ServerRequestReceived {
+        thread: ThreadId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<TurnId>,
+        request: ServerRequest,
+    },
+    ServerRequestResolved {
+        thread: ThreadId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<TurnId>,
+        request_id: ServerRequestId,
     },
     TurnCompleted {
         thread: ThreadId,
@@ -254,6 +267,24 @@ impl From<AgentEvent> for WireAgentEvent {
                 thread,
                 turn,
                 request: request.into(),
+            },
+            AgentEvent::ServerRequestReceived {
+                thread,
+                turn,
+                request,
+            } => Self::ServerRequestReceived {
+                thread,
+                turn,
+                request,
+            },
+            AgentEvent::ServerRequestResolved {
+                thread,
+                turn,
+                request_id,
+            } => Self::ServerRequestResolved {
+                thread,
+                turn,
+                request_id,
             },
             AgentEvent::TurnCompleted {
                 thread,

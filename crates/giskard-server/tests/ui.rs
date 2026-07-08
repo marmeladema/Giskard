@@ -79,6 +79,70 @@ async fn index_page_is_served_and_public() {
         "UI de-duplicates pending approval cards"
     );
     assert!(
+        body.contains("pendingServerRequests"),
+        "UI de-duplicates pending server request cards"
+    );
+    assert!(
+        body.contains("renderServerRequest"),
+        "UI renders non-approval server requests as transcript cards"
+    );
+    assert!(
+        body.contains("case \"server_request_received\""),
+        "UI consumes server request events"
+    );
+    assert!(
+        body.contains("case \"server_request_resolved\""),
+        "UI consumes server request resolution events"
+    );
+    assert!(
+        body.contains("pending_server_requests"),
+        "UI replays pending server requests from live snapshots"
+    );
+    assert!(
+        body.contains("type:\"server_request_response\""),
+        "server request cards send responses over the WebSocket"
+    );
+    assert!(
+        body.contains("item/tool/call"),
+        "UI has first-class dynamic tool-call request handling"
+    );
+    assert!(
+        body.contains("item/tool/requestUserInput"),
+        "UI has first-class user-input tool request handling"
+    );
+    assert!(
+        body.contains("mcpServer/elicitation/request"),
+        "UI has first-class MCP elicitation handling"
+    );
+    assert!(
+        body.contains("account/chatgptAuthTokens/refresh"),
+        "UI explicitly handles ChatGPT auth refresh requests"
+    );
+    assert!(
+        body.contains("attestation/generate"),
+        "UI explicitly handles client attestation requests"
+    );
+    assert!(
+        body.contains("renderUnsupportedServerRequest"),
+        "known unsupported server requests use an explicit error response"
+    );
+    assert!(
+        body.contains("Giskard cannot refresh ChatGPT auth tokens."),
+        "auth refresh requests cannot accidentally return empty success"
+    );
+    assert!(
+        body.contains("Giskard cannot generate client attestation tokens."),
+        "attestation requests cannot accidentally return empty success"
+    );
+    assert!(
+        body.contains("Return Empty Result"),
+        "UI exposes an intentional unknown-request fallback"
+    );
+    assert!(
+        body.contains("resetResolvingServerRequests"),
+        "server request response errors re-enable pending cards"
+    );
+    assert!(
         body.contains("awaitingInitialThreadState"),
         "UI distinguishes initial thread snapshots from metadata refreshes"
     );

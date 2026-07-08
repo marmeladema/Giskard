@@ -13,8 +13,9 @@ use tokio::sync::{Mutex, broadcast};
 use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ApprovalId, ThreadId, TurnId};
+use giskard_core::ids::{ApprovalId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::model::ModelDescriptor;
+use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::turn::TurnOverrides;
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
@@ -227,6 +228,14 @@ impl AgentHarness for ReplayHarness {
         &self,
         _req: ApprovalId,
         _decision: ApprovalDecision,
+    ) -> Result<(), HarnessError> {
+        Ok(())
+    }
+
+    async fn respond_server_request(
+        &self,
+        _req: ServerRequestId,
+        _response: ServerRequestResponse,
     ) -> Result<(), HarnessError> {
         Ok(())
     }

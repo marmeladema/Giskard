@@ -9,9 +9,10 @@ use tracing::{debug, warn};
 use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ThreadId, TurnId};
+use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{Item, ItemPayload, command_status_is_running, normalized_command_status};
 use giskard_core::model::ModelRef;
+use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::turn::{Mode, Turn, TurnOverrides, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{AgentHarness, OpenThreadOptions, ThreadHandle};
@@ -41,6 +42,7 @@ struct TurnContext {
 /// Shared handle to the pending-approvals map (`ApprovalId -> ThreadId`), cloneable into the
 /// spawned event forwarder so it can register approvals as they stream in.
 type ApprovalMap = Arc<Mutex<HashMap<ApprovalId, ThreadId>>>;
+type ServerRequestMap = Arc<Mutex<HashMap<ServerRequestId, ThreadId>>>;
 
 pub struct HarnessRegistry {
     harnesses: Mutex<HashMap<ProjectId, Arc<dyn AgentHarness>>>,
@@ -48,6 +50,9 @@ pub struct HarnessRegistry {
     /// Which thread a pending approval belongs to, so `ApprovalDecision { request_id }` (which
     /// carries no thread id, §13.6) can be routed to the right harness (§9.2).
     approvals: ApprovalMap,
+    /// Which thread a pending non-approval server request belongs to. Browser responses carry only
+    /// the opaque request id, so this mirrors the approval routing map for Codex server requests.
+    server_requests: ServerRequestMap,
     factory: Arc<dyn HarnessFactory>,
     hub: Arc<Hub>,
     live_buffers: Arc<LiveBufferStore>,
@@ -69,6 +74,7 @@ impl HarnessRegistry {
             harnesses: Mutex::new(HashMap::new()),
             threads: Mutex::new(HashMap::new()),
             approvals: Arc::new(Mutex::new(HashMap::new())),
+            server_requests: Arc::new(Mutex::new(HashMap::new())),
             factory,
             hub,
             live_buffers,
@@ -173,6 +179,7 @@ impl HarnessRegistry {
         let running_commands = self.running_commands.clone();
         let store = self.store.clone();
         let approvals_map = self.approvals.clone();
+        let server_requests_map = self.server_requests.clone();
         let ledger = self.ledger.clone();
 
         let stream = harness.subscribe(&handle);
@@ -188,6 +195,7 @@ impl HarnessRegistry {
                 running_commands,
                 store,
                 approvals_map,
+                server_requests_map,
                 ledger,
                 ctx,
             )
@@ -228,6 +236,42 @@ impl HarnessRegistry {
 
         self.approvals.lock().await.remove(&request_id);
         harness.respond_approval(request_id, decision).await
+    }
+
+    /// Route a non-approval server-request response to the harness that raised it.
+    pub async fn respond_server_request(
+        &self,
+        request_id: ServerRequestId,
+        response: ServerRequestResponse,
+    ) -> Result<(), HarnessError> {
+        let thread_id = self
+            .server_requests
+            .lock()
+            .await
+            .get(&request_id)
+            .copied()
+            .ok_or_else(|| {
+                HarnessError::Protocol(format!("no pending server request for id {request_id}"))
+            })?;
+
+        let project_id = self
+            .get_project_for_thread(thread_id)
+            .await
+            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+
+        let harness = self
+            .harnesses
+            .lock()
+            .await
+            .get(&project_id)
+            .cloned()
+            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+
+        harness
+            .respond_server_request(request_id.clone(), response)
+            .await?;
+        self.server_requests.lock().await.remove(&request_id);
+        Ok(())
     }
 
     pub async fn interrupt(&self, thread_id: ThreadId) -> Result<(), HarnessError> {
@@ -293,6 +337,7 @@ async fn forward_events(
     running_commands: Arc<RunningCommandStore>,
     store: Arc<PersistStore>,
     approvals: ApprovalMap,
+    server_requests: ServerRequestMap,
     ledger: LedgerHandle,
     ctx: TurnContext,
 ) {
@@ -347,6 +392,15 @@ async fn forward_events(
                     }
                     AgentEvent::ApprovalRequested { request, .. } => {
                         approvals.lock().await.insert(request.id.clone(), thread_id);
+                    }
+                    AgentEvent::ServerRequestReceived { request, .. } => {
+                        server_requests
+                            .lock()
+                            .await
+                            .insert(request.id.clone(), thread_id);
+                    }
+                    AgentEvent::ServerRequestResolved { request_id, .. } => {
+                        server_requests.lock().await.remove(request_id);
                     }
                     _ => {}
                 }
@@ -414,6 +468,8 @@ fn event_turn_id(event: &AgentEvent) -> Option<TurnId> {
         | AgentEvent::DiffUpdated { turn, .. }
         | AgentEvent::ApprovalRequested { turn, .. }
         | AgentEvent::TurnCompleted { turn, .. } => Some(*turn),
+        AgentEvent::ServerRequestReceived { turn, .. }
+        | AgentEvent::ServerRequestResolved { turn, .. } => *turn,
         AgentEvent::ThreadOpened { .. }
         | AgentEvent::Error { turn: None, .. }
         | AgentEvent::Notice { turn: None, .. } => None,
