@@ -9,8 +9,9 @@ use tokio::sync::broadcast;
 use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ApprovalId, ProjectId, ThreadId, TurnId};
+use giskard_core::ids::{ApprovalId, ProjectId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::model::{ModelDescriptor, ModelRef};
+use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::turn::TurnOverrides;
 use giskard_core::user_input::UserInput;
 
@@ -126,6 +127,13 @@ pub trait AgentHarness: Send + Sync {
         &self,
         req: ApprovalId,
         decision: ApprovalDecision,
+    ) -> Result<(), HarnessError>;
+
+    /// Respond to a pending non-approval server request.
+    async fn respond_server_request(
+        &self,
+        req: ServerRequestId,
+        response: ServerRequestResponse,
     ) -> Result<(), HarnessError>;
 
     /// Interrupt the active turn of a thread.

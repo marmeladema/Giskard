@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use tokio::sync::Mutex;
 
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ItemId, ThreadId, TurnId};
+use giskard_core::ids::{ItemId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{ItemDelta, ItemPayload};
+use giskard_core::server_request::ServerRequest;
 use giskard_proto::{LiveTurnSnapshot, WireAgentEvent, WireApprovalRequest};
 
 const MAX_LIVE_COMMAND_OUTPUT: usize = 16 * 1024;
@@ -80,14 +81,32 @@ impl LiveBufferStore {
                 });
             let accumulated: Vec<WireAgentEvent> =
                 turn.events.iter().cloned().map(Into::into).collect();
+            let pending_server_requests = pending_server_requests(&turn.events);
             LiveTurnSnapshot {
                 thread_id,
                 turn_id: turn.turn_id,
                 accumulated,
                 pending_approval,
+                pending_server_requests,
             }
         })
     }
+}
+
+fn pending_server_requests(events: &[AgentEvent]) -> Vec<ServerRequest> {
+    let mut requests: HashMap<ServerRequestId, ServerRequest> = HashMap::new();
+    for event in events {
+        match event {
+            AgentEvent::ServerRequestReceived { request, .. } => {
+                requests.insert(request.id.clone(), request.clone());
+            }
+            AgentEvent::ServerRequestResolved { request_id, .. } => {
+                requests.remove(request_id);
+            }
+            _ => {}
+        }
+    }
+    requests.into_values().collect()
 }
 
 fn completed_command_item_id(event: &AgentEvent) -> Option<ItemId> {
@@ -208,8 +227,9 @@ impl Default for LiveBufferStore {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use giskard_core::ids::{ItemId, ThreadId, TurnId};
+    use giskard_core::ids::{ItemId, ServerRequestId, ThreadId, TurnId};
     use giskard_core::item::{CommandExecutionStart, Item, ItemKind, ItemStart};
+    use giskard_core::server_request::ServerRequest;
     use giskard_proto::WireItemPayload;
 
     use super::*;
@@ -351,5 +371,50 @@ mod tests {
         assert!(output.starts_with("head\n"));
         assert!(output.contains(LIVE_COMMAND_OUTPUT_TRUNCATED.trim()));
         assert!(output.ends_with("\ntail"));
+    }
+
+    #[tokio::test]
+    async fn pending_server_requests_are_reconstructed_for_live_snapshot() {
+        let store = LiveBufferStore::new();
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let pending = ServerRequestId("pending".into());
+        let resolved = ServerRequestId("resolved".into());
+
+        store.start_turn(thread).await;
+        store
+            .append(thread, AgentEvent::TurnStarted { thread, turn })
+            .await;
+        for id in [pending.clone(), resolved.clone()] {
+            store
+                .append(
+                    thread,
+                    AgentEvent::ServerRequestReceived {
+                        thread,
+                        turn: Some(turn),
+                        request: ServerRequest {
+                            id,
+                            method: "item/tool/call".into(),
+                            params: serde_json::json!({ "tool": "example" }),
+                            received_at: Utc::now(),
+                        },
+                    },
+                )
+                .await;
+        }
+        store
+            .append(
+                thread,
+                AgentEvent::ServerRequestResolved {
+                    thread,
+                    turn: Some(turn),
+                    request_id: resolved,
+                },
+            )
+            .await;
+
+        let snapshot = store.snapshot(thread).await.expect("snapshot");
+        assert_eq!(snapshot.pending_server_requests.len(), 1);
+        assert_eq!(snapshot.pending_server_requests[0].id, pending);
     }
 }

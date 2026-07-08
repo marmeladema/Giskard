@@ -8,7 +8,21 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.14
+**Version:** 1.15
+
+**Changelog (1.14 → 1.15), pending Codex server requests:**
+- **SR1:** Codex `ServerRequest`s are no longer rejected as the normal unsupported path.
+  Command, file, permissions, `execCommandApproval`, and `applyPatchApproval` requests are mapped
+  to first-class approvals; all other request methods are surfaced as pending transcript cards and
+  wait for an explicit browser response.
+- **SR2:** The neutral harness contract includes `respond_server_request`, and the browser sends
+  `ServerRequestResponse { result | error }` for non-approval server requests. The Codex adapter
+  preserves the original JSON-RPC request id (integer or string) when sending the response.
+- **SR3:** The browser has dedicated pending-card handling for `item/tool/call`,
+  `item/tool/requestUserInput`, and `mcpServer/elicitation/request`, plus an unknown-method
+  fallback that can intentionally return `{}` or a JSON-RPC error.
+- **SR4:** Live-turn snapshots include unresolved server requests as well as approvals, so reloads
+  and reconnects do not lose browser-side work while Codex is waiting.
 
 **Changelog (1.13 → 1.14), tool calls, approvals, and Codex parity:**
 - **T1:** `ItemStart` carries optional `ToolCallStart` metadata for MCP/dynamic tool calls when
@@ -20,11 +34,9 @@
 - **Q1:** Plan-mode Codex turns send `readOnly { networkAccess: true }`; Build-mode Codex turns
   send `workspaceWrite { networkAccess: true }`. Network reads are available in Plan mode, while
   agents remain responsible for avoiding mutating network actions during planning.
-- **Q2:** Every Codex `ServerRequest` must receive a JSON-RPC response. Supported approval requests
-  keep the existing user-decision flow; unsupported request types are surfaced as transcript errors
-  and rejected immediately. `item/tool/call` uses the protocol's structured failure result
-  (`success: false`, `contentItems: [{ type: "inputText", ... }]`) so Codex can continue instead of
-  waiting forever.
+- **Q2 (superseded by SR1/SR2 in v1.15):** Every Codex `ServerRequest` must receive a JSON-RPC
+  response. The temporary v1.14 unsupported-request rejection path has been replaced by pending
+  server-request cards and explicit browser responses.
 - **A1:** Browser clients render live approval requests as actionable transcript cards, not
   transient notices. The card sends `ApprovalDecision` messages for command, file, and permissions
   approvals and is de-duplicated across live-turn snapshots.
@@ -609,6 +621,13 @@ pub trait AgentHarness: Send + Sync {
         decision: ApprovalDecision,
     ) -> Result<(), HarnessError>;
 
+    /// Respond to a pending non-approval server request.
+    async fn respond_server_request(
+        &self,
+        req: ServerRequestId,
+        response: ServerRequestResponse,
+    ) -> Result<(), HarnessError>;
+
     /// Interrupt the active turn of a thread.
     async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError>;
 
@@ -646,6 +665,12 @@ pub enum AgentEvent {
 
     /// Server-initiated approval request.
     ApprovalRequested { thread: ThreadId, turn: TurnId, request: ApprovalRequest },
+
+    /// Server-initiated non-approval request that needs a browser response.
+    ServerRequestReceived { thread: ThreadId, turn: Option<TurnId>, request: ServerRequest },
+
+    /// A pending server request was answered or otherwise resolved.
+    ServerRequestResolved { thread: ThreadId, turn: Option<TurnId>, request_id: ServerRequestId },
 
     TurnCompleted { thread: ThreadId, turn: TurnId, usage: TokenUsage, status: TurnStatus },
 
@@ -857,6 +882,18 @@ pub enum ApprovalDecision {
     Decline,
     Cancel,
     AcceptWithExecPolicyAmendment { amendment: Vec<String> }, // command exec only
+}
+
+// ---- Non-approval server requests (§9.2) ----
+pub struct ServerRequest {
+    pub id: ServerRequestId,
+    pub method: String,
+    pub params: serde_json::Value,            // original harness method params
+    pub received_at: DateTime<Utc>,
+}
+pub enum ServerRequestResponse {
+    Result { value: serde_json::Value },
+    Error { code: i64, message: String },
 }
 
 // ---- Models & usage ----
@@ -1451,6 +1488,14 @@ overwrite the project's `approval_policy`.
    gap later.
 3. User chooses a decision; server calls `respond_approval`.
 
+Codex also has server-initiated requests that are not approval decisions:
+`item/tool/call`, `item/tool/requestUserInput`, `mcpServer/elicitation/request`, auth refresh,
+attestation, and future method names. These use `AgentEvent::ServerRequestReceived` rather than
+`ApprovalRequested`, are rendered as transcript cards, and must remain pending until the browser
+sends `respond_server_request`. Giskard may provide first-class UI for known methods, but unknown
+methods must still be visible and answerable; silent best-effort rejection is not a valid normal
+path.
+
 **Decision granularity** (mirrors Codex):
 - `accept` (this once), `accept_for_session` (don't ask again this session for this kind),
   `decline`, `cancel`. For command exec, an optional "accept with amended exec policy" may be
@@ -1771,8 +1816,9 @@ This guarantees a coherent experience when a future, less-capable harness is plu
 **Server → client** (examples): `Event { thread_id, agent_event }` (a serialized
 `WireAgentEvent` — the path-mirrored wire form of `AgentEvent`, §3.5),
 `ThreadState { thread_id, state }` (persisted snapshot on subscribe/resync),
-`LiveTurnSnapshot { thread_id, turn_id, accumulated, pending_approval? }` (in-flight turn
-reconstruction on reconnect, carrying `WireAgentEvent`s + a `WireApprovalRequest`),
+`LiveTurnSnapshot { thread_id, turn_id, accumulated, pending_approval?, pending_server_requests }`
+(in-flight turn reconstruction on reconnect, carrying `WireAgentEvent`s, a `WireApprovalRequest`,
+and unresolved `ServerRequest`s),
 `RunningCommands { thread_id, commands: [RunningCommand] }` (commands still known to be running,
 including commands that outlived an interrupted turn),
 `TokenUpdate { scope, ledger }`, `ApprovalRequest { thread_id, request }` (a `WireApprovalRequest`),
@@ -1812,16 +1858,16 @@ events through the same event handler used for live WebSocket events.
   (§5.4), so a client that reconnects **during** an in-flight turn cannot reconstruct the live
   turn from disk alone. To close this gap the server keeps, **per active turn**, an in-memory
   **live buffer**: the ordered `AgentEvent`s accumulated since `TurnStarted` (agent-text so
-  far, command output so far, pending approval requests, current diffs). This buffer is
+  far, command output so far, pending approval/server requests, current diffs). This buffer is
   discarded on `TurnCompleted` (the finalized items are then on disk). On `Subscribe`, the
   server sends a **snapshot** first:
   1. the persisted thread state (all completed turns) from disk, then
   2. if a turn is currently live, a `LiveTurnSnapshot` reconstructed from the live buffer
-     (accumulated text/output + any pending approval), then
+     (accumulated text/output + any pending approval/server request), then
   3. subsequent deltas as normal.
 
-  This means a reconnected client sees the full in-progress turn, including a still-pending
-  approval prompt (so approvals are never lost across a reconnect). The live buffer is bounded
+  This means a reconnected client sees the full in-progress turn, including still-pending
+  approval and server-request prompts. The live buffer is bounded
   (coalesced/truncated for very long command output, keeping head+tail) to cap memory; the
   authoritative full output still lands on disk at `TurnCompleted`.
 - **Running-command resync.** Commands can outlive an interrupted turn even after the live buffer is
@@ -1891,8 +1937,8 @@ This is the core requirement. Mechanism:
   committed. A scrubbing step removes any credentials.
 - **Replaying:** integration tests wire the application services to `ReplayHarness` and assert
   end-to-end behavior: sending input produces the expected persisted thread state; token
-  ledgers update correctly; approval requests surface and decisions are routed; plan dump
-  writes the expected markdown; diffs are parsed and exposed; mode/model switches take effect
+  ledgers update correctly; approval and server requests surface and responses are routed; plan
+  dump writes the expected markdown; diffs are parsed and exposed; mode/model switches take effect
   on the right turn.
 - **Determinism:** replay advances on demand (test drives the clock/step), so assertions are
   stable. The same fixtures double as a "demo mode" for the app without a real harness.
@@ -1902,8 +1948,8 @@ This is the core requirement. Mechanism:
 - A small **headless-browser** suite (e.g. via a WebDriver/Chromium-headless runner invoked
   from Rust) guards critical flows against regression: login, create project (with the file
   picker), open thread, send a message (backed by `ReplayHarness`), see streamed transcript,
-  receive and answer an approval prompt, view a diff, open a code overlay, switch mode/model,
-  observe token/context updates. Runs in CI headless.
+  receive and answer approval and server-request prompts, view a diff, open a code overlay, switch
+  mode/model, observe token/context updates. Runs in CI headless.
 - Kept intentionally small (smoke-level for the main loop); business logic is covered more
   cheaply by §14.2.
 

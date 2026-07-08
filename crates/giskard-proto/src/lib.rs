@@ -25,6 +25,7 @@ pub use giskard_core::item::{
     CommandExecutionStart, FileChangeEntry, FileChangeKind, ItemDelta, ItemKind, ItemStart,
 };
 pub use giskard_core::model::{Effort, ModelDescriptor, ModelRef};
+pub use giskard_core::server_request::{ServerRequest, ServerRequestResponse};
 pub use giskard_core::token::{ByModel, DailyTokenLedger, TokenLedger, TokenUsage};
 pub use giskard_core::turn::{ApprovalPolicy, Mode, TurnStatus, TurnStatusKind};
 
@@ -67,6 +68,10 @@ pub enum ClientMessage {
         request_id: String,
         decision: ApprovalDecision,
     },
+    ServerRequestResponse {
+        request_id: String,
+        response: ServerRequestResponse,
+    },
     SavePlan {
         thread_id: ThreadId,
         path: String,
@@ -99,6 +104,8 @@ pub struct LiveTurnSnapshot {
     pub turn_id: TurnId,
     pub accumulated: Vec<WireAgentEvent>,
     pub pending_approval: Option<WireApprovalRequest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_server_requests: Vec<ServerRequest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -423,6 +430,61 @@ mod tests {
     }
 
     #[test]
+    fn client_message_server_request_response_serde() {
+        let msg = ClientMessage::ServerRequestResponse {
+            request_id: "req_1".into(),
+            response: ServerRequestResponse::result(serde_json::json!({
+                "success": true,
+                "contentItems": [],
+            })),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "server_request_response");
+        assert_eq!(json["request_id"], "req_1");
+        assert_eq!(json["response"]["kind"], "result");
+        assert_eq!(json["response"]["value"]["success"], true);
+
+        let back: ClientMessage = serde_json::from_value(json).unwrap();
+        match back {
+            ClientMessage::ServerRequestResponse {
+                request_id,
+                response: ServerRequestResponse::Result { value },
+            } => {
+                assert_eq!(request_id, "req_1");
+                assert_eq!(value["contentItems"], serde_json::json!([]));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn client_message_server_request_error_response_serde() {
+        let msg = ClientMessage::ServerRequestResponse {
+            request_id: "req_1".into(),
+            response: ServerRequestResponse::error(-32000, "unsupported"),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "server_request_response");
+        assert_eq!(json["request_id"], "req_1");
+        assert_eq!(json["response"]["kind"], "error");
+        assert_eq!(json["response"]["code"], -32000);
+        assert_eq!(json["response"]["message"], "unsupported");
+
+        let back: ClientMessage = serde_json::from_value(json).unwrap();
+        match back {
+            ClientMessage::ServerRequestResponse {
+                request_id,
+                response: ServerRequestResponse::Error { code, message },
+            } => {
+                assert_eq!(request_id, "req_1");
+                assert_eq!(code, -32000);
+                assert_eq!(message, "unsupported");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn client_message_ping() {
         let json = serde_json::to_string(&ClientMessage::Ping).unwrap();
         assert_eq!(json, "{\"type\":\"ping\"}");
@@ -500,5 +562,30 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn live_turn_snapshot_includes_pending_server_requests() {
+        let tid = ThreadId::new();
+        let turn = TurnId::new();
+        let snapshot = LiveTurnSnapshot {
+            thread_id: tid,
+            turn_id: turn,
+            accumulated: vec![],
+            pending_approval: None,
+            pending_server_requests: vec![ServerRequest {
+                id: giskard_core::ids::ServerRequestId("req_1".into()),
+                method: "item/tool/call".into(),
+                params: serde_json::json!({ "tool": "example" }),
+                received_at: chrono::Utc::now(),
+            }],
+        };
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(json["thread_id"], tid.to_string());
+        assert_eq!(json["pending_server_requests"][0]["id"], "req_1");
+        assert_eq!(
+            json["pending_server_requests"][0]["method"],
+            "item/tool/call"
+        );
     }
 }

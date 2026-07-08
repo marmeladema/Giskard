@@ -1252,6 +1252,27 @@ async fn handle_client_msg(
                 .await
                 .map_err(|e| WsError::from_harness(e, "approval_decision", None))?;
         }
+        ClientMessage::ServerRequestResponse {
+            request_id,
+            response,
+        } => {
+            let req_id = giskard_core::ids::ServerRequestId(request_id);
+            tokio::time::timeout(
+                HARNESS_CONTROL_TIMEOUT,
+                state.registry.respond_server_request(req_id, response),
+            )
+            .await
+            .map_err(|_| {
+                WsError::from_harness(
+                    HarnessError::Timeout(
+                        "server request response timed out waiting for Codex".into(),
+                    ),
+                    "server_request_response",
+                    None,
+                )
+            })?
+            .map_err(|e| WsError::from_harness(e, "server_request_response", None))?;
+        }
         ClientMessage::Interrupt { thread_id } => {
             tokio::time::timeout(HARNESS_CONTROL_TIMEOUT, state.registry.interrupt(thread_id))
                 .await

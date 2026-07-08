@@ -27,6 +27,11 @@ pub struct ItemId(pub ulid::Ulid);
 #[serde(transparent)]
 pub struct ApprovalId(pub String);
 
+/// Harness-native server request identifier (opaque string; short-lived, not persisted).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ServerRequestId(pub String);
+
 // --- Display impls ---
 
 impl fmt::Display for ProjectId {
@@ -50,6 +55,11 @@ impl fmt::Display for ItemId {
     }
 }
 impl fmt::Display for ApprovalId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl fmt::Display for ServerRequestId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
@@ -104,6 +114,11 @@ impl FromStr for ItemId {
     }
 }
 impl ApprovalId {
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+}
+impl ServerRequestId {
     pub fn new(s: impl Into<String>) -> Self {
         Self(s.into())
     }

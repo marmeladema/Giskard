@@ -64,12 +64,24 @@
   .msg.activity { background:#13181c; border:1px solid var(--border); color:#c9d1d9; }
   .msg.approval { background:#241d10; border:1px solid #d29922; max-width:100%; }
   .msg.approval.resolved { opacity:.72; }
+  .msg.server-request { background:#161826; border:1px solid #6e40c9; max-width:100%; }
+  .msg.server-request.resolved { opacity:.72; }
   .msg .role { font-size:11px; text-transform:uppercase; letter-spacing:.05em; opacity:.7; margin-bottom:4px; }
   .msg .body { min-width:0; max-width:100%; overflow-wrap:anywhere; }
   .approval-title { font-weight:600; margin-bottom:4px; }
   .approval-detail { font-family:var(--mono); font-size:12.5px; color:#f0d98c; margin-top:6px; }
   .approval-actions { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
   .approval-actions button { font-size:12px; padding:4px 8px; }
+  .server-request-title { font-weight:600; margin-bottom:4px; }
+  .server-request-detail { font-family:var(--mono); font-size:12.5px; color:#d8c7ff; margin-top:6px; }
+  .server-request-actions { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
+  .server-request-actions button { font-size:12px; padding:4px 8px; }
+  .server-request-fields { display:grid; gap:10px; margin-top:10px; }
+  .server-request-field label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
+  .server-request-field input,
+  .server-request-field select,
+  .server-request-field textarea { width:100%; }
+  .server-request-field textarea { min-height:84px; resize:vertical; font-family:var(--mono); }
   pre.out {
     max-width:100%; margin:0; overflow-x:hidden; font-family:var(--mono); font-size:12.5px;
     white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;
@@ -250,6 +262,7 @@
   [data-appearance="ide"] .msg.error .role { color:#f85149; }
   [data-appearance="ide"] .msg.notice { background:rgba(210,153,34,.09); border:0; border-bottom:1px solid var(--border); color:var(--fg); }
   [data-appearance="ide"] .msg.notice .role { color:#d29922; }
+  [data-appearance="ide"] .msg.server-request { background:rgba(110,64,201,.10); border:0; border-bottom:1px solid var(--border); }
 
   /* Terminal — dense, monospace, log-style rows. */
   [data-appearance="terminal"] body { font-family:var(--mono); }
@@ -262,7 +275,8 @@
   [data-appearance="terminal"] .msg .role { margin:0; text-align:right; text-transform:lowercase; letter-spacing:0; opacity:1; color:var(--muted); }
   [data-appearance="terminal"] .msg.user, [data-appearance="terminal"] .msg.agent,
   [data-appearance="terminal"] .msg.cmd, [data-appearance="terminal"] .msg.file,
-  [data-appearance="terminal"] .msg.tool, [data-appearance="terminal"] .msg.activity { background:transparent; border:0; color:var(--fg); }
+  [data-appearance="terminal"] .msg.tool, [data-appearance="terminal"] .msg.activity,
+  [data-appearance="terminal"] .msg.server-request { background:transparent; border:0; color:var(--fg); }
   [data-appearance="terminal"] .msg.user .role { color:var(--accent); }
   [data-appearance="terminal"] .msg.reasoning { background:transparent; border:0; color:var(--muted); }
   [data-appearance="terminal"] .msg.error { background:transparent; border:0; color:#ff9d96; }
@@ -433,7 +447,7 @@ let state = {
   projectId:null, threadId:null, mode:"build", ws:null, wsStatus:"closed", wsConnectId:0,
   models:[], streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null, pendingClientMsgs:[],
   streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), itemKindsByItemId:new Map(),
-  pendingApprovals:new Map(),
+  pendingApprovals:new Map(), pendingServerRequests:new Map(),
   runningCommands:new Map(), commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null,
   commandPayloadsByItemId:new Map(), endedCommandsByItemId:new Map(), expandedCommandOutputs:new Set(), manuallyToggledCommandOutputs:new Set(),
   linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, activeTurn:false, interruptPending:false,
@@ -787,6 +801,7 @@ function handleServer(msg) {
         updateComposerControls();
       }
       if (msg.action==="terminate_command") resetTerminatingCommand(msg.process_id);
+      if (msg.action==="server_request_response") resetResolvingServerRequests();
       notice(msg.message||"error", msg.severity||"error");
       break;
   }
@@ -910,6 +925,8 @@ function handleEvent(ev) {
       setTurnActive(false);
       break;
     case "approval_requested": renderApprovalRequest(ev.request); break;
+    case "server_request_received": renderServerRequest(ev.request); break;
+    case "server_request_resolved": resolveServerRequest(ev.request_id); break;
     // Render errors as a persistent transcript entry (tied to the turn/message that caused them)
     // rather than a toast that vanishes — so looking back at a thread explains why a message got
     // no agent response. The matching failed turn is also persisted server-side (§7.1).
@@ -943,6 +960,7 @@ function errorText(e) {
 function renderLiveTurnSnapshot(snap) {
   for (const ev of (snap.accumulated||[])) handleEvent(ev);
   if (snap.pending_approval) renderApprovalRequest(snap.pending_approval);
+  for (const request of (snap.pending_server_requests || [])) renderServerRequest(request);
 }
 
 function renderApprovalRequest(request) {
@@ -1029,6 +1047,391 @@ function respondApproval(id, decision) {
 function approvalDecisionLabel(decision) {
   if (decision==="accept_for_session") return "Session";
   return decision.charAt(0).toUpperCase() + decision.slice(1);
+}
+function renderServerRequest(request) {
+  if (!request || !request.id) return;
+  const id = String(request.id);
+  if (state.pendingServerRequests.has(id)) return;
+  const body = bubble("server-request","request");
+  const msg = body.parentElement;
+  msg.dataset.serverRequestId = id;
+  state.pendingServerRequests.set(id, { msg, request });
+
+  const title = document.createElement("div");
+  title.className = "server-request-title";
+  title.textContent = serverRequestTitle(request);
+  body.append(title);
+
+  const prompt = serverRequestPrompt(request);
+  if (prompt) {
+    const promptEl = document.createElement("div");
+    promptEl.textContent = prompt;
+    body.append(promptEl);
+  }
+
+  const detail = serverRequestDetail(request);
+  if (detail) {
+    const detailEl = document.createElement("div");
+    detailEl.className = "server-request-detail";
+    detailEl.textContent = detail;
+    body.append(detailEl);
+  }
+
+  const method = String(request.method || "");
+  if (method === "item/tool/requestUserInput") renderToolUserInputRequest(body, id, request);
+  else if (method === "mcpServer/elicitation/request") renderMcpElicitationRequest(body, id, request);
+  else if (method === "item/tool/call") renderDynamicToolCallRequest(body, id, request);
+  else if (method === "account/chatgptAuthTokens/refresh") {
+    renderUnsupportedServerRequest(body, id, request, "Giskard cannot refresh ChatGPT auth tokens.");
+  }
+  else if (method === "attestation/generate") {
+    renderUnsupportedServerRequest(body, id, request, "Giskard cannot generate client attestation tokens.");
+  }
+  else renderUnknownServerRequest(body, id, request);
+}
+function resolveServerRequest(id) {
+  id = String(id || "");
+  const entry = state.pendingServerRequests.get(id);
+  if (!entry) return;
+  entry.msg.classList.add("resolved");
+  entry.msg.querySelectorAll("button,input,select,textarea").forEach(el => el.disabled = true);
+  const body = entry.msg.querySelector(".body");
+  if (body && !entry.msg.dataset.resolvedLabel) {
+    const status = document.createElement("div");
+    status.className = "meta";
+    status.textContent = "Resolved";
+    body.append(status);
+  }
+  state.pendingServerRequests.delete(id);
+}
+function resetResolvingServerRequests() {
+  for (const { msg } of state.pendingServerRequests.values()) {
+    if (msg.dataset.resolving !== "true") continue;
+    msg.dataset.resolving = "false";
+    msg.querySelectorAll("button,input,select,textarea").forEach(el => el.disabled = false);
+    const status = msg.querySelector(".server-request-sent");
+    if (status) status.remove();
+  }
+}
+function serverRequestTitle(request) {
+  const method = String(request.method || "");
+  if (method === "item/tool/call") return "Tool call needs a browser response";
+  if (method === "item/tool/requestUserInput") return "Agent needs your answer";
+  if (method === "mcpServer/elicitation/request") return "MCP server needs input";
+  return "Codex server request";
+}
+function serverRequestPrompt(request) {
+  const p = objectValue(request.params);
+  return stringValue(p.message) || stringValue(p.reason) || stringValue(p.prompt) || "";
+}
+function serverRequestDetail(request) {
+  const method = String(request.method || "");
+  const p = objectValue(request.params);
+  if (method === "item/tool/call") {
+    const ns = stringValue(p.namespace);
+    const name = stringValue(p.tool) || "tool";
+    return `${ns ? ns + ":" : ""}${name}`;
+  }
+  if (method === "item/tool/requestUserInput") {
+    const n = Array.isArray(p.questions) ? p.questions.length : 0;
+    return n ? `${n} question${n===1 ? "" : "s"}` : "";
+  }
+  if (method === "mcpServer/elicitation/request") return stringValue(p.url) || stringValue(p.serverName);
+  return method;
+}
+function renderDynamicToolCallRequest(body, id, request) {
+  const p = objectValue(request.params);
+  if (p.arguments !== undefined) {
+    const args = document.createElement("pre");
+    args.className = "out";
+    args.textContent = jsonPreview(p.arguments);
+    body.append(args);
+  }
+  const actions = serverRequestActions();
+  addServerRequestButton(actions, id, "Fail Tool Call", "danger", () => ({
+    kind:"result",
+    value:{
+      success:false,
+      contentItems:[{ type:"inputText", text:"Tool call rejected from Giskard." }]
+    }
+  }));
+  addServerRequestButton(actions, id, "Success Empty", "", () => ({
+    kind:"result",
+    value:{ success:true, contentItems:[] }
+  }));
+  body.append(actions);
+}
+function renderToolUserInputRequest(body, id, request) {
+  const p = objectValue(request.params);
+  const questions = Array.isArray(p.questions) ? p.questions.map(objectValue).filter(Boolean) : [];
+  const fields = document.createElement("div");
+  fields.className = "server-request-fields";
+  for (const q of questions) fields.append(toolQuestionField(q));
+  body.append(fields);
+  const actions = serverRequestActions();
+  addServerRequestButton(actions, id, "Continue", "primary", () => ({
+    kind:"result",
+    value:{ answers: collectToolQuestionAnswers(fields) }
+  }));
+  addServerRequestButton(actions, id, "Cancel", "", () => ({
+    kind:"error",
+    code:-32000,
+    message:"User input request cancelled."
+  }));
+  body.append(actions);
+}
+function toolQuestionField(q) {
+  const field = document.createElement("div");
+  field.className = "server-request-field server-request-question";
+  field.dataset.questionId = stringValue(q.id);
+  const label = document.createElement("label");
+  label.textContent = stringValue(q.header) || stringValue(q.question) || stringValue(q.id) || "Question";
+  field.append(label);
+  const prompt = stringValue(q.question);
+  if (prompt && prompt !== label.textContent) {
+    const hint = document.createElement("div");
+    hint.className = "meta";
+    hint.textContent = prompt;
+    field.append(hint);
+  }
+  const options = Array.isArray(q.options) ? q.options.map(objectValue).filter(Boolean) : [];
+  if (options.length) {
+    const select = document.createElement("select");
+    select.className = "server-request-answer";
+    for (const option of options) {
+      const opt = document.createElement("option");
+      opt.value = stringValue(option.label);
+      opt.textContent = stringValue(option.label);
+      select.append(opt);
+    }
+    if (q.isOther === true) {
+      const opt = document.createElement("option");
+      opt.value = "__other__";
+      opt.textContent = "Other";
+      select.append(opt);
+    }
+    field.append(select);
+    const desc = document.createElement("div");
+    desc.className = "meta";
+    const updateDesc = () => {
+      const chosen = options.find(option => stringValue(option.label) === select.value);
+      desc.textContent = chosen ? stringValue(chosen.description) : "";
+    };
+    select.onchange = updateDesc;
+    updateDesc();
+    field.append(desc);
+    if (q.isOther === true) {
+      const other = document.createElement("input");
+      other.className = "server-request-other";
+      other.placeholder = "Other answer";
+      field.append(other);
+    }
+  } else {
+    const input = document.createElement("input");
+    input.className = "server-request-answer";
+    input.type = q.isSecret === true ? "password" : "text";
+    field.append(input);
+  }
+  return field;
+}
+function collectToolQuestionAnswers(fields) {
+  const result = {};
+  fields.querySelectorAll(".server-request-question").forEach(field => {
+    const id = field.dataset.questionId || "";
+    if (!id) return;
+    const answerEl = field.querySelector(".server-request-answer");
+    const otherEl = field.querySelector(".server-request-other");
+    let value = answerEl ? answerEl.value : "";
+    if (value === "__other__") value = otherEl ? otherEl.value : "";
+    result[id] = { answers: value ? [value] : [] };
+  });
+  return result;
+}
+function renderMcpElicitationRequest(body, id, request) {
+  const p = objectValue(request.params);
+  const url = safeHttpUrl(stringValue(p.url));
+  if (url) {
+    const a = document.createElement("a");
+    a.href = url;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.textContent = url;
+    body.append(a);
+  }
+  const fields = renderMcpSchemaFields(body, p.requestedSchema);
+  const actions = serverRequestActions();
+  addServerRequestButton(actions, id, "Continue", "primary", () => ({
+    kind:"result",
+    value:{ action:"accept", content: collectMcpElicitationContent(fields) }
+  }));
+  addServerRequestButton(actions, id, "Decline", "danger", () => ({
+    kind:"result",
+    value:{ action:"decline" }
+  }));
+  addServerRequestButton(actions, id, "Cancel", "", () => ({
+    kind:"result",
+    value:{ action:"cancel" }
+  }));
+  body.append(actions);
+}
+function renderMcpSchemaFields(body, schemaValue) {
+  const schema = objectValue(schemaValue);
+  const properties = objectValue(schema.properties);
+  const fields = document.createElement("div");
+  fields.className = "server-request-fields";
+  if (!properties || !Object.keys(properties).length) {
+    const field = document.createElement("div");
+    field.className = "server-request-field";
+    const label = document.createElement("label");
+    label.textContent = "Content JSON";
+    const textarea = document.createElement("textarea");
+    textarea.className = "server-request-json-content";
+    textarea.value = "{}";
+    field.append(label, textarea);
+    fields.append(field);
+    body.append(fields);
+    return fields;
+  }
+  for (const [key, raw] of Object.entries(properties)) {
+    const prop = objectValue(raw) || {};
+    const field = document.createElement("div");
+    field.className = "server-request-field server-request-mcp-field";
+    field.dataset.fieldKey = key;
+    field.dataset.fieldType = stringValue(prop.type) || "string";
+    const label = document.createElement("label");
+    label.textContent = stringValue(prop.title) || key;
+    field.append(label);
+    let input;
+    if (prop.type === "boolean") {
+      input = document.createElement("input");
+      input.type = "checkbox";
+    } else if (prop.enum && Array.isArray(prop.enum)) {
+      input = document.createElement("select");
+      for (const value of prop.enum) {
+        const opt = document.createElement("option");
+        opt.value = String(value);
+        opt.textContent = String(value);
+        input.append(opt);
+      }
+    } else {
+      input = document.createElement("input");
+      input.type = prop.type === "number" || prop.type === "integer" ? "number" : "text";
+    }
+    input.className = "server-request-mcp-value";
+    field.append(input);
+    if (prop.description) {
+      const desc = document.createElement("div");
+      desc.className = "meta";
+      desc.textContent = stringValue(prop.description);
+      field.append(desc);
+    }
+    fields.append(field);
+  }
+  body.append(fields);
+  return fields;
+}
+function collectMcpElicitationContent(fields) {
+  const textarea = fields.querySelector(".server-request-json-content");
+  if (textarea) {
+    try { return JSON.parse(textarea.value || "{}"); }
+    catch (e) {
+      notice("MCP content JSON is invalid: "+e.message, "error");
+      throw e;
+    }
+  }
+  const content = {};
+  fields.querySelectorAll(".server-request-mcp-field").forEach(field => {
+    const key = field.dataset.fieldKey || "";
+    if (!key) return;
+    const type = field.dataset.fieldType || "string";
+    const input = field.querySelector(".server-request-mcp-value");
+    if (!input) return;
+    if (input.type === "checkbox") content[key] = input.checked;
+    else if (type === "number" || type === "integer") {
+      const n = Number(input.value);
+      content[key] = Number.isFinite(n) ? n : null;
+    } else content[key] = input.value;
+  });
+  return content;
+}
+function renderUnknownServerRequest(body, id, request) {
+  const pre = document.createElement("pre");
+  pre.className = "out";
+  pre.textContent = jsonPreview(request.params);
+  body.append(pre);
+  const actions = serverRequestActions();
+  addServerRequestButton(actions, id, "Return Empty Result", "primary", () => ({
+    kind:"result",
+    value:{}
+  }));
+  addServerRequestButton(actions, id, "Reject", "danger", () => ({
+    kind:"error",
+    code:-32000,
+    message:`Giskard rejected server request ${request.method || ""}.`
+  }));
+  body.append(actions);
+}
+function renderUnsupportedServerRequest(body, id, request, message) {
+  const pre = document.createElement("pre");
+  pre.className = "out";
+  pre.textContent = jsonPreview(request.params);
+  body.append(pre);
+  const actions = serverRequestActions();
+  addServerRequestButton(actions, id, "Report Unsupported", "danger", () => ({
+    kind:"error",
+    code:-32000,
+    message:message || `Giskard does not support server request ${request.method || ""}.`
+  }));
+  body.append(actions);
+}
+function serverRequestActions() {
+  const actions = document.createElement("div");
+  actions.className = "server-request-actions";
+  return actions;
+}
+function addServerRequestButton(container, id, label, cls, buildResponse) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  if (cls) btn.className = cls;
+  btn.textContent = label;
+  btn.onclick = () => {
+    let response;
+    try { response = buildResponse(); }
+    catch { return; }
+    respondServerRequest(id, response, label);
+  };
+  container.append(btn);
+}
+function respondServerRequest(id, response, label) {
+  const entry = state.pendingServerRequests.get(String(id));
+  if (!entry) return;
+  entry.msg.dataset.resolving = "true";
+  entry.msg.querySelectorAll("button,input,select,textarea").forEach(el => el.disabled = true);
+  if (!send({ type:"server_request_response", request_id:String(id), response })) {
+    entry.msg.dataset.resolving = "false";
+    entry.msg.querySelectorAll("button,input,select,textarea").forEach(el => el.disabled = false);
+    notice(`Server request response not sent: WebSocket is ${state.wsStatus}.`, "error");
+    return;
+  }
+  const body = entry.msg.querySelector(".body");
+  const status = document.createElement("div");
+  status.className = "meta server-request-sent";
+  status.textContent = `Sent: ${label}`;
+  if (body) body.append(status);
+}
+function objectValue(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+function stringValue(value) {
+  return typeof value === "string" ? value : "";
+}
+function safeHttpUrl(value) {
+  if (!value) return "";
+  try {
+    const parsed = new URL(value);
+    const protocol = parsed.protocol.toLowerCase();
+    return protocol === "http:" || protocol === "https:" ? parsed.toString() : "";
+  } catch { return ""; }
 }
 
 // Where new bubbles are appended: the live transcript, or a detached container when rendering an
@@ -1650,6 +2053,7 @@ function resetRenderState() {
   state.renderedHarnessItemIds = new Set();
   state.itemKindsByItemId = new Map();
   state.pendingApprovals = new Map();
+  state.pendingServerRequests = new Map();
   state.runningCommands = new Map();
   state.commandBodyElsByItemId = new Map();
   state.commandMsgElsByItemId = new Map();
