@@ -313,58 +313,54 @@ impl CodexMapper {
                 ))
             }
 
+            // Codex advisories are non-fatal — surface them as notices (warnings), not hard errors,
+            // so they don't fail the turn or the pending message.
             Notification::Warning(n) => {
                 let thread = n
                     .thread_id
                     .as_deref()
                     .map(|id| self.resolve_thread(id, fallback_thread))
                     .unwrap_or(fallback_thread);
-                Some(AgentEvent::Error {
+                Some(AgentEvent::Notice {
                     thread,
                     turn: None,
-                    error: giskard_core::error::HarnessError::Protocol(format!(
-                        "warning: {}",
-                        n.message
-                    )),
+                    message: n.message.clone(),
                 })
             }
 
-            Notification::ConfigWarning(n) => Some(AgentEvent::Error {
+            Notification::ConfigWarning(n) => Some(AgentEvent::Notice {
                 thread: fallback_thread,
                 turn: None,
-                error: giskard_core::error::HarnessError::Protocol(format!(
-                    "configuration warning: {}{}",
+                message: format!(
+                    "Configuration: {}{}",
                     n.summary,
                     n.details
                         .as_ref()
                         .map(|d| format!(": {d}"))
                         .unwrap_or_default()
-                )),
+                ),
             }),
 
             Notification::GuardianWarning(n) => {
                 let thread = self.resolve_thread(&n.thread_id, fallback_thread);
-                Some(AgentEvent::Error {
+                Some(AgentEvent::Notice {
                     thread,
                     turn: None,
-                    error: giskard_core::error::HarnessError::Protocol(format!(
-                        "guardian warning: {}",
-                        n.message
-                    )),
+                    message: format!("Guardian: {}", n.message),
                 })
             }
 
-            Notification::DeprecationNotice(n) => Some(AgentEvent::Error {
+            Notification::DeprecationNotice(n) => Some(AgentEvent::Notice {
                 thread: fallback_thread,
                 turn: None,
-                error: giskard_core::error::HarnessError::Protocol(format!(
-                    "deprecation notice: {}{}",
+                message: format!(
+                    "Deprecation: {}{}",
                     n.summary,
                     n.details
                         .as_ref()
                         .map(|d| format!(": {d}"))
                         .unwrap_or_default()
-                )),
+                ),
             }),
 
             _ => None,
@@ -1379,6 +1375,25 @@ mod tests {
             .unwrap(),
         );
         assert!(fatal_turn_error(&plan).is_none());
+    }
+
+    /// A Codex `warning` is a non-fatal advisory: it maps to `Notice`, not `Error`, so it never
+    /// fails the turn or the pending message (which previously caused a duplicate user bubble).
+    #[test]
+    fn warning_notification_maps_to_notice() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let warn = Notification::Warning(
+            serde_json::from_value(serde_json::json!({
+                "message": "Model metadata for `glm` not found. Using fallback."
+            }))
+            .unwrap(),
+        );
+        match mapper.map_notification(&warn, ThreadId::new()).unwrap() {
+            AgentEvent::Notice { message, .. } => {
+                assert!(message.contains("Model metadata"), "got {message:?}");
+            }
+            other => panic!("expected Notice, got {other:?}"),
+        }
     }
 
     /// With no usage notification, a completed turn reports zero (not a panic).
