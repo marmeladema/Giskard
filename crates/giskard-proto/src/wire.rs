@@ -79,6 +79,12 @@ pub enum WireAgentEvent {
         turn: Option<TurnId>,
         error: WireHarnessError,
     },
+    Notice {
+        thread: ThreadId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<TurnId>,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -262,6 +268,15 @@ impl From<AgentEvent> for WireAgentEvent {
                 thread,
                 turn,
                 error: error.into(),
+            },
+            AgentEvent::Notice {
+                thread,
+                turn,
+                message,
+            } => Self::Notice {
+                thread,
+                turn,
+                message,
             },
         }
     }

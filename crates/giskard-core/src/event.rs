@@ -62,6 +62,15 @@ pub enum AgentEvent {
         turn: Option<TurnId>,
         error: HarnessError,
     },
+    /// A non-fatal advisory from the harness (Codex warnings, config/deprecation notices). Unlike
+    /// [`AgentEvent::Error`] this does not fail the turn or the pending message — it is surfaced as
+    /// a warning, not a hard error.
+    Notice {
+        thread: ThreadId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<TurnId>,
+        message: String,
+    },
 }
 
 #[cfg(test)]

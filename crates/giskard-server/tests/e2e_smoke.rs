@@ -201,6 +201,43 @@ fn failed_turn_fixture(thread: ThreadId, turn: TurnId) -> ReplayFixture {
     ])
 }
 
+/// A turn that emits a non-fatal advisory (a Codex warning) alongside normal agent output. The
+/// notice must reach the client as a `Notice` event and must not fail the turn.
+fn notice_fixture(thread: ThreadId, turn: TurnId) -> ReplayFixture {
+    let item = ItemId::new();
+    ReplayFixture::from_events(vec![
+        AgentEvent::ThreadOpened {
+            thread,
+            harness_thread_id: "th_notice".into(),
+        },
+        AgentEvent::TurnStarted { thread, turn },
+        AgentEvent::Notice {
+            thread,
+            turn: None,
+            message: "Model metadata for `glm` not found. Using fallback.".into(),
+        },
+        AgentEvent::ItemCompleted {
+            thread,
+            turn,
+            item: Item {
+                id: item,
+                harness_item_id: "a1".into(),
+                payload: ItemPayload::AgentMessage { text: "hi".into() },
+                created_at: chrono::Utc::now(),
+            },
+        },
+        AgentEvent::TurnCompleted {
+            thread,
+            turn,
+            usage: TokenUsage::new(1, 1),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        },
+    ])
+}
+
 fn generate_password_hash(password: &str) -> String {
     use argon2::password_hash::SaltString;
     use argon2::{Argon2, PasswordHasher};
@@ -1219,6 +1256,126 @@ async fn failed_turn_is_persisted_with_error_message() {
         failed.items.is_empty(),
         "a turn that failed before output has no items"
     );
+}
+
+/// A non-fatal advisory reaches the client as a `Notice` event (not an `Error`) and the turn still
+/// completes normally.
+#[tokio::test]
+async fn notice_event_is_delivered_to_client() {
+    let tid = ThreadId::new();
+    let turn = TurnId::new();
+    let fixture = notice_fixture(tid, turn);
+    let (_tmp, _state, port) =
+        start_server_with_fixture_and_extra_config_on_available_port(fixture, "").await;
+    let base = format!("http://127.0.0.1:{port}");
+    let ws_base = format!("ws://127.0.0.1:{port}");
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let resp = client
+        .post(format!("{base}/api/login"))
+        .json(&serde_json::json!({"password": "testpass"}))
+        .send()
+        .await
+        .unwrap();
+    let cookie = resp
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let resp = client
+        .post(format!("{base}/api/projects"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({
+            "name": "p",
+            "dir": "/tmp/test",
+            "default_model": {"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null},
+            "approval_policy": "auto"
+        }))
+        .send()
+        .await
+        .unwrap();
+    let project_id = resp.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"resume": "th_notice"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    use tokio_tungstenite::tungstenite::http::Request;
+    let ws_request = Request::builder()
+        .uri(format!("{ws_base}/api/ws"))
+        .header("host", format!("127.0.0.1:{port}"))
+        .header("cookie", &cookie)
+        .header("upgrade", "websocket")
+        .header("connection", "upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .body(())
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request)
+        .await
+        .expect("WS connect");
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::Subscribe { thread_id: tid })
+            .unwrap()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SendInput {
+            thread_id: tid,
+            text: "hi".into(),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    let mut saw_notice = false;
+    let mut saw_error = false;
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
+                if let ServerMessage::Event { agent_event, .. } =
+                    serde_json::from_str::<ServerMessage>(&t).unwrap()
+                {
+                    match agent_event {
+                        WireAgentEvent::Notice { message, .. } => {
+                            assert!(message.contains("Model metadata"));
+                            saw_notice = true;
+                        }
+                        WireAgentEvent::Error { .. } => saw_error = true,
+                        WireAgentEvent::TurnCompleted { .. } => break,
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => break,
+        }
+    }
+    assert!(saw_notice, "a notice event should reach the client");
+    assert!(!saw_error, "a warning must not surface as an error");
 }
 
 #[tokio::test]

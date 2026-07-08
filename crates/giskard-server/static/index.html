@@ -82,6 +82,8 @@
   .msg.failed { border:1px solid #f85149; }
   .msg.error { background:#2a1416; border:1px solid #f85149; color:#ffb4ae; max-width:100%; }
   .msg.error .role { color:#f85149; opacity:1; }
+  .msg.notice { background:#241d10; border:1px solid #d29922; color:#f0d98c; max-width:100%; }
+  .msg.notice .role { color:#d29922; opacity:1; }
 
   /* usage stat tiles (right column) */
   .stats { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
@@ -150,6 +152,8 @@
   [data-appearance="ide"] .msg.cmd { background:var(--panel2); }
   [data-appearance="ide"] .msg.error { background:rgba(248,81,73,.09); border:0; border-bottom:1px solid var(--border); }
   [data-appearance="ide"] .msg.error .role { color:#f85149; }
+  [data-appearance="ide"] .msg.notice { background:rgba(210,153,34,.09); border:0; border-bottom:1px solid var(--border); color:var(--fg); }
+  [data-appearance="ide"] .msg.notice .role { color:#d29922; }
 
   /* Terminal — dense, monospace, log-style rows. */
   [data-appearance="terminal"] body { font-family:var(--mono); }
@@ -167,6 +171,8 @@
   [data-appearance="terminal"] .msg.reasoning { background:transparent; border:0; color:var(--muted); }
   [data-appearance="terminal"] .msg.error { background:transparent; border:0; color:#ff9d96; }
   [data-appearance="terminal"] .msg.error .role { color:#ff6b63; }
+  [data-appearance="terminal"] .msg.notice { background:transparent; border:0; color:#e3c46a; }
+  [data-appearance="terminal"] .msg.notice .role { color:#d29922; }
 
   /* =================== Mobile / responsive ===================
      The same page adapts to the viewport (no separate mobile build). On narrow screens the three
@@ -745,12 +751,22 @@ function handleEvent(ev) {
       failPendingUserMessage(null);   // resolve the optimistic bubble to a failed state
       errorBubble(errorText(ev.error));
       break;
+    // A non-fatal advisory: show it as a warning, and do NOT fail the pending message — otherwise
+    // the optimistic user bubble is cleared early and the real user_message item renders a duplicate.
+    case "notice":
+      noticeBubble(ev.message || "");
+      break;
   }
 }
 
 // A persistent, transcript-anchored error entry (respects renderTarget for history prepends).
 function errorBubble(message) {
   bubble("error","error").textContent = message || "error";
+}
+// A non-alarming, transcript-anchored warning entry.
+function noticeBubble(message) {
+  if (!message) return;
+  bubble("notice","warning").textContent = message;
 }
 function errorText(e) {
   if (!e) return "error";

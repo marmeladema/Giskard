@@ -369,8 +369,13 @@ fn event_turn_id(event: &AgentEvent) -> Option<TurnId> {
         | AgentEvent::DiffUpdated { turn, .. }
         | AgentEvent::ApprovalRequested { turn, .. }
         | AgentEvent::TurnCompleted { turn, .. } => Some(*turn),
-        AgentEvent::ThreadOpened { .. } | AgentEvent::Error { turn: None, .. } => None,
+        AgentEvent::ThreadOpened { .. }
+        | AgentEvent::Error { turn: None, .. }
+        | AgentEvent::Notice { turn: None, .. } => None,
         AgentEvent::Error {
+            turn: Some(turn), ..
+        }
+        | AgentEvent::Notice {
             turn: Some(turn), ..
         } => Some(*turn),
     }
