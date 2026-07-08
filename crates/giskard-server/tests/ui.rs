@@ -177,6 +177,30 @@ async fn index_page_is_served_and_public() {
         "UI has first-class MCP elicitation handling"
     );
     assert!(
+        body.contains("if (!fields) return {}"),
+        "MCP elicitation cards with no schema fields submit empty content without a JSON editor"
+    );
+    assert!(
+        body.contains("appendJsonPreviewIfMeaningful(body, p.arguments)"),
+        "dynamic tool-call requests suppress empty argument previews"
+    );
+    assert!(
+        body.contains("appendJsonPreviewIfMeaningful(body, request.params)"),
+        "unknown and unsupported server requests suppress empty params previews"
+    );
+    assert!(
+        body.contains("hasMeaningfulJson(kind) ? JSON.stringify(kind) : \"\""),
+        "unknown approval kinds suppress empty JSON detail"
+    );
+    assert!(
+        body.contains("if (questions.length) body.append(fields)"),
+        "user-input request cards do not append empty field containers"
+    );
+    assert!(
+        !body.contains("Content JSON"),
+        "MCP elicitation cards should not show a confusing empty content section"
+    );
+    assert!(
         body.contains("account/chatgptAuthTokens/refresh"),
         "UI explicitly handles ChatGPT auth refresh requests"
     );

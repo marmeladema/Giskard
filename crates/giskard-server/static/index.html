@@ -1279,7 +1279,7 @@ function approvalDetail(request) {
   }
   if (kind.kind==="file_change") return [kind.change, kind.path].filter(Boolean).join(" ");
   if (kind.kind==="permission") return kind.detail || "";
-  return JSON.stringify(kind);
+  return hasMeaningfulJson(kind) ? JSON.stringify(kind) : "";
 }
 function renderApprovalMetadata(body, metadata) {
   if (!Array.isArray(metadata) || !metadata.length) return;
@@ -1454,12 +1454,7 @@ function serverRequestDetail(request) {
 }
 function renderDynamicToolCallRequest(body, id, request) {
   const p = objectValue(request.params);
-  if (p.arguments !== undefined) {
-    const args = document.createElement("pre");
-    args.className = "out";
-    args.textContent = jsonPreview(p.arguments);
-    body.append(args);
-  }
+  appendJsonPreviewIfMeaningful(body, p.arguments);
   const actions = serverRequestActions();
   addServerRequestButton(actions, id, "Fail Tool Call", "danger", () => ({
     kind:"result",
@@ -1480,7 +1475,7 @@ function renderToolUserInputRequest(body, id, request) {
   const fields = document.createElement("div");
   fields.className = "server-request-fields";
   for (const q of questions) fields.append(toolQuestionField(q));
-  body.append(fields);
+  if (questions.length) body.append(fields);
   const actions = serverRequestActions();
   addServerRequestButton(actions, id, "Continue", "primary", () => ({
     kind:"result",
@@ -1590,21 +1585,11 @@ function renderMcpElicitationRequest(body, id, request) {
 function renderMcpSchemaFields(body, schemaValue) {
   const schema = objectValue(schemaValue);
   const properties = objectValue(schema.properties);
+  if (!properties || !Object.keys(properties).length) {
+    return null;
+  }
   const fields = document.createElement("div");
   fields.className = "server-request-fields";
-  if (!properties || !Object.keys(properties).length) {
-    const field = document.createElement("div");
-    field.className = "server-request-field";
-    const label = document.createElement("label");
-    label.textContent = "Content JSON";
-    const textarea = document.createElement("textarea");
-    textarea.className = "server-request-json-content";
-    textarea.value = "{}";
-    field.append(label, textarea);
-    fields.append(field);
-    body.append(fields);
-    return fields;
-  }
   for (const [key, raw] of Object.entries(properties)) {
     const prop = objectValue(raw) || {};
     const field = document.createElement("div");
@@ -1644,6 +1629,7 @@ function renderMcpSchemaFields(body, schemaValue) {
   return fields;
 }
 function collectMcpElicitationContent(fields) {
+  if (!fields) return {};
   const textarea = fields.querySelector(".server-request-json-content");
   if (textarea) {
     try { return JSON.parse(textarea.value || "{}"); }
@@ -1668,10 +1654,7 @@ function collectMcpElicitationContent(fields) {
   return content;
 }
 function renderUnknownServerRequest(body, id, request) {
-  const pre = document.createElement("pre");
-  pre.className = "out";
-  pre.textContent = jsonPreview(request.params);
-  body.append(pre);
+  appendJsonPreviewIfMeaningful(body, request.params);
   const actions = serverRequestActions();
   addServerRequestButton(actions, id, "Return Empty Result", "primary", () => ({
     kind:"result",
@@ -1685,10 +1668,7 @@ function renderUnknownServerRequest(body, id, request) {
   body.append(actions);
 }
 function renderUnsupportedServerRequest(body, id, request, message) {
-  const pre = document.createElement("pre");
-  pre.className = "out";
-  pre.textContent = jsonPreview(request.params);
-  body.append(pre);
+  appendJsonPreviewIfMeaningful(body, request.params);
   const actions = serverRequestActions();
   addServerRequestButton(actions, id, "Report Unsupported", "danger", () => ({
     kind:"error",
@@ -2667,6 +2647,20 @@ function renderActivity(p) {
   const detail = p.detail ? `<div>${escapeHtml(p.detail)}</div>` : "";
   const meta = p.metadata ? `<pre class="out">${escapeHtml(jsonPreview(p.metadata))}</pre>` : "";
   return `<div>${escapeHtml(p.title||"Activity")}</div>${detail}${meta}`;
+}
+function appendJsonPreviewIfMeaningful(body, value) {
+  if (!hasMeaningfulJson(value)) return;
+  const pre = document.createElement("pre");
+  pre.className = "out";
+  pre.textContent = jsonPreview(value);
+  body.append(pre);
+}
+function hasMeaningfulJson(value) {
+  if (value === undefined || value === null) return false;
+  if (typeof value === "string") return value.trim() !== "";
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "object") return Object.keys(value).length > 0;
+  return true;
 }
 function jsonPreview(v) {
   try { return typeof v==="string" ? v : JSON.stringify(v, null, 2); }

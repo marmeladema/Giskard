@@ -16,7 +16,8 @@
   count, resource count, and expandable tool/resource detail. Servers that require OAuth expose an
   authenticate action when the harness supports it. Codex `unsupported` auth state means the
   server does not expose Codex-managed auth, not that the MCP server itself is unusable, so the UI
-  presents it as a usable unauthenticated server state.
+  presents it as a usable unauthenticated server state. MCP elicitation cards with an empty
+  requested schema do not show an empty JSON content editor; accepting them sends empty content.
 - **MCP2:** Giskard exposes project-scoped MCP REST endpoints backed by the harness:
   `GET /api/projects/{id}/mcp`, `POST /api/projects/{id}/mcp/reload`, and
   `POST /api/projects/{id}/mcp/oauth-login`. Codex maps these to `mcpServerStatus/list`,
