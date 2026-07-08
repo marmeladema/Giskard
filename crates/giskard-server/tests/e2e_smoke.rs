@@ -5,7 +5,9 @@ use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
-use giskard_core::item::{Item, ItemDelta, ItemKind, ItemPayload, ItemStart};
+use giskard_core::item::{
+    CommandExecutionStart, Item, ItemDelta, ItemKind, ItemPayload, ItemStart,
+};
 use giskard_core::model::ModelRef;
 use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::token::TokenUsage;
@@ -824,6 +826,180 @@ async fn thread_archive_and_delete_reject_active_turns() {
         .await
         .unwrap();
     assert_eq!(delete.status(), 409);
+}
+
+/// A running command must block archive/delete even when there is no live turn: the guard checks
+/// the running-command registry independently of the live buffer (§7 / `reject_thread_mutation_if_live`).
+#[tokio::test]
+async fn thread_archive_and_delete_reject_running_commands() {
+    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+
+    // Track a running command without starting a turn, so only the running-command branch of the
+    // guard can trip (not the live-turn branch).
+    let tracked = state
+        .running_commands
+        .apply_event(&AgentEvent::ItemStarted {
+            thread: thread_id,
+            turn: TurnId::new(),
+            item: ItemStart {
+                id: ItemId::new(),
+                harness_item_id: "cmd_guard".into(),
+                kind: ItemKind::CommandExecution,
+                command: Some(CommandExecutionStart {
+                    command: "sleep 60".into(),
+                    cwd: "/tmp/thread-actions".into(),
+                    status: Some("in_progress".into()),
+                    process_id: Some("proc_guard".into()),
+                    started_at_ms: None,
+                }),
+                tool: None,
+            },
+        })
+        .await;
+    assert!(tracked, "command should be tracked as running");
+    assert!(
+        !state.live_buffers.is_active(thread_id).await,
+        "precondition: no live turn — only a running command"
+    );
+
+    let archive = client
+        .post(format!(
+            "{base}/api/projects/{project_id}/threads/{thread_id}/archive"
+        ))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"archived": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(archive.status(), 409);
+
+    let delete = client
+        .delete(format!(
+            "{base}/api/projects/{project_id}/threads/{thread_id}"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), 409);
+}
+
+/// AP2: approval policy is thread-scoped, so two threads in the same project keep independent
+/// policies. Setting one thread's policy must not disturb the other's.
+#[tokio::test]
+async fn threads_in_a_project_keep_independent_approval_policies() {
+    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
+    let base = format!("http://127.0.0.1:{port}");
+    let ws_base = format!("ws://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let project_id = create_project_only(&client, &base, &cookie).await;
+    let thread_a =
+        open_thread_with_resume(&client, &base, &cookie, project_id, "th_policy_a").await;
+    let thread_b =
+        open_thread_with_resume(&client, &base, &cookie, project_id, "th_policy_b").await;
+
+    // New threads default to `ask`.
+    assert_eq!(
+        load_policy(&state, project_id, thread_a).await,
+        ApprovalPolicy::Ask
+    );
+    assert_eq!(
+        load_policy(&state, project_id, thread_b).await,
+        ApprovalPolicy::Ask
+    );
+
+    use tokio_tungstenite::tungstenite::http::Request;
+    let ws_request = Request::builder()
+        .uri(format!("{ws_base}/api/ws"))
+        .header("host", format!("127.0.0.1:{port}"))
+        .header("cookie", &cookie)
+        .header("upgrade", "websocket")
+        .header("connection", "upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .body(())
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request)
+        .await
+        .expect("WS connect");
+
+    // Give the two threads different policies.
+    for (thread_id, policy) in [
+        (thread_a, ApprovalPolicy::ReadOnly),
+        (thread_b, ApprovalPolicy::Auto),
+    ] {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&ClientMessage::SetApprovalPolicy { thread_id, policy })
+                .unwrap()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    }
+
+    // Each thread retains its own policy; setting B did not overwrite A (which a project-scoped
+    // policy would have done).
+    wait_for_policy(&state, project_id, thread_a, ApprovalPolicy::ReadOnly).await;
+    wait_for_policy(&state, project_id, thread_b, ApprovalPolicy::Auto).await;
+}
+
+async fn open_thread_with_resume(
+    client: &reqwest::Client,
+    base: &str,
+    cookie: &str,
+    project_id: ProjectId,
+    resume: &str,
+) -> ThreadId {
+    let resp = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", cookie)
+        .json(&serde_json::json!({ "resume": resume }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    resp.json::<serde_json::Value>().await.unwrap()["thread_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+async fn load_policy(
+    state: &AppState,
+    project_id: ProjectId,
+    thread_id: ThreadId,
+) -> ApprovalPolicy {
+    state
+        .store
+        .load_thread(project_id, thread_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .approval_policy
+}
+
+async fn wait_for_policy(
+    state: &AppState,
+    project_id: ProjectId,
+    thread_id: ThreadId,
+    expected: ApprovalPolicy,
+) {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        if load_policy(state, project_id, thread_id).await == expected {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("thread {thread_id} approval policy did not become {expected:?}");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+    }
 }
 
 #[tokio::test]
