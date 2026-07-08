@@ -11,6 +11,7 @@ use tracing::warn;
 
 use giskard_core::model::{ModelDescriptor, ModelRef, default_descriptor};
 use giskard_persist::Config;
+use giskard_proto::ProviderListingWarning;
 
 /// Build a `ModelDescriptor` from a typed config entry, if the provider + model are declared.
 fn from_config(config: &Config, provider: &str, model: &str) -> Option<ModelDescriptor> {
@@ -122,10 +123,15 @@ pub fn merge_models(
 
 /// Refresh the model list by querying `GET {base_url}/models` for every provider that advertises
 /// `model_listing`, merging the results over the static list (§8.3). Best-effort: a provider whose
-/// endpoint errors or returns unparseable JSON is skipped (its static entries remain), so the call
-/// always returns at least the static list.
-pub async fn refresh_models(config: &Config) -> Vec<ModelDescriptor> {
+/// endpoint errors, returns a non-success status, or sends unparseable JSON is skipped (its static
+/// entries remain), so the call always returns at least the static list. Each such failure is
+/// logged **and** returned as a [`ProviderListingWarning`] so it can be surfaced to the user rather
+/// than silently yielding no models (e.g. a 401 from a proxy whose api_key is missing/wrong).
+pub async fn refresh_models(
+    config: &Config,
+) -> (Vec<ModelDescriptor>, Vec<ProviderListingWarning>) {
     let base = list_descriptors(config);
+    let mut warnings: Vec<ProviderListingWarning> = Vec::new();
 
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -134,7 +140,7 @@ pub async fn refresh_models(config: &Config) -> Vec<ModelDescriptor> {
         Ok(c) => c,
         Err(e) => {
             warn!(%e, "cannot build HTTP client; returning static model list");
-            return base;
+            return (base, warnings);
         }
     };
 
@@ -153,20 +159,42 @@ pub async fn refresh_models(config: &Config) -> Vec<ModelDescriptor> {
         if let Some(key) = p.resolve_api_key() {
             request = request.bearer_auth(key);
         }
+
+        let mut fail = |message: String| {
+            warn!(provider = %p.id, %url, %message, "model discovery failed; skipping provider");
+            warnings.push(ProviderListingWarning {
+                provider: p.id.clone(),
+                message,
+            });
+        };
+
         match request.send().await {
-            Ok(resp) => match resp.json::<OpenAiModelsResponse>().await {
-                Ok(body) => {
-                    for m in body.data {
-                        dynamic.push((p.id.clone(), m.id));
-                    }
+            Ok(resp) => {
+                let status = resp.status();
+                if !status.is_success() {
+                    // A 401/403 almost always means the discovery api_key is missing or wrong.
+                    let hint = if status.as_u16() == 401 || status.as_u16() == 403 {
+                        " — check the provider's api_key / api_key_env"
+                    } else {
+                        ""
+                    };
+                    fail(format!("model listing returned HTTP {status}{hint}"));
+                    continue;
                 }
-                Err(e) => warn!(%e, provider = %p.id, "unparseable /models response; skipping"),
-            },
-            Err(e) => warn!(%e, provider = %p.id, "failed to fetch /models; skipping"),
+                match resp.json::<OpenAiModelsResponse>().await {
+                    Ok(body) => {
+                        for m in body.data {
+                            dynamic.push((p.id.clone(), m.id));
+                        }
+                    }
+                    Err(e) => fail(format!("unparseable /models response: {e}")),
+                }
+            }
+            Err(e) => fail(format!("could not reach {url}: {e}")),
         }
     }
 
-    merge_models(base, &dynamic)
+    (merge_models(base, &dynamic), warnings)
 }
 
 #[cfg(test)]

@@ -636,18 +636,19 @@ async fn list_models(State(state): State<AppState>) -> Result<Json<ListModelsRes
     let config = state.store.load_config().await?;
     Ok(Json(ListModelsResponse {
         models: crate::models::list_descriptors(&config),
+        warnings: Vec::new(),
     }))
 }
 
 /// `POST /api/models/refresh` — merge each listing-enabled provider's `/v1/models` over the static
-/// list (spec §8.3). Best-effort: always returns at least the static list.
+/// list (spec §8.3). Best-effort: always returns at least the static list, plus any per-provider
+/// discovery failures (e.g. a 401) as `warnings` so the UI can surface them.
 async fn refresh_models(
     State(state): State<AppState>,
 ) -> Result<Json<ListModelsResponse>, ApiError> {
     let config = state.store.load_config().await?;
-    Ok(Json(ListModelsResponse {
-        models: crate::models::refresh_models(&config).await,
-    }))
+    let (models, warnings) = crate::models::refresh_models(&config).await;
+    Ok(Json(ListModelsResponse { models, warnings }))
 }
 
 /// `GET /api/tokens` — the global token dashboard (day/week/month/total, §10.2).

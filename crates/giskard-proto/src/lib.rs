@@ -241,10 +241,21 @@ pub struct BrowseResponse {
     pub entries: Vec<DirEntry>,
 }
 
+/// A per-provider failure encountered while refreshing the model list from `/v1/models` (§8.3),
+/// surfaced so the user sees e.g. a 401 instead of silently getting no models.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderListingWarning {
+    pub provider: String,
+    pub message: String,
+}
+
 /// Static model list for the model picker (spec §8.3).
 #[derive(Debug, Clone, Serialize)]
 pub struct ListModelsResponse {
     pub models: Vec<ModelDescriptor>,
+    /// Non-fatal per-provider discovery failures from a refresh (empty for the static listing).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<ProviderListingWarning>,
 }
 
 /// Token dashboard report for a project or the global scope (spec §10.2). All figures reuse the
