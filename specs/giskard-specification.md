@@ -1684,8 +1684,13 @@ alongside raw token counts. Off by default; raw token counts are the primary met
   raw HTML in the source is escaped to inert text (never passed through), link URLs are restricted
   to `http`/`https`/`mailto`, and images are not fetched. Path detection runs in the same pass over
   prose text runs (not inside code), emitting the same `.path-link` controls the overlay wires up.
-  The browser injects the returned HTML as trusted markup and attaches the path-link handlers.
-  `/linkify` is retained for command output, which is plain text rather than Markdown.
+  Fenced code blocks are syntax-highlighted server-side with `syntect` when their fence language is
+  recognized, and every code block is rendered with a compact header showing the resolved language
+  label (for example `Rust` or `JSON`; unknown fence labels are shown as provided after
+  sanitization). Inline code spans are escaped/styled but not syntax-highlighted because Markdown
+  does not carry a reliable language for them. The browser injects the returned HTML as trusted
+  markup and attaches the path-link handlers. `/linkify` is retained for command output, which is
+  plain text rather than Markdown.
 
 ### 11.3 Large files & performance
 

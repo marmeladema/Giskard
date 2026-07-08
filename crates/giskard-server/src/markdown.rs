@@ -25,6 +25,7 @@ use std::path::Path;
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag};
 
+use crate::highlight::highlight_snippet;
 use crate::linkify::linkify_text;
 
 /// Render agent Markdown `text` to sanitized HTML, wrapping workspace paths (resolved against
@@ -39,53 +40,77 @@ pub fn render_markdown(text: &str, workspace_root: &Path) -> String {
     // stack means we never have to interpret the (version-sensitive) payload of `TagEnd`, so the
     // output stays balanced regardless of which tags we special-case.
     let mut stack: Vec<Frame> = Vec::new();
-    let mut in_code_block = false;
     let mut in_table_head = false;
+    let mut code_block: Option<ActiveCodeBlock> = None;
 
     for event in parser {
         match event {
             Event::Start(tag) => {
-                let frame = open_tag(&mut out, tag, in_table_head);
-                if frame.opens_code_block {
-                    in_code_block = true;
+                if let Tag::CodeBlock(kind) = tag {
+                    code_block = Some(ActiveCodeBlock::new(kind));
+                    continue;
                 }
+                let frame = open_tag(&mut out, tag, in_table_head);
                 if frame.opens_table_head {
                     in_table_head = true;
                 }
                 stack.push(frame);
             }
             Event::End(_) => {
+                if let Some(block) = code_block.take() {
+                    push_code_block(&mut out, block);
+                    continue;
+                }
                 if let Some(frame) = stack.pop() {
                     out.push_str(&frame.close);
-                    if frame.opens_code_block {
-                        in_code_block = false;
-                    }
                     if frame.closes_table_head {
                         in_table_head = false;
                     }
                 }
             }
             Event::Text(t) => {
-                if in_code_block {
-                    push_escaped(&mut out, &t);
+                if let Some(block) = &mut code_block {
+                    block.source.push_str(&t);
                 } else {
                     push_linkified(&mut out, &t, workspace_root);
                 }
             }
             // Inline code is literal: escape, never linkify.
             Event::Code(t) => {
-                out.push_str("<code>");
-                push_escaped(&mut out, &t);
-                out.push_str("</code>");
+                if let Some(block) = &mut code_block {
+                    block.source.push_str(&t);
+                } else {
+                    out.push_str("<code>");
+                    push_escaped(&mut out, &t);
+                    out.push_str("</code>");
+                }
             }
             // Raw HTML is rendered as inert, escaped text — never passed through. Math (only
             // emitted with `ENABLE_MATH`, which we do not set) is likewise shown verbatim.
             Event::Html(t)
             | Event::InlineHtml(t)
             | Event::InlineMath(t)
-            | Event::DisplayMath(t) => push_escaped(&mut out, &t),
-            Event::SoftBreak => out.push('\n'),
-            Event::HardBreak => out.push_str("<br>"),
+            | Event::DisplayMath(t) => {
+                if let Some(block) = &mut code_block {
+                    block.source.push_str(&t);
+                } else {
+                    push_escaped(&mut out, &t);
+                }
+            }
+            Event::SoftBreak => {
+                if let Some(block) = &mut code_block {
+                    block.source.push('\n');
+                } else {
+                    out.push('\n');
+                }
+            }
+            Event::HardBreak => {
+                if let Some(block) = &mut code_block {
+                    block.source.push('\n');
+                } else {
+                    out.push_str("<br>");
+                }
+            }
             Event::Rule => out.push_str("<hr>"),
             Event::TaskListMarker(checked) => {
                 out.push_str(if checked {
@@ -99,6 +124,11 @@ pub fn render_markdown(text: &str, workspace_root: &Path) -> String {
         }
     }
 
+    // Defensively render anything left open (malformed/truncated input).
+    if let Some(block) = code_block.take() {
+        push_code_block(&mut out, block);
+    }
+
     // Defensively close anything left open (malformed/truncated input).
     while let Some(frame) = stack.pop() {
         out.push_str(&frame.close);
@@ -109,7 +139,6 @@ pub fn render_markdown(text: &str, workspace_root: &Path) -> String {
 
 struct Frame {
     close: String,
-    opens_code_block: bool,
     opens_table_head: bool,
     closes_table_head: bool,
 }
@@ -118,7 +147,6 @@ impl Frame {
     fn new(close: impl Into<String>) -> Self {
         Self {
             close: close.into(),
-            opens_code_block: false,
             opens_table_head: false,
             closes_table_head: false,
         }
@@ -139,15 +167,6 @@ fn open_tag(out: &mut String, tag: Tag, in_table_head: bool) -> Frame {
         Tag::BlockQuote(_) => {
             out.push_str("<blockquote>");
             Frame::new("</blockquote>")
-        }
-        Tag::CodeBlock(kind) => {
-            match language_class(&kind) {
-                Some(class) => out.push_str(&format!("<pre><code class=\"{class}\">")),
-                None => out.push_str("<pre><code>"),
-            }
-            let mut frame = Frame::new("</code></pre>");
-            frame.opens_code_block = true;
-            frame
         }
         Tag::List(Some(start)) => {
             if start == 1 {
@@ -221,6 +240,42 @@ fn open_tag(out: &mut String, tag: Tag, in_table_head: bool) -> Frame {
     }
 }
 
+struct ActiveCodeBlock {
+    language_token: Option<String>,
+    source: String,
+}
+
+impl ActiveCodeBlock {
+    fn new(kind: CodeBlockKind) -> Self {
+        Self {
+            language_token: language_token(&kind),
+            source: String::new(),
+        }
+    }
+}
+
+fn push_code_block(out: &mut String, block: ActiveCodeBlock) {
+    let highlighted = highlight_snippet(&block.source, block.language_token.as_deref());
+    let class = block
+        .language_token
+        .as_deref()
+        .map(|lang| format!(" class=\"language-{}\"", escape_attr(lang)))
+        .unwrap_or_default();
+
+    out.push_str("<div class=\"code-block\">");
+    out.push_str("<div class=\"code-block-head\"><span>");
+    push_escaped(out, &highlighted.language);
+    out.push_str("</span></div>");
+    out.push_str("<pre><code");
+    out.push_str(&class);
+    if highlighted.recognized_language {
+        out.push_str(" data-highlighted=\"true\"");
+    }
+    out.push('>');
+    out.push_str(&highlighted.html);
+    out.push_str("</code></pre></div>");
+}
+
 fn heading_number(level: HeadingLevel) -> u8 {
     match level {
         HeadingLevel::H1 => 1,
@@ -232,8 +287,8 @@ fn heading_number(level: HeadingLevel) -> u8 {
     }
 }
 
-/// Build a `language-xxx` class for a fenced code block, keeping only a safe token.
-fn language_class(kind: &CodeBlockKind) -> Option<String> {
+/// Extract a safe language token for a fenced code block.
+fn language_token(kind: &CodeBlockKind) -> Option<String> {
     let CodeBlockKind::Fenced(info) = kind else {
         return None;
     };
@@ -244,11 +299,7 @@ fn language_class(kind: &CodeBlockKind) -> Option<String> {
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == '+')
         .collect();
-    if lang.is_empty() {
-        None
-    } else {
-        Some(format!("language-{lang}"))
-    }
+    if lang.is_empty() { None } else { Some(lang) }
 }
 
 /// Allow only schemes that cannot execute script or exfiltrate via navigation.
@@ -340,8 +391,30 @@ mod tests {
     #[test]
     fn fenced_code_block_keeps_language_and_escapes() {
         let html = render("```rust\nlet x = &y < z;\n```");
-        assert!(html.contains("<pre><code class=\"language-rust\">"));
-        assert!(html.contains("let x = &amp;y &lt; z;"));
+        assert!(html.contains("<div class=\"code-block\">"));
+        assert!(html.contains("<div class=\"code-block-head\"><span>Rust</span></div>"));
+        assert!(html.contains("<code class=\"language-rust\" data-highlighted=\"true\">"));
+        assert!(html.contains("&lt;"));
+        assert!(!html.contains("< z"));
+    }
+
+    #[test]
+    fn fenced_code_block_with_unknown_language_falls_back_safely() {
+        let html = render("```no-such-language\n<&>\n```");
+        assert!(
+            html.contains("<div class=\"code-block-head\"><span>no-such-language</span></div>")
+        );
+        assert!(html.contains("<code class=\"language-no-such-language\">"));
+        assert!(html.contains("&lt;&amp;&gt;"));
+        assert!(!html.contains("data-highlighted=\"true\""));
+    }
+
+    #[test]
+    fn code_block_without_language_gets_plain_text_label() {
+        let html = render("```\nplain text\n```");
+        assert!(html.contains("<div class=\"code-block-head\"><span>Plain Text</span></div>"));
+        assert!(html.contains("<code>"));
+        assert!(html.contains("plain text"));
     }
 
     #[test]

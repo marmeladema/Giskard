@@ -346,7 +346,7 @@ async fn render_endpoint_returns_sanitized_markdown_with_path_links() {
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
-    let text = "See `main.rs` and **open** main.rs now.\n\n<img src=x onerror=alert(1)>";
+    let text = "See `main.rs` and **open** main.rs now.\n\n```rust\nfn main() {}\n```\n\n<img src=x onerror=alert(1)>";
     let resp = client
         .post(format!("{base}/api/projects/{pid}/render"))
         .header("cookie", &cookie)
@@ -372,6 +372,15 @@ async fn render_endpoint_returns_sanitized_markdown_with_path_links() {
     assert!(
         html.contains("<code>main.rs</code>"),
         "code stays literal: {html}"
+    );
+    // ...fenced code blocks show their language and are highlighted server-side...
+    assert!(
+        html.contains("<div class=\"code-block-head\"><span>Rust</span></div>"),
+        "code block language is visible: {html}"
+    );
+    assert!(
+        html.contains("data-highlighted=\"true\""),
+        "code block is highlighted: {html}"
     );
     // ...and raw HTML is escaped, never passed through.
     assert!(

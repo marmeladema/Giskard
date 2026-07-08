@@ -14,12 +14,12 @@
 //! metadata only, so the UI can show a fallback message.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{Color, ThemeSet};
+use syntect::highlighting::{Color, Theme, ThemeSet};
 use syntect::html::{IncludeBackground, styled_line_to_highlighted_html};
-use syntect::parsing::SyntaxSet;
+use syntect::parsing::{SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -29,6 +29,9 @@ const DEFAULT_MAX_HIGHLIGHT_SIZE: usize = 10 * 1024 * 1024;
 
 /// Maximum number of cached highlight results before FIFO eviction kicks in.
 const MAX_CACHE_ENTRIES: usize = 128;
+
+static SNIPPET_SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+static SNIPPET_THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
 /// The cached, fully-highlighted form of a file: one HTML fragment per source line
 /// plus the `<pre …>` opener carrying the theme background. Range requests slice
@@ -80,6 +83,17 @@ pub struct HighlightResult {
     pub total_lines: usize,
     /// File size in bytes (spec §11.2: overlay shows path, size, and language).
     pub file_size: u64,
+}
+
+/// Syntax-highlighted HTML for a Markdown fenced code block.
+#[derive(Debug, Clone)]
+pub struct SnippetHighlight {
+    /// Inner HTML fragments for the code body, without a surrounding `<pre>` wrapper.
+    pub html: String,
+    /// Human-readable language label for the code block header.
+    pub language: String,
+    /// True when the fence language was recognized by syntect.
+    pub recognized_language: bool,
 }
 
 impl Highlighter {
@@ -167,19 +181,8 @@ impl Highlighter {
             .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
         let language = syntax.name.clone();
 
-        let theme = self
-            .theme_set
-            .themes
-            .get("base16-ocean.dark")
-            .or_else(|| self.theme_set.themes.values().next())
-            .ok_or("no syntax theme available")?;
-
-        let bg = theme.settings.background.unwrap_or(Color {
-            r: 0,
-            g: 0,
-            b: 0,
-            a: 0,
-        });
+        let theme = select_theme(&self.theme_set).ok_or("no syntax theme available")?;
+        let bg = theme_background(theme);
         let pre_open = format!(
             "<pre style=\"background-color:#{:02x}{:02x}{:02x};\">",
             bg.r, bg.g, bg.b
@@ -230,6 +233,48 @@ impl Highlighter {
 impl Default for Highlighter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Highlight a Markdown fenced code block using the same server-side highlighter family as the
+/// code overlay. Unknown language tokens fall back to escaped plain text while still returning a
+/// label derived from the fence, so the UI can show what the agent declared.
+pub fn highlight_snippet(source: &str, language_token: Option<&str>) -> SnippetHighlight {
+    let token = language_token.and_then(safe_language_token);
+    let syntax = token
+        .as_deref()
+        .and_then(|t| SNIPPET_SYNTAX_SET.find_syntax_by_token(t));
+    let recognized_language = syntax.is_some();
+    let syntax = syntax.unwrap_or_else(|| SNIPPET_SYNTAX_SET.find_syntax_plain_text());
+    let language = snippet_language_label(token.as_deref(), syntax, recognized_language);
+
+    let Some(theme) = select_theme(&SNIPPET_THEME_SET) else {
+        return SnippetHighlight {
+            html: escape_html(source),
+            language,
+            recognized_language: false,
+        };
+    };
+
+    let mut highlighter = HighlightLines::new(syntax, theme);
+    let mut html = String::new();
+    for line in LinesWithEndings::from(source) {
+        match highlighter.highlight_line(line, &SNIPPET_SYNTAX_SET) {
+            Ok(ranges) => html.push_str(
+                &styled_line_to_highlighted_html(&ranges, IncludeBackground::No)
+                    .unwrap_or_else(|_| escape_html(line)),
+            ),
+            Err(e) => {
+                warn!(language = ?token, %e, "snippet highlighting failed, escaping line");
+                html.push_str(&escape_html(line));
+            }
+        }
+    }
+
+    SnippetHighlight {
+        html,
+        language,
+        recognized_language,
     }
 }
 
@@ -303,6 +348,63 @@ fn detect_language(path: &Path) -> Option<String> {
     })
 }
 
+fn select_theme(theme_set: &ThemeSet) -> Option<&Theme> {
+    theme_set
+        .themes
+        .get("base16-ocean.dark")
+        .or_else(|| theme_set.themes.values().next())
+}
+
+fn theme_background(theme: &Theme) -> Color {
+    theme.settings.background.unwrap_or(Color {
+        r: 0,
+        g: 0,
+        b: 0,
+        a: 0,
+    })
+}
+
+fn safe_language_token(token: &str) -> Option<String> {
+    let token: String = token
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == '+')
+        .collect();
+    if token.is_empty() { None } else { Some(token) }
+}
+
+fn snippet_language_label(
+    token: Option<&str>,
+    syntax: &SyntaxReference,
+    recognized_language: bool,
+) -> String {
+    if recognized_language {
+        return syntax.name.clone();
+    }
+
+    token
+        .map(display_language_token)
+        .unwrap_or_else(|| "Plain Text".into())
+}
+
+fn display_language_token(token: &str) -> String {
+    match token.to_ascii_lowercase().as_str() {
+        "rs" | "rust" => "Rust".into(),
+        "js" | "javascript" | "mjs" => "JavaScript".into(),
+        "ts" | "typescript" => "TypeScript".into(),
+        "py" | "python" => "Python".into(),
+        "sh" | "bash" | "shell" => "Shell".into(),
+        "json" => "JSON".into(),
+        "yaml" | "yml" => "YAML".into(),
+        "toml" => "TOML".into(),
+        "html" => "HTML".into(),
+        "css" => "CSS".into(),
+        "sql" => "SQL".into(),
+        "md" | "markdown" => "Markdown".into(),
+        _ => token.to_string(),
+    }
+}
+
 /// Escape HTML special characters as a fallback when syntect highlighting fails.
 fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -332,6 +434,23 @@ mod tests {
             Some("Python".into())
         );
         assert_eq!(detect_language(Path::new("/noext")), None);
+    }
+
+    #[test]
+    fn highlight_rust_snippet_reports_language() {
+        let result = highlight_snippet("fn main() {}\n", Some("rust"));
+        assert_eq!(result.language, "Rust");
+        assert!(result.recognized_language);
+        assert!(result.html.contains("fn"));
+    }
+
+    #[test]
+    fn highlight_unknown_snippet_escapes_and_keeps_label() {
+        let result = highlight_snippet("<tag>\n", Some("not-real"));
+        assert_eq!(result.language, "not-real");
+        assert!(!result.recognized_language);
+        assert!(result.html.contains("&lt;tag&gt;"));
+        assert!(!result.html.contains("<tag>"));
     }
 
     #[tokio::test]
