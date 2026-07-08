@@ -8,7 +8,20 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.12
+**Version:** 1.13
+
+**Changelog (1.12 → 1.13), rendered agent Markdown:**
+- **M1:** Agent and reasoning messages are GitHub-flavored Markdown. The server renders them to
+  sanitized HTML via `POST /api/projects/{id}/render`; the browser injects the returned HTML.
+  Rendering happens when the `ItemCompleted` message is finalized (not per delta); the raw text is
+  shown until the render resolves, so streaming stays readable and a failed request degrades to
+  plain text.
+- **M2:** Rendering is a superset of the `/linkify` pass: detected workspace paths become the same
+  `.path-link` controls, wrapped inline during rendering. Paths inside code spans/fenced code
+  blocks are left literal. `/linkify` remains for command output (which is not Markdown).
+- **M3:** The renderer is the trust boundary. It escapes all text, never passes through raw HTML in
+  the source (it is escaped to inert text), and only emits `href`s with an `http`/`https`/`mailto`
+  scheme; images are not fetched (alt text is shown). Output is safe to inject as trusted HTML.
 
 **Changelog (1.11 → 1.12), live-turn interruption and running commands:**
 - **I1:** The browser exposes a Stop control while a turn is live and sends
@@ -1547,6 +1560,14 @@ alongside raw token counts. Off by default; raw token counts are the primary met
   `GET /api/projects/{id}/highlight?path=…` in the code overlay, and downloads through
   `GET /api/projects/{id}/raw?path=…`. This is intentionally whole-file oriented until the
   virtualized line-range viewer in §11.3 is implemented.
+- **Markdown rendering (M1–M3):** agent/reasoning text is Markdown, so finalized messages are sent
+  to `POST /api/projects/{id}/render` instead of `/linkify`. The server parses the Markdown
+  (`pulldown-cmark`) and emits **sanitized** HTML with a custom serializer: all text is escaped,
+  raw HTML in the source is escaped to inert text (never passed through), link URLs are restricted
+  to `http`/`https`/`mailto`, and images are not fetched. Path detection runs in the same pass over
+  prose text runs (not inside code), emitting the same `.path-link` controls the overlay wires up.
+  The browser injects the returned HTML as trusted markup and attaches the path-link handlers.
+  `/linkify` is retained for command output, which is plain text rather than Markdown.
 
 ### 11.3 Large files & performance
 

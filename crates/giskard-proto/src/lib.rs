@@ -355,6 +355,20 @@ pub struct LinkifyRequest {
     pub text: String,
 }
 
+/// Request body for Markdown rendering of agent text (spec §11.2).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RenderRequest {
+    pub text: String,
+}
+
+/// Result of rendering agent Markdown to sanitized HTML with embedded path links.
+#[derive(Debug, Clone, Serialize)]
+pub struct RenderResponse {
+    /// Sanitized HTML: agent-authored raw HTML is escaped, link URLs are scheme-checked, and
+    /// detected workspace paths are wrapped in `.path-link` buttons the client wires up.
+    pub html: String,
+}
+
 /// Request to create a directory under `parent` (filesystem picker "New folder"). `name` is a
 /// single path segment; the server rejects separators and `.`/`..` and enforces the browse roots.
 #[derive(Debug, Clone, Deserialize)]

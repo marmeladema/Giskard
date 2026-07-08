@@ -44,6 +44,7 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
         .route("/api/projects/{id}/highlight", get(highlight_file))
         .route("/api/projects/{id}/raw", get(download_file))
         .route("/api/projects/{id}/linkify", post(linkify))
+        .route("/api/projects/{id}/render", post(render_markdown))
         .route("/api/browse", get(browse))
         .route("/api/browse/mkdir", post(browse_mkdir))
         .route("/api/models", get(list_models))
@@ -611,6 +612,30 @@ async fn linkify(
         .collect();
 
     Ok(Json(LinkifyResponse { links }))
+}
+
+/// `POST /api/projects/{id}/render` — render agent Markdown to sanitized HTML (spec §11.2).
+///
+/// Agents emit GitHub-flavored Markdown; this returns safe HTML the client injects directly.
+/// Detected workspace paths are wrapped in `.path-link` buttons (the same affordance `/linkify`
+/// feeds), so rendering and linkification are a single pass. See [`crate::markdown`] for the
+/// sanitization guarantees.
+async fn render_markdown(
+    State(state): State<AppState>,
+    AxumPath(project_id): AxumPath<ProjectId>,
+    Json(req): Json<RenderRequest>,
+) -> Result<Json<RenderResponse>, ApiError> {
+    let project = state
+        .store
+        .load_project(project_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+    let workspace_root = PathBuf::from(project.workspace_root.as_deref().unwrap_or(&project.dir));
+    let root_canonical = workspace_root.canonicalize().unwrap_or(workspace_root);
+
+    let html = crate::markdown::render_markdown(&req.text, &root_canonical);
+    Ok(Json(RenderResponse { html }))
 }
 
 /// Canonicalize a requested path and verify it stays within the workspace root.
