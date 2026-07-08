@@ -1189,6 +1189,9 @@ Auto-generate an initial title from the first user message (truncated); user-edi
 
 - Agent message text arrives as `ItemDelta`s; the UI appends incrementally.
 - Command executions stream stdout/stderr as `ItemDelta`s under a command item.
+- Command output bodies are collapsible transcript sections. Running command output starts
+  expanded while small and may auto-collapse once output is large; completed command output is
+  collapsed by default regardless of size. Expanding a command renders the output inline.
 - Reasoning notes (if the model/effort emits them) render in a collapsible "thinking" block.
 - Each item ends with `ItemCompleted` carrying its final, canonical form (this is what gets
   persisted; deltas are transient).
@@ -1622,7 +1625,7 @@ sessions, so clarity and low visual noise beat flourish. Explicitly avoid the ge
   `✓` green for succeeded, `✕` red for failed, and `■` muted gray/orange for terminated or
   declined.
 - **Signature element:** the **thread transcript** treated as a first-class typed document —
-  agent text, collapsible reasoning, command blocks with streamed output, and inline
+  agent text, collapsible reasoning, command blocks with collapsible streamed output, and inline
   linkified paths — paired with the **context-window gauge** as a persistent, honest read on
   "how full is this conversation." That gauge + linkified transcript is what makes Giskard
   feel purpose-built rather than a generic chat wrapper.

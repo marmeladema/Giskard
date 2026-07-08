@@ -50,8 +50,11 @@
   header.thr .badge { font-size:12px; padding:2px 8px; border:1px solid var(--border); border-radius:20px; }
   header.thr .gauge { margin-left:auto; font-size:12px; }
 
-  #transcript { flex:1; overflow-y:auto; padding:16px; }
-  .msg { max-width:80%; margin:10px 0; padding:10px 12px; border-radius:10px; white-space:pre-wrap; word-wrap:break-word; }
+  #transcript { flex:1; min-width:0; overflow-y:auto; overflow-x:hidden; padding:16px; }
+  .msg {
+    max-width:80%; min-width:0; margin:10px 0; padding:10px 12px; border-radius:10px;
+    white-space:pre-wrap; overflow-wrap:anywhere; word-wrap:break-word;
+  }
   .msg.user { background:var(--accent); color:#fff; margin-left:auto; }
   .msg.agent { background:var(--panel2); }
   .msg.reasoning { background:transparent; border:1px dashed var(--border); color:var(--muted); font-size:13px; }
@@ -60,13 +63,18 @@
   .msg.tool { background:#151521; border:1px solid #3b3b67; }
   .msg.activity { background:#13181c; border:1px solid var(--border); color:#c9d1d9; }
   .msg .role { font-size:11px; text-transform:uppercase; letter-spacing:.05em; opacity:.7; margin-bottom:4px; }
-  pre.out { margin:0; font-family:var(--mono); font-size:12.5px; white-space:pre-wrap; }
+  .msg .body { min-width:0; max-width:100%; overflow-wrap:anywhere; }
+  pre.out {
+    max-width:100%; margin:0; overflow-x:hidden; font-family:var(--mono); font-size:12.5px;
+    white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;
+  }
   .item-list { margin:6px 0 0; padding-left:18px; }
   .item-list li { margin:2px 0; }
   .meta { margin-top:6px; color:var(--muted); font-size:12px; }
   .path-link {
     display:inline; margin:0; padding:0 2px; border:0; border-radius:3px; background:transparent;
-    color:#79c0ff; font:inherit; font-family:var(--mono); text-decoration:underline; text-underline-offset:2px;
+    max-width:100%; color:#79c0ff; font:inherit; font-family:var(--mono); overflow-wrap:anywhere;
+    text-decoration:underline; text-underline-offset:2px;
   }
   .path-link:hover, .path-link:focus { color:#a5d6ff; background:rgba(121,192,255,.12); outline:none; }
 
@@ -126,6 +134,8 @@
   .cmd-meta { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
   .cmd-actions { display:flex; gap:6px; align-items:center; }
   .cmd-actions button { font-size:12px; padding:3px 7px; }
+  .cmd-output-summary { margin-top:6px; }
+  .msg.cmd.toggleable { cursor:pointer; }
 
   /* modal dialog + directory picker */
   .overlay { position:fixed; inset:0; background:rgba(0,0,0,.55); display:none; align-items:center; justify-content:center; z-index:50; }
@@ -192,7 +202,7 @@
   [data-appearance="ide"] .msg {
     max-width:100%; margin:0; padding:11px 18px; border-radius:0; background:transparent;
     border:0; border-bottom:1px solid var(--border);
-    display:grid; grid-template-columns:78px 1fr; column-gap:16px; align-items:start;
+    display:grid; grid-template-columns:78px minmax(0,1fr); column-gap:16px; align-items:start;
   }
   [data-appearance="ide"] .msg .role { margin:0; padding-top:1px; text-align:right; opacity:1; color:var(--muted); }
   [data-appearance="ide"] .msg.user { background:rgba(59,130,246,.07); color:var(--fg); }
@@ -213,7 +223,7 @@
   [data-appearance="terminal"] #transcript { padding:10px 12px; }
   [data-appearance="terminal"] .msg {
     max-width:100%; margin:0; padding:1px 0; border:0; border-radius:0; background:transparent;
-    display:grid; grid-template-columns:66px 1fr; column-gap:10px;
+    display:grid; grid-template-columns:66px minmax(0,1fr); column-gap:10px;
     font-family:var(--mono); font-size:12.5px; line-height:1.55;
   }
   [data-appearance="terminal"] .msg .role { margin:0; text-align:right; text-transform:lowercase; letter-spacing:0; opacity:1; color:var(--muted); }
@@ -391,8 +401,11 @@ let state = {
   models:[], streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null, pendingClientMsgs:[],
   streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), itemKindsByItemId:new Map(),
   runningCommands:new Map(), commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null,
+  commandPayloadsByItemId:new Map(), endedCommandsByItemId:new Map(), expandedCommandOutputs:new Set(), manuallyToggledCommandOutputs:new Set(),
   linkifyCache:new Map(), codePath:null, codeLine:null, activeTurn:false, interruptPending:false
 };
+const COMMAND_AUTO_COLLAPSE_LINES = 120;
+const COMMAND_AUTO_COLLAPSE_BYTES = 16 * 1024;
 setInterval(updateRunningCommandDurations, 1000);
 
 async function api(method, path, body) {
@@ -830,8 +843,9 @@ function handleEvent(ev) {
     case "item_delta":
       if (ev.delta && ev.delta.type==="text") appendStream(ev.delta.text, ev.item_id, ev.delta.type);
       else if (ev.delta && ev.delta.type==="command_output") {
-        appendStream(ev.delta.chunk, ev.item_id, ev.delta.type);
-        appendRunningCommandOutput(ev.item_id, ev.delta.chunk);
+        if (!appendRunningCommandOutput(ev.item_id, ev.delta.chunk)) {
+          appendStream(ev.delta.chunk, ev.item_id, ev.delta.type);
+        }
       }
       break;
     case "item_completed":
@@ -953,6 +967,116 @@ function commandFromItem(item, p, existing) {
 function commandBodyFor(id) {
   return state.commandBodyElsByItemId.get(id) || state.streamElsByItemId.get(id);
 }
+function commandOutputStats(output) {
+  const text = String(output || "");
+  let lineCount = text ? 1 : 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) === 10 && i < text.length - 1) lineCount++;
+  }
+  let bytes = text.length;
+  try { bytes = new TextEncoder().encode(text).length; } catch {}
+  return { chars:text.length, bytes, lineCount };
+}
+function commandOutputStatsLabel(stats, phase) {
+  if (!stats.chars) return phase === "running" ? "No output yet" : "No output";
+  const lineWord = stats.lineCount === 1 ? "line" : "lines";
+  return `${stats.lineCount.toLocaleString()} ${lineWord} · ${formatBytes(stats.bytes)}`;
+}
+function commandOutputShouldAutoCollapse(stats) {
+  return stats.lineCount > COMMAND_AUTO_COLLAPSE_LINES ||
+    stats.bytes > COMMAND_AUTO_COLLAPSE_BYTES;
+}
+function commandOutputPhaseForId(id) {
+  const cmd = state.runningCommands.get(id);
+  if (cmd && commandIsRunningStatus(cmd.status)) return "running";
+  return "completed";
+}
+function commandOutputForId(id) {
+  const cmd = state.runningCommands.get(id);
+  if (cmd) return cmd.output || "";
+  const ended = state.endedCommandsByItemId.get(id);
+  if (ended && ended.command) return ended.command.output || "";
+  const payload = state.commandPayloadsByItemId.get(id);
+  return payload ? payload.output || "" : "";
+}
+function isCommandOutputExpanded(itemId, phase, output, stats) {
+  const key = idKey(itemId);
+  if (key && state.manuallyToggledCommandOutputs.has(key)) {
+    return state.expandedCommandOutputs.has(key);
+  }
+  if (phase === "completed") return false;
+  return !commandOutputShouldAutoCollapse(stats || commandOutputStats(output));
+}
+function makeCommandHead() {
+  const head = document.createElement("div");
+  head.className = "cmd-head";
+  return { head };
+}
+function wireCommandRowToggle(msg, itemId, expanded) {
+  const key = idKey(itemId);
+  if (!key) return;
+  msg.classList.add("toggleable");
+  msg.title = expanded ? "Collapse command output" : "Show command output";
+  msg.tabIndex = 0;
+  msg.setAttribute("role", "button");
+  msg.setAttribute("aria-expanded", expanded ? "true" : "false");
+  msg.onclick = (e) => {
+    if (e.defaultPrevented || e.target.closest("button,a,input,select,textarea")) return;
+    toggleCommandOutput(key);
+  };
+  msg.onkeydown = (e) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      toggleCommandOutput(key);
+    }
+  };
+}
+function toggleCommandOutput(itemId) {
+  const key = idKey(itemId);
+  if (!key) return;
+  const phase = commandOutputPhaseForId(key);
+  const output = commandOutputForId(key);
+  const expanded = isCommandOutputExpanded(key, phase, output);
+  state.manuallyToggledCommandOutputs.add(key);
+  if (expanded) state.expandedCommandOutputs.delete(key);
+  else state.expandedCommandOutputs.add(key);
+  rerenderCommandRow(key);
+}
+function rerenderCommandRow(id) {
+  const body = commandBodyFor(id);
+  if (!body) return;
+  const cmd = state.runningCommands.get(id);
+  if (cmd) { renderCommandBody(body, cmd); return; }
+  const ended = state.endedCommandsByItemId.get(id);
+  if (ended) { renderEndedCommandBody(body, ended.command, ended.status, ended.opts); return; }
+  const payload = state.commandPayloadsByItemId.get(id);
+  if (payload) renderItemBody(body, payload);
+}
+function renderCommandOutputBlock(body, opts) {
+  const itemId = idKey(opts.itemId);
+  const phase = opts.phase || "completed";
+  const output = String(opts.output || "");
+  const stats = commandOutputStats(output);
+  const expanded = isCommandOutputExpanded(itemId, phase, output, stats);
+  const msg = body.parentElement;
+  msg.classList.toggle("collapsed", !expanded);
+  msg.classList.toggle("expanded", expanded);
+  wireCommandRowToggle(msg, itemId, expanded);
+
+  const summary = document.createElement("div");
+  summary.className = "meta cmd-output-summary";
+  const label = commandOutputStatsLabel(stats, phase);
+  summary.textContent = !stats.chars ? label :
+    expanded ? `Output · ${label}` : `Output collapsed · ${label}`;
+  body.append(summary);
+
+  if (!expanded || !stats.chars) return;
+  const out = document.createElement("pre");
+  out.className = "out";
+  body.append(out);
+  if (opts.linkify) renderLinkedText(out, output);
+  else out.textContent = output;
+}
 function renderCommandBody(body, cmd) {
   const msg = body.parentElement;
   const stateName = commandVisualStateFromCommand(cmd);
@@ -962,8 +1086,7 @@ function renderCommandBody(body, cmd) {
   msg.dataset.commandStartedAtMs = String(cmd.startedAtMs || Date.now());
   body.replaceChildren();
 
-  const head = document.createElement("div");
-  head.className = "cmd-head";
+  const { head } = makeCommandHead();
   const title = document.createElement("div");
   title.className = "cmd-title mono";
   title.textContent = "$ " + (cmd.command || "(command)");
@@ -986,10 +1109,7 @@ function renderCommandBody(body, cmd) {
     cwd.textContent = cmd.cwd;
     body.append(cwd);
   }
-  const out = document.createElement("pre");
-  out.className = "out";
-  out.textContent = cmd.output || "";
-  body.append(out);
+  renderCommandOutputBlock(body, { itemId:cmd.id, output:cmd.output || "", phase:"running" });
 }
 function commandStatusLabel(cmd) {
   const elapsed = formatDuration(Date.now() - (cmd.startedAtMs || Date.now()));
@@ -1078,10 +1198,13 @@ function updateRunningCommandDurations() {
 function appendRunningCommandOutput(itemId, chunk) {
   const key = idKey(itemId);
   const cmd = state.runningCommands.get(key);
-  if (!cmd) return;
+  if (!cmd) return false;
   cmd.output = (cmd.output || "") + (chunk || "");
   if (cmd.output.length > 8000) cmd.output = cmd.output.slice(-8000);
+  const body = commandBodyFor(key);
+  if (body) renderCommandBody(body, cmd);
   renderRunningCommands();
+  return true;
 }
 function detachRunningCommands() {
   for (const cmd of state.runningCommands.values()) {
@@ -1098,6 +1221,7 @@ function finishRunningCommand(item) {
   if (p && p.kind==="command_execution" && commandIsRunningStatus(p.status)) {
     const cmd = commandFromItem(item, p, state.runningCommands.get(key));
     state.runningCommands.set(key, cmd);
+    state.endedCommandsByItemId.delete(key);
     let body = commandBodyFor(key);
     if (body) {
       state.commandBodyElsByItemId.set(key, body);
@@ -1106,9 +1230,7 @@ function finishRunningCommand(item) {
     }
   } else {
     state.runningCommands.delete(key);
-    state.commandStopRequestedByItemId.delete(key);
-    state.commandBodyElsByItemId.delete(key);
-    state.commandMsgElsByItemId.delete(key);
+    state.endedCommandsByItemId.delete(key);
   }
   renderRunningCommands();
 }
@@ -1150,12 +1272,11 @@ function renderRunningCommandSnapshot(commands) {
       renderEndedCommandBody(body, cmd, "unknown", { stopRequested:true });
     }
     state.commandStopRequestedByItemId.delete(id);
-    state.commandBodyElsByItemId.delete(id);
-    state.commandMsgElsByItemId.delete(id);
   }
   renderRunningCommands();
 }
 function renderEndedCommandBody(body, cmd, status, opts) {
+  state.endedCommandsByItemId.set(cmd.id, { command:cmd, status, opts:opts || {} });
   const msg = body.parentElement;
   const stateName = commandVisualStateFromStatus(status);
   msg.className = `msg cmd state-${stateName}`;
@@ -1163,8 +1284,9 @@ function renderEndedCommandBody(body, cmd, status, opts) {
   msg.dataset.commandItemId = cmd.id;
   msg.dataset.commandStartedAtMs = String(cmd.startedAtMs || Date.now());
   body.replaceChildren();
+  const { head } = makeCommandHead();
   const title = document.createElement("div");
-  title.className = "mono";
+  title.className = "cmd-title mono";
   title.textContent = "$ " + (cmd.command || "(command)");
   const meta = document.createElement("div");
   meta.className = "meta cmd-meta";
@@ -1173,12 +1295,10 @@ function renderEndedCommandBody(body, cmd, status, opts) {
   if (status) {
     appendCommandMetaPart(meta, commandStatusNode(terminalCommandStatus(status, durationMs, opts), stateName));
   }
-  const out = document.createElement("pre");
-  out.className = "out";
-  out.textContent = cmd.output || "";
-  body.append(title);
+  head.append(title);
+  body.append(head);
   if (meta.childNodes.length) body.append(meta);
-  body.append(out);
+  renderCommandOutputBlock(body, { itemId:cmd.id, output:cmd.output || "", phase:"completed" });
 }
 function renderRunningCommands() {
   const box = $("ctxCommands"); if (!box) return;
@@ -1262,10 +1382,17 @@ function appendStream(text, itemId, deltaType) {
   state.streamEl = body;
   state.streamItemId = key || null;
   const kind = key ? state.itemKindsByItemId.get(key) : null;
-  const out = (deltaType==="command_output" || kind==="command_execution") ?
-    body.querySelector("pre.out") : null;
-  if (out) out.append(document.createTextNode(text));
-  else body.textContent += text;
+  if (deltaType==="command_output" || kind==="command_execution") {
+    let out = body.querySelector("pre.out");
+    if (!out) {
+      out = document.createElement("pre");
+      out.className = "out";
+      body.append(out);
+    }
+    out.append(document.createTextNode(text));
+  } else {
+    body.textContent += text;
+  }
   $("transcript").scrollTop = $("transcript").scrollHeight;
 }
 function finalizeStreamedItem(item) {
@@ -1343,6 +1470,10 @@ function resetRenderState() {
   state.commandBodyElsByItemId = new Map();
   state.commandMsgElsByItemId = new Map();
   state.commandStopRequestedByItemId = new Set();
+  state.commandPayloadsByItemId = new Map();
+  state.endedCommandsByItemId = new Map();
+  state.expandedCommandOutputs = new Set();
+  state.manuallyToggledCommandOutputs = new Set();
   state.selectedCommandId = null;
   renderRunningCommands();
 }
@@ -1380,6 +1511,11 @@ function renderItemBody(body, p) {
   body.replaceChildren();
   if (p.kind==="command_execution") {
     const itemId = msg.dataset.commandItemId || "";
+    if (itemId) {
+      state.commandPayloadsByItemId.set(itemId, p);
+      state.commandBodyElsByItemId.set(itemId, body);
+      state.commandMsgElsByItemId.set(itemId, msg);
+    }
     const stopRequested = !!(itemId && (state.commandStopRequestedByItemId.has(itemId) || (state.runningCommands.get(itemId) && state.runningCommands.get(itemId).terminating)));
     const displayStatus = p.status;
     const stateName = commandVisualStateFromStatus(displayStatus);
@@ -1387,8 +1523,10 @@ function renderItemBody(body, p) {
     if (commandIsRunningStatus(displayStatus)) msg.classList.add("running-command");
     const startedAtMs = normalizeTimestampMs(msg.dataset.commandStartedAtMs, null);
     const durationMs = normalizeCommandDuration(p.duration_ms, startedAtMs);
+    const outputPhase = commandIsRunningStatus(displayStatus) ? "running" : "completed";
+    const { head } = makeCommandHead();
     const cmd = document.createElement("div");
-    cmd.className = "mono";
+    cmd.className = "cmd-title mono";
     cmd.textContent = "$ " + (p.command || "");
     const meta = document.createElement("div");
     meta.className = "meta cmd-meta";
@@ -1400,12 +1538,15 @@ function renderItemBody(body, p) {
       appendCommandMetaPart(meta, commandStatusNode(`status: ${displayStatus}`, stateName));
     }
     if (p.exit_code!==undefined && p.exit_code!==null) appendCommandMetaPart(meta, `exit: ${p.exit_code}`);
-    const out = document.createElement("pre");
-    out.className = "out";
-    body.append(cmd);
+    head.append(cmd);
+    body.append(head);
     if (meta.childNodes.length) body.append(meta);
-    body.append(out);
-    renderLinkedText(out, p.output || "");
+    renderCommandOutputBlock(body, {
+      itemId,
+      output:p.output || "",
+      phase:outputPhase,
+      linkify:true
+    });
   } else if (p.kind==="agent_message" || p.kind==="reasoning" || p.kind==="user_message") {
     if (p.kind==="user_message") body.textContent = p.text || "";
     else renderLinkedText(body, p.text || "");
@@ -1521,7 +1662,10 @@ function makePathLink(path, label, line) {
   btn.textContent = label || value;
   const targetLine = normalizeLine(line, null);
   btn.title = targetLine ? `Open source at line ${targetLine}` : "Open source";
-  btn.onclick = () => openCodeOverlay(value, targetLine);
+  btn.onclick = (e) => {
+    e.stopPropagation();
+    openCodeOverlay(value, targetLine);
+  };
   return btn;
 }
 function renderFileChange(body, p) {

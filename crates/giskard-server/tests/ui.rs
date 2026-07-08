@@ -231,8 +231,68 @@ async fn index_page_is_served_and_public() {
         "UI calls the server-side path linkifier"
     );
     assert!(
-        body.contains("renderLinkedText(out, p.output"),
-        "UI linkifies completed command output through the server"
+        body.contains("renderCommandOutputBlock"),
+        "UI renders command output through the collapsible output block"
+    );
+    assert!(
+        body.contains("if (phase === \"completed\") return false"),
+        "completed command output is collapsed by default"
+    );
+    assert!(
+        body.contains("commandOutputShouldAutoCollapse"),
+        "running command output can auto-collapse when it grows large"
+    );
+    assert!(
+        body.contains("COMMAND_AUTO_COLLAPSE_LINES"),
+        "UI has a line threshold for running command auto-collapse"
+    );
+    assert!(
+        body.contains("expandedCommandOutputs"),
+        "UI tracks command output expansion state by item"
+    );
+    assert!(
+        body.contains("manuallyToggledCommandOutputs"),
+        "UI preserves manual command output toggles while the thread is open"
+    );
+    assert!(
+        body.contains("toggleCommandOutput"),
+        "command rows can toggle collapsed output"
+    );
+    assert!(
+        body.contains("wireCommandRowToggle"),
+        "the transcript command row owns the output toggle handler"
+    );
+    assert!(
+        body.contains("e.target.closest(\"button,a,input,select,textarea\")"),
+        "nested controls inside command rows do not trigger collapse"
+    );
+    assert!(
+        !body.contains("cmd-toggle"),
+        "command output collapse must not use a separate arrow-style button"
+    );
+    assert!(
+        body.contains("grid-template-columns:78px minmax(0,1fr)"),
+        "IDE transcript grid cannot be widened by command output"
+    );
+    assert!(
+        body.contains("grid-template-columns:66px minmax(0,1fr)"),
+        "terminal transcript grid cannot be widened by command output"
+    );
+    assert!(
+        body.contains("overflow-x:hidden"),
+        "the transcript column suppresses horizontal overflow"
+    );
+    assert!(
+        body.contains("overflow-wrap:anywhere"),
+        "long command output can wrap instead of widening the row"
+    );
+    assert!(
+        body.contains("Output collapsed"),
+        "collapsed command rows summarize hidden output"
+    );
+    assert!(
+        body.contains("if (opts.linkify) renderLinkedText(out, output)"),
+        "UI linkifies command output only when the output block is expanded"
     );
     assert!(
         body.contains("renderLinkedText(body, p.text"),
