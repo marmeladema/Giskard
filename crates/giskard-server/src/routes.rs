@@ -952,7 +952,7 @@ async fn handle_client_msg(
 
             let tf = state
                 .store
-                .load_thread(access.project_id, thread_id)
+                .recompute_aggregates(access.project_id, thread_id)
                 .await
                 .map_err(|e| WsError::from_persist(e, "subscribe", Some(thread_id)))?
                 .ok_or_else(|| {

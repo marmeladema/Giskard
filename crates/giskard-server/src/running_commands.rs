@@ -215,6 +215,22 @@ impl RunningCommandStore {
         snapshot.sort_by_key(|cmd| (cmd.turn_id.to_string(), cmd.item_id.to_string()));
         snapshot
     }
+
+    pub async fn has_running_for_turn(
+        &self,
+        thread_id: ThreadId,
+        turn_id: giskard_core::ids::TurnId,
+    ) -> bool {
+        let commands = self.commands.lock().await;
+        commands
+            .get(&thread_id)
+            .map(|thread_commands| {
+                thread_commands
+                    .values()
+                    .any(|cmd| cmd.turn_id == turn_id && command_status_is_running(&cmd.status))
+            })
+            .unwrap_or(false)
+    }
 }
 
 fn path_to_display(path: &Path) -> String {
@@ -653,6 +669,56 @@ mod tests {
             .expect("running command should be indexed by item id");
         assert_eq!(command.process_id.as_deref(), Some("proc_1"));
         assert!(store.get_by_item(thread, ItemId::new()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn has_running_for_turn_only_matches_active_commands_for_that_turn() {
+        let store = RunningCommandStore::new();
+        let thread = ThreadId::new();
+        let first_turn = TurnId::new();
+        let second_turn = TurnId::new();
+        let first = ItemId::new();
+        let second = ItemId::new();
+
+        store
+            .apply_event(&command_start(
+                thread,
+                first_turn,
+                first,
+                "proc_1",
+                "in_progress",
+            ))
+            .await;
+        store
+            .apply_event(&command_start(
+                thread,
+                second_turn,
+                second,
+                "proc_2",
+                "in_progress",
+            ))
+            .await;
+
+        assert!(store.has_running_for_turn(thread, first_turn).await);
+        assert!(store.has_running_for_turn(thread, second_turn).await);
+
+        store
+            .apply_event(&command_completed(
+                thread,
+                first_turn,
+                first,
+                "proc_1",
+                Some("completed"),
+            ))
+            .await;
+
+        assert!(!store.has_running_for_turn(thread, first_turn).await);
+        assert!(store.has_running_for_turn(thread, second_turn).await);
+        assert!(
+            !store
+                .has_running_for_turn(ThreadId::new(), second_turn)
+                .await
+        );
     }
 
     #[tokio::test]
