@@ -65,6 +65,12 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
         .route("/api/browse/mkdir", post(browse_mkdir))
         .route("/api/models", get(list_models))
         .route("/api/models/refresh", post(refresh_models))
+        .route("/api/projects/{id}/mcp", get(list_mcp_servers))
+        .route("/api/projects/{id}/mcp/reload", post(reload_mcp_servers))
+        .route(
+            "/api/projects/{id}/mcp/oauth-login",
+            post(start_mcp_oauth_login),
+        )
         .route("/api/tokens", get(global_tokens))
         .route("/api/projects/{id}/tokens", get(project_tokens))
         .route("/api/logout", post(logout))
@@ -832,6 +838,107 @@ async fn refresh_models(
     let config = state.store.load_config().await?;
     let (models, warnings) = crate::models::refresh_models(&config).await;
     Ok(Json(ListModelsResponse { models, warnings }))
+}
+
+async fn list_mcp_servers(
+    State(state): State<AppState>,
+    AxumPath(project_id): AxumPath<ProjectId>,
+) -> Result<Json<ListMcpServersResponse>, ApiError> {
+    let project_config = state
+        .store
+        .load_project(project_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let capabilities = state
+        .registry
+        .capabilities(&project_config)
+        .await
+        .map_err(harness_api_error)?;
+    let servers = if capabilities.mcp_status {
+        state
+            .registry
+            .list_mcp_servers(&project_config)
+            .await
+            .map_err(harness_api_error)?
+    } else {
+        Vec::new()
+    };
+    Ok(Json(ListMcpServersResponse {
+        servers,
+        capabilities: McpCapabilitiesResponse {
+            status: capabilities.mcp_status,
+            reload: capabilities.mcp_reload,
+            oauth_login: capabilities.mcp_oauth_login,
+        },
+    }))
+}
+
+async fn reload_mcp_servers(
+    State(state): State<AppState>,
+    AxumPath(project_id): AxumPath<ProjectId>,
+) -> Result<Json<ReloadMcpServersResponse>, ApiError> {
+    let project_config = state
+        .store
+        .load_project(project_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let capabilities = state
+        .registry
+        .capabilities(&project_config)
+        .await
+        .map_err(harness_api_error)?;
+    if !capabilities.mcp_reload {
+        return Err(ApiError::BadRequest(
+            "MCP server reload is not supported by this harness".into(),
+        ));
+    }
+    state
+        .registry
+        .reload_mcp_servers(&project_config)
+        .await
+        .map_err(harness_api_error)?;
+    Ok(Json(ReloadMcpServersResponse { ok: true }))
+}
+
+async fn start_mcp_oauth_login(
+    State(state): State<AppState>,
+    AxumPath(project_id): AxumPath<ProjectId>,
+    Json(req): Json<StartMcpOauthLoginRequest>,
+) -> Result<Json<McpOauthStart>, ApiError> {
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::BadRequest(
+            "MCP server name cannot be empty".into(),
+        ));
+    }
+    let project_config = state
+        .store
+        .load_project(project_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let capabilities = state
+        .registry
+        .capabilities(&project_config)
+        .await
+        .map_err(harness_api_error)?;
+    if !capabilities.mcp_oauth_login {
+        return Err(ApiError::BadRequest(
+            "MCP OAuth login is not supported by this harness".into(),
+        ));
+    }
+    let login = state
+        .registry
+        .start_mcp_oauth_login(&project_config, name)
+        .await
+        .map_err(harness_api_error)?;
+    Ok(Json(login))
+}
+
+fn harness_api_error(error: HarnessError) -> ApiError {
+    match error {
+        HarnessError::Unsupported(message) => ApiError::BadRequest(message),
+        other => ApiError::Internal(other.to_string()),
+    }
 }
 
 /// `GET /api/tokens` — the global token dashboard (day/week/month/total, §10.2).

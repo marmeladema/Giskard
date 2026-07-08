@@ -8,7 +8,20 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.20
+**Version:** 1.21
+
+**Changelog (1.20 → 1.21), MCP status surface:**
+- **MCP1:** The thread header includes an `MCP` control with a status dot and server count.
+  Activating it opens an MCP menu that lists the active project's MCP servers, auth state, tool
+  count, resource count, and expandable tool/resource detail. Servers that require OAuth expose an
+  authenticate action when the harness supports it. Codex `unsupported` auth state means the
+  server does not expose Codex-managed auth, not that the MCP server itself is unusable, so the UI
+  presents it as a usable unauthenticated server state.
+- **MCP2:** Giskard exposes project-scoped MCP REST endpoints backed by the harness:
+  `GET /api/projects/{id}/mcp`, `POST /api/projects/{id}/mcp/reload`, and
+  `POST /api/projects/{id}/mcp/oauth-login`. Codex maps these to `mcpServerStatus/list`,
+  `config/mcpServer/reload`, and `mcpServer/oauth/login`. Server status is visible first;
+  enable/disable is not implemented until the exact Codex config contract is intentionally modeled.
 
 **Changelog (1.19 → 1.20), thread rename lifecycle:**
 - **TN1:** The thread list actions menu includes `Rename`. Activating it edits the row title next
@@ -624,12 +637,20 @@ pub struct HarnessCapabilities {
     pub model_listing: bool,
     /// Token usage reported on turn completion.
     pub token_usage: bool,
+    /// MCP server status can be listed through the harness.
+    pub mcp_status: bool,
+    /// MCP server config can be reloaded through the harness.
+    pub mcp_reload: bool,
+    /// MCP OAuth login can be started through the harness.
+    pub mcp_oauth_login: bool,
 }
 ```
 
-Codex advertises all of these as `true`. A future Claude Code adapter would likely set
-`live_approvals`, `structured_diffs`, and possibly `plan_build_modes` to `false` or a
-degraded form, and the UI reacts accordingly (§13.5).
+Codex advertises all Codex-backed capabilities as `true`, except harness-owned model listing
+(`model_listing`) because Giskard currently resolves provider models through its config/provider
+metadata (§8.3). A future Claude Code adapter would likely set `live_approvals`,
+`structured_diffs`, `mcp_status`, and possibly `plan_build_modes` to `false` or a degraded form,
+and the UI reacts accordingly (§13.5).
 
 ### 4.3 The trait
 
@@ -640,6 +661,15 @@ pub trait AgentHarness: Send + Sync {
 
     /// List models available through this harness/provider, if supported.
     async fn list_models(&self) -> Result<Vec<ModelDescriptor>, HarnessError>;
+
+    /// List configured MCP servers and their visible tools/resources.
+    async fn list_mcp_servers(&self) -> Result<Vec<McpServerStatus>, HarnessError>;
+
+    /// Reload MCP server configuration.
+    async fn reload_mcp_servers(&self) -> Result<(), HarnessError>;
+
+    /// Start an OAuth login flow for one MCP server.
+    async fn start_mcp_oauth_login(&self, name: &str) -> Result<McpOauthStart, HarnessError>;
 
     /// Open (or resume) a thread. `resume` carries a harness-native thread id if resuming.
     async fn open_thread(
@@ -1883,6 +1913,9 @@ The UI reads `HarnessCapabilities` for the active harness and adapts:
 - No `per_turn_model` ⇒ model is fixed at thread creation (picker disabled mid-thread).
 - No `reasoning_effort` or model doesn't support it ⇒ hide the effort selector.
 - No `structured_diffs` ⇒ hide the Diffs tab (or show a plain textual change summary).
+- No `mcp_status` ⇒ hide or disable the MCP menu. No `mcp_reload` ⇒ the menu can refresh the
+  cached status but not ask the harness to reload MCP config. No `mcp_oauth_login` ⇒ servers in
+  `not_logged_in` state show the auth state without an authenticate button.
 
 This guarantees a coherent experience when a future, less-capable harness is plugged in.
 

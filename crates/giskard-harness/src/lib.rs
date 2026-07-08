@@ -10,6 +10,7 @@ use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ProjectId, ServerRequestId, ThreadId, TurnId};
+use giskard_core::mcp::{McpOauthStart, McpServerStatus};
 use giskard_core::model::{ModelDescriptor, ModelRef};
 use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::turn::TurnOverrides;
@@ -35,6 +36,12 @@ pub struct HarnessCapabilities {
     pub model_listing: bool,
     /// Token usage reported on turn completion.
     pub token_usage: bool,
+    /// MCP server status can be listed through the harness.
+    pub mcp_status: bool,
+    /// MCP server config can be reloaded through the harness.
+    pub mcp_reload: bool,
+    /// MCP OAuth login can be started through the harness.
+    pub mcp_oauth_login: bool,
 }
 
 /// Options for opening (or resuming) a thread.
@@ -107,6 +114,27 @@ pub trait AgentHarness: Send + Sync {
 
     /// List models available through this harness/provider, if supported.
     async fn list_models(&self) -> Result<Vec<ModelDescriptor>, HarnessError>;
+
+    /// List configured MCP servers and their visible tools/resources.
+    async fn list_mcp_servers(&self) -> Result<Vec<McpServerStatus>, HarnessError> {
+        Err(HarnessError::Unsupported(
+            "MCP server status is not supported by this harness".into(),
+        ))
+    }
+
+    /// Reload MCP server configuration.
+    async fn reload_mcp_servers(&self) -> Result<(), HarnessError> {
+        Err(HarnessError::Unsupported(
+            "MCP server reload is not supported by this harness".into(),
+        ))
+    }
+
+    /// Start an OAuth login flow for one MCP server.
+    async fn start_mcp_oauth_login(&self, name: &str) -> Result<McpOauthStart, HarnessError> {
+        Err(HarnessError::Unsupported(format!(
+            "MCP OAuth login is not supported for server {name:?}"
+        )))
+    }
 
     /// Open (or resume) a thread.
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError>;
