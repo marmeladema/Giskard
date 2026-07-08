@@ -606,6 +606,7 @@ async fn linkify(
             start: s.start,
             end: s.end,
             path: s.path,
+            line: s.line,
         })
         .collect();
 

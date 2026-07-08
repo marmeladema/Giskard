@@ -95,6 +95,54 @@ async fn index_page_is_served_and_public() {
         "UI renders generic activity items"
     );
     assert!(
+        body.contains("/linkify"),
+        "UI calls the server-side path linkifier"
+    );
+    assert!(
+        body.contains("renderLinkedText(out, p.output"),
+        "UI linkifies completed command output through the server"
+    );
+    assert!(
+        body.contains("renderLinkedText(body, p.text"),
+        "UI linkifies completed agent/reasoning text through the server"
+    );
+    assert!(
+        body.contains("openCodeOverlay"),
+        "UI opens a source overlay for linked paths"
+    );
+    assert!(
+        body.contains("openCodeOverlay(value, targetLine)"),
+        "UI passes linkified line targets into the source overlay"
+    );
+    assert!(
+        body.contains("makePathLink(c.path"),
+        "UI routes structured file-change paths into the source overlay"
+    );
+    assert!(
+        body.contains("projectFileUrl(\"highlight\""),
+        "UI requests server-side syntax highlighted source"
+    );
+    assert!(
+        body.contains("projectFileUrl(\"raw\""),
+        "UI exposes raw file downloads"
+    );
+    assert!(
+        body.contains("codeDownload"),
+        "UI has a download button for source files"
+    );
+    assert!(
+        body.contains("code-line-nos"),
+        "UI renders source line numbers in the code overlay"
+    );
+    assert!(
+        body.contains("scrollToCodeLine"),
+        "UI scrolls the code overlay to a requested line"
+    );
+    assert!(
+        body.contains("view.clientHeight / 2"),
+        "UI centers requested source lines in the code overlay"
+    );
+    assert!(
         body.contains("live_turn_snapshot"),
         "UI replays active-turn snapshots on reconnect"
     );

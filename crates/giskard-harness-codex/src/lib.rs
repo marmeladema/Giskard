@@ -457,7 +457,7 @@ async fn stream_turn_events(
                 if let Some(message) = terminal_error {
                     // Mint a turn id when the error arrived before any `turn/started` (e.g. an
                     // immediate quota rejection) so the failed attempt is still persisted.
-                    let turn = active_turn.unwrap_or_else(TurnId::new);
+                    let turn = active_turn.unwrap_or_default();
                     let _ = broadcast_event(senders, thread_id, || AgentEvent::TurnCompleted {
                         thread: thread_id,
                         turn,

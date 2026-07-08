@@ -8,7 +8,33 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.7
+**Version:** 1.11
+
+**Changelog (1.10 → 1.11), source target positioning:**
+- **L7:** Opening a source link with a target line centers that line in the code overlay viewport
+  when possible, instead of pinning it near the top, so surrounding context remains visible.
+
+**Changelog (1.9 → 1.10), colon source line targets:**
+- **L6:** Path linkification accepts `path:<line>` and compiler-style `path:<line>:<column>` in
+  addition to `path#<line>`. The column is kept in the clickable span but the overlay targets the
+  line.
+
+**Changelog (1.8 → 1.9), source overlay line targets:**
+- **L4:** Code overlay previews render a left-side line-number gutter for text files.
+- **L5:** Path linkification recognizes line-target references such as `path#<line>`. The server
+  validates `path` exactly like a normal link, returns the normalized path plus an optional target
+  line, and the UI opens the overlay scrolled to that line.
+
+**Changelog (1.7 → 1.8), code overlay implementation slice:**
+- **L1:** Wired the existing Phase 4 highlight/linkify/raw-file backend into the served browser UI:
+  completed agent/reasoning text and command output are linkified through the server endpoint, and
+  clicked paths open a code overlay with server-side `syntect` HTML plus a download action (§11.2).
+- **L2:** Hardened path detection for absolute workspace paths, `./`-prefixed relative paths, and
+  sentence/markdown punctuation. The linkifier still validates every candidate by canonicalizing it
+  under the workspace root before surfacing a link (§11.2).
+- **L3:** Full large-file virtualization remains Phase 4 follow-up work: oversized or binary files
+  currently render metadata and a download-only fallback, while the endpoint already accepts line
+  ranges for future paginated viewing (§11.3).
 
 **Changelog (1.0 → 1.1), from review:**
 - Resolved thread token schema vs §10.2: thread `tokens` now carries `total` + `by_model` (§5.3).
@@ -1437,14 +1463,26 @@ alongside raw token counts. Off by default; raw token counts are the primary met
   that file.
 - **Server-side syntax highlighting** with `syntect`: the backend reads the file from the
   project filesystem, highlights based on extension/first line, and returns highlighted HTML
-  (plus raw text for download). The WASM client renders the HTML; no JS highlighter, no npm.
+  (plus raw text for download). The frontend renders the trusted server HTML; no JS
+  highlighter, no npm.
 - The overlay provides a **"Download file"** action (streams the raw file) and shows the
-  file's path, size, and language.
+  file's path, size, language, and line numbers for text previews.
 - **Path detection:** a server-side (or shared) linkifier scans agent text for path-like
   tokens and resolves them against the workspace root. Only paths that (a) resolve inside the
   allowed scope and (b) exist are linkified. Ambiguous/relative paths are resolved relative to
   the workspace root. This detection runs when an `ItemCompleted` agent message is finalized
   (not on every delta) for efficiency.
+- **Line targets (L5/L6):** a path may include a `#<line>` or `:<line>` suffix, for example
+  `src/main.rs#42` or `src/main.rs:42`. Compiler-style `:<line>:<column>` is also accepted, with
+  the column ignored for navigation. The suffix is included in the clickable span but removed before
+  filesystem validation; the response carries `path = "src/main.rs"` and `line = 42`, and the
+  overlay scrolls to that line after loading. When possible, the target line is centered in the
+  overlay viewport so before/after context is visible.
+- **Initial UI slice (L1):** the served self-contained UI calls `POST /api/projects/{id}/linkify`
+  for completed text items, renders path spans as inline controls, opens
+  `GET /api/projects/{id}/highlight?path=…` in the code overlay, and downloads through
+  `GET /api/projects/{id}/raw?path=…`. This is intentionally whole-file oriented until the
+  virtualized line-range viewer in §11.3 is implemented.
 
 ### 11.3 Large files & performance
 
@@ -1751,7 +1789,8 @@ approval policy + live approval prompts + decision routing. Approval diff previe
 diff string (S6); structured `FileDiff` parsing is deferred to Phase 4. Tests for each via replay.
 
 **Phase 4 — Visualization.** Side-by-side diff viewer from `DiffUpdated`; path linkification;
-code overlay with `syntect` highlighting + download; large-file virtualization/pagination.
+code overlay with `syntect` highlighting + download (initial whole-file UI slice complete in L1);
+large-file virtualization/pagination.
 
 **Phase 5 — Tokens & polish.** Thread/project/global ledgers; day/week/month/total dashboard;
 context-window gauge; dynamic `/v1/models` refresh; responsive/mobile passes; optional cost

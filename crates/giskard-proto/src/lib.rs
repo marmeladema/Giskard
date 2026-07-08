@@ -305,6 +305,10 @@ pub struct LinkSpanResponse {
     pub start: usize,
     pub end: usize,
     pub path: String,
+    /// Optional 1-based source line parsed from `path#<line>`, `path:<line>`,
+    /// or `path:<line>:<column>` suffixes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
 }
 
 /// Result of path linkification (spec §11.2).
