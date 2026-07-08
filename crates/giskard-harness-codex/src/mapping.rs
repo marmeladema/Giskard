@@ -888,6 +888,13 @@ pub fn map_mode_to_sandbox(mode: Mode) -> codex_codes::SandboxPolicy {
     }
 }
 
+pub fn map_mode_to_collaboration_mode(mode: Mode) -> codex_codes::ModeKind {
+    match mode {
+        Mode::Plan => codex_codes::ModeKind::Plan,
+        Mode::Build => codex_codes::ModeKind::Default,
+    }
+}
+
 pub fn map_approval_policy(policy: ApprovalPolicy) -> codex_codes::AskForApproval {
     match policy {
         ApprovalPolicy::ReadOnly => codex_codes::AskForApproval::Never,
@@ -2256,6 +2263,18 @@ mod tests {
             }
             other => panic!("expected read-only sandbox, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn mode_maps_to_matching_codex_collaboration_mode() {
+        assert_eq!(
+            map_mode_to_collaboration_mode(Mode::Plan),
+            codex_codes::ModeKind::Plan
+        );
+        assert_eq!(
+            map_mode_to_collaboration_mode(Mode::Build),
+            codex_codes::ModeKind::Default
+        );
     }
 
     #[test]

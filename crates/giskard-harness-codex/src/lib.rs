@@ -84,9 +84,7 @@ pub struct CodexHarness {
 
 impl CodexHarness {
     pub async fn start(workspace_root: PathBuf) -> Result<Arc<Self>, HarnessError> {
-        let client = codex_codes::AsyncClient::start()
-            .await
-            .map_err(|e| HarnessError::Spawn(e.to_string()))?;
+        let client = start_codex_client(codex_codes::AppServerBuilder::new()).await?;
         Self::spawn_harness(client, workspace_root)
     }
 
@@ -95,9 +93,7 @@ impl CodexHarness {
         codex_path: PathBuf,
     ) -> Result<Arc<Self>, HarnessError> {
         let builder = codex_codes::cli::AppServerBuilder::new().command(codex_path);
-        let client = codex_codes::AsyncClient::start_with(builder)
-            .await
-            .map_err(|e| HarnessError::Spawn(e.to_string()))?;
+        let client = start_codex_client(builder).await?;
         Self::spawn_harness(client, workspace_root)
     }
 
@@ -134,6 +130,35 @@ impl CodexHarness {
             workspace_root,
         ));
         Ok(harness)
+    }
+}
+
+async fn start_codex_client(
+    builder: codex_codes::AppServerBuilder,
+) -> Result<codex_codes::AsyncClient, HarnessError> {
+    let mut client = codex_codes::AsyncClient::spawn(builder)
+        .await
+        .map_err(|e| HarnessError::Spawn(e.to_string()))?;
+    client
+        .initialize(&build_initialize_params())
+        .await
+        .map_err(|e| HarnessError::Spawn(e.to_string()))?;
+    Ok(client)
+}
+
+fn build_initialize_params() -> codex_codes::InitializeParams {
+    codex_codes::InitializeParams {
+        client_info: codex_codes::ClientInfo {
+            name: "giskard".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            title: Some("Giskard".into()),
+        },
+        capabilities: Some(codex_codes::InitializeCapabilities {
+            experimental_api: Some(true),
+            mcp_server_openai_form_elicitation: None,
+            opt_out_notification_methods: None,
+            request_attestation: None,
+        }),
     }
 }
 
@@ -586,6 +611,20 @@ async fn handle_start_turn(
     input: &UserInput,
     overrides: &TurnOverrides,
 ) -> Result<TurnId, HarnessError> {
+    let params = build_turn_start_params(thread, input, overrides)?;
+    let _resp: codex_codes::TurnStartResponse = client
+        .request(codex_codes::protocol::methods::TURN_START, &params)
+        .await
+        .map_err(|e| HarnessError::Transport(e.to_string()))?;
+
+    Ok(TurnId::new())
+}
+
+fn build_turn_start_params(
+    thread: &ThreadHandle,
+    input: &UserInput,
+    overrides: &TurnOverrides,
+) -> Result<serde_json::Value, HarnessError> {
     let codex_input = mapping::map_user_input(input);
     let sandbox_policy = mapping::map_mode_to_sandbox(overrides.mode);
     let approval_policy = mapping::map_approval_policy(overrides.approval_policy);
@@ -595,22 +634,37 @@ async fn handle_start_turn(
         .and_then(|m| m.reasoning_effort)
         .map(mapping::map_effort);
 
-    let params: codex_codes::TurnStartParams = serde_json::from_value(serde_json::json!({
+    let mut params = serde_json::json!({
         "threadId": thread.harness_thread_id,
         "input": codex_input,
-        "model": overrides.model.as_ref().map(|m| &m.model),
-        "effort": effort,
         "sandboxPolicy": sandbox_policy,
         "approvalPolicy": approval_policy,
-    }))
-    .map_err(|e| HarnessError::Protocol(e.to_string()))?;
+    });
+    let Some(map) = params.as_object_mut() else {
+        return Err(HarnessError::Protocol(
+            "turn/start params must serialize as an object".into(),
+        ));
+    };
 
-    let _resp = client
-        .turn_start(&params)
-        .await
-        .map_err(|e| HarnessError::Transport(e.to_string()))?;
+    if let Some(model) = overrides.model.as_ref() {
+        map.insert("model".into(), serde_json::json!(model.model));
+        if let Some(effort) = effort.as_ref() {
+            map.insert("effort".into(), serde_json::json!(effort));
+        }
+        map.insert(
+            "collaborationMode".into(),
+            serde_json::json!({
+                "mode": mapping::map_mode_to_collaboration_mode(overrides.mode),
+                "settings": {
+                    "model": model.model,
+                    "reasoning_effort": effort,
+                    "developer_instructions": null,
+                }
+            }),
+        );
+    }
 
-    Ok(TurnId::new())
+    Ok(params)
 }
 
 async fn stream_turn_events(
@@ -973,4 +1027,79 @@ async fn handle_interrupt_turn(
         .await
         .map_err(|e| HarnessError::Transport(e.to_string()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use giskard_core::model::{Effort, ModelRef};
+    use giskard_core::turn::{ApprovalPolicy, Mode};
+
+    fn test_thread() -> ThreadHandle {
+        ThreadHandle {
+            thread: ThreadId::new(),
+            harness_thread_id: "native-thread".into(),
+            warning: None,
+        }
+    }
+
+    fn test_model(effort: Option<Effort>) -> ModelRef {
+        ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: effort,
+        }
+    }
+
+    fn turn_overrides(mode: Mode, effort: Option<Effort>) -> TurnOverrides {
+        TurnOverrides {
+            model: Some(test_model(effort)),
+            mode,
+            approval_policy: ApprovalPolicy::Ask,
+        }
+    }
+
+    #[test]
+    fn initialize_params_enable_experimental_app_server_api() {
+        let params = serde_json::to_value(build_initialize_params()).unwrap();
+
+        assert_eq!(params["clientInfo"]["name"], "giskard");
+        assert_eq!(params["capabilities"]["experimentalApi"], true);
+    }
+
+    #[test]
+    fn plan_turn_start_params_include_plan_collaboration_mode() {
+        let params = build_turn_start_params(
+            &test_thread(),
+            &UserInput::text("make a plan"),
+            &turn_overrides(Mode::Plan, Some(Effort::Medium)),
+        )
+        .unwrap();
+
+        assert_eq!(params["threadId"], "native-thread");
+        assert_eq!(params["model"], "gpt-5.5");
+        assert_eq!(params["effort"], "medium");
+        assert_eq!(params["collaborationMode"]["mode"], "plan");
+        assert_eq!(params["collaborationMode"]["settings"]["model"], "gpt-5.5");
+        assert_eq!(
+            params["collaborationMode"]["settings"]["reasoning_effort"],
+            "medium"
+        );
+        assert!(params["collaborationMode"]["settings"]["developer_instructions"].is_null());
+    }
+
+    #[test]
+    fn build_turn_start_params_reset_collaboration_mode_to_default() {
+        let params = build_turn_start_params(
+            &test_thread(),
+            &UserInput::text("implement it"),
+            &turn_overrides(Mode::Build, None),
+        )
+        .unwrap();
+
+        assert_eq!(params["collaborationMode"]["mode"], "default");
+        assert_eq!(params["collaborationMode"]["settings"]["model"], "gpt-5.5");
+        assert!(params.get("effort").is_none());
+        assert!(params["collaborationMode"]["settings"]["reasoning_effort"].is_null());
+    }
 }
