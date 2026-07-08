@@ -186,6 +186,12 @@ policy, failure-path test expectations) and the spec for the full design.
 every pull request: `rustfmt` (`--check`), `clippy` (`--workspace --all-targets -- -D warnings`),
 and the full `--workspace` test suite (build + test).
 
+A separate [security-audit workflow](.github/workflows/audit.yml) runs
+[`cargo-deny`](https://embarkstudios.github.io/cargo-deny/) (advisories, bans, licenses, sources,
+configured in [`deny.toml`](deny.toml)) on dependency-manifest changes, on pull requests, and on a
+weekly schedule so newly disclosed advisories are caught even without a code change. Run it locally
+with `cargo deny check`.
+
 ---
 
 ## License
