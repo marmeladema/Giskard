@@ -55,6 +55,20 @@ async fn index_page_is_served_and_public() {
         "UI tracks active turns for interrupt controls"
     );
     assert!(
+        body.contains("awaitingInitialThreadState"),
+        "UI distinguishes initial thread snapshots from metadata refreshes"
+    );
+    assert!(
+        body.contains("if (initialThreadState)"),
+        "UI only clears the transcript for the initial thread snapshot"
+    );
+    assert!(
+        !body.contains(
+            "// History now arrives separately via `history_page` (H6); clear the transcript ready for it.\n  $(\"transcript\").innerHTML=\"\";\n  resetRenderState();"
+        ),
+        "thread_state metadata broadcasts must not unconditionally clear the transcript"
+    );
+    assert!(
         body.contains("ctxCommands"),
         "right panel exposes a running command summary"
     );
