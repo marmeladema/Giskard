@@ -26,6 +26,10 @@ pub use giskard_core::ids::{ApprovalId, ItemId};
 pub use giskard_core::item::{
     CommandExecutionStart, FileChangeEntry, FileChangeKind, ItemDelta, ItemKind, ItemStart,
 };
+pub use giskard_core::mcp::{
+    McpAuthStatus, McpOauthStart, McpResource, McpResourceTemplate, McpServerInfo, McpServerStatus,
+    McpTool,
+};
 pub use giskard_core::model::{Effort, ModelDescriptor, ModelRef};
 pub use giskard_core::server_request::{ServerRequest, ServerRequestResponse};
 pub use giskard_core::token::{ByModel, DailyTokenLedger, TokenLedger, TokenUsage};
@@ -306,6 +310,29 @@ pub struct ListModelsResponse {
     /// Non-fatal per-provider discovery failures from a refresh (empty for the static listing).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<ProviderListingWarning>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct McpCapabilitiesResponse {
+    pub status: bool,
+    pub reload: bool,
+    pub oauth_login: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ListMcpServersResponse {
+    pub servers: Vec<McpServerStatus>,
+    pub capabilities: McpCapabilitiesResponse,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StartMcpOauthLoginRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReloadMcpServersResponse {
+    pub ok: bool,
 }
 
 /// Token dashboard report for a project or the global scope (spec §10.2). All figures reuse the

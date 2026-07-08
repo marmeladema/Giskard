@@ -14,6 +14,7 @@ use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ServerRequestId, ThreadId, TurnId};
+use giskard_core::mcp::McpServerStatus;
 use giskard_core::model::ModelDescriptor;
 use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::turn::TurnOverrides;
@@ -100,6 +101,9 @@ impl ReplayHarness {
                 resumable_threads: true,
                 model_listing: false,
                 token_usage: true,
+                mcp_status: true,
+                mcp_reload: true,
+                mcp_oauth_login: false,
             },
             threads: Mutex::new(Vec::new()),
             fixtures: Mutex::new(fixtures),
@@ -148,6 +152,14 @@ impl AgentHarness for ReplayHarness {
 
     async fn list_models(&self) -> Result<Vec<ModelDescriptor>, HarnessError> {
         Ok(vec![])
+    }
+
+    async fn list_mcp_servers(&self) -> Result<Vec<McpServerStatus>, HarnessError> {
+        Ok(vec![])
+    }
+
+    async fn reload_mcp_servers(&self) -> Result<(), HarnessError> {
+        Ok(())
     }
 
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {

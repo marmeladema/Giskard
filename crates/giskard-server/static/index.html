@@ -61,6 +61,37 @@
   .thread-control-label { color:var(--muted); font-size:12px; }
   .thread-control select { height:30px; padding:3px 8px; }
   header.thr .gauge { margin-left:auto; font-size:12px; }
+  .mcp-wrap { position:relative; }
+  .mcp-btn { display:flex; align-items:center; gap:6px; }
+  .mcp-dot { width:8px; height:8px; border-radius:50%; background:var(--muted); display:inline-block; }
+  .mcp-dot.ok { background:#3fb950; }
+  .mcp-dot.warn { background:#d29922; }
+  .mcp-dot.err { background:#f85149; }
+  .mcp-popover {
+    position:absolute; right:0; top:34px; z-index:35; width:min(520px, calc(100vw - 24px));
+    max-height:70vh; overflow:auto; padding:10px; border:1px solid var(--border);
+    border-radius:8px; background:var(--panel); box-shadow:0 20px 48px rgba(0,0,0,.45);
+  }
+  .mcp-popover[hidden] { display:none; }
+  .mcp-head { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+  .mcp-head strong { flex:1; }
+  .mcp-head button { font-size:12px; padding:4px 8px; }
+  .mcp-summary { color:var(--muted); font-size:12px; margin-bottom:8px; }
+  .mcp-list { display:grid; gap:8px; }
+  .mcp-card { border:1px solid var(--border); border-radius:8px; background:var(--panel2); overflow:hidden; }
+  .mcp-card-top { display:flex; align-items:center; gap:8px; width:100%; padding:8px; border:0; background:transparent; text-align:left; }
+  .mcp-card-top:hover { background:rgba(255,255,255,.03); }
+  .mcp-name { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .mcp-chip { display:inline-flex; align-items:center; gap:4px; padding:1px 6px; border:1px solid var(--border); border-radius:999px; color:var(--muted); font-size:11px; white-space:nowrap; }
+  .mcp-chip.ok { color:#7ee787; border-color:#238636; }
+  .mcp-chip.warn { color:#f0d98c; border-color:#9e6a03; }
+  .mcp-chip.err { color:#ff9d96; border-color:#da3633; }
+  .mcp-card-detail { padding:0 8px 8px; color:var(--muted); font-size:12px; }
+  .mcp-card-detail .out { margin-top:6px; max-height:180px; overflow:auto; }
+  .mcp-section { margin-top:8px; padding-top:8px; border-top:1px solid var(--border); }
+  .mcp-section-title { margin-bottom:4px; color:var(--fg); font-size:11px; font-weight:600; text-transform:uppercase; }
+  .mcp-actions { display:flex; gap:6px; flex-wrap:wrap; margin-top:8px; }
+  .mcp-actions button { font-size:12px; padding:4px 8px; }
 
   #transcript { flex:1; min-width:0; overflow-y:auto; overflow-x:hidden; padding:16px; }
   .msg {
@@ -381,6 +412,12 @@
         </label>
         <select id="modelSel" class="mono"></select>
         <button id="refreshModels" class="badge" title="Refresh model list from provider /v1/models">↻</button>
+        <div class="mcp-wrap">
+          <button id="mcpBtn" class="badge mcp-btn" title="MCP servers" aria-label="MCP servers">
+            <span class="mcp-dot" id="mcpDot"></span><span>MCP</span><span id="mcpCount">0</span>
+          </button>
+          <div id="mcpMenu" class="mcp-popover" hidden></div>
+        </div>
         <span class="gauge muted mono" id="gauge">0 / 0</span>
       </header>
       <div id="transcript" class="muted" style="padding:24px">Select or create a thread to begin.</div>
@@ -471,7 +508,8 @@ let state = {
   runningCommands:new Map(), commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null,
   commandPayloadsByItemId:new Map(), endedCommandsByItemId:new Map(), expandedCommandOutputs:new Set(), manuallyToggledCommandOutputs:new Set(),
   linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, activeTurn:false, interruptPending:false,
-  awaitingInitialThreadState:false, contextWindow:0, contextUsed:null, approvalPolicy:"ask"
+  awaitingInitialThreadState:false, contextWindow:0, contextUsed:null, approvalPolicy:"ask",
+  mcpServers:[], mcpCapabilities:{ status:false, reload:false, oauth_login:false }, mcpLoading:false, mcpError:null, expandedMcps:new Set()
 };
 const COMMAND_AUTO_COLLAPSE_LINES = 120;
 const COMMAND_AUTO_COLLAPSE_BYTES = 16 * 1024;
@@ -883,6 +921,10 @@ async function openThread(pid, tid, title, opts) {
   try { localStorage.setItem("giskard.lastThread", JSON.stringify({ pid, tid })); } catch {}
 
   state.projectId = pid; state.threadId = tid; state.pendingUserEl = null; state.pendingUserText = null;
+  state.mcpServers = []; state.mcpError = null; state.expandedMcps = new Set();
+  state.mcpCapabilities = { status:false, reload:false, oauth_login:false };
+  renderMcpButton();
+  loadMcpServers({ announce:false });
   setTurnActive(false);
   state.historyLoaded = false; state.oldestTurnId = null; state.hasMoreHistory = false;
   state.loadingHistory = false; state.pendingOlder = false;
@@ -2631,6 +2673,191 @@ function jsonPreview(v) {
   catch { return String(v); }
 }
 
+/* ---------- MCP servers ---------- */
+function mcpCounts() {
+  const servers = state.mcpServers || [];
+  const tools = servers.reduce((n, s) => n + ((s.tools || []).length), 0);
+  const resources = servers.reduce((n, s) => n + ((s.resources || []).length) + ((s.resource_templates || []).length), 0);
+  const needsAuth = servers.filter(s => s.auth_status === "not_logged_in").length;
+  return { servers:servers.length, tools, resources, needsAuth };
+}
+function mcpOverallState() {
+  if (state.mcpError) return "err";
+  if (state.mcpLoading) return "";
+  const counts = mcpCounts();
+  if (!counts.servers) return "";
+  if (counts.needsAuth) return "warn";
+  return "ok";
+}
+function renderMcpButton() {
+  const dot = $("mcpDot");
+  dot.className = "mcp-dot";
+  const visual = mcpOverallState();
+  if (visual) dot.classList.add(visual);
+  $("mcpCount").textContent = String((state.mcpServers || []).length);
+  const caps = state.mcpCapabilities || {};
+  $("mcpBtn").disabled = !state.projectId || (!caps.status && !state.mcpLoading && !state.mcpError && !(state.mcpServers || []).length);
+  if (!$("mcpMenu").hidden) renderMcpMenu();
+}
+async function loadMcpServers(opts) {
+  opts = opts || {};
+  if (!state.projectId || state.mcpLoading) return;
+  const projectId = state.projectId;
+  state.mcpLoading = true;
+  state.mcpError = null;
+  renderMcpButton();
+  try {
+    const res = await api("GET", `/api/projects/${projectId}/mcp`);
+    if (state.projectId !== projectId) return;
+    state.mcpServers = Array.isArray(res.servers) ? res.servers : [];
+    state.mcpCapabilities = res.capabilities || { status:true, reload:false, oauth_login:false };
+  } catch (e) {
+    if (state.projectId !== projectId) return;
+    state.mcpError = e.message || "Could not load MCP servers.";
+    if (opts.announce !== false) notice("Could not load MCP servers: "+state.mcpError, "warning");
+  } finally {
+    if (state.projectId === projectId) {
+      state.mcpLoading = false;
+      renderMcpButton();
+    }
+  }
+}
+async function reloadMcpServers() {
+  if (!state.projectId || state.mcpLoading) return;
+  const caps = state.mcpCapabilities || {};
+  if (!caps.reload) { await loadMcpServers(); return; }
+  try {
+    await api("POST", `/api/projects/${state.projectId}/mcp/reload`, {});
+    await loadMcpServers();
+    notice("MCP servers reloaded.", "info");
+  } catch (e) {
+    notice("Could not reload MCP servers: "+e.message, "error");
+  }
+}
+async function startMcpOauthLogin(name) {
+  if (!state.projectId || !name) return;
+  try {
+    const res = await api("POST", `/api/projects/${state.projectId}/mcp/oauth-login`, { name });
+    if (!res.authorization_url) {
+      notice(`No OAuth URL returned for ${name}.`, "error");
+      return;
+    }
+    window.open(res.authorization_url, "_blank", "noopener");
+  } catch (e) {
+    notice(`Could not start MCP login for ${name}: ${e.message}`, "error");
+  }
+}
+function toggleMcpMenu() {
+  const menu = $("mcpMenu");
+  menu.hidden = !menu.hidden;
+  if (!menu.hidden) {
+    renderMcpMenu();
+    loadMcpServers({ announce:false });
+  }
+}
+function renderMcpMenu() {
+  const menu = $("mcpMenu");
+  const counts = mcpCounts();
+  const caps = state.mcpCapabilities || {};
+  const rows = (state.mcpServers || []).map(renderMcpServerCard).join("");
+  const reloadLabel = caps.reload ? "Reload" : "Refresh";
+  const body = state.mcpError
+    ? `<div class="meta">Error: ${escapeHtml(state.mcpError)}</div>`
+    : caps.status === false
+      ? `<div class="muted">MCP status is not supported by this harness.</div>`
+    : state.mcpLoading && !state.mcpServers.length
+      ? `<div class="muted">Loading MCP servers...</div>`
+      : rows || `<div class="muted">No MCP servers reported by Codex.</div>`;
+  menu.innerHTML = `
+    <div class="mcp-head">
+      <strong>MCP Servers</strong>
+      <button id="mcpRefresh" type="button">${reloadLabel}</button>
+      <button id="mcpClose" type="button">Close</button>
+    </div>
+    <div class="mcp-summary">${counts.servers} servers · ${counts.tools} tools · ${counts.resources} resources${counts.needsAuth ? ` · ${counts.needsAuth} need auth` : ""}</div>
+    <div class="mcp-list">${body}</div>`;
+  $("mcpRefresh").onclick = reloadMcpServers;
+  $("mcpClose").onclick = () => { $("mcpMenu").hidden = true; };
+  menu.querySelectorAll("[data-mcp-toggle]").forEach(btn => {
+    btn.onclick = () => {
+      const name = btn.dataset.mcpToggle;
+      if (state.expandedMcps.has(name)) state.expandedMcps.delete(name);
+      else state.expandedMcps.add(name);
+      renderMcpMenu();
+    };
+  });
+  menu.querySelectorAll("[data-mcp-login]").forEach(btn => {
+    btn.onclick = () => startMcpOauthLogin(btn.dataset.mcpLogin);
+  });
+}
+function renderMcpServerCard(server) {
+  const name = server.name || "(unnamed)";
+  const expanded = state.expandedMcps.has(name);
+  const tools = server.tools || [];
+  const resources = server.resources || [];
+  const templates = server.resource_templates || [];
+  const auth = mcpAuthLabel(server.auth_status);
+  const chipClass = mcpAuthTone(server.auth_status);
+  const login = server.auth_status === "not_logged_in" && (state.mcpCapabilities || {}).oauth_login
+    ? `<button type="button" data-mcp-login="${escapeAttr(name)}">Authenticate</button>` : "";
+  const detail = expanded ? `
+    <div class="mcp-card-detail">
+      ${server.server_info && server.server_info.description ? `<div>${escapeHtml(server.server_info.description)}</div>` : ""}
+      <div class="meta">${tools.length} tools · ${resources.length + templates.length} resources</div>
+      ${mcpListSection("Tools", tools.map(mcpToolName))}
+      ${mcpListSection("Resources", resources.map(mcpResourceName))}
+      ${mcpListSection("Resource templates", templates.map(mcpTemplateName))}
+      <div class="mcp-actions">${login}</div>
+    </div>` : "";
+  return `<div class="mcp-card">
+    <button class="mcp-card-top" type="button" data-mcp-toggle="${escapeAttr(name)}">
+      <span class="mcp-dot ${chipClass}"></span>
+      <span class="mcp-name mono">${escapeHtml(name)}</span>
+      <span class="mcp-chip ${chipClass}">${auth}</span>
+      <span class="mcp-chip">${tools.length} tools</span>
+      <span class="mcp-chip">${resources.length + templates.length} resources</span>
+      <span>${expanded ? "⌃" : "⌄"}</span>
+    </button>
+    ${detail}
+  </div>`;
+}
+function mcpListSection(title, entries) {
+  const filtered = (entries || []).filter(Boolean);
+  if (!filtered.length) return "";
+  return `<div class="mcp-section">
+    <div class="mcp-section-title">${escapeHtml(title)}</div>
+    <pre class="out">${escapeHtml(filtered.join("\n"))}</pre>
+  </div>`;
+}
+function mcpToolName(tool) {
+  return tool.title || tool.name;
+}
+function mcpResourceName(resource) {
+  return resource.title || resource.name || resource.uri;
+}
+function mcpTemplateName(template) {
+  return template.title || template.name || template.uri_template;
+}
+function mcpAuthTone(status) {
+  if (status === "not_logged_in") return "warn";
+  return "ok";
+}
+function mcpAuthLabel(status) {
+  if (status === "not_logged_in") return "Needs auth";
+  if (status === "bearer_token") return "Bearer token";
+  if (status === "oauth") return "OAuth";
+  if (status === "unsupported") return "No auth";
+  return status || "Unknown";
+}
+$("mcpBtn").onclick = (e) => { e.stopPropagation(); toggleMcpMenu(); };
+$("mcpMenu").onclick = (e) => e.stopPropagation();
+document.addEventListener("click", (e) => {
+  const menu = $("mcpMenu");
+  if (menu.hidden) return;
+  if (e.target.closest && e.target.closest(".mcp-wrap")) return;
+  menu.hidden = true;
+});
+
 /* ---------- source overlay ---------- */
 function projectFileUrl(kind, path) {
   return `/api/projects/${state.projectId}/${kind}?path=${encodeURIComponent(path)}`;
@@ -2861,6 +3088,7 @@ function notice(text, severity) {
   $("notices").prepend(el); setTimeout(()=>el.remove(), 8000);
 }
 function escapeHtml(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function escapeAttr(s){ return escapeHtml(s).replace(/"/g,"&quot;").replace(/'/g,"&#39;"); }
 
 /* Infinite scroll: load older history when the transcript is scrolled near the top. */
 $("transcript").addEventListener("scroll", onTranscriptScroll);

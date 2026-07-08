@@ -570,6 +570,38 @@ async fn index_page_is_served_and_public() {
         body.contains("addItem(it)"),
         "UI replays persisted history with full item metadata"
     );
+    assert!(
+        body.contains("id=\"mcpBtn\""),
+        "thread header exposes an MCP status/menu button"
+    );
+    assert!(
+        body.contains("/mcp/reload"),
+        "UI can request an MCP config reload"
+    );
+    assert!(
+        body.contains("/mcp/oauth-login"),
+        "UI can start MCP OAuth login when supported"
+    );
+    assert!(
+        body.contains("renderMcpServerCard"),
+        "UI renders per-server MCP details"
+    );
+    assert!(
+        body.contains("mcpAuthTone"),
+        "UI maps MCP auth status to visual state separately from server availability"
+    );
+    assert!(
+        body.contains("No auth"),
+        "Codex unsupported auth status is not shown as a failed MCP server"
+    );
+    assert!(
+        body.contains("Resource templates"),
+        "expanded MCP details label resource template lists"
+    );
+    assert!(
+        body.contains("data-mcp-login"),
+        "MCP servers that need auth render an authenticate action"
+    );
     // Self-contained: no external script/style hosts.
     assert!(!body.contains("http://"), "no external http asset refs");
     assert!(!body.contains("cdn"), "no CDN references");

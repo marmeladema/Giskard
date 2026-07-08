@@ -9,6 +9,7 @@ pub mod error;
 pub mod event;
 pub mod ids;
 pub mod item;
+pub mod mcp;
 pub mod model;
 pub mod server_request;
 pub mod token;
@@ -21,6 +22,10 @@ pub use error::{GiskardError, HarnessError, PersistError};
 pub use event::AgentEvent;
 pub use ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
 pub use item::{FileChangeKind, Item, ItemDelta, ItemKind, ItemPayload, ItemStart};
+pub use mcp::{
+    McpAuthStatus, McpOauthStart, McpResource, McpResourceTemplate, McpServerInfo, McpServerStatus,
+    McpTool,
+};
 pub use model::{Effort, ModelDescriptor, ModelRef, default_descriptor};
 pub use server_request::{ServerRequest, ServerRequestResponse};
 pub use token::{ByModel, DailyTokenLedger, TokenLedger, TokenUsage};

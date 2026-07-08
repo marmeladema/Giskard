@@ -1,13 +1,19 @@
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
+use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ItemId, ProjectId, ThreadId, TurnId};
+use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{Item, ItemDelta, ItemKind, ItemPayload, ItemStart};
 use giskard_core::model::ModelRef;
+use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::token::TokenUsage;
-use giskard_core::turn::{ApprovalPolicy, Mode, TurnStatus, TurnStatusKind};
+use giskard_core::turn::{ApprovalPolicy, Mode, TurnOverrides, TurnStatus, TurnStatusKind};
+use giskard_core::user_input::UserInput;
+use giskard_harness::{
+    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+};
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 use giskard_persist::store::ProjectConfig;
 use giskard_proto::{ClientMessage, ErrorSeverity, ServerMessage, WireAgentEvent};
@@ -24,6 +30,95 @@ impl HarnessFactory for TestFactory {
         _config: &ProjectConfig,
     ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
         Ok(Arc::new(ReplayHarness::from_fixture(self.fixture.clone())))
+    }
+}
+
+struct NoMcpFactory;
+
+#[async_trait::async_trait]
+impl HarnessFactory for NoMcpFactory {
+    async fn create(
+        &self,
+        _config: &ProjectConfig,
+    ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
+        Ok(Arc::new(NoMcpHarness))
+    }
+}
+
+struct NoMcpHarness;
+
+#[async_trait::async_trait]
+impl AgentHarness for NoMcpHarness {
+    fn capabilities(&self) -> HarnessCapabilities {
+        HarnessCapabilities {
+            live_approvals: false,
+            plan_build_modes: false,
+            per_turn_model: false,
+            reasoning_effort: false,
+            structured_diffs: false,
+            resumable_threads: false,
+            model_listing: false,
+            token_usage: false,
+            mcp_status: false,
+            mcp_reload: false,
+            mcp_oauth_login: false,
+        }
+    }
+
+    async fn list_models(&self) -> Result<Vec<giskard_core::ModelDescriptor>, HarnessError> {
+        Ok(Vec::new())
+    }
+
+    async fn open_thread(&self, _opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
+        Err(HarnessError::Unsupported(
+            "thread opening is not supported by this harness".into(),
+        ))
+    }
+
+    async fn start_turn(
+        &self,
+        _thread: &ThreadHandle,
+        _input: UserInput,
+        _overrides: TurnOverrides,
+    ) -> Result<TurnId, HarnessError> {
+        Err(HarnessError::Unsupported(
+            "turns are not supported by this harness".into(),
+        ))
+    }
+
+    fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
+        let (_tx, rx) = tokio::sync::broadcast::channel(1);
+        AgentEventStream::new(rx)
+    }
+
+    async fn respond_approval(
+        &self,
+        _req: ApprovalId,
+        _decision: ApprovalDecision,
+    ) -> Result<(), HarnessError> {
+        Err(HarnessError::Unsupported(
+            "approvals are not supported by this harness".into(),
+        ))
+    }
+
+    async fn respond_server_request(
+        &self,
+        _req: ServerRequestId,
+        _response: ServerRequestResponse,
+    ) -> Result<(), HarnessError> {
+        Err(HarnessError::Unsupported(
+            "server requests are not supported by this harness".into(),
+        ))
+    }
+
+    async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
+        Err(HarnessError::Unsupported(
+            "interrupts are not supported by this harness".into(),
+        ))
+    }
+
+    async fn shutdown(&self) -> Result<(), HarnessError> {
+        Ok(())
     }
 }
 
@@ -350,6 +445,39 @@ session_days = 30
     (tmp, Arc::new(state), port)
 }
 
+async fn start_no_mcp_server_on_available_port() -> (tempfile::TempDir, Arc<AppState>, u16) {
+    let tmp = tempfile::TempDir::new().unwrap();
+
+    let hash = generate_password_hash("testpass");
+    let config_toml = format!(
+        r#"
+[server]
+bind = "127.0.0.1:0"
+secure_cookies = false
+
+[auth]
+password_hash = "{hash}"
+session_days = 30
+"#
+    );
+    tokio::fs::write(tmp.path().join("config.toml"), config_toml)
+        .await
+        .unwrap();
+
+    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
+    let session_key: Vec<u8> = (0..32u8).collect();
+    let state = AppState::new(store, Arc::new(NoMcpFactory), session_key);
+
+    let app = build_app(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    (tmp, Arc::new(state), port)
+}
+
 async fn login_cookie(client: &reqwest::Client, base: &str) -> String {
     let resp = client
         .post(format!("{base}/api/login"))
@@ -374,6 +502,26 @@ async fn create_project_and_thread(
     base: &str,
     cookie: &str,
 ) -> (ProjectId, ThreadId) {
+    let project_id = create_project_only(client, base, cookie).await;
+
+    let thread_resp = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", cookie)
+        .json(&serde_json::json!({"resume": "th_test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(thread_resp.status(), 200);
+    let thread_id: ThreadId = thread_resp.json::<serde_json::Value>().await.unwrap()["thread_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    (project_id, thread_id)
+}
+
+async fn create_project_only(client: &reqwest::Client, base: &str, cookie: &str) -> ProjectId {
     let project_resp = client
         .post(format!("{base}/api/projects"))
         .header("cookie", cookie)
@@ -391,22 +539,116 @@ async fn create_project_and_thread(
         .unwrap()
         .parse()
         .unwrap();
+    project_id
+}
 
-    let thread_resp = client
-        .post(format!("{base}/api/projects/{project_id}/threads"))
-        .header("cookie", cookie)
-        .json(&serde_json::json!({"resume": "th_test"}))
+#[tokio::test]
+async fn mcp_status_routes_surface_empty_replay_status_and_reload() {
+    let (_tmp, _state, port) = start_server_with_extra_config_on_available_port("").await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let (project_id, _) = create_project_and_thread(&client, &base, &cookie).await;
+
+    let status: serde_json::Value = client
+        .get(format!("{base}/api/projects/{project_id}/mcp"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["servers"].as_array().unwrap().len(), 0);
+    assert_eq!(status["capabilities"]["status"], true);
+    assert_eq!(status["capabilities"]["reload"], true);
+    assert_eq!(status["capabilities"]["oauth_login"], false);
+
+    let reload: serde_json::Value = client
+        .post(format!("{base}/api/projects/{project_id}/mcp/reload"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(reload["ok"], true);
+}
+
+#[tokio::test]
+async fn mcp_status_routes_surface_unsupported_capabilities_without_failing() {
+    let (_tmp, _state, port) = start_no_mcp_server_on_available_port().await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let project_id = create_project_only(&client, &base, &cookie).await;
+
+    let status: serde_json::Value = client
+        .get(format!("{base}/api/projects/{project_id}/mcp"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["servers"].as_array().unwrap().len(), 0);
+    assert_eq!(status["capabilities"]["status"], false);
+    assert_eq!(status["capabilities"]["reload"], false);
+    assert_eq!(status["capabilities"]["oauth_login"], false);
+
+    let reload = client
+        .post(format!("{base}/api/projects/{project_id}/mcp/reload"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({}))
         .send()
         .await
         .unwrap();
-    assert_eq!(thread_resp.status(), 200);
-    let thread_id: ThreadId = thread_resp.json::<serde_json::Value>().await.unwrap()["thread_id"]
-        .as_str()
-        .unwrap()
-        .parse()
-        .unwrap();
+    assert_eq!(reload.status(), 400);
+    assert!(
+        reload
+            .text()
+            .await
+            .unwrap()
+            .contains("MCP server reload is not supported")
+    );
+}
 
-    (project_id, thread_id)
+#[tokio::test]
+async fn mcp_oauth_login_rejects_empty_and_unsupported_requests() {
+    let (_tmp, _state, port) = start_server_with_extra_config_on_available_port("").await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let (project_id, _) = create_project_and_thread(&client, &base, &cookie).await;
+
+    let empty = client
+        .post(format!("{base}/api/projects/{project_id}/mcp/oauth-login"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"name": "   "}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(empty.status(), 400);
+    assert!(empty.text().await.unwrap().contains("cannot be empty"));
+
+    let unsupported = client
+        .post(format!("{base}/api/projects/{project_id}/mcp/oauth-login"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"name": "cf-mcp"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unsupported.status(), 400);
+    assert!(
+        unsupported
+            .text()
+            .await
+            .unwrap()
+            .contains("MCP OAuth login is not supported")
+    );
 }
 
 #[tokio::test]

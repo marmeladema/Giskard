@@ -11,11 +11,12 @@ use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{Item, ItemPayload, command_status_is_running, normalized_command_status};
+use giskard_core::mcp::{McpOauthStart, McpServerStatus};
 use giskard_core::model::ModelRef;
 use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::turn::{Mode, Turn, TurnOverrides, TurnStatusKind};
 use giskard_core::user_input::UserInput;
-use giskard_harness::{AgentHarness, OpenThreadOptions, ThreadHandle};
+use giskard_harness::{AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle};
 use giskard_persist::PersistStore;
 use giskard_persist::store::ProjectConfig;
 use giskard_proto::{RunningCommand, ServerMessage, TokenScope};
@@ -352,6 +353,36 @@ impl HarnessRegistry {
                 warning: None,
             });
         harness.set_thread_name(&handle, &name).await
+    }
+
+    pub async fn list_mcp_servers(
+        &self,
+        config: &ProjectConfig,
+    ) -> Result<Vec<McpServerStatus>, HarnessError> {
+        let harness = self.get_or_create_harness(config.id, config).await?;
+        harness.list_mcp_servers().await
+    }
+
+    pub async fn capabilities(
+        &self,
+        config: &ProjectConfig,
+    ) -> Result<HarnessCapabilities, HarnessError> {
+        let harness = self.get_or_create_harness(config.id, config).await?;
+        Ok(harness.capabilities())
+    }
+
+    pub async fn reload_mcp_servers(&self, config: &ProjectConfig) -> Result<(), HarnessError> {
+        let harness = self.get_or_create_harness(config.id, config).await?;
+        harness.reload_mcp_servers().await
+    }
+
+    pub async fn start_mcp_oauth_login(
+        &self,
+        config: &ProjectConfig,
+        name: &str,
+    ) -> Result<McpOauthStart, HarnessError> {
+        let harness = self.get_or_create_harness(config.id, config).await?;
+        harness.start_mcp_oauth_login(name).await
     }
 
     pub async fn delete_thread(

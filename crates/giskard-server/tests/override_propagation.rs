@@ -56,6 +56,9 @@ impl AgentHarness for CapturingHarness {
             resumable_threads: true,
             model_listing: false,
             token_usage: true,
+            mcp_status: false,
+            mcp_reload: false,
+            mcp_oauth_login: false,
         }
     }
 

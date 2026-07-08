@@ -19,6 +19,10 @@ use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ServerRequestId, ThreadId, TurnId};
+use giskard_core::mcp::{
+    McpAuthStatus, McpOauthStart, McpResource, McpResourceTemplate, McpServerInfo, McpServerStatus,
+    McpTool,
+};
 use giskard_core::model::ModelDescriptor;
 use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::token::TokenUsage;
@@ -80,6 +84,16 @@ enum ControlCommand {
         thread: ThreadHandle,
         response: oneshot::Sender<Result<(), HarnessError>>,
     },
+    ListMcpServers {
+        response: oneshot::Sender<Result<Vec<McpServerStatus>, HarnessError>>,
+    },
+    ReloadMcpServers {
+        response: oneshot::Sender<Result<(), HarnessError>>,
+    },
+    StartMcpOauthLogin {
+        name: String,
+        response: oneshot::Sender<Result<McpOauthStart, HarnessError>>,
+    },
     Shutdown {
         response: oneshot::Sender<Result<(), HarnessError>>,
     },
@@ -133,6 +147,9 @@ impl CodexHarness {
                 resumable_threads: true,
                 model_listing: false,
                 token_usage: true,
+                mcp_status: true,
+                mcp_reload: true,
+                mcp_oauth_login: true,
             },
         });
 
@@ -184,6 +201,39 @@ impl AgentHarness for CodexHarness {
 
     async fn list_models(&self) -> Result<Vec<ModelDescriptor>, HarnessError> {
         Ok(vec![])
+    }
+
+    async fn list_mcp_servers(&self) -> Result<Vec<McpServerStatus>, HarnessError> {
+        let (tx, rx) = oneshot::channel();
+        self.control_tx
+            .send(ControlCommand::ListMcpServers { response: tx })
+            .await
+            .map_err(|_| HarnessError::Transport("background task closed".into()))?;
+        rx.await
+            .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
+    }
+
+    async fn reload_mcp_servers(&self) -> Result<(), HarnessError> {
+        let (tx, rx) = oneshot::channel();
+        self.control_tx
+            .send(ControlCommand::ReloadMcpServers { response: tx })
+            .await
+            .map_err(|_| HarnessError::Transport("background task closed".into()))?;
+        rx.await
+            .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
+    }
+
+    async fn start_mcp_oauth_login(&self, name: &str) -> Result<McpOauthStart, HarnessError> {
+        let (tx, rx) = oneshot::channel();
+        self.control_tx
+            .send(ControlCommand::StartMcpOauthLogin {
+                name: name.to_owned(),
+                response: tx,
+            })
+            .await
+            .map_err(|_| HarnessError::Transport("background task closed".into()))?;
+        rx.await
+            .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
 
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
@@ -489,6 +539,18 @@ async fn background_task(
                         }
                         let _ = response.send(result);
                     }
+                    Some(ControlCommand::ListMcpServers { response }) => {
+                        let result = handle_list_mcp_servers(&mut client).await;
+                        let _ = response.send(result);
+                    }
+                    Some(ControlCommand::ReloadMcpServers { response }) => {
+                        let result = handle_reload_mcp_servers(&mut client).await;
+                        let _ = response.send(result);
+                    }
+                    Some(ControlCommand::StartMcpOauthLogin { name, response }) => {
+                        let result = handle_start_mcp_oauth_login(&mut client, &name).await;
+                        let _ = response.send(result);
+                    }
                     Some(ControlCommand::Shutdown { response }) => {
                         let _ = client.shutdown().await;
                         let _ = response.send(Ok(()));
@@ -589,6 +651,18 @@ async fn handle_idle_server_message(
                         let _ = response.send(Err(HarnessError::Unsupported(
                             "thread deletion is not available during an active turn".into(),
                         )));
+                    }
+                    Some(ControlCommand::ListMcpServers { response }) => {
+                        let result = handle_list_mcp_servers(client).await;
+                        let _ = response.send(result);
+                    }
+                    Some(ControlCommand::ReloadMcpServers { response }) => {
+                        let result = handle_reload_mcp_servers(client).await;
+                        let _ = response.send(result);
+                    }
+                    Some(ControlCommand::StartMcpOauthLogin { name, response }) => {
+                        let result = handle_start_mcp_oauth_login(client, &name).await;
+                        let _ = response.send(result);
                     }
                     Some(ControlCommand::Shutdown { response }) => {
                         let _ = response.send(Ok(()));
@@ -934,6 +1008,18 @@ async fn stream_turn_events(
                                 "thread deletion is not available during an active turn".into(),
                             )));
                         }
+                        Some(ControlCommand::ListMcpServers { response }) => {
+                            let result = handle_list_mcp_servers(client).await;
+                            let _ = response.send(result);
+                        }
+                        Some(ControlCommand::ReloadMcpServers { response }) => {
+                            let result = handle_reload_mcp_servers(client).await;
+                            let _ = response.send(result);
+                        }
+                        Some(ControlCommand::StartMcpOauthLogin { name, response }) => {
+                            let result = handle_start_mcp_oauth_login(client, &name).await;
+                            let _ = response.send(result);
+                        }
                         Some(ControlCommand::Shutdown { response }) => {
                             let _ = response.send(Ok(()));
                             return StreamOutcome::Shutdown;
@@ -1012,6 +1098,21 @@ async fn handle_stream_control(
             let _ = response.send(Err(HarnessError::Unsupported(
                 "thread deletion is not available during an active turn".into(),
             )));
+            StreamControlOutcome::Continue
+        }
+        Some(ControlCommand::ListMcpServers { response }) => {
+            let result = handle_list_mcp_servers(client).await;
+            let _ = response.send(result);
+            StreamControlOutcome::Continue
+        }
+        Some(ControlCommand::ReloadMcpServers { response }) => {
+            let result = handle_reload_mcp_servers(client).await;
+            let _ = response.send(result);
+            StreamControlOutcome::Continue
+        }
+        Some(ControlCommand::StartMcpOauthLogin { name, response }) => {
+            let result = handle_start_mcp_oauth_login(client, &name).await;
+            let _ = response.send(result);
             StreamControlOutcome::Continue
         }
         Some(ControlCommand::Shutdown { response }) => {
@@ -1194,6 +1295,137 @@ async fn handle_set_thread_name(
     Ok(())
 }
 
+async fn handle_list_mcp_servers(
+    client: &mut codex_codes::AsyncClient,
+) -> Result<Vec<McpServerStatus>, HarnessError> {
+    let mut out = Vec::new();
+    let mut cursor = None;
+
+    loop {
+        let params = codex_codes::ListMcpServerStatusParams {
+            cursor: cursor.clone(),
+            detail: Some(codex_codes::McpServerStatusDetail::Full),
+            limit: None,
+            thread_id: None,
+        };
+        let page: codex_codes::ListMcpServerStatusResponse = client
+            .request(
+                codex_codes::protocol::methods::MCPSERVERSTATUS_LIST,
+                &params,
+            )
+            .await
+            .map_err(|e| HarnessError::Transport(e.to_string()))?;
+
+        out.extend(page.data.into_iter().map(map_mcp_server_status));
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    Ok(out)
+}
+
+async fn handle_reload_mcp_servers(
+    client: &mut codex_codes::AsyncClient,
+) -> Result<(), HarnessError> {
+    let _: codex_codes::McpServerRefreshResponse = client
+        .request(
+            codex_codes::protocol::methods::CONFIG_MCPSERVER_RELOAD,
+            &serde_json::json!({}),
+        )
+        .await
+        .map_err(|e| HarnessError::Transport(e.to_string()))?;
+    Ok(())
+}
+
+async fn handle_start_mcp_oauth_login(
+    client: &mut codex_codes::AsyncClient,
+    name: &str,
+) -> Result<McpOauthStart, HarnessError> {
+    let params = codex_codes::McpServerOauthLoginParams {
+        name: name.to_owned(),
+        scopes: None,
+        thread_id: None,
+        timeout_secs: None,
+    };
+    let response: codex_codes::McpServerOauthLoginResponse = client
+        .request(
+            codex_codes::protocol::methods::MCPSERVER_OAUTH_LOGIN,
+            &params,
+        )
+        .await
+        .map_err(|e| HarnessError::Transport(e.to_string()))?;
+    Ok(McpOauthStart {
+        authorization_url: response.authorization_url,
+    })
+}
+
+fn map_mcp_server_status(status: codex_codes::McpServerStatus) -> McpServerStatus {
+    McpServerStatus {
+        name: status.name,
+        auth_status: map_mcp_auth_status(status.auth_status),
+        server_info: status.server_info.map(map_mcp_server_info),
+        tools: status.tools.into_values().map(map_mcp_tool).collect(),
+        resources: status.resources.into_iter().map(map_mcp_resource).collect(),
+        resource_templates: status
+            .resource_templates
+            .into_iter()
+            .map(map_mcp_resource_template)
+            .collect(),
+    }
+}
+
+fn map_mcp_auth_status(status: codex_codes::McpAuthStatus) -> McpAuthStatus {
+    match status {
+        codex_codes::McpAuthStatus::Unsupported => McpAuthStatus::Unsupported,
+        codex_codes::McpAuthStatus::NotLoggedIn => McpAuthStatus::NotLoggedIn,
+        codex_codes::McpAuthStatus::BearerToken => McpAuthStatus::BearerToken,
+        codex_codes::McpAuthStatus::OAuth => McpAuthStatus::OAuth,
+    }
+}
+
+fn map_mcp_server_info(info: codex_codes::McpServerInfo) -> McpServerInfo {
+    McpServerInfo {
+        name: info.name,
+        title: info.title,
+        description: info.description,
+        version: (!info.version.is_empty()).then_some(info.version),
+        website_url: info.website_url,
+    }
+}
+
+fn map_mcp_tool(tool: codex_codes::Tool) -> McpTool {
+    McpTool {
+        name: tool.name,
+        title: tool.title,
+        description: tool.description,
+        input_schema: tool.input_schema,
+        output_schema: tool.output_schema,
+    }
+}
+
+fn map_mcp_resource(resource: codex_codes::Resource) -> McpResource {
+    McpResource {
+        name: resource.name,
+        uri: resource.uri,
+        title: resource.title,
+        description: resource.description,
+        mime_type: resource.mime_type,
+        size: resource.size,
+    }
+}
+
+fn map_mcp_resource_template(template: codex_codes::ResourceTemplate) -> McpResourceTemplate {
+    McpResourceTemplate {
+        name: template.name,
+        uri_template: template.uri_template,
+        title: template.title,
+        description: template.description,
+        mime_type: template.mime_type,
+    }
+}
+
 async fn handle_delete_thread(
     client: &mut codex_codes::AsyncClient,
     thread: &ThreadHandle,
@@ -1252,6 +1484,68 @@ mod tests {
             mode,
             approval_policy: ApprovalPolicy::Ask,
         }
+    }
+
+    #[test]
+    fn mcp_server_status_maps_codex_metadata() {
+        let mut tools = std::collections::BTreeMap::new();
+        tools.insert(
+            "jira_search".into(),
+            codex_codes::Tool {
+                _meta: None,
+                annotations: None,
+                description: Some("Search Jira".into()),
+                icons: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                name: "jira_search".into(),
+                output_schema: Some(serde_json::json!({"type": "object"})),
+                title: Some("Jira Search".into()),
+            },
+        );
+
+        let mapped = map_mcp_server_status(codex_codes::McpServerStatus {
+            auth_status: codex_codes::McpAuthStatus::NotLoggedIn,
+            name: "cf-mcp".into(),
+            resource_templates: vec![codex_codes::ResourceTemplate {
+                annotations: None,
+                description: Some("Issue by key".into()),
+                mime_type: Some("application/json".into()),
+                name: "jira issue".into(),
+                title: Some("Jira Issue".into()),
+                uri_template: "jira://issue/{key}".into(),
+            }],
+            resources: vec![codex_codes::Resource {
+                _meta: None,
+                annotations: None,
+                description: Some("Project metadata".into()),
+                icons: None,
+                mime_type: Some("application/json".into()),
+                name: "project".into(),
+                size: Some(42),
+                title: Some("Project".into()),
+                uri: "gitlab://project/group/name".into(),
+            }],
+            server_info: Some(codex_codes::McpServerInfo {
+                description: Some("Cloudflare tools".into()),
+                icons: None,
+                name: "cf-mcp".into(),
+                title: Some("Cloudflare MCP".into()),
+                version: "1.2.3".into(),
+                website_url: Some("https://example.invalid".into()),
+            }),
+            tools,
+        });
+
+        assert_eq!(mapped.name, "cf-mcp");
+        assert_eq!(mapped.auth_status, McpAuthStatus::NotLoggedIn);
+        assert_eq!(mapped.server_info.unwrap().title.unwrap(), "Cloudflare MCP");
+        assert_eq!(mapped.tools[0].name, "jira_search");
+        assert_eq!(mapped.tools[0].description.as_deref(), Some("Search Jira"));
+        assert_eq!(mapped.resources[0].uri, "gitlab://project/group/name");
+        assert_eq!(
+            mapped.resource_templates[0].uri_template,
+            "jira://issue/{key}"
+        );
     }
 
     #[test]
