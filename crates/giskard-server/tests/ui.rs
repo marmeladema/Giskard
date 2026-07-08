@@ -233,6 +233,22 @@ async fn index_page_is_served_and_public() {
         "UI only clears the transcript for the initial thread snapshot"
     );
     assert!(
+        body.contains("beginRenameThread(el, pid, t.id)"),
+        "thread rename starts from the sidebar row title next to the actions menu"
+    );
+    assert!(
+        body.contains("`/api/projects/${pid}/threads/${tid}/title`"),
+        "thread rename is persisted through the server API"
+    );
+    assert!(
+        body.contains("if (state.threadId === tid) setThreadTitle(savedTitle)"),
+        "renaming the open thread updates the header/mobile title after save"
+    );
+    assert!(
+        body.contains("updateThreadRowTitle(s.id || s.thread_id || state.threadId, s.title)"),
+        "thread_state title broadcasts update the sidebar row as well as the header"
+    );
+    assert!(
         !body.contains(
             "// History now arrives separately via `history_page` (H6); clear the transcript ready for it.\n  $(\"transcript\").innerHTML=\"\";\n  resetRenderState();"
         ),

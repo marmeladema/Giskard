@@ -459,6 +459,69 @@ async fn thread_archive_unarchive_updates_thread_summary() {
 }
 
 #[tokio::test]
+async fn thread_rename_updates_thread_summary_and_persistence() {
+    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+
+    let renamed = client
+        .patch(format!(
+            "{base}/api/projects/{project_id}/threads/{thread_id}/title"
+        ))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"title": "  Better   title\nnow  "}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(renamed.status(), 200);
+    let renamed: serde_json::Value = renamed.json().await.unwrap();
+    assert_eq!(renamed["id"].as_str().unwrap(), thread_id.to_string());
+    assert_eq!(renamed["title"].as_str(), Some("Better title now"));
+
+    let saved = state
+        .store
+        .load_thread(project_id, thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.title, "Better title now");
+
+    let listed: serde_json::Value = client
+        .get(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        listed["threads"][0]["title"].as_str(),
+        Some("Better title now")
+    );
+
+    let empty = client
+        .patch(format!(
+            "{base}/api/projects/{project_id}/threads/{thread_id}/title"
+        ))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"title": " \n\t "}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(empty.status(), 400);
+    let saved = state
+        .store
+        .load_thread(project_id, thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.title, "Better title now");
+}
+
+#[tokio::test]
 async fn thread_delete_removes_native_and_persisted_thread() {
     let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
     let base = format!("http://127.0.0.1:{port}");

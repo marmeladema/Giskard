@@ -10,7 +10,7 @@ use axum::{
     },
     middleware,
     response::{IntoResponse, Json},
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
 };
 use chrono::Utc;
 use serde::Deserialize;
@@ -32,6 +32,7 @@ use crate::auth::{
 };
 
 const HARNESS_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_THREAD_TITLE_CHARS: usize = 120;
 
 pub fn protected_routes(state: AppState) -> Router<AppState> {
     Router::new()
@@ -47,6 +48,10 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
         .route(
             "/api/projects/{id}/threads/{thread_id}",
             delete(delete_thread),
+        )
+        .route(
+            "/api/projects/{id}/threads/{thread_id}/title",
+            patch(rename_thread),
         )
         .route(
             "/api/projects/{id}/threads/{thread_id}/archive",
@@ -242,14 +247,7 @@ async fn list_threads(
     let mut threads = Vec::new();
     for tid in thread_ids {
         if let Ok(Some(tf)) = state.store.load_thread(project_id, tid).await {
-            threads.push(ThreadSummary {
-                id: tf.id,
-                title: tf.title,
-                mode: tf.mode,
-                archived: tf.archived,
-                created_at: tf.created_at,
-                updated_at: tf.updated_at,
-            });
+            threads.push(thread_summary(&tf));
         }
     }
     threads.sort_by_key(|t| std::cmp::Reverse(t.updated_at));
@@ -414,6 +412,30 @@ async fn open_thread(
     }))
 }
 
+fn thread_summary(tf: &ThreadFile) -> ThreadSummary {
+    ThreadSummary {
+        id: tf.id,
+        title: tf.title.clone(),
+        mode: tf.mode,
+        archived: tf.archived,
+        created_at: tf.created_at,
+        updated_at: tf.updated_at,
+    }
+}
+
+fn normalize_thread_title(raw: &str) -> Result<String, ApiError> {
+    let title = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.is_empty() {
+        return Err(ApiError::BadRequest("thread title cannot be empty".into()));
+    }
+    if title.chars().count() > MAX_THREAD_TITLE_CHARS {
+        return Err(ApiError::BadRequest(format!(
+            "thread title must be {MAX_THREAD_TITLE_CHARS} characters or fewer"
+        )));
+    }
+    Ok(title)
+}
+
 async fn archive_thread(
     State(state): State<AppState>,
     AxumPath((project_id, thread_id)): AxumPath<(ProjectId, ThreadId)>,
@@ -449,14 +471,50 @@ async fn archive_thread(
         .await?
         .ok_or(ApiError::NotFound)?;
 
-    Ok(Json(ThreadSummary {
-        id: tf.id,
-        title: tf.title,
-        mode: tf.mode,
-        archived: tf.archived,
-        created_at: tf.created_at,
-        updated_at: tf.updated_at,
-    }))
+    Ok(Json(thread_summary(&tf)))
+}
+
+async fn rename_thread(
+    State(state): State<AppState>,
+    AxumPath((project_id, thread_id)): AxumPath<(ProjectId, ThreadId)>,
+    Json(req): Json<RenameThreadRequest>,
+) -> Result<Json<ThreadSummary>, ApiError> {
+    let title = normalize_thread_title(&req.title)?;
+    let project_config = state
+        .store
+        .load_project(project_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let thread_file = state
+        .store
+        .load_thread(project_id, thread_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if thread_file.title == title {
+        return Ok(Json(thread_summary(&thread_file)));
+    }
+
+    state
+        .registry
+        .set_thread_name(
+            &project_config,
+            thread_id,
+            thread_file.harness_thread_id,
+            title.clone(),
+        )
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let tf = state
+        .store
+        .update_thread(project_id, thread_id, |tf| {
+            tf.title = title;
+            tf.updated_at = Utc::now();
+        })
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    broadcast_thread_state(&state, thread_id, &tf).await;
+
+    Ok(Json(thread_summary(&tf)))
 }
 
 async fn delete_thread(

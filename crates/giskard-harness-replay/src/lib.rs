@@ -244,6 +244,14 @@ impl AgentHarness for ReplayHarness {
         Ok(())
     }
 
+    async fn set_thread_name(
+        &self,
+        _thread: &ThreadHandle,
+        _name: &str,
+    ) -> Result<(), HarnessError> {
+        Ok(())
+    }
+
     async fn set_thread_archived(
         &self,
         _thread: &ThreadHandle,

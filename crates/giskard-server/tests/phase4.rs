@@ -427,6 +427,17 @@ async fn thread_lifecycle_native_failure_preserves_local_thread() {
         .await
         .unwrap();
 
+    let rename = client
+        .patch(format!("{base}/api/projects/{pid}/threads/{tid}/title"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"title": "Remote title"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rename.status(), 500);
+    let saved = state.store.load_thread(pid, tid).await.unwrap().unwrap();
+    assert_eq!(saved.title, "Local thread");
+
     let archive = client
         .post(format!("{base}/api/projects/{pid}/threads/{tid}/archive"))
         .header("cookie", &cookie)
