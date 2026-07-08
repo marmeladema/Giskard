@@ -62,6 +62,11 @@
   .item-list { margin:6px 0 0; padding-left:18px; }
   .item-list li { margin:2px 0; }
   .meta { margin-top:6px; color:var(--muted); font-size:12px; }
+  .path-link {
+    display:inline; margin:0; padding:0 2px; border:0; border-radius:3px; background:transparent;
+    color:#79c0ff; font:inherit; font-family:var(--mono); text-decoration:underline; text-underline-offset:2px;
+  }
+  .path-link:hover, .path-link:focus { color:#a5d6ff; background:rgba(121,192,255,.12); outline:none; }
 
   .composer { display:flex; gap:8px; padding:12px; border-top:1px solid var(--border); background:var(--panel); }
   .composer textarea { flex:1; resize:none; height:52px; }
@@ -112,6 +117,23 @@
   .field label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
   .field input, .field select { width:100%; }
   .field .hint { font-size:11px; color:var(--muted); margin-top:4px; }
+  .code-dialog { width:min(1120px,94vw); height:min(860px,90vh); }
+  .code-head { padding:14px 18px; border-bottom:1px solid var(--border); display:flex; gap:10px; align-items:flex-start; }
+  .code-head-main { flex:1; min-width:0; }
+  .code-title { font-family:var(--mono); word-break:break-all; font-size:13px; }
+  .code-meta { margin-top:4px; color:var(--muted); font-size:12px; }
+  .code-view { flex:1; overflow:auto; background:#0b0e13; }
+  .code-table { display:grid; grid-template-columns:auto minmax(0,1fr); min-height:100%; }
+  .code-line-nos {
+    padding:16px 10px 16px 14px; border-right:1px solid var(--border); background:#0d1117;
+    color:var(--muted); font-family:var(--mono); font-size:12.5px; line-height:1.45; text-align:right;
+    user-select:none;
+  }
+  .code-line-no { height:1.45em; min-width:3ch; }
+  .code-line-no.focused { color:#fff; background:rgba(79,140,255,.28); border-radius:4px; }
+  .code-source { min-width:0; }
+  .code-source pre { margin:0; padding:16px; min-height:100%; overflow:visible; font-family:var(--mono); font-size:12.5px; line-height:1.45; white-space:pre; }
+  .code-empty { padding:24px; color:var(--muted); }
 
   /* =================== Appearance themes ===================
      Three selectable looks (persisted client-side). Each sets a palette; IDE and Terminal also
@@ -311,13 +333,30 @@
     </div>
   </div>
 
+  <!-- Source/code overlay opened from linkified transcript paths. Highlighting and downloads are
+       served by the backend so the browser does not need a JS highlighter or filesystem access. -->
+  <div class="overlay" id="codeOverlay">
+    <div class="dialog code-dialog">
+      <div class="code-head">
+        <div class="code-head-main">
+          <div class="code-title" id="codePath">—</div>
+          <div class="code-meta" id="codeMeta">Loading…</div>
+        </div>
+        <button id="codeDownload">Download</button>
+        <button id="codeClose">Close</button>
+      </div>
+      <div class="code-view" id="codeView"><div class="code-empty">Select a linked path.</div></div>
+    </div>
+  </div>
+
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
 let state = {
   projectId:null, threadId:null, mode:"build", ws:null, wsStatus:"closed", wsConnectId:0,
   models:[], streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null, pendingClientMsgs:[],
-  streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), itemKindsByItemId:new Map()
+  streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), itemKindsByItemId:new Map(),
+  linkifyCache:new Map(), codePath:null, codeLine:null
 };
 
 async function api(method, path, body) {
@@ -890,12 +929,20 @@ function renderItemBody(body, p) {
   const msg = body.parentElement;
   msg.className = "msg " + classForPayload(p);
   msg.querySelector(".role").textContent = roleForPayload(p);
+  body.replaceChildren();
   if (p.kind==="command_execution") {
-    body.innerHTML = `<div class="mono">$ ${escapeHtml(p.command)}</div><pre class="out">${escapeHtml(p.output||"")}</pre>`;
+    const cmd = document.createElement("div");
+    cmd.className = "mono";
+    cmd.textContent = "$ " + (p.command || "");
+    const out = document.createElement("pre");
+    out.className = "out";
+    body.append(cmd, out);
+    renderLinkedText(out, p.output || "");
   } else if (p.kind==="agent_message" || p.kind==="reasoning" || p.kind==="user_message") {
-    body.textContent = p.text;
+    if (p.kind==="user_message") body.textContent = p.text || "";
+    else renderLinkedText(body, p.text || "");
   } else if (p.kind==="file_change") {
-    body.innerHTML = renderFileChange(p);
+    renderFileChange(body, p);
   } else if (p.kind==="tool_call") {
     body.innerHTML = renderToolCall(p);
   } else if (p.kind==="activity") {
@@ -936,11 +983,93 @@ function roleForStream(kind, deltaType) {
   if (kind==="activity") return "activity";
   return "agent";
 }
-function renderFileChange(p) {
+function renderLinkedText(el, text) {
+  text = String(text || "");
+  el.textContent = text;
+  if (!text.trim() || !state.projectId) return;
+
+  const projectId = state.projectId;
+  const cacheKey = projectId + "\n" + text;
+  const apply = (links) => {
+    if (!el.isConnected || projectId !== state.projectId) return;
+    applyLinkedText(el, text, links || []);
+  };
+
+  if (state.linkifyCache.has(cacheKey)) {
+    apply(state.linkifyCache.get(cacheKey));
+    return;
+  }
+
+  api("POST", `/api/projects/${projectId}/linkify`, { text })
+    .then((res) => {
+      const links = Array.isArray(res.links) ? res.links : [];
+      state.linkifyCache.set(cacheKey, links);
+      apply(links);
+    })
+    .catch(() => {});
+}
+function applyLinkedText(el, text, links) {
+  const sorted = links.slice().sort((a, b) => (a.start || 0) - (b.start || 0));
+  const frag = document.createDocumentFragment();
+  let pos = 0;
+  let added = false;
+  for (const link of sorted) {
+    const start = byteOffsetToIndex(text, Number(link.start) || 0);
+    const end = byteOffsetToIndex(text, Number(link.end) || 0);
+    if (!link.path || start < pos || end <= start) continue;
+    frag.append(document.createTextNode(text.slice(pos, start)));
+    frag.append(makePathLink(link.path, text.slice(start, end), link.line));
+    pos = end;
+    added = true;
+  }
+  if (!added) return;
+  frag.append(document.createTextNode(text.slice(pos)));
+  el.replaceChildren(frag);
+}
+function byteOffsetToIndex(text, offset) {
+  let bytes = 0;
+  for (let i = 0; i < text.length;) {
+    if (bytes >= offset) return i;
+    const code = text.codePointAt(i);
+    const step = code > 0xffff ? 2 : 1;
+    bytes += code <= 0x7f ? 1 : code <= 0x7ff ? 2 : code <= 0xffff ? 3 : 4;
+    i += step;
+  }
+  return text.length;
+}
+function makePathLink(path, label, line) {
+  const value = String(path || "");
+  if (!value) return document.createTextNode(label || "");
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "path-link";
+  btn.textContent = label || value;
+  const targetLine = normalizeLine(line, null);
+  btn.title = targetLine ? `Open source at line ${targetLine}` : "Open source";
+  btn.onclick = () => openCodeOverlay(value, targetLine);
+  return btn;
+}
+function renderFileChange(body, p) {
   const changes = (p.changes && p.changes.length) ? p.changes : [{ path:p.path, change:p.change }];
-  const items = changes.map(c => `<li><span class="mono">${escapeHtml(c.change||"modified")}</span> ${escapeHtml(c.path||"")}</li>`).join("");
-  const status = p.status ? `<div class="meta">status: ${escapeHtml(p.status)}</div>` : "";
-  return `<div>File change${changes.length===1 ? "" : "s"}</div><ul class="item-list">${items}</ul>${status}`;
+  const title = document.createElement("div");
+  title.textContent = `File change${changes.length===1 ? "" : "s"}`;
+  const list = document.createElement("ul");
+  list.className = "item-list";
+  for (const c of changes) {
+    const li = document.createElement("li");
+    const kind = document.createElement("span");
+    kind.className = "mono";
+    kind.textContent = c.change || "modified";
+    li.append(kind, document.createTextNode(" "), makePathLink(c.path || "", c.path || "", null));
+    list.append(li);
+  }
+  body.append(title, list);
+  if (p.status) {
+    const status = document.createElement("div");
+    status.className = "meta";
+    status.textContent = "status: " + p.status;
+    body.append(status);
+  }
 }
 function renderToolCall(p) {
   const head = `${p.server ? escapeHtml(p.server)+":" : ""}${escapeHtml(p.name||"tool")}`;
@@ -959,6 +1088,100 @@ function jsonPreview(v) {
   try { return typeof v==="string" ? v : JSON.stringify(v, null, 2); }
   catch { return String(v); }
 }
+
+/* ---------- source overlay ---------- */
+function projectFileUrl(kind, path) {
+  return `/api/projects/${state.projectId}/${kind}?path=${encodeURIComponent(path)}`;
+}
+async function openCodeOverlay(path, line) {
+  if (!state.projectId || !path) return;
+  state.codePath = path;
+  state.codeLine = normalizeLine(line, null);
+  $("codeOverlay").classList.add("open");
+  $("codePath").textContent = state.codeLine ? `${path}#${state.codeLine}` : path;
+  $("codeMeta").textContent = "Loading…";
+  $("codeView").innerHTML = `<div class="code-empty">Loading source…</div>`;
+  $("codeDownload").disabled = false;
+
+  const projectId = state.projectId;
+  try {
+    const res = await api("GET", projectFileUrl("highlight", path));
+    if (state.codePath !== path || state.projectId !== projectId) return;
+    const bits = [];
+    if (res.language) bits.push(res.language);
+    if (res.file_size !== undefined) bits.push(formatBytes(res.file_size));
+    if (res.total_lines) bits.push(`${res.total_lines.toLocaleString()} lines`);
+    $("codeMeta").textContent = bits.join(" · ") || "Source file";
+    if (res.is_binary) {
+      $("codeView").innerHTML = `<div class="code-empty">Binary file. Download to inspect it.</div>`;
+    } else if (!res.html) {
+      $("codeView").innerHTML = `<div class="code-empty">Preview unavailable for this file size. Download to inspect it.</div>`;
+    } else {
+      renderCodeHtml(res, state.codeLine);
+    }
+  } catch (e) {
+    if (state.codePath !== path || state.projectId !== projectId) return;
+    $("codeMeta").textContent = "Could not load source";
+    $("codeView").innerHTML = `<div class="code-empty">${escapeHtml(e.message || "Could not load file.")}</div>`;
+    $("codeDownload").disabled = true;
+  }
+}
+function closeCodeOverlay() {
+  $("codeOverlay").classList.remove("open");
+  state.codePath = null;
+  state.codeLine = null;
+}
+function renderCodeHtml(res, targetLine) {
+  const totalLines = Number(res.total_lines) || 0;
+  const line = normalizeLine(targetLine, totalLines);
+  const table = document.createElement("div");
+  table.className = "code-table";
+
+  const gutter = document.createElement("div");
+  gutter.className = "code-line-nos";
+  for (let i = 1; i <= totalLines; i++) {
+    const row = document.createElement("div");
+    row.className = "code-line-no" + (line === i ? " focused" : "");
+    row.dataset.line = String(i);
+    row.textContent = String(i);
+    gutter.append(row);
+  }
+
+  const source = document.createElement("div");
+  source.className = "code-source";
+  source.innerHTML = res.html;
+
+  table.append(gutter, source);
+  $("codeView").replaceChildren(table);
+  if (line) requestAnimationFrame(() => requestAnimationFrame(() => scrollToCodeLine(line)));
+}
+function scrollToCodeLine(line) {
+  const view = $("codeView");
+  const row = view.querySelector(`.code-line-no[data-line="${line}"]`);
+  if (!row) return;
+  const rowRect = row.getBoundingClientRect();
+  const viewRect = view.getBoundingClientRect();
+  const target = view.scrollTop + (rowRect.top - viewRect.top) - (view.clientHeight / 2) + (rowRect.height / 2);
+  const max = Math.max(0, view.scrollHeight - view.clientHeight);
+  view.scrollTop = Math.max(0, Math.min(max, target));
+}
+function normalizeLine(value, max) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 1) return null;
+  const line = Math.trunc(n);
+  return max && max > 0 ? Math.min(line, max) : line;
+}
+function formatBytes(value) {
+  const n = Number(value) || 0;
+  if (n >= 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " MiB";
+  if (n >= 1024) return (n / 1024).toFixed(1) + " KiB";
+  return n.toLocaleString() + " B";
+}
+$("codeClose").onclick = closeCodeOverlay;
+$("codeDownload").onclick = () => {
+  if (state.projectId && state.codePath) window.location.href = projectFileUrl("raw", state.codePath);
+};
+$("codeOverlay").addEventListener("click", (e) => { if (e.target === $("codeOverlay")) closeCodeOverlay(); });
 
 /* ---------- composer + controls ---------- */
 function sendInput() {
@@ -1020,7 +1243,11 @@ function toggleDrawer(side) {
 $("btnMenu").onclick = () => toggleDrawer("left");
 $("btnInfo").onclick = () => toggleDrawer("right");
 $("backdrop").onclick = closeDrawers;
-document.addEventListener("keydown", (e) => { if (e.key==="Escape") closeDrawers(); });
+document.addEventListener("keydown", (e) => {
+  if (e.key!=="Escape") return;
+  if ($("codeOverlay").classList.contains("open")) closeCodeOverlay();
+  else closeDrawers();
+});
 
 function renderTokens(led) {
   if (!led || !led.total) return;

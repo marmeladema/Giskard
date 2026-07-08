@@ -339,6 +339,99 @@ async fn linkify_finds_paths() {
 }
 
 #[tokio::test]
+async fn linkify_endpoint_returns_only_existing_workspace_files() {
+    let port = 19012;
+    let (_data_dir, proj_dir, _state, pid, cookie) = start_server(port).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+
+    tokio::fs::create_dir_all(proj_dir.path().join("src"))
+        .await
+        .unwrap();
+    tokio::fs::write(proj_dir.path().join("src/lib.rs"), "pub fn lib() {}\n")
+        .await
+        .unwrap();
+
+    let absolute_main = proj_dir.path().join("main.rs");
+    let text = format!(
+        "Changed {absolute_main}. Also inspect ./src/lib.rs:2:4, but ignore missing.rs:4.",
+        absolute_main = absolute_main.display()
+    );
+
+    let resp = client
+        .post(format!("{base}/api/projects/{pid}/linkify"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({ "text": text }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let links = body["links"].as_array().unwrap();
+    let paths = links
+        .iter()
+        .map(|link| link["path"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paths,
+        vec!["main.rs", "src/lib.rs"],
+        "linkify should return only existing workspace files as workspace-relative paths"
+    );
+    assert_eq!(
+        links[0].get("line"),
+        None,
+        "plain path should not carry a line target"
+    );
+    assert_eq!(
+        links[1]["line"].as_u64(),
+        Some(2),
+        "colon line suffix should be returned as a line target"
+    );
+
+    for link in links {
+        let start = link["start"].as_u64().unwrap() as usize;
+        let end = link["end"].as_u64().unwrap() as usize;
+        let slice = &text[start..end];
+        assert!(
+            slice == absolute_main.to_string_lossy() || slice == "./src/lib.rs:2:4",
+            "span should point at the exact source text path, got {slice:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn linkify_endpoint_rejects_symlink_escape() {
+    let port = 19013;
+    let outside = tempfile::TempDir::new().unwrap();
+    let outside_file = outside.path().join("outside.rs");
+    tokio::fs::write(&outside_file, "pub fn outside() {}\n")
+        .await
+        .unwrap();
+
+    let (_data_dir, proj_dir, _state, pid, cookie) = start_server(port).await;
+    std::os::unix::fs::symlink(&outside_file, proj_dir.path().join("linked.rs")).unwrap();
+
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/api/projects/{pid}/linkify"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"text": "linked.rs exists but points outside"}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["links"].as_array().unwrap().is_empty(),
+        "symlink escape must not become a browser link"
+    );
+}
+
+#[tokio::test]
 async fn highlight_rejects_path_escape() {
     let port = 19005;
     let (_data_dir, _proj_dir, _state, pid, cookie) = start_server(port).await;
@@ -355,6 +448,91 @@ async fn highlight_rejects_path_escape() {
         .unwrap();
 
     assert_eq!(resp.status(), 403);
+}
+
+#[tokio::test]
+async fn highlight_and_raw_reject_missing_files() {
+    let port = 19015;
+    let (_data_dir, _proj_dir, _state, pid, cookie) = start_server(port).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+
+    for endpoint in ["highlight", "raw"] {
+        let resp = client
+            .get(format!(
+                "{base}/api/projects/{pid}/{endpoint}?path=missing.rs"
+            ))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            403,
+            "{endpoint} should fail closed for missing files"
+        );
+    }
+}
+
+#[tokio::test]
+async fn code_overlay_endpoints_return_not_found_for_missing_project() {
+    let port = 19016;
+    let (_data_dir, _proj_dir, _state, _pid, cookie) = start_server(port).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let missing_project = ProjectId::new();
+
+    for (method, endpoint) in [
+        ("GET", "highlight?path=main.rs"),
+        ("GET", "raw?path=main.rs"),
+        ("POST", "linkify"),
+    ] {
+        let url = format!("{base}/api/projects/{missing_project}/{endpoint}");
+        let request = match method {
+            "POST" => client
+                .post(url)
+                .json(&serde_json::json!({"text": "main.rs"})),
+            _ => client.get(url),
+        };
+        let resp = request.header("cookie", &cookie).send().await.unwrap();
+        assert_eq!(
+            resp.status(),
+            404,
+            "{method} {endpoint} should report missing project"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn highlight_and_raw_reject_symlink_escape() {
+    let port = 19014;
+    let outside = tempfile::TempDir::new().unwrap();
+    let outside_file = outside.path().join("outside.rs");
+    tokio::fs::write(&outside_file, "pub fn outside() {}\n")
+        .await
+        .unwrap();
+
+    let (_data_dir, proj_dir, _state, pid, cookie) = start_server(port).await;
+    std::os::unix::fs::symlink(&outside_file, proj_dir.path().join("linked.rs")).unwrap();
+
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    for endpoint in ["highlight", "raw"] {
+        let resp = client
+            .get(format!(
+                "{base}/api/projects/{pid}/{endpoint}?path=linked.rs"
+            ))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            403,
+            "{endpoint} must reject symlinks that resolve outside the workspace"
+        );
+    }
 }
 
 /// DiffUpdated events should be accumulated into Turn.diffs and persisted.
