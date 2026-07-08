@@ -342,6 +342,8 @@ async fn forward_events(
     ctx: TurnContext,
 ) {
     let mut turn_id: Option<TurnId> = None;
+    let mut owned_turn: Option<TurnId> = None;
+    let mut owned_turn_completed = false;
     let mut started_at = Utc::now();
     let mut items: Vec<Item> = Vec::new();
     let mut diffs: Vec<giskard_core::FileDiff> = Vec::new();
@@ -352,7 +354,29 @@ async fn forward_events(
     loop {
         match stream.recv().await {
             Ok(event) => {
-                if let Some(turn) = event_turn_id(&event) {
+                let event_turn = event_turn_id(&event);
+                if let Some(owned) = owned_turn {
+                    if let Some(turn) = event_turn {
+                        if turn != owned {
+                            continue;
+                        }
+                    } else if owned_turn_completed {
+                        continue;
+                    }
+                } else if let Some(turn) = event_turn {
+                    if !seen_turn_ids.contains(&turn) {
+                        owned_turn = Some(turn);
+                        if !matches!(event, AgentEvent::TurnStarted { .. }) {
+                            debug!(
+                                %thread_id,
+                                %turn,
+                                "event forwarder attached to turn before seeing turn start"
+                            );
+                        }
+                    }
+                }
+
+                if let Some(turn) = event_turn {
                     if seen_turn_ids.contains(&turn) {
                         let command_state_changed =
                             apply_running_command_event(&running_commands, &event).await;
@@ -362,9 +386,30 @@ async fn forward_events(
                             }
                             broadcast_running_commands(&hub, &running_commands, thread_id).await;
                         }
+                        if owned_turn_completed {
+                            if let Some(owned) = owned_turn {
+                                if !running_commands
+                                    .has_running_for_turn(thread_id, owned)
+                                    .await
+                                {
+                                    break;
+                                }
+                            }
+                        }
                         continue;
                     }
                 }
+
+                if owned_turn.is_none() && event_turn.is_none() {
+                    match event {
+                        AgentEvent::Error { .. } | AgentEvent::Notice { .. } => {
+                            hub.broadcast_event(thread_id, event).await;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 if should_skip_duplicate_item(
                     &event,
                     &mut seen_harness_item_ids,
@@ -448,7 +493,10 @@ async fn forward_events(
                     };
                     persist_turn(&store, &hub, &ledger, project_id, thread_id, turn).await;
                     live_buffers.clear_turn(thread_id).await;
-                    turn_id = None;
+                    owned_turn_completed = true;
+                    if !running_commands.has_running_for_turn(thread_id, tid).await {
+                        break;
+                    }
                 }
             }
             Err(e) => {
@@ -734,7 +782,29 @@ async fn persist_turn(
 
 #[cfg(test)]
 mod tests {
-    use super::{command_completion_is_normal_success, command_status_is_running};
+    use std::sync::Arc;
+
+    use chrono::Utc;
+    use giskard_core::event::AgentEvent;
+    use giskard_core::ids::{ItemId, ProjectId, ThreadId, TurnId};
+    use giskard_core::item::{Item, ItemPayload};
+    use giskard_core::model::ModelRef;
+    use giskard_core::token::{TokenLedger, TokenUsage};
+    use giskard_core::turn::{ApprovalPolicy, Mode, TurnStatus, TurnStatusKind};
+    use giskard_core::user_input::UserInput;
+    use giskard_harness::AgentEventStream;
+    use giskard_persist::PersistStore;
+    use giskard_persist::store::ThreadFile;
+    use tokio::sync::{Mutex, broadcast};
+
+    use super::{
+        TurnContext, command_completion_is_normal_success, command_status_is_running,
+        forward_events,
+    };
+    use crate::hub::Hub;
+    use crate::ledger;
+    use crate::live_buffer::LiveBufferStore;
+    use crate::running_commands::RunningCommandStore;
 
     #[test]
     fn command_completion_success_requires_success_status_and_zero_exit() {
@@ -758,5 +828,231 @@ mod tests {
 
         assert!(!command_status_is_running("completed"));
         assert!(!command_status_is_running("interrupted"));
+    }
+
+    #[tokio::test]
+    async fn live_turn_forwarders_do_not_persist_later_turns() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: None,
+        };
+        store
+            .create_project(
+                project_id,
+                "proj",
+                "/tmp/test",
+                model.clone(),
+                ApprovalPolicy::Ask,
+            )
+            .await
+            .unwrap();
+        let now = Utc::now();
+        store
+            .save_thread(
+                project_id,
+                &ThreadFile {
+                    version: 1,
+                    id: thread_id,
+                    project_id,
+                    title: "t".into(),
+                    harness_thread_id: "th".into(),
+                    mode: Mode::Build,
+                    current_model: model.clone(),
+                    context_window: 128_000,
+                    approval_policy: None,
+                    model_efforts: Default::default(),
+                    tokens: TokenLedger::default(),
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        let (tx, _) = broadcast::channel(64);
+        let hub = Arc::new(Hub::new());
+        let live_buffers = Arc::new(LiveBufferStore::new());
+        let running_commands = Arc::new(RunningCommandStore::new());
+        let approvals = Arc::new(Mutex::new(Default::default()));
+        let server_requests = Arc::new(Mutex::new(Default::default()));
+        let ledger = ledger::spawn(store.clone());
+
+        spawn_forwarder(
+            thread_id,
+            project_id,
+            AgentEventStream::new(tx.subscribe()),
+            hub.clone(),
+            live_buffers.clone(),
+            running_commands.clone(),
+            store.clone(),
+            approvals.clone(),
+            server_requests.clone(),
+            ledger.clone(),
+            model.clone(),
+            "first",
+        );
+        let first_turn = TurnId::new();
+        for event in turn_events(
+            thread_id,
+            first_turn,
+            "first",
+            "one",
+            TokenUsage::new(10, 1),
+        ) {
+            tx.send(event).unwrap();
+        }
+        wait_for_turn_count(&store, project_id, thread_id, 1).await;
+
+        spawn_forwarder(
+            thread_id,
+            project_id,
+            AgentEventStream::new(tx.subscribe()),
+            hub,
+            live_buffers,
+            running_commands,
+            store.clone(),
+            approvals,
+            server_requests,
+            ledger,
+            model,
+            "second",
+        );
+        let second_turn = TurnId::new();
+        for event in turn_events(
+            thread_id,
+            second_turn,
+            "second",
+            "two",
+            TokenUsage::new(20, 2),
+        ) {
+            tx.send(event).unwrap();
+        }
+        wait_for_turn_count(&store, project_id, thread_id, 2).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let raw_history = tokio::fs::read_to_string(
+            data_dir
+                .join("projects")
+                .join(project_id.to_string())
+                .join("threads")
+                .join(format!("{thread_id}.jsonl")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(raw_history.lines().count(), 2);
+
+        let saved = store.load_all_turns(project_id, thread_id).await.unwrap();
+        assert_eq!(saved.len(), 2);
+        assert_eq!(saved[0].id, first_turn);
+        assert_eq!(saved[0].user_input, UserInput::text("first"));
+        assert_eq!(saved[1].id, second_turn);
+        assert_eq!(saved[1].user_input, UserInput::text("second"));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_forwarder(
+        thread_id: ThreadId,
+        project_id: ProjectId,
+        stream: AgentEventStream,
+        hub: Arc<Hub>,
+        live_buffers: Arc<LiveBufferStore>,
+        running_commands: Arc<RunningCommandStore>,
+        store: Arc<PersistStore>,
+        approvals: super::ApprovalMap,
+        server_requests: super::ServerRequestMap,
+        ledger: ledger::LedgerHandle,
+        model: ModelRef,
+        user_input: &str,
+    ) {
+        let ctx = TurnContext {
+            user_input: UserInput::text(user_input),
+            model,
+            mode: Mode::Build,
+        };
+        tokio::spawn(async move {
+            forward_events(
+                thread_id,
+                project_id,
+                stream,
+                hub,
+                live_buffers,
+                running_commands,
+                store,
+                approvals,
+                server_requests,
+                ledger,
+                ctx,
+            )
+            .await;
+        });
+    }
+
+    fn turn_events(
+        thread: ThreadId,
+        turn: TurnId,
+        input: &str,
+        output: &str,
+        usage: TokenUsage,
+    ) -> Vec<AgentEvent> {
+        let now = Utc::now();
+        vec![
+            AgentEvent::TurnStarted { thread, turn },
+            AgentEvent::ItemCompleted {
+                thread,
+                turn,
+                item: Item {
+                    id: ItemId::new(),
+                    harness_item_id: format!("user_{input}"),
+                    payload: ItemPayload::UserMessage { text: input.into() },
+                    created_at: now,
+                },
+            },
+            AgentEvent::ItemCompleted {
+                thread,
+                turn,
+                item: Item {
+                    id: ItemId::new(),
+                    harness_item_id: format!("agent_{output}"),
+                    payload: ItemPayload::AgentMessage {
+                        text: output.into(),
+                    },
+                    created_at: now,
+                },
+            },
+            AgentEvent::TurnCompleted {
+                thread,
+                turn,
+                usage,
+                status: TurnStatus {
+                    kind: TurnStatusKind::Completed,
+                    message: None,
+                },
+            },
+        ]
+    }
+
+    async fn wait_for_turn_count(
+        store: &PersistStore,
+        project_id: ProjectId,
+        thread_id: ThreadId,
+        count: usize,
+    ) {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            let saved = store.load_all_turns(project_id, thread_id).await.unwrap();
+            if saved.len() >= count {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("timed out waiting for {count} persisted turns");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
     }
 }

@@ -451,7 +451,7 @@ let state = {
   runningCommands:new Map(), commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null,
   commandPayloadsByItemId:new Map(), endedCommandsByItemId:new Map(), expandedCommandOutputs:new Set(), manuallyToggledCommandOutputs:new Set(),
   linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, activeTurn:false, interruptPending:false,
-  awaitingInitialThreadState:false
+  awaitingInitialThreadState:false, contextWindow:0, contextUsed:null
 };
 const COMMAND_AUTO_COLLAPSE_LINES = 120;
 const COMMAND_AUTO_COLLAPSE_BYTES = 16 * 1024;
@@ -677,6 +677,7 @@ async function openThread(pid, tid, title, opts) {
   setTurnActive(false);
   state.historyLoaded = false; state.oldestTurnId = null; state.hasMoreHistory = false;
   state.loadingHistory = false; state.pendingOlder = false;
+  state.contextUsed = null; state.contextWindow = 0;
   state.awaitingInitialThreadState = true;
   resetRenderState();
   document.querySelectorAll(".thread").forEach(e => e.classList.toggle("active", e.dataset.tid===tid));
@@ -817,7 +818,7 @@ function renderThreadState(s) {
   // The header already owns title / mode / model; the right column is usage-only now.
   if (s.title) setThreadTitle(s.title);
   if (s.tokens) renderTokens(s.tokens);
-  updateGauge(s.tokens ? s.tokens.total.total : 0, s.context_window || 0);
+  updateGauge(state.contextUsed, s.context_window || 0);
   if (initialThreadState) {
     // History now arrives separately via `history_page` (H6); clear the transcript ready for it.
     $("transcript").innerHTML="";
@@ -834,6 +835,7 @@ function renderHistoryPage(msg) {
   state.hasMoreHistory = !!msg.has_more;
   const turns = msg.turns || [];
   if (turns.length) state.oldestTurnId = turns[0].id;   // turns are oldest-first
+  if (!older) updateGaugeFromTurns(turns);
 
   if (older) {
     // Render into a detached container, then prepend to the top and preserve the scroll position
@@ -917,6 +919,7 @@ function handleEvent(ev) {
       if (!finalizeStreamedItem(ev.item)) addItem(ev.item);
       break;
     case "turn_completed":
+      updateGaugeFromUsage(ev.usage);
       state.streamEl=null;
       state.streamItemId=null;
       state.streamElsByItemId.clear();
@@ -2542,13 +2545,31 @@ function renderTokens(led) {
   const tile = (label, val) =>
     `<div class="stat"><div class="statlabel">${label}</div><div class="statval">${val.toLocaleString()}</div></div>`;
   $("ctxTokens").innerHTML =
-    `<div class="stats">${tile("Input", t.input)}${tile("Output", t.output)}${tile("Total", t.total)}</div>`;
-  updateGauge(t.total, state.contextWindow||0);
+    `<div class="stats">${tile("Cumulative Input", t.input)}${tile("Output", t.output)}${tile("Total", t.total)}</div>`;
 }
 function updateGauge(used, window) {
   state.contextWindow = window || state.contextWindow || 0;
+  if (used !== undefined && used !== null) state.contextUsed = used;
   const w = state.contextWindow;
-  $("gauge").textContent = w ? `${fmt(used)} / ${fmt(w)}` : `${fmt(used)} tokens`;
+  const u = state.contextUsed;
+  $("gauge").textContent = w
+    ? `${u === null ? "…" : fmt(u)} / ${fmt(w)}`
+    : `${u === null ? "…" : fmt(u)} tokens`;
+}
+function updateGaugeFromTurns(turns) {
+  if (!turns.length) {
+    updateGauge(null, state.contextWindow);
+    return;
+  }
+  const latest = turns[turns.length - 1];
+  updateGaugeFromUsage(latest && latest.usage);
+}
+function updateGaugeFromUsage(usage) {
+  if (!usage) return;
+  // Codex currently exposes `last.input_tokens` rather than a dedicated context-used field;
+  // input tokens are the best available proxy for current context occupancy (spec §10.3).
+  const used = Number.isFinite(usage.input) ? usage.input : usage.total;
+  if (Number.isFinite(used)) updateGauge(used, state.contextWindow);
 }
 function fmt(n) { return n>=1000 ? (n/1000).toFixed(1)+"k" : String(n); }
 function notice(text, severity) {

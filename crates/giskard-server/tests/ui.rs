@@ -147,6 +147,26 @@ async fn index_page_is_served_and_public() {
         "UI distinguishes initial thread snapshots from metadata refreshes"
     );
     assert!(
+        body.contains("contextUsed"),
+        "UI tracks context gauge usage separately from cumulative token totals"
+    );
+    assert!(
+        body.contains("updateGaugeFromUsage(ev.usage)"),
+        "turn completion updates the context gauge from per-turn usage"
+    );
+    assert!(
+        body.contains("updateGaugeFromTurns(turns)"),
+        "initial history updates the context gauge from the latest persisted turn"
+    );
+    assert!(
+        body.contains("input tokens are the best available proxy for current context occupancy"),
+        "UI documents the selected Codex context-usage source"
+    );
+    assert!(
+        !body.contains("updateGauge(t.total"),
+        "cumulative token totals must not drive the context gauge"
+    );
+    assert!(
         body.contains("if (initialThreadState)"),
         "UI only clears the transcript for the initial thread snapshot"
     );

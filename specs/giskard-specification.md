@@ -1570,7 +1570,7 @@ and monthly figures are derived on read by summing `by_day` buckets (single sour
 
 ### 10.3 Context-window gauge (per thread)
 
-Within a thread, show the thread's cumulative token footprint **relative to the active
+Within a thread, show the thread's current context footprint **relative to the active
 model's context window** (e.g. 15.4k / 262k, or / 1M). The denominator is
 `ModelDescriptor.context_window` for the current model and **recomputes when the model
 changes** (§8.4). This is a usage-vs-capacity indicator to warn before hitting context limits.

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -361,10 +361,22 @@ impl PersistStore {
 
         let lines: Vec<&str> = data.lines().filter(|l| !l.trim().is_empty()).collect();
         let mut turns = Vec::with_capacity(lines.len());
+        let mut seen_turn_ids = HashSet::new();
         let last = lines.len().saturating_sub(1);
         for (i, line) in lines.iter().enumerate() {
             match serde_json::from_str::<Turn>(line) {
-                Ok(turn) => turns.push(turn),
+                Ok(turn) => {
+                    if !seen_turn_ids.insert(turn.id) {
+                        tracing::warn!(
+                            path = %path.display(),
+                            turn_id = %turn.id,
+                            line = i + 1,
+                            "skipping duplicate turn id in history"
+                        );
+                        continue;
+                    }
+                    turns.push(turn);
+                }
                 Err(e) if i == last => {
                     tracing::warn!(
                         path = %path.display(),
@@ -848,6 +860,56 @@ mod tests {
         let tf = store.recompute_aggregates(pid, tid).await.unwrap().unwrap();
         // 100+200+300 input, 30 output.
         assert_eq!(tf.tokens.total.input, 600);
+        assert_eq!(tf.tokens.total.output, 30);
+    }
+
+    #[tokio::test]
+    async fn jsonl_history_skips_duplicate_turn_ids_on_read_and_recompute() {
+        use giskard_core::token::TokenUsage;
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+
+        let original = make_turn(TokenUsage::new(100, 10));
+        let mut duplicate = original.clone();
+        duplicate.user_input = giskard_core::user_input::UserInput::text("stale input");
+        duplicate.usage = TokenUsage::new(999, 99);
+        let second = make_turn(TokenUsage::new(200, 20));
+
+        store.append_turn(pid, tid, &original).await.unwrap();
+        store.append_turn(pid, tid, &duplicate).await.unwrap();
+        store.append_turn(pid, tid, &second).await.unwrap();
+
+        let all = store.load_all_turns(pid, tid).await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].id, original.id);
+        assert_eq!(all[0].user_input, original.user_input);
+        assert_eq!(all[0].usage, original.usage);
+        assert_eq!(all[1].id, second.id);
+
+        store
+            .save_thread(
+                pid,
+                &ThreadFile {
+                    version: SCHEMA_VERSION,
+                    id: tid,
+                    project_id: pid,
+                    title: "t".into(),
+                    harness_thread_id: "th".into(),
+                    mode: Mode::Build,
+                    current_model: test_model(),
+                    context_window: 0,
+                    approval_policy: None,
+                    model_efforts: HashMap::new(),
+                    tokens: TokenLedger::default(),
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        let tf = store.recompute_aggregates(pid, tid).await.unwrap().unwrap();
+        assert_eq!(tf.tokens.total.input, 300);
         assert_eq!(tf.tokens.total.output, 30);
     }
 

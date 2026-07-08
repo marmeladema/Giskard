@@ -61,6 +61,12 @@ Then open **http://127.0.0.1:8787**, log in, and:
    picker, and a **token/context** gauge; scrolling the transcript to the top lazy-loads older
    history.
 
+The header gauge is a context-window indicator, not a billing total. Codex currently exposes the
+latest turn's input tokens rather than a dedicated context-occupancy field, so Giskard uses that as
+the best available proxy for "how full is the active conversation?" The usage tiles in the right
+panel remain cumulative input/output/total tokens and can legitimately exceed the model's context
+window over a long thread.
+
 > **Common gotcha:** with `secure_cookies = true` over plain HTTP, the browser drops the session
 > cookie — login appears to succeed but nothing loads. Use `false` for local HTTP; set `true` only
 > behind HTTPS/TLS (e.g. an Nginx terminator).
