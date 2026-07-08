@@ -7,7 +7,7 @@ use giskard_core::ids::{ItemId, ProjectId, ThreadId, TurnId};
 use giskard_core::item::{Item, ItemDelta, ItemKind, ItemPayload, ItemStart};
 use giskard_core::model::ModelRef;
 use giskard_core::token::TokenUsage;
-use giskard_core::turn::{Mode, TurnStatus, TurnStatusKind};
+use giskard_core::turn::{ApprovalPolicy, Mode, TurnStatus, TurnStatusKind};
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 use giskard_persist::store::ProjectConfig;
 use giskard_proto::{ClientMessage, ErrorSeverity, ServerMessage, WireAgentEvent};
@@ -532,7 +532,6 @@ async fn websocket_serializes_harness_error_events() {
             "name": "test-project",
             "dir": "/tmp/test",
             "default_model": {"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null},
-            "approval_policy": "auto"
         }))
         .send()
         .await
@@ -668,7 +667,6 @@ async fn subscribe_reopens_persisted_thread() {
             "name": "test-project",
             "dir": "/tmp/test",
             "default_model": model,
-            "approval_policy": "auto"
         }))
         .send()
         .await
@@ -695,7 +693,7 @@ async fn subscribe_reopens_persisted_thread() {
                 mode: Mode::Build,
                 current_model: model.clone(),
                 context_window: 128_000,
-                approval_policy: None,
+                approval_policy: ApprovalPolicy::Ask,
                 model_efforts: Default::default(),
                 tokens: Default::default(),
                 created_at: now,
@@ -793,7 +791,6 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
             "name": "test-project",
             "dir": "/tmp/test",
             "default_model": model,
-            "approval_policy": "auto"
         }))
         .send()
         .await
@@ -820,7 +817,7 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
                 mode: Mode::Build,
                 current_model: model.clone(),
                 context_window: 128_000,
-                approval_policy: None,
+                approval_policy: ApprovalPolicy::Ask,
                 model_efforts: Default::default(),
                 tokens: Default::default(),
                 created_at: now,
@@ -944,7 +941,6 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
             "name": "test-project",
             "dir": "/tmp/test",
             "default_model": model,
-            "approval_policy": "auto"
         }))
         .send()
         .await
@@ -970,7 +966,7 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
                 mode: Mode::Build,
                 current_model: model.clone(),
                 context_window: 128_000,
-                approval_policy: None,
+                approval_policy: ApprovalPolicy::Ask,
                 model_efforts: Default::default(),
                 tokens: Default::default(),
                 created_at: now,
@@ -1157,7 +1153,6 @@ async fn failed_turn_is_persisted_with_error_message() {
             "name": "test-project",
             "dir": "/tmp/test",
             "default_model": {"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null},
-            "approval_policy": "auto"
         }))
         .send()
         .await
@@ -1301,7 +1296,6 @@ async fn notice_event_is_delivered_to_client() {
             "name": "p",
             "dir": "/tmp/test",
             "default_model": {"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null},
-            "approval_policy": "auto"
         }))
         .send()
         .await
@@ -1433,7 +1427,6 @@ wire_api = "responses"
             "name": "test-project",
             "dir": "/tmp/test",
             "default_model": stale_model,
-            "approval_policy": "auto"
         }))
         .send()
         .await
@@ -1467,7 +1460,7 @@ wire_api = "responses"
                     reasoning_effort: None,
                 },
                 context_window: 128_000,
-                approval_policy: None,
+                approval_policy: ApprovalPolicy::Ask,
                 model_efforts: Default::default(),
                 tokens: Default::default(),
                 created_at: now,
@@ -1536,7 +1529,6 @@ async fn login_project_thread_message() {
             "name": "test-project",
             "dir": "/tmp/test",
             "default_model": {"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null},
-            "approval_policy": "auto"
         }))
         .send()
         .await

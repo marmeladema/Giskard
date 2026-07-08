@@ -1,9 +1,8 @@
 //! Regression test for the turn-override snapshot the server hands the harness.
 //!
 //! Guards two fixes: (1) the thread's current model + reasoning effort must reach `start_turn`
-//! so mid-thread model/effort changes take effect (§8.4/§8.5); (2) a per-thread approval-policy
-//! override must win over the project default (§9). A capturing harness records every
-//! `TurnOverrides` it is handed.
+//! so mid-thread model/effort changes take effect (§8.4/§8.5); (2) the thread's approval policy
+//! must reach the harness (§9). A capturing harness records every `TurnOverrides` it is handed.
 
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -198,7 +197,6 @@ async fn send_input_snapshot_carries_model_effort_and_thread_policy() {
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
             },
-            ApprovalPolicy::Ask, // project default
         )
         .await
         .unwrap();
@@ -292,17 +290,32 @@ async fn send_input_snapshot_carries_model_effort_and_thread_policy() {
     assert_eq!(
         first.approval_policy,
         ApprovalPolicy::Ask,
-        "no thread override yet ⇒ project default"
+        "new threads default to ask"
     );
 
-    // Now set a per-thread approval policy and send again.
+    // Now set the thread approval policy and send again.
     ws.send(ws_text(&ClientMessage::SetApprovalPolicy {
-        thread_id: Some(thread_id),
-        project_id: None,
+        thread_id,
         policy: ApprovalPolicy::ReadOnly,
     }))
     .await
     .unwrap();
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        let tf = state
+            .store
+            .load_thread(pid, thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        if tf.approval_policy == ApprovalPolicy::ReadOnly {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("thread approval policy was not persisted");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+    }
     ws.send(ws_text(&ClientMessage::SendInput {
         thread_id,
         text: "again".into(),
@@ -314,29 +327,8 @@ async fn send_input_snapshot_carries_model_effort_and_thread_policy() {
     assert_eq!(
         second.approval_policy,
         ApprovalPolicy::ReadOnly,
-        "fix #2: per-thread approval policy override must win over the project's"
+        "thread approval policy changes must reach the harness"
     );
-
-    // SetApprovalPolicy with a project_id (no thread_id) changes the project default.
-    ws.send(ws_text(&ClientMessage::SetApprovalPolicy {
-        thread_id: None,
-        project_id: Some(pid),
-        policy: ApprovalPolicy::Auto,
-    }))
-    .await
-    .unwrap();
-
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-    loop {
-        let cfg = state.store.load_project(pid).await.unwrap().unwrap();
-        if cfg.approval_policy == ApprovalPolicy::Auto {
-            break;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("project approval policy was not updated");
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
-    }
 }
 
 /// Wait until at least `n` overrides have been captured, returning the `n`-th (1-based).

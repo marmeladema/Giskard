@@ -48,6 +48,9 @@
 
   header.thr { display:flex; gap:12px; align-items:center; padding:10px 14px; border-bottom:1px solid var(--border); background:var(--panel); flex-wrap:wrap; }
   header.thr .badge { font-size:12px; padding:2px 8px; border:1px solid var(--border); border-radius:20px; }
+  .thread-control { display:flex; align-items:center; gap:6px; min-height:30px; }
+  .thread-control-label { color:var(--muted); font-size:12px; }
+  .thread-control select { height:30px; padding:3px 8px; }
   header.thr .gauge { margin-left:auto; font-size:12px; }
 
   #transcript { flex:1; min-width:0; overflow-y:auto; overflow-x:hidden; padding:16px; }
@@ -355,6 +358,14 @@
       <header class="thr" id="thrHeader" style="display:none">
         <span class="badge mono" id="thrTitle">—</span>
         <button id="modeBtn" class="badge" title="Toggle Plan/Build">build</button>
+        <label class="thread-control" title="Approval policy for agent commands and file changes in this thread">
+          <span class="thread-control-label">Approvals</span>
+          <select id="approvalSel" aria-label="Approval policy">
+            <option value="ask">Ask first</option>
+            <option value="auto">Auto approve</option>
+            <option value="read_only">Read only</option>
+          </select>
+        </label>
         <select id="modelSel" class="mono"></select>
         <button id="refreshModels" class="badge" title="Refresh model list from provider /v1/models">↻</button>
         <span class="gauge muted mono" id="gauge">0 / 0</span>
@@ -411,14 +422,6 @@
           <label for="pmModel">Default model</label>
           <select id="pmModel" class="mono"></select>
         </div>
-        <div class="field">
-          <label for="pmApproval">Approval policy</label>
-          <select id="pmApproval">
-            <option value="auto">auto — run without asking</option>
-            <option value="ask">ask — prompt before actions</option>
-            <option value="read_only">read only</option>
-          </select>
-        </div>
       </div>
       <div class="foot">
         <span class="err" id="pmErr"></span>
@@ -455,7 +458,7 @@ let state = {
   runningCommands:new Map(), commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null,
   commandPayloadsByItemId:new Map(), endedCommandsByItemId:new Map(), expandedCommandOutputs:new Set(), manuallyToggledCommandOutputs:new Set(),
   linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, activeTurn:false, interruptPending:false,
-  awaitingInitialThreadState:false, contextWindow:0, contextUsed:null
+  awaitingInitialThreadState:false, contextWindow:0, contextUsed:null, approvalPolicy:"ask"
 };
 const COMMAND_AUTO_COLLAPSE_LINES = 120;
 const COMMAND_AUTO_COLLAPSE_BYTES = 16 * 1024;
@@ -645,9 +648,8 @@ $("pmCreate").onclick = async () => {
   const model = opt && opt.dataset.model
     ? { provider: opt.dataset.provider, model: opt.dataset.model, reasoning_effort:null }
     : { provider:"openai", model:"gpt-5.5", reasoning_effort:null };
-  const approval_policy = $("pmApproval").value;
   try {
-    await api("POST","/api/projects",{ name, dir, default_model:model, approval_policy });
+    await api("POST","/api/projects",{ name, dir, default_model:model });
     closeProjectModal();
     await loadProjects();
   } catch (e) { $("pmErr").textContent = "Create project failed: "+e.message; }
@@ -757,6 +759,7 @@ function updateComposerControls() {
     state.wsStatus==="open" ? "Message the agent…  (Enter to send, Shift+Enter for newline)" :
     state.wsStatus==="connecting" ? "Connecting to agent…" :
     "WebSocket disconnected";
+  $("approvalSel").disabled = !state.threadId;
 }
 function setTurnActive(active) {
   state.activeTurn = active;
@@ -817,6 +820,7 @@ function renderThreadState(s) {
   const initialThreadState = state.awaitingInitialThreadState;
   state.awaitingInitialThreadState = false;
   state.mode = s.mode || "build";
+  setApprovalPolicy(s.approval_policy || "ask");
   $("modeBtn").textContent = state.mode;
   if (s.current_model) setModel(`${s.current_model.provider}/${s.current_model.model}`);
   // The header already owns title / mode / model; the right column is usage-only now.
@@ -828,6 +832,10 @@ function renderThreadState(s) {
     $("transcript").innerHTML="";
     resetRenderState();
   }
+}
+function setApprovalPolicy(policy) {
+  state.approvalPolicy = policy || "ask";
+  $("approvalSel").value = state.approvalPolicy;
 }
 
 // Render the most recent page of persisted history (H6), oldest-first. Older pages are available
@@ -2551,6 +2559,21 @@ $("modeBtn").onclick = () => {
   state.mode = state.mode==="build" ? "plan" : "build";
   $("modeBtn").textContent = state.mode;
   send({ type:"switch_mode", thread_id: state.threadId, mode: state.mode });
+};
+
+$("approvalSel").onchange = () => {
+  const previous = state.approvalPolicy || "ask";
+  const policy = $("approvalSel").value || "ask";
+  if (!state.threadId) {
+    setApprovalPolicy(previous);
+    return;
+  }
+  if (send({ type:"set_approval_policy", thread_id: state.threadId, policy }, { queue:true })) {
+    setApprovalPolicy(policy);
+  } else {
+    setApprovalPolicy(previous);
+    notice(`Approval policy not changed: WebSocket is ${state.wsStatus}.`, "error");
+  }
 };
 
 function renderModelSelect() {

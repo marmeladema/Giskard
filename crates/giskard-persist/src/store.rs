@@ -39,6 +39,7 @@ pub struct ProjectEntry {
 
 /// `projects/<id>/project.json` — per-project config (spec §5.3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectConfig {
     pub version: u32,
     pub id: ProjectId,
@@ -48,13 +49,13 @@ pub struct ProjectConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_root: Option<String>,
     pub default_model: ModelRef,
-    pub approval_policy: ApprovalPolicy,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
 /// `projects/<id>/threads/<thread_id>.json` — thread state + history (spec §5.3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ThreadFile {
     pub version: u32,
     pub id: ThreadId,
@@ -68,9 +69,8 @@ pub struct ThreadFile {
     /// callers should recompute it from `current_model` against the live model config.
     #[serde(default)]
     pub context_window: u32,
-    /// Per-thread approval-policy override (P3). `None` ⇒ use the project's `approval_policy`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approval_policy: Option<ApprovalPolicy>,
+    /// Per-thread approval policy (P3).
+    pub approval_policy: ApprovalPolicy,
     /// Per-model effort retention (C7): maps `"provider/model"` → stored `Effort`, so switching
     /// back to a reasoning model restores the user's last effort choice.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -202,7 +202,6 @@ impl PersistStore {
         name: &str,
         dir: &str,
         default_model: ModelRef,
-        approval_policy: ApprovalPolicy,
     ) -> Result<ProjectConfig, PersistError> {
         let now = Utc::now();
         let mut index = self.load_project_index().await?;
@@ -225,7 +224,6 @@ impl PersistStore {
             harness: "codex".into(),
             workspace_root: None,
             default_model,
-            approval_policy,
             created_at: now,
             updated_at: now,
         };
@@ -580,13 +578,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let id = ProjectId::new();
         store
-            .create_project(
-                id,
-                "test-project",
-                "/tmp/test",
-                test_model(),
-                ApprovalPolicy::Ask,
-            )
+            .create_project(id, "test-project", "/tmp/test", test_model())
             .await
             .unwrap();
 
@@ -597,7 +589,31 @@ mod tests {
         let config = store.load_project(id).await.unwrap().unwrap();
         assert_eq!(config.name, "test-project");
         assert_eq!(config.harness, "codex");
-        assert_eq!(config.approval_policy, ApprovalPolicy::Ask);
+    }
+
+    #[tokio::test]
+    async fn load_project_rejects_obsolete_approval_policy() {
+        let (_tmp, store) = make_store();
+        let id = ProjectId::new();
+        let project = store
+            .create_project(id, "test-project", "/tmp/test", test_model())
+            .await
+            .unwrap();
+
+        let mut value = serde_json::to_value(&project).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("approval_policy".into(), serde_json::json!("auto"));
+        tokio::fs::write(
+            store.project_json_path(id),
+            serde_json::to_vec_pretty(&value).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let result = store.load_project(id).await;
+        assert!(matches!(result.unwrap_err(), PersistError::Corrupt(_)));
     }
 
     #[tokio::test]
@@ -605,13 +621,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let id = ProjectId::new();
         store
-            .create_project(
-                id,
-                "to-delete",
-                "/tmp/test",
-                test_model(),
-                ApprovalPolicy::Auto,
-            )
+            .create_project(id, "to-delete", "/tmp/test", test_model())
             .await
             .unwrap();
 
@@ -627,7 +637,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
         store
-            .create_project(pid, "proj", "/tmp/test", test_model(), ApprovalPolicy::Ask)
+            .create_project(pid, "proj", "/tmp/test", test_model())
             .await
             .unwrap();
 
@@ -642,7 +652,7 @@ mod tests {
             mode: Mode::Build,
             current_model: test_model(),
             context_window: 262_144,
-            approval_policy: None,
+            approval_policy: ApprovalPolicy::Ask,
             model_efforts: HashMap::new(),
             tokens: TokenLedger::default(),
             created_at: now,
@@ -657,11 +667,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_thread_requires_approval_policy() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        store
+            .create_project(pid, "proj", "/tmp/test", test_model())
+            .await
+            .unwrap();
+
+        let tid = ThreadId::new();
+        let now = Utc::now();
+        let thread = ThreadFile {
+            version: SCHEMA_VERSION,
+            id: tid,
+            project_id: pid,
+            title: "Fix auth".into(),
+            harness_thread_id: "th_abc".into(),
+            mode: Mode::Build,
+            current_model: test_model(),
+            context_window: 262_144,
+            approval_policy: ApprovalPolicy::Ask,
+            model_efforts: HashMap::new(),
+            tokens: TokenLedger::default(),
+            created_at: now,
+            updated_at: now,
+        };
+        let mut value = serde_json::to_value(&thread).unwrap();
+        value.as_object_mut().unwrap().remove("approval_policy");
+        tokio::fs::create_dir_all(store.threads_dir(pid))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            store.thread_json_path(pid, tid),
+            serde_json::to_vec_pretty(&value).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let result = store.load_thread(pid, tid).await;
+        assert!(matches!(result.unwrap_err(), PersistError::Corrupt(_)));
+    }
+
+    #[tokio::test]
     async fn list_threads() {
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
         store
-            .create_project(pid, "proj", "/tmp/test", test_model(), ApprovalPolicy::Ask)
+            .create_project(pid, "proj", "/tmp/test", test_model())
             .await
             .unwrap();
 
@@ -678,7 +730,7 @@ mod tests {
                 mode: Mode::Plan,
                 current_model: test_model(),
                 context_window: 128_000,
-                approval_policy: None,
+                approval_policy: ApprovalPolicy::Ask,
                 model_efforts: HashMap::new(),
                 tokens: TokenLedger::default(),
                 created_at: now,
@@ -696,7 +748,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
         store
-            .create_project(pid, "proj", "/tmp/test", test_model(), ApprovalPolicy::Ask)
+            .create_project(pid, "proj", "/tmp/test", test_model())
             .await
             .unwrap();
 
@@ -717,7 +769,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
         store
-            .create_project(pid, "proj", "/tmp/test", test_model(), ApprovalPolicy::Ask)
+            .create_project(pid, "proj", "/tmp/test", test_model())
             .await
             .unwrap();
 
@@ -757,7 +809,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
         store
-            .create_project(pid, "proj", "/tmp/test", test_model(), ApprovalPolicy::Ask)
+            .create_project(pid, "proj", "/tmp/test", test_model())
             .await
             .unwrap();
 
@@ -848,7 +900,7 @@ mod tests {
                     mode: Mode::Build,
                     current_model: test_model(),
                     context_window: 0,
-                    approval_policy: None,
+                    approval_policy: ApprovalPolicy::Ask,
                     model_efforts: HashMap::new(),
                     tokens: TokenLedger::default(),
                     created_at: Utc::now(),
@@ -899,7 +951,7 @@ mod tests {
                     mode: Mode::Build,
                     current_model: test_model(),
                     context_window: 0,
-                    approval_policy: None,
+                    approval_policy: ApprovalPolicy::Ask,
                     model_efforts: HashMap::new(),
                     tokens: TokenLedger::default(),
                     created_at: Utc::now(),
@@ -918,7 +970,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
         store
-            .create_project(pid, "proj", "/tmp/test", test_model(), ApprovalPolicy::Ask)
+            .create_project(pid, "proj", "/tmp/test", test_model())
             .await
             .unwrap();
 
@@ -936,7 +988,7 @@ mod tests {
                     mode: Mode::Build,
                     current_model: test_model(),
                     context_window: 0,
-                    approval_policy: None,
+                    approval_policy: ApprovalPolicy::Ask,
                     model_efforts: HashMap::new(),
                     tokens: TokenLedger::default(),
                     created_at: now,

@@ -75,6 +75,30 @@ async fn index_page_is_served_and_public() {
         "approval cards expose session-scoped approval"
     );
     assert!(
+        body.contains("id=\"approvalSel\""),
+        "approval policy is a thread-header selector"
+    );
+    assert!(
+        body.contains("<span class=\"thread-control-label\">Approvals</span>"),
+        "approval policy selector has a visible label"
+    );
+    assert!(
+        body.contains(">Ask first</option>") && body.contains(">Auto approve</option>"),
+        "approval policy selector uses action-oriented option labels"
+    );
+    assert!(
+        body.contains("type:\"set_approval_policy\", thread_id: state.threadId, policy"),
+        "approval policy changes target the active thread"
+    );
+    assert!(
+        body.contains("setApprovalPolicy(s.approval_policy || \"ask\")"),
+        "thread state hydrates the approval policy selector"
+    );
+    assert!(
+        !body.contains("id=\"pmApproval\""),
+        "approval policy is not configured at project creation"
+    );
+    assert!(
         body.contains("pendingApprovals"),
         "UI de-duplicates pending approval cards"
     );
