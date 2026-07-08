@@ -82,7 +82,13 @@ async fn run() -> Result<(), String> {
                         .await
                         .map_err(|e| format!("failed to load thread {tid}: {e}"))?
                     {
-                        println!("{}  {}  [{:?}]", tid, thread.title, thread.mode);
+                        println!(
+                            "{}  {}  [{:?}]  {}",
+                            tid,
+                            thread.title,
+                            thread.mode,
+                            thread_archive_status(thread.archived)
+                        );
                     }
                 }
             }
@@ -173,6 +179,10 @@ fn parse_thread_id(raw: &str) -> Result<giskard_core::ThreadId, String> {
     raw.parse::<ulid::Ulid>()
         .map(giskard_core::ThreadId)
         .map_err(|e| format!("invalid thread id {raw}: {e}"))
+}
+
+fn thread_archive_status(archived: bool) -> &'static str {
+    if archived { "archived" } else { "active" }
 }
 
 fn usage(prog: &str) {

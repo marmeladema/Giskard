@@ -326,6 +326,7 @@ async fn replay_persisted_state_roundtrip() {
         },
         created_at: now,
         updated_at: now,
+        archived: false,
     };
 
     store.save_thread(pid, &thread_file).await.unwrap();

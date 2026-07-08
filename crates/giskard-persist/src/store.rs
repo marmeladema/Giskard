@@ -80,6 +80,12 @@ pub struct ThreadFile {
     pub tokens: TokenLedger,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub archived: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 // ---- Store ----
@@ -657,6 +663,7 @@ mod tests {
             tokens: TokenLedger::default(),
             created_at: now,
             updated_at: now,
+            archived: false,
         };
         store.save_thread(pid, &thread).await.unwrap();
 
@@ -691,6 +698,7 @@ mod tests {
             tokens: TokenLedger::default(),
             created_at: now,
             updated_at: now,
+            archived: false,
         };
         let mut value = serde_json::to_value(&thread).unwrap();
         value.as_object_mut().unwrap().remove("approval_policy");
@@ -735,6 +743,7 @@ mod tests {
                 tokens: TokenLedger::default(),
                 created_at: now,
                 updated_at: now,
+                archived: false,
             };
             store.save_thread(pid, &thread).await.unwrap();
         }
@@ -905,6 +914,7 @@ mod tests {
                     tokens: TokenLedger::default(),
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
+                    archived: false,
                 },
             )
             .await
@@ -956,6 +966,7 @@ mod tests {
                     tokens: TokenLedger::default(),
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
+                    archived: false,
                 },
             )
             .await
@@ -993,6 +1004,7 @@ mod tests {
                     tokens: TokenLedger::default(),
                     created_at: now,
                     updated_at: now,
+                    archived: false,
                 },
             )
             .await

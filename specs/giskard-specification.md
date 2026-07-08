@@ -8,7 +8,18 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.18
+**Version:** 1.19
+
+**Changelog (1.18 → 1.19), thread archive/delete lifecycle:**
+- **TD1:** Threads continue to create/resume their native Codex thread eagerly when opened. Giskard
+  does not create local-only placeholder threads; accidental threads are handled by explicit
+  archive/delete actions.
+- **TD2:** The thread list exposes a per-thread `...` actions menu. Active threads offer `Archive`
+  and `Delete`; archived threads offer `Unarchive` and `Delete`.
+- **TD3:** Archive/unarchive calls the harness first (`thread/archive` / `thread/unarchive` for
+  Codex) and only then updates the local thread metadata. Delete calls the harness first
+  (`thread/delete` for Codex) and only then removes local metadata/history. Giskard rejects
+  archive/delete while a turn or command is active.
 
 **Changelog (1.17 → 1.18), Codex collaboration mode alignment:**
 - **CM1:** Giskard Plan/Build mode now maps to both Codex sandbox policy and Codex
@@ -657,6 +668,16 @@ pub trait AgentHarness: Send + Sync {
     /// Interrupt the active turn of a thread.
     async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError>;
 
+    /// Archive or unarchive a durable thread in the underlying harness.
+    async fn set_thread_archived(
+        &self,
+        thread: &ThreadHandle,
+        archived: bool,
+    ) -> Result<(), HarnessError>;
+
+    /// Delete a durable thread in the underlying harness.
+    async fn delete_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError>;
+
     /// Cleanly shut down the harness (terminate child process, flush).
     /// Takes `&self` (not `self: Arc<Self>`) so the trait stays object-safe and is
     /// callable through `Arc<dyn AgentHarness>`. Idempotent: implementations perform the
@@ -1130,6 +1151,7 @@ All defined in `giskard-core`, serialized by `giskard-persist`. Illustrative sha
                                          //   recomputed from current_model on load — not a source of
                                          //   truth. May be omitted; a corrected config value wins.
   "approval_policy": "ask",              // "ask" | "auto" | "read_only" (§9)
+  "archived": false,                     // hidden from the active thread group when true
   "model_efforts": {                     // C7: per-model effort retention. Maps "provider/model"
     "openai/gpt-5.5": "high"             //   → stored Effort, so switching back to a reasoning model
   },                                     //   restores the user's last effort choice. Entries are
@@ -1203,7 +1225,8 @@ Because the store is plain files, the primary debugging tool is the filesystem i
 (inspect with `jq`, delete a thread by removing its file). In addition, `giskard-persist`
 exposes a small maintenance API used by a `giskard-admin` binary (or hidden UI panel):
 
-- `list_projects`, `list_threads(project)`, `dump_thread(id)` (pretty JSON to stdout),
+- `list_projects`, `list_threads(project)` (including active/archived status),
+  `dump_thread(id)` (pretty JSON to stdout),
 - `delete_thread(id)`, `delete_project(id)` (with confirmation),
 - `validate_all` (parse every file, report corruption),
 - `compact_thread(id)` (rewrite/prune the jsonl log).
@@ -1299,7 +1322,16 @@ Flow: user clicks "New project" → names it → picks a directory via the file 
 - **Interrupt:** user can interrupt an in-flight turn (`turn/interrupt`). The UI exposes this as a
   live-turn Stop control; sending another user message while a turn is still live is a separate
   queueing policy and is not implied by interrupt support.
-- **Rename / delete:** thread title editable; delete removes the thread file (§5.5).
+- **Archive / unarchive:** the thread list exposes an actions menu (`...`) per thread. Archive calls
+  the harness lifecycle operation first (Codex `thread/archive`) and marks the local thread
+  metadata `archived = true` only after success. Unarchive is the reverse operation (Codex
+  `thread/unarchive`, then `archived = false`). Archived threads are listed separately and do not
+  restore as the active thread after reload.
+- **Delete:** delete calls the harness lifecycle operation first (Codex `thread/delete`) and removes
+  local `<thread_id>.json` + `<thread_id>.jsonl` only after success. Delete also drops the in-memory
+  Giskard harness handle. Archive/delete are rejected while the thread has an active turn or running
+  command; the browser surfaces the failure as an error notice.
+- **Rename:** thread title editable.
 
 ### 7.2 Titles
 

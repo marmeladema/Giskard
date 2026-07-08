@@ -316,6 +316,45 @@ impl HarnessRegistry {
         harness.terminate_command(&handle, &process_id).await
     }
 
+    pub async fn set_thread_archived(
+        &self,
+        config: &ProjectConfig,
+        thread_id: ThreadId,
+        harness_thread_id: String,
+        archived: bool,
+    ) -> Result<(), HarnessError> {
+        let harness = self.get_or_create_harness(config.id, config).await?;
+        let handle = self
+            .get_thread_handle(thread_id)
+            .await
+            .unwrap_or(ThreadHandle {
+                thread: thread_id,
+                harness_thread_id,
+                warning: None,
+            });
+        harness.set_thread_archived(&handle, archived).await
+    }
+
+    pub async fn delete_thread(
+        &self,
+        config: &ProjectConfig,
+        thread_id: ThreadId,
+        harness_thread_id: String,
+    ) -> Result<(), HarnessError> {
+        let harness = self.get_or_create_harness(config.id, config).await?;
+        let handle = self
+            .get_thread_handle(thread_id)
+            .await
+            .unwrap_or(ThreadHandle {
+                thread: thread_id,
+                harness_thread_id,
+                warning: None,
+            });
+        harness.delete_thread(&handle).await?;
+        self.forget_thread(thread_id).await;
+        Ok(())
+    }
+
     pub async fn get_thread_handle(&self, thread_id: ThreadId) -> Option<ThreadHandle> {
         let threads = self.threads.lock().await;
         threads.get(&thread_id).map(|(_, h)| h.clone())
@@ -324,6 +363,11 @@ impl HarnessRegistry {
     pub async fn get_project_for_thread(&self, thread_id: ThreadId) -> Option<ProjectId> {
         let threads = self.threads.lock().await;
         threads.get(&thread_id).map(|(p, _)| *p)
+    }
+
+    pub async fn forget_thread(&self, thread_id: ThreadId) {
+        let mut threads = self.threads.lock().await;
+        threads.remove(&thread_id);
     }
 }
 
@@ -864,6 +908,7 @@ mod tests {
                     tokens: TokenLedger::default(),
                     created_at: now,
                     updated_at: now,
+                    archived: false,
                 },
             )
             .await

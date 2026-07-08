@@ -66,6 +66,15 @@ enum ControlCommand {
         process_id: String,
         response: oneshot::Sender<Result<(), HarnessError>>,
     },
+    SetThreadArchived {
+        thread: ThreadHandle,
+        archived: bool,
+        response: oneshot::Sender<Result<(), HarnessError>>,
+    },
+    DeleteThread {
+        thread: ThreadHandle,
+        response: oneshot::Sender<Result<(), HarnessError>>,
+    },
     Shutdown {
         response: oneshot::Sender<Result<(), HarnessError>>,
     },
@@ -279,6 +288,37 @@ impl AgentHarness for CodexHarness {
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
 
+    async fn set_thread_archived(
+        &self,
+        thread: &ThreadHandle,
+        archived: bool,
+    ) -> Result<(), HarnessError> {
+        let (tx, rx) = oneshot::channel();
+        self.control_tx
+            .send(ControlCommand::SetThreadArchived {
+                thread: thread.clone(),
+                archived,
+                response: tx,
+            })
+            .await
+            .map_err(|_| HarnessError::Transport("background task closed".into()))?;
+        rx.await
+            .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
+    }
+
+    async fn delete_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
+        let (tx, rx) = oneshot::channel();
+        self.control_tx
+            .send(ControlCommand::DeleteThread {
+                thread: thread.clone(),
+                response: tx,
+            })
+            .await
+            .map_err(|_| HarnessError::Transport("background task closed".into()))?;
+        rx.await
+            .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
+    }
+
     async fn shutdown(&self) -> Result<(), HarnessError> {
         if self.shutdown_called.swap(true, Ordering::SeqCst) {
             return Ok(());
@@ -406,6 +446,22 @@ async fn background_task(
                                 .await;
                         let _ = response.send(result);
                     }
+                    Some(ControlCommand::SetThreadArchived {
+                        thread,
+                        archived,
+                        response,
+                    }) => {
+                        let result = handle_set_thread_archived(&mut client, &thread, archived)
+                            .await;
+                        let _ = response.send(result);
+                    }
+                    Some(ControlCommand::DeleteThread { thread, response }) => {
+                        let result = handle_delete_thread(&mut client, &thread).await;
+                        if result.is_ok() {
+                            senders.lock().await.remove(&thread.thread);
+                        }
+                        let _ = response.send(result);
+                    }
                     Some(ControlCommand::Shutdown { response }) => {
                         let _ = client.shutdown().await;
                         let _ = response.send(Ok(()));
@@ -488,6 +544,16 @@ async fn handle_idle_server_message(
                         let result =
                             handle_terminate_command(client, mapper, &thread, &process_id).await;
                         let _ = response.send(result);
+                    }
+                    Some(ControlCommand::SetThreadArchived { response, .. }) => {
+                        let _ = response.send(Err(HarnessError::Unsupported(
+                            "thread archiving is not available during an active turn".into(),
+                        )));
+                    }
+                    Some(ControlCommand::DeleteThread { response, .. }) => {
+                        let _ = response.send(Err(HarnessError::Unsupported(
+                            "thread deletion is not available during an active turn".into(),
+                        )));
                     }
                     Some(ControlCommand::Shutdown { response }) => {
                         let _ = response.send(Ok(()));
@@ -815,6 +881,16 @@ async fn stream_turn_events(
                                     .await;
                             let _ = response.send(result);
                         }
+                        Some(ControlCommand::SetThreadArchived { response, .. }) => {
+                            let _ = response.send(Err(HarnessError::Unsupported(
+                                "thread archiving is not available during an active turn".into(),
+                            )));
+                        }
+                        Some(ControlCommand::DeleteThread { response, .. }) => {
+                            let _ = response.send(Err(HarnessError::Unsupported(
+                                "thread deletion is not available during an active turn".into(),
+                            )));
+                        }
                         Some(ControlCommand::Shutdown { response }) => {
                             let _ = response.send(Ok(()));
                             return StreamOutcome::Shutdown;
@@ -872,6 +948,18 @@ async fn handle_stream_control(
         }) => {
             let result = handle_terminate_command(client, mapper, &thread, &process_id).await;
             let _ = response.send(result);
+            StreamControlOutcome::Continue
+        }
+        Some(ControlCommand::SetThreadArchived { response, .. }) => {
+            let _ = response.send(Err(HarnessError::Unsupported(
+                "thread archiving is not available during an active turn".into(),
+            )));
+            StreamControlOutcome::Continue
+        }
+        Some(ControlCommand::DeleteThread { response, .. }) => {
+            let _ = response.send(Err(HarnessError::Unsupported(
+                "thread deletion is not available during an active turn".into(),
+            )));
             StreamControlOutcome::Continue
         }
         Some(ControlCommand::Shutdown { response }) => {
@@ -1011,6 +1099,45 @@ async fn handle_terminate_command(
             ))
         })?;
     handle_interrupt_turn(client, &thread.harness_thread_id, native_turn_id).await
+}
+
+async fn handle_set_thread_archived(
+    client: &mut codex_codes::AsyncClient,
+    thread: &ThreadHandle,
+    archived: bool,
+) -> Result<(), HarnessError> {
+    if archived {
+        let params = codex_codes::ThreadArchiveParams {
+            thread_id: thread.harness_thread_id.clone(),
+        };
+        client
+            .thread_archive(&params)
+            .await
+            .map_err(|e| HarnessError::Transport(e.to_string()))?;
+    } else {
+        let params = codex_codes::ThreadUnarchiveParams {
+            thread_id: thread.harness_thread_id.clone(),
+        };
+        let _: codex_codes::ThreadUnarchiveResponse = client
+            .request(codex_codes::protocol::methods::THREAD_UNARCHIVE, &params)
+            .await
+            .map_err(|e| HarnessError::Transport(e.to_string()))?;
+    }
+    Ok(())
+}
+
+async fn handle_delete_thread(
+    client: &mut codex_codes::AsyncClient,
+    thread: &ThreadHandle,
+) -> Result<(), HarnessError> {
+    let params = codex_codes::ThreadDeleteParams {
+        thread_id: thread.harness_thread_id.clone(),
+    };
+    client
+        .thread_delete(&params)
+        .await
+        .map_err(|e| HarnessError::Transport(e.to_string()))?;
+    Ok(())
 }
 
 async fn handle_interrupt_turn(

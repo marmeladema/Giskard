@@ -10,7 +10,7 @@ use axum::{
     },
     middleware,
     response::{IntoResponse, Json},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use chrono::Utc;
 use serde::Deserialize;
@@ -43,6 +43,14 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
         .route(
             "/api/projects/{id}/threads",
             get(list_threads).post(open_thread),
+        )
+        .route(
+            "/api/projects/{id}/threads/{thread_id}",
+            delete(delete_thread),
+        )
+        .route(
+            "/api/projects/{id}/threads/{thread_id}/archive",
+            post(archive_thread),
         )
         .route("/api/projects/{id}/highlight", get(highlight_file))
         .route("/api/projects/{id}/raw", get(download_file))
@@ -209,6 +217,23 @@ async fn delete_project(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+async fn reject_thread_mutation_if_live(
+    state: &AppState,
+    thread_id: ThreadId,
+) -> Result<(), ApiError> {
+    if state.live_buffers.is_active(thread_id).await {
+        return Err(ApiError::Conflict(
+            "thread has an active turn; stop it before archiving or deleting".into(),
+        ));
+    }
+    if !state.running_commands.snapshot(thread_id).await.is_empty() {
+        return Err(ApiError::Conflict(
+            "thread has running commands; stop them before archiving or deleting".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn list_threads(
     State(state): State<AppState>,
     AxumPath(project_id): AxumPath<ProjectId>,
@@ -221,6 +246,7 @@ async fn list_threads(
                 id: tf.id,
                 title: tf.title,
                 mode: tf.mode,
+                archived: tf.archived,
                 created_at: tf.created_at,
                 updated_at: tf.updated_at,
             });
@@ -367,6 +393,7 @@ async fn open_thread(
         tokens: giskard_core::token::TokenLedger::default(),
         created_at: now,
         updated_at: now,
+        archived: false,
     };
     state.store.save_thread(project_id, &thread_file).await?;
 
@@ -385,6 +412,75 @@ async fn open_thread(
         harness_thread_id: handle.harness_thread_id,
         warning,
     }))
+}
+
+async fn archive_thread(
+    State(state): State<AppState>,
+    AxumPath((project_id, thread_id)): AxumPath<(ProjectId, ThreadId)>,
+    Json(req): Json<ArchiveThreadRequest>,
+) -> Result<Json<ThreadSummary>, ApiError> {
+    reject_thread_mutation_if_live(&state, thread_id).await?;
+    let project_config = state
+        .store
+        .load_project(project_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let thread_file = state
+        .store
+        .load_thread(project_id, thread_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    state
+        .registry
+        .set_thread_archived(
+            &project_config,
+            thread_id,
+            thread_file.harness_thread_id,
+            req.archived,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let tf = state
+        .store
+        .update_thread(project_id, thread_id, |tf| {
+            tf.archived = req.archived;
+            tf.updated_at = Utc::now();
+        })
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+    Ok(Json(ThreadSummary {
+        id: tf.id,
+        title: tf.title,
+        mode: tf.mode,
+        archived: tf.archived,
+        created_at: tf.created_at,
+        updated_at: tf.updated_at,
+    }))
+}
+
+async fn delete_thread(
+    State(state): State<AppState>,
+    AxumPath((project_id, thread_id)): AxumPath<(ProjectId, ThreadId)>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    reject_thread_mutation_if_live(&state, thread_id).await?;
+    let project_config = state
+        .store
+        .load_project(project_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let thread_file = state
+        .store
+        .load_thread(project_id, thread_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    state
+        .registry
+        .delete_thread(&project_config, thread_id, thread_file.harness_thread_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    state.store.delete_thread(project_id, thread_id).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]
@@ -1616,6 +1712,7 @@ pub enum ApiError {
     NotFound,
     BadRequest(String),
     Forbidden(String),
+    Conflict(String),
     Internal(String),
 }
 
@@ -1625,6 +1722,7 @@ impl IntoResponse for ApiError {
             ApiError::NotFound => (axum::http::StatusCode::NOT_FOUND, "not found".into()),
             ApiError::BadRequest(msg) => (axum::http::StatusCode::BAD_REQUEST, msg),
             ApiError::Forbidden(msg) => (axum::http::StatusCode::FORBIDDEN, msg),
+            ApiError::Conflict(msg) => (axum::http::StatusCode::CONFLICT, msg),
             ApiError::Internal(msg) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
         (status, msg).into_response()
