@@ -453,6 +453,88 @@ api_key = "secret-key"
     );
 }
 
+/// A discovery failure (here: a 401 because no `api_key` is configured) is reported as a warning in
+/// the refresh response instead of silently yielding no models.
+#[tokio::test]
+async fn dynamic_model_refresh_reports_failure() {
+    let mock = Router::new().route(
+        "/models",
+        get(|| async {
+            (
+                axum::http::StatusCode::UNAUTHORIZED,
+                AxumJson(serde_json::json!({ "error": "unauthorized" })),
+            )
+        }),
+    );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(mock_listener, mock).await.unwrap() });
+
+    let port = 19210;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let hash = password_hash("testpass");
+    // model_listing enabled but no api_key ⇒ the mock rejects with 401.
+    tokio::fs::write(
+        tmp.path().join("config.toml"),
+        format!(
+            r#"
+[server]
+bind = "127.0.0.1:{port}"
+secure_cookies = false
+
+[auth]
+password_hash = "{hash}"
+session_days = 30
+
+[[providers]]
+id = "secured"
+name = "Secured"
+base_url = "http://{mock_addr}"
+wire_api = "responses"
+model_listing = true
+"#
+        ),
+    )
+    .await
+    .unwrap();
+
+    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
+    let state = AppState::new(
+        store,
+        Arc::new(DiffFactory {
+            fixture: make_fixture(),
+        }),
+        (0..32u8).collect(),
+    );
+    let app = build_app(state);
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let base = format!("http://127.0.0.1:{port}");
+    let (client, cookie) = login(&base).await;
+
+    let refreshed: serde_json::Value = client
+        .post(format!("{base}/api/models/refresh"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let warnings = refreshed["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1, "one provider failed: {refreshed}");
+    assert_eq!(warnings[0]["provider"], "secured");
+    assert!(
+        warnings[0]["message"].as_str().unwrap().contains("401"),
+        "warning names the status: {}",
+        warnings[0]["message"]
+    );
+}
+
 #[tokio::test]
 async fn history_pagination_over_websocket() {
     use futures_util::StreamExt;

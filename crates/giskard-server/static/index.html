@@ -345,7 +345,8 @@ async function startApp() {
 // Re-pull the model list, merging each `model_listing` provider's /v1/models over the static list,
 // then re-render the pickers. Best-effort; on failure the current list stays.
 let _refreshingModels = false;
-async function refreshModels() {
+async function refreshModels(opts) {
+  opts = opts || {};
   if (_refreshingModels) return;
   _refreshingModels = true;
   const btn = $("refreshModels"); if (btn) btn.disabled = true;
@@ -356,6 +357,11 @@ async function refreshModels() {
       renderModelSelect();
       populateModalModels();
     }
+    // Surface per-provider discovery failures (e.g. a 401 from a misconfigured api_key) so they
+    // aren't silent. Suppressed on the modal-open auto-refresh to avoid duplicate toasts.
+    if (opts.announce !== false && res && Array.isArray(res.warnings)) {
+      for (const w of res.warnings) notice(`Model discovery — ${w.provider}: ${w.message}`, "warning");
+    }
   } catch (e) {
     notice("Could not refresh models: "+e.message, "warning");
   } finally {
@@ -363,7 +369,7 @@ async function refreshModels() {
     if (btn) btn.disabled = false;
   }
 }
-$("refreshModels").onclick = refreshModels;
+$("refreshModels").onclick = () => refreshModels();
 
 /* ---------- projects & threads ---------- */
 async function loadProjects() {
@@ -436,7 +442,7 @@ function openProjectModal() {
   $("projectModal").classList.add("open");
   // Start browsing where we last were, falling back to the filesystem root.
   browsePicker(localStorage.getItem("giskard.lastBrowse") || "/");
-  refreshModels();   // pull discovered models so a just-added provider shows up
+  refreshModels({ announce:false });   // pull discovered models; startup already announced failures
 }
 function closeProjectModal() { $("projectModal").classList.remove("open"); }
 $("pmCancel").onclick = closeProjectModal;
