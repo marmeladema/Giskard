@@ -8,7 +8,17 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.17
+**Version:** 1.18
+
+**Changelog (1.17 → 1.18), Codex collaboration mode alignment:**
+- **CM1:** Giskard Plan/Build mode now maps to both Codex sandbox policy and Codex
+  `collaborationMode` on `turn/start`: Plan sends `collaborationMode.mode = "plan"` and Build
+  sends `collaborationMode.mode = "default"`. This keeps Codex-only tool availability, including
+  `request_user_input` / `item/tool/requestUserInput`, aligned with the visible Giskard mode and
+  resets the app-server after a plan turn.
+- **CM2:** The Codex harness initializes app-server with `capabilities.experimentalApi = true`,
+  matching the current app-server contract needed for experimental interaction APIs such as
+  collaboration modes and `request_user_input`.
 
 **Changelog (1.16 → 1.17), thread-scoped approval policy:**
 - **AP1:** Approval policy is now a concrete thread setting stored in
@@ -1315,6 +1325,10 @@ Auto-generate an initial title from the first user message (truncated); user-edi
   an implementation plan without modifying files or performing mutating network actions.
 - **Build mode** ⇒ harness runs **workspace-write**; the agent implements, subject to the
   approval policy (§9).
+- For the Codex harness, this same thread mode also drives Codex's app-server
+  `collaborationMode`: Plan sends `plan`, Build sends `default`. This is distinct from sandboxing
+  but must stay synchronized because Codex gates some interaction tools, such as
+  `request_user_input` / `item/tool/requestUserInput`, on collaboration mode.
 - The mode applied to a turn is the thread's mode **at the moment `start_turn` is called**
   (Codex takes sandbox per turn). Switching mode takes effect on the next turn; the UI makes
   this explicit ("Plan mode — next message will be read-only").
@@ -2075,20 +2089,28 @@ codex app-server generate-ts          --out schemas/   # reference only; not use
 ```
 Artifacts are version-pinned to the Codex binary that produced them; regenerate on upgrade.
 
-> Sandbox/mode mapping: **Plan ⇒ `read-only`**, **Build ⇒ `workspace-write`**. Approval policy
-> maps to Codex's approval configuration. `TurnOverrides.model` maps to the per-turn `turn/start`
-> model field; reasoning effort is carried inside `ModelRef.reasoning_effort` (P1: no standalone
-> effort field on `TurnOverrides`). `TurnOverrides.approval_policy` is the thread policy snapshot
-> (P3/AP1: not a per-turn override).
+> Sandbox/mode mapping: **Plan ⇒ `read-only`**, **Build ⇒ `workspace-write`**. Codex
+> collaboration-mode mapping is sent on every turn too: **Plan ⇒ `plan`**, **Build ⇒ `default`**.
+> The Build/default send is intentional because Codex app-server collaboration mode is sticky after
+> a plan turn. Approval policy maps to Codex's approval configuration. `TurnOverrides.model` maps
+> to the per-turn `turn/start` model field; reasoning effort is carried inside
+> `ModelRef.reasoning_effort` (P1: no standalone effort field on `TurnOverrides`).
+> `TurnOverrides.approval_policy` is the thread policy snapshot (P3/AP1: not a per-turn override).
 
 **Client library:** use `codex-codes` (v0.143.0, tested against Codex CLI 0.143.0) with the
-`async-client` feature — its `AsyncClient` API (`start`, `thread_start`, `turn_start`,
-`next_message`, `respond`, `shutdown`) maps directly onto the `AgentHarness` trait. Its built-in
-schema coverage scorecard validates typed structs against `codex app-server generate-json-schema`
-output and can be wired into the CI drift check (§14.4). Fall back to `codex-app-server-sdk`
-(v0.5.1) or a hand-rolled client only if a future Codex CLI version diverges beyond what
-`codex-codes` tracks. Whichever is chosen, confine all Codex types to `giskard-harness-codex` and
-preserve the raw-JSON fallback for unknown/drifted messages.
+`async-client` feature — its `AsyncClient` API (`spawn`, `initialize`, `thread_start`, generic
+`request`, `next_message`, `respond`, `shutdown`) maps onto the `AgentHarness` trait. The Codex
+`turn/start` call uses the generic `request` path while `codex-codes`' typed `TurnStartParams`
+lags newer fields such as `collaborationMode`. Its built-in schema coverage scorecard validates
+typed structs against `codex app-server generate-json-schema` output and can be wired into the CI
+drift check (§14.4). Fall back to `codex-app-server-sdk` (v0.5.1) or a hand-rolled client only if a
+future Codex CLI version diverges beyond what `codex-codes` tracks. Whichever is chosen, confine all
+Codex types to `giskard-harness-codex` and preserve the raw-JSON fallback for unknown/drifted
+messages.
+
+The harness initializes Codex app-server with `capabilities.experimentalApi = true` before starting
+or resuming threads. This is required for the experimental app-server fields/requests Giskard
+supports, including `collaborationMode` and `item/tool/requestUserInput`.
 
 ### Appendix B — Example client↔server WebSocket messages
 
