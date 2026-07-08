@@ -244,6 +244,18 @@ impl AgentHarness for ReplayHarness {
         Ok(())
     }
 
+    async fn set_thread_archived(
+        &self,
+        _thread: &ThreadHandle,
+        _archived: bool,
+    ) -> Result<(), HarnessError> {
+        Ok(())
+    }
+
+    async fn delete_thread(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
+        Ok(())
+    }
+
     async fn shutdown(&self) -> Result<(), HarnessError> {
         if self.shutdown_called.swap(true, Ordering::SeqCst) {
             return Ok(());

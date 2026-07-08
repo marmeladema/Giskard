@@ -42,9 +42,17 @@
 
   .proj { margin-bottom:10px; }
   .proj > .name { font-weight:600; display:flex; justify-content:space-between; align-items:center; }
-  .thread { padding:5px 8px; margin:3px 0 3px 8px; border-radius:6px; cursor:pointer; color:var(--muted); font-size:13px; }
+  .thread-row { position:relative; display:flex; align-items:center; gap:4px; margin:3px 0 3px 8px; border-radius:6px; }
+  .thread { flex:1; min-width:0; padding:5px 8px; border-radius:6px; cursor:pointer; color:var(--muted); font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .thread:hover { background:var(--panel2); }
   .thread.active { background:var(--panel2); color:var(--fg); }
+  .thread-menu-btn { width:28px; height:28px; padding:0; border-color:transparent; background:transparent; color:var(--muted); }
+  .thread-menu-btn:hover { border-color:var(--border); color:var(--fg); }
+  .thread-menu { position:absolute; right:0; top:30px; z-index:20; min-width:130px; padding:4px; border:1px solid var(--border); border-radius:6px; background:var(--panel); box-shadow:0 12px 32px rgba(0,0,0,.35); }
+  .thread-menu[hidden] { display:none; }
+  .thread-menu button { display:block; width:100%; padding:6px 8px; border:0; background:transparent; text-align:left; }
+  .thread-menu button:hover { background:var(--panel2); }
+  .thread-section-label { margin:8px 0 3px 8px; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:0; }
 
   header.thr { display:flex; gap:12px; align-items:center; padding:10px 14px; border-bottom:1px solid var(--border); background:var(--panel); flex-wrap:wrap; }
   header.thr .badge { font-size:12px; padding:2px 8px; border:1px solid var(--border); border-radius:20px; }
@@ -564,13 +572,98 @@ async function loadThreads(pid) {
   try {
     const { threads } = await api("GET",`/api/projects/${pid}/threads`);
     box.innerHTML="";
-    for (const t of threads) {
-      const el = document.createElement("div"); el.className="thread mono";
-      el.textContent = t.title || t.id.slice(0,8); el.dataset.tid = t.id;
-      el.onclick = () => openThread(pid, t.id, t.title);
-      box.append(el);
+    for (const t of threads.filter(t => !t.archived)) box.append(threadRow(pid, t));
+    const archived = threads.filter(t => t.archived);
+    if (archived.length) {
+      const label = document.createElement("div");
+      label.className = "thread-section-label";
+      label.textContent = "Archived";
+      box.append(label);
+      for (const t of archived) box.append(threadRow(pid, t));
     }
   } catch {}
+}
+
+function threadRow(pid, t) {
+  const row = document.createElement("div"); row.className="thread-row";
+  const title = t.title || t.id.slice(0,8);
+  const el = document.createElement("div"); el.className="thread mono";
+  el.textContent = title; el.title = title; el.dataset.tid = t.id;
+  el.onclick = () => openThread(pid, t.id, t.title);
+
+  const menuBtn = document.createElement("button");
+  menuBtn.type = "button"; menuBtn.className = "thread-menu-btn";
+  menuBtn.textContent = "..."; menuBtn.title = "Thread actions";
+  menuBtn.setAttribute("aria-label", "Thread actions");
+
+  const menu = document.createElement("div"); menu.className = "thread-menu"; menu.hidden = true;
+  const archive = document.createElement("button");
+  archive.type = "button"; archive.textContent = t.archived ? "Unarchive" : "Archive";
+  archive.onclick = async (e) => {
+    e.stopPropagation();
+    closeThreadMenus();
+    await setThreadArchived(pid, t.id, !t.archived);
+  };
+  const del = document.createElement("button");
+  del.type = "button"; del.textContent = "Delete"; del.className = "danger";
+  del.onclick = async (e) => {
+    e.stopPropagation();
+    closeThreadMenus();
+    await deleteThread(pid, t.id, title);
+  };
+  menu.append(archive, del);
+
+  menuBtn.onclick = (e) => {
+    e.stopPropagation();
+    const wasHidden = menu.hidden;
+    closeThreadMenus();
+    menu.hidden = !wasHidden;
+  };
+  row.append(el, menuBtn, menu);
+  return row;
+}
+
+function closeThreadMenus() {
+  document.querySelectorAll(".thread-menu").forEach(m => m.hidden = true);
+}
+
+document.addEventListener("click", closeThreadMenus);
+
+async function setThreadArchived(pid, tid, archived) {
+  try {
+    await api("POST", `/api/projects/${pid}/threads/${tid}/archive`, { archived });
+    if (state.threadId === tid && archived) clearThreadView(tid);
+    await loadThreads(pid);
+  } catch (e) {
+    notice((archived ? "Archive" : "Unarchive") + " thread failed: " + e.message, "error");
+  }
+}
+
+async function deleteThread(pid, tid, title) {
+  if (!confirm(`Delete thread "${title}"? This also deletes the Codex thread.`)) return;
+  try {
+    await api("DELETE", `/api/projects/${pid}/threads/${tid}`);
+    clearThreadView(tid);
+    await loadThreads(pid);
+  } catch (e) {
+    notice("Delete thread failed: " + e.message, "error");
+  }
+}
+
+function clearThreadView(tid) {
+  if (state.threadId !== tid) return;
+  try { localStorage.removeItem("giskard.lastThread"); } catch {}
+  const ws = state.ws;
+  state.ws = null;
+  if (ws) { try { ws.close(); } catch {} }
+  state.projectId = null; state.threadId = null;
+  state.pendingUserEl = null; state.pendingUserText = null;
+  setTurnActive(false);
+  state.awaitingInitialThreadState = false;
+  resetRenderState();
+  $("thrHeader").style.display="none"; $("composer").style.display="none";
+  $("transcript").innerHTML="";
+  setWsStatus("closed");
 }
 
 /* ---------- new-project modal + directory picker ---------- */

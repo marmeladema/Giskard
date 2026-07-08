@@ -150,6 +150,27 @@ pub trait AgentHarness: Send + Sync {
         )))
     }
 
+    /// Archive or unarchive a durable thread in the underlying harness, when supported.
+    async fn set_thread_archived(
+        &self,
+        thread: &ThreadHandle,
+        archived: bool,
+    ) -> Result<(), HarnessError> {
+        let action = if archived { "archiving" } else { "unarchiving" };
+        Err(HarnessError::Unsupported(format!(
+            "{action} thread {} is not supported",
+            thread.harness_thread_id
+        )))
+    }
+
+    /// Delete a durable thread in the underlying harness, when supported.
+    async fn delete_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
+        Err(HarnessError::Unsupported(format!(
+            "deleting thread {} is not supported",
+            thread.harness_thread_id
+        )))
+    }
+
     /// Cleanly shut down the harness.
     ///
     /// Takes `&self` (not `self: Arc<Self>`) so the trait stays object-safe.

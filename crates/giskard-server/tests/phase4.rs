@@ -11,10 +11,10 @@ use giskard_core::ids::{ItemId, ProjectId, ThreadId, TurnId};
 use giskard_core::item::{FileChangeKind, Item, ItemKind, ItemPayload, ItemStart};
 use giskard_core::model::ModelRef;
 use giskard_core::token::TokenUsage;
-use giskard_core::turn::{TurnStatus, TurnStatusKind};
+use giskard_core::turn::{ApprovalPolicy, Mode, TurnStatus, TurnStatusKind};
 use giskard_harness::AgentHarness;
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
-use giskard_persist::store::ProjectConfig;
+use giskard_persist::store::{ProjectConfig, ThreadFile};
 use giskard_proto::ClientMessage;
 use giskard_server::{AppState, HarnessFactory, build_app};
 
@@ -388,6 +388,64 @@ async fn render_endpoint_returns_sanitized_markdown_with_path_links() {
         "raw HTML must not pass through: {html}"
     );
     assert!(html.contains("&lt;img"), "raw HTML is escaped: {html}");
+}
+
+#[tokio::test]
+async fn thread_lifecycle_native_failure_preserves_local_thread() {
+    let port = 19037;
+    let (_data_dir, _proj_dir, state, pid, cookie) = start_server(port).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+
+    let tid = ThreadId::new();
+    let now = Utc::now();
+    state
+        .store
+        .save_thread(
+            pid,
+            &ThreadFile {
+                version: 1,
+                id: tid,
+                project_id: pid,
+                title: "Local thread".into(),
+                harness_thread_id: "native-thread".into(),
+                mode: Mode::Build,
+                current_model: ModelRef {
+                    provider: "openai".into(),
+                    model: "gpt-5.5".into(),
+                    reasoning_effort: None,
+                },
+                context_window: 262_144,
+                approval_policy: ApprovalPolicy::Ask,
+                model_efforts: Default::default(),
+                tokens: Default::default(),
+                created_at: now,
+                updated_at: now,
+                archived: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    let archive = client
+        .post(format!("{base}/api/projects/{pid}/threads/{tid}/archive"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"archived": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(archive.status(), 500);
+    let saved = state.store.load_thread(pid, tid).await.unwrap().unwrap();
+    assert!(!saved.archived);
+
+    let delete = client
+        .delete(format!("{base}/api/projects/{pid}/threads/{tid}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), 500);
+    assert!(state.store.load_thread(pid, tid).await.unwrap().is_some());
 }
 
 #[tokio::test]

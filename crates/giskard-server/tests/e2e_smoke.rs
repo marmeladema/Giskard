@@ -350,6 +350,177 @@ session_days = 30
     (tmp, Arc::new(state), port)
 }
 
+async fn login_cookie(client: &reqwest::Client, base: &str) -> String {
+    let resp = client
+        .post(format!("{base}/api/login"))
+        .json(&serde_json::json!({"password": "testpass"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    resp.headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+async fn create_project_and_thread(
+    client: &reqwest::Client,
+    base: &str,
+    cookie: &str,
+) -> (ProjectId, ThreadId) {
+    let project_resp = client
+        .post(format!("{base}/api/projects"))
+        .header("cookie", cookie)
+        .json(&serde_json::json!({
+            "name": "thread-actions",
+            "dir": "/tmp/thread-actions",
+            "default_model": {"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null},
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(project_resp.status(), 200);
+    let project_id: ProjectId = project_resp.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let thread_resp = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", cookie)
+        .json(&serde_json::json!({"resume": "th_test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(thread_resp.status(), 200);
+    let thread_id: ThreadId = thread_resp.json::<serde_json::Value>().await.unwrap()["thread_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    (project_id, thread_id)
+}
+
+#[tokio::test]
+async fn thread_archive_unarchive_updates_thread_summary() {
+    let (_tmp, _state, port) = start_server_with_extra_config_on_available_port("").await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+
+    let archived: serde_json::Value = client
+        .post(format!(
+            "{base}/api/projects/{project_id}/threads/{thread_id}/archive"
+        ))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"archived": true}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(archived["id"].as_str().unwrap(), thread_id.to_string());
+    assert_eq!(archived["archived"].as_bool(), Some(true));
+
+    let listed: serde_json::Value = client
+        .get(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["threads"][0]["archived"].as_bool(), Some(true));
+
+    let unarchived: serde_json::Value = client
+        .post(format!(
+            "{base}/api/projects/{project_id}/threads/{thread_id}/archive"
+        ))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"archived": false}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(unarchived["archived"].as_bool(), Some(false));
+}
+
+#[tokio::test]
+async fn thread_delete_removes_native_and_persisted_thread() {
+    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    assert_eq!(
+        state.registry.get_project_for_thread(thread_id).await,
+        Some(project_id)
+    );
+
+    let resp = client
+        .delete(format!(
+            "{base}/api/projects/{project_id}/threads/{thread_id}"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    assert!(
+        state
+            .store
+            .load_thread(project_id, thread_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(state.registry.get_project_for_thread(thread_id).await, None);
+}
+
+#[tokio::test]
+async fn thread_archive_and_delete_reject_active_turns() {
+    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    state.live_buffers.start_turn(thread_id).await;
+
+    let archive = client
+        .post(format!(
+            "{base}/api/projects/{project_id}/threads/{thread_id}/archive"
+        ))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"archived": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(archive.status(), 409);
+
+    let delete = client
+        .delete(format!(
+            "{base}/api/projects/{project_id}/threads/{thread_id}"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), 409);
+}
+
 #[tokio::test]
 async fn subscribe_unknown_thread_returns_structured_error() {
     let port = 18791;
@@ -698,6 +869,7 @@ async fn subscribe_reopens_persisted_thread() {
                 tokens: Default::default(),
                 created_at: now,
                 updated_at: now,
+                archived: false,
             },
         )
         .await
@@ -822,6 +994,7 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
                 tokens: Default::default(),
                 created_at: now,
                 updated_at: now,
+                archived: false,
             },
         )
         .await
@@ -971,6 +1144,7 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
                 tokens: Default::default(),
                 created_at: now,
                 updated_at: now,
+                archived: false,
             },
         )
         .await
@@ -1465,6 +1639,7 @@ wire_api = "responses"
                 tokens: Default::default(),
                 created_at: now,
                 updated_at: now,
+                archived: false,
             },
         )
         .await

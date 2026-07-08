@@ -243,6 +243,7 @@ pub struct ThreadSummary {
     pub id: ThreadId,
     pub title: String,
     pub mode: Mode,
+    pub archived: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -264,6 +265,11 @@ pub struct OpenThreadResponse {
     pub harness_thread_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<ErrorInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArchiveThreadRequest {
+    pub archived: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
