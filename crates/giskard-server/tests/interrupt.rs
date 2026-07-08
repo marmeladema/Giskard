@@ -625,6 +625,7 @@ async fn terminate_failure_preserves_snapshot(behavior: TerminateBehavior, expec
 
     let error = wait_for_error(&mut ws, "terminate_command", expected_code).await;
     assert_eq!(error.thread_id, Some(thread_id));
+    assert_eq!(error.process_id.as_deref(), Some("proc_1"));
     let snapshot = app.state.running_commands.snapshot(thread_id).await;
     assert_eq!(snapshot.len(), 1);
     assert_eq!(snapshot[0].process_id.as_deref(), Some("proc_1"));

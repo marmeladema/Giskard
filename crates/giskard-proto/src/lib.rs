@@ -138,6 +138,10 @@ pub struct ErrorInfo {
     pub thread_id: Option<ThreadId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
+    /// Command process the error refers to, when the failing action targeted a specific command
+    /// (e.g. `terminate_command`). Lets the client scope any recovery to that one command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -466,6 +470,7 @@ mod tests {
                 detail: Some("missing".into()),
                 thread_id: Some(tid),
                 action: Some("subscribe".into()),
+                process_id: None,
             },
         };
         let json = serde_json::to_value(&msg).unwrap();

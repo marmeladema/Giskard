@@ -48,6 +48,23 @@ pub struct ItemStart {
     pub command: Option<CommandExecutionStart>,
 }
 
+/// Normalize a command-execution status string for comparison (lowercase, `-` → `_`).
+///
+/// Codex reports statuses like `inProgress` / `in_progress` / `in-progress`; normalizing here
+/// keeps the running/terminal classification consistent across the harness, server registry, and
+/// live-turn buffer.
+pub fn normalized_command_status(status: &str) -> String {
+    status.to_ascii_lowercase().replace('-', "_")
+}
+
+/// Returns true when a command-execution status string denotes a still-running command.
+pub fn command_status_is_running(status: &str) -> bool {
+    matches!(
+        normalized_command_status(status).as_str(),
+        "in_progress" | "inprogress" | "running"
+    )
+}
+
 /// Command metadata available when a command item starts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandExecutionStart {
