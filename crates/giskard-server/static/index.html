@@ -53,6 +53,7 @@
   .settings-head button { font-size:12px; padding:4px 8px; }
   .settings-field label { display:block; color:var(--muted); font-size:12px; margin-bottom:4px; }
   .settings-field select { width:100%; }
+  .settings-field button { width:100%; }
   /* The center column owns both dividers, so each delimiter line hugs the thread and the drag
      bar sits just outside it — symmetric on the left and right. */
   .center { display:flex; flex-direction:column; border-left:1px solid var(--border); border-right:1px solid var(--border); }
@@ -82,11 +83,10 @@
   .thread-section-label { margin:8px 0 3px 8px; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:0; }
 
   header.thr { display:flex; gap:12px; align-items:center; padding:10px 14px; border-bottom:1px solid var(--border); background:var(--panel); flex-wrap:wrap; }
-  header.thr .badge { font-size:12px; padding:2px 8px; border:1px solid var(--border); border-radius:20px; }
-  .thread-control { display:flex; align-items:center; gap:6px; min-height:30px; }
-  .thread-control-label { color:var(--muted); font-size:12px; }
-  .thread-control select { height:30px; padding:3px 8px; }
-  header.thr .gauge { font-size:12px; }
+  /* Header controls are chrome, not content: keep their type a step smaller than the body so the
+     transcript stays the focal point. */
+  header.thr .badge { font-size:11px; padding:2px 8px; border:1px solid var(--border); border-radius:20px; }
+  header.thr .gauge { font-size:11px; }
   .mcp-wrap { position:relative; }
   .mcp-btn { display:flex; align-items:center; gap:6px; }
   .mcp-dot { width:8px; height:8px; border-radius:50%; background:var(--muted); display:inline-block; }
@@ -94,7 +94,7 @@
   .mcp-dot.warn { background:#d29922; }
   .mcp-dot.err { background:#f85149; }
   .mcp-popover {
-    position:absolute; right:0; top:34px; z-index:35; width:min(520px, calc(100vw - 24px));
+    position:absolute; left:0; top:34px; z-index:35; width:min(520px, calc(100vw - 24px));
     max-height:70vh; overflow:auto; padding:10px; border:1px solid var(--border);
     border-radius:8px; background:var(--panel); box-shadow:0 20px 48px rgba(0,0,0,.45);
   }
@@ -124,7 +124,7 @@
   .tasks-btn.state-running { color:#f0d98c; border-color:#d29922; background:rgba(210,153,34,.08); }
   .tasks-btn.state-stopping { color:#c9d1d9; border-color:#8b949e; background:rgba(139,148,158,.10); }
   .tasks-popover {
-    position:absolute; right:0; top:34px; z-index:35; width:min(480px, calc(100vw - 24px));
+    position:absolute; left:0; top:34px; z-index:35; width:min(480px, calc(100vw - 24px));
     max-height:70vh; overflow:auto; padding:10px; border:1px solid var(--border);
     border-radius:8px; background:var(--panel); box-shadow:0 20px 48px rgba(0,0,0,.45);
   }
@@ -244,6 +244,37 @@
 
   .composer { display:flex; gap:8px; padding:12px; border-top:1px solid var(--border); background:var(--panel); }
   .composer textarea { flex:1; resize:none; height:52px; }
+
+  /* Turn/model pickers: small low-emphasis chips below the composer that open popovers upward
+     (they sit at the very bottom). The bar splits them left (mode+approval) and right (model). */
+  .picker-bar { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:0 12px 10px; background:var(--panel); }
+  .picker { position:relative; min-width:0; }
+  .mp-btn {
+    display:inline-flex; align-items:center; gap:6px; max-width:100%;
+    padding:3px 10px; font-size:11px; color:var(--muted);
+    background:var(--panel2); border:1px solid var(--border); border-radius:20px;
+  }
+  .mp-btn:hover:not(:disabled) { color:var(--fg); border-color:var(--accent); }
+  .mp-btn:disabled { opacity:.55; cursor:not-allowed; }
+  .mp-btn .mp-label { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .mp-btn .mp-caret { font-size:9px; opacity:.7; }
+  .mp-popover {
+    position:absolute; bottom:calc(100% + 6px); z-index:45;
+    width:min(380px, calc(100vw - 24px)); padding:10px;
+    display:grid; grid-template-columns:1fr 1fr; gap:6px 10px;
+    border:1px solid var(--border); border-radius:8px; background:var(--panel);
+    box-shadow:0 20px 48px rgba(0,0,0,.45);
+  }
+  .picker-left .mp-popover { left:0; }
+  .picker-right .mp-popover { right:0; }
+  .mp-popover[hidden] { display:none; }
+  /* Labels on the first line, dropdowns on the second. When the model has no effort setting the
+     model field spans the full width instead of leaving a dangling empty column. */
+  .mp-popover:has(#effortControl[hidden]) .mp-field { grid-column:1 / -1; }
+  .mp-field { display:grid; gap:4px; margin:0; }
+  .mp-field[hidden] { display:none; }   /* the grid display above would otherwise defeat [hidden] */
+  .mp-field > label, .mp-field > span { color:var(--muted); font-size:11px; }
+  .mp-field select { width:100%; }
   .composer textarea:disabled { opacity:.65; cursor:not-allowed; }
   button:disabled { opacity:.55; cursor:not-allowed; }
 
@@ -470,11 +501,26 @@
     .resizer { display:none; }
     .center { border:0; height:100vh; height:100dvh; }
     #mobileBar { display:flex; }
-    header.thr .badge#thrTitle { display:none; }   /* title already shown in the mobile bar */
+    /* Tighten the header on phones; with only the status badges left it stays on one line. */
+    header.thr { gap:7px 6px; padding:7px 10px; }
+    header.thr .badge { padding:3px 7px; }
+    /* The context gauge ("12.3k / 272k") is the widest element in the bar. Hide the inline number
+       on phones — the full breakdown is one tap away in the Context card — so the row packs. */
+    header.thr #gauge { display:none; }
 
-    /* The sidebar becomes an off-canvas drawer. */
+    /* Header menus anchor to their button (right-aligned). Tasks/MCP sit near the left edge, so on
+       phones their wide popovers spilled off the left of the screen. Pin all three below the header
+       spanning the viewport width, so they open fully on-screen regardless of which button. */
+    .tasks-popover, .mcp-popover, .usage-popover {
+      position:fixed; left:12px; right:12px; top:86px; width:auto; max-height:calc(100dvh - 150px);
+    }
+
+    /* The sidebar becomes an off-canvas drawer. dvh + the safe-area inset keep the settings
+       footer clear of the mobile browser's bottom chrome and the home indicator; with the
+       inherited height:100vh it was pinned to a bottom edge that those UI layers overlap. */
     .sidebar {
-      position:fixed; top:0; bottom:0; width:84%; max-width:340px; z-index:60;
+      position:fixed; top:0; bottom:0; height:100dvh; width:84%; max-width:340px; z-index:60;
+      padding-bottom:calc(12px + env(safe-area-inset-bottom));
       transition:transform .22s ease; will-change:transform;
     }
     .sidebar { left:0; transform:translateX(-100%); border-right:1px solid var(--border); }
@@ -521,6 +567,10 @@
               <option value="terminal">Terminal</option>
             </select>
           </div>
+          <div class="settings-field">
+            <label for="refreshModels">Models</label>
+            <button id="refreshModels" type="button" title="Refresh the model list from the provider's /v1/models endpoint">↻ Reload models</button>
+          </div>
         </div>
       </div>
     </div>
@@ -533,22 +583,6 @@
         <div class="mbTitle" id="mbTitle">Giskard</div>
       </div>
       <header class="thr" id="thrHeader" style="display:none">
-        <span class="badge mono" id="thrTitle">—</span>
-        <button id="modeBtn" class="badge" title="Toggle Plan/Build">build</button>
-        <label class="thread-control" title="Approval policy for agent commands and file changes in this thread">
-          <span class="thread-control-label">Approvals</span>
-          <select id="approvalSel" aria-label="Approval policy">
-            <option value="ask">Ask first</option>
-            <option value="auto">Auto approve</option>
-            <option value="read_only">Read only</option>
-          </select>
-        </label>
-        <select id="modelSel" class="mono"></select>
-        <label id="effortControl" class="thread-control" title="Reasoning effort for the selected model" hidden>
-          <span class="thread-control-label">Effort</span>
-          <select id="effortSel" aria-label="Reasoning effort"></select>
-        </label>
-        <button id="refreshModels" class="badge" title="Refresh model list from provider /v1/models">↻</button>
         <div class="tasks-wrap">
           <button id="tasksBtn" class="badge tasks-btn state-idle" title="Running tasks" aria-label="Running tasks">
             <span>Tasks</span><span id="tasksCount" class="mono">0</span>
@@ -573,6 +607,51 @@
         <textarea id="input" placeholder="Message the agent…  (Enter to send, Shift+Enter for newline)"></textarea>
         <button class="primary" id="sendBtn">Send</button>
         <button class="danger" id="stopBtn" title="Interrupt the running turn" hidden>Stop</button>
+      </div>
+      <!-- Turn settings sit below the composer, split left/right: the turn's "how" (mode +
+           approvals) on the left, the model it runs on (model + effort) on the right. Each is a
+           compact chip opening a two-column popover. The selects keep their ids so the existing
+           mode / approval / model / effort logic is unchanged. -->
+      <div class="picker-bar" id="pickerBar" style="display:none">
+        <div class="picker picker-left" id="turnPicker">
+          <button id="turnPickerBtn" class="mp-btn" type="button" aria-haspopup="true"
+                  title="Mode & approval policy for this thread">
+            <span class="mp-label">Build · Ask first</span><span class="mp-caret">▾</span>
+          </button>
+          <div id="turnPickerMenu" class="mp-popover" hidden>
+            <div class="mp-field">
+              <label for="modeSel">Mode</label>
+              <select id="modeSel" aria-label="Agent mode">
+                <option value="build">Build</option>
+                <option value="plan">Plan</option>
+              </select>
+            </div>
+            <div class="mp-field">
+              <label for="approvalSel">Approvals</label>
+              <select id="approvalSel" aria-label="Approval policy">
+                <option value="ask">Ask first</option>
+                <option value="auto">Auto approve</option>
+                <option value="read_only">Read only</option>
+              </select>
+            </div>
+          </div>
+        </div>
+        <div class="picker picker-right" id="modelPicker">
+          <button id="modelPickerBtn" class="mp-btn" type="button" aria-haspopup="true"
+                  title="Model & reasoning effort for this thread">
+            <span class="mp-label">Model</span><span class="mp-caret">▾</span>
+          </button>
+          <div id="modelPickerMenu" class="mp-popover" hidden>
+            <div class="mp-field">
+              <label for="modelSel">Model</label>
+              <select id="modelSel" class="mono"></select>
+            </div>
+            <label id="effortControl" class="mp-field" title="Reasoning effort for the selected model" hidden>
+              <span>Effort</span>
+              <select id="effortSel" aria-label="Reasoning effort"></select>
+            </label>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -1011,6 +1090,7 @@ function clearThreadView(tid) {
   state.awaitingInitialThreadState = false;
   resetRenderState();
   $("thrHeader").style.display="none"; $("composer").style.display="none";
+  $("pickerBar").style.display="none"; closeModelPicker(); closeTurnPicker();
   $("transcript").innerHTML="";
   setWsStatus("closed");
 }
@@ -1145,6 +1225,7 @@ async function openThread(pid, tid, title, opts) {
   resetRenderState();
   document.querySelectorAll(".thread").forEach(e => e.classList.toggle("active", e.dataset.tid===tid));
   $("thrHeader").style.display="flex"; $("composer").style.display="flex";
+  $("pickerBar").style.display="flex";
   setThreadTitle(title || tid.slice(0,8));
   $("transcript").className=""; $("transcript").innerHTML=""; $("notices").innerHTML="";
   closeDrawers();   // on mobile, reveal the transcript after picking a thread
@@ -1211,6 +1292,7 @@ function updateComposerControls() {
   $("stopBtn").disabled = !ready || state.interruptPending;
   $("stopBtn").textContent = state.interruptPending ? "Stopping…" : "Stop";
   $("modelSel").disabled = !state.threadId;
+  $("modelPickerBtn").disabled = !state.threadId;
   $("effortSel").disabled = !state.threadId;
   const compactBtn = $("compactBtn");
   if (compactBtn) {
@@ -1224,6 +1306,8 @@ function updateComposerControls() {
     state.wsStatus==="connecting" ? "Connecting to agent…" :
     "WebSocket disconnected";
   $("approvalSel").disabled = !state.threadId;
+  $("modeSel").disabled = !state.threadId;
+  $("turnPickerBtn").disabled = !state.threadId;
 }
 function setTurnActive(active) {
   state.activeTurn = active;
@@ -1288,9 +1372,8 @@ function renderThreadState(s) {
   if (!s) return;
   const initialThreadState = state.awaitingInitialThreadState;
   state.awaitingInitialThreadState = false;
-  state.mode = s.mode || "build";
+  setMode(s.mode || "build");
   setApprovalPolicy(s.approval_policy || "ask");
-  $("modeBtn").textContent = state.mode;
   if (s.current_model) {
     state.currentModel = s.current_model;
     syncModelControls();
@@ -1307,9 +1390,24 @@ function renderThreadState(s) {
     resetRenderState();
   }
 }
+const MODE_LABELS = { build:"Build", plan:"Plan" };
+const APPROVAL_LABELS = { ask:"Ask first", auto:"Auto approve", read_only:"Read only" };
+// Summarise "mode · approvals" on the turn chip below the composer.
+function updateTurnButton() {
+  const btn = $("turnPickerBtn"); if (!btn) return;
+  const mode = MODE_LABELS[state.mode] || "Build";
+  const appr = APPROVAL_LABELS[state.approvalPolicy] || "Ask first";
+  btn.querySelector(".mp-label").textContent = `${mode} · ${appr}`;
+}
+function setMode(mode) {
+  state.mode = mode === "plan" ? "plan" : "build";
+  $("modeSel").value = state.mode;
+  updateTurnButton();
+}
 function setApprovalPolicy(policy) {
   state.approvalPolicy = policy || "ask";
   $("approvalSel").value = state.approvalPolicy;
+  updateTurnButton();
 }
 
 // Render the most recent page of persisted history (H6), oldest-first. Older pages are available
@@ -3872,10 +3970,19 @@ function compactContext() {
   }
 }
 
-$("modeBtn").onclick = () => {
-  state.mode = state.mode==="build" ? "plan" : "build";
-  $("modeBtn").textContent = state.mode;
-  send({ type:"switch_mode", thread_id: state.threadId, mode: state.mode });
+$("modeSel").onchange = () => {
+  const previous = state.mode || "build";
+  const mode = $("modeSel").value === "plan" ? "plan" : "build";
+  if (!state.threadId) {
+    setMode(previous);
+    return;
+  }
+  if (send({ type:"switch_mode", thread_id: state.threadId, mode })) {
+    setMode(mode);
+  } else {
+    setMode(previous);
+    notice(`Mode not changed: WebSocket is ${state.wsStatus}.`, "error");
+  }
 };
 
 $("approvalSel").onchange = () => {
@@ -3931,7 +4038,24 @@ function syncModelControls() {
   if (state.currentModel) setModel(modelKey(state.currentModel));
   syncEffortControl();
 }
+// Summarise the current model (and effort, when set) on the picker chip below the composer.
+function updateModelButton() {
+  const btn = $("modelPickerBtn"); if (!btn) return;
+  const label = btn.querySelector(".mp-label");
+  const m = state.currentModel;
+  if (!m || !m.model) { label.textContent = "Model"; return; }
+  const desc = findModelDescriptor(m.provider, m.model);
+  let txt = (desc && (desc.display_name || desc.model)) || m.model;
+  // Models that support reasoning effort always show it — "Default" when left unset — so the chip
+  // reflects the same two settings the popover holds. Models without an effort concept show nothing.
+  if (effortOptionsForModel(desc).length) {
+    const eff = EFFORT_OPTIONS.find(o => o.value === m.reasoning_effort);
+    txt += " · " + (m.reasoning_effort ? (eff ? eff.label : m.reasoning_effort) : "Default");
+  }
+  label.textContent = txt;
+}
 function syncEffortControl() {
+  updateModelButton();
   const control = $("effortControl");
   const sel = $("effortSel");
   const model = selectedModelFromControl();
@@ -3945,7 +4069,7 @@ function syncEffortControl() {
   control.hidden = false;
   const unset = document.createElement("option");
   unset.value = "";
-  unset.textContent = "Model default";
+  unset.textContent = "Default";
   sel.append(unset);
   for (const effort of efforts) {
     const o = document.createElement("option");
@@ -3996,10 +4120,9 @@ function sendSelectedEffort() {
 function setModel(key) { const sel=$("modelSel"); for (const o of sel.options) if (o.value===key) { o.selected=true; break; } }
 
 /* ---------- mobile drawers ---------- */
-// Desktop keeps the thread name alone (the sidebar shows the active project); the mobile bar has no
-// visible sidebar, so it shows a "project / thread" breadcrumb to make the current project clear.
+// The thread name lives in the sidebar (highlighted) and, on mobile where the sidebar is hidden,
+// in the top bar as a "project / thread" breadcrumb that makes the current project clear.
 function setThreadTitle(t) {
-  $("thrTitle").textContent = t;
   const proj = state.projectNames && state.projectNames[state.projectId];
   $("mbTitle").innerHTML = proj
     ? `<span class="crumb">${escapeHtml(proj)}</span> / ${escapeHtml(t)}`
@@ -4017,6 +4140,8 @@ document.addEventListener("keydown", (e) => {
   if ($("codeOverlay").classList.contains("open")) closeCodeOverlay();
   else {
     closeSettingsMenu();
+    closeModelPicker();
+    closeTurnPicker();
     closeDrawers();
   }
 });
@@ -4167,6 +4292,37 @@ function toggleSettingsMenu() {
 $("settingsBtn").onclick = (e) => { e.stopPropagation(); toggleSettingsMenu(); };
 $("settingsMenu").onclick = (e) => e.stopPropagation();
 $("settingsClose").onclick = closeSettingsMenu;
+
+/* ---------- turn + model pickers (below the composer) ---------- */
+function closeModelPicker() { $("modelPickerMenu").hidden = true; }
+function closeTurnPicker() { $("turnPickerMenu").hidden = true; }
+// Only one picker open at a time: opening one closes the other.
+$("modelPickerBtn").onclick = (e) => {
+  e.stopPropagation();
+  closeTurnPicker();
+  const menu = $("modelPickerMenu");
+  menu.hidden = !menu.hidden;
+};
+$("turnPickerBtn").onclick = (e) => {
+  e.stopPropagation();
+  closeModelPicker();
+  const menu = $("turnPickerMenu");
+  menu.hidden = !menu.hidden;
+};
+$("modelPickerMenu").onclick = (e) => e.stopPropagation();
+$("turnPickerMenu").onclick = (e) => e.stopPropagation();
+document.addEventListener("click", (e) => {
+  const menu = $("modelPickerMenu");
+  if (menu.hidden) return;
+  if (e.target.closest && e.target.closest("#modelPicker")) return;
+  menu.hidden = true;
+});
+document.addEventListener("click", (e) => {
+  const menu = $("turnPickerMenu");
+  if (menu.hidden) return;
+  if (e.target.closest && e.target.closest("#turnPicker")) return;
+  menu.hidden = true;
+});
 document.addEventListener("click", (e) => {
   const menu = $("settingsMenu");
   if (menu.hidden) return;
