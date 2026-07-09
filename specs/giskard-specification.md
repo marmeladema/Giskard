@@ -8,7 +8,23 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.21
+**Version:** 1.22
+
+**Changelog (1.21 → 1.22), tool calls as running tasks:**
+- **TK1:** The running-command surface is generalized to **running tasks**. `RunningCommand` →
+  `RunningTask` with a `kind` (`command` | `tool`) and a `server` field; the `RunningCommands`
+  server message → `RunningTasks { thread_id, tasks }`. The server registry tracks tool/MCP calls
+  the same way it tracks commands (name + server, live output, elapsed time), so they appear in the
+  same right-panel summary. Tool calls carry no `process_id` and do not outlive their turn: a tool
+  still running when its turn completes (an interrupted turn) is dropped; commands are kept as
+  `after_turn`. Stopping a tool sends `Interrupt { thread_id }` (Codex has no per-call cancel);
+  commands still `TerminateCommand` by process id. Tool progress arrives as `Text` item deltas.
+- **TK2:** Tool-call transcript rows render input/output like command output: running rows stay
+  expanded while small and may auto-collapse once large; completed tool-call input/output is
+  collapsed by default regardless of size. The transcript row itself owns the toggle handler, so
+  clicking the row (or pressing Enter/Space while focused) expands or collapses tool input/output.
+  Tool-call lifecycle status uses the same symbol/wording and row placement as command lifecycle
+  status, including best-effort elapsed/terminal duration when the start timestamp is available.
 
 **Changelog (1.20 → 1.21), MCP status surface:**
 - **MCP1:** The thread header includes an `MCP` control with a status dot and server count.
@@ -129,8 +145,8 @@
 - **R2:** The right context panel includes a running-command summary. Selecting a summary row
   scrolls to and selects the matching transcript command row.
 - **R3:** The server maintains a running-command registry from command start/output/completion
-  events, separate from the live-turn buffer, and broadcasts `RunningCommands` snapshots on
-  subscribe and after registry changes.
+  events, separate from the live-turn buffer, and broadcasts running-task snapshots on subscribe
+  and after registry changes. The current wire message is `RunningTasks` (generalized in TK1).
 - **R4:** Harness adapters that can observe command lifecycle notifications after `TurnCompleted`
   continue draining them while commands are known running. Late terminal command completions update
   the running-command registry and may be broadcast to connected clients without mutating persisted
@@ -866,15 +882,19 @@ pub struct ToolCallStart {
     pub started_at_ms: Option<i64>,   // Unix epoch ms when supplied by the harness
 }
 
-pub struct RunningCommand {
+pub enum TaskKind { Command, Tool }   // TK1: a running task is a shell command or a tool/MCP call
+
+pub struct RunningTask {              // TK1: formerly `RunningCommand`; generalized over commands + tools
+    pub kind: TaskKind,
     pub thread_id: ThreadId,
     pub turn_id: TurnId,
     pub item_id: ItemId,              // transcript row to select/scroll to
     pub harness_item_id: String,
-    pub command: String,
-    pub cwd: String,                  // wire-safe display path
+    pub command: String,              // command line (command) or tool name (tool)
+    pub cwd: String,                  // wire-safe display path (empty for tools)
+    pub server: Option<String>,       // MCP/tool server name when this is a tool call
     pub status: String,               // in_progress / running-like while present
-    pub process_id: Option<String>,   // enables terminate when present
+    pub process_id: Option<String>,   // present for commands; None for tools (stop → turn interrupt)
     pub started_at_ms: i64,           // server-observed fallback when harness omits it
     pub output: String,               // bounded output tail for the right-panel summary
     pub after_turn: bool,             // true when the turn ended but the command is still known
@@ -1394,6 +1414,10 @@ Auto-generate an initial title from the first user message (truncated); user-edi
 - Command output bodies are collapsible transcript sections. Running command output starts
   expanded while small and may auto-collapse once output is large; completed command output is
   collapsed by default regardless of size. Expanding a command renders the output inline.
+- Tool-call input/output bodies follow the same collapse model as command output: running rows
+  start expanded while small and may auto-collapse once large; completed tool-call input/output is
+  collapsed by default, and expanding the row renders input/output inline. Tool-call status is
+  rendered in the same meta position and with the same lifecycle wording as command status.
 - Reasoning notes (if the model/effort emits them) render in a collapsible "thinking" block.
 - Each item ends with `ItemCompleted` carrying its final, canonical form (this is what gets
   persisted; deltas are transient).
@@ -1888,7 +1912,7 @@ sessions, so clarity and low visual noise beat flourish. Explicitly avoid the ge
   "new project" action.
 - **Center:** thread header (mode, model, approval policy, context gauge, plan-dump &
   interrupt actions) + transcript + composer.
-- **Right context panel:** running-command summary plus tabbed **Diffs** (side-by-side), **Code
+- **Right context panel:** running-task summary (commands + tool calls) plus tabbed **Diffs** (side-by-side), **Code
   overlay**, **Tokens**.
 
 ### 13.4 Responsive (smartphone)
@@ -1952,8 +1976,8 @@ This guarantees a coherent experience when a future, less-capable harness is plu
 `LiveTurnSnapshot { thread_id, turn_id, accumulated, pending_approval?, pending_server_requests }`
 (in-flight turn reconstruction on reconnect, carrying `WireAgentEvent`s, a `WireApprovalRequest`,
 and unresolved `ServerRequest`s),
-`RunningCommands { thread_id, commands: [RunningCommand] }` (commands still known to be running,
-including commands that outlived an interrupted turn),
+`RunningTasks { thread_id, tasks: [RunningTask] }` (commands and tool/MCP calls still known to be
+running, including commands that outlived an interrupted turn),
 `TokenUpdate { scope, ledger }`, `ApprovalRequest { thread_id, request }` (a `WireApprovalRequest`),
 `Error { code, severity, message, detail?, thread_id?, action? }`, `Pong`.
 
@@ -2003,11 +2027,17 @@ events through the same event handler used for live WebSocket events.
   approval and server-request prompts. The live buffer is bounded
   (coalesced/truncated for very long command output, keeping head+tail) to cap memory; the
   authoritative full output still lands on disk at `TurnCompleted`.
-- **Running-command resync.** Commands can outlive an interrupted turn even after the live buffer is
-  discarded. The server therefore keeps a separate in-memory running-command registry keyed by
-  `thread_id` + `item_id`, updated from command item start/output/completion events. On subscribe,
-  and after each registry change, the server sends `RunningCommands`; the browser renders these in
-  the right context panel and maps `item_id` back to the transcript command row for select/scroll.
+- **Running-task resync (TK1).** Commands can outlive an interrupted turn even after the live buffer
+  is discarded. The server therefore keeps a separate in-memory running-task registry keyed by
+  `thread_id` + `item_id`, updated from command **and tool-call** item start/output/completion
+  events. Tool calls are tracked the same way (name + server, elapsed time, output tail) and shown
+  in the same right-panel summary, but they carry no `process_id` and do not outlive their turn: a
+  tool still running when its turn completes (i.e. an interrupted turn) is dropped, while commands
+  are kept as `after_turn`. Stopping a tool has no per-call cancel in Codex, so the browser sends
+  `Interrupt { thread_id }` (turn-level) rather than `TerminateCommand`. On subscribe, and after
+  each registry change, the server sends `RunningTasks`; the browser renders these in the right
+  context panel and maps `item_id` back to the transcript row for select/scroll (tool transcript
+  rows are owned by the item stream, not re-rendered from the snapshot).
   `TerminateCommand` requests are forwarded to the active harness. Giskard must not terminate
   local processes directly; Codex-owned command processes are stopped only through the Codex
   app-server protocol. Codex agent command executions are not standalone `command/exec` sessions,
@@ -2024,10 +2054,10 @@ events through the same event handler used for live WebSocket events.
   structured `Error` path and the command remains visible with `terminating: false`.
   Harness adapters that can observe post-turn command lifecycle messages must keep draining them
   while any command is known running. When a late terminal command completion arrives for an
-  already-persisted turn, the server updates `RunningCommands` and may broadcast the terminal
+  already-persisted turn, the server updates `RunningTasks` and may broadcast the terminal
   `ItemCompleted` event to connected clients, but it does not mutate the already-appended JSONL
   turn record.
-  Running-command snapshots include `started_at_ms`; clients use it to render elapsed time and
+  Running-task snapshots include `started_at_ms`; clients use it to render elapsed time and
   refresh that display about once per second. Completed command payloads include `duration_ms`
   when the harness supplies it; clients render terminal outcome text from the status plus duration.
 - **Auth:** the WS upgrade validates the session cookie (§12).

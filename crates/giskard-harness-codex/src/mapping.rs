@@ -3115,6 +3115,41 @@ mod tests {
     }
 
     #[test]
+    fn mcp_tool_call_item_preserves_success_status() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let notif = completed_item(serde_json::json!({
+            "type": "mcpToolCall",
+            "id": "tool1",
+            "server": "cf-tools",
+            "tool": "wiki_search",
+            "arguments": { "query": "text ~ \"Giskard\"" },
+            "status": "completed",
+            "result": { "content": [{ "type": "text", "text": "found" }] }
+        }));
+
+        match mapper.map_notification(&notif, ThreadId::new()).unwrap() {
+            AgentEvent::ItemCompleted { item, .. } => match item.payload {
+                ItemPayload::ToolCall {
+                    name,
+                    server,
+                    status,
+                    error,
+                    output,
+                    ..
+                } => {
+                    assert_eq!(name, "wiki_search");
+                    assert_eq!(server.as_deref(), Some("cf-tools"));
+                    assert_eq!(status.as_deref(), Some("completed"));
+                    assert_eq!(error, None);
+                    assert!(output.is_some(), "successful tool result should be kept");
+                }
+                other => panic!("expected tool call, got {other:?}"),
+            },
+            other => panic!("expected item completion, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn mcp_tool_call_started_preserves_pending_tool_metadata() {
         let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
         let notif = started_item(serde_json::json!({

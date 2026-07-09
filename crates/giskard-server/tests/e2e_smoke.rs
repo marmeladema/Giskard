@@ -1271,7 +1271,7 @@ async fn websocket_serializes_harness_error_events() {
             },
             ServerMessage::HistoryPage { .. }
             | ServerMessage::LiveTurnSnapshot(_)
-            | ServerMessage::RunningCommands { .. } => continue,
+            | ServerMessage::RunningTasks { .. } => continue,
             other => panic!("expected event, got {other:?}"),
         }
     }

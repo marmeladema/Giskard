@@ -113,14 +113,34 @@ pub struct LiveTurnSnapshot {
     pub pending_server_requests: Vec<ServerRequest>,
 }
 
+/// Whether a running task is a shell command or a tool/MCP call. Both are tracked and surfaced the
+/// same way (right-panel row, elapsed time, stop control); they differ only in labeling and how a
+/// stop request is routed (commands terminate by process id, tools interrupt the owning turn).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskKind {
+    #[default]
+    Command,
+    Tool,
+}
+
+/// A unit of agent work still running (or outliving an interrupted turn): a shell command or a
+/// tool/MCP call. Formerly `RunningCommand`; generalized so tool calls share the running-work UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunningCommand {
+pub struct RunningTask {
+    #[serde(default)]
+    pub kind: TaskKind,
     pub thread_id: ThreadId,
     pub turn_id: TurnId,
     pub item_id: ItemId,
     pub harness_item_id: String,
+    /// Primary label: the command line for commands, the tool name for tool calls.
     pub command: String,
+    /// Secondary label: the working directory for commands (empty for tools).
     pub cwd: String,
+    /// MCP/tool server name, when this is a tool call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_id: Option<String>,
@@ -171,9 +191,9 @@ pub enum ServerMessage {
         has_more: bool,
     },
     LiveTurnSnapshot(LiveTurnSnapshot),
-    RunningCommands {
+    RunningTasks {
         thread_id: ThreadId,
-        commands: Vec<RunningCommand>,
+        tasks: Vec<RunningTask>,
     },
     TokenUpdate {
         scope: TokenScope,
@@ -558,39 +578,64 @@ mod tests {
     }
 
     #[test]
-    fn server_message_running_commands_serde() {
+    fn server_message_running_tasks_serde() {
         let tid = ThreadId::new();
         let turn_id = TurnId::new();
         let item_id = ItemId::new();
-        let msg = ServerMessage::RunningCommands {
+        let tool_item = ItemId::new();
+        let msg = ServerMessage::RunningTasks {
             thread_id: tid,
-            commands: vec![RunningCommand {
-                thread_id: tid,
-                turn_id,
-                item_id,
-                harness_item_id: "cmd1".into(),
-                command: "sleep 60".into(),
-                cwd: "/tmp/project".into(),
-                status: "in_progress".into(),
-                process_id: Some("proc_1".into()),
-                started_at_ms: 1_785_000_000_000,
-                output: "waiting".into(),
-                after_turn: true,
-                terminating: true,
-            }],
+            tasks: vec![
+                RunningTask {
+                    kind: TaskKind::Command,
+                    thread_id: tid,
+                    turn_id,
+                    item_id,
+                    harness_item_id: "cmd1".into(),
+                    command: "sleep 60".into(),
+                    cwd: "/tmp/project".into(),
+                    server: None,
+                    status: "in_progress".into(),
+                    process_id: Some("proc_1".into()),
+                    started_at_ms: 1_785_000_000_000,
+                    output: "waiting".into(),
+                    after_turn: true,
+                    terminating: true,
+                },
+                RunningTask {
+                    kind: TaskKind::Tool,
+                    thread_id: tid,
+                    turn_id,
+                    item_id: tool_item,
+                    harness_item_id: "tool1".into(),
+                    command: "search".into(),
+                    cwd: String::new(),
+                    server: Some("wiki".into()),
+                    status: "in_progress".into(),
+                    process_id: None,
+                    started_at_ms: 1_785_000_000_500,
+                    output: String::new(),
+                    after_turn: false,
+                    terminating: false,
+                },
+            ],
         };
         let json = serde_json::to_value(&msg).unwrap();
-        assert_eq!(json["type"], "running_commands");
+        assert_eq!(json["type"], "running_tasks");
         assert_eq!(json["thread_id"], tid.to_string());
-        assert_eq!(json["commands"][0]["process_id"], "proc_1");
-        assert_eq!(json["commands"][0]["after_turn"], true);
-        assert_eq!(json["commands"][0]["terminating"], true);
+        assert_eq!(json["tasks"][0]["kind"], "command");
+        assert_eq!(json["tasks"][0]["process_id"], "proc_1");
+        assert_eq!(json["tasks"][0]["after_turn"], true);
+        assert_eq!(json["tasks"][1]["kind"], "tool");
+        assert_eq!(json["tasks"][1]["server"], "wiki");
         let back: ServerMessage = serde_json::from_value(json).unwrap();
         match back {
-            ServerMessage::RunningCommands { commands, .. } => {
-                assert_eq!(commands[0].item_id, item_id);
-                assert_eq!(commands[0].status, "in_progress");
-                assert!(commands[0].terminating);
+            ServerMessage::RunningTasks { tasks, .. } => {
+                assert_eq!(tasks[0].item_id, item_id);
+                assert_eq!(tasks[0].kind, TaskKind::Command);
+                assert!(tasks[0].terminating);
+                assert_eq!(tasks[1].kind, TaskKind::Tool);
+                assert_eq!(tasks[1].server.as_deref(), Some("wiki"));
             }
             _ => panic!("wrong variant"),
         }

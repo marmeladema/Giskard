@@ -283,8 +283,16 @@ async fn index_page_is_served_and_public() {
         "right panel exposes a running command summary"
     );
     assert!(
-        body.contains("case \"running_commands\""),
-        "UI consumes server-owned running command snapshots"
+        body.contains("case \"running_tasks\""),
+        "UI consumes server-owned running task snapshots"
+    );
+    assert!(
+        body.contains("taskTitleText") && body.contains("cmd.kind === \"tool\""),
+        "UI shows tool calls as running tasks alongside commands"
+    );
+    assert!(
+        body.contains("function stopTask"),
+        "UI can stop a running task (command terminate or tool turn-interrupt)"
     );
     assert!(
         body.contains("commandBodyElsByItemId"),
@@ -443,8 +451,59 @@ async fn index_page_is_served_and_public() {
         "UI renders file-change items"
     );
     assert!(
-        body.contains("renderToolCall"),
+        body.contains("renderToolBody"),
         "UI renders tool-call items"
+    );
+    assert!(
+        body.contains("toolPayloadsByItemId") && body.contains("expandedToolOutputs"),
+        "UI tracks tool-call payloads and expansion state by item"
+    );
+    assert!(
+        body.contains(".msg.tool.state-succeeded") && body.contains(".msg.tool.state-failed"),
+        "UI styles succeeded and failed tool-call rows distinctly"
+    );
+    assert!(
+        body.contains("function toolVisualStateFromStatus")
+            && body.contains("if (error) return \"failed\"")
+            && body.contains("if (s===\"completed\" || s===\"succeeded\" || s===\"success\") return \"succeeded\"")
+            && body.contains("if (s===\"failed\" || s===\"error\") return \"failed\""),
+        "UI maps tool-call success and failure statuses to distinct visual states"
+    );
+    assert!(
+        body.contains("toolStatusLabel(p.status, p.error, msg, stateName)")
+            && body.contains("terminalCommandStatus(error && !status ? \"failed\" : status"),
+        "tool-call rows use the same terminal status wording as command rows"
+    );
+    assert!(
+        body.contains("meta.className = \"meta cmd-meta\"")
+            && body
+                .contains("appendCommandMetaPart(meta, commandStatusNode(statusLabel, stateName))"),
+        "tool-call status is rendered in the same meta row position as command status"
+    );
+    assert!(
+        body.contains("if (body && payload && commandIsRunningStatus(payload.status)) renderItemBody(body, payload)"),
+        "running tool-call transcript durations refresh on the shared running-task timer"
+    );
+    assert!(
+        body.contains("wireToolRowToggle"),
+        "the transcript tool row owns the input/output toggle handler"
+    );
+    assert!(
+        body.contains("function isToolIoExpanded")
+            && body.contains("if (phase === \"completed\") return false"),
+        "completed tool-call input/output is collapsed by default"
+    );
+    assert!(
+        body.contains("toggleToolOutput"),
+        "tool rows can toggle collapsed input/output"
+    );
+    assert!(
+        body.contains("Tool data collapsed"),
+        "collapsed tool-call rows summarize hidden input/output"
+    );
+    assert!(
+        !body.contains("tool-io-toggle"),
+        "tool-call collapse must not use a separate toggle button"
     );
     assert!(
         body.contains("startToolCall"),
@@ -457,6 +516,15 @@ async fn index_page_is_served_and_public() {
     assert!(
         body.contains("appendToolProgress"),
         "UI appends tool progress deltas to the pending tool row"
+    );
+    assert!(
+        body.contains("payload.output = current ? current + \"\\n\" + chunk : chunk")
+            && body.contains("renderItemBody(body, payload)"),
+        "UI preserves tool progress through collapsed-row re-renders"
+    );
+    assert!(
+        body.contains("resetTerminatingToolTasks"),
+        "failed tool-task interrupts roll back the stop-request state"
     );
     assert!(
         body.contains("toolVisualStateFromStatus"),

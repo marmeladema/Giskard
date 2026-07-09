@@ -22,7 +22,7 @@ use giskard_harness::{
     AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
 };
 use giskard_persist::store::ProjectConfig;
-use giskard_proto::{ClientMessage, ErrorInfo, RunningCommand, ServerMessage, WireAgentEvent};
+use giskard_proto::{ClientMessage, ErrorInfo, RunningTask, ServerMessage, WireAgentEvent};
 use giskard_server::{AppState, HarnessFactory, build_app};
 use tokio::sync::{Mutex, broadcast};
 use tokio::time::{Duration, Instant};
@@ -682,7 +682,7 @@ async fn terminate_failure_preserves_snapshot(behavior: TerminateBehavior, expec
     assert!(!snapshot[0].terminating);
 }
 
-async fn wait_for_running_command(ws: &mut TestWs) -> RunningCommand {
+async fn wait_for_running_command(ws: &mut TestWs) -> RunningTask {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -701,8 +701,8 @@ async fn wait_for_running_command(ws: &mut TestWs) -> RunningCommand {
             continue;
         };
         let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
-        if let ServerMessage::RunningCommands { commands, .. } = server_msg {
-            if let Some(cmd) = commands
+        if let ServerMessage::RunningTasks { tasks, .. } = server_msg {
+            if let Some(cmd) = tasks
                 .iter()
                 .find(|cmd| cmd.process_id.as_deref() == Some("proc_1"))
             {
@@ -733,17 +733,17 @@ async fn wait_for_empty_running_commands(ws: &mut TestWs) {
         let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
             continue;
         };
-        if let ServerMessage::RunningCommands { commands, .. } =
+        if let ServerMessage::RunningTasks { tasks, .. } =
             serde_json::from_str::<ServerMessage>(&text).unwrap()
         {
-            if commands.is_empty() {
+            if tasks.is_empty() {
                 return;
             }
         }
     }
 }
 
-async fn wait_for_terminating_command(ws: &mut TestWs) -> RunningCommand {
+async fn wait_for_terminating_command(ws: &mut TestWs) -> RunningTask {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -762,8 +762,8 @@ async fn wait_for_terminating_command(ws: &mut TestWs) -> RunningCommand {
             continue;
         };
         let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
-        if let ServerMessage::RunningCommands { commands, .. } = server_msg {
-            if let Some(cmd) = commands
+        if let ServerMessage::RunningTasks { tasks, .. } = server_msg {
+            if let Some(cmd) = tasks
                 .iter()
                 .find(|cmd| cmd.process_id.as_deref() == Some("proc_1") && cmd.terminating)
             {
@@ -842,8 +842,8 @@ async fn wait_for_completed_command_after_interrupted_turn(ws: &mut TestWs) {
                         && duration_ms == Some(60_000);
                 }
             }
-            ServerMessage::RunningCommands { commands, .. } => {
-                saw_empty_running_commands = commands.is_empty();
+            ServerMessage::RunningTasks { tasks, .. } => {
+                saw_empty_running_commands = tasks.is_empty();
             }
             _ => {}
         }
