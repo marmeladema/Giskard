@@ -334,6 +334,98 @@ async fn index_page_is_served_and_public() {
         "empty task menus should not duplicate the no-running-tasks empty state"
     );
     assert!(
+        body.contains("taskGroupsById:new Map()")
+            && body.contains("taskGroupsByItemId:new Map()")
+            && body.contains("expandedTaskDetails:new Map()"),
+        "UI tracks transcript task groups and selected task details by item id"
+    );
+    assert!(
+        body.contains("function expandedTaskDetailIds")
+            && body.contains("ids = new Set(ids ? [ids] : [])"),
+        "task groups track a set of expanded task details per group"
+    );
+    assert!(
+        body.contains("if (kind===\"tool_call\") msg.dataset.toolItemId = key")
+            && body.contains("else msg.dataset.commandItemId = key"),
+        "task groups give every nested task detail row a selectable item id"
+    );
+    assert!(
+        body.contains("entry.append(row, msg)")
+            && body.contains("group.list.append(entry)")
+            && body.contains("item.entry.classList.toggle(\"expanded\""),
+        "clicking a task summary expands the detail inline inside that task entry"
+    );
+    assert!(
+        body.contains("if (detailIds.has(key))")
+            && body.contains("detailIds.delete(key)")
+            && body.contains("clearTaskSelection();"),
+        "clicking an expanded task summary collapses that task detail again"
+    );
+    assert!(
+        body.contains("head.title = \"Expand or collapse all task details\"")
+            && body.contains("const allExpanded = itemIds.length > 0")
+            && body.contains("if (!allExpanded) {")
+            && body.contains("for (const id of itemIds) detailIds.add(id);")
+            && body.contains("itemIds.includes(state.selectedCommandId)"),
+        "the task group header expands all details and collapses them when all are open"
+    );
+    assert!(
+        body.contains(
+            "row.onclick = (e) => { e.stopPropagation(); selectTaskGroupItem(group.id, key); }"
+        ) && !body.contains("selectCommand(key);"),
+        "in-thread task summary clicks toggle inline details without scrolling the transcript"
+    );
+    assert!(
+        body.contains(".task-group-body { white-space:normal; font-size:12px; }")
+            && body.contains(".task-group-item-status { color:var(--muted); font-size:11px;")
+            && body.contains(".task-group-entry > .msg .role { font-size:10px; }"),
+        "task group summaries and details use tighter typography than normal transcript rows"
+    );
+    assert!(
+        body.contains("function appendBubble")
+            && body.contains("function bubble(cls, role)")
+            && body.contains("breakTaskGroup();")
+            && body.contains("function taskBubble"),
+        "normal transcript rows close active task groups while task rows append inside them"
+    );
+    assert!(
+        body.contains("if (allTerminal) state.expandedTaskGroups.delete(group.id)")
+            && body.contains("else state.expandedTaskGroups.add(group.id)")
+            && body.contains("manuallyToggledTaskGroups"),
+        "task groups auto-expand while running and auto-collapse after terminal states"
+    );
+    assert!(
+        body.contains(
+            "taskBubble(key, \"command_execution\", \"cmd running-command\", \"command\")"
+        ) && body.contains(
+            "taskBubble(key, \"tool_call\", \"tool running-tool state-running\", \"tool\")"
+        ),
+        "live command and tool starts render inside transcript task groups"
+    );
+    assert!(
+        body.contains("? taskBubble(key, p.kind, classForPayload(p), roleForPayload(p))")
+            && body.contains("isTaskPayloadKind(p.kind)"),
+        "persisted command/tool items are grouped even when they are singletons"
+    );
+    assert!(
+        body.contains("expandedTaskDetailIds(group.id).add(key)")
+            && body.contains("(task ? task.entry : msg).scrollIntoView"),
+        "header task-menu selection expands inline detail before scrolling to the task entry"
+    );
+    assert!(
+        body.contains("const prevTaskGroup = state.activeTaskGroup")
+            && body.contains("state.activeTaskGroup = prevTaskGroup")
+            && body.contains("active.el.parentElement === target")
+            && body.contains("function renderPersistedTurn(turn) {\n  breakTaskGroup();"),
+        "history rendering preserves live grouping state and breaks groups at turn boundaries"
+    );
+    assert!(
+        body.contains("renderItemBody(toolBody, {")
+            && body.contains("name:cmd.command || \"tool\"")
+            && body.contains("state.streamElsByItemId.set(key, toolBody)"),
+        "running tool snapshots create grouped transcript rows when no stream row exists yet"
+    );
+    assert!(
         !body.contains("id=\"ctxCommands\""),
         "running tasks are not rendered as a permanent right-column section"
     );

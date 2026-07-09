@@ -8,7 +8,25 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.24
+**Version:** 1.25
+
+**Changelog (1.24 → 1.25), transcript task grouping:**
+- **TG1:** Command execution and tool/MCP call transcript items render inside top-level `Tasks`
+  transcript rows. Every task item participates, including singletons. Consecutive task items in
+  the same turn merge into the same group; any non-task transcript item or turn boundary closes the
+  active group.
+- **TG2:** A task group shows a compact chronological task list when expanded. Selecting a compact
+  task expands that task's existing command/tool detail row inline inside the selected task card
+  itself, and selecting the same task again collapses its detail. Transcript-row task selection
+  updates in place without scrolling the thread; header Tasks-menu selection may still scroll to
+  the task entry. The task preserves the original item id, lifecycle state, output/input collapse
+  state, Stop action, and menu select/scroll behavior.
+- **TG2a:** The task-group header is an aggregate control: activating it expands all task details
+  in the group, or collapses all details when every task detail is already expanded. It does not
+  perform an invisible no-op.
+- **TG3:** Task groups remain expanded while tasks are running unless the user manually toggles the
+  group. Once every task in a group reaches a terminal state, the group collapses automatically
+  unless the user explicitly expanded or collapsed it.
 
 **Changelog (1.23 → 1.24), tasks menu:**
 - **TM1:** The thread header includes a `Tasks N` control for commands and tool/MCP calls that are
