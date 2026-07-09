@@ -544,6 +544,10 @@
           </select>
         </label>
         <select id="modelSel" class="mono"></select>
+        <label id="effortControl" class="thread-control" title="Reasoning effort for the selected model" hidden>
+          <span class="thread-control-label">Effort</span>
+          <select id="effortSel" aria-label="Reasoning effort"></select>
+        </label>
         <button id="refreshModels" class="badge" title="Refresh model list from provider /v1/models">↻</button>
         <div class="tasks-wrap">
           <button id="tasksBtn" class="badge tasks-btn state-idle" title="Running tasks" aria-label="Running tasks">
@@ -639,13 +643,20 @@ let state = {
   activeTaskGroup:null, taskGroupSeq:0, taskItemSeq:0, taskGroupsById:new Map(), taskGroupsByItemId:new Map(),
   expandedTaskGroups:new Set(), manuallyToggledTaskGroups:new Set(), expandedTaskDetails:new Map(),
   linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, activeTurn:false, interruptPending:false, compactPending:false,
-  awaitingInitialThreadState:false, contextWindow:0, contextUsed:null, tokenLedger:null, approvalPolicy:"ask",
+  awaitingInitialThreadState:false, contextWindow:0, contextUsed:null, tokenLedger:null, approvalPolicy:"ask", currentModel:null,
   mcpServers:[], mcpCapabilities:{ status:false, reload:false, oauth_login:false }, mcpLoading:false, mcpError:null, expandedMcps:new Set(),
   collapsedProjects:new Set(loadCollapsedProjects())
 };
 const COMMAND_AUTO_COLLAPSE_LINES = 120;
 const COMMAND_AUTO_COLLAPSE_BYTES = 16 * 1024;
 const THREAD_TITLE_MAX = 120;
+const EFFORT_OPTIONS = [
+  { value:"minimal", label:"Minimal" },
+  { value:"low", label:"Low" },
+  { value:"medium", label:"Medium" },
+  { value:"high", label:"High" },
+  { value:"xhigh", label:"Extra High" }
+];
 setInterval(updateRunningCommandDurations, 1000);
 
 async function api(method, path, body) {
@@ -994,6 +1005,8 @@ function clearThreadView(tid) {
   state.projectId = null; state.threadId = null;
   state.pendingUserEl = null; state.pendingUserText = null;
   state.compactPending = false;
+  state.currentModel = null;
+  $("effortControl").hidden = true;
   setTurnActive(false);
   state.awaitingInitialThreadState = false;
   resetRenderState();
@@ -1114,6 +1127,8 @@ async function openThread(pid, tid, title, opts) {
 
   state.projectId = pid; state.threadId = tid; state.pendingUserEl = null; state.pendingUserText = null;
   state.compactPending = false;
+  state.currentModel = null;
+  $("effortControl").hidden = true;
   state.mcpServers = []; state.mcpError = null; state.expandedMcps = new Set();
   state.mcpCapabilities = { status:false, reload:false, oauth_login:false };
   $("tasksMenu").hidden = true;
@@ -1195,6 +1210,8 @@ function updateComposerControls() {
   $("stopBtn").hidden = !state.activeTurn;
   $("stopBtn").disabled = !ready || state.interruptPending;
   $("stopBtn").textContent = state.interruptPending ? "Stopping…" : "Stop";
+  $("modelSel").disabled = !state.threadId;
+  $("effortSel").disabled = !state.threadId;
   const compactBtn = $("compactBtn");
   if (compactBtn) {
     compactBtn.disabled = !state.threadId || state.activeTurn || state.compactPending || !ready;
@@ -1274,7 +1291,10 @@ function renderThreadState(s) {
   state.mode = s.mode || "build";
   setApprovalPolicy(s.approval_policy || "ask");
   $("modeBtn").textContent = state.mode;
-  if (s.current_model) setModel(`${s.current_model.provider}/${s.current_model.model}`);
+  if (s.current_model) {
+    state.currentModel = s.current_model;
+    syncModelControls();
+  }
   if (s.title) {
     updateThreadRowTitle(s.id || s.thread_id || state.threadId, s.title);
     setThreadTitle(s.title);
@@ -3874,18 +3894,104 @@ $("approvalSel").onchange = () => {
 };
 
 function renderModelSelect() {
-  const sel = $("modelSel"); const prev = sel.value; sel.innerHTML="";
+  const sel = $("modelSel");
+  const prev = state.currentModel ? modelKey(state.currentModel) : sel.value;
+  sel.innerHTML="";
   for (const m of state.models) {
     const o = document.createElement("option");
-    o.value = `${m.provider}/${m.model}`; o.textContent = m.display_name || m.model; o.dataset.provider=m.provider; o.dataset.model=m.model;
+    o.value = modelKey(m);
+    o.textContent = m.display_name || m.model;
+    o.dataset.provider=m.provider;
+    o.dataset.model=m.model;
+    o.dataset.supportsReasoningEffort = m.supports_reasoning_effort ? "true" : "false";
     sel.append(o);
   }
   if (!state.models.length) { const o=document.createElement("option"); o.textContent="(no models configured)"; sel.append(o); }
   if (prev) sel.value = prev;   // preserve the current selection across a refresh
-  sel.onchange = () => {
-    const opt = sel.selectedOptions[0]; if (!opt || !opt.dataset.model) return;
-    send({ type:"select_model", thread_id: state.threadId, model_ref:{ provider:opt.dataset.provider, model:opt.dataset.model, reasoning_effort:null } });
-  };
+  syncEffortControl();
+  sel.onchange = sendSelectedModel;
+}
+function modelKey(m) {
+  return m && m.provider && m.model ? `${m.provider}/${m.model}` : "";
+}
+function findModelDescriptor(provider, model) {
+  return state.models.find(m => m.provider === provider && m.model === model) || null;
+}
+function effortOptionsForModel(desc) {
+  if (!desc || !desc.supports_reasoning_effort) return [];
+  if (Array.isArray(desc.reasoning_efforts) && desc.reasoning_efforts.length) {
+    const known = new Map(EFFORT_OPTIONS.map(o => [o.value, o]));
+    return desc.reasoning_efforts
+      .map(e => known.get(String(e)) || { value:String(e), label:String(e) })
+      .filter(o => o.value);
+  }
+  return EFFORT_OPTIONS;
+}
+function syncModelControls() {
+  if (state.currentModel) setModel(modelKey(state.currentModel));
+  syncEffortControl();
+}
+function syncEffortControl() {
+  const control = $("effortControl");
+  const sel = $("effortSel");
+  const model = selectedModelFromControl();
+  const desc = model ? findModelDescriptor(model.provider, model.model) : null;
+  const efforts = effortOptionsForModel(desc);
+  sel.innerHTML = "";
+  if (!efforts.length) {
+    control.hidden = true;
+    return;
+  }
+  control.hidden = false;
+  const unset = document.createElement("option");
+  unset.value = "";
+  unset.textContent = "Model default";
+  sel.append(unset);
+  for (const effort of efforts) {
+    const o = document.createElement("option");
+    o.value = effort.value;
+    o.textContent = effort.label;
+    sel.append(o);
+  }
+  sel.value = state.currentModel && modelKey(state.currentModel) === modelKey(model)
+    ? (state.currentModel.reasoning_effort || "")
+    : "";
+  sel.onchange = sendSelectedEffort;
+}
+function selectedModelFromControl() {
+  const opt = $("modelSel").selectedOptions[0];
+  if (!opt || !opt.dataset.model) return null;
+  return { provider:opt.dataset.provider, model:opt.dataset.model };
+}
+function sendSelectedModel() {
+  const model = selectedModelFromControl();
+  if (!model || !state.threadId) {
+    syncEffortControl();
+    return;
+  }
+  const previous = state.currentModel;
+  const next = { provider:model.provider, model:model.model, reasoning_effort:null };
+  state.currentModel = next;
+  syncEffortControl();
+  if (!send({ type:"select_model", thread_id: state.threadId, model_ref:next })) {
+    state.currentModel = previous;
+    syncModelControls();
+    notice(`Model not changed: WebSocket is ${state.wsStatus}.`, "error");
+  }
+}
+function sendSelectedEffort() {
+  const model = selectedModelFromControl();
+  if (!model || !state.threadId) return;
+  const previous = state.currentModel;
+  const effort = $("effortSel").value || null;
+  const next = { provider:model.provider, model:model.model, reasoning_effort:effort };
+  state.currentModel = next;
+  syncEffortControl();
+  if (!send({ type:"select_model", thread_id: state.threadId, model_ref:next })) {
+    state.currentModel = previous;
+    syncModelControls();
+    notice(`Reasoning effort not changed: WebSocket is ${state.wsStatus}.`, "error");
+  }
 }
 function setModel(key) { const sel=$("modelSel"); for (const o of sel.options) if (o.value===key) { o.selected=true; break; } }
 

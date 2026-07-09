@@ -122,6 +122,10 @@ Provider config governs the **picker** and optional `/v1/models` discovery only 
 reads `~/.codex/config.toml` for real provider/auth, so any model you select must be one Codex can
 actually reach.
 
+Models with `supports_reasoning_effort = true` expose a thread-header **Effort** selector next to
+the model picker. Choose `Model default` to omit the effort parameter, or select a concrete Codex
+effort (`Minimal` through `Extra High`) for subsequent turns in that thread.
+
 ---
 
 ## Storage layout

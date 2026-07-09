@@ -333,6 +333,52 @@ async fn send_input_snapshot_carries_model_effort_and_thread_policy() {
         ApprovalPolicy::ReadOnly,
         "thread approval policy changes must reach the harness"
     );
+
+    // Clearing effort on the same model should mean "model default", not "restore the previous
+    // remembered effort".
+    ws.send(ws_text(&ClientMessage::SelectModel {
+        thread_id,
+        model_ref: ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: None,
+        },
+    }))
+    .await
+    .unwrap();
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        let tf = state
+            .store
+            .load_thread(pid, thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        if tf.current_model.reasoning_effort.is_none() {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("thread reasoning effort was not cleared");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+    }
+    ws.send(ws_text(&ClientMessage::SendInput {
+        thread_id,
+        text: "default effort".into(),
+    }))
+    .await
+    .unwrap();
+
+    let third = wait_for_capture(&captured, 3).await;
+    assert_eq!(
+        third.model,
+        Some(ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: None,
+        }),
+        "cleared reasoning effort should not be sent to the harness"
+    );
 }
 
 /// Wait until at least `n` overrides have been captured, returning the `n`-th (1-based).

@@ -1407,8 +1407,12 @@ async fn handle_client_msg(
 
                     let new_descriptor = crate::models::resolve_descriptor(&config, &model_ref);
                     let mut new_model = model_ref.clone();
+                    let same_model = tf.current_model.provider == new_model.provider
+                        && tf.current_model.model == new_model.model;
                     if new_descriptor.supports_reasoning_effort {
-                        if new_model.reasoning_effort.is_none() {
+                        if same_model && new_model.reasoning_effort.is_none() {
+                            tf.model_efforts.remove(&new_model.key());
+                        } else if new_model.reasoning_effort.is_none() {
                             new_model.reasoning_effort =
                                 tf.model_efforts.get(&new_model.key()).copied();
                         }
