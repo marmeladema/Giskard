@@ -92,6 +92,23 @@
   .mcp-section-title { margin-bottom:4px; color:var(--fg); font-size:11px; font-weight:600; text-transform:uppercase; }
   .mcp-actions { display:flex; gap:6px; flex-wrap:wrap; margin-top:8px; }
   .mcp-actions button { font-size:12px; padding:4px 8px; }
+  .tasks-wrap { position:relative; }
+  .tasks-btn { display:flex; align-items:center; gap:6px; }
+  .tasks-btn.state-idle { color:var(--muted); }
+  .tasks-btn.state-running { color:#f0d98c; border-color:#d29922; background:rgba(210,153,34,.08); }
+  .tasks-btn.state-stopping { color:#c9d1d9; border-color:#8b949e; background:rgba(139,148,158,.10); }
+  .tasks-popover {
+    position:absolute; right:0; top:34px; z-index:35; width:min(480px, calc(100vw - 24px));
+    max-height:70vh; overflow:auto; padding:10px; border:1px solid var(--border);
+    border-radius:8px; background:var(--panel); box-shadow:0 20px 48px rgba(0,0,0,.45);
+  }
+  .tasks-popover[hidden] { display:none; }
+  .tasks-head { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+  .tasks-head strong { flex:1; }
+  .tasks-head button { font-size:12px; padding:4px 8px; }
+  .tasks-summary { color:var(--muted); font-size:12px; margin-bottom:8px; }
+  .tasks-section { margin-top:8px; padding-top:8px; border-top:1px solid var(--border); }
+  .tasks-section-title { margin-bottom:6px; color:var(--fg); font-size:11px; font-weight:600; text-transform:uppercase; }
   .usage-wrap { position:relative; margin-left:auto; }
   .usage-btn { display:flex; align-items:center; gap:6px; }
   .usage-popover {
@@ -218,13 +235,13 @@
   .msg.notice { background:#241d10; border:1px solid #d29922; color:#f0d98c; max-width:100%; }
   .msg.notice .role { color:#d29922; opacity:1; }
 
-  /* usage stat tiles (right column) */
+  /* usage stat tiles (context menu) */
   .stats { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
   .stat { background:var(--panel2); border:1px solid var(--border); border-radius:8px; padding:8px 10px; }
   .statlabel { font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
   .statval { font-size:16px; font-variant-numeric:tabular-nums; margin-top:2px; }
   .cmd-summary { display:flex; flex-direction:column; gap:8px; }
-  .cmd-card { width:100%; text-align:left; border-radius:8px; padding:8px 10px; background:var(--panel2); }
+  .cmd-card { width:100%; text-align:left; border-radius:8px; padding:8px 10px; background:var(--panel2); cursor:pointer; }
   .cmd-card.state-running { border-color:#d29922; background:rgba(210,153,34,.08); }
   .cmd-card.state-succeeded { border-color:#238636; background:rgba(35,134,54,.10); }
   .cmd-card.state-failed { border-color:#f85149; background:rgba(248,81,73,.10); }
@@ -355,7 +372,7 @@
 
   /* =================== Mobile / responsive ===================
      The same page adapts to the viewport (no separate mobile build). On narrow screens the three
-     columns collapse to a single full-width transcript; the projects list and the task/appearance
+     columns collapse to a single full-width transcript; the projects list and the appearance
      panel become slide-in drawers reached from a top bar. Desktop (>820px) is unchanged. */
   #mobileBar { align-items:center; gap:10px; padding:8px 12px; border-bottom:1px solid var(--border); background:var(--panel); }
   #mobileBar button { font-size:18px; line-height:1; padding:3px 11px; }
@@ -415,7 +432,7 @@
       <div id="mobileBar">
         <button id="btnMenu" title="Projects & threads" aria-label="Projects">☰</button>
         <div class="mbTitle" id="mbTitle">Giskard</div>
-        <button id="btnInfo" title="Tasks & appearance" aria-label="Info">ⓘ</button>
+        <button id="btnInfo" title="Appearance" aria-label="Info">ⓘ</button>
       </div>
       <header class="thr" id="thrHeader" style="display:none">
         <span class="badge mono" id="thrTitle">—</span>
@@ -430,6 +447,12 @@
         </label>
         <select id="modelSel" class="mono"></select>
         <button id="refreshModels" class="badge" title="Refresh model list from provider /v1/models">↻</button>
+        <div class="tasks-wrap">
+          <button id="tasksBtn" class="badge tasks-btn state-idle" title="Running tasks" aria-label="Running tasks">
+            <span>Tasks</span><span id="tasksCount" class="mono">0</span>
+          </button>
+          <div id="tasksMenu" class="tasks-popover" hidden></div>
+        </div>
         <div class="mcp-wrap">
           <button id="mcpBtn" class="badge mcp-btn" title="MCP servers" aria-label="MCP servers">
             <span class="mcp-dot" id="mcpDot"></span><span>MCP</span><span id="mcpCount">0</span>
@@ -462,8 +485,6 @@
           <option value="terminal">Terminal</option>
         </select>
       </div>
-      <h3 class="sec">Running Tasks</h3>
-      <div id="ctxCommands" class="muted">No running tasks.</div>
     </div>
 
     <!-- Tap-to-dismiss backdrop shown behind an open mobile drawer. -->
@@ -945,6 +966,7 @@ async function openThread(pid, tid, title, opts) {
   state.projectId = pid; state.threadId = tid; state.pendingUserEl = null; state.pendingUserText = null;
   state.mcpServers = []; state.mcpError = null; state.expandedMcps = new Set();
   state.mcpCapabilities = { status:false, reload:false, oauth_login:false };
+  $("tasksMenu").hidden = true;
   $("mcpMenu").hidden = true;
   $("usageMenu").hidden = true;
   renderMcpButton();
@@ -2202,20 +2224,76 @@ function renderEndedCommandBody(body, cmd, status, opts) {
   renderCommandOutputBlock(body, { itemId:cmd.id, output:cmd.output || "", phase:"completed" });
 }
 function renderRunningCommands() {
-  const box = $("ctxCommands"); if (!box) return;
   const cmds = Array.from(state.runningCommands.values());
+  renderTasksButton(cmds);
+  if (!$("tasksMenu").hidden) renderTasksMenu(cmds);
+}
+function renderTasksButton(cmds) {
+  cmds = cmds || Array.from(state.runningCommands.values());
+  const btn = $("tasksBtn");
+  const count = cmds.length;
+  const stateName = taskButtonState(cmds);
+  btn.className = `badge tasks-btn state-${stateName}`;
+  btn.disabled = !state.threadId;
+  btn.title = count ? `${count} running task${count === 1 ? "" : "s"}` : "No running tasks";
+  $("tasksCount").textContent = String(count);
+}
+function taskButtonState(cmds) {
+  if (!cmds.length) return "idle";
+  if (cmds.some(cmd => cmd.terminating)) return "stopping";
+  return "running";
+}
+function renderTasksMenu(cmds) {
+  cmds = cmds || Array.from(state.runningCommands.values());
+  const menu = $("tasksMenu");
+  const count = cmds.length;
+  const commandTasks = cmds.filter(cmd => cmd.kind !== "tool");
+  const toolTasks = cmds.filter(cmd => cmd.kind === "tool");
+  const summaryHtml = count
+    ? `<div class="tasks-summary">${count} running task${count === 1 ? "" : "s"} · ${commandTasks.length} commands · ${toolTasks.length} tools</div>`
+    : "";
+  const sectionsHtml = count ? `
+    <div class="tasks-section">
+      <div class="tasks-section-title">Commands</div>
+      <div id="tasksCommandList"></div>
+    </div>
+    <div class="tasks-section">
+      <div class="tasks-section-title">Tools</div>
+      <div id="tasksToolList"></div>
+    </div>` : `<div id="tasksList"></div>`;
+  menu.innerHTML = `
+    <div class="tasks-head">
+      <strong>Tasks</strong>
+      <button id="tasksClose" type="button">Close</button>
+    </div>
+    ${summaryHtml}
+    ${sectionsHtml}`;
+  $("tasksClose").onclick = () => { $("tasksMenu").hidden = true; };
+  if (count) {
+    renderTaskCards($("tasksCommandList"), commandTasks, "No running commands.");
+    renderTaskCards($("tasksToolList"), toolTasks, "No running tools.");
+  } else {
+    renderTaskCards($("tasksList"), cmds, "No running tasks.");
+  }
+}
+function renderTaskCards(box, cmds, emptyText) {
   if (!cmds.length) {
     box.className = "muted";
-    box.textContent = "No running tasks.";
+    box.textContent = emptyText || "No running tasks.";
     return;
   }
   box.className = "cmd-summary";
   box.replaceChildren();
   for (const cmd of cmds) {
     const stateName = commandVisualStateFromCommand(cmd);
-    const row = document.createElement("button");
+    const row = document.createElement("div");
     row.className = `cmd-card state-${stateName}` + (state.selectedCommandId===cmd.id ? " selected" : "");
+    row.tabIndex = 0;
+    row.setAttribute("role", "button");
     row.onclick = () => selectCommand(cmd.id);
+    row.onkeydown = (e) => {
+      if (e.key==="Enter" || e.key===" ") { e.preventDefault(); selectCommand(cmd.id); }
+    };
     const title = document.createElement("div");
     title.className = "cmd-title mono";
     title.textContent = taskTitleText(cmd);
@@ -2237,6 +2315,23 @@ function renderRunningCommands() {
     box.append(row);
   }
 }
+function toggleTasksMenu() {
+  const menu = $("tasksMenu");
+  menu.hidden = !menu.hidden;
+  if (!menu.hidden) {
+    $("mcpMenu").hidden = true;
+    $("usageMenu").hidden = true;
+    renderTasksMenu();
+  }
+}
+$("tasksBtn").onclick = (e) => { e.stopPropagation(); toggleTasksMenu(); };
+$("tasksMenu").onclick = (e) => e.stopPropagation();
+document.addEventListener("click", (e) => {
+  const menu = $("tasksMenu");
+  if (menu.hidden) return;
+  if (e.target.closest && e.target.closest(".tasks-wrap")) return;
+  menu.hidden = true;
+});
 // A tool task can't be stopped individually (Codex has no per-call cancel), so stopping it
 // interrupts the owning turn; commands terminate by process id.
 function stopTask(id) {
@@ -3006,6 +3101,7 @@ function toggleMcpMenu() {
   const menu = $("mcpMenu");
   menu.hidden = !menu.hidden;
   if (!menu.hidden) {
+    $("tasksMenu").hidden = true;
     $("usageMenu").hidden = true;
     renderMcpMenu();
     loadMcpServers({ announce:false });
@@ -3351,6 +3447,7 @@ function toggleUsageMenu() {
   const menu = $("usageMenu");
   menu.hidden = !menu.hidden;
   if (!menu.hidden) {
+    $("tasksMenu").hidden = true;
     $("mcpMenu").hidden = true;
     renderUsageMenu();
   }
