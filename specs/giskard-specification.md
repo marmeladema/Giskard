@@ -8,7 +8,15 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.23
+**Version:** 1.24
+
+**Changelog (1.23 → 1.24), tasks menu:**
+- **TM1:** The thread header includes a `Tasks N` control for commands and tool/MCP calls that are
+  still known running. The count is the current running-task snapshot size, and the control changes
+  visual state between idle, running, and stop-requested tasks.
+- **TM2:** Running-task cards move from the permanent right context panel into the `Tasks` popover.
+  Selecting a task still scrolls to/selects the transcript row, and the same Stop action remains
+  available from the menu.
 
 **Changelog (1.22 → 1.23), context usage menu:**
 - **CU1:** The thread-header context gauge is an interactive `Context` control. Activating it opens a
@@ -16,15 +24,15 @@
   token usage. Cumulative tokens remain separate from the gauge source: they are informational totals
   and must not drive the context-occupancy numerator.
 - **CU2:** Thread token totals no longer occupy a permanent right-column section. The right context
-  panel remains focused on running tasks and contextual work surfaces; thread-level token details are
-  reached from the header context control.
+  panel kept running tasks until v1.24 moved them to the header `Tasks` menu; thread-level token
+  details are reached from the header context control.
 
 **Changelog (1.21 → 1.22), tool calls as running tasks:**
 - **TK1:** The running-command surface is generalized to **running tasks**. `RunningCommand` →
   `RunningTask` with a `kind` (`command` | `tool`) and a `server` field; the `RunningCommands`
   server message → `RunningTasks { thread_id, tasks }`. The server registry tracks tool/MCP calls
   the same way it tracks commands (name + server, live output, elapsed time), so they appear in the
-  same right-panel summary. Tool calls carry no `process_id` and do not outlive their turn: a tool
+  same running-task summary. Tool calls carry no `process_id` and do not outlive their turn: a tool
   still running when its turn completes (an interrupted turn) is dropped; commands are kept as
   `after_turn`. Stopping a tool sends `Interrupt { thread_id }` (Codex has no per-call cancel);
   commands still `TerminateCommand` by process id. Tool progress arrives as `Text` item deltas.
@@ -151,8 +159,8 @@
   separate policy decision.
 - **R1:** Command execution items are surfaced as transcript rows with live output, elapsed time,
   lifecycle status, and a Stop control when the harness supplies a process id.
-- **R2:** The right context panel includes a running-command summary. Selecting a summary row
-  scrolls to and selects the matching transcript command row.
+- **R2:** The UI includes a running-command summary. Selecting a summary row scrolls to and selects
+  the matching transcript command row.
 - **R3:** The server maintains a running-command registry from command start/output/completion
   events, separate from the live-turn buffer, and broadcasts running-task snapshots on subscribe
   and after registry changes. The current wire message is `RunningTasks` (generalized in TK1).
@@ -905,7 +913,7 @@ pub struct RunningTask {              // TK1: formerly `RunningCommand`; general
     pub status: String,               // in_progress / running-like while present
     pub process_id: Option<String>,   // present for commands; None for tools (stop → turn interrupt)
     pub started_at_ms: i64,           // server-observed fallback when harness omits it
-    pub output: String,               // bounded output tail for the right-panel summary
+    pub output: String,               // bounded output tail for the task menu
     pub after_turn: bool,             // true when the turn ended but the command is still known
     pub terminating: bool,             // true while waiting for a terminal event after terminate
 }
@@ -1881,8 +1889,8 @@ sessions, so clarity and low visual noise beat flourish. Explicitly avoid the ge
   model names are always monospace so they read as "things you can click / act on".
 - **Structure encodes state,** not decoration: mode (Plan/Build), model, and approval policy
   are always visible and legible at a glance in the thread header; a running turn has a clear
-  live indicator. Running commands are shown both inline in the transcript and as a summary in
-  the right context panel; selecting a summary entry scrolls to the transcript command row.
+  live indicator. Running commands are shown both inline in the transcript and in the header
+  `Tasks` menu; selecting a summary entry scrolls to the transcript command row.
   Command lifecycle state is shown with a non-color cue plus subtle color: `●` amber for running,
   `✓` green for succeeded, `✕` red for failed, and `■` muted gray/orange for terminated or
   declined.
@@ -1907,7 +1915,7 @@ sessions, so clarity and low visual noise beat flourish. Explicitly avoid the ge
 ```
 ┌───────────┬────────────────────────────────────┬────────────────────┐
 │ Projects  │  Thread header: mode · model ·      │  Context panel     │
-│ + threads │  approval · context usage · actions │  (tabs):           │
+│ + threads │  approval · tasks · context usage    │  (tabs):           │
 │ (sidebar) ├────────────────────────────────────┤  • Diffs (side-by- │
 │           │                                     │    side)           │
 │  proj A   │  Transcript (streamed items,        │  • Code overlay    │
@@ -1923,10 +1931,9 @@ sessions, so clarity and low visual noise beat flourish. Explicitly avoid the ge
 
 - **Left sidebar:** projects with their threads (collapsible), token summary entry point,
   "new project" action.
-- **Center:** thread header (mode, model, approval policy, context usage menu, plan-dump &
+- **Center:** thread header (mode, model, approval policy, tasks menu, context usage menu, plan-dump &
   interrupt actions) + transcript + composer.
-- **Right context panel:** running-task summary (commands + tool calls) plus tabbed **Diffs**
-  (side-by-side) and **Code overlay**.
+- **Right context panel:** tabbed **Diffs** (side-by-side) and **Code overlay**.
 
 ### 13.4 Responsive (smartphone)
 
@@ -2044,12 +2051,12 @@ events through the same event handler used for live WebSocket events.
   is discarded. The server therefore keeps a separate in-memory running-task registry keyed by
   `thread_id` + `item_id`, updated from command **and tool-call** item start/output/completion
   events. Tool calls are tracked the same way (name + server, elapsed time, output tail) and shown
-  in the same right-panel summary, but they carry no `process_id` and do not outlive their turn: a
+  in the same `Tasks` menu, but they carry no `process_id` and do not outlive their turn: a
   tool still running when its turn completes (i.e. an interrupted turn) is dropped, while commands
   are kept as `after_turn`. Stopping a tool has no per-call cancel in Codex, so the browser sends
   `Interrupt { thread_id }` (turn-level) rather than `TerminateCommand`. On subscribe, and after
-  each registry change, the server sends `RunningTasks`; the browser renders these in the right
-  context panel and maps `item_id` back to the transcript row for select/scroll (tool transcript
+  each registry change, the server sends `RunningTasks`; the browser renders these in the header
+  `Tasks` menu and maps `item_id` back to the transcript row for select/scroll (tool transcript
   rows are owned by the item stream, not re-rendered from the snapshot).
   `TerminateCommand` requests are forwarded to the active harness. Giskard must not terminate
   local processes directly; Codex-owned command processes are stopped only through the Codex

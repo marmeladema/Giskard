@@ -298,8 +298,44 @@ async fn index_page_is_served_and_public() {
         "thread_state metadata broadcasts must not unconditionally clear the transcript"
     );
     assert!(
-        body.contains("ctxCommands"),
-        "right panel exposes a running command summary"
+        body.contains("id=\"tasksBtn\"") && body.contains("id=\"tasksMenu\""),
+        "thread header exposes a running-task summary button and menu"
+    );
+    assert!(
+        body.contains("function renderTasksButton")
+            && body.contains("taskButtonState")
+            && body.contains("$(\"tasksCount\").textContent = String(count)"),
+        "task button shows the current running-task count and state"
+    );
+    assert!(
+        body.contains(".tasks-btn.state-idle")
+            && body.contains(".tasks-btn.state-running")
+            && body.contains(".tasks-btn.state-stopping"),
+        "task button has distinct visual states for idle, running, and stop-requested tasks"
+    );
+    assert!(
+        body.contains("function renderTaskCards")
+            && body.contains("renderTaskCards($(\"tasksCommandList\"), commandTasks")
+            && body.contains("renderTaskCards($(\"tasksToolList\"), toolTasks"),
+        "running-task cards render inside the task menu"
+    );
+    assert!(
+        body.contains("tasks-section-title")
+            && body.contains("Commands</div>")
+            && body.contains("Tools</div>")
+            && body.contains("No running commands.")
+            && body.contains("No running tools."),
+        "task menu separates running commands from running tools"
+    );
+    assert!(
+        body.contains("const summaryHtml = count")
+            && body.contains(": \"\";")
+            && body.contains("${summaryHtml}"),
+        "empty task menus should not duplicate the no-running-tasks empty state"
+    );
+    assert!(
+        !body.contains("id=\"ctxCommands\""),
+        "running tasks are not rendered as a permanent right-column section"
     );
     assert!(
         body.contains("case \"running_tasks\""),

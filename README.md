@@ -58,8 +58,8 @@ Then open **http://127.0.0.1:8787**, log in, and:
    server machine (the agent's workspace).
 2. **+** on the project → *New thread*.
 3. Type in the composer (Enter to send). The header has the **Plan/Build** toggle, the **model**
-   picker, and a **Context** usage button; scrolling the transcript to the top lazy-loads older
-   history.
+   picker, a **Tasks** menu for running commands/tools, and a **Context** usage button; scrolling
+   the transcript to the top lazy-loads older history.
 
 The header context value is a context-window indicator, not a billing total. Codex currently exposes
 the latest turn's input tokens rather than a dedicated context-occupancy field, so Giskard uses that
