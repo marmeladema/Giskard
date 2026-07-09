@@ -294,6 +294,18 @@ async fn index_page_is_served_and_public() {
         "the permanent right column and right mobile drawer are removed"
     );
     assert!(
+        body.contains("scrollbar-color:var(--scroll-thumb) var(--scroll-track)")
+            && body.contains("scrollbar-gutter:stable")
+            && body.contains("#transcript::-webkit-scrollbar")
+            && body.contains("#transcript::-webkit-scrollbar-thumb:hover")
+            && body.matches("--scroll-track:#").count() >= 4
+            && body.matches("--scroll-thumb:#").count() >= 4
+            && body.matches("--scroll-thumb-hover:#").count() >= 4
+            && !body.contains("body::-webkit-scrollbar")
+            && !body.contains("*::-webkit-scrollbar"),
+        "the transcript scrollbar is scoped and appearance-aware"
+    );
+    assert!(
         body.contains("if (initialThreadState)"),
         "UI only clears the transcript for the initial thread snapshot"
     );

@@ -8,7 +8,12 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.26
+**Version:** 1.27
+
+**Changelog (1.26 → 1.27), appearance-aware transcript scrollbar:**
+- **SB1:** The thread transcript owns a scoped thin scrollbar whose track, thumb, and hover colors
+  are part of the active Appearance theme. Other browser scroll containers keep their native
+  rendering unless they get their own explicit styling later.
 
 **Changelog (1.25 → 1.26), settings menu and two-column shell:**
 - **S1:** The desktop shell no longer reserves a right column for appearance-only content. The
