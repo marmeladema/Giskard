@@ -76,10 +76,10 @@ async fn index_page_is_served_and_public() {
     );
     assert!(
         body.contains("id=\"approvalSel\""),
-        "approval policy is a thread-header selector"
+        "approval policy is exposed as a selector"
     );
     assert!(
-        body.contains("<span class=\"thread-control-label\">Approvals</span>"),
+        body.contains("<label for=\"approvalSel\">Approvals</label>"),
         "approval policy selector has a visible label"
     );
     assert!(
@@ -261,7 +261,7 @@ async fn index_page_is_served_and_public() {
             && body.contains("EFFORT_OPTIONS")
             && body.contains("supports_reasoning_effort")
             && body.contains("reasoning_effort:effort")
-            && body.contains("Model default"),
+            && body.contains("unset.textContent = \"Default\""),
         "reasoning models expose a thread-header effort selector"
     );
     assert!(
