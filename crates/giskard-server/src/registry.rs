@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -45,9 +45,71 @@ struct TurnContext {
 type ApprovalMap = Arc<Mutex<HashMap<ApprovalId, ThreadId>>>;
 type ServerRequestMap = Arc<Mutex<HashMap<ServerRequestId, ThreadId>>>;
 
+#[derive(Clone, Default)]
+struct ThreadTurnGate {
+    active: Arc<StdMutex<HashSet<ThreadId>>>,
+}
+
+impl ThreadTurnGate {
+    fn reserve(&self, thread_id: ThreadId) -> Result<ThreadTurnLease, HarnessError> {
+        let mut active = self.active_threads();
+        if !active.insert(thread_id) {
+            return Err(HarnessError::ThreadBusy { thread: thread_id });
+        }
+        debug!(%thread_id, "reserved active thread turn");
+        Ok(ThreadTurnLease {
+            gate: self.clone(),
+            thread_id,
+            released: false,
+        })
+    }
+
+    fn active_threads(&self) -> StdMutexGuard<'_, HashSet<ThreadId>> {
+        match self.active.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("thread turn gate lock was poisoned; recovering active-turn state");
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    fn release(&self, thread_id: ThreadId) {
+        let mut active = self.active_threads();
+        if active.remove(&thread_id) {
+            debug!(%thread_id, "released active thread turn");
+        }
+    }
+}
+
+struct ThreadTurnLease {
+    gate: ThreadTurnGate,
+    thread_id: ThreadId,
+    released: bool,
+}
+
+impl ThreadTurnLease {
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.gate.release(self.thread_id);
+        self.released = true;
+    }
+}
+
+impl Drop for ThreadTurnLease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 pub struct HarnessRegistry {
     harnesses: Mutex<HashMap<ProjectId, Arc<dyn AgentHarness>>>,
     threads: Mutex<HashMap<ThreadId, (ProjectId, ThreadHandle)>>,
+    /// Per-thread turn gate covering both start-in-progress and live turns. `LiveBufferStore` only
+    /// becomes active after `TurnStarted`, so it cannot protect the `start_turn` race itself.
+    turn_gate: ThreadTurnGate,
     /// Which thread a pending approval belongs to, so `ApprovalDecision { request_id }` (which
     /// carries no thread id, §13.6) can be routed to the right harness (§9.2).
     approvals: ApprovalMap,
@@ -74,6 +136,7 @@ impl HarnessRegistry {
         Self {
             harnesses: Mutex::new(HashMap::new()),
             threads: Mutex::new(HashMap::new()),
+            turn_gate: ThreadTurnGate::default(),
             approvals: Arc::new(Mutex::new(HashMap::new())),
             server_requests: Arc::new(Mutex::new(HashMap::new())),
             factory,
@@ -169,6 +232,7 @@ impl HarnessRegistry {
             .clone();
         drop(harnesses);
 
+        let turn_gate = self.turn_gate.reserve(thread_id)?;
         let ctx = TurnContext {
             user_input: input.clone(),
             model: effective_model,
@@ -199,6 +263,7 @@ impl HarnessRegistry {
                 server_requests_map,
                 ledger,
                 ctx,
+                Some(turn_gate),
             )
             .await;
         });
@@ -316,6 +381,7 @@ impl HarnessRegistry {
             .cloned()
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
 
+        let turn_gate = self.turn_gate.reserve(thread_id)?;
         let ctx = TurnContext {
             user_input: UserInput::text("/compact"),
             model: effective_model,
@@ -346,6 +412,7 @@ impl HarnessRegistry {
                 server_requests_map,
                 ledger,
                 ctx,
+                Some(turn_gate),
             )
             .await;
         });
@@ -492,6 +559,7 @@ async fn forward_events(
     server_requests: ServerRequestMap,
     ledger: LedgerHandle,
     ctx: TurnContext,
+    mut turn_gate: Option<ThreadTurnLease>,
 ) {
     let mut turn_id: Option<TurnId> = None;
     let mut owned_turn: Option<TurnId> = None;
@@ -627,12 +695,6 @@ async fn forward_events(
                     live_buffers.append(thread_id, event.clone()).await;
                 }
 
-                hub.broadcast_event(thread_id, event).await;
-
-                if command_state_changed {
-                    broadcast_running_commands(&hub, &running_commands, thread_id).await;
-                }
-
                 if let Some((completed_turn, usage, status)) = completed {
                     let tid = turn_id.unwrap_or(completed_turn);
                     seen_turn_ids.insert(tid);
@@ -650,10 +712,24 @@ async fn forward_events(
                     };
                     persist_turn(&store, &hub, &ledger, project_id, thread_id, turn).await;
                     live_buffers.clear_turn(thread_id).await;
+                    if let Some(turn_gate) = turn_gate.as_mut() {
+                        turn_gate.release();
+                    }
                     owned_turn_completed = true;
+                    hub.broadcast_event(thread_id, event).await;
+                    if command_state_changed {
+                        broadcast_running_commands(&hub, &running_commands, thread_id).await;
+                    }
                     if !running_commands.has_running_for_turn(thread_id, tid).await {
                         break;
                     }
+                    continue;
+                }
+
+                hub.broadcast_event(thread_id, event).await;
+
+                if command_state_changed {
+                    broadcast_running_commands(&hub, &running_commands, thread_id).await;
                 }
             }
             Err(e) => {
@@ -1254,6 +1330,7 @@ mod tests {
                 server_requests,
                 ledger,
                 ctx,
+                None,
             )
             .await;
         });

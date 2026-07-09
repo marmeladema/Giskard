@@ -23,6 +23,8 @@ pub enum HarnessError {
     Unsupported(String),
     #[error("thread not found: {0}")]
     ThreadNotFound(ThreadId),
+    #[error("thread already has an active turn: {thread}")]
+    ThreadBusy { thread: ThreadId },
     #[error("operation timed out: {0}")]
     Timeout(String),
 }

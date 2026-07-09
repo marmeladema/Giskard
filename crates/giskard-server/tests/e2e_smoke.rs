@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use futures_util::{SinkExt, StreamExt};
 use giskard_core::approval::ApprovalDecision;
@@ -39,6 +40,9 @@ impl HarnessFactory for TestFactory {
 struct NoMcpFactory;
 struct UnsupportedCompactionFactory;
 struct SlowCompactionFactory;
+struct SlowStartFactory {
+    harness: Arc<SlowStartHarness>,
+}
 
 #[async_trait::async_trait]
 impl HarnessFactory for NoMcpFactory {
@@ -70,6 +74,16 @@ impl HarnessFactory for SlowCompactionFactory {
     }
 }
 
+#[async_trait::async_trait]
+impl HarnessFactory for SlowStartFactory {
+    async fn create(
+        &self,
+        _config: &ProjectConfig,
+    ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
+        Ok(self.harness.clone())
+    }
+}
+
 struct NoMcpHarness;
 
 #[derive(Default)]
@@ -80,6 +94,45 @@ struct UnsupportedCompactionHarness {
 #[derive(Default)]
 struct SlowCompactionHarness {
     threads: tokio::sync::Mutex<HashMap<ThreadId, tokio::sync::broadcast::Sender<AgentEvent>>>,
+}
+
+struct SlowStartHarness {
+    threads: tokio::sync::Mutex<HashMap<ThreadId, tokio::sync::broadcast::Sender<AgentEvent>>>,
+    start_calls: AtomicUsize,
+    hold_first_start: AtomicBool,
+    release_first_start: AtomicBool,
+}
+
+impl SlowStartHarness {
+    fn new() -> Self {
+        Self {
+            threads: tokio::sync::Mutex::new(HashMap::new()),
+            start_calls: AtomicUsize::new(0),
+            hold_first_start: AtomicBool::new(true),
+            release_first_start: AtomicBool::new(false),
+        }
+    }
+
+    async fn wait_for_start_calls(&self, expected: usize) {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            if self.start_calls.load(Ordering::SeqCst) >= expected {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("timed out waiting for {expected} start_turn calls");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    fn start_calls(&self) -> usize {
+        self.start_calls.load(Ordering::SeqCst)
+    }
+
+    fn release_first_start(&self) {
+        self.release_first_start.store(true, Ordering::SeqCst);
+    }
 }
 
 #[async_trait::async_trait]
@@ -313,6 +366,129 @@ impl AgentHarness for SlowCompactionHarness {
                 },
             });
         });
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> Result<(), HarnessError> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentHarness for SlowStartHarness {
+    fn capabilities(&self) -> HarnessCapabilities {
+        HarnessCapabilities {
+            live_approvals: false,
+            plan_build_modes: false,
+            per_turn_model: false,
+            reasoning_effort: false,
+            structured_diffs: false,
+            resumable_threads: true,
+            model_listing: false,
+            token_usage: false,
+            mcp_status: false,
+            mcp_reload: false,
+            mcp_oauth_login: false,
+            context_compaction: true,
+        }
+    }
+
+    async fn list_models(&self) -> Result<Vec<giskard_core::ModelDescriptor>, HarnessError> {
+        Ok(Vec::new())
+    }
+
+    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
+        let thread = opts.thread.unwrap_or_default();
+        let (tx, _) = tokio::sync::broadcast::channel(32);
+        self.threads.lock().await.insert(thread, tx);
+        Ok(ThreadHandle {
+            thread,
+            harness_thread_id: opts.resume.unwrap_or_else(|| format!("test_{thread}")),
+            warning: None,
+        })
+    }
+
+    async fn start_turn(
+        &self,
+        thread: &ThreadHandle,
+        input: UserInput,
+        _overrides: TurnOverrides,
+    ) -> Result<TurnId, HarnessError> {
+        let Some(sender) = self.threads.lock().await.get(&thread.thread).cloned() else {
+            return Err(HarnessError::ThreadNotFound(thread.thread));
+        };
+        let call = self.start_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == 1 && self.hold_first_start.swap(false, Ordering::SeqCst) {
+            while !self.release_first_start.load(Ordering::SeqCst) {
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        let thread_id = thread.thread;
+        let turn = TurnId::new();
+        let text = input.as_text().unwrap_or("message").to_owned();
+        let item = Item {
+            id: ItemId::new(),
+            harness_item_id: format!("reply_{call}_{turn}"),
+            payload: ItemPayload::AgentMessage {
+                text: format!("reply to {text}"),
+            },
+            created_at: chrono::Utc::now(),
+        };
+        let _ = sender.send(AgentEvent::TurnStarted {
+            thread: thread_id,
+            turn,
+        });
+        tokio::task::yield_now().await;
+        let _ = sender.send(AgentEvent::ItemCompleted {
+            thread: thread_id,
+            turn,
+            item,
+        });
+        tokio::task::yield_now().await;
+        let _ = sender.send(AgentEvent::TurnCompleted {
+            thread: thread_id,
+            turn,
+            usage: TokenUsage::default(),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        });
+        Ok(turn)
+    }
+
+    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
+        if let Ok(threads) = self.threads.try_lock() {
+            if let Some(sender) = threads.get(&thread.thread) {
+                return AgentEventStream::new(sender.subscribe());
+            }
+        }
+        let (_, rx) = tokio::sync::broadcast::channel(1);
+        AgentEventStream::new(rx)
+    }
+
+    async fn respond_approval(
+        &self,
+        _req: ApprovalId,
+        _decision: ApprovalDecision,
+    ) -> Result<(), HarnessError> {
+        Ok(())
+    }
+
+    async fn respond_server_request(
+        &self,
+        _req: ServerRequestId,
+        _response: ServerRequestResponse,
+    ) -> Result<(), HarnessError> {
+        Ok(())
+    }
+
+    async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
+        Ok(())
+    }
+
+    async fn compact_thread(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
         Ok(())
     }
 
@@ -789,6 +965,18 @@ session_days = 30
 
 async fn start_slow_compaction_server_on_available_port() -> (tempfile::TempDir, Arc<AppState>, u16)
 {
+    start_custom_server_on_available_port(Arc::new(SlowCompactionFactory)).await
+}
+
+async fn start_slow_start_server_on_available_port(
+    harness: Arc<SlowStartHarness>,
+) -> (tempfile::TempDir, Arc<AppState>, u16) {
+    start_custom_server_on_available_port(Arc::new(SlowStartFactory { harness })).await
+}
+
+async fn start_custom_server_on_available_port(
+    factory: Arc<dyn HarnessFactory>,
+) -> (tempfile::TempDir, Arc<AppState>, u16) {
     let tmp = tempfile::TempDir::new().unwrap();
 
     let hash = generate_password_hash("testpass");
@@ -809,8 +997,7 @@ session_days = 30
 
     let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
     let session_key: Vec<u8> = (0..32u8).collect();
-    let state = AppState::new(store, Arc::new(SlowCompactionFactory), session_key);
-
+    let state = AppState::new(store, factory, session_key);
     let app = build_app(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -905,6 +1092,175 @@ async fn create_project_only(client: &reqwest::Client, base: &str, cookie: &str)
         .parse()
         .unwrap();
     project_id
+}
+
+async fn wait_for_ws_error(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    action: &str,
+    code: &str,
+) -> giskard_proto::ErrorInfo {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                if let Ok(ServerMessage::Error { error }) = serde_json::from_str(&text) {
+                    if error.action.as_deref() == Some(action) && error.code == code {
+                        return error;
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => {}
+        }
+    }
+    panic!("websocket error {code}/{action} was not observed");
+}
+
+async fn wait_for_turn_completed(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    thread_id: ThreadId,
+) {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                if let Ok(ServerMessage::Event {
+                    thread_id: event_thread,
+                    agent_event: WireAgentEvent::TurnCompleted { .. },
+                }) = serde_json::from_str(&text)
+                {
+                    if event_thread == thread_id {
+                        return;
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => {}
+        }
+    }
+    panic!("turn completion for {thread_id} was not observed");
+}
+
+#[tokio::test]
+async fn send_input_rejects_second_turn_before_turn_started() {
+    let harness = Arc::new(SlowStartHarness::new());
+    let (_tmp, _state, port) = start_slow_start_server_on_available_port(harness.clone()).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let (_, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    let mut first = connect_ws(port, &cookie).await;
+    let mut second = connect_ws(port, &cookie).await;
+
+    for ws in [&mut first, &mut second] {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&ClientMessage::Subscribe { thread_id })
+                .unwrap()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    }
+
+    first
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&ClientMessage::SendInput {
+                thread_id,
+                text: "first message".into(),
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    harness.wait_for_start_calls(1).await;
+
+    second
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&ClientMessage::SendInput {
+                thread_id,
+                text: "overlapping message".into(),
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let error = wait_for_ws_error(&mut second, "send_input", "thread_turn_active").await;
+    assert_eq!(error.severity, ErrorSeverity::Error);
+    assert_eq!(error.thread_id, Some(thread_id));
+    assert_eq!(harness.start_calls(), 1);
+
+    harness.release_first_start();
+    wait_for_turn_completed(&mut first, thread_id).await;
+
+    second
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&ClientMessage::SendInput {
+                thread_id,
+                text: "after completion".into(),
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    harness.wait_for_start_calls(2).await;
+    wait_for_turn_completed(&mut second, thread_id).await;
+    assert_eq!(harness.start_calls(), 2);
+}
+
+#[tokio::test]
+async fn send_input_rejects_same_thread_during_compaction() {
+    let (_tmp, state, port) = start_slow_compaction_server_on_available_port().await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let (_, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    let mut ws = connect_ws(port, &cookie).await;
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::Subscribe { thread_id })
+            .unwrap()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::CompactContext { thread_id })
+            .unwrap()
+            .into(),
+    ))
+    .await
+    .unwrap();
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while !state.live_buffers.is_active(thread_id).await {
+        if tokio::time::Instant::now() >= deadline {
+            panic!("compaction thread did not become active");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+    }
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SendInput {
+            thread_id,
+            text: "overlap compaction".into(),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    let error = wait_for_ws_error(&mut ws, "send_input", "thread_turn_active").await;
+    assert_eq!(error.severity, ErrorSeverity::Error);
+    assert_eq!(error.thread_id, Some(thread_id));
 }
 
 #[tokio::test]
