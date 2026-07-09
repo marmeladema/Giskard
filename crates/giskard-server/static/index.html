@@ -27,19 +27,34 @@
 
   /* app grid — flanking column widths are user-resizable (persisted) via CSS vars.
      Display is toggled via `.open` (not inline style) so the mobile media query can override it. */
-  #app { display:none; grid-template-columns:var(--col-left,260px) 6px minmax(360px,1fr) 6px var(--col-right,300px); height:100vh; }
+  #app { display:none; grid-template-columns:var(--col-left,260px) 6px minmax(360px,1fr); height:100vh; }
   #app.open { display:grid; }
   #mobileBar { display:none; }
   #backdrop { display:none; }
   .col { height:100vh; overflow-y:auto; }
   .resizer { cursor:col-resize; background:transparent; transition:background .12s; }
   .resizer:hover, .resizer.active { background:var(--accent); }
-  .sidebar { background:var(--panel); padding:12px; }
+  .sidebar {
+    position:relative; z-index:40; background:var(--panel); padding:12px;
+    display:flex; flex-direction:column; min-height:0; overflow:visible;
+  }
+  #projects { flex:1; min-height:0; overflow-y:auto; }
+  .sidebar-settings { position:relative; margin-top:10px; padding-top:10px; border-top:1px solid var(--border); }
+  .settings-btn { width:32px; height:32px; padding:0; font-size:17px; line-height:1; }
+  .settings-popover {
+    position:absolute; left:0; bottom:40px; z-index:70; width:min(260px, calc(100vw - 24px));
+    padding:10px; border:1px solid var(--border); border-radius:8px; background:var(--panel);
+    box-shadow:0 20px 48px rgba(0,0,0,.45);
+  }
+  .settings-popover[hidden] { display:none; }
+  .settings-head { display:flex; align-items:center; gap:8px; margin-bottom:10px; }
+  .settings-head strong { flex:1; }
+  .settings-head button { font-size:12px; padding:4px 8px; }
+  .settings-field label { display:block; color:var(--muted); font-size:12px; margin-bottom:4px; }
+  .settings-field select { width:100%; }
   /* The center column owns both dividers, so each delimiter line hugs the thread and the drag
      bar sits just outside it — symmetric on the left and right. */
   .center { display:flex; flex-direction:column; border-left:1px solid var(--border); border-right:1px solid var(--border); }
-  .ctx { background:var(--panel); padding:12px; }
-
   .proj { margin-bottom:10px; }
   .proj > .name { font-weight:600; display:flex; justify-content:space-between; align-items:center; }
   .thread-row { position:relative; display:flex; align-items:center; gap:4px; margin:3px 0 3px 8px; border-radius:6px; }
@@ -416,9 +431,8 @@
   [data-appearance="terminal"] .msg.notice .role { color:#d29922; }
 
   /* =================== Mobile / responsive ===================
-     The same page adapts to the viewport (no separate mobile build). On narrow screens the three
-     columns collapse to a single full-width transcript; the projects list and the appearance
-     panel become slide-in drawers reached from a top bar. Desktop (>820px) is unchanged. */
+     The same page adapts to the viewport (no separate mobile build). On narrow screens the
+     sidebar becomes a slide-in drawer reached from a top bar. Desktop (>820px) is unchanged. */
   #mobileBar { align-items:center; gap:10px; padding:8px 12px; border-bottom:1px solid var(--border); background:var(--panel); }
   #mobileBar button { font-size:18px; line-height:1; padding:3px 11px; }
   #mobileBar .mbTitle { flex:1; min-width:0; text-align:center; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -433,16 +447,14 @@
     #mobileBar { display:flex; }
     header.thr .badge#thrTitle { display:none; }   /* title already shown in the mobile bar */
 
-    /* Side columns become off-canvas drawers. */
-    .sidebar, .ctx {
+    /* The sidebar becomes an off-canvas drawer. */
+    .sidebar {
       position:fixed; top:0; bottom:0; width:84%; max-width:340px; z-index:60;
       transition:transform .22s ease; will-change:transform;
     }
     .sidebar { left:0; transform:translateX(-100%); border-right:1px solid var(--border); }
-    .ctx { right:0; transform:translateX(100%); border-left:1px solid var(--border); }
     #app.drawer-left .sidebar { transform:translateX(0); box-shadow:0 0 40px rgba(0,0,0,.55); }
-    #app.drawer-right .ctx { transform:translateX(0); box-shadow:0 0 40px rgba(0,0,0,.55); }
-    #app.drawer-left #backdrop, #app.drawer-right #backdrop { display:block; }
+    #app.drawer-left #backdrop { display:block; }
 
     .msg { max-width:100%; }
     [data-appearance="bubbles"] .msg { max-width:100%; }
@@ -469,6 +481,23 @@
     <div class="col sidebar">
       <div class="row"><b style="flex:1">Projects</b><button id="newProj" title="New project">+</button></div>
       <div id="projects"></div>
+      <div class="sidebar-settings">
+        <button id="settingsBtn" class="settings-btn" title="Settings" aria-label="Settings">⚙</button>
+        <div id="settingsMenu" class="settings-popover" hidden>
+          <div class="settings-head">
+            <strong>Settings</strong>
+            <button id="settingsClose" type="button">Close</button>
+          </div>
+          <div class="settings-field">
+            <label for="appearanceSel">Appearance</label>
+            <select id="appearanceSel">
+              <option value="ide">Professional (IDE)</option>
+              <option value="bubbles">Bubbles</option>
+              <option value="terminal">Terminal</option>
+            </select>
+          </div>
+        </div>
+      </div>
     </div>
 
     <div class="resizer" id="resizeLeft" title="Drag to resize"></div>
@@ -477,7 +506,6 @@
       <div id="mobileBar">
         <button id="btnMenu" title="Projects & threads" aria-label="Projects">☰</button>
         <div class="mbTitle" id="mbTitle">Giskard</div>
-        <button id="btnInfo" title="Appearance" aria-label="Info">ⓘ</button>
       </div>
       <header class="thr" id="thrHeader" style="display:none">
         <span class="badge mono" id="thrTitle">—</span>
@@ -519,25 +547,12 @@
       </div>
     </div>
 
-    <div class="resizer" id="resizeRight" title="Drag to resize"></div>
-
-    <div class="col ctx">
-      <div class="field" style="margin-top:0">
-        <label for="appearanceSel">Appearance</label>
-        <select id="appearanceSel">
-          <option value="ide">Professional (IDE)</option>
-          <option value="bubbles">Bubbles</option>
-          <option value="terminal">Terminal</option>
-        </select>
-      </div>
-    </div>
-
     <!-- Tap-to-dismiss backdrop shown behind an open mobile drawer. -->
     <div id="backdrop"></div>
   </div>
 
-  <!-- Toast/notice stack: a body-level fixed overlay so it stays visible on mobile (where the
-       right column becomes a closed drawer) and isn't clipped by the drawer's transform. -->
+  <!-- Toast/notice stack: a body-level fixed overlay so it stays visible on mobile and isn't
+       clipped by drawer transforms. -->
   <div id="notices"></div>
 
   <!-- New-project dialog with a directory picker -->
@@ -3747,19 +3762,20 @@ function setThreadTitle(t) {
     ? `<span class="crumb">${escapeHtml(proj)}</span> / ${escapeHtml(t)}`
     : escapeHtml(t);
 }
-function closeDrawers() { $("app").classList.remove("drawer-left","drawer-right"); }
+function closeDrawers() { $("app").classList.remove("drawer-left"); }
 function toggleDrawer(side) {
-  const app = $("app"), cls = side==="left" ? "drawer-left" : "drawer-right", other = side==="left" ? "drawer-right" : "drawer-left";
-  app.classList.remove(other);
-  app.classList.toggle(cls);
+  if (side !== "left") return;
+  $("app").classList.toggle("drawer-left");
 }
 $("btnMenu").onclick = () => toggleDrawer("left");
-$("btnInfo").onclick = () => toggleDrawer("right");
 $("backdrop").onclick = closeDrawers;
 document.addEventListener("keydown", (e) => {
   if (e.key!=="Escape") return;
   if ($("codeOverlay").classList.contains("open")) closeCodeOverlay();
-  else closeDrawers();
+  else {
+    closeSettingsMenu();
+    closeDrawers();
+  }
 });
 
 function renderTokens(led) {
@@ -3860,11 +3876,8 @@ $("transcript").addEventListener("scroll", onTranscriptScroll);
 function initResizers() {
   const app = $("app");
   const savedL = localStorage.getItem("giskard.colLeft");
-  const savedR = localStorage.getItem("giskard.colRight");
   if (savedL) app.style.setProperty("--col-left", savedL);
-  if (savedR) app.style.setProperty("--col-right", savedR);
   setupResizer($("resizeLeft"), "--col-left", "giskard.colLeft", true, 260);
-  setupResizer($("resizeRight"), "--col-right", "giskard.colRight", false, 300);
 }
 function setupResizer(handle, cssVar, storeKey, isLeft, fallback) {
   handle.addEventListener("mousedown", (e) => {
@@ -3893,6 +3906,24 @@ function setupResizer(handle, cssVar, storeKey, isLeft, fallback) {
   });
 }
 initResizers();
+
+/* ---------- settings menu ---------- */
+function closeSettingsMenu() {
+  $("settingsMenu").hidden = true;
+}
+function toggleSettingsMenu() {
+  const menu = $("settingsMenu");
+  menu.hidden = !menu.hidden;
+}
+$("settingsBtn").onclick = (e) => { e.stopPropagation(); toggleSettingsMenu(); };
+$("settingsMenu").onclick = (e) => e.stopPropagation();
+$("settingsClose").onclick = closeSettingsMenu;
+document.addEventListener("click", (e) => {
+  const menu = $("settingsMenu");
+  if (menu.hidden) return;
+  if (e.target.closest && e.target.closest(".sidebar-settings")) return;
+  menu.hidden = true;
+});
 
 /* ---------- appearance theme (persisted client-side) ---------- */
 const APPEARANCES = ["ide","bubbles","terminal"];

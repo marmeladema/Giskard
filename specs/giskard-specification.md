@@ -8,7 +8,14 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.25
+**Version:** 1.26
+
+**Changelog (1.25 → 1.26), settings menu and two-column shell:**
+- **S1:** The desktop shell no longer reserves a right column for appearance-only content. The
+  application layout is a left project/thread sidebar plus the main thread workspace.
+- **S2:** Durable client UI preferences, starting with Appearance, live in a `Settings` popover
+  opened from an icon button pinned to the bottom of the left sidebar. On mobile the same control is
+  reached inside the Projects drawer.
 
 **Changelog (1.24 → 1.25), transcript task grouping:**
 - **TG1:** Command execution and tool/MCP call transcript items render inside top-level `Tasks`
@@ -1931,34 +1938,34 @@ sessions, so clarity and low visual noise beat flourish. Explicitly avoid the ge
 ### 13.3 Primary layout (desktop / laptop)
 
 ```
-┌───────────┬────────────────────────────────────┬────────────────────┐
-│ Projects  │  Thread header: mode · model ·      │  Context panel     │
-│ + threads │  approval · tasks · context usage    │  (tabs):           │
-│ (sidebar) ├────────────────────────────────────┤  • Diffs (side-by- │
-│           │                                     │    side)           │
-│  proj A   │  Transcript (streamed items,        │  • Code overlay    │
-│   ├ th 1  │  linkified paths, collapsible        │    (syntect HTML)  │
-│   └ th 2  │  reasoning, command output, diffs)  │                    │
-│  proj B   │                                     │                    │
-│   └ th 3  │                                     │                    │
-│           ├────────────────────────────────────┤                    │
-│  [+ proj] │  Composer: input · mode toggle ·    │                    │
-│           │  model picker · send/interrupt      │                    │
-└───────────┴────────────────────────────────────┴────────────────────┘
+┌───────────┬───────────────────────────────────────────────┐
+│ Projects  │  Thread header: mode · model · approval ·      │
+│ + threads │  tasks · MCP · context usage                   │
+│ (sidebar) ├───────────────────────────────────────────────┤
+│           │                                               │
+│  proj A   │  Transcript (streamed items, linkified paths,  │
+│   ├ th 1  │  collapsible reasoning, tasks, command output, │
+│   └ th 2  │  file changes)                                │
+│  proj B   │                                               │
+│   └ th 3  │                                               │
+│           ├───────────────────────────────────────────────┤
+│  Settings │  Composer: input · send/interrupt              │
+└───────────┴───────────────────────────────────────────────┘
 ```
 
 - **Left sidebar:** projects with their threads (collapsible), token summary entry point,
-  "new project" action.
+  "new project" action, and a bottom-pinned **Settings** menu for durable client UI preferences
+  such as Appearance.
 - **Center:** thread header (mode, model, approval policy, tasks menu, context usage menu, plan-dump &
   interrupt actions) + transcript + composer.
-- **Right context panel:** tabbed **Diffs** (side-by-side) and **Code overlay**.
+- Source/code previews and downloads open as overlays from linkified transcript paths rather than
+  occupying a permanent right column.
 
 ### 13.4 Responsive (smartphone)
 
-- The three columns collapse into a **single-column, tab/drawer navigation**:
-  - Bottom (or top) nav switches between **Threads list**, **Transcript**, **Context panel**.
-  - The right-panel tabs (Diffs / Code) become a secondary switcher within the
-    Context view.
+- The two columns collapse into a **single-column drawer navigation**:
+  - The top bar opens the **Projects** drawer, which also contains the **Settings** menu.
+  - The transcript remains the primary view.
   - Side-by-side diffs fall back to **unified inline** diffs when width is insufficient.
 - Composer stays pinned to the bottom on the Transcript view. Approval prompts appear as a
   bottom sheet.
