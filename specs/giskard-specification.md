@@ -8,7 +8,13 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.29
+**Version:** 1.30
+
+**Changelog (1.29 → 1.30), collapsible project sidebar groups:**
+- **PC1:** Project groups in the left sidebar / mobile Projects drawer are collapsible so a user can
+  hide a project's thread list without leaving the project behind. The collapsed/expanded state is
+  a durable browser UI preference stored in local storage, not server state, and the New Thread
+  action remains available from the project row.
 
 **Changelog (1.28 → 1.29), per-thread turn gate:**
 - **TG1:** Giskard enforces a server-side, per-thread turn gate around normal user turns and manual
@@ -1986,9 +1992,10 @@ sessions, so clarity and low visual noise beat flourish. Explicitly avoid the ge
 └───────────┴───────────────────────────────────────────────┘
 ```
 
-- **Left sidebar:** projects with their threads (collapsible), token summary entry point,
-  "new project" action, and a bottom-pinned **Settings** menu for durable client UI preferences
-  such as Appearance.
+- **Left sidebar:** projects with their thread lists, a project-row disclosure control to collapse
+  or expand each project's threads, "new project" / per-project "new thread" actions, and a
+  bottom-pinned **Settings** menu for durable client UI preferences such as Appearance. Project
+  collapse state is browser-local and persists across reloads.
 - **Center:** thread header (mode, model, approval policy, tasks menu, MCP menu, context usage menu
   with manual compact action, plan-dump & interrupt actions) + transcript + composer.
 - Source/code previews and downloads open as overlays from linkified transcript paths rather than

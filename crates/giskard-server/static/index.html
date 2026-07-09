@@ -57,7 +57,17 @@
      bar sits just outside it — symmetric on the left and right. */
   .center { display:flex; flex-direction:column; border-left:1px solid var(--border); border-right:1px solid var(--border); }
   .proj { margin-bottom:10px; }
-  .proj > .name { font-weight:600; display:flex; justify-content:space-between; align-items:center; }
+  .proj.collapsed { margin-bottom:6px; }
+  .proj > .name { font-weight:600; display:flex; gap:4px; align-items:center; }
+  .project-toggle { width:24px; height:24px; padding:0; border-color:transparent; background:transparent; color:var(--muted); line-height:1; }
+  .project-toggle:hover { border-color:var(--border); color:var(--fg); }
+  .project-name {
+    flex:1; min-width:0; padding:2px 0; border:0; background:transparent; color:var(--fg);
+    font-weight:600; text-align:left; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .project-name:hover { border-color:transparent; color:var(--accent); }
+  .project-add { width:28px; height:28px; padding:0; }
+  .project-threads[hidden] { display:none; }
   .thread-row { position:relative; display:flex; align-items:center; gap:4px; margin:3px 0 3px 8px; border-radius:6px; }
   .thread { flex:1; min-width:0; padding:5px 8px; border-radius:6px; cursor:pointer; color:var(--muted); font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .thread:hover { background:var(--panel2); }
@@ -617,6 +627,7 @@
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
+const PROJECT_COLLAPSE_KEY = "giskard.collapsedProjects";
 let state = {
   projectId:null, threadId:null, mode:"build", ws:null, wsStatus:"closed", wsConnectId:0,
   models:[], streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null, pendingClientMsgs:[],
@@ -629,7 +640,8 @@ let state = {
   expandedTaskGroups:new Set(), manuallyToggledTaskGroups:new Set(), expandedTaskDetails:new Map(),
   linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, activeTurn:false, interruptPending:false, compactPending:false,
   awaitingInitialThreadState:false, contextWindow:0, contextUsed:null, tokenLedger:null, approvalPolicy:"ask",
-  mcpServers:[], mcpCapabilities:{ status:false, reload:false, oauth_login:false }, mcpLoading:false, mcpError:null, expandedMcps:new Set()
+  mcpServers:[], mcpCapabilities:{ status:false, reload:false, oauth_login:false }, mcpLoading:false, mcpError:null, expandedMcps:new Set(),
+  collapsedProjects:new Set(loadCollapsedProjects())
 };
 const COMMAND_AUTO_COLLAPSE_LINES = 120;
 const COMMAND_AUTO_COLLAPSE_BYTES = 16 * 1024;
@@ -702,12 +714,36 @@ async function loadProjects() {
   for (const p of projects) {
     state.projectNames[p.id] = p.name;
     const d = document.createElement("div"); d.className="proj";
+    d.dataset.pid = p.id;
+    const collapsed = state.collapsedProjects.has(p.id);
+    d.classList.toggle("collapsed", collapsed);
     const name = document.createElement("div"); name.className="name";
-    const label = document.createElement("span"); label.textContent = p.name;
-    const add = document.createElement("button"); add.textContent="+"; add.title="New thread";
-    add.onclick = () => newThread(p.id);
-    name.append(label, add); d.append(name);
-    const threads = document.createElement("div"); threads.id = "threads-"+p.id; d.append(threads);
+    const toggle = document.createElement("button");
+    toggle.type = "button"; toggle.className = "project-toggle";
+    toggle.setAttribute("aria-label", collapsed ? "Expand project" : "Collapse project");
+    toggle.setAttribute("aria-expanded", String(!collapsed));
+    toggle.textContent = collapsed ? ">" : "v";
+    toggle.title = collapsed ? "Expand project" : "Collapse project";
+    toggle.onclick = (e) => {
+      e.stopPropagation();
+      setProjectCollapsed(p.id, !state.collapsedProjects.has(p.id));
+    };
+    const label = document.createElement("button");
+    label.type = "button"; label.className = "project-name";
+    label.textContent = p.name; label.title = p.name;
+    label.onclick = () => setProjectCollapsed(p.id, !state.collapsedProjects.has(p.id));
+    const add = document.createElement("button"); add.className="project-add"; add.textContent="+";
+    add.title="New thread";
+    add.onclick = (e) => {
+      e.stopPropagation();
+      setProjectCollapsed(p.id, false);
+      newThread(p.id);
+    };
+    name.append(toggle, label, add); d.append(name);
+    const threads = document.createElement("div");
+    threads.id = "threads-"+p.id; threads.className = "project-threads";
+    threads.hidden = collapsed;
+    d.append(threads);
     box.append(d);
     pending.push(loadThreads(p.id));
   }
@@ -742,6 +778,41 @@ async function loadThreads(pid) {
       for (const t of archived) box.append(threadRow(pid, t));
     }
   } catch {}
+}
+
+function loadCollapsedProjects() {
+  try {
+    const ids = JSON.parse(localStorage.getItem(PROJECT_COLLAPSE_KEY) || "[]");
+    return Array.isArray(ids) ? ids.filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveCollapsedProjects() {
+  try {
+    localStorage.setItem(PROJECT_COLLAPSE_KEY, JSON.stringify([...state.collapsedProjects]));
+  } catch {}
+}
+
+function setProjectCollapsed(pid, collapsed) {
+  if (!pid) return;
+  if (collapsed) state.collapsedProjects.add(pid);
+  else state.collapsedProjects.delete(pid);
+  saveCollapsedProjects();
+  const project = document.querySelector(`.proj[data-pid="${pid}"]`);
+  if (!project) return;
+  project.classList.toggle("collapsed", collapsed);
+  const threads = $("threads-"+pid);
+  if (threads) threads.hidden = collapsed;
+  const toggle = project.querySelector(".project-toggle");
+  if (toggle) {
+    toggle.textContent = collapsed ? ">" : "v";
+    toggle.title = collapsed ? "Expand project" : "Collapse project";
+    toggle.setAttribute("aria-label", toggle.title);
+    toggle.setAttribute("aria-expanded", String(!collapsed));
+  }
+  closeThreadMenus();
 }
 
 function threadRow(pid, t) {
