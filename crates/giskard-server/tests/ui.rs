@@ -288,6 +288,16 @@ async fn index_page_is_served_and_public() {
         "appearance is exposed from the sidebar settings popover"
     );
     assert!(
+        body.contains("PROJECT_COLLAPSE_KEY = \"giskard.collapsedProjects\"")
+            && body.contains("collapsedProjects:new Set(loadCollapsedProjects())")
+            && body.contains("className = \"project-toggle\"")
+            && body.contains("aria-expanded")
+            && body.contains("setProjectCollapsed(p.id, !state.collapsedProjects.has(p.id))")
+            && body.contains(".project-threads[hidden]")
+            && body.contains("localStorage.setItem(PROJECT_COLLAPSE_KEY"),
+        "project rows can collapse and persist their thread-list visibility"
+    );
+    assert!(
         body.contains("overflow:visible")
             && body.contains("z-index:40")
             && body.contains("z-index:70"),
