@@ -937,6 +937,9 @@ async fn start_mcp_oauth_login(
 fn harness_api_error(error: HarnessError) -> ApiError {
     match error {
         HarnessError::Unsupported(message) => ApiError::BadRequest(message),
+        HarnessError::ThreadBusy { .. } => {
+            ApiError::Conflict("Thread already has an active turn.".into())
+        }
         other => ApiError::Internal(other.to_string()),
     }
 }
@@ -1060,6 +1063,9 @@ impl WsError {
             ),
             HarnessError::ThreadNotFound(_) => {
                 ("thread_not_open", "Thread is not open in the harness.")
+            }
+            HarnessError::ThreadBusy { .. } => {
+                ("thread_turn_active", "Thread already has an active turn.")
             }
             HarnessError::Timeout(_) => ("harness_timeout", "Codex operation timed out."),
         };
@@ -1494,15 +1500,6 @@ async fn handle_client_msg(
                 .map_err(|e| WsError::from_harness(e, "interrupt", Some(thread_id)))?;
         }
         ClientMessage::CompactContext { thread_id } => {
-            if state.live_buffers.is_active(thread_id).await {
-                return Err(WsError::new(
-                    "compact_context_active_turn",
-                    ErrorSeverity::Warning,
-                    "Context compaction is not available while a turn is running.",
-                )
-                .thread(thread_id)
-                .action("compact_context"));
-            }
             let project_id = project_for(state, thread_id, "compact_context").await?;
             let tf = state
                 .store

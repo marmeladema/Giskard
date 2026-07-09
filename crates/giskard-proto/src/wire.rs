@@ -358,6 +358,7 @@ impl From<HarnessError> for WireHarnessError {
             HarnessError::Overloaded => "harness_overloaded",
             HarnessError::Unsupported(_) => "harness_unsupported",
             HarnessError::ThreadNotFound(_) => "thread_not_open",
+            HarnessError::ThreadBusy { .. } => "thread_turn_active",
             HarnessError::Timeout(_) => "harness_timeout",
         };
         Self {

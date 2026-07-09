@@ -8,7 +8,15 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.28
+**Version:** 1.29
+
+**Changelog (1.28 → 1.29), per-thread turn gate:**
+- **TG1:** Giskard enforces a server-side, per-thread turn gate around normal user turns and manual
+  context compaction. The gate is reserved before calling the harness, so it covers the race before
+  `TurnStarted` reaches the live buffer. Overlapping `SendInput` or `CompactContext` on the same
+  thread is rejected with a structured `thread_turn_active` error; other threads and projects
+  remain usable. The gate is released when the owned turn completes, or earlier startup paths fail
+  or are cancelled.
 
 **Changelog (1.27 → 1.28), manual context compaction:**
 - **CC1:** The context usage menu exposes a `Compact context` action that asks the active harness to
@@ -1124,6 +1132,7 @@ pub enum HarnessError {
     Overloaded,               // JSON-RPC -32001 after retries exhausted
     Unsupported(String),      // capability not offered by this harness
     ThreadNotFound(ThreadId),
+    ThreadBusy { thread: ThreadId },
     Timeout(String),          // operation timed out (S3: renamed from `Timed`)
 }
 ```
@@ -2029,6 +2038,13 @@ This guarantees a coherent experience when a future, less-capable harness is plu
 `Interrupt { thread_id }`, `CompactContext { thread_id }`,
 `TerminateCommand { thread_id, process_id }`,
 `ApprovalDecision { request_id, decision }`, `SavePlan { thread_id, path }`.
+
+`SendInput` and `CompactContext` are serialized per thread by the server before they enter the
+harness. If another normal turn or manual context compaction is already starting or running on the
+same thread, the server rejects the later request with `Error { code: "thread_turn_active", ... }`
+instead of starting a second forwarder. This is a correctness boundary, not only a browser disabled
+state: multiple tabs or reconnect races must not be able to start overlapping native turns for one
+thread.
 
 > **Durable settings switches (P2/P3).** `SwitchMode`, `SelectModel`, and `SetApprovalPolicy`
 > persist immediately to `<thread_id>.json` before the server acknowledges, then broadcast a
