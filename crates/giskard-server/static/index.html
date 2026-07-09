@@ -138,6 +138,7 @@
   .msg.cmd { background:#0b0e13; border:1px solid var(--border); }
   .msg.file { background:#101820; border:1px solid #28445f; }
   .msg.tool { background:#151521; border:1px solid #3b3b67; }
+  .msg.tasks { max-width:100%; background:#10151c; border:1px solid var(--border); }
   .msg.activity { background:#13181c; border:1px solid var(--border); color:#c9d1d9; }
   .msg.approval { background:#241d10; border:1px solid #d29922; max-width:100%; }
   .msg.approval.resolved { opacity:.72; }
@@ -234,6 +235,42 @@
   .msg.error .role { color:#f85149; opacity:1; }
   .msg.notice { background:#241d10; border:1px solid #d29922; color:#f0d98c; max-width:100%; }
   .msg.notice .role { color:#d29922; opacity:1; }
+  .msg.tasks.state-running { border-color:#d29922; }
+  .msg.tasks.state-succeeded { border-color:#238636; }
+  .msg.tasks.state-failed { border-color:#f85149; }
+  .msg.tasks.state-terminated { border-color:#8b949e; }
+  .task-group-body { white-space:normal; font-size:12px; }
+  .task-group-head {
+    display:flex; align-items:center; gap:8px; min-width:0; cursor:pointer;
+  }
+  .task-group-head:focus { outline:2px solid var(--accent); outline-offset:2px; border-radius:6px; }
+  .task-group-caret { color:var(--muted); width:1em; text-align:center; }
+  .task-group-title { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:600; }
+  .task-group-status { flex:0 0 auto; }
+  .task-group-status .cmd-status { font-size:11.5px; }
+  .task-group-list { display:flex; flex-direction:column; gap:5px; margin-top:6px; }
+  .task-group-item {
+    display:grid; grid-template-columns:auto minmax(0,1fr) auto; gap:7px; align-items:center;
+    border:1px solid var(--border); border-radius:8px; padding:5px 8px; background:var(--panel2);
+    cursor:pointer;
+  }
+  .task-group-item:focus { outline:2px solid var(--accent); outline-offset:1px; }
+  .task-group-item.state-running { border-color:#d29922; background:rgba(210,153,34,.08); }
+  .task-group-item.state-succeeded { border-color:#238636; background:rgba(35,134,54,.10); }
+  .task-group-item.state-failed { border-color:#f85149; background:rgba(248,81,73,.10); }
+  .task-group-item.state-terminated { border-color:#8b949e; background:rgba(139,148,158,.10); }
+  .task-group-item.selected { border-color:var(--accent); }
+  .task-group-item-symbol { font-size:12px; font-weight:700; line-height:1; }
+  .task-group-item-title { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }
+  .task-group-item-status { color:var(--muted); font-size:11px; white-space:nowrap; }
+  .task-group-entry.expanded .task-group-item { border-color:var(--accent); }
+  .task-group-entry > .msg { max-width:100%; margin:5px 0 0 0; padding:8px 10px; font-size:12px; }
+  .task-group-entry > .msg[hidden] { display:none; }
+  .task-group-entry > .msg .role { font-size:10px; }
+  .task-group-entry > .msg .cmd-title { font-size:12px; }
+  .task-group-entry > .msg .cmd-status,
+  .task-group-entry > .msg .meta { font-size:11.5px; }
+  .task-group-entry > .msg pre.out { font-size:12px; }
 
   /* usage stat tiles (context menu) */
   .stats { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
@@ -342,8 +379,13 @@
   [data-appearance="ide"] .msg.cmd,
   [data-appearance="ide"] .msg.file,
   [data-appearance="ide"] .msg.tool,
+  [data-appearance="ide"] .msg.tasks,
   [data-appearance="ide"] .msg.activity { border:0; border-bottom:1px solid var(--border); }
   [data-appearance="ide"] .msg.cmd { background:var(--panel2); }
+  [data-appearance="ide"] .msg.tasks { background:rgba(22,29,40,.72); }
+  [data-appearance="ide"] .task-group-entry > .msg {
+    border:1px solid var(--border); border-radius:8px; background:var(--panel2);
+  }
   [data-appearance="ide"] .msg.error { background:rgba(248,81,73,.09); border:0; border-bottom:1px solid var(--border); }
   [data-appearance="ide"] .msg.error .role { color:#f85149; }
   [data-appearance="ide"] .msg.notice { background:rgba(210,153,34,.09); border:0; border-bottom:1px solid var(--border); color:var(--fg); }
@@ -361,8 +403,11 @@
   [data-appearance="terminal"] .msg .role { margin:0; text-align:right; text-transform:lowercase; letter-spacing:0; opacity:1; color:var(--muted); }
   [data-appearance="terminal"] .msg.user, [data-appearance="terminal"] .msg.agent,
   [data-appearance="terminal"] .msg.cmd, [data-appearance="terminal"] .msg.file,
-  [data-appearance="terminal"] .msg.tool, [data-appearance="terminal"] .msg.activity,
+  [data-appearance="terminal"] .msg.tool, [data-appearance="terminal"] .msg.tasks,
+  [data-appearance="terminal"] .msg.activity,
   [data-appearance="terminal"] .msg.server-request { background:transparent; border:0; color:var(--fg); }
+  [data-appearance="terminal"] .task-group-item { padding:2px 0; border:0; background:transparent; }
+  [data-appearance="terminal"] .task-group-entry > .msg { margin-top:2px; padding:1px 0; }
   [data-appearance="terminal"] .msg.user .role { color:var(--accent); }
   [data-appearance="terminal"] .msg.reasoning { background:transparent; border:0; color:var(--muted); }
   [data-appearance="terminal"] .msg.error { background:transparent; border:0; color:#ff9d96; }
@@ -550,6 +595,8 @@ let state = {
   runningCommands:new Map(), commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null,
   commandPayloadsByItemId:new Map(), endedCommandsByItemId:new Map(), expandedCommandOutputs:new Set(), manuallyToggledCommandOutputs:new Set(),
   toolPayloadsByItemId:new Map(), toolBodyElsByItemId:new Map(), expandedToolOutputs:new Set(), manuallyToggledToolOutputs:new Set(),
+  activeTaskGroup:null, taskGroupSeq:0, taskItemSeq:0, taskGroupsById:new Map(), taskGroupsByItemId:new Map(),
+  expandedTaskGroups:new Set(), manuallyToggledTaskGroups:new Set(), expandedTaskDetails:new Map(),
   linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, activeTurn:false, interruptPending:false,
   awaitingInitialThreadState:false, contextWindow:0, contextUsed:null, tokenLedger:null, approvalPolicy:"ask",
   mcpServers:[], mcpCapabilities:{ status:false, reload:false, oauth_login:false }, mcpLoading:false, mcpError:null, expandedMcps:new Set()
@@ -1149,9 +1196,12 @@ function renderHistoryPage(msg) {
     // so the viewport doesn't jump while older content is inserted (infinite scroll).
     const container = document.createElement("div");
     const prev = state.renderTarget;
+    const prevTaskGroup = state.activeTaskGroup;
     state.renderTarget = container;
+    state.activeTaskGroup = null;
     for (const turn of turns) renderPersistedTurn(turn);
     state.renderTarget = prev;
+    state.activeTaskGroup = prevTaskGroup;
 
     const t = $("transcript");
     const heightBefore = t.scrollHeight;
@@ -1168,6 +1218,7 @@ function renderHistoryPage(msg) {
 // has no user_message item, so we render `user_input` directly; its `status.message` then explains
 // why the message got no agent response — the record that a transient toast used to lose.
 function renderPersistedTurn(turn) {
+  breakTaskGroup();
   const items = turn.items || [];
   const hasUserItem = items.some(it => ((it.payload||it).kind) === "user_message");
   const inputText = turn.user_input && turn.user_input.text;
@@ -1179,6 +1230,7 @@ function renderPersistedTurn(turn) {
   if (st && (st.kind==="failed" || st.kind==="interrupted")) {
     errorBubble(st.message || (st.kind==="interrupted" ? "Turn interrupted." : "Turn failed."));
   }
+  breakTaskGroup();
 }
 
 // Load older history when the user scrolls near the top (H4/H6 infinite scroll).
@@ -1194,6 +1246,7 @@ function onTranscriptScroll() {
 function handleEvent(ev) {
   switch (ev.kind) {
     case "turn_started":
+      breakTaskGroup();
       state.streamEl = null;
       state.streamItemId = null;
       state.streamElsByItemId.clear();
@@ -1233,6 +1286,7 @@ function handleEvent(ev) {
       state.itemKindsByItemId.clear();
       detachRunningCommands();
       setTurnActive(false);
+      breakTaskGroup();
       break;
     case "approval_requested": renderApprovalRequest(ev.request); break;
     case "server_request_received": renderServerRequest(ev.request); break;
@@ -1778,7 +1832,7 @@ function safeHttpUrl(value) {
 // Where new bubbles are appended: the live transcript, or a detached container when rendering an
 // older history page for prepending (infinite scroll).
 function renderTarget() { return state.renderTarget || $("transcript"); }
-function bubble(cls, role) {
+function appendBubble(cls, role) {
   const el = document.createElement("div"); el.className="msg "+cls;
   const r = document.createElement("div"); r.className="role"; r.textContent=role;
   const body = document.createElement("div"); body.className="body";
@@ -1787,6 +1841,249 @@ function bubble(cls, role) {
   t.append(el);
   if (!state.renderTarget) t.scrollTop = t.scrollHeight;
   return body;
+}
+function bubble(cls, role) {
+  breakTaskGroup();
+  return appendBubble(cls, role);
+}
+function isTaskPayloadKind(kind) {
+  return kind==="command_execution" || kind==="tool_call";
+}
+function breakTaskGroup() {
+  state.activeTaskGroup = null;
+}
+function currentTaskGroup() {
+  const target = renderTarget();
+  const active = state.activeTaskGroup;
+  if (active && active.target === target && active.el.parentElement === target) return active;
+  return createTaskGroup(target);
+}
+function createTaskGroup(target) {
+  const groupId = "task-group-" + (++state.taskGroupSeq);
+  const body = appendBubble("tasks task-group state-running expanded", "tasks");
+  body.classList.add("task-group-body");
+  const el = body.parentElement;
+  el.dataset.taskGroupId = groupId;
+
+  const head = document.createElement("div");
+  head.className = "task-group-head";
+  head.tabIndex = 0;
+  head.setAttribute("role", "button");
+  head.title = "Expand or collapse all task details";
+  head.setAttribute("aria-label", "Expand or collapse all task details");
+  const caret = document.createElement("span");
+  caret.className = "task-group-caret";
+  const title = document.createElement("div");
+  title.className = "task-group-title";
+  const status = document.createElement("div");
+  status.className = "task-group-status";
+  head.append(caret, title, status);
+  const list = document.createElement("div");
+  list.className = "task-group-list";
+  body.append(head, list);
+
+  const group = {
+    id:groupId, target, el, body, head, caret, title, status, list,
+    items:new Map(), itemOrder:[]
+  };
+  state.taskGroupsById.set(groupId, group);
+  state.activeTaskGroup = group;
+  state.expandedTaskGroups.add(groupId);
+  head.onclick = (e) => {
+    if (e.defaultPrevented || e.target.closest("button,a,input,select,textarea")) return;
+    toggleTaskGroup(groupId);
+  };
+  head.onkeydown = (e) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      toggleTaskGroup(groupId);
+    }
+  };
+  syncTaskGroupState(group);
+  return group;
+}
+function taskBubble(itemId, kind, cls, role) {
+  let key = idKey(itemId);
+  if (!key) key = "anonymous-task-" + (++state.taskItemSeq);
+  const existingGroup = state.taskGroupsByItemId.get(key);
+  const existing = existingGroup && existingGroup.items.get(key);
+  if (existing) return existing.body;
+
+  const group = currentTaskGroup();
+  const entry = document.createElement("div");
+  entry.className = "task-group-entry";
+  const row = document.createElement("div");
+  row.className = "task-group-item state-running";
+  row.tabIndex = 0;
+  row.setAttribute("role", "button");
+  const symbol = document.createElement("span");
+  symbol.className = "task-group-item-symbol";
+  const title = document.createElement("span");
+  title.className = "task-group-item-title mono";
+  const status = document.createElement("span");
+  status.className = "task-group-item-status";
+  row.append(symbol, title, status);
+  row.onclick = (e) => { e.stopPropagation(); selectTaskGroupItem(group.id, key); };
+  row.onkeydown = (e) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      selectTaskGroupItem(group.id, key);
+    }
+  };
+
+  const msg = document.createElement("div");
+  msg.className = "msg " + cls;
+  msg.hidden = true;
+  if (kind==="tool_call") msg.dataset.toolItemId = key;
+  else msg.dataset.commandItemId = key;
+  const roleEl = document.createElement("div");
+  roleEl.className = "role";
+  roleEl.textContent = role;
+  const body = document.createElement("div");
+  body.className = "body";
+  msg.append(roleEl, body);
+
+  entry.append(row, msg);
+  const task = { id:key, kind, entry, row, symbol, title, status, msg, body };
+  group.items.set(key, task);
+  group.itemOrder.push(key);
+  state.taskGroupsByItemId.set(key, group);
+  group.list.append(entry);
+  syncTaskGroupItem(key);
+  return body;
+}
+function selectTaskGroupItem(groupId, itemId) {
+  const key = idKey(itemId);
+  const group = state.taskGroupsById.get(groupId);
+  if (!group || !key) return;
+  state.manuallyToggledTaskGroups.add(groupId);
+  state.expandedTaskGroups.add(groupId);
+  const detailIds = expandedTaskDetailIds(groupId);
+  if (detailIds.has(key)) {
+    detailIds.delete(key);
+    if (state.selectedCommandId === key) state.selectedCommandId = null;
+    clearTaskSelection();
+    syncTaskGroupState(group);
+    renderRunningCommands();
+    return;
+  }
+  detailIds.add(key);
+  state.selectedCommandId = key;
+  clearTaskSelection();
+  const msg = state.commandMsgElsByItemId.get(key);
+  if (msg) msg.classList.add("selected");
+  syncTaskGroupState(group);
+  syncTaskGroupItem(key);
+  renderRunningCommands();
+}
+function expandedTaskDetailIds(groupId) {
+  let ids = state.expandedTaskDetails.get(groupId);
+  if (!(ids instanceof Set)) {
+    ids = new Set(ids ? [ids] : []);
+    state.expandedTaskDetails.set(groupId, ids);
+  }
+  return ids;
+}
+function toggleTaskGroup(groupId) {
+  const group = state.taskGroupsById.get(groupId);
+  if (!group) return;
+  state.manuallyToggledTaskGroups.add(groupId);
+  state.expandedTaskGroups.add(groupId);
+  const detailIds = expandedTaskDetailIds(groupId);
+  const itemIds = group.itemOrder.slice();
+  const allExpanded = itemIds.length > 0 && itemIds.every(id => detailIds.has(id));
+  detailIds.clear();
+  if (!allExpanded) {
+    for (const id of itemIds) detailIds.add(id);
+  } else if (itemIds.includes(state.selectedCommandId)) {
+    state.selectedCommandId = null;
+    clearTaskSelection();
+  }
+  syncTaskGroupState(group);
+}
+function taskVisualStateFromElement(msg) {
+  if (!msg) return "running";
+  if (msg.classList.contains("state-failed")) return "failed";
+  if (msg.classList.contains("state-terminated")) return "terminated";
+  if (msg.classList.contains("state-succeeded")) return "succeeded";
+  return "running";
+}
+function taskStatusText(msg) {
+  const text = msg && (msg.querySelector(".cmd-status span:last-child") || msg.querySelector(".cmd-status"));
+  return text ? text.textContent.trim() : "";
+}
+function syncTaskGroupItem(itemId) {
+  const key = idKey(itemId);
+  const group = state.taskGroupsByItemId.get(key);
+  const task = group && group.items.get(key);
+  if (!task) return;
+  const stateName = taskVisualStateFromElement(task.msg);
+  task.row.className = `task-group-item state-${stateName}` + (state.selectedCommandId===key ? " selected" : "");
+  task.symbol.className = `task-group-item-symbol cmd-symbol state-${stateName}`;
+  task.symbol.textContent = commandStateSymbol(stateName);
+  const title = task.msg.querySelector(".cmd-title");
+  task.title.textContent = title ? title.textContent.trim() : (task.kind==="tool_call" ? "tool" : "command");
+  task.status.textContent = taskStatusText(task.msg);
+  syncTaskGroupState(group);
+}
+function syncTaskGroupState(group) {
+  if (!group) return;
+  const items = group.itemOrder.map(id => group.items.get(id)).filter(Boolean);
+  const count = items.length;
+  const runningCount = items.filter(item => taskVisualStateFromElement(item.msg)==="running").length;
+  const failedCount = items.filter(item => taskVisualStateFromElement(item.msg)==="failed").length;
+  const terminatedCount = items.filter(item => taskVisualStateFromElement(item.msg)==="terminated").length;
+  const commandCount = items.filter(item => item.kind !== "tool_call").length;
+  const toolCount = items.filter(item => item.kind === "tool_call").length;
+  const allTerminal = count > 0 && runningCount === 0;
+  if (!state.manuallyToggledTaskGroups.has(group.id)) {
+    if (allTerminal) state.expandedTaskGroups.delete(group.id);
+    else state.expandedTaskGroups.add(group.id);
+  }
+  const stateName = runningCount ? "running" : failedCount ? "failed" : terminatedCount ? "terminated" : "succeeded";
+  const expanded = state.expandedTaskGroups.has(group.id);
+  group.el.classList.remove("state-running", "state-succeeded", "state-failed", "state-terminated", "expanded", "collapsed");
+  group.el.classList.add(`state-${stateName}`, expanded ? "expanded" : "collapsed");
+  group.caret.textContent = expanded ? "▾" : "▸";
+  group.head.setAttribute("aria-expanded", expanded ? "true" : "false");
+  group.title.textContent = `${count} task${count === 1 ? "" : "s"} · ${commandCount} command${commandCount === 1 ? "" : "s"} · ${toolCount} tool${toolCount === 1 ? "" : "s"}`;
+  const statusLabel = runningCount ? `${runningCount} running` :
+    failedCount ? `${failedCount} failed` :
+    terminatedCount ? `${terminatedCount} terminated` : "succeeded";
+  group.status.replaceChildren(commandStatusNode(statusLabel, stateName));
+  group.list.hidden = !expanded;
+  const detailIds = expandedTaskDetailIds(group.id);
+  for (const item of items) {
+    item.msg.hidden = !(expanded && detailIds.has(item.id));
+    item.row.classList.toggle("selected", state.selectedCommandId===item.id);
+    item.entry.classList.toggle("expanded", expanded && detailIds.has(item.id));
+  }
+}
+function removeTaskGroupItem(itemId) {
+  const key = idKey(itemId);
+  const group = state.taskGroupsByItemId.get(key);
+  const task = group && group.items.get(key);
+  if (!task) return false;
+  task.entry.remove();
+  group.items.delete(key);
+  group.itemOrder = group.itemOrder.filter(id => id !== key);
+  state.taskGroupsByItemId.delete(key);
+  state.commandBodyElsByItemId.delete(key);
+  state.commandMsgElsByItemId.delete(key);
+  state.toolBodyElsByItemId.delete(key);
+  const detailIds = expandedTaskDetailIds(group.id);
+  detailIds.delete(key);
+  if (!group.itemOrder.length) {
+    group.el.remove();
+    state.taskGroupsById.delete(group.id);
+    state.expandedTaskGroups.delete(group.id);
+    state.manuallyToggledTaskGroups.delete(group.id);
+    state.expandedTaskDetails.delete(group.id);
+    if (state.activeTaskGroup === group) state.activeTaskGroup = null;
+  } else {
+    syncTaskGroupState(group);
+  }
+  return true;
 }
 function startRunningCommand(item, turnId) {
   const key = idKey(item.id); if (!key) return;
@@ -1807,7 +2104,7 @@ function startRunningCommand(item, turnId) {
   });
   state.runningCommands.set(key, cmd);
   let body = commandBodyFor(key);
-  if (!body) body = bubble("cmd running-command","command");
+  if (!body) body = taskBubble(key, "command_execution", "cmd running-command", "command");
   state.streamElsByItemId.set(key, body);
   state.commandBodyElsByItemId.set(key, body);
   state.commandMsgElsByItemId.set(key, body.parentElement);
@@ -2014,6 +2311,7 @@ function renderCommandBody(body, cmd) {
     body.append(cwd);
   }
   renderCommandOutputBlock(body, { itemId:cmd.id, output:cmd.output || "", phase:"running" });
+  syncTaskGroupItem(cmd.id);
 }
 function commandStatusLabel(cmd) {
   const elapsed = formatDuration(Date.now() - (cmd.startedAtMs || Date.now()));
@@ -2168,14 +2466,30 @@ function renderRunningCommandSnapshot(commands) {
     });
     if (cmd.terminating) state.commandStopRequestedByItemId.add(key);
     state.runningCommands.set(key, cmd);
-    // Tool tasks already have a transcript row from the item stream (renderToolBody); only link it
-    // for select/scroll. Command tasks own their transcript row and (re)render it here.
+    // Snapshots can arrive before replayed live items, so both task kinds can create transcript
+    // rows here. Later item events reuse the same body by item id and finalize it in place.
     if (cmd.kind === "tool") {
-      const toolBody = toolBodyFor(key);
-      if (toolBody) state.commandMsgElsByItemId.set(key, toolBody.parentElement);
+      let toolBody = toolBodyFor(key);
+      if (!toolBody) {
+        toolBody = taskBubble(key, "tool_call", "tool running-tool state-running", "tool");
+        state.streamElsByItemId.set(key, toolBody);
+        state.toolBodyElsByItemId.set(key, toolBody);
+        toolBody.parentElement.dataset.toolItemId = key;
+        toolBody.parentElement.dataset.toolStartedAtMs = String(cmd.startedAtMs || Date.now());
+        renderItemBody(toolBody, {
+          kind:"tool_call",
+          name:cmd.command || "tool",
+          input:null,
+          output:cmd.output || null,
+          server:cmd.server || null,
+          status:cmd.status || "in_progress",
+          error:null
+        });
+      }
+      state.commandMsgElsByItemId.set(key, toolBody.parentElement);
     } else {
       let body = commandBodyFor(key);
-      if (!body) body = bubble("cmd running-command","command");
+      if (!body) body = taskBubble(key, "command_execution", "cmd running-command", "command");
       state.commandBodyElsByItemId.set(key, body);
       state.commandMsgElsByItemId.set(key, body.parentElement);
       renderCommandBody(body, cmd);
@@ -2222,6 +2536,7 @@ function renderEndedCommandBody(body, cmd, status, opts) {
   body.append(head);
   if (meta.childNodes.length) body.append(meta);
   renderCommandOutputBlock(body, { itemId:cmd.id, output:cmd.output || "", phase:"completed" });
+  syncTaskGroupItem(cmd.id);
 }
 function renderRunningCommands() {
   const cmds = Array.from(state.runningCommands.values());
@@ -2351,14 +2666,28 @@ function stopTask(id) {
   }
   terminateCommand(id);
 }
-function selectCommand(id) {
-  state.selectedCommandId = id;
+function clearTaskSelection() {
   document.querySelectorAll(".msg.selected").forEach(el => el.classList.remove("selected"));
-  const msg = state.commandMsgElsByItemId.get(id);
+  document.querySelectorAll(".task-group-item.selected").forEach(el => el.classList.remove("selected"));
+}
+function selectCommand(id) {
+  const key = idKey(id);
+  state.selectedCommandId = key;
+  clearTaskSelection();
+  const group = state.taskGroupsByItemId.get(key);
+  if (group) {
+    state.manuallyToggledTaskGroups.add(group.id);
+    state.expandedTaskGroups.add(group.id);
+    expandedTaskDetailIds(group.id).add(key);
+    syncTaskGroupState(group);
+  }
+  const msg = state.commandMsgElsByItemId.get(key);
   if (msg) {
     msg.classList.add("selected");
-    msg.scrollIntoView({ block:"center", behavior:"smooth" });
+    const task = group && group.items.get(key);
+    (task ? task.entry : msg).scrollIntoView({ block:"center", behavior:"smooth" });
   }
+  if (group) syncTaskGroupItem(key);
   renderRunningCommands();
 }
 function terminateCommand(id) {
@@ -2402,9 +2731,10 @@ function startToolCall(item, turnId) {
   const key = idKey(item.id); if (!key) return;
   const tool = item.tool || {};
   let body = state.streamElsByItemId.get(key);
-  if (!body) body = bubble("tool running-tool state-running","tool");
+  if (!body) body = taskBubble(key, "tool_call", "tool running-tool state-running", "tool");
   state.streamElsByItemId.set(key, body);
   state.toolBodyElsByItemId.set(key, body);
+  state.commandMsgElsByItemId.set(key, body.parentElement);
   body.parentElement.dataset.toolItemId = key;
   body.parentElement.dataset.toolStartedAtMs = String(normalizeTimestampMs(tool.started_at_ms, Date.now()));
   renderItemBody(body, {
@@ -2421,10 +2751,11 @@ function appendToolProgress(itemId, text) {
   const key = idKey(itemId);
   let body = key ? state.streamElsByItemId.get(key) : null;
   if (!body) {
-    body = bubble("tool running-tool state-running","tool");
+    body = taskBubble(key, "tool_call", "tool running-tool state-running", "tool");
     if (key) {
       state.streamElsByItemId.set(key, body);
       state.toolBodyElsByItemId.set(key, body);
+      state.commandMsgElsByItemId.set(key, body.parentElement);
       body.parentElement.dataset.toolItemId = key;
     }
     renderItemBody(body, {
@@ -2464,7 +2795,21 @@ function appendStream(text, itemId, deltaType) {
   let body = key ? state.streamElsByItemId.get(key) : state.streamEl;
   if (!body) {
     const kind = key ? state.itemKindsByItemId.get(key) : null;
-    body = bubble(classForStream(kind, deltaType), roleForStream(kind, deltaType));
+    if (key && (isTaskPayloadKind(kind) || deltaType==="command_output")) {
+      const taskKind = kind==="tool_call" ? "tool_call" : "command_execution";
+      body = taskBubble(key, taskKind, classForStream(taskKind, deltaType), roleForStream(taskKind, deltaType));
+      if (taskKind==="command_execution") {
+        state.commandBodyElsByItemId.set(key, body);
+        state.commandMsgElsByItemId.set(key, body.parentElement);
+        body.parentElement.dataset.commandItemId = key;
+      } else {
+        state.toolBodyElsByItemId.set(key, body);
+        state.commandMsgElsByItemId.set(key, body.parentElement);
+        body.parentElement.dataset.toolItemId = key;
+      }
+    } else {
+      body = bubble(classForStream(kind, deltaType), roleForStream(kind, deltaType));
+    }
     if (key) state.streamElsByItemId.set(key, body);
   }
   state.streamEl = body;
@@ -2489,7 +2834,9 @@ function finalizeStreamedItem(item) {
   const body = (key && (state.streamElsByItemId.get(key) || state.commandBodyElsByItemId.get(key) || state.toolBodyElsByItemId.get(key))) ||
     (state.streamItemId===key ? state.streamEl : null);
   if (!hasVisiblePayload(item.payload)) {
-    if (body && !body.textContent.trim()) body.parentElement.remove();
+    if (body && !body.textContent.trim()) {
+      if (key && !removeTaskGroupItem(key)) body.parentElement.remove();
+    }
     markRenderedItem(item);
     if (state.streamEl === body) {
       state.streamEl = null;
@@ -2505,6 +2852,7 @@ function finalizeStreamedItem(item) {
   }
   if (item.payload.kind==="tool_call" && key) {
     state.toolBodyElsByItemId.set(key, body);
+    state.commandMsgElsByItemId.set(key, body.parentElement);
     body.parentElement.dataset.toolItemId = key;
   }
   renderItemBody(body, item.payload);
@@ -2537,9 +2885,11 @@ function addItem(item) {
     renderItemBody(bubble("user","you"), p);
   }
   else {
-    const body = bubble(classForPayload(p), roleForPayload(p));
+    const key = idKey(item && item.id);
+    const body = isTaskPayloadKind(p.kind)
+      ? taskBubble(key, p.kind, classForPayload(p), roleForPayload(p))
+      : bubble(classForPayload(p), roleForPayload(p));
     if (p.kind==="command_execution") {
-      const key = idKey(item && item.id);
       if (key) {
         state.commandBodyElsByItemId.set(key, body);
         state.commandMsgElsByItemId.set(key, body.parentElement);
@@ -2547,9 +2897,9 @@ function addItem(item) {
       }
     }
     if (p.kind==="tool_call") {
-      const key = idKey(item && item.id);
       if (key) {
         state.toolBodyElsByItemId.set(key, body);
+        state.commandMsgElsByItemId.set(key, body.parentElement);
         body.parentElement.dataset.toolItemId = key;
       }
     }
@@ -2579,6 +2929,14 @@ function resetRenderState() {
   state.toolBodyElsByItemId = new Map();
   state.expandedToolOutputs = new Set();
   state.manuallyToggledToolOutputs = new Set();
+  state.activeTaskGroup = null;
+  state.taskGroupSeq = 0;
+  state.taskItemSeq = 0;
+  state.taskGroupsById = new Map();
+  state.taskGroupsByItemId = new Map();
+  state.expandedTaskGroups = new Set();
+  state.manuallyToggledTaskGroups = new Set();
+  state.expandedTaskDetails = new Map();
   state.selectedCommandId = null;
   renderRunningCommands();
 }
@@ -2666,6 +3024,8 @@ function renderItemBody(body, p) {
   } else if (p.kind==="activity") {
     body.innerHTML = renderActivity(p);
   }
+  const taskItemId = msg.dataset.commandItemId || msg.dataset.toolItemId || "";
+  if (taskItemId) syncTaskGroupItem(taskItemId);
 }
 function normalizeCommandDuration(durationMs, startedAtMs) {
   const provided = Number(durationMs);
@@ -2853,6 +3213,7 @@ function renderToolBody(body, p) {
   if (itemId) {
     state.toolPayloadsByItemId.set(itemId, p);
     state.toolBodyElsByItemId.set(itemId, body);
+    state.commandMsgElsByItemId.set(itemId, msg);
   }
   const head = document.createElement("div");
   head.className = "cmd-head";
