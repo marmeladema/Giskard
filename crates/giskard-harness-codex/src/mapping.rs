@@ -351,14 +351,20 @@ impl CodexMapper {
             Notification::ContextCompacted(n) => {
                 let thread = self.resolve_thread(&n.thread_id, fallback_thread);
                 let turn = self.resolve_turn(&n.turn_id);
-                Some(self.activity_event(
+                Some(AgentEvent::ItemCompleted {
                     thread,
                     turn,
-                    format!("context_compacted:{}", n.turn_id),
-                    "Context compacted",
-                    "",
-                    n,
-                ))
+                    item: Item {
+                        id: self.resolve_item(&format!("context_compacted:{}", n.turn_id)),
+                        harness_item_id: format!("context_compacted:{}", n.turn_id),
+                        payload: ItemPayload::Activity {
+                            title: "Context compacted".into(),
+                            detail: None,
+                            metadata: serde_json::to_value(n).ok(),
+                        },
+                        created_at: Utc::now(),
+                    },
+                })
             }
 
             // Codex advisories are non-fatal — surface them as notices (warnings), not hard errors,
@@ -1760,7 +1766,7 @@ fn map_thread_item_complete(
             metadata: None,
         },
         codex_codes::ThreadItem::ContextCompaction { .. } => ItemPayload::Activity {
-            title: "Context compaction".into(),
+            title: "Context compacted".into(),
             detail: None,
             metadata: json_value(item),
         },
@@ -3190,6 +3196,63 @@ mod tests {
                 ItemPayload::Activity { title, detail, .. } => {
                     assert_eq!(title, "Web search");
                     assert_eq!(detail.as_deref(), Some("rust serde"));
+                }
+                other => panic!("expected activity, got {other:?}"),
+            },
+            other => panic!("expected item completion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_compaction_item_maps_to_clean_activity() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let notif = completed_item(serde_json::json!({
+            "type": "contextCompaction",
+            "id": "compact1"
+        }));
+
+        match mapper.map_notification(&notif, ThreadId::new()).unwrap() {
+            AgentEvent::ItemCompleted { item, .. } => match item.payload {
+                ItemPayload::Activity {
+                    title,
+                    detail,
+                    metadata,
+                } => {
+                    assert_eq!(title, "Context compacted");
+                    assert_eq!(detail, None);
+                    let metadata = metadata.expect("raw Codex item metadata is preserved");
+                    assert_eq!(metadata["type"], "contextCompaction");
+                    assert_eq!(metadata["id"], "compact1");
+                }
+                other => panic!("expected activity, got {other:?}"),
+            },
+            other => panic!("expected item completion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_compacted_notification_maps_to_clean_activity() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let notif = Notification::ContextCompacted(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "th1",
+                "turnId": "t1"
+            }))
+            .unwrap(),
+        );
+
+        match mapper.map_notification(&notif, ThreadId::new()).unwrap() {
+            AgentEvent::ItemCompleted { item, .. } => match item.payload {
+                ItemPayload::Activity {
+                    title,
+                    detail,
+                    metadata,
+                } => {
+                    assert_eq!(title, "Context compacted");
+                    assert_eq!(detail, None);
+                    let metadata = metadata.expect("raw Codex notification metadata is preserved");
+                    assert_eq!(metadata["threadId"], "th1");
+                    assert_eq!(metadata["turnId"], "t1");
                 }
                 other => panic!("expected activity, got {other:?}"),
             },

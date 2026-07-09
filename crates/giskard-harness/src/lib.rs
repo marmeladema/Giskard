@@ -42,6 +42,8 @@ pub struct HarnessCapabilities {
     pub mcp_reload: bool,
     /// MCP OAuth login can be started through the harness.
     pub mcp_oauth_login: bool,
+    /// Manual context compaction can be requested for a thread.
+    pub context_compaction: bool,
 }
 
 /// Options for opening (or resuming) a thread.
@@ -166,6 +168,14 @@ pub trait AgentHarness: Send + Sync {
 
     /// Interrupt the active turn of a thread.
     async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError>;
+
+    /// Ask the harness to compact the thread context, when supported.
+    async fn compact_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
+        Err(HarnessError::Unsupported(format!(
+            "context compaction is not supported for thread {}",
+            thread.harness_thread_id
+        )))
+    }
 
     /// Ask the harness to terminate a running command process, if it exposes a process handle.
     async fn terminate_command(

@@ -65,6 +65,9 @@ pub enum ClientMessage {
     Interrupt {
         thread_id: ThreadId,
     },
+    CompactContext {
+        thread_id: ThreadId,
+    },
     TerminateCommand {
         thread_id: ThreadId,
         process_id: String,
@@ -483,6 +486,21 @@ mod tests {
             ClientMessage::TerminateCommand { process_id, .. } => {
                 assert_eq!(process_id, "proc_1");
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn client_message_compact_context_serde() {
+        let tid = ThreadId::new();
+        let msg = ClientMessage::CompactContext { thread_id: tid };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "compact_context");
+        assert_eq!(json["thread_id"], tid.to_string());
+
+        let back: ClientMessage = serde_json::from_value(json).unwrap();
+        match back {
+            ClientMessage::CompactContext { thread_id } => assert_eq!(thread_id, tid),
             _ => panic!("wrong variant"),
         }
     }

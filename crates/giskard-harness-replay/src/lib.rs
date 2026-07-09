@@ -13,11 +13,14 @@ use tokio::sync::{Mutex, broadcast};
 use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ApprovalId, ServerRequestId, ThreadId, TurnId};
+use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, ThreadId, TurnId};
+use giskard_core::item::{Item, ItemPayload};
 use giskard_core::mcp::McpServerStatus;
 use giskard_core::model::ModelDescriptor;
 use giskard_core::server_request::ServerRequestResponse;
+use giskard_core::token::TokenUsage;
 use giskard_core::turn::TurnOverrides;
+use giskard_core::turn::{TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
     AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
@@ -104,6 +107,7 @@ impl ReplayHarness {
                 mcp_status: true,
                 mcp_reload: true,
                 mcp_oauth_login: false,
+                context_compaction: true,
             },
             threads: Mutex::new(Vec::new()),
             fixtures: Mutex::new(fixtures),
@@ -253,6 +257,51 @@ impl AgentHarness for ReplayHarness {
     }
 
     async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
+        Ok(())
+    }
+
+    async fn compact_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
+        let mut threads = self.threads.lock().await;
+        let Some((_, state)) = threads.iter_mut().find(|(id, _)| *id == thread.thread) else {
+            return Err(HarnessError::ThreadNotFound(thread.thread));
+        };
+        let sender = state.sender.clone();
+        let thread_id = thread.thread;
+        drop(threads);
+
+        tokio::spawn(async move {
+            let turn = TurnId::new();
+            let item_id = ItemId::new();
+            let _ = sender.send(AgentEvent::TurnStarted {
+                thread: thread_id,
+                turn,
+            });
+            tokio::task::yield_now().await;
+            let _ = sender.send(AgentEvent::ItemCompleted {
+                thread: thread_id,
+                turn,
+                item: Item {
+                    id: item_id,
+                    harness_item_id: "replay_context_compaction".into(),
+                    payload: ItemPayload::Activity {
+                        title: "Context compacted".into(),
+                        detail: None,
+                        metadata: None,
+                    },
+                    created_at: chrono::Utc::now(),
+                },
+            });
+            tokio::task::yield_now().await;
+            let _ = sender.send(AgentEvent::TurnCompleted {
+                thread: thread_id,
+                turn,
+                usage: TokenUsage::default(),
+                status: TurnStatus {
+                    kind: TurnStatusKind::Completed,
+                    message: None,
+                },
+            });
+        });
         Ok(())
     }
 

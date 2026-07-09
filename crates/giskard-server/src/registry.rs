@@ -294,6 +294,64 @@ impl HarnessRegistry {
         harness.interrupt(&handle).await
     }
 
+    pub async fn compact_thread(
+        &self,
+        thread_id: ThreadId,
+        effective_model: ModelRef,
+        mode: Mode,
+    ) -> Result<(), HarnessError> {
+        let handle = self
+            .get_thread_handle(thread_id)
+            .await
+            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+        let project_id = self
+            .get_project_for_thread(thread_id)
+            .await
+            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+        let harness = self
+            .harnesses
+            .lock()
+            .await
+            .get(&project_id)
+            .cloned()
+            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+
+        let ctx = TurnContext {
+            user_input: UserInput::text("/compact"),
+            model: effective_model,
+            mode,
+        };
+
+        let hub = self.hub.clone();
+        let live_buffers = self.live_buffers.clone();
+        let running_commands = self.running_commands.clone();
+        let store = self.store.clone();
+        let approvals_map = self.approvals.clone();
+        let server_requests_map = self.server_requests.clone();
+        let ledger = self.ledger.clone();
+
+        let stream = harness.subscribe(&handle);
+        harness.compact_thread(&handle).await?;
+
+        tokio::spawn(async move {
+            forward_events(
+                thread_id,
+                project_id,
+                stream,
+                hub,
+                live_buffers,
+                running_commands,
+                store,
+                approvals_map,
+                server_requests_map,
+                ledger,
+                ctx,
+            )
+            .await;
+        });
+        Ok(())
+    }
+
     pub async fn terminate_command(
         &self,
         thread_id: ThreadId,
@@ -444,10 +502,15 @@ async fn forward_events(
     let mut seen_turn_ids = persisted_turn_ids(&store, project_id, thread_id).await;
     let mut seen_harness_item_ids = persisted_harness_item_ids(&store, project_id, thread_id).await;
     let mut duplicate_item_ids = HashSet::new();
+    let mut seen_notices = HashSet::new();
 
     loop {
         match stream.recv().await {
             Ok(event) => {
+                if should_skip_duplicate_notice(&event, &mut seen_notices) {
+                    continue;
+                }
+
                 let event_turn = event_turn_id(&event);
                 if let Some(owned) = owned_turn {
                     if let Some(turn) = event_turn {
@@ -599,6 +662,16 @@ async fn forward_events(
             }
         }
     }
+}
+
+fn should_skip_duplicate_notice(
+    event: &AgentEvent,
+    seen_notices: &mut HashSet<(Option<TurnId>, String)>,
+) -> bool {
+    let AgentEvent::Notice { turn, message, .. } = event else {
+        return false;
+    };
+    !seen_notices.insert((*turn, message.clone()))
 }
 
 fn event_turn_id(event: &AgentEvent) -> Option<TurnId> {
@@ -883,7 +956,8 @@ mod tests {
     use giskard_harness::AgentEventStream;
     use giskard_persist::PersistStore;
     use giskard_persist::store::ThreadFile;
-    use tokio::sync::{Mutex, broadcast};
+    use giskard_proto::{ServerMessage, WireAgentEvent};
+    use tokio::sync::{Mutex, broadcast, mpsc};
 
     use super::{
         TurnContext, command_completion_is_normal_success, command_status_is_running,
@@ -1036,6 +1110,115 @@ mod tests {
         assert_eq!(saved[0].user_input, UserInput::text("first"));
         assert_eq!(saved[1].id, second_turn);
         assert_eq!(saved[1].user_input, UserInput::text("second"));
+    }
+
+    #[tokio::test]
+    async fn forwarder_deduplicates_identical_notices_in_one_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: None,
+        };
+        store
+            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .await
+            .unwrap();
+        let now = Utc::now();
+        store
+            .save_thread(
+                project_id,
+                &ThreadFile {
+                    version: 1,
+                    id: thread_id,
+                    project_id,
+                    title: "t".into(),
+                    harness_thread_id: "th".into(),
+                    mode: Mode::Build,
+                    current_model: model.clone(),
+                    context_window: 128_000,
+                    approval_policy: ApprovalPolicy::Ask,
+                    model_efforts: Default::default(),
+                    tokens: TokenLedger::default(),
+                    created_at: now,
+                    updated_at: now,
+                    archived: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let (tx, _) = broadcast::channel(64);
+        let hub = Arc::new(Hub::new());
+        let (client_tx, mut client_rx) = mpsc::channel(16);
+        hub.subscribe(thread_id, 1, client_tx).await;
+        let live_buffers = Arc::new(LiveBufferStore::new());
+        let running_commands = Arc::new(RunningTaskStore::new());
+        let approvals = Arc::new(Mutex::new(Default::default()));
+        let server_requests = Arc::new(Mutex::new(Default::default()));
+        let ledger = ledger::spawn(store.clone());
+
+        spawn_forwarder(
+            thread_id,
+            project_id,
+            AgentEventStream::new(tx.subscribe()),
+            hub,
+            live_buffers,
+            running_commands,
+            store,
+            approvals,
+            server_requests,
+            ledger,
+            model,
+            "compact",
+        );
+
+        let turn = TurnId::new();
+        tx.send(AgentEvent::TurnStarted {
+            thread: thread_id,
+            turn,
+        })
+        .unwrap();
+        for _ in 0..2 {
+            tx.send(AgentEvent::Notice {
+                thread: thread_id,
+                turn: Some(turn),
+                message: "Heads up: Long threads and multiple compactions can cause drift.".into(),
+            })
+            .unwrap();
+        }
+        tx.send(AgentEvent::TurnCompleted {
+            thread: thread_id,
+            turn,
+            usage: TokenUsage::default(),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        })
+        .unwrap();
+
+        let mut notice_count = 0;
+        let mut completed = false;
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline && !completed {
+            match tokio::time::timeout(tokio::time::Duration::from_secs(1), client_rx.recv()).await
+            {
+                Ok(Some(ServerMessage::Event { agent_event, .. })) => match agent_event {
+                    WireAgentEvent::Notice { .. } => notice_count += 1,
+                    WireAgentEvent::TurnCompleted { .. } => completed = true,
+                    _ => {}
+                },
+                Ok(Some(_)) => {}
+                _ => {}
+            }
+        }
+
+        assert!(completed, "turn should complete");
+        assert_eq!(notice_count, 1);
     }
 
     #[allow(clippy::too_many_arguments)]

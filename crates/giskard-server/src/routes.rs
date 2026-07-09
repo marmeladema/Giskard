@@ -1493,6 +1493,49 @@ async fn handle_client_msg(
                 })?
                 .map_err(|e| WsError::from_harness(e, "interrupt", Some(thread_id)))?;
         }
+        ClientMessage::CompactContext { thread_id } => {
+            if state.live_buffers.is_active(thread_id).await {
+                return Err(WsError::new(
+                    "compact_context_active_turn",
+                    ErrorSeverity::Warning,
+                    "Context compaction is not available while a turn is running.",
+                )
+                .thread(thread_id)
+                .action("compact_context"));
+            }
+            let project_id = project_for(state, thread_id, "compact_context").await?;
+            let tf = state
+                .store
+                .load_thread(project_id, thread_id)
+                .await
+                .map_err(|e| WsError::from_persist(e, "compact_context", Some(thread_id)))?
+                .ok_or_else(|| {
+                    WsError::new(
+                        "thread_not_found",
+                        ErrorSeverity::Error,
+                        "Thread not found.",
+                    )
+                    .thread(thread_id)
+                    .action("compact_context")
+                })?;
+            tokio::time::timeout(
+                HARNESS_CONTROL_TIMEOUT,
+                state
+                    .registry
+                    .compact_thread(thread_id, tf.current_model.clone(), tf.mode),
+            )
+            .await
+            .map_err(|_| {
+                WsError::from_harness(
+                    HarnessError::Timeout(
+                        "context compaction request timed out waiting for Codex".into(),
+                    ),
+                    "compact_context",
+                    Some(thread_id),
+                )
+            })?
+            .map_err(|e| WsError::from_harness(e, "compact_context", Some(thread_id)))?;
+        }
         ClientMessage::TerminateCommand {
             thread_id,
             process_id,

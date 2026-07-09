@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
@@ -36,6 +37,8 @@ impl HarnessFactory for TestFactory {
 }
 
 struct NoMcpFactory;
+struct UnsupportedCompactionFactory;
+struct SlowCompactionFactory;
 
 #[async_trait::async_trait]
 impl HarnessFactory for NoMcpFactory {
@@ -47,7 +50,276 @@ impl HarnessFactory for NoMcpFactory {
     }
 }
 
+#[async_trait::async_trait]
+impl HarnessFactory for UnsupportedCompactionFactory {
+    async fn create(
+        &self,
+        _config: &ProjectConfig,
+    ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
+        Ok(Arc::new(UnsupportedCompactionHarness::default()))
+    }
+}
+
+#[async_trait::async_trait]
+impl HarnessFactory for SlowCompactionFactory {
+    async fn create(
+        &self,
+        _config: &ProjectConfig,
+    ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
+        Ok(Arc::new(SlowCompactionHarness::default()))
+    }
+}
+
 struct NoMcpHarness;
+
+#[derive(Default)]
+struct UnsupportedCompactionHarness {
+    threads: tokio::sync::Mutex<HashMap<ThreadId, tokio::sync::broadcast::Sender<AgentEvent>>>,
+}
+
+#[derive(Default)]
+struct SlowCompactionHarness {
+    threads: tokio::sync::Mutex<HashMap<ThreadId, tokio::sync::broadcast::Sender<AgentEvent>>>,
+}
+
+#[async_trait::async_trait]
+impl AgentHarness for UnsupportedCompactionHarness {
+    fn capabilities(&self) -> HarnessCapabilities {
+        HarnessCapabilities {
+            live_approvals: false,
+            plan_build_modes: false,
+            per_turn_model: false,
+            reasoning_effort: false,
+            structured_diffs: false,
+            resumable_threads: true,
+            model_listing: false,
+            token_usage: false,
+            mcp_status: false,
+            mcp_reload: false,
+            mcp_oauth_login: false,
+            context_compaction: false,
+        }
+    }
+
+    async fn list_models(&self) -> Result<Vec<giskard_core::ModelDescriptor>, HarnessError> {
+        Ok(Vec::new())
+    }
+
+    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
+        let thread = opts.thread.unwrap_or_default();
+        let (tx, _) = tokio::sync::broadcast::channel(16);
+        self.threads.lock().await.insert(thread, tx);
+        Ok(ThreadHandle {
+            thread,
+            harness_thread_id: opts.resume.unwrap_or_else(|| format!("test_{thread}")),
+            warning: None,
+        })
+    }
+
+    async fn start_turn(
+        &self,
+        _thread: &ThreadHandle,
+        _input: UserInput,
+        _overrides: TurnOverrides,
+    ) -> Result<TurnId, HarnessError> {
+        Err(HarnessError::Unsupported(
+            "turns are not supported by this harness".into(),
+        ))
+    }
+
+    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
+        if let Ok(threads) = self.threads.try_lock() {
+            if let Some(sender) = threads.get(&thread.thread) {
+                return AgentEventStream::new(sender.subscribe());
+            }
+        }
+        let (_, rx) = tokio::sync::broadcast::channel(1);
+        AgentEventStream::new(rx)
+    }
+
+    async fn respond_approval(
+        &self,
+        _req: ApprovalId,
+        _decision: ApprovalDecision,
+    ) -> Result<(), HarnessError> {
+        Err(HarnessError::Unsupported(
+            "approvals are not supported by this harness".into(),
+        ))
+    }
+
+    async fn respond_server_request(
+        &self,
+        _req: ServerRequestId,
+        _response: ServerRequestResponse,
+    ) -> Result<(), HarnessError> {
+        Err(HarnessError::Unsupported(
+            "server requests are not supported by this harness".into(),
+        ))
+    }
+
+    async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
+        Err(HarnessError::Unsupported(
+            "interrupts are not supported by this harness".into(),
+        ))
+    }
+
+    async fn shutdown(&self) -> Result<(), HarnessError> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentHarness for SlowCompactionHarness {
+    fn capabilities(&self) -> HarnessCapabilities {
+        HarnessCapabilities {
+            live_approvals: false,
+            plan_build_modes: false,
+            per_turn_model: false,
+            reasoning_effort: false,
+            structured_diffs: false,
+            resumable_threads: true,
+            model_listing: false,
+            token_usage: false,
+            mcp_status: false,
+            mcp_reload: false,
+            mcp_oauth_login: false,
+            context_compaction: true,
+        }
+    }
+
+    async fn list_models(&self) -> Result<Vec<giskard_core::ModelDescriptor>, HarnessError> {
+        Ok(Vec::new())
+    }
+
+    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
+        let thread = opts.thread.unwrap_or_default();
+        let (tx, _) = tokio::sync::broadcast::channel(32);
+        self.threads.lock().await.insert(thread, tx);
+        Ok(ThreadHandle {
+            thread,
+            harness_thread_id: opts.resume.unwrap_or_else(|| format!("test_{thread}")),
+            warning: None,
+        })
+    }
+
+    async fn start_turn(
+        &self,
+        thread: &ThreadHandle,
+        _input: UserInput,
+        _overrides: TurnOverrides,
+    ) -> Result<TurnId, HarnessError> {
+        let Some(sender) = self.threads.lock().await.get(&thread.thread).cloned() else {
+            return Err(HarnessError::ThreadNotFound(thread.thread));
+        };
+        let thread_id = thread.thread;
+        let turn = TurnId::new();
+        tokio::spawn(async move {
+            let item = Item {
+                id: ItemId::new(),
+                harness_item_id: format!("reply_{turn}"),
+                payload: ItemPayload::AgentMessage {
+                    text: "other thread reply".into(),
+                },
+                created_at: chrono::Utc::now(),
+            };
+            let _ = sender.send(AgentEvent::TurnStarted {
+                thread: thread_id,
+                turn,
+            });
+            tokio::task::yield_now().await;
+            let _ = sender.send(AgentEvent::ItemCompleted {
+                thread: thread_id,
+                turn,
+                item,
+            });
+            tokio::task::yield_now().await;
+            let _ = sender.send(AgentEvent::TurnCompleted {
+                thread: thread_id,
+                turn,
+                usage: TokenUsage::default(),
+                status: TurnStatus {
+                    kind: TurnStatusKind::Completed,
+                    message: None,
+                },
+            });
+        });
+        Ok(turn)
+    }
+
+    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
+        if let Ok(threads) = self.threads.try_lock() {
+            if let Some(sender) = threads.get(&thread.thread) {
+                return AgentEventStream::new(sender.subscribe());
+            }
+        }
+        let (_, rx) = tokio::sync::broadcast::channel(1);
+        AgentEventStream::new(rx)
+    }
+
+    async fn respond_approval(
+        &self,
+        _req: ApprovalId,
+        _decision: ApprovalDecision,
+    ) -> Result<(), HarnessError> {
+        Ok(())
+    }
+
+    async fn respond_server_request(
+        &self,
+        _req: ServerRequestId,
+        _response: ServerRequestResponse,
+    ) -> Result<(), HarnessError> {
+        Ok(())
+    }
+
+    async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
+        Ok(())
+    }
+
+    async fn compact_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
+        let Some(sender) = self.threads.lock().await.get(&thread.thread).cloned() else {
+            return Err(HarnessError::ThreadNotFound(thread.thread));
+        };
+        let thread_id = thread.thread;
+        tokio::spawn(async move {
+            let turn = TurnId::new();
+            let _ = sender.send(AgentEvent::TurnStarted {
+                thread: thread_id,
+                turn,
+            });
+            tokio::task::yield_now().await;
+            let _ = sender.send(AgentEvent::ItemCompleted {
+                thread: thread_id,
+                turn,
+                item: Item {
+                    id: ItemId::new(),
+                    harness_item_id: format!("compact_{turn}"),
+                    payload: ItemPayload::Activity {
+                        title: "Context compacted".into(),
+                        detail: None,
+                        metadata: None,
+                    },
+                    created_at: chrono::Utc::now(),
+                },
+            });
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            let _ = sender.send(AgentEvent::TurnCompleted {
+                thread: thread_id,
+                turn,
+                usage: TokenUsage::default(),
+                status: TurnStatus {
+                    kind: TurnStatusKind::Completed,
+                    message: None,
+                },
+            });
+        });
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> Result<(), HarnessError> {
+        Ok(())
+    }
+}
 
 #[async_trait::async_trait]
 impl AgentHarness for NoMcpHarness {
@@ -64,6 +336,7 @@ impl AgentHarness for NoMcpHarness {
             mcp_status: false,
             mcp_reload: false,
             mcp_oauth_login: false,
+            context_compaction: false,
         }
     }
 
@@ -480,6 +753,74 @@ session_days = 30
     (tmp, Arc::new(state), port)
 }
 
+async fn start_unsupported_compaction_server_on_available_port()
+-> (tempfile::TempDir, Arc<AppState>, u16) {
+    let tmp = tempfile::TempDir::new().unwrap();
+
+    let hash = generate_password_hash("testpass");
+    let config_toml = format!(
+        r#"
+[server]
+bind = "127.0.0.1:0"
+secure_cookies = false
+
+[auth]
+password_hash = "{hash}"
+session_days = 30
+"#
+    );
+    tokio::fs::write(tmp.path().join("config.toml"), config_toml)
+        .await
+        .unwrap();
+
+    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
+    let session_key: Vec<u8> = (0..32u8).collect();
+    let state = AppState::new(store, Arc::new(UnsupportedCompactionFactory), session_key);
+
+    let app = build_app(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    (tmp, Arc::new(state), port)
+}
+
+async fn start_slow_compaction_server_on_available_port() -> (tempfile::TempDir, Arc<AppState>, u16)
+{
+    let tmp = tempfile::TempDir::new().unwrap();
+
+    let hash = generate_password_hash("testpass");
+    let config_toml = format!(
+        r#"
+[server]
+bind = "127.0.0.1:0"
+secure_cookies = false
+
+[auth]
+password_hash = "{hash}"
+session_days = 30
+"#
+    );
+    tokio::fs::write(tmp.path().join("config.toml"), config_toml)
+        .await
+        .unwrap();
+
+    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
+    let session_key: Vec<u8> = (0..32u8).collect();
+    let state = AppState::new(store, Arc::new(SlowCompactionFactory), session_key);
+
+    let app = build_app(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    (tmp, Arc::new(state), port)
+}
+
 async fn login_cookie(client: &reqwest::Client, base: &str) -> String {
     let resp = client
         .post(format!("{base}/api/login"))
@@ -497,6 +838,28 @@ async fn login_cookie(client: &reqwest::Client, base: &str) -> String {
         .next()
         .unwrap()
         .to_string()
+}
+
+async fn connect_ws(
+    port: u16,
+    cookie: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    use tokio_tungstenite::tungstenite::http::Request;
+
+    let ws_request = Request::builder()
+        .uri(format!("ws://127.0.0.1:{port}/api/ws"))
+        .header("host", format!("127.0.0.1:{port}"))
+        .header("cookie", cookie)
+        .header("upgrade", "websocket")
+        .header("connection", "upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .body(())
+        .unwrap();
+    tokio_tungstenite::connect_async(ws_request)
+        .await
+        .expect("WS connect")
+        .0
 }
 
 async fn create_project_and_thread(
@@ -542,6 +905,237 @@ async fn create_project_only(client: &reqwest::Client, base: &str, cookie: &str)
         .parse()
         .unwrap();
     project_id
+}
+
+#[tokio::test]
+async fn compact_context_streams_and_persists_compaction_turn() {
+    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    let mut ws = connect_ws(port, &cookie).await;
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::Subscribe { thread_id })
+            .unwrap()
+            .into(),
+    ))
+    .await
+    .unwrap();
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::CompactContext { thread_id })
+            .unwrap()
+            .into(),
+    ))
+    .await
+    .unwrap();
+
+    let mut saw_activity = false;
+    let mut saw_completed = false;
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline && !saw_completed {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
+                if let ServerMessage::Event { agent_event, .. } = server_msg {
+                    match agent_event {
+                        WireAgentEvent::ItemCompleted { item, .. } => {
+                            if let giskard_proto::WireItemPayload::Activity { title, .. } =
+                                item.payload
+                            {
+                                saw_activity = title == "Context compacted";
+                            }
+                        }
+                        WireAgentEvent::TurnCompleted { .. } => saw_completed = true,
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => break,
+        }
+    }
+
+    assert!(
+        saw_activity,
+        "compaction should stream a visible activity item"
+    );
+    assert!(saw_completed, "compaction should complete a turn");
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    let saved_turns = loop {
+        let turns = state
+            .store
+            .load_all_turns(project_id, thread_id)
+            .await
+            .unwrap();
+        if turns
+            .iter()
+            .any(|turn| turn.user_input.as_text() == Some("/compact"))
+        {
+            break turns;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("compaction turn was not persisted");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+    };
+    let compact_turn = saved_turns
+        .iter()
+        .find(|turn| turn.user_input.as_text() == Some("/compact"))
+        .unwrap();
+    assert!(
+        compact_turn.items.iter().any(|item| matches!(
+            &item.payload,
+            ItemPayload::Activity { title, .. } if title == "Context compacted"
+        )),
+        "persisted compaction turn should contain the activity item"
+    );
+}
+
+#[tokio::test]
+async fn compact_context_does_not_block_turns_on_other_threads_or_projects() {
+    let (_tmp, state, port) = start_slow_compaction_server_on_available_port().await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let (project_id, compacting_thread) = create_project_and_thread(&client, &base, &cookie).await;
+    let other_thread =
+        open_thread_with_resume(&client, &base, &cookie, project_id, "other_thread").await;
+    let (_, other_project_thread) = create_project_and_thread(&client, &base, &cookie).await;
+    let mut ws = connect_ws(port, &cookie).await;
+
+    for thread_id in [compacting_thread, other_thread, other_project_thread] {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&ClientMessage::Subscribe { thread_id })
+                .unwrap()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    }
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::CompactContext {
+            thread_id: compacting_thread,
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while !state.live_buffers.is_active(compacting_thread).await {
+        if tokio::time::Instant::now() >= deadline {
+            panic!("compaction thread did not become active");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+    }
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SendInput {
+            thread_id: other_thread,
+            text: "work on another thread".into(),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SendInput {
+            thread_id: other_project_thread,
+            text: "work on another project".into(),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    let mut other_completed = false;
+    let mut other_project_completed = false;
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline && (!other_completed || !other_project_completed) {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
+                if let ServerMessage::Event {
+                    thread_id,
+                    agent_event: WireAgentEvent::TurnCompleted { .. },
+                } = server_msg
+                {
+                    if thread_id == other_thread {
+                        other_completed = true;
+                    } else if thread_id == other_project_thread {
+                        other_project_completed = true;
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => {}
+        }
+    }
+
+    assert!(
+        other_completed,
+        "a compaction turn must not block another thread from completing work"
+    );
+    assert!(
+        other_project_completed,
+        "a compaction turn must not block another project from completing work"
+    );
+    assert!(
+        state.live_buffers.is_active(compacting_thread).await,
+        "precondition check: compaction should still be active while the other thread completed"
+    );
+}
+
+#[tokio::test]
+async fn compact_context_unsupported_harness_returns_structured_error() {
+    let (_tmp, _state, port) = start_unsupported_compaction_server_on_available_port().await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let (_, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    let mut ws = connect_ws(port, &cookie).await;
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::CompactContext { thread_id })
+            .unwrap()
+            .into(),
+    ))
+    .await
+    .unwrap();
+
+    let msg = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
+        panic!("expected text WS frame");
+    };
+    let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
+    match server_msg {
+        ServerMessage::Error { error } => {
+            assert_eq!(error.code, "harness_unsupported");
+            assert_eq!(error.severity, ErrorSeverity::Error);
+            assert_eq!(error.thread_id, Some(thread_id));
+            assert_eq!(error.action.as_deref(), Some("compact_context"));
+            assert!(
+                error
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("context compaction is not supported"))
+            );
+        }
+        other => panic!("expected structured compaction error, got {other:?}"),
+    }
 }
 
 #[tokio::test]

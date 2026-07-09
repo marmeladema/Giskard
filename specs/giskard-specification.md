@@ -8,7 +8,17 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.27
+**Version:** 1.28
+
+**Changelog (1.27 → 1.28), manual context compaction:**
+- **CC1:** The context usage menu exposes a `Compact context` action that asks the active harness to
+  compact the native thread context. For Codex this maps to app-server `thread/compact/start`, not
+  to sending a literal `/compact` user message.
+- **CC2:** While a manual compaction request is in flight, the header control is disabled and shows
+  `Compacting...`. The control is also disabled while another turn is running. Giskard still relies
+  on Codex for automatic near-limit compaction; no threshold warning is required.
+- **CC3:** Manual compaction starts the same event-forwarding path as a normal turn so compaction
+  activity is visible live and persisted in Giskard history.
 
 **Changelog (1.26 → 1.27), appearance-aware transcript scrollbar:**
 - **SB1:** The thread transcript owns a scoped thin scrollbar whose track, thumb, and hover colors
@@ -707,6 +717,8 @@ pub struct HarnessCapabilities {
     pub mcp_reload: bool,
     /// MCP OAuth login can be started through the harness.
     pub mcp_oauth_login: bool,
+    /// Manual context compaction can be requested for a thread.
+    pub context_compaction: bool,
 }
 ```
 
@@ -769,6 +781,9 @@ pub trait AgentHarness: Send + Sync {
 
     /// Interrupt the active turn of a thread.
     async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError>;
+
+    /// Ask the harness to compact the thread context.
+    async fn compact_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError>;
 
     /// Rename a durable thread in the underlying harness.
     async fn set_thread_name(
@@ -1772,7 +1787,11 @@ model's context window** (e.g. 15.4k / 262k, or / 1M). The denominator is
 `ModelDescriptor.context_window` for the current model and **recomputes when the model
 changes** (§8.4). This is a usage-vs-capacity indicator to warn before hitting context limits.
 The gauge is rendered as a header button; activating it opens a compact card with the same current
-context footprint plus cumulative thread token totals from §10.2.
+context footprint plus cumulative thread token totals from §10.2 and a manual `Compact context`
+action routed through `HarnessCapabilities.context_compaction`. Unsupported harnesses return a
+structured browser-visible error. Manual compaction is a thread-level operation and is disabled
+while that thread has an active turn; other threads and projects remain usable while compaction is
+running. Giskard does not need to warn near the limit because Codex may compact automatically.
 
 > **Codex source field.** "Tokens used in the thread" for the gauge should reflect the current
 > conversation's *context occupancy*, which is not the same as cumulative billed tokens
@@ -1961,8 +1980,8 @@ sessions, so clarity and low visual noise beat flourish. Explicitly avoid the ge
 - **Left sidebar:** projects with their threads (collapsible), token summary entry point,
   "new project" action, and a bottom-pinned **Settings** menu for durable client UI preferences
   such as Appearance.
-- **Center:** thread header (mode, model, approval policy, tasks menu, context usage menu, plan-dump &
-  interrupt actions) + transcript + composer.
+- **Center:** thread header (mode, model, approval policy, tasks menu, MCP menu, context usage menu
+  with manual compact action, plan-dump & interrupt actions) + transcript + composer.
 - Source/code previews and downloads open as overlays from linkified transcript paths rather than
   occupying a permanent right column.
 
@@ -2007,7 +2026,8 @@ This guarantees a coherent experience when a future, less-capable harness is plu
 **Client → server** (examples): `Subscribe { thread_id }`, `Unsubscribe { thread_id }`,
 `SendInput { thread_id, text }`, `SwitchMode { thread_id, mode }`,
 `SelectModel { thread_id, model_ref }`, `SetApprovalPolicy { thread_id, policy }`,
-`Interrupt { thread_id }`, `TerminateCommand { thread_id, process_id }`,
+`Interrupt { thread_id }`, `CompactContext { thread_id }`,
+`TerminateCommand { thread_id, process_id }`,
 `ApprovalDecision { request_id, decision }`, `SavePlan { thread_id, path }`.
 
 > **Durable settings switches (P2/P3).** `SwitchMode`, `SelectModel`, and `SetApprovalPolicy`
