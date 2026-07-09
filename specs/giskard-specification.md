@@ -8,7 +8,19 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.30
+**Version:** 1.31
+
+**Changelog (1.30 → 1.31), manual compaction completion hardening:**
+- **CC4:** After `thread/compact/start` succeeds, the Codex harness keeps draining app-server
+  notifications even when no command is running, so context-compaction notifications/items reach
+  the browser and registry. A `Context compacted` marker is terminal only for marker-only
+  compactions; once Codex emits `TurnStarted`, Giskard keeps draining until the matching
+  `TurnCompleted` event.
+- **CC5:** Manual compaction completion is robust to Codex versions that emit only a
+  context-compaction item/notification and no normal `turn/completed`. If no `TurnStarted` was
+  observed for the manual compaction, the first `Context compacted` activity item is treated as a
+  terminal successful compaction turn, persisted as `/compact`, broadcast to the browser, and used
+  to release the per-thread turn gate.
 
 **Changelog (1.29 → 1.30), collapsible project sidebar groups:**
 - **PC1:** Project groups in the left sidebar / mobile Projects drawer are collapsible so a user can

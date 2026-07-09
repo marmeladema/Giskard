@@ -10,10 +10,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
-use tracing::warn;
+use tracing::{info, warn};
 
 use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
@@ -428,30 +429,54 @@ async fn background_task(
     workspace_root: PathBuf,
 ) {
     let mut mapper = CodexMapper::new(workspace_root);
+    let mut pending_compactions: HashMap<ThreadId, PendingCompaction> = HashMap::new();
 
     loop {
         tokio::select! {
-            msg = client.next_message(), if mapper.has_running_commands() => {
+            msg = client.next_message(), if mapper.has_running_commands() || !pending_compactions.is_empty() => {
                 match msg {
                     Ok(Some(msg)) => {
-                        if matches!(
-                            handle_idle_server_message(
+                        match handle_idle_server_message(
                                 &mut client,
                                 &mut mapper,
                                 &senders,
                                 &mut control_rx,
+                                &mut pending_compactions,
                                 msg,
                             )
-                            .await,
-                            StreamOutcome::Shutdown,
-                        ) {
-                            let _ = client.shutdown().await;
-                            break;
+                            .await
+                        {
+                            StreamOutcome::TurnEnded => {}
+                            StreamOutcome::CompactionCompleted { thread, elapsed_ms } => {
+                                info!(
+                                    %thread,
+                                    elapsed_ms,
+                                    pending_compactions = pending_compactions.len(),
+                                    "Codex context compaction completion observed"
+                                );
+                            }
+                            StreamOutcome::Shutdown => {
+                                let _ = client.shutdown().await;
+                                break;
+                            }
                         }
                     }
-                    Ok(None) => break,
+                    Ok(None) => {
+                        if !pending_compactions.is_empty() {
+                            warn!(
+                                pending_compactions = pending_compactions.len(),
+                                pending_compaction_states = ?pending_compaction_states(&pending_compactions),
+                                "Codex message stream ended with pending context compactions"
+                            );
+                        }
+                        break;
+                    }
                     Err(e) => {
-                        warn!("Codex idle stream failed while commands were running: {e}");
+                        warn!(
+                            pending_compactions = pending_compactions.len(),
+                            pending_compaction_states = ?pending_compaction_states(&pending_compactions),
+                            "Codex idle stream failed while background work was running: {e}"
+                        );
                     }
                 }
             }
@@ -534,7 +559,35 @@ async fn background_task(
                         let _ = response.send(result);
                     }
                     Some(ControlCommand::CompactThread { thread, response }) => {
+                        let started = Instant::now();
+                        info!(
+                            thread = %thread.thread,
+                            harness_thread_id = %thread.harness_thread_id,
+                            pending_compactions = pending_compactions.len(),
+                            "requesting Codex context compaction"
+                        );
                         let result = handle_compact_thread(&mut client, &thread).await;
+                        match &result {
+                            Ok(()) => {
+                                pending_compactions
+                                    .insert(thread.thread, PendingCompaction::new(started));
+                                info!(
+                                    thread = %thread.thread,
+                                    harness_thread_id = %thread.harness_thread_id,
+                                    ack_elapsed_ms = started.elapsed().as_millis(),
+                                    pending_compactions = pending_compactions.len(),
+                                    "Codex accepted context compaction request"
+                                );
+                            }
+                            Err(error) => {
+                                warn!(
+                                    thread = %thread.thread,
+                                    harness_thread_id = %thread.harness_thread_id,
+                                    elapsed_ms = started.elapsed().as_millis(),
+                                    "Codex context compaction request failed: {error}"
+                                );
+                            }
+                        }
                         let _ = response.send(result);
                     }
                     Some(ControlCommand::SetThreadName {
@@ -590,6 +643,7 @@ async fn handle_idle_server_message(
     mapper: &mut CodexMapper,
     senders: &SenderMap,
     control_rx: &mut mpsc::Receiver<ControlCommand>,
+    pending_compactions: &mut HashMap<ThreadId, PendingCompaction>,
     msg: codex_codes::ServerMessage,
 ) -> StreamOutcome {
     let fallback_thread = mapper.running_command_fallback_thread().unwrap_or_default();
@@ -597,7 +651,12 @@ async fn handle_idle_server_message(
         codex_codes::ServerMessage::Notification(notif) => {
             if let Some(event) = mapper.map_notification(&notif, fallback_thread) {
                 let thread = event_thread(&event);
+                let completed_compaction =
+                    observe_pending_compaction(pending_compactions, thread, &event);
                 let _ = broadcast_event(senders, thread, || event).await;
+                if let Some(elapsed_ms) = completed_compaction {
+                    return StreamOutcome::CompactionCompleted { thread, elapsed_ms };
+                }
             }
             StreamOutcome::TurnEnded
         }
@@ -705,7 +764,118 @@ async fn handle_idle_server_message(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamOutcome {
     TurnEnded,
+    CompactionCompleted { thread: ThreadId, elapsed_ms: u128 },
     Shutdown,
+}
+
+#[derive(Debug)]
+struct PendingCompaction {
+    started_at: Instant,
+    saw_turn_started: bool,
+}
+
+impl PendingCompaction {
+    fn new(started_at: Instant) -> Self {
+        Self {
+            started_at,
+            saw_turn_started: false,
+        }
+    }
+
+    fn observe(&mut self, event: &AgentEvent) -> bool {
+        match event {
+            AgentEvent::TurnStarted { .. } => {
+                self.saw_turn_started = true;
+                false
+            }
+            AgentEvent::ItemCompleted { item, .. }
+                if is_context_compaction_activity(item) && !self.saw_turn_started =>
+            {
+                true
+            }
+            AgentEvent::TurnCompleted { .. } => true,
+            _ => false,
+        }
+    }
+}
+
+fn observe_pending_compaction(
+    pending_compactions: &mut HashMap<ThreadId, PendingCompaction>,
+    thread: ThreadId,
+    event: &AgentEvent,
+) -> Option<u128> {
+    let event_name = compaction_event_name(event)?;
+    let event_turn = agent_event_turn(event);
+    let pending = pending_compactions.get_mut(&thread)?;
+    let saw_turn_started_before = pending.saw_turn_started;
+    let elapsed_ms = pending.started_at.elapsed().as_millis();
+    let completed = pending.observe(event);
+    info!(
+        %thread,
+        ?event_turn,
+        event = event_name,
+        saw_turn_started_before,
+        saw_turn_started_after = pending.saw_turn_started,
+        completed,
+        elapsed_ms,
+        "observed Codex context compaction event"
+    );
+    if !completed {
+        return None;
+    }
+    pending_compactions
+        .remove(&thread)
+        .map(|pending| pending.started_at.elapsed().as_millis())
+}
+
+fn compaction_event_name(event: &AgentEvent) -> Option<&'static str> {
+    match event {
+        AgentEvent::TurnStarted { .. } => Some("turn_started"),
+        AgentEvent::ItemCompleted { item, .. } if is_context_compaction_activity(item) => {
+            Some("context_compacted_item")
+        }
+        AgentEvent::TurnCompleted { .. } => Some("turn_completed"),
+        _ => None,
+    }
+}
+
+fn agent_event_turn(event: &AgentEvent) -> Option<TurnId> {
+    match event {
+        AgentEvent::TurnStarted { turn, .. }
+        | AgentEvent::ItemStarted { turn, .. }
+        | AgentEvent::ItemDelta { turn, .. }
+        | AgentEvent::ItemCompleted { turn, .. }
+        | AgentEvent::DiffUpdated { turn, .. }
+        | AgentEvent::ApprovalRequested { turn, .. }
+        | AgentEvent::TurnCompleted { turn, .. } => Some(*turn),
+        AgentEvent::ServerRequestReceived { turn, .. }
+        | AgentEvent::ServerRequestResolved { turn, .. }
+        | AgentEvent::Error { turn, .. }
+        | AgentEvent::Notice { turn, .. } => *turn,
+        AgentEvent::ThreadOpened { .. } => None,
+    }
+}
+
+fn pending_compaction_states(
+    pending_compactions: &HashMap<ThreadId, PendingCompaction>,
+) -> Vec<String> {
+    pending_compactions
+        .iter()
+        .map(|(thread, pending)| {
+            format!(
+                "{thread}:saw_turn_started={},elapsed_ms={}",
+                pending.saw_turn_started,
+                pending.started_at.elapsed().as_millis()
+            )
+        })
+        .collect()
+}
+
+fn is_context_compaction_activity(item: &giskard_core::item::Item) -> bool {
+    matches!(
+        &item.payload,
+        giskard_core::item::ItemPayload::Activity { title, .. } if title == "Context compacted"
+    )
 }
 
 async fn handle_open_thread(
@@ -1514,6 +1684,9 @@ async fn handle_interrupt_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use giskard_core::ids::ItemId;
+    use giskard_core::item::{Item, ItemPayload};
     use giskard_core::model::{Effort, ModelRef};
     use giskard_core::turn::{ApprovalPolicy, Mode};
 
@@ -1539,6 +1712,77 @@ mod tests {
             mode,
             approval_policy: ApprovalPolicy::Ask,
         }
+    }
+
+    fn context_compacted_event(thread: ThreadId, turn: TurnId) -> AgentEvent {
+        AgentEvent::ItemCompleted {
+            thread,
+            turn,
+            item: Item {
+                id: ItemId::new(),
+                harness_item_id: format!("context_compacted:{turn}"),
+                payload: ItemPayload::Activity {
+                    title: "Context compacted".into(),
+                    detail: None,
+                    metadata: None,
+                },
+                created_at: Utc::now(),
+            },
+        }
+    }
+
+    fn completed_event(thread: ThreadId, turn: TurnId) -> AgentEvent {
+        AgentEvent::TurnCompleted {
+            thread,
+            turn,
+            usage: TokenUsage::default(),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        }
+    }
+
+    #[test]
+    fn pending_compaction_marker_only_completes_without_turn_started() {
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let mut pending = HashMap::new();
+        pending.insert(thread, PendingCompaction::new(Instant::now()));
+
+        let elapsed_ms = observe_pending_compaction(
+            &mut pending,
+            thread,
+            &context_compacted_event(thread, turn),
+        );
+
+        assert!(elapsed_ms.is_some());
+        assert!(!pending.contains_key(&thread));
+    }
+
+    #[test]
+    fn pending_compaction_marker_after_turn_started_waits_for_turn_completed() {
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let mut pending = HashMap::new();
+        pending.insert(thread, PendingCompaction::new(Instant::now()));
+
+        let started = AgentEvent::TurnStarted { thread, turn };
+        assert!(observe_pending_compaction(&mut pending, thread, &started).is_none());
+        assert!(pending.get(&thread).unwrap().saw_turn_started);
+
+        let marker = observe_pending_compaction(
+            &mut pending,
+            thread,
+            &context_compacted_event(thread, turn),
+        );
+        assert!(marker.is_none());
+        assert!(pending.contains_key(&thread));
+
+        let completed =
+            observe_pending_compaction(&mut pending, thread, &completed_event(thread, turn));
+        assert!(completed.is_some());
+        assert!(!pending.contains_key(&thread));
     }
 
     #[test]
