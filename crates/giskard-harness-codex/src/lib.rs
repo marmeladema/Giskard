@@ -70,6 +70,10 @@ enum ControlCommand {
         process_id: String,
         response: oneshot::Sender<Result<(), HarnessError>>,
     },
+    CompactThread {
+        thread: ThreadHandle,
+        response: oneshot::Sender<Result<(), HarnessError>>,
+    },
     SetThreadName {
         thread: ThreadHandle,
         name: String,
@@ -150,6 +154,7 @@ impl CodexHarness {
                 mcp_status: true,
                 mcp_reload: true,
                 mcp_oauth_login: true,
+                context_compaction: true,
             },
         });
 
@@ -316,6 +321,19 @@ impl AgentHarness for CodexHarness {
         let (tx, rx) = oneshot::channel();
         self.control_tx
             .send(ControlCommand::Interrupt {
+                thread: thread.clone(),
+                response: tx,
+            })
+            .await
+            .map_err(|_| HarnessError::Transport("background task closed".into()))?;
+        rx.await
+            .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
+    }
+
+    async fn compact_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
+        let (tx, rx) = oneshot::channel();
+        self.control_tx
+            .send(ControlCommand::CompactThread {
                 thread: thread.clone(),
                 response: tx,
             })
@@ -515,6 +533,10 @@ async fn background_task(
                                 .await;
                         let _ = response.send(result);
                     }
+                    Some(ControlCommand::CompactThread { thread, response }) => {
+                        let result = handle_compact_thread(&mut client, &thread).await;
+                        let _ = response.send(result);
+                    }
                     Some(ControlCommand::SetThreadName {
                         thread,
                         name,
@@ -633,6 +655,11 @@ async fn handle_idle_server_message(
                         let result =
                             handle_terminate_command(client, mapper, &thread, &process_id).await;
                         let _ = response.send(result);
+                    }
+                    Some(ControlCommand::CompactThread { response, .. }) => {
+                        let _ = response.send(Err(HarnessError::Unsupported(
+                            "context compaction is not available during an active turn".into(),
+                        )));
                     }
                     Some(ControlCommand::SetThreadName {
                         thread,
@@ -990,6 +1017,11 @@ async fn stream_turn_events(
                                     .await;
                             let _ = response.send(result);
                         }
+                        Some(ControlCommand::CompactThread { response, .. }) => {
+                            let _ = response.send(Err(HarnessError::Unsupported(
+                                "context compaction is not available during an active turn".into(),
+                            )));
+                        }
                         Some(ControlCommand::SetThreadName {
                             thread,
                             name,
@@ -1077,6 +1109,12 @@ async fn handle_stream_control(
         }) => {
             let result = handle_terminate_command(client, mapper, &thread, &process_id).await;
             let _ = response.send(result);
+            StreamControlOutcome::Continue
+        }
+        Some(ControlCommand::CompactThread { response, .. }) => {
+            let _ = response.send(Err(HarnessError::Unsupported(
+                "context compaction is not available during an active turn".into(),
+            )));
             StreamControlOutcome::Continue
         }
         Some(ControlCommand::SetThreadName {
@@ -1252,6 +1290,23 @@ async fn handle_terminate_command(
             ))
         })?;
     handle_interrupt_turn(client, &thread.harness_thread_id, native_turn_id).await
+}
+
+async fn handle_compact_thread(
+    client: &mut codex_codes::AsyncClient,
+    thread: &ThreadHandle,
+) -> Result<(), HarnessError> {
+    let params = codex_codes::ThreadCompactStartParams {
+        thread_id: thread.harness_thread_id.clone(),
+    };
+    let _: codex_codes::ThreadCompactStartResponse = client
+        .request(
+            codex_codes::protocol::methods::THREAD_COMPACT_START,
+            &params,
+        )
+        .await
+        .map_err(|e| HarnessError::Transport(e.to_string()))?;
+    Ok(())
 }
 
 async fn handle_set_thread_archived(

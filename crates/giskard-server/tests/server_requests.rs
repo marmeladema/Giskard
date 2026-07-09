@@ -77,6 +77,7 @@ impl AgentHarness for ServerRequestHarness {
             mcp_status: false,
             mcp_reload: false,
             mcp_oauth_login: false,
+            context_compaction: false,
         }
     }
 

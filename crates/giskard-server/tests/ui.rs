@@ -257,6 +257,15 @@ async fn index_page_is_served_and_public() {
         "context usage is exposed as a header button with a popover menu"
     );
     assert!(
+        body.contains("id=\"compactBtn\"")
+            && body.contains("function compactContext")
+            && body.contains("type:\"compact_context\", thread_id: state.threadId")
+            && body.contains("state.compactPending ? \"Compacting")
+            && body.contains("msg.action===\"compact_context\"")
+            && body.contains("isContextCompactionItem"),
+        "context menu exposes a manual context compaction action with pending/error recovery"
+    );
+    assert!(
         body.contains("function renderUsageMenu")
             && body.contains("Current Context")
             && body.contains("Cumulative Tokens"),
@@ -714,6 +723,11 @@ async fn index_page_is_served_and_public() {
     assert!(
         body.contains("renderActivity"),
         "UI renders generic activity items"
+    );
+    assert!(
+        body.contains("visibleActivityMetadata")
+            && body.contains("if (isContextCompactionPayload(p)) return null"),
+        "UI hides protocol-only context compaction metadata from old persisted activity rows"
     );
     assert!(
         body.contains("/linkify"),

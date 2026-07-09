@@ -627,7 +627,7 @@ let state = {
   toolPayloadsByItemId:new Map(), toolBodyElsByItemId:new Map(), expandedToolOutputs:new Set(), manuallyToggledToolOutputs:new Set(),
   activeTaskGroup:null, taskGroupSeq:0, taskItemSeq:0, taskGroupsById:new Map(), taskGroupsByItemId:new Map(),
   expandedTaskGroups:new Set(), manuallyToggledTaskGroups:new Set(), expandedTaskDetails:new Map(),
-  linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, activeTurn:false, interruptPending:false,
+  linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, activeTurn:false, interruptPending:false, compactPending:false,
   awaitingInitialThreadState:false, contextWindow:0, contextUsed:null, tokenLedger:null, approvalPolicy:"ask",
   mcpServers:[], mcpCapabilities:{ status:false, reload:false, oauth_login:false }, mcpLoading:false, mcpError:null, expandedMcps:new Set()
 };
@@ -922,6 +922,7 @@ function clearThreadView(tid) {
   if (ws) { try { ws.close(); } catch {} }
   state.projectId = null; state.threadId = null;
   state.pendingUserEl = null; state.pendingUserText = null;
+  state.compactPending = false;
   setTurnActive(false);
   state.awaitingInitialThreadState = false;
   resetRenderState();
@@ -1041,6 +1042,7 @@ async function openThread(pid, tid, title, opts) {
   try { localStorage.setItem("giskard.lastThread", JSON.stringify({ pid, tid })); } catch {}
 
   state.projectId = pid; state.threadId = tid; state.pendingUserEl = null; state.pendingUserText = null;
+  state.compactPending = false;
   state.mcpServers = []; state.mcpError = null; state.expandedMcps = new Set();
   state.mcpCapabilities = { status:false, reload:false, oauth_login:false };
   $("tasksMenu").hidden = true;
@@ -1122,6 +1124,11 @@ function updateComposerControls() {
   $("stopBtn").hidden = !state.activeTurn;
   $("stopBtn").disabled = !ready || state.interruptPending;
   $("stopBtn").textContent = state.interruptPending ? "Stopping…" : "Stop";
+  const compactBtn = $("compactBtn");
+  if (compactBtn) {
+    compactBtn.disabled = !state.threadId || state.activeTurn || state.compactPending || !ready;
+    compactBtn.textContent = state.compactPending ? "Compacting..." : "Compact context";
+  }
   $("input").disabled = state.wsStatus==="closed";
   $("input").placeholder =
     state.activeTurn ? "Agent is running… draft the next message here." :
@@ -1176,6 +1183,10 @@ function handleServer(msg) {
       if (msg.action==="interrupt") {
         state.interruptPending = false;
         resetTerminatingToolTasks();
+        updateComposerControls();
+      }
+      if (msg.action==="compact_context") {
+        state.compactPending = false;
         updateComposerControls();
       }
       if (msg.action==="terminate_command") resetTerminatingCommand(msg.process_id);
@@ -1307,6 +1318,7 @@ function handleEvent(ev) {
       break;
     case "item_completed":
       if (!finalizeStreamedItem(ev.item)) addItem(ev.item);
+      if (isContextCompactionItem(ev.item)) finishCompactPending();
       break;
     case "turn_completed":
       updateGaugeFromUsage(ev.usage);
@@ -1315,6 +1327,7 @@ function handleEvent(ev) {
       state.streamElsByItemId.clear();
       state.itemKindsByItemId.clear();
       detachRunningCommands();
+      finishCompactPending();
       setTurnActive(false);
       breakTaskGroup();
       break;
@@ -2994,7 +3007,7 @@ function hasVisiblePayload(p) {
   if (p.kind==="agent_message" || p.kind==="reasoning" || p.kind==="user_message") return Boolean((p.text||"").trim());
   if (p.kind==="file_change") return Boolean((p.path||"").trim() || (p.changes||[]).length || p.status);
   if (p.kind==="tool_call") return Boolean((p.name||"").trim() || (p.server||"").trim() || p.status || p.error || p.input || p.output);
-  if (p.kind==="activity") return Boolean((p.title||"").trim() || (p.detail||"").trim() || p.metadata);
+  if (p.kind==="activity") return Boolean((p.title||"").trim() || (p.detail||"").trim() || visibleActivityMetadata(p));
   return false;
 }
 function renderItemBody(body, p) {
@@ -3392,8 +3405,31 @@ function toolTerminalDurationMs(msg, startedAtMs) {
 }
 function renderActivity(p) {
   const detail = p.detail ? `<div>${escapeHtml(p.detail)}</div>` : "";
-  const meta = p.metadata ? `<pre class="out">${escapeHtml(jsonPreview(p.metadata))}</pre>` : "";
+  const metadata = visibleActivityMetadata(p);
+  const meta = metadata ? `<pre class="out">${escapeHtml(jsonPreview(metadata))}</pre>` : "";
   return `<div>${escapeHtml(p.title||"Activity")}</div>${detail}${meta}`;
+}
+function visibleActivityMetadata(p) {
+  if (!p || !p.metadata) return null;
+  if (isContextCompactionPayload(p)) return null;
+  return p.metadata;
+}
+function isContextCompactionPayload(p) {
+  if (!p || p.kind !== "activity") return false;
+  const metadata = p.metadata || {};
+  if (metadata.type === "contextCompaction") return true;
+  if (metadata.threadId && metadata.turnId && String(p.title || "").toLowerCase().includes("context compact")) return true;
+  const title = String(p.title || "").toLowerCase();
+  return title.includes("context compaction") || title.includes("context compacted");
+}
+function isContextCompactionItem(item) {
+  const payload = item && (item.payload || item);
+  return isContextCompactionPayload(payload);
+}
+function finishCompactPending() {
+  if (!state.compactPending) return;
+  state.compactPending = false;
+  updateComposerControls();
 }
 function appendJsonPreviewIfMeaningful(body, value) {
   if (!hasMeaningfulJson(value)) return;
@@ -3730,6 +3766,21 @@ function interruptTurn() {
 }
 $("stopBtn").onclick = interruptTurn;
 
+function compactContext() {
+  if (!state.threadId || state.compactPending) return;
+  if (state.activeTurn) {
+    notice("Wait for the current turn to finish before compacting context.", "warning");
+    return;
+  }
+  state.compactPending = true;
+  updateComposerControls();
+  if (!send({ type:"compact_context", thread_id: state.threadId })) {
+    state.compactPending = false;
+    updateComposerControls();
+    notice(`Compaction not started: WebSocket is ${state.wsStatus}.`, "error");
+  }
+}
+
 $("modeBtn").onclick = () => {
   state.mode = state.mode==="build" ? "plan" : "build";
   $("modeBtn").textContent = state.mode;
@@ -3863,10 +3914,16 @@ function renderUsageMenu() {
       <div class="usage-line"><span class="muted">Window filled</span><span class="mono">${escapeHtml(pctLabel)}</span></div>
     </div>
     <div class="usage-section">
+      <div class="usage-section-title">Actions</div>
+      <button id="compactBtn" class="btn" type="button" title="Compact this thread's Codex context">Compact context</button>
+    </div>
+    <div class="usage-section">
       <div class="usage-section-title">Cumulative Tokens</div>
       ${renderTokenStats(state.tokenLedger)}
     </div>`;
   $("usageClose").onclick = () => { $("usageMenu").hidden = true; };
+  $("compactBtn").onclick = compactContext;
+  updateComposerControls();
 }
 $("usageBtn").onclick = (e) => { e.stopPropagation(); toggleUsageMenu(); };
 $("usageMenu").onclick = (e) => e.stopPropagation();
