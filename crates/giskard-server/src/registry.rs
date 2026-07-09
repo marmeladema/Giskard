@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use chrono::Utc;
 use tokio::sync::Mutex;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
@@ -14,7 +15,7 @@ use giskard_core::item::{Item, ItemPayload, command_status_is_running, normalize
 use giskard_core::mcp::{McpOauthStart, McpServerStatus};
 use giskard_core::model::ModelRef;
 use giskard_core::server_request::ServerRequestResponse;
-use giskard_core::turn::{Mode, Turn, TurnOverrides, TurnStatusKind};
+use giskard_core::turn::{Mode, Turn, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle};
 use giskard_persist::PersistStore;
@@ -38,6 +39,13 @@ struct TurnContext {
     user_input: UserInput,
     model: ModelRef,
     mode: Mode,
+    kind: TurnContextKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TurnContextKind {
+    User,
+    ManualCompaction,
 }
 
 /// Shared handle to the pending-approvals map (`ApprovalId -> ThreadId`), cloneable into the
@@ -237,6 +245,7 @@ impl HarnessRegistry {
             user_input: input.clone(),
             model: effective_model,
             mode: overrides.mode,
+            kind: TurnContextKind::User,
         };
 
         let hub = self.hub.clone();
@@ -381,11 +390,22 @@ impl HarnessRegistry {
             .cloned()
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
 
+        let request_started = Instant::now();
+        info!(
+            %project_id,
+            %thread_id,
+            harness_thread_id = %handle.harness_thread_id,
+            provider = %effective_model.provider,
+            model = %effective_model.model,
+            mode = ?mode,
+            "starting context compaction"
+        );
         let turn_gate = self.turn_gate.reserve(thread_id)?;
         let ctx = TurnContext {
             user_input: UserInput::text("/compact"),
             model: effective_model,
             mode,
+            kind: TurnContextKind::ManualCompaction,
         };
 
         let hub = self.hub.clone();
@@ -398,6 +418,13 @@ impl HarnessRegistry {
 
         let stream = harness.subscribe(&handle);
         harness.compact_thread(&handle).await?;
+        info!(
+            %project_id,
+            %thread_id,
+            harness_thread_id = %handle.harness_thread_id,
+            ack_elapsed_ms = request_started.elapsed().as_millis(),
+            "harness accepted context compaction request"
+        );
 
         tokio::spawn(async move {
             forward_events(
@@ -571,6 +598,8 @@ async fn forward_events(
     let mut seen_harness_item_ids = persisted_harness_item_ids(&store, project_id, thread_id).await;
     let mut duplicate_item_ids = HashSet::new();
     let mut seen_notices = HashSet::new();
+    let forwarder_started = Instant::now();
+    let mut saw_context_compaction_marker = false;
 
     loop {
         match stream.recv().await {
@@ -650,8 +679,34 @@ async fn forward_events(
                     AgentEvent::TurnStarted { turn, .. } => {
                         turn_id = Some(*turn);
                         started_at = Utc::now();
+                        if ctx.kind == TurnContextKind::ManualCompaction {
+                            info!(
+                                %project_id,
+                                %thread_id,
+                                %turn,
+                                elapsed_ms = forwarder_started.elapsed().as_millis(),
+                                "context compaction turn started"
+                            );
+                        }
                     }
-                    AgentEvent::ItemCompleted { item, .. } => items.push(item.clone()),
+                    AgentEvent::ItemCompleted { item, turn, .. } => {
+                        if ctx.kind == TurnContextKind::ManualCompaction
+                            && is_context_compaction_item(item)
+                        {
+                            saw_context_compaction_marker = true;
+                            info!(
+                                %project_id,
+                                %thread_id,
+                                %turn,
+                                turn_started_seen = turn_id.is_some(),
+                                will_synthesize_completion = turn_id.is_none(),
+                                items_buffered_after = items.len() + 1,
+                                elapsed_ms = forwarder_started.elapsed().as_millis(),
+                                "context compaction marker received"
+                            );
+                        }
+                        items.push(item.clone());
+                    }
                     AgentEvent::DiffUpdated { diff, .. } => {
                         let existing = diffs.iter_mut().find(|d| d.path == diff.path);
                         if let Some(existing) = existing {
@@ -687,6 +742,16 @@ async fn forward_events(
                 } else {
                     None
                 };
+                let synthetic_compaction_completed = match &event {
+                    AgentEvent::ItemCompleted { turn, item, .. }
+                        if ctx.kind == TurnContextKind::ManualCompaction
+                            && turn_id.is_none()
+                            && is_context_compaction_item(item) =>
+                    {
+                        Some(*turn)
+                    }
+                    _ => None,
+                };
 
                 if is_turn_start {
                     live_buffers.start_turn(thread_id).await;
@@ -696,25 +761,37 @@ async fn forward_events(
                 }
 
                 if let Some((completed_turn, usage, status)) = completed {
-                    let tid = turn_id.unwrap_or(completed_turn);
-                    seen_turn_ids.insert(tid);
-                    let turn = Turn {
-                        id: tid,
-                        user_input: ctx.user_input.clone(),
-                        items: std::mem::take(&mut items),
-                        model: ctx.model.clone(),
-                        mode: ctx.mode,
-                        status: status.clone(),
-                        usage,
-                        diffs: std::mem::take(&mut diffs),
-                        started_at,
-                        completed_at: Some(Utc::now()),
-                    };
-                    persist_turn(&store, &hub, &ledger, project_id, thread_id, turn).await;
-                    live_buffers.clear_turn(thread_id).await;
-                    if let Some(turn_gate) = turn_gate.as_mut() {
-                        turn_gate.release();
+                    if ctx.kind == TurnContextKind::ManualCompaction {
+                        info!(
+                            %project_id,
+                            %thread_id,
+                            turn = %completed_turn,
+                            status = ?status.kind,
+                            items_buffered = items.len(),
+                            saw_context_compaction_marker,
+                            elapsed_ms = forwarder_started.elapsed().as_millis(),
+                            "context compaction turn completed"
+                        );
                     }
+                    let tid = complete_forwarded_turn(
+                        thread_id,
+                        project_id,
+                        completed_turn,
+                        usage,
+                        status.clone(),
+                        &ctx,
+                        &mut items,
+                        &mut diffs,
+                        started_at,
+                        turn_id,
+                        &mut seen_turn_ids,
+                        &store,
+                        &hub,
+                        &ledger,
+                        &live_buffers,
+                        turn_gate.as_mut(),
+                    )
+                    .await;
                     owned_turn_completed = true;
                     hub.broadcast_event(thread_id, event).await;
                     if command_state_changed {
@@ -731,13 +808,154 @@ async fn forward_events(
                 if command_state_changed {
                     broadcast_running_commands(&hub, &running_commands, thread_id).await;
                 }
+
+                if let Some(completed_turn) = synthetic_compaction_completed {
+                    info!(
+                        %project_id,
+                        %thread_id,
+                        turn = %completed_turn,
+                        turn_started_seen = turn_id.is_some(),
+                        items_buffered = items.len(),
+                        elapsed_ms = forwarder_started.elapsed().as_millis(),
+                        "context compaction completed from marker without turn completion"
+                    );
+                    let status = TurnStatus {
+                        kind: TurnStatusKind::Completed,
+                        message: None,
+                    };
+                    let completion_event = AgentEvent::TurnCompleted {
+                        thread: thread_id,
+                        turn: completed_turn,
+                        usage: giskard_core::token::TokenUsage::default(),
+                        status: status.clone(),
+                    };
+                    if live_buffers.is_active(thread_id).await {
+                        live_buffers
+                            .append(thread_id, completion_event.clone())
+                            .await;
+                    }
+                    let tid = complete_forwarded_turn(
+                        thread_id,
+                        project_id,
+                        completed_turn,
+                        giskard_core::token::TokenUsage::default(),
+                        status,
+                        &ctx,
+                        &mut items,
+                        &mut diffs,
+                        started_at,
+                        turn_id,
+                        &mut seen_turn_ids,
+                        &store,
+                        &hub,
+                        &ledger,
+                        &live_buffers,
+                        turn_gate.as_mut(),
+                    )
+                    .await;
+                    owned_turn_completed = true;
+                    hub.broadcast_event(thread_id, completion_event).await;
+                    if !running_commands.has_running_for_turn(thread_id, tid).await {
+                        break;
+                    }
+                }
             }
             Err(e) => {
-                debug!(%thread_id, ?e, "event stream ended");
+                if ctx.kind == TurnContextKind::ManualCompaction && !owned_turn_completed {
+                    let live_buffer_active = live_buffers.is_active(thread_id).await;
+                    warn!(
+                        %project_id,
+                        %thread_id,
+                        ?e,
+                        ?owned_turn,
+                        ?turn_id,
+                        saw_context_compaction_marker,
+                        items_buffered = items.len(),
+                        live_buffer_active,
+                        turn_gate_held = turn_gate.is_some(),
+                        elapsed_ms = forwarder_started.elapsed().as_millis(),
+                        "context compaction event stream ended before completion"
+                    );
+                } else {
+                    debug!(%thread_id, ?e, "event stream ended");
+                }
                 break;
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn complete_forwarded_turn(
+    thread_id: ThreadId,
+    project_id: ProjectId,
+    completed_turn: TurnId,
+    usage: giskard_core::token::TokenUsage,
+    status: TurnStatus,
+    ctx: &TurnContext,
+    items: &mut Vec<Item>,
+    diffs: &mut Vec<giskard_core::FileDiff>,
+    started_at: chrono::DateTime<Utc>,
+    turn_id: Option<TurnId>,
+    seen_turn_ids: &mut HashSet<TurnId>,
+    store: &Arc<PersistStore>,
+    hub: &Arc<Hub>,
+    ledger: &LedgerHandle,
+    live_buffers: &Arc<LiveBufferStore>,
+    turn_gate: Option<&mut ThreadTurnLease>,
+) -> TurnId {
+    let tid = turn_id.unwrap_or(completed_turn);
+    seen_turn_ids.insert(tid);
+    let item_count = items.len();
+    let has_context_compaction_marker = items.iter().any(is_context_compaction_item);
+    if ctx.kind == TurnContextKind::ManualCompaction {
+        info!(
+            %project_id,
+            %thread_id,
+            turn = %tid,
+            completed_turn = %completed_turn,
+            started_turn = ?turn_id,
+            item_count,
+            has_context_compaction_marker,
+            status = ?status.kind,
+            "persisting context compaction turn"
+        );
+    }
+    let turn = Turn {
+        id: tid,
+        user_input: ctx.user_input.clone(),
+        items: std::mem::take(items),
+        model: ctx.model.clone(),
+        mode: ctx.mode,
+        status,
+        usage,
+        diffs: std::mem::take(diffs),
+        started_at,
+        completed_at: Some(Utc::now()),
+    };
+    persist_turn(store, hub, ledger, project_id, thread_id, turn).await;
+    if ctx.kind == TurnContextKind::ManualCompaction {
+        info!(
+            %project_id,
+            %thread_id,
+            turn = %tid,
+            item_count,
+            has_context_compaction_marker,
+            "context compaction persistence path finished"
+        );
+    }
+    live_buffers.clear_turn(thread_id).await;
+    if let Some(turn_gate) = turn_gate {
+        turn_gate.release();
+    }
+    tid
+}
+
+fn is_context_compaction_item(item: &Item) -> bool {
+    matches!(
+        &item.payload,
+        ItemPayload::Activity { title, .. } if title == "Context compacted"
+    )
 }
 
 fn should_skip_duplicate_notice(
@@ -1036,8 +1254,8 @@ mod tests {
     use tokio::sync::{Mutex, broadcast, mpsc};
 
     use super::{
-        TurnContext, command_completion_is_normal_success, command_status_is_running,
-        forward_events,
+        ThreadTurnGate, TurnContext, TurnContextKind, command_completion_is_normal_success,
+        command_status_is_running, forward_events,
     };
     use crate::hub::Hub;
     use crate::ledger;
@@ -1297,6 +1515,139 @@ mod tests {
         assert_eq!(notice_count, 1);
     }
 
+    #[tokio::test]
+    async fn manual_compaction_item_completes_turn_and_releases_gate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: None,
+        };
+        store
+            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .await
+            .unwrap();
+        let now = Utc::now();
+        store
+            .save_thread(
+                project_id,
+                &ThreadFile {
+                    version: 1,
+                    id: thread_id,
+                    project_id,
+                    title: "t".into(),
+                    harness_thread_id: "th".into(),
+                    mode: Mode::Build,
+                    current_model: model.clone(),
+                    context_window: 128_000,
+                    approval_policy: ApprovalPolicy::Ask,
+                    model_efforts: Default::default(),
+                    tokens: TokenLedger::default(),
+                    created_at: now,
+                    updated_at: now,
+                    archived: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let (tx, _) = broadcast::channel(64);
+        let hub = Arc::new(Hub::new());
+        let (client_tx, mut client_rx) = mpsc::channel(16);
+        hub.subscribe(thread_id, 1, client_tx).await;
+        let live_buffers = Arc::new(LiveBufferStore::new());
+        let running_commands = Arc::new(RunningTaskStore::new());
+        let approvals = Arc::new(Mutex::new(Default::default()));
+        let server_requests = Arc::new(Mutex::new(Default::default()));
+        let ledger = ledger::spawn(store.clone());
+        let gate = ThreadTurnGate::default();
+        let lease = gate.reserve(thread_id).unwrap();
+        let stream = AgentEventStream::new(tx.subscribe());
+        let ctx = TurnContext {
+            user_input: UserInput::text("/compact"),
+            model: model.clone(),
+            mode: Mode::Build,
+            kind: TurnContextKind::ManualCompaction,
+        };
+
+        tokio::spawn({
+            let hub = hub.clone();
+            let live_buffers = live_buffers.clone();
+            let running_commands = running_commands.clone();
+            let store = store.clone();
+            async move {
+                forward_events(
+                    thread_id,
+                    project_id,
+                    stream,
+                    hub,
+                    live_buffers,
+                    running_commands,
+                    store,
+                    approvals,
+                    server_requests,
+                    ledger,
+                    ctx,
+                    Some(lease),
+                )
+                .await;
+            }
+        });
+
+        let turn = TurnId::new();
+        tx.send(AgentEvent::ItemCompleted {
+            thread: thread_id,
+            turn,
+            item: Item {
+                id: ItemId::new(),
+                harness_item_id: format!("context_compacted:{turn}"),
+                payload: ItemPayload::Activity {
+                    title: "Context compacted".into(),
+                    detail: None,
+                    metadata: None,
+                },
+                created_at: Utc::now(),
+            },
+        })
+        .unwrap();
+
+        let mut completed = false;
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline && !completed {
+            match tokio::time::timeout(tokio::time::Duration::from_secs(1), client_rx.recv()).await
+            {
+                Ok(Some(ServerMessage::Event { agent_event, .. })) => {
+                    if matches!(agent_event, WireAgentEvent::TurnCompleted { .. }) {
+                        completed = true;
+                    }
+                }
+                Ok(Some(_)) => {}
+                _ => {}
+            }
+        }
+        assert!(
+            completed,
+            "compaction marker should synthesize turn completion"
+        );
+
+        wait_for_turn_count(&store, project_id, thread_id, 1).await;
+        let saved = store.load_all_turns(project_id, thread_id).await.unwrap();
+        assert_eq!(saved[0].id, turn);
+        assert_eq!(saved[0].user_input.as_text(), Some("/compact"));
+        assert!(matches!(saved[0].status.kind, TurnStatusKind::Completed));
+        assert!(saved[0].items.iter().any(|item| matches!(
+            &item.payload,
+            ItemPayload::Activity { title, .. } if title == "Context compacted"
+        )));
+        assert!(
+            gate.reserve(thread_id).is_ok(),
+            "manual compaction completion should release the turn gate"
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn spawn_forwarder(
         thread_id: ThreadId,
@@ -1316,6 +1667,7 @@ mod tests {
             user_input: UserInput::text(user_input),
             model,
             mode: Mode::Build,
+            kind: TurnContextKind::User,
         };
         tokio::spawn(async move {
             forward_events(
