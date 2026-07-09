@@ -29,26 +29,50 @@ directory that becomes the agent's sandbox/workspace.
 
 ---
 
-## Quick start
+## Installation
+
+The repository root is a virtual Cargo workspace, so `cargo install --path .` is not valid. Install
+the two binaries from their package manifests instead:
 
 ```bash
-# 1. Build
-cargo build --release
+cargo install --locked --path crates/giskard-server --bin giskard-server
+cargo install --locked --path crates/giskard-persist --bin giskard-admin
+```
 
-# 2. Choose a data directory (holds config, projects, threads, token ledgers).
+Cargo installs binaries into `~/.cargo/bin` by default; make sure that directory is on `PATH`.
+`giskard-server` serves the browser app, while `giskard-admin` manages passwords and stored data.
+
+If you prefer not to install, run the same binaries from the checkout with `cargo run` as shown in
+the quick start below.
+
+---
+
+## Quick start
+
+With the installed binaries:
+
+```bash
+# 1. Choose a data directory (holds config, projects, threads, token ledgers).
 #    Defaults to ~/.local/share/giskard; override with GISKARD_DATA_DIR.
 export GISKARD_DATA_DIR="$HOME/.local/share/giskard"
 mkdir -p "$GISKARD_DATA_DIR"
 
-# 3. Set the app password (prints an Argon2 hash to paste into config.toml).
-cargo run -p giskard-persist --bin giskard-admin -- set-password
+# 2. Set the app password (prints an Argon2 hash to paste into config.toml).
+giskard-admin set-password
 
-# 4. Create the config from the annotated example and edit it (paste the hash;
+# 3. Create the config from the annotated example and edit it (paste the hash;
 #    keep secure_cookies = false for plain-HTTP localhost).
 cp config.example.toml "$GISKARD_DATA_DIR/config.toml"
 $EDITOR "$GISKARD_DATA_DIR/config.toml"
 
-# 5. Run the server.
+# 4. Run the server.
+giskard-server
+```
+
+From the checkout without installing, use the package binaries explicitly:
+
+```bash
+cargo run -p giskard-persist --bin giskard-admin -- set-password
 cargo run --release -p giskard-server --bin giskard-server
 ```
 
@@ -57,9 +81,9 @@ Then open **http://127.0.0.1:8787**, log in, and:
 1. **+** next to *Projects* → name it and give an **absolute directory path** that exists on the
    server machine (the agent's workspace).
 2. **+** on the project → *New thread*.
-3. Type in the composer (Enter to send). The header has the **Plan/Build** toggle, the **model**
-   picker, a **Tasks** menu for running commands/tools, and a **Context** usage button; scrolling
-   the transcript to the top lazy-loads older history.
+3. Type in the composer (Enter to send). The header has the **Plan/Build** toggle, **approval
+   policy**, **model** picker, **Tasks** menu for running commands/tools, **MCP** status menu, and
+   **Context** usage button; scrolling the transcript to the top lazy-loads older history.
 
 The header context value is a context-window indicator, not a billing total. Codex currently exposes
 the latest turn's input tokens rather than a dedicated context-occupancy field, so Giskard uses that
@@ -107,6 +131,7 @@ Flat files under the data directory (human-readable; inspect with `cat`/`jq`):
 ```
 $GISKARD_DATA_DIR/
 ├── config.toml                  # this config
+├── session.key                  # 32-byte local key for signed browser sessions
 ├── projects.json                # project index (id, name, dir, created_at, order)
 ├── projects/<project_id>/
 │   ├── project.json             # workspace root, default model, harness kind
@@ -127,15 +152,18 @@ on load).
 ## Admin CLI (`giskard-admin`)
 
 ```bash
-cargo run -p giskard-persist --bin giskard-admin -- <command>
+giskard-admin <command>
 ```
+
+From the checkout without installing, use
+`cargo run -p giskard-persist --bin giskard-admin -- <command>`.
 
 | Command | Description |
 |---------|-------------|
 | `set-password` | Prompt for a password and print its Argon2 hash. |
 | `list-projects` | List projects in the data dir. |
 | `list-threads <project_id>` | List a project's threads. |
-| `dump-thread <project_id> <thread_id>` | Pretty-print a thread's metadata + history. |
+| `dump-thread <project_id> <thread_id>` | Pretty-print a thread's metadata JSON. |
 | `delete-thread <project_id> <thread_id>` | Delete a thread (metadata + history). |
 | `delete-project <project_id>` | Delete a project and its threads. |
 | `validate` | Parse every stored file and report corruption (history is checked line-by-line). |
@@ -145,12 +173,16 @@ cargo run -p giskard-persist --bin giskard-admin -- <command>
 ## HTTP / WebSocket API
 
 The browser (and any client) drives everything through a small REST surface plus one multiplexed
-WebSocket. Highlights: `POST /api/login`, `GET/POST /api/projects`, `GET/POST
-/api/projects/{id}/threads`, `GET /api/models` (+ `POST /api/models/refresh`), `GET /api/tokens` and
-`GET /api/projects/{id}/tokens` (dashboards), `GET /api/projects/{id}/highlight|raw`, `POST
-/api/projects/{id}/linkify`, `POST /api/projects/{id}/render` (agent Markdown → sanitized HTML),
-`GET /api/browse`, and `GET /api/ws`. Wire types are defined once in
-`giskard-proto`. See [§13.6](specs/giskard-specification.md) for the message protocol.
+WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticket`, `GET /api/ws`,
+`GET/POST /api/projects`, `GET/DELETE /api/projects/{id}`, `GET/POST
+/api/projects/{id}/threads`, `DELETE /api/projects/{id}/threads/{thread_id}`, `PATCH
+/api/projects/{id}/threads/{thread_id}/title`, `POST
+/api/projects/{id}/threads/{thread_id}/archive`, `GET /api/models`, `POST /api/models/refresh`,
+`GET /api/tokens`, `GET /api/projects/{id}/tokens`, `GET /api/projects/{id}/highlight|raw`, `POST
+/api/projects/{id}/linkify`, `POST /api/projects/{id}/render`, `GET /api/browse`, `POST
+/api/browse/mkdir`, `GET /api/projects/{id}/mcp`, `POST /api/projects/{id}/mcp/reload`, and `POST
+/api/projects/{id}/mcp/oauth-login`. Wire types are defined once in `giskard-proto`. See
+[§13.6](specs/giskard-specification.md) for the message protocol.
 
 ---
 
@@ -178,10 +210,10 @@ because the wire contract (`giskard-proto`) is stable, that port can happen with
 ## Development
 
 ```bash
-cargo build            # build native crates
-cargo test             # run the full test suite (unit + replay-driven integration + e2e)
+cargo build --workspace
+cargo test --workspace
 cargo fmt --all
-cargo clippy --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 Tests never call a real LLM: integration/e2e tests drive the application through the
@@ -189,8 +221,9 @@ Tests never call a real LLM: integration/e2e tests drive the application through
 policy, failure-path test expectations) and the spec for the full design.
 
 [GitHub Actions CI](.github/workflows/ci.yml) runs the same three gates on every push to `main` and
-every pull request: `rustfmt` (`--check`), `clippy` (`--workspace --all-targets -- -D warnings`),
-and the full `--workspace` test suite (build + test).
+every pull request: `rustfmt` (`cargo fmt --all --check`), `clippy` (`cargo clippy --workspace
+--all-targets --locked -- -D warnings`), and the full locked workspace suite (`cargo build
+--workspace --locked` + `cargo test --workspace --locked`).
 
 A separate [security-audit workflow](.github/workflows/audit.yml) runs
 [`cargo-deny`](https://embarkstudios.github.io/cargo-deny/) (advisories, bans, licenses, sources,

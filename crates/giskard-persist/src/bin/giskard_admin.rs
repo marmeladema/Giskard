@@ -4,7 +4,7 @@
 //!   giskard-admin set-password              Generate an Argon2 hash for the app password.
 //!   giskard-admin list-projects             List all projects.
 //!   giskard-admin list-threads <project>    List threads in a project.
-//!   giskard-admin dump-thread <id>          Pretty-print a thread's JSON.
+//!   giskard-admin dump-thread <project> <thread>   Pretty-print thread metadata JSON.
 //!   giskard-admin delete-thread <id>        Delete a thread.
 //!   giskard-admin delete-project <id>       Delete a project.
 //!   giskard-admin validate                  Validate all files, report corruption.
@@ -193,7 +193,7 @@ Commands:
   set-password              Generate an Argon2 hash for the app password
   list-projects             List all projects
   list-threads <project>    List threads in a project
-  dump-thread <project> <thread>   Pretty-print a thread's JSON
+  dump-thread <project> <thread>   Pretty-print thread metadata JSON
   delete-thread <project> <thread> Delete a thread
   delete-project <project>         Delete a project
   validate                  Validate all files, report corruption

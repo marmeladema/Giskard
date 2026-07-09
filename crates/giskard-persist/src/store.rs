@@ -53,7 +53,7 @@ pub struct ProjectConfig {
     pub updated_at: DateTime<Utc>,
 }
 
-/// `projects/<id>/threads/<thread_id>.json` — thread state + history (spec §5.3).
+/// `projects/<id>/threads/<thread_id>.json` — thread metadata and recomputable caches (§5.3/H1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ThreadFile {
