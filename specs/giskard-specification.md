@@ -8,7 +8,16 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.22
+**Version:** 1.23
+
+**Changelog (1.22 → 1.23), context usage menu:**
+- **CU1:** The thread-header context gauge is an interactive `Context` control. Activating it opens a
+  popover that shows the current context footprint and the thread's cumulative input/output/total
+  token usage. Cumulative tokens remain separate from the gauge source: they are informational totals
+  and must not drive the context-occupancy numerator.
+- **CU2:** Thread token totals no longer occupy a permanent right-column section. The right context
+  panel remains focused on running tasks and contextual work surfaces; thread-level token details are
+  reached from the header context control.
 
 **Changelog (1.21 → 1.22), tool calls as running tasks:**
 - **TK1:** The running-command surface is generalized to **running tasks**. `RunningCommand` →
@@ -1704,7 +1713,9 @@ contributes `{ input, output, total }` tagged with the `(provider, model)` used 
 
 Recorded and viewable at:
 
-- **Thread** — running totals in `<thread_id>.json` (`tokens`), plus per-model breakdown.
+- **Thread** — running totals in `<thread_id>.json` (`tokens`), plus per-model breakdown. The
+  browser shows these totals in the thread-header context usage popover, not as a permanent
+  right-panel section.
 - **Project** — `projects/<id>/tokens.json`: `total`, `by_day`, `by_model`.
 - **Global** — `tokens-global.json`: `total`, `by_day`, `by_model`.
 
@@ -1722,6 +1733,8 @@ Within a thread, show the thread's current context footprint **relative to the a
 model's context window** (e.g. 15.4k / 262k, or / 1M). The denominator is
 `ModelDescriptor.context_window` for the current model and **recomputes when the model
 changes** (§8.4). This is a usage-vs-capacity indicator to warn before hitting context limits.
+The gauge is rendered as a header button; activating it opens a compact card with the same current
+context footprint plus cumulative thread token totals from §10.2.
 
 > **Codex source field.** "Tokens used in the thread" for the gauge should reflect the current
 > conversation's *context occupancy*, which is not the same as cumulative billed tokens
@@ -1894,12 +1907,12 @@ sessions, so clarity and low visual noise beat flourish. Explicitly avoid the ge
 ```
 ┌───────────┬────────────────────────────────────┬────────────────────┐
 │ Projects  │  Thread header: mode · model ·      │  Context panel     │
-│ + threads │  approval · context gauge · actions │  (tabs):           │
+│ + threads │  approval · context usage · actions │  (tabs):           │
 │ (sidebar) ├────────────────────────────────────┤  • Diffs (side-by- │
 │           │                                     │    side)           │
 │  proj A   │  Transcript (streamed items,        │  • Code overlay    │
 │   ├ th 1  │  linkified paths, collapsible        │    (syntect HTML)  │
-│   └ th 2  │  reasoning, command output, diffs)  │  • Tokens          │
+│   └ th 2  │  reasoning, command output, diffs)  │                    │
 │  proj B   │                                     │                    │
 │   └ th 3  │                                     │                    │
 │           ├────────────────────────────────────┤                    │
@@ -1910,16 +1923,16 @@ sessions, so clarity and low visual noise beat flourish. Explicitly avoid the ge
 
 - **Left sidebar:** projects with their threads (collapsible), token summary entry point,
   "new project" action.
-- **Center:** thread header (mode, model, approval policy, context gauge, plan-dump &
+- **Center:** thread header (mode, model, approval policy, context usage menu, plan-dump &
   interrupt actions) + transcript + composer.
-- **Right context panel:** running-task summary (commands + tool calls) plus tabbed **Diffs** (side-by-side), **Code
-  overlay**, **Tokens**.
+- **Right context panel:** running-task summary (commands + tool calls) plus tabbed **Diffs**
+  (side-by-side) and **Code overlay**.
 
 ### 13.4 Responsive (smartphone)
 
 - The three columns collapse into a **single-column, tab/drawer navigation**:
   - Bottom (or top) nav switches between **Threads list**, **Transcript**, **Context panel**.
-  - The right-panel tabs (Diffs / Code / Tokens) become a secondary switcher within the
+  - The right-panel tabs (Diffs / Code) become a secondary switcher within the
     Context view.
   - Side-by-side diffs fall back to **unified inline** diffs when width is insufficient.
 - Composer stays pinned to the bottom on the Transcript view. Approval prompts appear as a

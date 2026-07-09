@@ -253,6 +253,25 @@ async fn index_page_is_served_and_public() {
         "cumulative token totals must not drive the context gauge"
     );
     assert!(
+        body.contains("id=\"usageBtn\"") && body.contains("id=\"usageMenu\""),
+        "context usage is exposed as a header button with a popover menu"
+    );
+    assert!(
+        body.contains("function renderUsageMenu")
+            && body.contains("Current Context")
+            && body.contains("Cumulative Tokens"),
+        "context menu renders context occupancy and cumulative token totals"
+    );
+    assert!(
+        body.contains("state.tokenLedger = led && led.total ? led : null")
+            && body.contains("renderTokenStats(state.tokenLedger)"),
+        "token updates populate the context usage menu"
+    );
+    assert!(
+        !body.contains("id=\"ctxTokens\"") && !body.contains("$(\"ctxTokens\")"),
+        "cumulative token totals are not rendered as a permanent right-column section"
+    );
+    assert!(
         body.contains("if (initialThreadState)"),
         "UI only clears the transcript for the initial thread snapshot"
     );

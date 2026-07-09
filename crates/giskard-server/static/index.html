@@ -60,7 +60,7 @@
   .thread-control { display:flex; align-items:center; gap:6px; min-height:30px; }
   .thread-control-label { color:var(--muted); font-size:12px; }
   .thread-control select { height:30px; padding:3px 8px; }
-  header.thr .gauge { margin-left:auto; font-size:12px; }
+  header.thr .gauge { font-size:12px; }
   .mcp-wrap { position:relative; }
   .mcp-btn { display:flex; align-items:center; gap:6px; }
   .mcp-dot { width:8px; height:8px; border-radius:50%; background:var(--muted); display:inline-block; }
@@ -92,6 +92,23 @@
   .mcp-section-title { margin-bottom:4px; color:var(--fg); font-size:11px; font-weight:600; text-transform:uppercase; }
   .mcp-actions { display:flex; gap:6px; flex-wrap:wrap; margin-top:8px; }
   .mcp-actions button { font-size:12px; padding:4px 8px; }
+  .usage-wrap { position:relative; margin-left:auto; }
+  .usage-btn { display:flex; align-items:center; gap:6px; }
+  .usage-popover {
+    position:absolute; right:0; top:34px; z-index:35; width:min(440px, calc(100vw - 24px));
+    max-height:70vh; overflow:auto; padding:10px; border:1px solid var(--border);
+    border-radius:8px; background:var(--panel); box-shadow:0 20px 48px rgba(0,0,0,.45);
+  }
+  .usage-popover[hidden] { display:none; }
+  .usage-head { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+  .usage-head strong { flex:1; }
+  .usage-head button { font-size:12px; padding:4px 8px; }
+  .usage-section { margin-top:10px; padding-top:10px; border-top:1px solid var(--border); }
+  .usage-section:first-of-type { margin-top:0; padding-top:0; border-top:0; }
+  .usage-section-title { margin-bottom:6px; color:var(--fg); font-size:11px; font-weight:600; text-transform:uppercase; }
+  .usage-meter { height:6px; margin:8px 0 6px; overflow:hidden; border-radius:999px; background:var(--panel2); border:1px solid var(--border); }
+  .usage-meter span { display:block; height:100%; min-width:2px; max-width:100%; background:var(--accent); }
+  .usage-line { display:flex; align-items:center; justify-content:space-between; gap:8px; font-size:12px; }
 
   #transcript { flex:1; min-width:0; overflow-y:auto; overflow-x:hidden; padding:16px; }
   .msg {
@@ -338,7 +355,7 @@
 
   /* =================== Mobile / responsive ===================
      The same page adapts to the viewport (no separate mobile build). On narrow screens the three
-     columns collapse to a single full-width transcript; the projects list and the usage/appearance
+     columns collapse to a single full-width transcript; the projects list and the task/appearance
      panel become slide-in drawers reached from a top bar. Desktop (>820px) is unchanged. */
   #mobileBar { align-items:center; gap:10px; padding:8px 12px; border-bottom:1px solid var(--border); background:var(--panel); }
   #mobileBar button { font-size:18px; line-height:1; padding:3px 11px; }
@@ -398,7 +415,7 @@
       <div id="mobileBar">
         <button id="btnMenu" title="Projects & threads" aria-label="Projects">☰</button>
         <div class="mbTitle" id="mbTitle">Giskard</div>
-        <button id="btnInfo" title="Usage & appearance" aria-label="Info">ⓘ</button>
+        <button id="btnInfo" title="Tasks & appearance" aria-label="Info">ⓘ</button>
       </div>
       <header class="thr" id="thrHeader" style="display:none">
         <span class="badge mono" id="thrTitle">—</span>
@@ -419,7 +436,12 @@
           </button>
           <div id="mcpMenu" class="mcp-popover" hidden></div>
         </div>
-        <span class="gauge muted mono" id="gauge">0 / 0</span>
+        <div class="usage-wrap">
+          <button id="usageBtn" class="badge usage-btn" title="Context usage" aria-label="Context usage">
+            <span>Context</span><span class="gauge muted mono" id="gauge">0 / 0</span>
+          </button>
+          <div id="usageMenu" class="usage-popover" hidden></div>
+        </div>
       </header>
       <div id="transcript" class="muted" style="padding:24px">Select or create a thread to begin.</div>
       <div class="composer" id="composer" style="display:none">
@@ -442,8 +464,6 @@
       </div>
       <h3 class="sec">Running Tasks</h3>
       <div id="ctxCommands" class="muted">No running tasks.</div>
-      <h3 class="sec">Usage</h3>
-      <div id="ctxTokens" class="muted">No thread open.</div>
     </div>
 
     <!-- Tap-to-dismiss backdrop shown behind an open mobile drawer. -->
@@ -510,7 +530,7 @@ let state = {
   commandPayloadsByItemId:new Map(), endedCommandsByItemId:new Map(), expandedCommandOutputs:new Set(), manuallyToggledCommandOutputs:new Set(),
   toolPayloadsByItemId:new Map(), toolBodyElsByItemId:new Map(), expandedToolOutputs:new Set(), manuallyToggledToolOutputs:new Set(),
   linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, activeTurn:false, interruptPending:false,
-  awaitingInitialThreadState:false, contextWindow:0, contextUsed:null, approvalPolicy:"ask",
+  awaitingInitialThreadState:false, contextWindow:0, contextUsed:null, tokenLedger:null, approvalPolicy:"ask",
   mcpServers:[], mcpCapabilities:{ status:false, reload:false, oauth_login:false }, mcpLoading:false, mcpError:null, expandedMcps:new Set()
 };
 const COMMAND_AUTO_COLLAPSE_LINES = 120;
@@ -925,12 +945,15 @@ async function openThread(pid, tid, title, opts) {
   state.projectId = pid; state.threadId = tid; state.pendingUserEl = null; state.pendingUserText = null;
   state.mcpServers = []; state.mcpError = null; state.expandedMcps = new Set();
   state.mcpCapabilities = { status:false, reload:false, oauth_login:false };
+  $("mcpMenu").hidden = true;
+  $("usageMenu").hidden = true;
   renderMcpButton();
   loadMcpServers({ announce:false });
   setTurnActive(false);
   state.historyLoaded = false; state.oldestTurnId = null; state.hasMoreHistory = false;
   state.loadingHistory = false; state.pendingOlder = false;
-  state.contextUsed = null; state.contextWindow = 0;
+  state.contextUsed = null; state.contextWindow = 0; state.tokenLedger = null;
+  updateGauge(null, 0);
   state.awaitingInitialThreadState = true;
   resetRenderState();
   document.querySelectorAll(".thread").forEach(e => e.classList.toggle("active", e.dataset.tid===tid));
@@ -2983,6 +3006,7 @@ function toggleMcpMenu() {
   const menu = $("mcpMenu");
   menu.hidden = !menu.hidden;
   if (!menu.hidden) {
+    $("usageMenu").hidden = true;
     renderMcpMenu();
     loadMcpServers({ announce:false });
   }
@@ -3282,12 +3306,15 @@ document.addEventListener("keydown", (e) => {
 });
 
 function renderTokens(led) {
-  if (!led || !led.total) return;
+  state.tokenLedger = led && led.total ? led : null;
+  if (!$("usageMenu").hidden) renderUsageMenu();
+}
+function renderTokenStats(led) {
+  if (!led || !led.total) return `<div class="muted">No token usage recorded for this thread yet.</div>`;
   const t = led.total;
   const tile = (label, val) =>
-    `<div class="stat"><div class="statlabel">${label}</div><div class="statval">${val.toLocaleString()}</div></div>`;
-  $("ctxTokens").innerHTML =
-    `<div class="stats">${tile("Cumulative Input", t.input)}${tile("Output", t.output)}${tile("Total", t.total)}</div>`;
+    `<div class="stat"><div class="statlabel">${label}</div><div class="statval">${Number(val || 0).toLocaleString()}</div></div>`;
+  return `<div class="stats">${tile("Cumulative Input", t.input)}${tile("Output", t.output)}${tile("Total", t.total)}</div>`;
 }
 function updateGauge(used, window) {
   state.contextWindow = window || state.contextWindow || 0;
@@ -3297,6 +3324,8 @@ function updateGauge(used, window) {
   $("gauge").textContent = w
     ? `${u === null ? "…" : fmt(u)} / ${fmt(w)}`
     : `${u === null ? "…" : fmt(u)} tokens`;
+  $("usageBtn").disabled = !state.threadId;
+  if (!$("usageMenu").hidden) renderUsageMenu();
 }
 function updateGaugeFromTurns(turns) {
   if (!turns.length) {
@@ -3314,6 +3343,50 @@ function updateGaugeFromUsage(usage) {
   if (Number.isFinite(used)) updateGauge(used, state.contextWindow);
 }
 function fmt(n) { return n>=1000 ? (n/1000).toFixed(1)+"k" : String(n); }
+function usagePercent() {
+  if (!state.contextWindow || state.contextUsed === null) return null;
+  return Math.max(0, Math.min(100, (state.contextUsed / state.contextWindow) * 100));
+}
+function toggleUsageMenu() {
+  const menu = $("usageMenu");
+  menu.hidden = !menu.hidden;
+  if (!menu.hidden) {
+    $("mcpMenu").hidden = true;
+    renderUsageMenu();
+  }
+}
+function renderUsageMenu() {
+  const menu = $("usageMenu");
+  const pct = usagePercent();
+  const used = state.contextUsed === null ? "…" : fmt(state.contextUsed);
+  const window = state.contextWindow ? fmt(state.contextWindow) : "unknown";
+  const pctLabel = pct === null ? "unknown" : `${pct.toFixed(1)}%`;
+  const meterWidth = pct === null ? 0 : pct;
+  menu.innerHTML = `
+    <div class="usage-head">
+      <strong>Context Usage</strong>
+      <button id="usageClose" type="button">Close</button>
+    </div>
+    <div class="usage-section">
+      <div class="usage-section-title">Current Context</div>
+      <div class="usage-line"><span class="muted">Used</span><span class="mono">${escapeHtml(used)} / ${escapeHtml(window)}</span></div>
+      <div class="usage-meter" aria-hidden="true"><span style="width:${meterWidth}%"></span></div>
+      <div class="usage-line"><span class="muted">Window filled</span><span class="mono">${escapeHtml(pctLabel)}</span></div>
+    </div>
+    <div class="usage-section">
+      <div class="usage-section-title">Cumulative Tokens</div>
+      ${renderTokenStats(state.tokenLedger)}
+    </div>`;
+  $("usageClose").onclick = () => { $("usageMenu").hidden = true; };
+}
+$("usageBtn").onclick = (e) => { e.stopPropagation(); toggleUsageMenu(); };
+$("usageMenu").onclick = (e) => e.stopPropagation();
+document.addEventListener("click", (e) => {
+  const menu = $("usageMenu");
+  if (menu.hidden) return;
+  if (e.target.closest && e.target.closest(".usage-wrap")) return;
+  menu.hidden = true;
+});
 function notice(text, severity) {
   const cls = severity===true || severity==="error" ? " err" : severity==="warning" ? " warn" : "";
   const el = document.createElement("div"); el.className="notice"+cls; el.textContent=text;
