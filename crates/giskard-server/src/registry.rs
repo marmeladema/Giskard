@@ -19,13 +19,13 @@ use giskard_core::user_input::UserInput;
 use giskard_harness::{AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle};
 use giskard_persist::PersistStore;
 use giskard_persist::store::ProjectConfig;
-use giskard_proto::{RunningCommand, ServerMessage, TokenScope};
+use giskard_proto::{RunningTask, ServerMessage, TokenScope};
 
 use crate::hub::Hub;
 use crate::ledger::LedgerHandle;
 use crate::live_buffer::LiveBufferStore;
 use crate::models::context_window_for;
-use crate::running_commands::RunningCommandStore;
+use crate::running_commands::RunningTaskStore;
 
 #[async_trait]
 pub trait HarnessFactory: Send + Sync {
@@ -57,7 +57,7 @@ pub struct HarnessRegistry {
     factory: Arc<dyn HarnessFactory>,
     hub: Arc<Hub>,
     live_buffers: Arc<LiveBufferStore>,
-    running_commands: Arc<RunningCommandStore>,
+    running_commands: Arc<RunningTaskStore>,
     store: Arc<PersistStore>,
     ledger: LedgerHandle,
 }
@@ -67,7 +67,7 @@ impl HarnessRegistry {
         factory: Arc<dyn HarnessFactory>,
         hub: Arc<Hub>,
         live_buffers: Arc<LiveBufferStore>,
-        running_commands: Arc<RunningCommandStore>,
+        running_commands: Arc<RunningTaskStore>,
         store: Arc<PersistStore>,
         ledger: LedgerHandle,
     ) -> Self {
@@ -428,7 +428,7 @@ async fn forward_events(
     mut stream: giskard_harness::AgentEventStream,
     hub: Arc<Hub>,
     live_buffers: Arc<LiveBufferStore>,
-    running_commands: Arc<RunningCommandStore>,
+    running_commands: Arc<RunningTaskStore>,
     store: Arc<PersistStore>,
     approvals: ApprovalMap,
     server_requests: ServerRequestMap,
@@ -625,7 +625,7 @@ fn event_turn_id(event: &AgentEvent) -> Option<TurnId> {
 }
 
 async fn apply_running_command_event(
-    running_commands: &RunningCommandStore,
+    running_commands: &RunningTaskStore,
     event: &AgentEvent,
 ) -> bool {
     let command_before_completion =
@@ -636,9 +636,9 @@ async fn apply_running_command_event(
 }
 
 async fn terminating_command_before_terminal_completion(
-    running_commands: &RunningCommandStore,
+    running_commands: &RunningTaskStore,
     event: &AgentEvent,
-) -> Option<RunningCommand> {
+) -> Option<RunningTask> {
     let AgentEvent::ItemCompleted { thread, item, .. } = event else {
         return None;
     };
@@ -657,7 +657,7 @@ async fn terminating_command_before_terminal_completion(
     command.terminating.then_some(command)
 }
 
-fn log_command_completion_after_terminate(command: Option<&RunningCommand>, event: &AgentEvent) {
+fn log_command_completion_after_terminate(command: Option<&RunningTask>, event: &AgentEvent) {
     let Some(command) = command else {
         return;
     };
@@ -696,18 +696,12 @@ fn log_command_completion_after_terminate(command: Option<&RunningCommand>, even
 
 async fn broadcast_running_commands(
     hub: &Hub,
-    running_commands: &RunningCommandStore,
+    running_commands: &RunningTaskStore,
     thread_id: ThreadId,
 ) {
-    let commands = running_commands.snapshot(thread_id).await;
-    hub.broadcast(
-        thread_id,
-        ServerMessage::RunningCommands {
-            thread_id,
-            commands,
-        },
-    )
-    .await;
+    let tasks = running_commands.snapshot(thread_id).await;
+    hub.broadcast(thread_id, ServerMessage::RunningTasks { thread_id, tasks })
+        .await;
 }
 
 fn is_terminal_command_completion(event: &AgentEvent) -> bool {
@@ -898,7 +892,7 @@ mod tests {
     use crate::hub::Hub;
     use crate::ledger;
     use crate::live_buffer::LiveBufferStore;
-    use crate::running_commands::RunningCommandStore;
+    use crate::running_commands::RunningTaskStore;
 
     #[test]
     fn command_completion_success_requires_success_status_and_zero_exit() {
@@ -967,7 +961,7 @@ mod tests {
         let (tx, _) = broadcast::channel(64);
         let hub = Arc::new(Hub::new());
         let live_buffers = Arc::new(LiveBufferStore::new());
-        let running_commands = Arc::new(RunningCommandStore::new());
+        let running_commands = Arc::new(RunningTaskStore::new());
         let approvals = Arc::new(Mutex::new(Default::default()));
         let server_requests = Arc::new(Mutex::new(Default::default()));
         let ledger = ledger::spawn(store.clone());
@@ -1051,7 +1045,7 @@ mod tests {
         stream: AgentEventStream,
         hub: Arc<Hub>,
         live_buffers: Arc<LiveBufferStore>,
-        running_commands: Arc<RunningCommandStore>,
+        running_commands: Arc<RunningTaskStore>,
         store: Arc<PersistStore>,
         approvals: super::ApprovalMap,
         server_requests: super::ServerRequestMap,

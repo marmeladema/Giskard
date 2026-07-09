@@ -231,7 +231,8 @@
   .cmd-actions { display:flex; gap:6px; align-items:center; }
   .cmd-actions button { font-size:12px; padding:3px 7px; }
   .cmd-output-summary { margin-top:6px; }
-  .msg.cmd.toggleable { cursor:pointer; }
+  .msg.cmd.toggleable, .msg.tool.toggleable { cursor:pointer; }
+  .tool-io { margin-top:6px; }
 
   /* modal dialog + directory picker */
   .overlay { position:fixed; inset:0; background:rgba(0,0,0,.55); display:none; align-items:center; justify-content:center; z-index:50; }
@@ -439,8 +440,8 @@
           <option value="terminal">Terminal</option>
         </select>
       </div>
-      <h3 class="sec">Running Commands</h3>
-      <div id="ctxCommands" class="muted">No running commands.</div>
+      <h3 class="sec">Running Tasks</h3>
+      <div id="ctxCommands" class="muted">No running tasks.</div>
       <h3 class="sec">Usage</h3>
       <div id="ctxTokens" class="muted">No thread open.</div>
     </div>
@@ -507,6 +508,7 @@ let state = {
   pendingApprovals:new Map(), pendingServerRequests:new Map(),
   runningCommands:new Map(), commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null,
   commandPayloadsByItemId:new Map(), endedCommandsByItemId:new Map(), expandedCommandOutputs:new Set(), manuallyToggledCommandOutputs:new Set(),
+  toolPayloadsByItemId:new Map(), toolBodyElsByItemId:new Map(), expandedToolOutputs:new Set(), manuallyToggledToolOutputs:new Set(),
   linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, activeTurn:false, interruptPending:false,
   awaitingInitialThreadState:false, contextWindow:0, contextUsed:null, approvalPolicy:"ask",
   mcpServers:[], mcpCapabilities:{ status:false, reload:false, oauth_login:false }, mcpLoading:false, mcpError:null, expandedMcps:new Set()
@@ -1041,7 +1043,7 @@ function handleServer(msg) {
     case "thread_state": renderThreadState(msg.state); break;
     case "history_page": renderHistoryPage(msg); break;
     case "live_turn_snapshot": renderLiveTurnSnapshot(msg); break;
-    case "running_commands": renderRunningCommandSnapshot(msg.commands || []); break;
+    case "running_tasks": renderRunningCommandSnapshot(msg.tasks || []); break;
     case "event": handleEvent(msg.agent_event); break;
     case "token_update": renderTokens(msg.ledger); break;
     case "approval_request": renderApprovalRequest(msg.request); break;
@@ -1051,6 +1053,7 @@ function handleServer(msg) {
       }
       if (msg.action==="interrupt") {
         state.interruptPending = false;
+        resetTerminatingToolTasks();
         updateComposerControls();
       }
       if (msg.action==="terminate_command") resetTerminatingCommand(msg.process_id);
@@ -1769,10 +1772,12 @@ function startRunningCommand(item, turnId) {
 function commandFromParts(parts) {
   return {
     id:parts.id,
+    kind:parts.kind === "tool" ? "tool" : "command",
     turnId:parts.turnId || "",
     harnessItemId:parts.harnessItemId || "",
     command:parts.command || "",
     cwd:parts.cwd || "",
+    server:parts.server || "",
     status:parts.status || "in_progress",
     processId:parts.processId || "",
     startedAtMs:normalizeTimestampMs(parts.startedAtMs, Date.now()),
@@ -1780,6 +1785,11 @@ function commandFromParts(parts) {
     afterTurn:!!parts.afterTurn,
     terminating:!!parts.terminating
   };
+}
+// Right-panel label for a running task: a shell command shows "$ cmd"; a tool shows "server:tool".
+function taskTitleText(cmd) {
+  if (cmd.kind === "tool") return (cmd.server ? cmd.server + ":" : "") + (cmd.command || "tool");
+  return "$ " + (cmd.command || "(command)");
 }
 function commandFromItem(item, p, existing) {
   return commandFromParts({
@@ -1798,6 +1808,9 @@ function commandFromItem(item, p, existing) {
 }
 function commandBodyFor(id) {
   return state.commandBodyElsByItemId.get(id) || state.streamElsByItemId.get(id);
+}
+function toolBodyFor(id) {
+  return state.toolBodyElsByItemId.get(id) || state.streamElsByItemId.get(id);
 }
 function commandOutputStats(output) {
   const text = String(output || "");
@@ -1883,6 +1896,20 @@ function rerenderCommandRow(id) {
   if (ended) { renderEndedCommandBody(body, ended.command, ended.status, ended.opts); return; }
   const payload = state.commandPayloadsByItemId.get(id);
   if (payload) renderItemBody(body, payload);
+}
+function rerenderToolRow(id) {
+  const body = toolBodyFor(id);
+  const payload = state.toolPayloadsByItemId.get(id);
+  if (body && payload) renderItemBody(body, payload);
+}
+function clearRowToggle(msg) {
+  msg.classList.remove("toggleable", "collapsed", "expanded");
+  msg.removeAttribute("title");
+  msg.removeAttribute("tabindex");
+  msg.removeAttribute("role");
+  msg.removeAttribute("aria-expanded");
+  msg.onclick = null;
+  msg.onkeydown = null;
 }
 function renderCommandOutputBlock(body, opts) {
   const itemId = idKey(opts.itemId);
@@ -2022,6 +2049,12 @@ function terminalCommandStatus(status, durationMs, opts) {
 function updateRunningCommandDurations() {
   if (!state.runningCommands.size) return;
   for (const cmd of state.runningCommands.values()) {
+    if (cmd.kind === "tool") {
+      const body = toolBodyFor(cmd.id);
+      const payload = state.toolPayloadsByItemId.get(cmd.id);
+      if (body && payload && commandIsRunningStatus(payload.status)) renderItemBody(body, payload);
+      continue;
+    }
     const body = commandBodyFor(cmd.id);
     if (body) renderCommandBody(body, cmd);
   }
@@ -2075,10 +2108,12 @@ function renderRunningCommandSnapshot(commands) {
     const existing = state.runningCommands.get(key);
     const cmd = commandFromParts({
       id:key,
+      kind:info.kind,
       turnId:idKey(info.turn_id),
       harnessItemId:info.harness_item_id || "",
       command:info.command || "",
       cwd:info.cwd || "",
+      server:info.server || "",
       status:info.status || "in_progress",
       processId:info.process_id || "",
       startedAtMs:normalizeTimestampMs(info.started_at_ms, existing ? existing.startedAtMs : Date.now()),
@@ -2088,20 +2123,31 @@ function renderRunningCommandSnapshot(commands) {
     });
     if (cmd.terminating) state.commandStopRequestedByItemId.add(key);
     state.runningCommands.set(key, cmd);
-    let body = commandBodyFor(key);
-    if (!body) body = bubble("cmd running-command","command");
-    state.commandBodyElsByItemId.set(key, body);
-    state.commandMsgElsByItemId.set(key, body.parentElement);
-    renderCommandBody(body, cmd);
+    // Tool tasks already have a transcript row from the item stream (renderToolBody); only link it
+    // for select/scroll. Command tasks own their transcript row and (re)render it here.
+    if (cmd.kind === "tool") {
+      const toolBody = toolBodyFor(key);
+      if (toolBody) state.commandMsgElsByItemId.set(key, toolBody.parentElement);
+    } else {
+      let body = commandBodyFor(key);
+      if (!body) body = bubble("cmd running-command","command");
+      state.commandBodyElsByItemId.set(key, body);
+      state.commandMsgElsByItemId.set(key, body.parentElement);
+      renderCommandBody(body, cmd);
+    }
   }
 
   for (const [id, cmd] of Array.from(state.runningCommands.entries())) {
     if (seen.has(id)) continue;
     state.runningCommands.delete(id);
-    const body = commandBodyFor(id);
-    const stopRequested = cmd.terminating || state.commandStopRequestedByItemId.has(id);
-    if (body && stopRequested) {
-      renderEndedCommandBody(body, cmd, "unknown", { stopRequested:true });
+    // Tool transcript rows are owned by the item stream; only command rows get the ended-body
+    // rewrite when a stop was requested.
+    if (cmd.kind !== "tool") {
+      const body = commandBodyFor(id);
+      const stopRequested = cmd.terminating || state.commandStopRequestedByItemId.has(id);
+      if (body && stopRequested) {
+        renderEndedCommandBody(body, cmd, "unknown", { stopRequested:true });
+      }
     }
     state.commandStopRequestedByItemId.delete(id);
   }
@@ -2137,7 +2183,7 @@ function renderRunningCommands() {
   const cmds = Array.from(state.runningCommands.values());
   if (!cmds.length) {
     box.className = "muted";
-    box.textContent = "No running commands.";
+    box.textContent = "No running tasks.";
     return;
   }
   box.className = "cmd-summary";
@@ -2149,22 +2195,43 @@ function renderRunningCommands() {
     row.onclick = () => selectCommand(cmd.id);
     const title = document.createElement("div");
     title.className = "cmd-title mono";
-    title.textContent = "$ " + (cmd.command || "(command)");
+    title.textContent = taskTitleText(cmd);
     const meta = document.createElement("div");
     meta.className = "meta cmd-meta";
     appendCommandMetaPart(meta, commandStatusNode(commandStatusLabel(cmd), stateName));
-    if (cmd.cwd) appendCommandMetaPart(meta, cmd.cwd);
+    if (cmd.kind !== "tool" && cmd.cwd) appendCommandMetaPart(meta, cmd.cwd);
     const actions = document.createElement("div");
     actions.className = "cmd-actions";
     const term = document.createElement("button");
     term.className = "danger";
     term.textContent = cmd.terminating ? "Stop requested" : "Stop";
-    term.disabled = cmd.terminating || !cmd.processId;
-    term.onclick = (e) => { e.stopPropagation(); terminateCommand(cmd.id); };
+    // Commands stop by process id; tools have no process, so stopping interrupts the owning turn.
+    term.disabled = cmd.terminating || (cmd.kind !== "tool" && !cmd.processId);
+    term.title = cmd.kind === "tool" ? "Interrupt the turn running this tool call" : (cmd.processId ? "Ask Codex to stop this running command" : "No process id available");
+    term.onclick = (e) => { e.stopPropagation(); stopTask(cmd.id); };
     actions.append(term);
     row.append(title, meta, actions);
     box.append(row);
   }
+}
+// A tool task can't be stopped individually (Codex has no per-call cancel), so stopping it
+// interrupts the owning turn; commands terminate by process id.
+function stopTask(id) {
+  const cmd = state.runningCommands.get(id);
+  if (!cmd || cmd.terminating) return;
+  if (cmd.kind === "tool") {
+    cmd.terminating = true;
+    state.commandStopRequestedByItemId.add(id);
+    renderRunningCommands();
+    if (!send({ type:"interrupt", thread_id: state.threadId })) {
+      cmd.terminating = false;
+      state.commandStopRequestedByItemId.delete(id);
+      renderRunningCommands();
+      notice(`Interrupt not sent: WebSocket is ${state.wsStatus}.`, "error");
+    }
+    return;
+  }
+  terminateCommand(id);
 }
 function selectCommand(id) {
   state.selectedCommandId = id;
@@ -2205,12 +2272,21 @@ function resetTerminatingCommand(processId) {
   }
   renderRunningCommands();
 }
+function resetTerminatingToolTasks() {
+  for (const cmd of state.runningCommands.values()) {
+    if (cmd.kind !== "tool" || !cmd.terminating) continue;
+    cmd.terminating = false;
+    state.commandStopRequestedByItemId.delete(cmd.id);
+  }
+  renderRunningCommands();
+}
 function startToolCall(item, turnId) {
   const key = idKey(item.id); if (!key) return;
   const tool = item.tool || {};
   let body = state.streamElsByItemId.get(key);
   if (!body) body = bubble("tool running-tool state-running","tool");
   state.streamElsByItemId.set(key, body);
+  state.toolBodyElsByItemId.set(key, body);
   body.parentElement.dataset.toolItemId = key;
   body.parentElement.dataset.toolStartedAtMs = String(normalizeTimestampMs(tool.started_at_ms, Date.now()));
   renderItemBody(body, {
@@ -2228,7 +2304,11 @@ function appendToolProgress(itemId, text) {
   let body = key ? state.streamElsByItemId.get(key) : null;
   if (!body) {
     body = bubble("tool running-tool state-running","tool");
-    if (key) state.streamElsByItemId.set(key, body);
+    if (key) {
+      state.streamElsByItemId.set(key, body);
+      state.toolBodyElsByItemId.set(key, body);
+      body.parentElement.dataset.toolItemId = key;
+    }
     renderItemBody(body, {
       kind:"tool_call",
       name:"tool",
@@ -2239,13 +2319,24 @@ function appendToolProgress(itemId, text) {
       error:null
     });
   }
+  const chunk = String(text || "");
+  if (key) {
+    const payload = state.toolPayloadsByItemId.get(key);
+    if (payload) {
+      const current = typeof payload.output === "string" ? payload.output : "";
+      payload.output = current ? current + "\n" + chunk : chunk;
+      state.toolPayloadsByItemId.set(key, payload);
+      renderItemBody(body, payload);
+      $("transcript").scrollTop = $("transcript").scrollHeight;
+      return;
+    }
+  }
   let progress = body.querySelector(".tool-progress");
   if (!progress) {
     progress = document.createElement("div");
     progress.className = "meta tool-progress";
     body.append(progress);
   }
-  const chunk = String(text || "");
   progress.textContent += (progress.textContent ? "\n" : "") + chunk;
   $("transcript").scrollTop = $("transcript").scrollHeight;
 }
@@ -2277,7 +2368,7 @@ function appendStream(text, itemId, deltaType) {
 function finalizeStreamedItem(item) {
   if (!item || !item.payload) return false;
   const key = idKey(item.id);
-  const body = (key && (state.streamElsByItemId.get(key) || state.commandBodyElsByItemId.get(key))) ||
+  const body = (key && (state.streamElsByItemId.get(key) || state.commandBodyElsByItemId.get(key) || state.toolBodyElsByItemId.get(key))) ||
     (state.streamItemId===key ? state.streamEl : null);
   if (!hasVisiblePayload(item.payload)) {
     if (body && !body.textContent.trim()) body.parentElement.remove();
@@ -2293,6 +2384,10 @@ function finalizeStreamedItem(item) {
     state.commandBodyElsByItemId.set(key, body);
     state.commandMsgElsByItemId.set(key, body.parentElement);
     body.parentElement.dataset.commandItemId = key;
+  }
+  if (item.payload.kind==="tool_call" && key) {
+    state.toolBodyElsByItemId.set(key, body);
+    body.parentElement.dataset.toolItemId = key;
   }
   renderItemBody(body, item.payload);
   if (item.payload.kind==="command_execution") finishRunningCommand(item);
@@ -2333,6 +2428,13 @@ function addItem(item) {
         body.parentElement.dataset.commandItemId = key;
       }
     }
+    if (p.kind==="tool_call") {
+      const key = idKey(item && item.id);
+      if (key) {
+        state.toolBodyElsByItemId.set(key, body);
+        body.parentElement.dataset.toolItemId = key;
+      }
+    }
     renderItemBody(body, p);
   }
   if (p.kind==="command_execution") finishRunningCommand(item);
@@ -2355,6 +2457,10 @@ function resetRenderState() {
   state.endedCommandsByItemId = new Map();
   state.expandedCommandOutputs = new Set();
   state.manuallyToggledCommandOutputs = new Set();
+  state.toolPayloadsByItemId = new Map();
+  state.toolBodyElsByItemId = new Map();
+  state.expandedToolOutputs = new Set();
+  state.manuallyToggledToolOutputs = new Set();
   state.selectedCommandId = null;
   renderRunningCommands();
 }
@@ -2389,6 +2495,7 @@ function renderItemBody(body, p) {
   const msg = body.parentElement;
   msg.className = "msg " + classForPayload(p);
   msg.querySelector(".role").textContent = roleForPayload(p);
+  clearRowToggle(msg);
   body.replaceChildren();
   if (p.kind==="command_execution") {
     const itemId = msg.dataset.commandItemId || "";
@@ -2437,7 +2544,7 @@ function renderItemBody(body, p) {
     const stateName = toolVisualStateFromStatus(p.status, p.error);
     msg.classList.add(`state-${stateName}`);
     if (stateName==="running") msg.classList.add("running-tool");
-    body.innerHTML = renderToolCall(p);
+    renderToolBody(body, p);
   } else if (p.kind==="activity") {
     body.innerHTML = renderActivity(p);
   }
@@ -2618,15 +2725,136 @@ function renderFileChange(body, p) {
     body.append(status);
   }
 }
-function renderToolCall(p) {
-  const head = `${p.server ? escapeHtml(p.server)+":" : ""}${escapeHtml(p.name||"tool")}`;
+// Tool calls (esp. MCP results) can return very large input/output payloads. Render them with the
+// same row-owned collapse model as command output: running rows start expanded while small, large
+// running payloads auto-collapse, and completed payloads collapse by default.
+function renderToolBody(body, p) {
   const stateName = toolVisualStateFromStatus(p.status, p.error);
-  const statusLabel = toolStatusLabel(p.status, p.error);
-  const status = statusLabel ? ` <span class="cmd-status state-${stateName}"><span class="cmd-symbol state-${stateName}">${escapeHtml(commandStateSymbol(stateName))}</span><span>${escapeHtml(statusLabel)}</span></span>` : "";
-  const input = p.input!==undefined && p.input!==null ? `<pre class="out">${escapeHtml(jsonPreview(p.input))}</pre>` : "";
-  const output = p.output!==undefined && p.output!==null ? `<pre class="out">${escapeHtml(jsonPreview(p.output))}</pre>` : "";
-  const err = p.error ? `<div class="meta">error: ${escapeHtml(p.error)}</div>` : "";
-  return `<div class="mono">${head}${status}</div>${input}${output}${err}`;
+  const msg = body.parentElement;
+  const itemId = idKey(msg.dataset.toolItemId);
+  if (itemId) {
+    state.toolPayloadsByItemId.set(itemId, p);
+    state.toolBodyElsByItemId.set(itemId, body);
+  }
+  const head = document.createElement("div");
+  head.className = "cmd-head";
+  const title = document.createElement("div");
+  title.className = "cmd-title mono";
+  title.textContent = `${p.server ? p.server + ":" : ""}${p.name || "tool"}`;
+  head.append(title);
+  body.append(head);
+
+  const statusLabel = toolStatusLabel(p.status, p.error, msg, stateName);
+  if (statusLabel) {
+    const meta = document.createElement("div");
+    meta.className = "meta cmd-meta";
+    appendCommandMetaPart(meta, commandStatusNode(statusLabel, stateName));
+    body.append(meta);
+  }
+
+  renderToolIoBlocks(body, {
+    itemId,
+    phase:stateName === "running" ? "running" : "completed",
+    blocks:toolIoBlocks(p)
+  });
+  if (p.error) {
+    const err = document.createElement("div");
+    err.className = "meta";
+    err.textContent = "error: " + p.error;
+    body.append(err);
+  }
+}
+function toolIoBlocks(p) {
+  const blocks = [];
+  const input = toolIoText(p.input);
+  const output = toolIoText(p.output);
+  if (input) blocks.push({ label:"Input", text:input });
+  if (output) blocks.push({ label:"Output", text:output });
+  return blocks;
+}
+function toolIoText(value) {
+  if (!hasMeaningfulJson(value)) return "";
+  return jsonPreview(value);
+}
+function toolIoStats(blocks) {
+  return commandOutputStats(blocks.map(block => `${block.label}\n${block.text}`).join("\n\n"));
+}
+function isToolIoExpanded(itemId, phase, blocks, stats) {
+  const key = idKey(itemId);
+  if (key && state.manuallyToggledToolOutputs.has(key)) {
+    return state.expandedToolOutputs.has(key);
+  }
+  if (phase === "completed") return false;
+  return !commandOutputShouldAutoCollapse(stats || toolIoStats(blocks));
+}
+function wireToolRowToggle(msg, itemId, expanded) {
+  const key = idKey(itemId);
+  if (!key) return;
+  msg.classList.add("toggleable");
+  msg.title = expanded ? "Collapse tool input/output" : "Show tool input/output";
+  msg.tabIndex = 0;
+  msg.setAttribute("role", "button");
+  msg.setAttribute("aria-expanded", expanded ? "true" : "false");
+  msg.onclick = (e) => {
+    if (e.defaultPrevented || e.target.closest("button,a,input,select,textarea")) return;
+    toggleToolOutput(key);
+  };
+  msg.onkeydown = (e) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      toggleToolOutput(key);
+    }
+  };
+}
+function toggleToolOutput(itemId) {
+  const key = idKey(itemId);
+  if (!key) return;
+  const payload = state.toolPayloadsByItemId.get(key);
+  if (!payload) return;
+  const blocks = toolIoBlocks(payload);
+  if (!blocks.length) return;
+  const stateName = toolVisualStateFromStatus(payload.status, payload.error);
+  const phase = stateName === "running" ? "running" : "completed";
+  const expanded = isToolIoExpanded(key, phase, blocks);
+  state.manuallyToggledToolOutputs.add(key);
+  if (expanded) state.expandedToolOutputs.delete(key);
+  else state.expandedToolOutputs.add(key);
+  rerenderToolRow(key);
+}
+function renderToolIoBlocks(body, opts) {
+  const blocks = opts.blocks || [];
+  if (!blocks.length) {
+    clearRowToggle(body.parentElement);
+    return;
+  }
+  const itemId = idKey(opts.itemId);
+  const phase = opts.phase || "completed";
+  const stats = toolIoStats(blocks);
+  const expanded = isToolIoExpanded(itemId, phase, blocks, stats);
+  const msg = body.parentElement;
+  msg.classList.toggle("collapsed", !expanded);
+  msg.classList.toggle("expanded", expanded);
+  wireToolRowToggle(msg, itemId, expanded);
+
+  const summary = document.createElement("div");
+  summary.className = "meta cmd-output-summary";
+  const label = commandOutputStatsLabel(stats, phase);
+  summary.textContent = expanded ? `Tool data · ${label}` : `Tool data collapsed · ${label}`;
+  body.append(summary);
+
+  if (!expanded) return;
+  for (const block of blocks) {
+    const section = document.createElement("div");
+    section.className = "tool-io";
+    const heading = document.createElement("div");
+    heading.className = "meta";
+    heading.textContent = block.label;
+    const pre = document.createElement("pre");
+    pre.className = "out";
+    pre.textContent = block.text;
+    section.append(heading, pre);
+    body.append(section);
+  }
 }
 function toolVisualStateFromStatus(status, error) {
   if (error) return "failed";
@@ -2637,11 +2865,21 @@ function toolVisualStateFromStatus(status, error) {
   if (commandIsRunningStatus(status)) return "running";
   return s ? "failed" : "running";
 }
-function toolStatusLabel(status, error) {
-  if (error && !status) return "failed";
-  if (!status) return "";
-  if (commandIsRunningStatus(status)) return "running";
-  return String(status);
+function toolStatusLabel(status, error, msg, stateName) {
+  const startedAtMs = normalizeTimestampMs(msg && msg.dataset.toolStartedAtMs, null);
+  if (stateName === "running") {
+    return startedAtMs ? `running for ${formatDuration(Date.now() - startedAtMs)}` : "running";
+  }
+  const durationMs = toolTerminalDurationMs(msg, startedAtMs);
+  return terminalCommandStatus(error && !status ? "failed" : status, durationMs, null);
+}
+function toolTerminalDurationMs(msg, startedAtMs) {
+  if (!msg || !startedAtMs) return null;
+  const stored = normalizeTimestampMs(msg.dataset.toolDurationMs, null);
+  if (stored !== null) return stored;
+  const durationMs = Date.now() - startedAtMs;
+  msg.dataset.toolDurationMs = String(durationMs);
+  return durationMs;
 }
 function renderActivity(p) {
   const detail = p.detail ? `<div>${escapeHtml(p.detail)}</div>` : "";

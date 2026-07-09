@@ -1269,12 +1269,9 @@ async fn handle_client_msg(
                 let _ = tx.send(ServerMessage::LiveTurnSnapshot(snap)).await;
             }
 
-            let commands = state.running_commands.snapshot(thread_id).await;
+            let tasks = state.running_commands.snapshot(thread_id).await;
             let _ = tx
-                .send(ServerMessage::RunningCommands {
-                    thread_id,
-                    commands,
-                })
+                .send(ServerMessage::RunningTasks { thread_id, tasks })
                 .await;
         }
         ClientMessage::LoadHistory {
@@ -1803,16 +1800,10 @@ async fn broadcast_thread_state(
 }
 
 async fn broadcast_running_commands(state: &AppState, thread_id: ThreadId) {
-    let commands = state.running_commands.snapshot(thread_id).await;
+    let tasks = state.running_commands.snapshot(thread_id).await;
     state
         .hub
-        .broadcast(
-            thread_id,
-            ServerMessage::RunningCommands {
-                thread_id,
-                commands,
-            },
-        )
+        .broadcast(thread_id, ServerMessage::RunningTasks { thread_id, tasks })
         .await;
 }
 
