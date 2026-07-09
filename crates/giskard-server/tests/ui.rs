@@ -272,6 +272,28 @@ async fn index_page_is_served_and_public() {
         "cumulative token totals are not rendered as a permanent right-column section"
     );
     assert!(
+        body.contains("id=\"settingsBtn\"")
+            && body.contains("id=\"settingsMenu\"")
+            && body.contains("id=\"appearanceSel\"")
+            && body.contains("function toggleSettingsMenu"),
+        "appearance is exposed from the sidebar settings popover"
+    );
+    assert!(
+        body.contains("overflow:visible")
+            && body.contains("z-index:40")
+            && body.contains("z-index:70"),
+        "settings popover is not clipped behind the thread column"
+    );
+    assert!(
+        body.contains("grid-template-columns:var(--col-left,260px) 6px minmax(360px,1fr)")
+            && !body.contains("id=\"resizeRight\"")
+            && !body.contains("id=\"btnInfo\"")
+            && !body.contains("col ctx")
+            && !body.contains("drawer-right")
+            && !body.contains("giskard.colRight"),
+        "the permanent right column and right mobile drawer are removed"
+    );
+    assert!(
         body.contains("if (initialThreadState)"),
         "UI only clears the transcript for the initial thread snapshot"
     );
