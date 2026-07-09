@@ -257,6 +257,14 @@ async fn index_page_is_served_and_public() {
         "context usage is exposed as a header button with a popover menu"
     );
     assert!(
+        body.contains("id=\"effortSel\"")
+            && body.contains("EFFORT_OPTIONS")
+            && body.contains("supports_reasoning_effort")
+            && body.contains("reasoning_effort:effort")
+            && body.contains("Model default"),
+        "reasoning models expose a thread-header effort selector"
+    );
+    assert!(
         body.contains("id=\"compactBtn\"")
             && body.contains("function compactContext")
             && body.contains("type:\"compact_context\", thread_id: state.threadId")

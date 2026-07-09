@@ -8,7 +8,18 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.31
+**Version:** 1.32
+
+**Changelog (1.31 → 1.32), thread reasoning-effort selector:**
+- **RE1:** The thread header shows an `Effort` selector immediately after the model picker when the
+  selected model descriptor advertises `supports_reasoning_effort`. The selector offers
+  `Model default`, `Minimal`, `Low`, `Medium`, `High`, and `Extra High` for Codex-compatible
+  reasoning models, sends the selected value through `SelectModel.model_ref.reasoning_effort`, and
+  hides for models that do not support reasoning effort.
+- **RE2:** Selecting `Model default` for the current model clears the thread's explicit
+  `reasoning_effort`, so the next turn omits the effort parameter. Switching away from and back to
+  a reasoning model still restores that model's last explicit effort via the existing per-thread
+  `model_efforts` map.
 
 **Changelog (1.30 → 1.31), manual compaction completion hardening:**
 - **CC4:** After `thread/compact/start` succeeds, the Codex harness keeps draining app-server
@@ -1682,8 +1693,8 @@ LiteLLM gateway fronting Cloudflare Workers AI.
 - Effort (`minimal | low | medium | high | xhigh`, matching the pinned Codex `ModelReasoningEffort`,
   S4) is selectable **only when the chosen model supports it** (`supports_reasoning_effort`);
   otherwise the selector is hidden and no effort param is sent (avoids sending unsupported
-  parameters). The concrete set offered per model should ideally be driven by the harness/model
-  descriptor rather than a hardcoded list.
+  parameters). If a model descriptor supplies a concrete effort list, the browser uses it;
+  otherwise the Codex-compatible set above is offered for reasoning models.
 
 ---
 
