@@ -8,12 +8,12 @@ mod mapping;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
 use std::time::Instant;
 
 use async_trait::async_trait;
-use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{info, warn};
 
 use giskard_core::approval::ApprovalDecision;
@@ -104,7 +104,7 @@ enum ControlCommand {
     },
 }
 
-type SenderMap = Arc<Mutex<HashMap<ThreadId, broadcast::Sender<AgentEvent>>>>;
+type SenderMap = Arc<StdMutex<HashMap<ThreadId, broadcast::Sender<AgentEvent>>>>;
 
 /// Codex CLI harness adapter (one app-server process per project).
 pub struct CodexHarness {
@@ -136,7 +136,7 @@ impl CodexHarness {
     ) -> Result<Arc<Self>, HarnessError> {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (control_tx, control_rx) = mpsc::channel(64);
-        let senders: SenderMap = Arc::new(Mutex::new(HashMap::new()));
+        let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
 
         let harness = Arc::new(Self {
             cmd_tx,
@@ -273,10 +273,8 @@ impl AgentHarness for CodexHarness {
     }
 
     fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Ok(senders) = self.senders.try_lock() {
-            if let Some(sender) = senders.get(&thread.thread) {
-                return AgentEventStream::new(sender.subscribe());
-            }
+        if let Some(sender) = sender_for_thread(&self.senders, thread.thread) {
+            return AgentEventStream::new(sender.subscribe());
         }
         let (_, rx) = broadcast::channel(1);
         AgentEventStream::new(rx)
@@ -610,7 +608,7 @@ async fn background_task(
                     Some(ControlCommand::DeleteThread { thread, response }) => {
                         let result = handle_delete_thread(&mut client, &thread).await;
                         if result.is_ok() {
-                            senders.lock().await.remove(&thread.thread);
+                            lock_senders(&senders).remove(&thread.thread);
                         }
                         let _ = response.send(result);
                     }
@@ -662,7 +660,10 @@ async fn handle_idle_server_message(
         }
         codex_codes::ServerMessage::Request { id, request } => {
             let waiting_for = id.to_string();
-            let event = mapper.map_server_request(&id, &request, fallback_thread);
+            let Some(event) = mapper.map_server_request(&id, &request, fallback_thread) else {
+                respond_unroutable_server_request(client, &id).await;
+                return StreamOutcome::TurnEnded;
+            };
             let thread = event_thread(&event);
             let _ = broadcast_event(senders, thread, || event).await;
 
@@ -914,7 +915,7 @@ async fn handle_open_thread(
     mapper.register_thread(harness_thread_id.clone(), thread_id);
 
     let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
-    senders.lock().await.insert(thread_id, tx);
+    ensure_thread_sender(senders, thread_id, tx);
 
     let _ = broadcast_event(senders, thread_id, || AgentEvent::ThreadOpened {
         thread: thread_id,
@@ -1097,38 +1098,52 @@ async fn stream_turn_events(
                 // A non-retryable error ends the turn without Codex sending `turn/completed`.
                 // Capture its message so we can synthesize a terminal Failed turn below (§7.1),
                 // giving history a persistent record of why the turn produced no agent output.
-                let terminal_error = mapping::fatal_turn_error(&notif);
                 let event = mapper.map_notification(&notif, thread_id);
                 if let Some(event) = event {
-                    if let AgentEvent::TurnStarted { turn, .. } = &event {
-                        active_turn = Some(*turn);
+                    let event_thread_id = event_thread(&event);
+                    let is_current_thread = event_belongs_to_stream(thread_id, &event);
+                    if is_current_thread {
+                        if let AgentEvent::TurnStarted { turn, .. } = &event {
+                            active_turn = Some(*turn);
+                        }
                     }
-                    let is_completed = matches!(event, AgentEvent::TurnCompleted { .. });
-                    let _ = broadcast_event(senders, thread_id, || event).await;
+                    let is_completed = event_completes_stream(thread_id, &event);
+                    let _ = broadcast_event(senders, event_thread_id, || event).await;
                     if is_completed {
                         break;
                     }
-                }
-                if let Some(message) = terminal_error {
-                    // Mint a turn id when the error arrived before any `turn/started` (e.g. an
-                    // immediate quota rejection) so the failed attempt is still persisted.
-                    let turn = active_turn.unwrap_or_default();
-                    let _ = broadcast_event(senders, thread_id, || AgentEvent::TurnCompleted {
-                        thread: thread_id,
-                        turn,
-                        usage: TokenUsage::default(),
-                        status: TurnStatus {
-                            kind: TurnStatusKind::Failed,
-                            message: Some(message),
-                        },
-                    })
-                    .await;
-                    break;
+                    if is_current_thread {
+                        if let Some(message) = mapping::fatal_turn_error(&notif) {
+                            // Mint a turn id when the error arrived before any `turn/started` (e.g.
+                            // an immediate quota rejection) so the failed attempt is still persisted.
+                            let turn = active_turn.unwrap_or_default();
+                            let _ =
+                                broadcast_event(senders, thread_id, || AgentEvent::TurnCompleted {
+                                    thread: thread_id,
+                                    turn,
+                                    usage: TokenUsage::default(),
+                                    status: TurnStatus {
+                                        kind: TurnStatusKind::Failed,
+                                        message: Some(message),
+                                    },
+                                })
+                                .await;
+                            break;
+                        }
+                    }
+                } else if let Some(message) = mapping::fatal_turn_error(&notif) {
+                    warn!(
+                        %thread_id,
+                        "dropping fatal Codex error notification that could not be mapped to a known thread: {message}"
+                    );
                 }
             }
             codex_codes::ServerMessage::Request { id, request } => {
                 let waiting_for = id.to_string();
-                let event = mapper.map_server_request(&id, &request, thread_id);
+                let Some(event) = mapper.map_server_request(&id, &request, thread_id) else {
+                    respond_unroutable_server_request(client, &id).await;
+                    continue;
+                };
                 let event_thread_id = event_thread(&event);
                 let _ = broadcast_event(senders, event_thread_id, || event).await;
 
@@ -1332,9 +1347,48 @@ async fn handle_stream_control(
 }
 
 async fn broadcast_event<F: FnOnce() -> AgentEvent>(senders: &SenderMap, thread: ThreadId, f: F) {
-    let sender = senders.lock().await.get(&thread).cloned();
+    let sender = sender_for_thread(senders, thread);
     if let Some(sender) = sender {
         let _ = sender.send(f());
+    }
+}
+
+fn lock_senders(
+    senders: &SenderMap,
+) -> StdMutexGuard<'_, HashMap<ThreadId, broadcast::Sender<AgentEvent>>> {
+    match senders.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!("Codex sender map lock was poisoned; recovering sender state");
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn sender_for_thread(
+    senders: &SenderMap,
+    thread: ThreadId,
+) -> Option<broadcast::Sender<AgentEvent>> {
+    lock_senders(senders).get(&thread).cloned()
+}
+
+fn ensure_thread_sender(
+    senders: &SenderMap,
+    thread: ThreadId,
+    sender: broadcast::Sender<AgentEvent>,
+) {
+    lock_senders(senders).entry(thread).or_insert(sender);
+}
+
+async fn respond_unroutable_server_request(
+    client: &mut codex_codes::AsyncClient,
+    id: &codex_codes::jsonrpc::RequestId,
+) {
+    let message = "Giskard cannot route this Codex server request to a known thread.";
+    if let Err(error) = client.respond_error(id.clone(), -32000, message).await {
+        warn!(%id, %error, "failed to reject unroutable Codex server request");
+    } else {
+        warn!(%id, "rejected unroutable Codex server request");
     }
 }
 
@@ -1353,6 +1407,15 @@ fn event_thread(event: &AgentEvent) -> ThreadId {
         | AgentEvent::Error { thread, .. }
         | AgentEvent::Notice { thread, .. } => *thread,
     }
+}
+
+fn event_belongs_to_stream(stream_thread: ThreadId, event: &AgentEvent) -> bool {
+    event_thread(event) == stream_thread
+}
+
+fn event_completes_stream(stream_thread: ThreadId, event: &AgentEvent) -> bool {
+    event_belongs_to_stream(stream_thread, event)
+        && matches!(event, AgentEvent::TurnCompleted { .. })
 }
 
 async fn emit_incomplete_turn(
@@ -1741,6 +1804,41 @@ mod tests {
                 message: None,
             },
         }
+    }
+
+    #[test]
+    fn foreign_turn_completion_does_not_end_live_stream() {
+        let stream_thread = ThreadId::new();
+        let foreign_thread = ThreadId::new();
+        let turn = TurnId::new();
+        let event = completed_event(foreign_thread, turn);
+
+        assert!(!event_belongs_to_stream(stream_thread, &event));
+        assert!(!event_completes_stream(stream_thread, &event));
+        assert!(event_completes_stream(foreign_thread, &event));
+    }
+
+    #[test]
+    fn opening_thread_preserves_existing_sender() {
+        let thread = ThreadId::new();
+        let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
+        let (first_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let mut first_rx = first_tx.subscribe();
+        ensure_thread_sender(&senders, thread, first_tx);
+
+        let (replacement_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        ensure_thread_sender(&senders, thread, replacement_tx);
+
+        let turn = TurnId::new();
+        sender_for_thread(&senders, thread)
+            .expect("sender exists")
+            .send(AgentEvent::TurnStarted { thread, turn })
+            .unwrap();
+        assert!(matches!(
+            first_rx.try_recv(),
+            Ok(AgentEvent::TurnStarted { thread: got_thread, turn: got_turn })
+                if got_thread == thread && got_turn == turn
+        ));
     }
 
     #[test]

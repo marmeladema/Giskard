@@ -41,6 +41,23 @@ async fn index_page_is_served_and_public() {
         body.contains("/api/ws-ticket"),
         "app fetches a WS auth ticket"
     );
+    assert!(
+        body.contains("ws.onmessage = (m) => {\n    if (state.ws !== ws) return;"),
+        "stale websocket frames from a replaced connection are ignored"
+    );
+    assert!(
+        body.contains("function serverMessageThreadId(msg)")
+            && body.contains("function isThreadScopedServerMessage(msg)")
+            && body.contains("function isCurrentThreadServerMessage(msg)")
+            && body.contains("if (!isCurrentThreadServerMessage(msg)) return;"),
+        "thread-scoped server messages are gated by the active thread before rendering"
+    );
+    assert!(
+        body.contains(
+            "case \"token_update\":\n      if (msg.scope === \"thread\") renderTokens(msg.ledger);"
+        ),
+        "only thread-scoped token updates render into the thread usage menu"
+    );
     assert!(body.contains("send_input"), "composer wired to SendInput");
     assert!(
         body.contains("id=\"stopBtn\""),

@@ -8,7 +8,34 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.32
+**Version:** 1.33
+
+**Changelog (1.32 → 1.33), thread-scoped WebSocket and Codex routing isolation:**
+- **WS1:** Browser clients must reject stale messages from a replaced WebSocket connection and must
+  ignore any thread-scoped server message whose `thread_id` does not match the currently selected
+  thread. This guard applies before rendering or mutating transcript state for `ThreadState`,
+  `HistoryPage`, `LiveTurnSnapshot`, `RunningTasks`, `Event`, `ApprovalRequest`, thread-scoped
+  `TokenUpdate`, and thread-scoped `Error`.
+- **WS2:** Thread-scoped `TokenUpdate` messages include `thread_id` on the wire. The browser only
+  renders token ledgers into the active thread usage menu when that `thread_id` matches the active
+  thread; project/global token updates must not be rendered as thread totals.
+- **WS3:** Event forwarders must verify that each incoming `AgentEvent.thread` matches the
+  forwarder's owning `ThreadId` before attaching to a turn, updating live buffers, broadcasting, or
+  persisting. Harness stream leakage across native subscriptions must therefore be ignored rather
+  than written into the wrong Giskard JSONL history, and logged as an operator-visible error with
+  the owner thread, event thread, event kind, and turn id when available.
+- **WS4:** The Codex harness must broadcast mapped notifications and server requests to the
+  `ThreadId` carried by the mapped `AgentEvent`, not merely to the thread whose stream is currently
+  being drained. A `TurnCompleted` only ends the currently drained stream when the completed event
+  belongs to that same thread; foreign-thread lifecycle events must not terminate or release another
+  thread's forwarder.
+- **WS5:** After at least one native Codex thread id is registered, non-empty unknown native
+  `threadId` values are unroutable. The harness must reject/drop them with an operator-visible warning
+  instead of falling back to the caller's scoped thread. Omitted `threadId` values may still use the
+  scoped fallback for global/threadless notifications and requests.
+- **WS6:** Reopening an already-open Giskard thread must preserve the existing per-thread harness
+  sender/subscriptions. Metadata normalization while opening a thread may update persisted thread
+  state, but it must not force a second native open or replace the live sender.
 
 **Changelog (1.31 → 1.32), thread reasoning-effort selector:**
 - **RE1:** The thread header shows an `Effort` selector immediately after the model picker when the
@@ -2094,8 +2121,13 @@ thread.
 and unresolved `ServerRequest`s),
 `RunningTasks { thread_id, tasks: [RunningTask] }` (commands and tool/MCP calls still known to be
 running, including commands that outlived an interrupted turn),
-`TokenUpdate { scope, ledger }`, `ApprovalRequest { thread_id, request }` (a `WireApprovalRequest`),
+`TokenUpdate { scope, thread_id?, ledger }`, `ApprovalRequest { thread_id, request }` (a
+`WireApprovalRequest`),
 `Error { code, severity, message, detail?, thread_id?, action? }`, `Pong`.
+
+For `TokenUpdate`, `thread_id` is required when `scope = "thread"` and omitted for non-thread
+ledger scopes. The browser must only apply a thread-scoped token update to the thread usage menu
+when the message `thread_id` matches the active thread.
 
 `OpenThreadResponse` may also carry `warning: ErrorInfo?` with the same `code` / `severity` /
 `message` shape when the requested thread was opened but degraded (for example, Codex resume
@@ -2106,6 +2138,26 @@ for the same `Item.id` are one lifecycle. The UI must finalize or replace the st
 place when the completed item arrives, and must de-duplicate rendered items by both Giskard
 `ItemId` and harness-native `harness_item_id` when replaying persisted state or receiving live
 events.
+
+**Client thread isolation invariant (WS1/WS2):** before rendering or mutating local thread state,
+the browser must verify that every thread-scoped server message belongs to the active thread.
+Messages for a previously selected thread, including frames delivered by a replaced WebSocket
+connection, are ignored. Thread-scoped messages without a usable `thread_id` fail closed, except
+for global errors that intentionally omit `thread_id`.
+
+**Server thread isolation invariant (WS3):** a per-thread event forwarder only owns
+`AgentEvent`s whose `thread` field equals the forwarder's `ThreadId`. Events for another thread
+are ignored before turn ownership, live-buffer updates, running-task updates, approval/server
+request registration, hub broadcast, or JSONL persistence. Each ignored foreign-thread event is
+logged at error level with structured fields sufficient to diagnose the harness routing bug without
+dumping the full event payload.
+
+**Harness routing invariant (WS4/WS5/WS6):** harness adapters must route every mapped native event by
+the mapped `AgentEvent.thread` before it reaches the server forwarder. If a native message carries a
+non-empty unknown native thread id after native-thread registration has begun, the adapter treats it
+as unroutable and logs/rejects it rather than relabeling it as the current fallback thread. Reopening
+an already-open thread reuses the existing per-thread sender so live subscribers and forwarders are
+not orphaned by metadata refreshes or duplicate open requests.
 
 **Transcript visibility invariant (E7/E8/E9):** every finalized item payload with user-observable
 meaning is rendered as a transcript row. `FileChange`, `ToolCall`, and `Activity` are visible rows;

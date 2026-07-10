@@ -172,7 +172,7 @@ impl AgentHarness for ReplayHarness {
             .clone()
             .unwrap_or_else(|| format!("replay_{}", ThreadId::new()));
 
-        let (thread_id, pending) = if let Some(resume) = &opts.resume {
+        let (thread_id, mut pending) = if let Some(resume) = &opts.resume {
             let mut fixtures = self.fixtures.lock().await;
             if let Some(fixture) = fixtures.remove(resume) {
                 (opts.thread.unwrap_or(fixture.thread_id), fixture.events)
@@ -182,6 +182,9 @@ impl AgentHarness for ReplayHarness {
         } else {
             (opts.thread.unwrap_or_default(), Vec::new())
         };
+        for event in &mut pending {
+            remap_event_thread(event, thread_id);
+        }
 
         let (tx, _) = broadcast::channel(256);
         let mut threads = self.threads.lock().await;
@@ -333,6 +336,23 @@ impl AgentHarness for ReplayHarness {
     }
 }
 
+fn remap_event_thread(event: &mut AgentEvent, thread_id: ThreadId) {
+    match event {
+        AgentEvent::ThreadOpened { thread, .. }
+        | AgentEvent::TurnStarted { thread, .. }
+        | AgentEvent::ItemStarted { thread, .. }
+        | AgentEvent::ItemDelta { thread, .. }
+        | AgentEvent::ItemCompleted { thread, .. }
+        | AgentEvent::DiffUpdated { thread, .. }
+        | AgentEvent::ApprovalRequested { thread, .. }
+        | AgentEvent::ServerRequestReceived { thread, .. }
+        | AgentEvent::ServerRequestResolved { thread, .. }
+        | AgentEvent::TurnCompleted { thread, .. }
+        | AgentEvent::Error { thread, .. }
+        | AgentEvent::Notice { thread, .. } => *thread = thread_id,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,6 +490,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_resume_remaps_fixture_events_to_requested_thread() {
+        let fixture = make_simple_fixture();
+        let requested_thread = ThreadId::new();
+        let harness = Arc::new(ReplayHarness::from_fixture(fixture));
+
+        let handle = harness
+            .open_thread(giskard_harness::OpenThreadOptions {
+                project: giskard_core::ProjectId::new(),
+                thread: Some(requested_thread),
+                workspace_root: "/tmp".into(),
+                resume: Some("th_test".into()),
+                initial_model: ModelRef {
+                    provider: "openai".into(),
+                    model: "gpt-5.5".into(),
+                    reasoning_effort: None,
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(handle.thread, requested_thread);
+
+        let mut stream = harness.subscribe(&handle);
+        harness
+            .start_turn(
+                &handle,
+                UserInput::text("test"),
+                TurnOverrides {
+                    model: None,
+                    mode: Mode::Build,
+                    approval_policy: giskard_core::turn::ApprovalPolicy::Auto,
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(event) = stream.recv().await {
+            let is_completed = matches!(event, AgentEvent::TurnCompleted { .. });
+            events.push(event);
+            if is_completed {
+                break;
+            }
+        }
+
+        assert_eq!(events.len(), 6);
+        for event in events {
+            assert_eq!(event_thread(&event), requested_thread);
+        }
+    }
+
+    #[tokio::test]
     async fn replay_shutdown_idempotent() {
         let harness = ReplayHarness::new();
         harness.shutdown().await.unwrap();
@@ -492,5 +563,22 @@ mod tests {
         fixture.save(tmp.path()).unwrap();
         let loaded = ReplayFixture::load(tmp.path()).unwrap();
         assert_eq!(loaded.events.len(), fixture.events.len());
+    }
+
+    fn event_thread(event: &AgentEvent) -> ThreadId {
+        match event {
+            AgentEvent::ThreadOpened { thread, .. }
+            | AgentEvent::TurnStarted { thread, .. }
+            | AgentEvent::ItemStarted { thread, .. }
+            | AgentEvent::ItemDelta { thread, .. }
+            | AgentEvent::ItemCompleted { thread, .. }
+            | AgentEvent::DiffUpdated { thread, .. }
+            | AgentEvent::ApprovalRequested { thread, .. }
+            | AgentEvent::ServerRequestReceived { thread, .. }
+            | AgentEvent::ServerRequestResolved { thread, .. }
+            | AgentEvent::TurnCompleted { thread, .. }
+            | AgentEvent::Error { thread, .. }
+            | AgentEvent::Notice { thread, .. } => *thread,
+        }
     }
 }

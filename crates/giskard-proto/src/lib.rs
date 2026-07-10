@@ -200,6 +200,10 @@ pub enum ServerMessage {
     },
     TokenUpdate {
         scope: TokenScope,
+        /// Present for thread-scoped token updates so clients can reject stale frames that belong
+        /// to a previously selected thread.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_id: Option<ThreadId>,
         ledger: serde_json::Value,
     },
     ApprovalRequest {
@@ -593,6 +597,38 @@ mod tests {
     fn server_message_pong() {
         let json = serde_json::to_string(&ServerMessage::Pong).unwrap();
         assert_eq!(json, "{\"type\":\"pong\"}");
+    }
+
+    #[test]
+    fn server_message_thread_token_update_carries_thread_id() {
+        let tid = ThreadId::new();
+        let msg = ServerMessage::TokenUpdate {
+            scope: TokenScope::Thread,
+            thread_id: Some(tid),
+            ledger: serde_json::json!({
+                "total": { "input": 10, "output": 5, "total": 15 }
+            }),
+        };
+
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "token_update");
+        assert_eq!(json["scope"], "thread");
+        assert_eq!(json["thread_id"], tid.to_string());
+        assert_eq!(json["ledger"]["total"]["total"], 15);
+
+        let back: ServerMessage = serde_json::from_value(json).unwrap();
+        match back {
+            ServerMessage::TokenUpdate {
+                scope,
+                thread_id,
+                ledger,
+            } => {
+                assert_eq!(scope, TokenScope::Thread);
+                assert_eq!(thread_id, Some(tid));
+                assert_eq!(ledger["total"]["input"], 10);
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]
