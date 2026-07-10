@@ -8,7 +8,18 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.33
+**Version:** 1.34
+
+**Changelog (1.33 → 1.34), mobile-friendly WebSocket reconnect UX:**
+- **RX1:** Browser WebSocket disconnects are treated as a recoverable lifecycle state. The client
+  reconnects with bounded exponential backoff, resubscribes to the active thread, and uses the
+  existing thread state/history/live-turn/task snapshots to resync.
+- **RX2:** Expected mobile/tab-suspension disconnects must not produce repeated error toasts. The
+  thread header shows persistent connection state instead, while foreground auth/network failures
+  remain visible through throttled warnings/errors.
+- **RX3:** User messages are blocked while the WebSocket is reconnecting rather than queued. The
+  composer stays editable so users can keep drafting, but no optimistic pending bubble is created
+  until the socket is open.
 
 **Changelog (1.32 → 1.33), thread-scoped WebSocket and Codex routing isolation:**
 - **WS1:** Browser clients must reject stale messages from a replaced WebSocket connection and must
@@ -2178,7 +2189,9 @@ events through the same event handler used for live WebSocket events.
   the sidebar shows activity, but not the full delta stream (bandwidth control).
 - **Backpressure:** per-connection bounded queue; if a client falls behind, coalesce deltas
   (keep latest) rather than unbounded buffering. Heartbeat ping/pong; auto-reconnect on the
-  client with resubscribe + state resync.
+  client with resubscribe + state resync. Browser disconnects caused by mobile/tab suspension are
+  not user-facing errors while recovery is in progress; foreground auth/network failures remain
+  visible through persistent connection state and throttled warning/error notices.
 - **Reconnect & live-turn resync.** Persisted thread state only advances on `TurnCompleted`
   (§5.4), so a client that reconnects **during** an in-flight turn cannot reconstruct the live
   turn from disk alone. To close this gap the server keeps, **per active turn**, an in-memory
