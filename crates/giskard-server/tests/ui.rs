@@ -350,8 +350,22 @@ async fn index_page_is_served_and_public() {
         "the transcript scrollbar is scoped and appearance-aware"
     );
     assert!(
-        body.contains("if (initialThreadState)"),
-        "UI only clears the transcript for the initial thread snapshot"
+        body.contains(
+            "const shouldResetTranscript = state.awaitingInitialThreadState || state.awaitingThreadResync"
+        ) && body.contains("state.awaitingThreadResync = false")
+            && body.contains(
+                "if (shouldResetTranscript) {\n    resetTranscriptForAuthoritativeSnapshot();\n  }"
+            ),
+        "UI only clears the transcript for initial snapshots or subscribe resyncs"
+    );
+    assert!(
+        body.contains("function resetTranscriptForAuthoritativeSnapshot()")
+            && body.contains("state.pendingUserEl = null")
+            && body.contains("state.pendingUserText = null")
+            && body.contains("state.oldestTurnId = null")
+            && body.contains("state.hasMoreHistory = false")
+            && body.contains("setTurnActive(false);"),
+        "subscribe resync clears transient browser-only state before replaying history"
     );
     assert!(
         body.contains("beginRenameThread(el, pid, t.id)"),
@@ -662,8 +676,38 @@ async fn index_page_is_served_and_public() {
         "UI blocks new sends until the WebSocket is open"
     );
     assert!(
-        body.contains("WebSocket connection failed. Reconnecting"),
-        "foreground connection failures remain visible"
+        body.contains("state.awaitingThreadResync = true;\n    send({ type:\"subscribe\"")
+            && body.contains("awaitingThreadResync:false"),
+        "resubscribe marks the next thread state as an authoritative resync"
+    );
+    assert!(
+        body.contains("const WS_BACKGROUND_CLOSE_GRACE_MS = 10000")
+            && body.contains(
+                "ws._giskardBackgroundedAt = document.visibilityState === \"hidden\" ? Date.now() : 0"
+            )
+            && body.contains("if (state.ws) state.ws._giskardBackgroundedAt = Date.now()")
+            && body.contains("state.ws._giskardResumedAt = Date.now()")
+            && body.contains(
+                "Date.now() - resumedAt < WS_BACKGROUND_CLOSE_GRACE_MS"
+            ),
+        "recently backgrounded sockets do not toast for lifecycle disconnects on resume"
+    );
+    let onerror_start = body
+        .find("ws.onerror = () => {")
+        .expect("websocket onerror handler exists");
+    let onclose_start = body
+        .find("ws.onclose = (ev) => {")
+        .expect("websocket onclose handler exists");
+    let onerror = &body[onerror_start..onclose_start];
+    assert!(
+        onerror.contains("recordWsProblem(\"WebSocket connection failed. Reconnecting...\")")
+            && !onerror.contains("surfaceWsProblem"),
+        "websocket onerror updates status without directly emitting a notice"
+    );
+    assert!(
+        body.contains("surfaceWsProblem(message, \"warning\")")
+            && body.contains("abnormalForegroundClose"),
+        "foreground connection failures remain visible from the close path"
     );
     assert!(
         body.contains("Invalid WebSocket message from server"),
@@ -949,4 +993,183 @@ async fn index_page_is_served_and_public() {
     // Self-contained: no external script/style hosts.
     assert!(!body.contains("http://"), "no external http asset refs");
     assert!(!body.contains("cdn"), "no CDN references");
+}
+
+#[test]
+fn browser_resubscribe_replaces_transient_transcript_state() {
+    let body = index_html();
+    let onopen = between(body, "ws.onopen = () => {", "  };\n  ws.onmessage");
+    assert_order(
+        onopen,
+        "state.awaitingThreadResync = true;",
+        "send({ type:\"subscribe\", thread_id: state.threadId });",
+    );
+
+    let render_thread_state = between(
+        body,
+        "function renderThreadState(s) {",
+        "function resetTranscriptForAuthoritativeSnapshot() {",
+    );
+    assert!(render_thread_state.contains(
+        "const shouldResetTranscript = state.awaitingInitialThreadState || state.awaitingThreadResync"
+    ));
+    assert!(render_thread_state.contains("state.awaitingInitialThreadState = false;"));
+    assert!(render_thread_state.contains("state.awaitingThreadResync = false;"));
+    assert!(render_thread_state.contains(
+        "if (shouldResetTranscript) {\n    resetTranscriptForAuthoritativeSnapshot();\n  }"
+    ));
+    assert!(
+        !render_thread_state.contains("$(\"transcript\").innerHTML=\"\""),
+        "metadata-only ThreadState updates must not clear the transcript directly"
+    );
+    assert!(
+        !render_thread_state.contains("resetRenderState();"),
+        "metadata-only ThreadState updates must not reset rendered item de-dupe state directly"
+    );
+
+    let reset = between(
+        body,
+        "function resetTranscriptForAuthoritativeSnapshot() {",
+        "const MODE_LABELS",
+    );
+    for expected in [
+        "$(\"transcript\").innerHTML=\"\";",
+        "state.pendingUserEl = null;",
+        "state.pendingUserText = null;",
+        "state.pendingOlder = false;",
+        "state.loadingHistory = false;",
+        "state.oldestTurnId = null;",
+        "state.hasMoreHistory = false;",
+        "state.interruptPending = false;",
+        "state.compactPending = false;",
+        "resetRenderState();",
+        "setTurnActive(false);",
+    ] {
+        assert!(
+            reset.contains(expected),
+            "authoritative resync reset is missing `{expected}`"
+        );
+    }
+    assert_order(
+        reset,
+        "$(\"transcript\").innerHTML=\"\";",
+        "resetRenderState();",
+    );
+    assert_order(reset, "resetRenderState();", "setTurnActive(false);");
+}
+
+#[test]
+fn browser_websocket_lifecycle_errors_are_not_toasted_directly() {
+    let body = index_html();
+
+    let onerror = between(body, "ws.onerror = () => {", "  };\n  ws.onclose");
+    assert!(onerror.contains("ws._giskardHadError = true;"));
+    assert!(onerror.contains("recordWsProblem(\"WebSocket connection failed. Reconnecting...\")"));
+    assert!(
+        !onerror.contains("surfaceWsProblem") && !onerror.contains("notice("),
+        "WebSocket.onerror must update status only; close decides whether a notice is actionable"
+    );
+
+    let onclose = between(body, "ws.onclose = (ev) => {", "function setWsStatus");
+    for expected in [
+        "const backgroundedAt = Number(ws._giskardBackgroundedAt) || 0;",
+        "const resumedAt = Number(ws._giskardResumedAt) || 0;",
+        "Date.now() - resumedAt < WS_BACKGROUND_CLOSE_GRACE_MS",
+        "const backgrounded = recentlyBackgrounded || document.visibilityState === \"hidden\";",
+        "const abnormalForegroundClose = ev.code === 1006 || ev.code === 1008 || ev.code === 1011;",
+        "if (!backgrounded && (ws._giskardHadError || abnormalForegroundClose))",
+        "surfaceWsProblem(message, \"warning\");",
+        "scheduleWsReconnect(message);",
+    ] {
+        assert!(
+            onclose.contains(expected),
+            "WebSocket close handler is missing `{expected}`"
+        );
+    }
+    assert_order(onclose, "const backgrounded =", "if (!backgrounded");
+    assert_order(
+        onclose,
+        "surfaceWsProblem(message, \"warning\");",
+        "scheduleWsReconnect(message);",
+    );
+
+    let visibility = between(
+        body,
+        "document.addEventListener(\"visibilitychange\", () => {",
+        "});\nwindow.addEventListener(\"online\"",
+    );
+    assert!(visibility.contains("if (state.ws) state.ws._giskardBackgroundedAt = Date.now();"));
+    assert!(visibility.contains("state.ws._giskardResumedAt = Date.now();"));
+    assert_order(
+        visibility,
+        "document.visibilityState === \"hidden\"",
+        "state.ws._giskardResumedAt = Date.now();",
+    );
+    assert_order(
+        visibility,
+        "state.ws._giskardResumedAt = Date.now();",
+        "reconnectIfNeeded(\"tab visible\");",
+    );
+}
+
+#[test]
+fn browser_backgrounded_socket_recovery_restores_foreground_errors() {
+    let body = index_html();
+
+    let recover = between(
+        body,
+        "function markWsForegroundRecovered(ws) {",
+        "function scheduleWsReconnect",
+    );
+    assert!(recover.contains("if (!ws || document.visibilityState !== \"visible\") return;"));
+    assert!(recover.contains("ws._giskardBackgroundedAt = 0;"));
+    assert!(recover.contains("ws._giskardResumedAt = 0;"));
+
+    let onopen = between(body, "ws.onopen = () => {", "  };\n  ws.onmessage");
+    assert_order(
+        onopen,
+        "setWsStatus(\"open\", \"Connected to agent.\");",
+        "markWsForegroundRecovered(ws);",
+    );
+    assert_order(
+        onopen,
+        "markWsForegroundRecovered(ws);",
+        "state.awaitingThreadResync = true;",
+    );
+
+    let onmessage = between(body, "ws.onmessage = (m) => {", "  };\n  ws.onerror");
+    assert_order(
+        onmessage,
+        "markWsForegroundRecovered(ws);",
+        "handleServer(JSON.parse(m.data));",
+    );
+}
+
+fn index_html() -> &'static str {
+    include_str!("../static/index.html")
+}
+
+fn between<'a>(haystack: &'a str, start: &str, end: &str) -> &'a str {
+    let start_index = haystack
+        .find(start)
+        .unwrap_or_else(|| panic!("start marker not found: {start}"));
+    let content_start = start_index + start.len();
+    let end_index = haystack[content_start..]
+        .find(end)
+        .map(|offset| content_start + offset)
+        .unwrap_or_else(|| panic!("end marker not found after {start}: {end}"));
+    &haystack[content_start..end_index]
+}
+
+fn assert_order(haystack: &str, first: &str, second: &str) {
+    let first_index = haystack
+        .find(first)
+        .unwrap_or_else(|| panic!("first marker not found: {first}"));
+    let second_index = haystack
+        .find(second)
+        .unwrap_or_else(|| panic!("second marker not found: {second}"));
+    assert!(
+        first_index < second_index,
+        "`{first}` should appear before `{second}`"
+    );
 }

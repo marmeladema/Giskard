@@ -725,6 +725,7 @@ const PROJECT_COLLAPSE_KEY = "giskard.collapsedProjects";
 const WS_RECONNECT_BASE_MS = 600;
 const WS_RECONNECT_MAX_MS = 8000;
 const WS_PROBLEM_NOTICE_INTERVAL_MS = 30000;
+const WS_BACKGROUND_CLOSE_GRACE_MS = 10000;
 let state = {
   projectId:null, threadId:null, mode:"build", ws:null, wsStatus:"closed", wsConnectId:0,
   wsReconnectTimer:null, wsReconnectAttempt:0, wsStatusDetail:"WebSocket disconnected",
@@ -738,7 +739,7 @@ let state = {
   activeTaskGroup:null, taskGroupSeq:0, taskItemSeq:0, taskGroupsById:new Map(), taskGroupsByItemId:new Map(),
   expandedTaskGroups:new Set(), manuallyToggledTaskGroups:new Set(), expandedTaskDetails:new Map(),
   linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, activeTurn:false, interruptPending:false, compactPending:false,
-  awaitingInitialThreadState:false, contextWindow:0, contextUsed:null, tokenLedger:null, approvalPolicy:"ask", currentModel:null,
+  awaitingInitialThreadState:false, awaitingThreadResync:false, contextWindow:0, contextUsed:null, tokenLedger:null, approvalPolicy:"ask", currentModel:null,
   mcpServers:[], mcpCapabilities:{ status:false, reload:false, oauth_login:false }, mcpLoading:false, mcpError:null, expandedMcps:new Set(),
   collapsedProjects:new Set(loadCollapsedProjects())
 };
@@ -1108,6 +1109,7 @@ function clearThreadView(tid) {
   $("effortControl").hidden = true;
   setTurnActive(false);
   state.awaitingInitialThreadState = false;
+  state.awaitingThreadResync = false;
   resetRenderState();
   $("thrHeader").style.display="none"; $("composer").style.display="none";
   $("pickerBar").style.display="none"; closeModelPicker(); closeTurnPicker();
@@ -1242,6 +1244,7 @@ async function openThread(pid, tid, title, opts) {
   state.contextUsed = null; state.contextWindow = 0; state.tokenLedger = null;
   updateGauge(null, 0);
   state.awaitingInitialThreadState = true;
+  state.awaitingThreadResync = false;
   resetRenderState();
   document.querySelectorAll(".thread").forEach(e => e.classList.toggle("active", e.dataset.tid===tid));
   $("thrHeader").style.display="flex"; $("composer").style.display="flex";
@@ -1278,10 +1281,13 @@ function renderWsStatus() {
   el.textContent = wsStatusLabel(state.wsStatus);
   el.title = state.wsStatusDetail || wsStatusLabel(state.wsStatus);
 }
-function surfaceWsProblem(message, severity) {
+function recordWsProblem(message) {
   state.wsLastProblem = message || "";
   if (message) state.wsStatusDetail = message;
   renderWsStatus();
+}
+function surfaceWsProblem(message, severity) {
+  recordWsProblem(message);
   if (!message || document.visibilityState === "hidden") return;
   const now = Date.now();
   if (state.wsLastProblemNotice !== message ||
@@ -1290,6 +1296,11 @@ function surfaceWsProblem(message, severity) {
     state.wsLastProblemNoticeAt = now;
     notice(message, severity || "warning");
   }
+}
+function markWsForegroundRecovered(ws) {
+  if (!ws || document.visibilityState !== "visible") return;
+  ws._giskardBackgroundedAt = 0;
+  ws._giskardResumedAt = 0;
 }
 function scheduleWsReconnect(reason) {
   if (!state.threadId) {
@@ -1348,15 +1359,19 @@ async function connectWs(opts) {
   if (connectId !== state.wsConnectId) return;
   const ws = new WebSocket(`${proto}://${location.host}/api/ws?ticket=${encodeURIComponent(ticket)}`);
   state.ws = ws;
+  ws._giskardBackgroundedAt = document.visibilityState === "hidden" ? Date.now() : 0;
   ws.onopen = () => {
     if (state.ws !== ws) return;
     state.wsReconnectAttempt = 0;
     state.wsLastProblem = "";
     setWsStatus("open", "Connected to agent.");
+    markWsForegroundRecovered(ws);
+    state.awaitingThreadResync = true;
     send({ type:"subscribe", thread_id: state.threadId });
   };
   ws.onmessage = (m) => {
     if (state.ws !== ws) return;
+    markWsForegroundRecovered(ws);
     try {
       handleServer(JSON.parse(m.data));
     } catch (e) {
@@ -1366,7 +1381,7 @@ async function connectWs(opts) {
   ws.onerror = () => {
     if (state.ws !== ws) return;
     ws._giskardHadError = true;
-    surfaceWsProblem("WebSocket connection failed. Reconnecting...", "warning");
+    recordWsProblem("WebSocket connection failed. Reconnecting...");
   };
   ws.onclose = (ev) => {
     if (state.ws !== ws) return;
@@ -1377,7 +1392,16 @@ async function connectWs(opts) {
     const message = ws._giskardHadError
       ? `WebSocket connection failed${code}.${reason} Reconnecting...`
       : `Connection lost${code}.${reason} Reconnecting...`;
-    if (ws._giskardHadError) surfaceWsProblem(message, "warning");
+    const backgroundedAt = Number(ws._giskardBackgroundedAt) || 0;
+    const resumedAt = Number(ws._giskardResumedAt) || 0;
+    const recentlyBackgrounded =
+      backgroundedAt > 0 &&
+      (resumedAt === 0 || Date.now() - resumedAt < WS_BACKGROUND_CLOSE_GRACE_MS);
+    const backgrounded = recentlyBackgrounded || document.visibilityState === "hidden";
+    const abnormalForegroundClose = ev.code === 1006 || ev.code === 1008 || ev.code === 1011;
+    if (!backgrounded && (ws._giskardHadError || abnormalForegroundClose)) {
+      surfaceWsProblem(message, "warning");
+    }
     scheduleWsReconnect(message);
   };
 }
@@ -1430,7 +1454,14 @@ function reconnectIfNeeded(reason) {
   connectWs({ reconnect:true, reason });
 }
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") reconnectIfNeeded("tab visible");
+  if (document.visibilityState === "hidden") {
+    if (state.ws) state.ws._giskardBackgroundedAt = Date.now();
+    return;
+  }
+  if (state.ws && state.ws._giskardBackgroundedAt) {
+    state.ws._giskardResumedAt = Date.now();
+  }
+  reconnectIfNeeded("tab visible");
 });
 window.addEventListener("online", () => {
   reconnectIfNeeded("network online");
@@ -1520,8 +1551,9 @@ function handleServer(msg) {
 
 function renderThreadState(s) {
   if (!s) return;
-  const initialThreadState = state.awaitingInitialThreadState;
+  const shouldResetTranscript = state.awaitingInitialThreadState || state.awaitingThreadResync;
   state.awaitingInitialThreadState = false;
+  state.awaitingThreadResync = false;
   setMode(s.mode || "build");
   setApprovalPolicy(s.approval_policy || "ask");
   if (s.current_model) {
@@ -1534,11 +1566,25 @@ function renderThreadState(s) {
   }
   if (s.tokens) renderTokens(s.tokens);
   updateGauge(state.contextUsed, s.context_window || 0);
-  if (initialThreadState) {
-    // History now arrives separately via `history_page` (H6); clear the transcript ready for it.
-    $("transcript").innerHTML="";
-    resetRenderState();
+  if (shouldResetTranscript) {
+    resetTranscriptForAuthoritativeSnapshot();
   }
+}
+function resetTranscriptForAuthoritativeSnapshot() {
+  // Subscribe/resubscribe snapshots replay persisted history and any live turn from the server.
+  // Clear transient browser-only rows first so fallback error/user bubbles cannot be appended
+  // again, and so a missed turn_completed while suspended does not leave stale active-turn UI.
+  $("transcript").innerHTML="";
+  state.pendingUserEl = null;
+  state.pendingUserText = null;
+  state.pendingOlder = false;
+  state.loadingHistory = false;
+  state.oldestTurnId = null;
+  state.hasMoreHistory = false;
+  state.interruptPending = false;
+  state.compactPending = false;
+  resetRenderState();
+  setTurnActive(false);
 }
 const MODE_LABELS = { build:"Build", plan:"Plan" };
 const APPROVAL_LABELS = { ask:"Ask first", auto:"Auto approve", read_only:"Read only" };
