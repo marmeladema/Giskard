@@ -8,7 +8,19 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.34
+**Version:** 1.35
+
+**Changelog (1.34 → 1.35), authoritative reconnect resync:**
+- **RX4:** A browser `Subscribe` response is an authoritative active-thread resync, not an
+  append-only delta. The client clears transient browser-rendered transcript state before replaying
+  the returned recent history and any live snapshot so failed-turn fallback bubbles, optimistic user
+  rows, and stale active-turn flags cannot duplicate or survive a reconnect.
+- **RX5:** WebSocket `error` events update persistent connection status but do not directly create
+  warning notices. Warning/error notices are reserved for actionable foreground failures such as
+  authorization failures, offline state, or abnormal foreground closes; sockets recently
+  foregrounded after tab/mobile lifecycle suspension reconnect without toast spam. Once a socket
+  successfully opens or receives a message while foregrounded, later failures are treated as normal
+  foreground failures again.
 
 **Changelog (1.33 → 1.34), mobile-friendly WebSocket reconnect UX:**
 - **RX1:** Browser WebSocket disconnects are treated as a recoverable lifecycle state. The client
@@ -2203,6 +2215,13 @@ events through the same event handler used for live WebSocket events.
   2. if a turn is currently live, a `LiveTurnSnapshot` reconstructed from the live buffer
      (accumulated text/output + any pending approval/server request), then
   3. subsequent deltas as normal.
+
+  The browser treats this subscribe/resubscribe snapshot as authoritative for the active thread.
+  It must clear transient browser-rendered transcript state (including optimistic pending user
+  rows, fallback failed-turn bubbles, pending approvals/server requests, running-task DOM maps, and
+  stale active-turn controls) before rendering the returned recent history and then replaying the
+  live snapshot. Later metadata-only `ThreadState` broadcasts are not subscribe snapshots and must
+  not clear the visible transcript.
 
   This means a reconnected client sees the full in-progress turn, including still-pending
   approval and server-request prompts. The live buffer is bounded
