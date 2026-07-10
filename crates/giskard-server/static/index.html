@@ -118,6 +118,16 @@
   .mcp-section-title { margin-bottom:4px; color:var(--fg); font-size:11px; font-weight:600; text-transform:uppercase; }
   .mcp-actions { display:flex; gap:6px; flex-wrap:wrap; margin-top:8px; }
   .mcp-actions button { font-size:12px; padding:4px 8px; }
+  .ws-badge { display:inline-flex; align-items:center; gap:6px; color:var(--muted); }
+  .ws-badge::before { content:""; width:8px; height:8px; border-radius:50%; background:var(--muted); }
+  .ws-badge.state-open { color:#7ee787; border-color:#238636; }
+  .ws-badge.state-open::before { background:#3fb950; }
+  .ws-badge.state-connecting,
+  .ws-badge.state-reconnecting { color:#f0d98c; border-color:#d29922; background:rgba(210,153,34,.08); }
+  .ws-badge.state-connecting::before,
+  .ws-badge.state-reconnecting::before { background:#d29922; }
+  .ws-badge.state-closed { color:#ffb4ae; border-color:#f85149; background:rgba(248,81,73,.08); }
+  .ws-badge.state-closed::before { background:#f85149; }
   .tasks-wrap { position:relative; }
   .tasks-btn { display:flex; align-items:center; gap:6px; }
   .tasks-btn.state-idle { color:var(--muted); }
@@ -583,6 +593,7 @@
         <div class="mbTitle" id="mbTitle">Giskard</div>
       </div>
       <header class="thr" id="thrHeader" style="display:none">
+        <span id="wsStatusBadge" class="badge ws-badge state-closed" title="WebSocket disconnected">Disconnected</span>
         <div class="tasks-wrap">
           <button id="tasksBtn" class="badge tasks-btn state-idle" title="Running tasks" aria-label="Running tasks">
             <span>Tasks</span><span id="tasksCount" class="mono">0</span>
@@ -711,9 +722,14 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 const PROJECT_COLLAPSE_KEY = "giskard.collapsedProjects";
+const WS_RECONNECT_BASE_MS = 600;
+const WS_RECONNECT_MAX_MS = 8000;
+const WS_PROBLEM_NOTICE_INTERVAL_MS = 30000;
 let state = {
   projectId:null, threadId:null, mode:"build", ws:null, wsStatus:"closed", wsConnectId:0,
-  models:[], streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null, pendingClientMsgs:[],
+  wsReconnectTimer:null, wsReconnectAttempt:0, wsStatusDetail:"WebSocket disconnected",
+  wsLastProblem:"", wsLastProblemNotice:"", wsLastProblemNoticeAt:0,
+  models:[], streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null,
   streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), itemKindsByItemId:new Map(),
   pendingApprovals:new Map(), pendingServerRequests:new Map(),
   runningCommands:new Map(), commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null,
@@ -1078,9 +1094,13 @@ async function deleteThread(pid, tid, title) {
 function clearThreadView(tid) {
   if (state.threadId !== tid) return;
   try { localStorage.removeItem("giskard.lastThread"); } catch {}
+  clearWsReconnectTimer();
   const ws = state.ws;
   state.ws = null;
-  if (ws) { try { ws.close(); } catch {} }
+  if (ws) {
+    ws._giskardExpectedClose = true;
+    try { ws.close(); } catch {}
+  }
   state.projectId = null; state.threadId = null;
   state.pendingUserEl = null; state.pendingUserText = null;
   state.compactPending = false;
@@ -1092,7 +1112,7 @@ function clearThreadView(tid) {
   $("thrHeader").style.display="none"; $("composer").style.display="none";
   $("pickerBar").style.display="none"; closeModelPicker(); closeTurnPicker();
   $("transcript").innerHTML="";
-  setWsStatus("closed");
+  setWsStatus("closed", "No thread selected.");
 }
 
 /* ---------- new-project modal + directory picker ---------- */
@@ -1233,22 +1253,96 @@ async function openThread(pid, tid, title, opts) {
   connectWs();
 }
 
-async function connectWs() {
+function clearWsReconnectTimer() {
+  if (state.wsReconnectTimer) {
+    clearTimeout(state.wsReconnectTimer);
+    state.wsReconnectTimer = null;
+  }
+}
+function wsIsOpen() {
+  return !!(state.ws && state.ws.readyState === WebSocket.OPEN);
+}
+function wsStatusLabel(status) {
+  switch (status) {
+    case "open": return "Connected";
+    case "connecting": return "Connecting";
+    case "reconnecting": return "Reconnecting...";
+    default: return "Disconnected";
+  }
+}
+function renderWsStatus() {
+  const el = $("wsStatusBadge");
+  if (!el) return;
+  el.hidden = !state.threadId;
+  el.className = `badge ws-badge state-${state.wsStatus}`;
+  el.textContent = wsStatusLabel(state.wsStatus);
+  el.title = state.wsStatusDetail || wsStatusLabel(state.wsStatus);
+}
+function surfaceWsProblem(message, severity) {
+  state.wsLastProblem = message || "";
+  if (message) state.wsStatusDetail = message;
+  renderWsStatus();
+  if (!message || document.visibilityState === "hidden") return;
+  const now = Date.now();
+  if (state.wsLastProblemNotice !== message ||
+      now - state.wsLastProblemNoticeAt > WS_PROBLEM_NOTICE_INTERVAL_MS) {
+    state.wsLastProblemNotice = message;
+    state.wsLastProblemNoticeAt = now;
+    notice(message, severity || "warning");
+  }
+}
+function scheduleWsReconnect(reason) {
+  if (!state.threadId) {
+    setWsStatus("closed", "No thread selected.");
+    return;
+  }
+  if (navigator.onLine === false) {
+    setWsStatus("reconnecting", "Network is offline. Reconnect will resume when the network returns.");
+    surfaceWsProblem("Network is offline. Reconnect will resume when the network returns.", "warning");
+    return;
+  }
+  clearWsReconnectTimer();
+  const attempt = state.wsReconnectAttempt++;
+  const delay = Math.min(WS_RECONNECT_MAX_MS, WS_RECONNECT_BASE_MS * Math.pow(2, attempt));
+  const jitter = Math.floor(Math.random() * 200);
+  const message = reason || `Connection lost. Reconnecting in ${Math.ceil((delay + jitter) / 1000)}s.`;
+  setWsStatus("reconnecting", message);
+  state.wsReconnectTimer = setTimeout(() => {
+    state.wsReconnectTimer = null;
+    connectWs({ reconnect:true });
+  }, delay + jitter);
+}
+async function connectWs(opts) {
+  opts = opts || {};
+  if (!state.threadId) {
+    setWsStatus("closed", "No thread selected.");
+    return;
+  }
+  clearWsReconnectTimer();
   const oldWs = state.ws;
   state.ws = null;
-  if (oldWs) { try { oldWs.close(); } catch {} }
+  if (oldWs) {
+    oldWs._giskardExpectedClose = true;
+    try { oldWs.close(); } catch {}
+  }
   const connectId = ++state.wsConnectId;
-  state.pendingClientMsgs = [];
-  setWsStatus("connecting");
+  if (!opts.reconnect) {
+    state.wsReconnectAttempt = 0;
+    state.wsLastProblem = "";
+    state.wsLastProblemNotice = "";
+    state.wsLastProblemNoticeAt = 0;
+  }
+  setWsStatus(opts.reconnect ? "reconnecting" : "connecting", opts.reconnect ? "Reconnecting to agent..." : "Connecting to agent...");
   const proto = location.protocol==="https:" ? "wss" : "ws";
   let ticket;
   try {
     ticket = (await api("GET","/api/ws-ticket")).ticket;
   } catch (e) {
     if (connectId !== state.wsConnectId) return;
-    setWsStatus("closed");
-    failPendingUserMessage("Message not sent: could not authorize WebSocket.");
-    notice("WebSocket authorization failed: "+e.message, "error");
+    const message = "WebSocket authorization failed: "+e.message;
+    setWsStatus("reconnecting", message);
+    surfaceWsProblem(message, "error");
+    scheduleWsReconnect(message);
     return;
   }
   if (connectId !== state.wsConnectId) return;
@@ -1256,9 +1350,10 @@ async function connectWs() {
   state.ws = ws;
   ws.onopen = () => {
     if (state.ws !== ws) return;
-    setWsStatus("open");
+    state.wsReconnectAttempt = 0;
+    state.wsLastProblem = "";
+    setWsStatus("open", "Connected to agent.");
     send({ type:"subscribe", thread_id: state.threadId });
-    flushPendingClientMsgs();
   };
   ws.onmessage = (m) => {
     if (state.ws !== ws) return;
@@ -1270,67 +1365,82 @@ async function connectWs() {
   };
   ws.onerror = () => {
     if (state.ws !== ws) return;
-    notice("WebSocket connection failed.", "error");
+    ws._giskardHadError = true;
+    surfaceWsProblem("WebSocket connection failed. Reconnecting...", "warning");
   };
   ws.onclose = (ev) => {
     if (state.ws !== ws) return;
-    setWsStatus("closed");
-    failPendingUserMessage("Message not sent: WebSocket closed.");
+    state.ws = null;
+    if (ws._giskardExpectedClose) return;
     const reason = ev.reason ? ` ${ev.reason}` : "";
     const code = ev.code ? ` (${ev.code})` : "";
-    notice(`WebSocket closed${code}.${reason}`, "error");
+    const message = ws._giskardHadError
+      ? `WebSocket connection failed${code}.${reason} Reconnecting...`
+      : `Connection lost${code}.${reason} Reconnecting...`;
+    if (ws._giskardHadError) surfaceWsProblem(message, "warning");
+    scheduleWsReconnect(message);
   };
 }
-function setWsStatus(status) {
+function setWsStatus(status, detail) {
   state.wsStatus = status;
+  state.wsStatusDetail = detail || wsStatusLabel(status);
+  renderWsStatus();
   updateComposerControls();
 }
 function updateComposerControls() {
   const ready = state.wsStatus==="open";
-  const connecting = state.wsStatus==="connecting";
-  $("sendBtn").disabled = state.activeTurn || (!ready && !connecting);
+  $("sendBtn").disabled = state.activeTurn || !ready;
   $("stopBtn").hidden = !state.activeTurn;
   $("stopBtn").disabled = !ready || state.interruptPending;
   $("stopBtn").textContent = state.interruptPending ? "Stopping…" : "Stop";
-  $("modelSel").disabled = !state.threadId;
-  $("modelPickerBtn").disabled = !state.threadId;
-  $("effortSel").disabled = !state.threadId;
+  $("modelSel").disabled = !state.threadId || !ready;
+  $("modelPickerBtn").disabled = !state.threadId || !ready;
+  $("effortSel").disabled = !state.threadId || !ready;
   const compactBtn = $("compactBtn");
   if (compactBtn) {
     compactBtn.disabled = !state.threadId || state.activeTurn || state.compactPending || !ready;
     compactBtn.textContent = state.compactPending ? "Compacting..." : "Compact context";
   }
-  $("input").disabled = state.wsStatus==="closed";
+  $("input").disabled = !state.threadId;
   $("input").placeholder =
     state.activeTurn ? "Agent is running… draft the next message here." :
     state.wsStatus==="open" ? "Message the agent…  (Enter to send, Shift+Enter for newline)" :
     state.wsStatus==="connecting" ? "Connecting to agent…" :
-    "WebSocket disconnected";
-  $("approvalSel").disabled = !state.threadId;
-  $("modeSel").disabled = !state.threadId;
-  $("turnPickerBtn").disabled = !state.threadId;
+    state.wsStatus==="reconnecting" ? "Reconnecting to agent… keep drafting here." :
+    "Disconnected from agent.";
+  $("approvalSel").disabled = !state.threadId || !ready;
+  $("modeSel").disabled = !state.threadId || !ready;
+  $("turnPickerBtn").disabled = !state.threadId || !ready;
 }
 function setTurnActive(active) {
   state.activeTurn = active;
   if (!active) state.interruptPending = false;
   updateComposerControls();
 }
-function flushPendingClientMsgs() {
-  const pending = state.pendingClientMsgs.splice(0);
-  for (const msg of pending) send(msg);
-}
-function send(obj, opts) {
-  opts = opts || {};
-  if (state.ws && state.ws.readyState===1) {
+function send(obj) {
+  if (wsIsOpen()) {
     state.ws.send(JSON.stringify(obj));
-    return true;
-  }
-  if (opts.queue && state.wsStatus==="connecting") {
-    state.pendingClientMsgs.push(obj);
     return true;
   }
   return false;
 }
+function reconnectIfNeeded(reason) {
+  if (!state.threadId || wsIsOpen()) return;
+  state.wsReconnectAttempt = 0;
+  connectWs({ reconnect:true, reason });
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") reconnectIfNeeded("tab visible");
+});
+window.addEventListener("online", () => {
+  reconnectIfNeeded("network online");
+});
+window.addEventListener("offline", () => {
+  if (!state.threadId || state.wsStatus === "closed") return;
+  clearWsReconnectTimer();
+  setWsStatus("reconnecting", "Network is offline. Reconnect will resume when the network returns.");
+  surfaceWsProblem("Network is offline. Reconnect will resume when the network returns.", "warning");
+});
 function failPendingUserMessage(text) {
   if (!state.pendingUserEl) return;
   state.pendingUserEl.classList.remove("pending");
@@ -3967,10 +4077,15 @@ function sendInput() {
     notice("Wait for the current turn to finish, or stop it first.", "warning");
     return;
   }
+  if (!wsIsOpen()) {
+    notice(`Message not sent: WebSocket is ${state.wsStatus}.`, "warning");
+    reconnectIfNeeded("send requested while disconnected");
+    return;
+  }
   const body = bubble("user pending","you");
   body.textContent = text;
   const msgEl = body.parentElement;
-  if (!send({ type:"send_input", thread_id: state.threadId, text }, { queue:true })) {
+  if (!send({ type:"send_input", thread_id: state.threadId, text })) {
     msgEl.classList.remove("pending");
     msgEl.classList.add("failed");
     notice(`Message not sent: WebSocket is ${state.wsStatus}.`, "error");
@@ -4032,7 +4147,7 @@ $("approvalSel").onchange = () => {
     setApprovalPolicy(previous);
     return;
   }
-  if (send({ type:"set_approval_policy", thread_id: state.threadId, policy }, { queue:true })) {
+  if (send({ type:"set_approval_policy", thread_id: state.threadId, policy })) {
     setApprovalPolicy(policy);
   } else {
     setApprovalPolicy(previous);

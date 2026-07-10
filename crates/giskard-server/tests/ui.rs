@@ -632,16 +632,38 @@ async fn index_page_is_served_and_public() {
         "transcript command rows expose running command state"
     );
     assert!(
-        body.contains("pendingClientMsgs"),
-        "messages are queued while WS connects"
+        body.contains("function scheduleWsReconnect(reason)")
+            && body.contains("WS_RECONNECT_BASE_MS")
+            && body.contains("WS_RECONNECT_MAX_MS"),
+        "UI reconnects the WebSocket with bounded backoff"
+    );
+    assert!(
+        body.contains("visibilitychange")
+            && body.contains("window.addEventListener(\"online\"")
+            && body.contains("window.addEventListener(\"offline\""),
+        "UI reconnects on tab focus and network recovery"
+    );
+    assert!(
+        body.contains("id=\"wsStatusBadge\"")
+            && body.contains("function renderWsStatus()")
+            && body.contains("state-reconnecting"),
+        "UI exposes persistent connection status without toast spam"
     );
     assert!(
         body.contains("Connecting to agent"),
         "UI exposes WS connecting state"
     );
     assert!(
-        body.contains("WebSocket closed"),
-        "UI surfaces WS close failures"
+        body.contains("Reconnecting to agent"),
+        "UI exposes WS reconnecting state"
+    );
+    assert!(
+        body.contains("$(\"sendBtn\").disabled = state.activeTurn || !ready"),
+        "UI blocks new sends until the WebSocket is open"
+    );
+    assert!(
+        body.contains("WebSocket connection failed. Reconnecting"),
+        "foreground connection failures remain visible"
     );
     assert!(
         body.contains("Invalid WebSocket message from server"),
