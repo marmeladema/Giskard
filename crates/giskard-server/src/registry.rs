@@ -5,7 +5,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use chrono::Utc;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
@@ -604,6 +604,18 @@ async fn forward_events(
     loop {
         match stream.recv().await {
             Ok(event) => {
+                let event_thread = event_thread_id(&event);
+                if event_thread != thread_id {
+                    error!(
+                        %thread_id,
+                        event_thread_id = %event_thread,
+                        event_kind = event_kind(&event),
+                        event_turn_id = ?event_turn_id(&event),
+                        "dropping harness event for a different thread"
+                    );
+                    continue;
+                }
+
                 if should_skip_duplicate_notice(&event, &mut seen_notices) {
                     continue;
                 }
@@ -991,6 +1003,40 @@ fn event_turn_id(event: &AgentEvent) -> Option<TurnId> {
     }
 }
 
+fn event_thread_id(event: &AgentEvent) -> ThreadId {
+    match event {
+        AgentEvent::ThreadOpened { thread, .. }
+        | AgentEvent::TurnStarted { thread, .. }
+        | AgentEvent::ItemStarted { thread, .. }
+        | AgentEvent::ItemDelta { thread, .. }
+        | AgentEvent::ItemCompleted { thread, .. }
+        | AgentEvent::DiffUpdated { thread, .. }
+        | AgentEvent::ApprovalRequested { thread, .. }
+        | AgentEvent::ServerRequestReceived { thread, .. }
+        | AgentEvent::ServerRequestResolved { thread, .. }
+        | AgentEvent::TurnCompleted { thread, .. }
+        | AgentEvent::Error { thread, .. }
+        | AgentEvent::Notice { thread, .. } => *thread,
+    }
+}
+
+fn event_kind(event: &AgentEvent) -> &'static str {
+    match event {
+        AgentEvent::ThreadOpened { .. } => "thread_opened",
+        AgentEvent::TurnStarted { .. } => "turn_started",
+        AgentEvent::ItemStarted { .. } => "item_started",
+        AgentEvent::ItemDelta { .. } => "item_delta",
+        AgentEvent::ItemCompleted { .. } => "item_completed",
+        AgentEvent::DiffUpdated { .. } => "diff_updated",
+        AgentEvent::ApprovalRequested { .. } => "approval_requested",
+        AgentEvent::ServerRequestReceived { .. } => "server_request_received",
+        AgentEvent::ServerRequestResolved { .. } => "server_request_resolved",
+        AgentEvent::TurnCompleted { .. } => "turn_completed",
+        AgentEvent::Error { .. } => "error",
+        AgentEvent::Notice { .. } => "notice",
+    }
+}
+
 async fn apply_running_command_event(
     running_commands: &RunningTaskStore,
     event: &AgentEvent,
@@ -1228,6 +1274,7 @@ async fn persist_turn(
             thread_id,
             ServerMessage::TokenUpdate {
                 scope: TokenScope::Thread,
+                thread_id: Some(thread_id),
                 ledger: ledger_json,
             },
         )
@@ -1240,10 +1287,13 @@ mod tests {
     use std::sync::Arc;
 
     use chrono::Utc;
+    use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalRequest};
+    use giskard_core::error::HarnessError;
     use giskard_core::event::AgentEvent;
-    use giskard_core::ids::{ItemId, ProjectId, ThreadId, TurnId};
-    use giskard_core::item::{Item, ItemPayload};
+    use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
+    use giskard_core::item::{CommandExecutionStart, Item, ItemKind, ItemPayload, ItemStart};
     use giskard_core::model::ModelRef;
+    use giskard_core::server_request::ServerRequest;
     use giskard_core::token::{TokenLedger, TokenUsage};
     use giskard_core::turn::{ApprovalPolicy, Mode, TurnStatus, TurnStatusKind};
     use giskard_core::user_input::UserInput;
@@ -1404,6 +1454,265 @@ mod tests {
         assert_eq!(saved[0].user_input, UserInput::text("first"));
         assert_eq!(saved[1].id, second_turn);
         assert_eq!(saved[1].user_input, UserInput::text("second"));
+    }
+
+    #[tokio::test]
+    async fn live_turn_forwarder_ignores_events_for_other_threads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let other_thread_id = ThreadId::new();
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: None,
+        };
+        store
+            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .await
+            .unwrap();
+        let now = Utc::now();
+        store
+            .save_thread(
+                project_id,
+                &ThreadFile {
+                    version: 1,
+                    id: thread_id,
+                    project_id,
+                    title: "target".into(),
+                    harness_thread_id: "th_target".into(),
+                    mode: Mode::Build,
+                    current_model: model.clone(),
+                    context_window: 128_000,
+                    approval_policy: ApprovalPolicy::Ask,
+                    model_efforts: Default::default(),
+                    tokens: TokenLedger::default(),
+                    created_at: now,
+                    updated_at: now,
+                    archived: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let (tx, _) = broadcast::channel(64);
+        let hub = Arc::new(Hub::new());
+        let live_buffers = Arc::new(LiveBufferStore::new());
+        let running_commands = Arc::new(RunningTaskStore::new());
+        let approvals = Arc::new(Mutex::new(Default::default()));
+        let server_requests = Arc::new(Mutex::new(Default::default()));
+        let ledger = ledger::spawn(store.clone());
+        let (client_tx, mut client_rx) = mpsc::channel(16);
+        hub.subscribe(thread_id, 1, client_tx).await;
+
+        spawn_forwarder(
+            thread_id,
+            project_id,
+            AgentEventStream::new(tx.subscribe()),
+            hub,
+            live_buffers.clone(),
+            running_commands,
+            store.clone(),
+            approvals,
+            server_requests,
+            ledger,
+            model,
+            "target",
+        );
+        let foreign_turn = TurnId::new();
+        for event in turn_events(
+            other_thread_id,
+            foreign_turn,
+            "foreign",
+            "wrong",
+            TokenUsage::new(99, 1),
+        ) {
+            tx.send(event).unwrap();
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        let saved = store.load_all_turns(project_id, thread_id).await.unwrap();
+        assert!(
+            saved.is_empty(),
+            "events for another thread must not be persisted into the target thread"
+        );
+        assert!(
+            live_buffers.snapshot(thread_id).await.is_none(),
+            "events for another thread must not create a live snapshot"
+        );
+        assert!(
+            matches!(
+                client_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "events for another thread must not be broadcast to target-thread subscribers"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_turn_forwarder_rejects_foreign_side_effect_events() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let other_thread_id = ThreadId::new();
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: None,
+        };
+        store
+            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .await
+            .unwrap();
+        let now = Utc::now();
+        store
+            .save_thread(
+                project_id,
+                &ThreadFile {
+                    version: 1,
+                    id: thread_id,
+                    project_id,
+                    title: "target".into(),
+                    harness_thread_id: "th_target".into(),
+                    mode: Mode::Build,
+                    current_model: model.clone(),
+                    context_window: 128_000,
+                    approval_policy: ApprovalPolicy::Ask,
+                    model_efforts: Default::default(),
+                    tokens: TokenLedger::default(),
+                    created_at: now,
+                    updated_at: now,
+                    archived: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let (tx, _) = broadcast::channel(64);
+        let hub = Arc::new(Hub::new());
+        let live_buffers = Arc::new(LiveBufferStore::new());
+        let running_commands = Arc::new(RunningTaskStore::new());
+        let approvals = Arc::new(Mutex::new(Default::default()));
+        let server_requests = Arc::new(Mutex::new(Default::default()));
+        let ledger = ledger::spawn(store.clone());
+        let (client_tx, mut client_rx) = mpsc::channel(16);
+        hub.subscribe(thread_id, 1, client_tx).await;
+
+        spawn_forwarder(
+            thread_id,
+            project_id,
+            AgentEventStream::new(tx.subscribe()),
+            hub,
+            live_buffers.clone(),
+            running_commands.clone(),
+            store.clone(),
+            approvals.clone(),
+            server_requests.clone(),
+            ledger,
+            model,
+            "target",
+        );
+
+        let foreign_turn = TurnId::new();
+        let foreign_item = ItemId::new();
+        let approval_id = ApprovalId("foreign_approval".into());
+        let server_request_id = ServerRequestId("foreign_request".into());
+        let foreign_events = vec![
+            AgentEvent::Notice {
+                thread: other_thread_id,
+                turn: None,
+                message: "wrong thread notice".into(),
+            },
+            AgentEvent::Error {
+                thread: other_thread_id,
+                turn: None,
+                error: HarnessError::Protocol("wrong thread error".into()),
+            },
+            AgentEvent::ApprovalRequested {
+                thread: other_thread_id,
+                turn: foreign_turn,
+                request: ApprovalRequest {
+                    id: approval_id.clone(),
+                    kind: ApprovalKind::CommandExecution {
+                        command: "sleep 60".into(),
+                        cwd: "/tmp/test".into(),
+                    },
+                    reason: Some("wrong thread approval".into()),
+                    metadata: Vec::new(),
+                    available: vec![ApprovalDecision::Accept, ApprovalDecision::Cancel],
+                },
+            },
+            AgentEvent::ServerRequestReceived {
+                thread: other_thread_id,
+                turn: Some(foreign_turn),
+                request: ServerRequest {
+                    id: server_request_id.clone(),
+                    method: "tool/request_user_input".into(),
+                    params: serde_json::json!({"message": "wrong thread request"}),
+                    received_at: Utc::now(),
+                },
+            },
+            AgentEvent::ItemStarted {
+                thread: other_thread_id,
+                turn: foreign_turn,
+                item: ItemStart {
+                    id: foreign_item,
+                    harness_item_id: "foreign_command".into(),
+                    kind: ItemKind::CommandExecution,
+                    command: Some(CommandExecutionStart {
+                        command: "sleep 60".into(),
+                        cwd: "/tmp/test".into(),
+                        status: Some("running".into()),
+                        process_id: Some("foreign_process".into()),
+                        started_at_ms: Some(1),
+                    }),
+                    tool: None,
+                },
+            },
+        ];
+
+        for event in foreign_events {
+            tx.send(event).unwrap();
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        assert!(
+            store
+                .load_all_turns(project_id, thread_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "foreign events must not be persisted into the target thread"
+        );
+        assert!(
+            live_buffers.snapshot(thread_id).await.is_none(),
+            "foreign events must not create target-thread live state"
+        );
+        assert!(
+            running_commands.snapshot(thread_id).await.is_empty(),
+            "foreign running commands must not appear in the target-thread task list"
+        );
+        assert!(
+            approvals.lock().await.get(&approval_id).is_none(),
+            "foreign approvals must not register against the target thread"
+        );
+        assert!(
+            server_requests
+                .lock()
+                .await
+                .get(&server_request_id)
+                .is_none(),
+            "foreign server requests must not register against the target thread"
+        );
+        assert!(
+            matches!(
+                client_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "foreign notices/errors must not be broadcast to target-thread subscribers"
+        );
     }
 
     #[tokio::test]

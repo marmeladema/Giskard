@@ -1261,6 +1261,7 @@ async function connectWs() {
     flushPendingClientMsgs();
   };
   ws.onmessage = (m) => {
+    if (state.ws !== ws) return;
     try {
       handleServer(JSON.parse(m.data));
     } catch (e) {
@@ -1339,14 +1340,53 @@ function failPendingUserMessage(text) {
   if (text) notice(text, "error");
 }
 
+function serverMessageThreadId(msg) {
+  if (!msg) return null;
+  if (msg.thread_id !== undefined && msg.thread_id !== null) return String(msg.thread_id);
+  if (msg.error && msg.error.thread_id !== undefined && msg.error.thread_id !== null) {
+    return String(msg.error.thread_id);
+  }
+  if (msg.state && msg.state.thread_id !== undefined && msg.state.thread_id !== null) {
+    return String(msg.state.thread_id);
+  }
+  return null;
+}
+function isThreadScopedServerMessage(msg) {
+  if (!msg) return false;
+  switch (msg.type) {
+    case "thread_state":
+    case "history_page":
+    case "live_turn_snapshot":
+    case "running_tasks":
+    case "event":
+    case "approval_request":
+      return true;
+    case "token_update":
+      return msg.scope === "thread";
+    case "error":
+      return serverMessageThreadId(msg) !== null;
+    default:
+      return false;
+  }
+}
+function isCurrentThreadServerMessage(msg) {
+  if (!isThreadScopedServerMessage(msg)) return true;
+  const messageThreadId = serverMessageThreadId(msg);
+  if (!messageThreadId || !state.threadId) return false;
+  return messageThreadId === String(state.threadId);
+}
+
 function handleServer(msg) {
+  if (!isCurrentThreadServerMessage(msg)) return;
   switch (msg.type) {
     case "thread_state": renderThreadState(msg.state); break;
     case "history_page": renderHistoryPage(msg); break;
     case "live_turn_snapshot": renderLiveTurnSnapshot(msg); break;
     case "running_tasks": renderRunningCommandSnapshot(msg.tasks || []); break;
     case "event": handleEvent(msg.agent_event); break;
-    case "token_update": renderTokens(msg.ledger); break;
+    case "token_update":
+      if (msg.scope === "thread") renderTokens(msg.ledger);
+      break;
     case "approval_request": renderApprovalRequest(msg.request); break;
     case "error":
       if (msg.action==="send_input" && state.pendingUserEl) {

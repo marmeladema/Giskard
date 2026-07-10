@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use serde::Serialize;
 use serde_json::{Value, json};
+use tracing::warn;
 
 use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalMetadata, ApprovalRequest};
 use giskard_core::diff::{DiffHunk, DiffLine, FileDiff};
@@ -90,13 +91,27 @@ impl CodexMapper {
         self.thread_ids.insert(harness_thread_id, thread);
     }
 
-    /// Resolve a native thread id to its owned `ThreadId`, falling back to the thread in scope
-    /// when the message omits the id or it is not yet registered.
-    fn resolve_thread(&self, native: &str, fallback: ThreadId) -> ThreadId {
+    /// Resolve a native thread id to its owned `ThreadId`.
+    ///
+    /// Codex legitimately omits `threadId` on a few global messages; those keep using the caller's
+    /// scoped fallback. Once at least one native thread is registered, however, a non-empty unknown
+    /// native id is a routing bug and must not be relabeled as the fallback thread.
+    fn resolve_thread(&self, native: &str, fallback: ThreadId) -> Option<ThreadId> {
         if native.is_empty() {
-            return fallback;
+            return Some(fallback);
         }
-        self.thread_ids.get(native).copied().unwrap_or(fallback)
+        if let Some(thread) = self.thread_ids.get(native).copied() {
+            return Some(thread);
+        }
+        if self.thread_ids.is_empty() {
+            return Some(fallback);
+        }
+        warn!(
+            native_thread_id = native,
+            fallback_thread = %fallback,
+            "dropping Codex message for unknown native thread"
+        );
+        None
     }
 
     /// Resolve (get-or-mint) the owned `TurnId` for a native turn id.
@@ -122,7 +137,7 @@ impl CodexMapper {
     ) -> Option<AgentEvent> {
         match notif {
             Notification::TurnStarted(TurnStartedNotification { thread_id, turn }) => {
-                let thread = self.resolve_thread(thread_id, fallback_thread);
+                let thread = self.resolve_thread(thread_id, fallback_thread)?;
                 self.active_turns.insert(thread, turn.id.clone());
                 Some(AgentEvent::TurnStarted {
                     thread,
@@ -131,7 +146,7 @@ impl CodexMapper {
             }
 
             Notification::TurnCompleted(TurnCompletedNotification { thread_id, turn }) => {
-                let thread = self.resolve_thread(thread_id, fallback_thread);
+                let thread = self.resolve_thread(thread_id, fallback_thread)?;
                 if self
                     .active_turns
                     .get(&thread)
@@ -155,6 +170,7 @@ impl CodexMapper {
             Notification::ThreadTokenUsageUpdated(n) => {
                 // Cache the last-turn usage breakdown; emit no Giskard event for the intermediate
                 // update (the usage is surfaced on `TurnCompleted`).
+                self.resolve_thread(&n.thread_id, fallback_thread)?;
                 if !n.turn_id.is_empty() {
                     self.turn_usage
                         .insert(n.turn_id.clone(), breakdown_to_usage(&n.token_usage.last));
@@ -169,7 +185,7 @@ impl CodexMapper {
                 turn_id,
                 ..
             }) => {
-                let thread = self.resolve_thread(thread_id, fallback_thread);
+                let thread = self.resolve_thread(thread_id, fallback_thread)?;
                 let turn = self.resolve_turn(turn_id);
                 let (harness_item_id, kind, command, tool) =
                     map_thread_item_start(item, *started_at_ms);
@@ -194,7 +210,7 @@ impl CodexMapper {
                 thread_id,
                 turn_id,
             }) => {
-                let thread = self.resolve_thread(thread_id, fallback_thread);
+                let thread = self.resolve_thread(thread_id, fallback_thread)?;
                 let turn = self.resolve_turn(turn_id);
                 let harness_item_id = thread_item_id(item);
                 let id = self.resolve_item(&harness_item_id);
@@ -222,7 +238,7 @@ impl CodexMapper {
                 turn_id,
                 ..
             }) => {
-                let thread = self.resolve_thread(thread_id, fallback_thread);
+                let thread = self.resolve_thread(thread_id, fallback_thread)?;
                 let turn = self.resolve_turn(turn_id);
                 Some(AgentEvent::ItemDelta {
                     thread,
@@ -285,7 +301,7 @@ impl CodexMapper {
                 turn_id,
                 ..
             }) => {
-                let thread = self.resolve_thread(thread_id, fallback_thread);
+                let thread = self.resolve_thread(thread_id, fallback_thread)?;
                 let turn = self.resolve_turn(turn_id);
                 Some(AgentEvent::DiffUpdated {
                     thread,
@@ -302,7 +318,7 @@ impl CodexMapper {
             }
 
             Notification::Error(n) => {
-                let thread = self.resolve_thread(&n.thread_id, fallback_thread);
+                let thread = self.resolve_thread(&n.thread_id, fallback_thread)?;
                 Some(AgentEvent::Error {
                     thread,
                     turn: None,
@@ -314,7 +330,7 @@ impl CodexMapper {
             }
 
             Notification::TurnPlanUpdated(n) => {
-                let thread = self.resolve_thread(&n.thread_id, fallback_thread);
+                let thread = self.resolve_thread(&n.thread_id, fallback_thread)?;
                 let turn = self.resolve_turn(&n.turn_id);
                 let mut lines = Vec::new();
                 if let Some(explanation) = &n.explanation {
@@ -336,7 +352,7 @@ impl CodexMapper {
             }
 
             Notification::ModelRerouted(n) => {
-                let thread = self.resolve_thread(&n.thread_id, fallback_thread);
+                let thread = self.resolve_thread(&n.thread_id, fallback_thread)?;
                 let turn = self.resolve_turn(&n.turn_id);
                 Some(self.activity_event(
                     thread,
@@ -349,7 +365,7 @@ impl CodexMapper {
             }
 
             Notification::ContextCompacted(n) => {
-                let thread = self.resolve_thread(&n.thread_id, fallback_thread);
+                let thread = self.resolve_thread(&n.thread_id, fallback_thread)?;
                 let turn = self.resolve_turn(&n.turn_id);
                 Some(AgentEvent::ItemCompleted {
                     thread,
@@ -374,7 +390,7 @@ impl CodexMapper {
                     .thread_id
                     .as_deref()
                     .map(|id| self.resolve_thread(id, fallback_thread))
-                    .unwrap_or(fallback_thread);
+                    .unwrap_or(Some(fallback_thread))?;
                 Some(AgentEvent::Notice {
                     thread,
                     turn: None,
@@ -396,7 +412,7 @@ impl CodexMapper {
             }),
 
             Notification::GuardianWarning(n) => {
-                let thread = self.resolve_thread(&n.thread_id, fallback_thread);
+                let thread = self.resolve_thread(&n.thread_id, fallback_thread)?;
                 Some(AgentEvent::Notice {
                     thread,
                     turn: None,
@@ -489,7 +505,7 @@ impl CodexMapper {
         if text.is_empty() {
             return None;
         }
-        let thread = self.resolve_thread(thread_id, fallback_thread);
+        let thread = self.resolve_thread(thread_id, fallback_thread)?;
         let turn = self.resolve_turn(turn_id);
         Some(AgentEvent::ItemDelta {
             thread,
@@ -533,12 +549,12 @@ impl CodexMapper {
         id: &RequestId,
         request: &CodexServerRequest,
         fallback_thread: ThreadId,
-    ) -> AgentEvent {
+    ) -> Option<AgentEvent> {
         let req_id = request_id_to_string(id);
 
         match request {
             CodexServerRequest::CmdExecApproval(params) => {
-                let thread = self.resolve_thread(&params.thread_id, fallback_thread);
+                let thread = self.resolve_thread(&params.thread_id, fallback_thread)?;
                 let turn = self.resolve_turn(&params.turn_id);
                 let approval_id = ApprovalId(req_id);
                 self.pending_approval_responses.insert(
@@ -548,7 +564,7 @@ impl CodexMapper {
                         kind: PendingApprovalResponseKind::Decision,
                     },
                 );
-                AgentEvent::ApprovalRequested {
+                Some(AgentEvent::ApprovalRequested {
                     thread,
                     turn,
                     request: ApprovalRequest {
@@ -570,10 +586,10 @@ impl CodexMapper {
                             ApprovalDecision::Cancel,
                         ],
                     },
-                }
+                })
             }
             CodexServerRequest::FileChangeApproval(params) => {
-                let thread = self.resolve_thread(&params.thread_id, fallback_thread);
+                let thread = self.resolve_thread(&params.thread_id, fallback_thread)?;
                 let turn = self.resolve_turn(&params.turn_id);
                 let approval_id = ApprovalId(req_id);
                 self.pending_approval_responses.insert(
@@ -583,7 +599,7 @@ impl CodexMapper {
                         kind: PendingApprovalResponseKind::Decision,
                     },
                 );
-                AgentEvent::ApprovalRequested {
+                Some(AgentEvent::ApprovalRequested {
                     thread,
                     turn,
                     request: ApprovalRequest {
@@ -605,10 +621,10 @@ impl CodexMapper {
                             ApprovalDecision::Cancel,
                         ],
                     },
-                }
+                })
             }
             CodexServerRequest::PermissionsRequestApproval(params) => {
-                let thread = self.resolve_thread(&params.thread_id, fallback_thread);
+                let thread = self.resolve_thread(&params.thread_id, fallback_thread)?;
                 let turn = self.resolve_turn(&params.turn_id);
                 let permissions = serde_json::to_value(&params.permissions).unwrap_or_default();
                 let approval_id = ApprovalId(req_id);
@@ -621,7 +637,7 @@ impl CodexMapper {
                         },
                     },
                 );
-                AgentEvent::ApprovalRequested {
+                Some(AgentEvent::ApprovalRequested {
                     thread,
                     turn,
                     request: ApprovalRequest {
@@ -638,13 +654,13 @@ impl CodexMapper {
                             ApprovalDecision::Cancel,
                         ],
                     },
-                }
+                })
             }
             CodexServerRequest::ExecCommandApproval(params) => {
                 let thread = self.thread_from_native_value(
                     serde_json::to_value(&params.conversation_id).ok().as_ref(),
                     fallback_thread,
-                );
+                )?;
                 let turn = self
                     .active_turns
                     .get(&thread)
@@ -659,7 +675,7 @@ impl CodexMapper {
                         kind: PendingApprovalResponseKind::LegacyReviewDecision,
                     },
                 );
-                AgentEvent::ApprovalRequested {
+                Some(AgentEvent::ApprovalRequested {
                     thread,
                     turn,
                     request: ApprovalRequest {
@@ -677,13 +693,13 @@ impl CodexMapper {
                             ApprovalDecision::Cancel,
                         ],
                     },
-                }
+                })
             }
             CodexServerRequest::ApplyPatchApproval(params) => {
                 let thread = self.thread_from_native_value(
                     serde_json::to_value(&params.conversation_id).ok().as_ref(),
                     fallback_thread,
-                );
+                )?;
                 let turn = self
                     .active_turns
                     .get(&thread)
@@ -698,7 +714,7 @@ impl CodexMapper {
                         kind: PendingApprovalResponseKind::LegacyReviewDecision,
                     },
                 );
-                AgentEvent::ApprovalRequested {
+                Some(AgentEvent::ApprovalRequested {
                     thread,
                     turn,
                     request: ApprovalRequest {
@@ -716,10 +732,10 @@ impl CodexMapper {
                             ApprovalDecision::Cancel,
                         ],
                     },
-                }
+                })
             }
             _ => {
-                let (thread, turn) = self.server_request_scope(request, fallback_thread);
+                let (thread, turn) = self.server_request_scope(request, fallback_thread)?;
                 let server_request_id = ServerRequestId(req_id);
                 self.pending_server_requests.insert(
                     server_request_id.clone(),
@@ -729,7 +745,7 @@ impl CodexMapper {
                         turn,
                     },
                 );
-                AgentEvent::ServerRequestReceived {
+                Some(AgentEvent::ServerRequestReceived {
                     thread,
                     turn,
                     request: GiskardServerRequest {
@@ -738,7 +754,7 @@ impl CodexMapper {
                         params: server_request_params(request),
                         received_at: Utc::now(),
                     },
-                }
+                })
             }
         }
     }
@@ -792,19 +808,19 @@ impl CodexMapper {
         &mut self,
         request: &CodexServerRequest,
         fallback_thread: ThreadId,
-    ) -> (ThreadId, Option<TurnId>) {
+    ) -> Option<(ThreadId, Option<TurnId>)> {
         match request {
             CodexServerRequest::ToolRequestUserInput(params) => {
-                let thread = self.resolve_thread(&params.thread_id, fallback_thread);
+                let thread = self.resolve_thread(&params.thread_id, fallback_thread)?;
                 let turn = (!params.turn_id.is_empty()).then(|| self.resolve_turn(&params.turn_id));
-                (thread, turn)
+                Some((thread, turn))
             }
             CodexServerRequest::ItemToolCall(params) => {
-                let thread = self.resolve_thread(&params.thread_id, fallback_thread);
+                let thread = self.resolve_thread(&params.thread_id, fallback_thread)?;
                 let turn = (!params.turn_id.is_empty()).then(|| self.resolve_turn(&params.turn_id));
-                (thread, turn)
+                Some((thread, turn))
             }
-            _ => (fallback_thread, None),
+            _ => Some((fallback_thread, None)),
         }
     }
 
@@ -812,7 +828,7 @@ impl CodexMapper {
         &self,
         native_value: Option<&Value>,
         fallback_thread: ThreadId,
-    ) -> ThreadId {
+    ) -> Option<ThreadId> {
         let native = native_value.and_then(Value::as_str).unwrap_or_default();
         self.resolve_thread(native, fallback_thread)
     }
@@ -2218,6 +2234,89 @@ mod tests {
     }
 
     #[test]
+    fn unknown_native_thread_notification_is_rejected_after_registration() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let fallback = ThreadId::new();
+        mapper.register_thread("known".into(), fallback);
+
+        assert!(
+            mapper
+                .map_notification(&turn_started("turn1"), fallback)
+                .is_none()
+        );
+        assert_eq!(mapper.active_native_turn_for_thread(fallback), None);
+    }
+
+    #[test]
+    fn unknown_native_thread_usage_is_not_cached_after_registration() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let fallback = ThreadId::new();
+        mapper.register_thread("known".into(), fallback);
+
+        let usage_notif = Notification::ThreadTokenUsageUpdated(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "unknown",
+                "turnId": "turn1",
+                "tokenUsage": {
+                    "last": {
+                        "cachedInputTokens": 0, "inputTokens": 123,
+                        "outputTokens": 45, "reasoningOutputTokens": 0, "totalTokens": 168
+                    },
+                    "total": {
+                        "cachedInputTokens": 0, "inputTokens": 123,
+                        "outputTokens": 45, "reasoningOutputTokens": 0, "totalTokens": 168
+                    }
+                }
+            }))
+            .unwrap(),
+        );
+        assert!(mapper.map_notification(&usage_notif, fallback).is_none());
+
+        let completed = Notification::TurnCompleted(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "known",
+                "turn": { "id": "turn1", "status": "completed" }
+            }))
+            .unwrap(),
+        );
+        match mapper.map_notification(&completed, fallback).unwrap() {
+            AgentEvent::TurnCompleted { usage, .. } => {
+                assert_eq!(usage, TokenUsage::default());
+            }
+            other => panic!("expected TurnCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_native_thread_server_request_is_rejected_after_registration() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let fallback = ThreadId::new();
+        mapper.register_thread("known".into(), fallback);
+        let request = CodexServerRequest::ItemToolCall(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "unknown",
+                "turnId": "turn1",
+                "callId": "call1",
+                "namespace": "cf-mcp",
+                "tool": "wiki_search",
+                "arguments": { "query": "test" }
+            }))
+            .unwrap(),
+        );
+
+        assert!(
+            mapper
+                .map_server_request(&RequestId::Integer(42), &request, fallback)
+                .is_none()
+        );
+        assert!(
+            mapper
+                .pending_server_request(&ServerRequestId("42".into()))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn file_change_item_preserves_all_changed_paths() {
         let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
         let notif = completed_item(serde_json::json!({
@@ -2324,7 +2423,10 @@ mod tests {
         );
         let request_id = RequestId::String("perm_req".into());
 
-        match mapper.map_server_request(&request_id, &request, ThreadId::new()) {
+        match mapper
+            .map_server_request(&request_id, &request, ThreadId::new())
+            .unwrap()
+        {
             AgentEvent::ApprovalRequested { request, .. } => {
                 assert_eq!(request.id, ApprovalId("perm_req".into()));
                 assert!(matches!(request.kind, ApprovalKind::Permission { .. }));
@@ -2411,7 +2513,7 @@ mod tests {
             .unwrap(),
         );
         let request_id = RequestId::String("perm_req".into());
-        mapper.map_server_request(&request_id, &request, ThreadId::new());
+        let _ = mapper.map_server_request(&request_id, &request, ThreadId::new());
 
         match mapper
             .map_approval_response(&ApprovalId("perm_req".into()), &ApprovalDecision::Decline)
@@ -2471,11 +2573,14 @@ mod tests {
             .unwrap(),
         );
 
-        match mapper.map_server_request(
-            &RequestId::String("cmd_req".into()),
-            &request,
-            ThreadId::new(),
-        ) {
+        match mapper
+            .map_server_request(
+                &RequestId::String("cmd_req".into()),
+                &request,
+                ThreadId::new(),
+            )
+            .unwrap()
+        {
             AgentEvent::ApprovalRequested { request, .. } => match request.kind {
                 ApprovalKind::CommandExecution { command, .. } => {
                     assert_eq!(command, "rg marmeladema tf");
@@ -2544,11 +2649,14 @@ mod tests {
             .unwrap(),
         );
 
-        match mapper.map_server_request(
-            &RequestId::String("cmd_req".into()),
-            &request,
-            ThreadId::new(),
-        ) {
+        match mapper
+            .map_server_request(
+                &RequestId::String("cmd_req".into()),
+                &request,
+                ThreadId::new(),
+            )
+            .unwrap()
+        {
             AgentEvent::ApprovalRequested { request, .. } => {
                 assert!(request.metadata.is_empty());
             }
@@ -2570,7 +2678,7 @@ mod tests {
             }))
             .unwrap(),
         );
-        mapper.map_server_request(
+        let _ = mapper.map_server_request(
             &RequestId::String("cmd_req".into()),
             &request,
             ThreadId::new(),
@@ -2609,11 +2717,14 @@ mod tests {
             }))
             .unwrap(),
         );
-        match mapper.map_server_request(
-            &RequestId::String("file_req".into()),
-            &request,
-            ThreadId::new(),
-        ) {
+        match mapper
+            .map_server_request(
+                &RequestId::String("file_req".into()),
+                &request,
+                ThreadId::new(),
+            )
+            .unwrap()
+        {
             AgentEvent::ApprovalRequested { request, .. } => match request.kind {
                 ApprovalKind::FileChange { path, change } => {
                     assert_eq!(path, PathBuf::from("/tmp/project"));
@@ -2667,11 +2778,14 @@ mod tests {
             }))
             .unwrap(),
         );
-        match mapper.map_server_request(
-            &RequestId::String("patch_req".into()),
-            &request,
-            ThreadId::new(),
-        ) {
+        match mapper
+            .map_server_request(
+                &RequestId::String("patch_req".into()),
+                &request,
+                ThreadId::new(),
+            )
+            .unwrap()
+        {
             AgentEvent::ApprovalRequested { request, .. } => {
                 assert!(metadata_has_path(
                     &request.metadata,
@@ -2746,7 +2860,9 @@ mod tests {
             .unwrap(),
         );
         mapper.register_thread("thread1".into(), fallback);
-        let event = mapper.map_server_request(&RequestId::Integer(42), &request, ThreadId::new());
+        let event = mapper
+            .map_server_request(&RequestId::Integer(42), &request, ThreadId::new())
+            .unwrap();
 
         match event {
             AgentEvent::ServerRequestReceived {
@@ -2845,7 +2961,10 @@ mod tests {
         ];
 
         for (id, request, method, expected_thread) in cases {
-            match mapper.map_server_request(&RequestId::String(id.into()), &request, fallback) {
+            match mapper
+                .map_server_request(&RequestId::String(id.into()), &request, fallback)
+                .unwrap()
+            {
                 AgentEvent::ServerRequestReceived {
                     thread,
                     turn,
@@ -2875,11 +2994,14 @@ mod tests {
             params: Some(serde_json::json!({ "answer": 42 })),
         };
 
-        match mapper.map_server_request(
-            &RequestId::String("future_req".into()),
-            &request,
-            ThreadId::new(),
-        ) {
+        match mapper
+            .map_server_request(
+                &RequestId::String("future_req".into()),
+                &request,
+                ThreadId::new(),
+            )
+            .unwrap()
+        {
             AgentEvent::ServerRequestReceived { request, .. } => {
                 assert_eq!(request.id, ServerRequestId("future_req".into()));
                 assert_eq!(request.method, "future/request");
@@ -2922,11 +3044,14 @@ mod tests {
             .unwrap(),
         );
 
-        match mapper.map_server_request(
-            &RequestId::String("legacy_cmd".into()),
-            &request,
-            ThreadId::new(),
-        ) {
+        match mapper
+            .map_server_request(
+                &RequestId::String("legacy_cmd".into()),
+                &request,
+                ThreadId::new(),
+            )
+            .unwrap()
+        {
             AgentEvent::ApprovalRequested { request, .. } => match request.kind {
                 ApprovalKind::CommandExecution { command, cwd } => {
                     assert_eq!(command, "cargo test");

@@ -311,14 +311,12 @@ async fn open_thread(
                 })
                 .await?;
         }
-        if !model_changed {
-            if let Some(handle) = state.registry.get_thread_handle(thread_id).await {
-                return Ok(Json(OpenThreadResponse {
-                    thread_id: handle.thread,
-                    harness_thread_id: handle.harness_thread_id,
-                    warning: None,
-                }));
-            }
+        if let Some(handle) = state.registry.get_thread_handle(thread_id).await {
+            return Ok(Json(OpenThreadResponse {
+                thread_id: handle.thread,
+                harness_thread_id: handle.harness_thread_id,
+                warning: None,
+            }));
         }
 
         let handle = state

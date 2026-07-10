@@ -43,6 +43,9 @@ struct SlowCompactionFactory;
 struct SlowStartFactory {
     harness: Arc<SlowStartHarness>,
 }
+struct CountingOpenFactory {
+    harness: Arc<CountingOpenHarness>,
+}
 
 #[async_trait::async_trait]
 impl HarnessFactory for NoMcpFactory {
@@ -84,6 +87,16 @@ impl HarnessFactory for SlowStartFactory {
     }
 }
 
+#[async_trait::async_trait]
+impl HarnessFactory for CountingOpenFactory {
+    async fn create(
+        &self,
+        _config: &ProjectConfig,
+    ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
+        Ok(self.harness.clone())
+    }
+}
+
 struct NoMcpHarness;
 
 #[derive(Default)]
@@ -101,6 +114,12 @@ struct SlowStartHarness {
     start_calls: AtomicUsize,
     hold_first_start: AtomicBool,
     release_first_start: AtomicBool,
+}
+
+#[derive(Default)]
+struct CountingOpenHarness {
+    threads: tokio::sync::Mutex<HashMap<ThreadId, tokio::sync::broadcast::Sender<AgentEvent>>>,
+    open_calls: AtomicUsize,
 }
 
 impl SlowStartHarness {
@@ -132,6 +151,12 @@ impl SlowStartHarness {
 
     fn release_first_start(&self) {
         self.release_first_start.store(true, Ordering::SeqCst);
+    }
+}
+
+impl CountingOpenHarness {
+    fn open_calls(&self) -> usize {
+        self.open_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -489,6 +514,87 @@ impl AgentHarness for SlowStartHarness {
     }
 
     async fn compact_thread(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> Result<(), HarnessError> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentHarness for CountingOpenHarness {
+    fn capabilities(&self) -> HarnessCapabilities {
+        HarnessCapabilities {
+            live_approvals: false,
+            plan_build_modes: false,
+            per_turn_model: false,
+            reasoning_effort: false,
+            structured_diffs: false,
+            resumable_threads: true,
+            model_listing: false,
+            token_usage: false,
+            mcp_status: false,
+            mcp_reload: false,
+            mcp_oauth_login: false,
+            context_compaction: false,
+        }
+    }
+
+    async fn list_models(&self) -> Result<Vec<giskard_core::ModelDescriptor>, HarnessError> {
+        Ok(Vec::new())
+    }
+
+    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
+        self.open_calls.fetch_add(1, Ordering::SeqCst);
+        let thread = opts.thread.unwrap_or_default();
+        let (tx, _) = tokio::sync::broadcast::channel(16);
+        self.threads.lock().await.insert(thread, tx);
+        Ok(ThreadHandle {
+            thread,
+            harness_thread_id: opts.resume.unwrap_or_else(|| format!("count_{thread}")),
+            warning: None,
+        })
+    }
+
+    async fn start_turn(
+        &self,
+        _thread: &ThreadHandle,
+        _input: UserInput,
+        _overrides: TurnOverrides,
+    ) -> Result<TurnId, HarnessError> {
+        Err(HarnessError::Unsupported(
+            "turns are not supported by this harness".into(),
+        ))
+    }
+
+    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
+        if let Ok(threads) = self.threads.try_lock() {
+            if let Some(sender) = threads.get(&thread.thread) {
+                return AgentEventStream::new(sender.subscribe());
+            }
+        }
+        let (_, rx) = tokio::sync::broadcast::channel(1);
+        AgentEventStream::new(rx)
+    }
+
+    async fn respond_approval(
+        &self,
+        _req: ApprovalId,
+        _decision: ApprovalDecision,
+    ) -> Result<(), HarnessError> {
+        Ok(())
+    }
+
+    async fn respond_server_request(
+        &self,
+        _req: ServerRequestId,
+        _response: ServerRequestResponse,
+    ) -> Result<(), HarnessError> {
+        Ok(())
+    }
+
+    async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
         Ok(())
     }
 
@@ -977,6 +1083,13 @@ async fn start_slow_start_server_on_available_port(
 async fn start_custom_server_on_available_port(
     factory: Arc<dyn HarnessFactory>,
 ) -> (tempfile::TempDir, Arc<AppState>, u16) {
+    start_custom_server_with_extra_config_on_available_port(factory, "").await
+}
+
+async fn start_custom_server_with_extra_config_on_available_port(
+    factory: Arc<dyn HarnessFactory>,
+    extra_config: &str,
+) -> (tempfile::TempDir, Arc<AppState>, u16) {
     let tmp = tempfile::TempDir::new().unwrap();
 
     let hash = generate_password_hash("testpass");
@@ -989,6 +1102,8 @@ secure_cookies = false
 [auth]
 password_hash = "{hash}"
 session_days = 30
+
+{extra_config}
 "#
     );
     tokio::fs::write(tmp.path().join("config.toml"), config_toml)
@@ -3084,6 +3199,107 @@ wire_api = "responses"
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+
+    let saved_thread = state.store.load_thread(pid, tid).await.unwrap().unwrap();
+    assert_eq!(saved_thread.current_model.provider, "proxy");
+    assert_eq!(saved_thread.context_window, 262_144);
+}
+
+#[tokio::test]
+async fn open_thread_normalization_reuses_live_handle() {
+    let extra_config = r#"
+[[providers]]
+id = "proxy"
+name = "proxy"
+wire_api = "responses"
+
+  [[providers.models]]
+  id = "gpt-5.5"
+  display_name = "GPT-5.5"
+  context_window = 262144
+  supports_reasoning_effort = true
+"#;
+    let harness = Arc::new(CountingOpenHarness::default());
+    let (_tmp, state, port) = start_custom_server_with_extra_config_on_available_port(
+        Arc::new(CountingOpenFactory {
+            harness: harness.clone(),
+        }),
+        extra_config,
+    )
+    .await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let cookie = login_cookie(&client, &base).await;
+
+    let stale_model = ModelRef {
+        provider: "openai".into(),
+        model: "gpt-5.5".into(),
+        reasoning_effort: None,
+    };
+    let pid = ProjectId::new();
+    state
+        .store
+        .create_project(pid, "test-project", "/tmp/test", stale_model.clone())
+        .await
+        .unwrap();
+    let tid = ThreadId::new();
+    let now = chrono::Utc::now();
+    state
+        .store
+        .save_thread(
+            pid,
+            &giskard_persist::store::ThreadFile {
+                version: 1,
+                id: tid,
+                project_id: pid,
+                title: "Live stale thread".into(),
+                harness_thread_id: "th_live".into(),
+                mode: Mode::Build,
+                current_model: stale_model.clone(),
+                context_window: 128_000,
+                approval_policy: ApprovalPolicy::Ask,
+                model_efforts: Default::default(),
+                tokens: Default::default(),
+                created_at: now,
+                updated_at: now,
+                archived: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    let project_config = state.store.load_project(pid).await.unwrap().unwrap();
+    state
+        .registry
+        .open_thread(
+            &project_config,
+            "/tmp/test",
+            Some(tid),
+            Some("th_live".into()),
+            stale_model,
+        )
+        .await
+        .unwrap();
+    assert_eq!(harness.open_calls(), 1);
+
+    let resp = client
+        .post(format!("{base}/api/projects/{pid}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"thread_id": tid, "resume": null}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(body["harness_thread_id"], "th_live");
+    assert_eq!(
+        harness.open_calls(),
+        1,
+        "HTTP reopen must reuse the live registry handle"
+    );
 
     let saved_thread = state.store.load_thread(pid, tid).await.unwrap().unwrap();
     assert_eq!(saved_thread.current_model.provider, "proxy");
