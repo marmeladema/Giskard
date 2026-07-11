@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -37,6 +37,7 @@ use giskard_harness::{
 use mapping::CodexMapper;
 
 const BROADCAST_CAPACITY: usize = 256;
+const TURN_FIRST_EVENT_WARN_AFTER: Duration = Duration::from_secs(15);
 
 enum HarnessCommand {
     OpenThread {
@@ -1065,10 +1066,30 @@ async fn stream_turn_events(
 ) -> StreamOutcome {
     let thread_id = thread.thread;
     let mut active_turn: Option<TurnId> = Some(acknowledged_turn);
+    let stream_started = Instant::now();
+    let mut saw_server_message = false;
+    let mut warned_no_server_message = false;
+    let first_event_warning = tokio::time::sleep(TURN_FIRST_EVENT_WARN_AFTER);
+    tokio::pin!(first_event_warning);
 
     loop {
         let msg = tokio::select! {
-            msg = client.next_message() => msg,
+            msg = client.next_message() => {
+                saw_server_message = true;
+                msg
+            },
+            _ = &mut first_event_warning, if !saw_server_message && !warned_no_server_message => {
+                warned_no_server_message = true;
+                warn!(
+                    %thread_id,
+                    harness_thread_id = %thread.harness_thread_id,
+                    acknowledged_turn = %acknowledged_turn,
+                    ?active_turn,
+                    elapsed_ms = stream_started.elapsed().as_millis(),
+                    "Codex accepted turn/start but has not emitted a server message yet"
+                );
+                continue;
+            },
             control = control_rx.recv() => {
                 match handle_stream_control(client, mapper, senders, control).await {
                     StreamControlOutcome::Continue => continue,
@@ -1136,6 +1157,7 @@ async fn stream_turn_events(
                         if let Some(message) = mapping::fatal_turn_error(&notif) {
                             emit_fatal_turn_completion(senders, thread_id, active_turn, message)
                                 .await;
+                            mapper.clear_active_turn(thread_id);
                             break;
                         }
                     }

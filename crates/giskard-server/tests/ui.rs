@@ -1059,6 +1059,34 @@ fn browser_resubscribe_replaces_transient_transcript_state() {
 }
 
 #[test]
+fn browser_marks_turn_active_when_send_is_accepted() {
+    let body = index_html();
+    let send_input = between(
+        body,
+        "function sendInput() {",
+        "$(\"sendBtn\").onclick = sendInput;",
+    );
+    assert_order(
+        send_input,
+        "if (!send({ type:\"send_input\", thread_id: state.threadId, text }))",
+        "setTurnActive(true);",
+    );
+    assert_order(
+        send_input,
+        "setTurnActive(true);",
+        "state.pendingUserEl = msgEl;",
+    );
+
+    let error_case = between(body, "case \"error\":", "      break;\n  }");
+    assert!(
+        error_case.contains(
+            "if (msg.action===\"send_input\") {\n        setTurnActive(msg.code === \"thread_turn_active\");\n      }"
+        ),
+        "send_input errors must reconcile optimistic active-turn state"
+    );
+}
+
+#[test]
 fn browser_websocket_lifecycle_errors_are_not_toasted_directly() {
     let body = index_html();
 
