@@ -65,12 +65,17 @@ pub fn spawn(store: Arc<PersistStore>) -> LedgerHandle {
 }
 
 async fn actor(store: Arc<PersistStore>, mut rx: mpsc::Receiver<Record>) {
-    let mut global = store
-        .load_global_tokens()
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_default();
+    let mut global = match store.load_global_tokens().await {
+        Ok(Some(ledger)) => ledger,
+        Ok(None) => DailyTokenLedger::default(),
+        Err(error) => {
+            warn!(
+                %error,
+                "failed to load global token ledger; starting with an empty in-memory ledger"
+            );
+            DailyTokenLedger::default()
+        }
+    };
     let mut projects: HashMap<ProjectId, DailyTokenLedger> = HashMap::new();
 
     while let Some(first) = rx.recv().await {
@@ -107,12 +112,18 @@ async fn apply(
         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
         std::collections::hash_map::Entry::Vacant(e) => {
             // Hydrate the project ledger from disk on first touch so restarts accumulate.
-            let existing = store
-                .load_project_tokens(rec.project)
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_default();
+            let existing = match store.load_project_tokens(rec.project).await {
+                Ok(Some(ledger)) => ledger,
+                Ok(None) => DailyTokenLedger::default(),
+                Err(error) => {
+                    warn!(
+                        project_id = %rec.project,
+                        %error,
+                        "failed to load project token ledger; starting with an empty in-memory ledger"
+                    );
+                    DailyTokenLedger::default()
+                }
+            };
             e.insert(existing)
         }
     };

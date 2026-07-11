@@ -5,7 +5,7 @@ Giskard: a local-first, single-user web UI for agentic coding CLIs (Codex CLI fi
 Built in Rust (Dioxus fullstack + Axum). No npm/Node/JS toolchain.
 
 ## Specification
-`specs/giskard-specification.md` (v1.32) is the authoritative spec. Read it before making changes.
+`specs/giskard-specification.md` (v1.36) is the authoritative spec. Read it before making changes.
 
 ## Documentation
 `README.md` is the practical setup/usage guide and MUST be kept in sync with the code. Update it
@@ -56,3 +56,14 @@ Cargo workspace with 8 crates under `crates/`:
   - degraded-but-usable flows should surface warnings rather than fail silently.
 - Error paths need tests too. When adding or changing a failure mode, add focused coverage for the
   structured error, warning, log-adjacent behavior, or persisted recovery path as appropriate.
+- New async, WebSocket, harness, persistence, approval, command/tool, or cross-thread lifecycle
+  paths need useful observability at their boundaries. Prefer structured logs with stable fields
+  such as `project_id`, `thread_id`, `turn_id`, `action`, `method`, `command_id`, `tool_call_id`,
+  and the underlying error source when available.
+- Do not silently drop, coalesce, synthesize, or recover from protocol events without logging enough
+  context to diagnose why. Expected user/client failures should generally be `debug` or `warn`;
+  server invariants, data corruption, lost events, foreign-thread events, and unexpected harness
+  failures should be `warn` or `error`.
+- When adding a recovery path, timeout, idempotent close, deduplication rule, fallback completion,
+  or lifecycle cleanup, add focused tests for the failure path and make sure logs or browser-visible
+  errors explain what happened.

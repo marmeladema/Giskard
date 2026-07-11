@@ -97,6 +97,47 @@ cumulative totals can legitimately exceed the model's context window over a long
 
 ---
 
+## Logging
+
+`giskard-server` logs to the server process output using Rust's standard `RUST_LOG` filter syntax.
+When `RUST_LOG` is unset, the server defaults to:
+
+```bash
+giskard=info,tower_http=info
+```
+
+For normal debugging, start the server with Giskard logs at `debug`:
+
+```bash
+RUST_LOG=giskard=debug,tower_http=info giskard-server
+```
+
+From a checkout:
+
+```bash
+RUST_LOG=giskard=debug,tower_http=info \
+  cargo run --release -p giskard-server --bin giskard-server
+```
+
+For verbose turn-lifecycle, Codex harness, and HTTP request diagnostics, use `trace` selectively:
+
+```bash
+RUST_LOG=giskard=trace,giskard_harness_codex=trace,tower_http=debug giskard-server
+```
+
+If the output is too noisy, scope logging to the area being diagnosed. For example, this focuses on
+thread turn ownership and Codex harness events while keeping the rest of Giskard at `info`:
+
+```bash
+RUST_LOG=giskard_server::registry=trace,giskard_harness_codex=trace,giskard=info,tower_http=info \
+  giskard-server
+```
+
+Use `debug` first for most issues. `trace` can be very verbose, but it is useful when diagnosing
+stuck turns, harness protocol failures, WebSocket forwarding, or command/tool lifecycle bugs.
+
+---
+
 ## Configuration
 
 Config lives at `${GISKARD_DATA_DIR:-~/.local/share/giskard}/config.toml`. A fully annotated,

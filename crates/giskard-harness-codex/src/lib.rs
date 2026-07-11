@@ -1064,6 +1064,11 @@ async fn stream_turn_events(
         let msg = match msg {
             Ok(Some(msg)) => msg,
             Ok(None) => {
+                warn!(
+                    %thread_id,
+                    ?active_turn,
+                    "Codex stream ended before turn completion"
+                );
                 emit_incomplete_turn(
                     senders,
                     thread_id,
@@ -1075,13 +1080,12 @@ async fn stream_turn_events(
             }
             Err(e) => {
                 let message = e.to_string();
-                let event_message = message.clone();
-                let _ = broadcast_event(senders, thread_id, || AgentEvent::Error {
-                    thread: thread_id,
-                    turn: None,
-                    error: HarnessError::Transport(event_message),
-                })
-                .await;
+                warn!(
+                    %thread_id,
+                    ?active_turn,
+                    error = %message,
+                    "Codex stream failed before turn completion"
+                );
                 emit_incomplete_turn(
                     senders,
                     thread_id,
@@ -1117,6 +1121,13 @@ async fn stream_turn_events(
                             // Mint a turn id when the error arrived before any `turn/started` (e.g.
                             // an immediate quota rejection) so the failed attempt is still persisted.
                             let turn = active_turn.unwrap_or_default();
+                            warn!(
+                                %thread_id,
+                                ?active_turn,
+                                %turn,
+                                error = %message,
+                                "synthesizing failed turn completion from fatal Codex error notification"
+                            );
                             let _ =
                                 broadcast_event(senders, thread_id, || AgentEvent::TurnCompleted {
                                     thread: thread_id,
@@ -1424,8 +1435,8 @@ async fn emit_incomplete_turn(
     turn: Option<TurnId>,
     message: impl Into<String>,
 ) {
+    let message = message.into();
     if let Some(turn) = turn {
-        let message = message.into();
         let _ = broadcast_event(senders, thread, || AgentEvent::TurnCompleted {
             thread,
             turn,
@@ -1434,6 +1445,13 @@ async fn emit_incomplete_turn(
                 kind: TurnStatusKind::Failed,
                 message: Some(message),
             },
+        })
+        .await;
+    } else {
+        let _ = broadcast_event(senders, thread, || AgentEvent::Error {
+            thread,
+            turn: None,
+            error: HarnessError::Transport(message),
         })
         .await;
     }
@@ -1881,6 +1899,29 @@ mod tests {
             observe_pending_compaction(&mut pending, thread, &completed_event(thread, turn));
         assert!(completed.is_some());
         assert!(!pending.contains_key(&thread));
+    }
+
+    #[tokio::test]
+    async fn incomplete_stream_without_turn_emits_error_event() {
+        let thread = ThreadId::new();
+        let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
+        let (tx, mut rx) = broadcast::channel(BROADCAST_CAPACITY);
+        ensure_thread_sender(&senders, thread, tx);
+
+        emit_incomplete_turn(&senders, thread, None, "stream ended").await;
+
+        let event = rx.recv().await.unwrap();
+        match event {
+            AgentEvent::Error {
+                thread: got_thread,
+                turn: None,
+                error: HarnessError::Transport(message),
+            } => {
+                assert_eq!(got_thread, thread);
+                assert_eq!(message, "stream ended");
+            }
+            other => panic!("expected error event, got {other:?}"),
+        }
     }
 
     #[test]

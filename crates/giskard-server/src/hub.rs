@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::sync::{Mutex, mpsc};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::ThreadId;
@@ -68,7 +68,28 @@ impl Hub {
     pub async fn broadcast(&self, thread_id: ThreadId, msg: ServerMessage) {
         let mut subs = self.subs.lock().await;
         if let Some(list) = subs.get_mut(&thread_id) {
-            list.retain(|(_, tx)| tx.try_send(msg.clone()).is_ok());
+            let message_kind = server_message_kind(&msg);
+            list.retain(|(client_id, tx)| match tx.try_send(msg.clone()) {
+                Ok(()) => true,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!(
+                        %thread_id,
+                        %client_id,
+                        message_kind = %message_kind,
+                        "client outbound queue full; dropping message for this client"
+                    );
+                    true
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    warn!(
+                        %thread_id,
+                        %client_id,
+                        message_kind = %message_kind,
+                        "client outbound queue closed; removing subscription"
+                    );
+                    false
+                }
+            });
         }
     }
 
@@ -88,5 +109,55 @@ impl Hub {
 impl Default for Hub {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn server_message_kind(msg: &ServerMessage) -> &'static str {
+    match msg {
+        ServerMessage::Event { .. } => "event",
+        ServerMessage::ThreadState(_) => "thread_state",
+        ServerMessage::HistoryPage { .. } => "history_page",
+        ServerMessage::LiveTurnSnapshot(_) => "live_turn_snapshot",
+        ServerMessage::RunningTasks { .. } => "running_tasks",
+        ServerMessage::TokenUpdate { .. } => "token_update",
+        ServerMessage::ApprovalRequest { .. } => "approval_request",
+        ServerMessage::Error { .. } => "error",
+        ServerMessage::Pong => "pong",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn full_client_queue_does_not_unsubscribe_client() {
+        let hub = Hub::new();
+        let thread_id = ThreadId::new();
+        let (tx, mut rx) = mpsc::channel(1);
+
+        hub.subscribe(thread_id, 7, tx.clone()).await;
+        tx.try_send(ServerMessage::Pong).unwrap();
+
+        hub.broadcast(thread_id, ServerMessage::Pong).await;
+
+        let subs = hub.subs.lock().await;
+        assert_eq!(subs.get(&thread_id).map(Vec::len), Some(1));
+        drop(subs);
+        assert!(matches!(rx.try_recv(), Ok(ServerMessage::Pong)));
+    }
+
+    #[tokio::test]
+    async fn closed_client_queue_removes_subscription() {
+        let hub = Hub::new();
+        let thread_id = ThreadId::new();
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+
+        hub.subscribe(thread_id, 9, tx).await;
+        hub.broadcast(thread_id, ServerMessage::Pong).await;
+
+        let subs = hub.subs.lock().await;
+        assert!(subs.get(&thread_id).is_none_or(Vec::is_empty));
     }
 }

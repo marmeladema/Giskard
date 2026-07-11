@@ -8,7 +8,31 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.35
+**Version:** 1.36
+
+**Changelog (1.35 → 1.36), observability gap closure:**
+- **O1:** Turn startup and forwarding emit structured operator logs at the decision points needed to
+  diagnose provider/proxy failures: harness `turn/start` acceptance or rejection, turnless harness
+  errors before turn ownership, stream failures before completion, and forwarder exit while the
+  active-turn gate is still held. Logs include project/thread ids, harness thread id when known,
+  model/provider, mode, elapsed time, buffered state, and the underlying harness/Codex error.
+- **O2:** HTTP/API errors are logged at the response boundary. Internal failures are `error`,
+  conflicts are `warn`, and expected client errors remain `debug` so browser-visible failures are
+  not silently returned without any server-side diagnostic trail.
+- **O3:** WebSocket subscribe must not silently omit history when loading persisted history fails.
+  The client receives a structured error, and the server logs the failure through the WebSocket
+  action-error path with the affected thread/action.
+- **O4:** Server-side event drops and recovery paths are observable. Slow/closed browser outbound
+  queues, same-thread/different-turn harness events, duplicate notice/item suppression, failed
+  persisted-history scans used for deduplication, history page-size config fallbacks, corrupt-file
+  quarantine failures, and token-ledger load fallbacks emit structured logs with stable ids where
+  available.
+- **O5:** If the Codex stream closes or fails before any `turn/started` event arrives, Giskard emits
+  a browser-visible harness error rather than only logging server-side. If a turn did start, Giskard
+  still synthesizes a terminal failed turn so history records the failed attempt.
+- **O6:** Browser-only enhancement failures for Markdown rendering and path linkification degrade to
+  plain text, but emit console warnings so UI diagnostics can distinguish expected fallback from a
+  missing feature.
 
 **Changelog (1.34 → 1.35), authoritative reconnect resync:**
 - **RX4:** A browser `Subscribe` response is an authoritative active-thread resync, not an
