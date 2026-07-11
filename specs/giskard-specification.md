@@ -29,7 +29,10 @@
   available.
 - **O5:** If the Codex stream closes or fails before any `turn/started` event arrives, Giskard emits
   a browser-visible harness error rather than only logging server-side. If a turn did start, Giskard
-  still synthesizes a terminal failed turn so history records the failed attempt.
+  still synthesizes a terminal failed turn using the `TurnId` bound from the `turn/start` response,
+  so history records the failed attempt and the active-turn gate releases correctly. Giskard must
+  not mint a replacement `TurnId` for fatal-error recovery if the `turn/start` response failed to
+  bind one; that case is logged as a protocol/stream inconsistency instead.
 - **O6:** Browser-only enhancement failures for Markdown rendering and path linkification degrade to
   plain text, but emit console warnings so UI diagnostics can distinguish expected fallback from a
   missing feature.
@@ -1289,9 +1292,10 @@ maps to Codex's approval configuration (§9).
 
   This matters especially on **resume**: the native id is re-established (possibly different from the
   previous run), and the map re-binds it to the same durable `ThreadId` so history stays continuous.
-  The mapper similarly keeps `harness_item_id → ItemId` (B2) and `harness_turn_id → TurnId` maps,
-  established at `ItemStarted`/`TurnStarted`, so streamed deltas and completions resolve to the
-  owned ids rather than minting a fresh id per message.
+  The mapper similarly keeps `harness_item_id → ItemId` (B2) and `harness_turn_id → TurnId` maps.
+  Turn id mapping is established as soon as `turn/start` returns its native `turn.id`, then reused
+  by `TurnStarted`, streamed deltas, and completions so the returned `TurnId` and subsequent events
+  resolve to the same owned id rather than minting a fresh id per message.
 - **Resume-failure fallback (C5).** `thread/resume {threadId}` can fail even though Giskard has the
   stored native id — Codex's own thread store may have been purged or rotated. On a resume-by-id
   failure the harness MUST **not** hard-error the thread: it starts a **fresh** native thread

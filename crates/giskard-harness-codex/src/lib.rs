@@ -495,20 +495,30 @@ async fn background_task(
                         overrides,
                         response,
                     } => {
-                        let result = handle_start_turn(&mut client, &thread, &input, &overrides).await;
-                        let ok = result.is_ok();
+                        let result = handle_start_turn(
+                            &mut client,
+                            &mut mapper,
+                            &thread,
+                            &input,
+                            &overrides,
+                        )
+                        .await;
+                        let acknowledged_turn = result.as_ref().ok().copied();
                         let _ = response.send(result);
-                        if ok && matches!(
+                        if let Some(acknowledged_turn) = acknowledged_turn
+                            && matches!(
                             stream_turn_events(
                                 &mut client,
                                 &mut mapper,
                                 &thread,
+                                acknowledged_turn,
                                 &senders,
                                 &mut control_rx,
                             )
                             .await,
                             StreamOutcome::Shutdown,
-                        ) {
+                        )
+                        {
                             let _ = client.shutdown().await;
                             break;
                         }
@@ -980,17 +990,22 @@ async fn start_thread(
 
 async fn handle_start_turn(
     client: &mut codex_codes::AsyncClient,
+    mapper: &mut CodexMapper,
     thread: &ThreadHandle,
     input: &UserInput,
     overrides: &TurnOverrides,
 ) -> Result<TurnId, HarnessError> {
     let params = build_turn_start_params(thread, input, overrides)?;
-    let _resp: codex_codes::TurnStartResponse = client
+    let resp: codex_codes::TurnStartResponse = client
         .request(codex_codes::protocol::methods::TURN_START, &params)
         .await
         .map_err(|e| HarnessError::Transport(e.to_string()))?;
 
-    Ok(TurnId::new())
+    mapper
+        .register_active_turn(thread.thread, &resp.turn.id)
+        .ok_or_else(|| {
+            HarnessError::Protocol("turn/start response did not include a turn id".into())
+        })
 }
 
 fn build_turn_start_params(
@@ -1044,11 +1059,12 @@ async fn stream_turn_events(
     client: &mut codex_codes::AsyncClient,
     mapper: &mut CodexMapper,
     thread: &ThreadHandle,
+    acknowledged_turn: TurnId,
     senders: &SenderMap,
     control_rx: &mut mpsc::Receiver<ControlCommand>,
 ) -> StreamOutcome {
     let thread_id = thread.thread;
-    let mut active_turn: Option<TurnId> = None;
+    let mut active_turn: Option<TurnId> = Some(acknowledged_turn);
 
     loop {
         let msg = tokio::select! {
@@ -1118,26 +1134,7 @@ async fn stream_turn_events(
                     }
                     if is_current_thread {
                         if let Some(message) = mapping::fatal_turn_error(&notif) {
-                            // Mint a turn id when the error arrived before any `turn/started` (e.g.
-                            // an immediate quota rejection) so the failed attempt is still persisted.
-                            let turn = active_turn.unwrap_or_default();
-                            warn!(
-                                %thread_id,
-                                ?active_turn,
-                                %turn,
-                                error = %message,
-                                "synthesizing failed turn completion from fatal Codex error notification"
-                            );
-                            let _ =
-                                broadcast_event(senders, thread_id, || AgentEvent::TurnCompleted {
-                                    thread: thread_id,
-                                    turn,
-                                    usage: TokenUsage::default(),
-                                    status: TurnStatus {
-                                        kind: TurnStatusKind::Failed,
-                                        message: Some(message),
-                                    },
-                                })
+                            emit_fatal_turn_completion(senders, thread_id, active_turn, message)
                                 .await;
                             break;
                         }
@@ -1455,6 +1452,41 @@ async fn emit_incomplete_turn(
         })
         .await;
     }
+}
+
+async fn emit_fatal_turn_completion(
+    senders: &SenderMap,
+    thread: ThreadId,
+    turn: Option<TurnId>,
+    message: impl Into<String>,
+) -> bool {
+    let message = message.into();
+    let Some(turn) = turn else {
+        warn!(
+            %thread,
+            error = %message,
+            "fatal Codex error notification arrived without an active turn; not synthesizing turn completion"
+        );
+        return false;
+    };
+
+    warn!(
+        %thread,
+        %turn,
+        error = %message,
+        "synthesizing failed turn completion from fatal Codex error notification"
+    );
+    let _ = broadcast_event(senders, thread, || AgentEvent::TurnCompleted {
+        thread,
+        turn,
+        usage: TokenUsage::default(),
+        status: TurnStatus {
+            kind: TurnStatusKind::Failed,
+            message: Some(message),
+        },
+    })
+    .await;
+    true
 }
 
 async fn handle_respond_approval(
@@ -1922,6 +1954,75 @@ mod tests {
             }
             other => panic!("expected error event, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn incomplete_stream_with_turn_emits_failed_completion() {
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
+        let (tx, mut rx) = broadcast::channel(BROADCAST_CAPACITY);
+        ensure_thread_sender(&senders, thread, tx);
+
+        emit_incomplete_turn(&senders, thread, Some(turn), "stream failed").await;
+
+        let event = rx.recv().await.unwrap();
+        match event {
+            AgentEvent::TurnCompleted {
+                thread: got_thread,
+                turn: got_turn,
+                status,
+                ..
+            } => {
+                assert_eq!(got_thread, thread);
+                assert_eq!(got_turn, turn);
+                assert_eq!(status.kind, TurnStatusKind::Failed);
+                assert_eq!(status.message.as_deref(), Some("stream failed"));
+            }
+            other => panic!("expected failed turn completion, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fatal_error_with_turn_emits_failed_completion() {
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
+        let (tx, mut rx) = broadcast::channel(BROADCAST_CAPACITY);
+        ensure_thread_sender(&senders, thread, tx);
+
+        assert!(emit_fatal_turn_completion(&senders, thread, Some(turn), "quota exceeded").await);
+
+        let event = rx.recv().await.unwrap();
+        match event {
+            AgentEvent::TurnCompleted {
+                thread: got_thread,
+                turn: got_turn,
+                status,
+                ..
+            } => {
+                assert_eq!(got_thread, thread);
+                assert_eq!(got_turn, turn);
+                assert_eq!(status.kind, TurnStatusKind::Failed);
+                assert_eq!(status.message.as_deref(), Some("quota exceeded"));
+            }
+            other => panic!("expected failed turn completion, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fatal_error_without_turn_does_not_synthesize_completion() {
+        let thread = ThreadId::new();
+        let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
+        let (tx, mut rx) = broadcast::channel(BROADCAST_CAPACITY);
+        ensure_thread_sender(&senders, thread, tx);
+
+        assert!(!emit_fatal_turn_completion(&senders, thread, None, "quota exceeded").await);
+
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]
