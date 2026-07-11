@@ -32,10 +32,17 @@
   still synthesizes a terminal failed turn using the `TurnId` bound from the `turn/start` response,
   so history records the failed attempt and the active-turn gate releases correctly. Giskard must
   not mint a replacement `TurnId` for fatal-error recovery if the `turn/start` response failed to
-  bind one; that case is logged as a protocol/stream inconsistency instead.
+  bind one; that case is logged as a protocol/stream inconsistency instead. Codex error
+  notifications carrying `turnId` remain turn-scoped, and fatal-error recovery clears the adapter's
+  active native-turn binding for that thread.
 - **O6:** Browser-only enhancement failures for Markdown rendering and path linkification degrade to
   plain text, but emit console warnings so UI diagnostics can distinguish expected fallback from a
   missing feature.
+- **O7:** Codex-provided ids are preserved or consumed at the correct boundary. `threadId`,
+  `turnId`, `itemId`, and `serverRequest/resolved.requestId` drive routing/correlation; approval
+  `approvalId`/`itemId`/`callId` values are surfaced as card metadata when present; unknown future
+  server requests that carry raw `threadId`/`turnId` are scoped through the same native-id registry
+  instead of being relabeled onto the fallback thread.
 
 **Changelog (1.34 → 1.35), authoritative reconnect resync:**
 - **RX4:** A browser `Subscribe` response is an authoritative active-thread resync, not an
@@ -122,7 +129,9 @@
   `TurnStarted` reaches the live buffer. Overlapping `SendInput` or `CompactContext` on the same
   thread is rejected with a structured `thread_turn_active` error; other threads and projects
   remain usable. The gate is released when the owned turn completes, or earlier startup paths fail
-  or are cancelled.
+  or are cancelled. The browser must mirror this boundary optimistically once a `SendInput` frame is
+  written to the WebSocket, then reconcile from any `send_input` error response; it must not wait for
+  Codex's later `TurnStarted` notification before disabling additional sends and exposing Stop.
 
 **Changelog (1.27 → 1.28), manual context compaction:**
 - **CC1:** The context usage menu exposes a `Compact context` action that asks the active harness to
@@ -967,7 +976,8 @@ pub enum AgentEvent {
 note, command execution (with output deltas), file change, and MCP/tool calls. `ItemDelta` carries
 incremental text or command output, keyed by the Giskard-owned `ItemId` (the `CodexHarness`
 translates the harness-native item id to the owned `ItemId` via the map established at `ItemStarted`;
-§4.7).
+§4.7). Codex notifications that carry an item id but no visible payload may still seed the
+native-item registry without emitting a transcript row, so later deltas/completions stay correlated.
 
 > **Note (B5):** the `ItemStarted` above is an `AgentEvent` **variant**; the payload struct it carries
 > is named `ItemStart` (§4.5), not `ItemStarted`, to avoid the name collision.
@@ -1259,6 +1269,7 @@ The `CodexHarness` maps the Codex app-server JSON-RPC protocol onto the above. K
 | `item/started`, `item/*/delta`, `item/completed` | `ItemStarted` / `ItemDelta` / `ItemCompleted` |
 | `turn/diff/updated` | `DiffUpdated` |
 | `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval` | `ApprovalRequested` |
+| `serverRequest/resolved` | `ServerRequestResolved` |
 | `turn/completed` (token usage) | `TurnCompleted` |
 | `turn/interrupt` | `interrupt` |
 | JSON-RPC error `-32001` "overloaded" | retry with exponential backoff + jitter, surfaced as transient `Error` only if retries exhausted |
@@ -1295,7 +1306,10 @@ maps to Codex's approval configuration (§9).
   The mapper similarly keeps `harness_item_id → ItemId` (B2) and `harness_turn_id → TurnId` maps.
   Turn id mapping is established as soon as `turn/start` returns its native `turn.id`, then reused
   by `TurnStarted`, streamed deltas, and completions so the returned `TurnId` and subsequent events
-  resolve to the same owned id rather than minting a fresh id per message.
+  resolve to the same owned id rather than minting a fresh id per message. Server requests use the
+  JSON-RPC request id for response routing, but any Codex thread/turn ids carried by first-class
+  params, MCP elicitation `_meta`, or unknown raw params must still pass through the native-id map
+  before the request is shown or persisted.
 - **Resume-failure fallback (C5).** `thread/resume {threadId}` can fail even though Giskard has the
   stored native id — Codex's own thread store may have been purged or rotated. On a resume-by-id
   failure the harness MUST **not** hard-error the thread: it starts a **fresh** native thread
@@ -1806,7 +1820,8 @@ overwrite the thread's `approval_policy`.
 
 1. Harness pushes an approval request (command exec / file change / permission escalation);
    `CodexHarness` maps it to `AgentEvent::ApprovalRequested` with the details (command, cwd,
-   reason, target path, and the set of available decisions).
+   reason, target path, Codex approval/item/call ids when present, and the set of available
+   decisions).
 2. UI shows a non-blocking prompt scoped to the thread (with the command/diff preview).
    **Phase 3 (S6):** the preview uses the **raw diff string** from the harness (the text carried
    in the `ApprovalRequest`'s reason/detail). Structured `FileDiff` parsing and the side-by-side
@@ -2152,7 +2167,9 @@ harness. If another normal turn or manual context compaction is already starting
 same thread, the server rejects the later request with `Error { code: "thread_turn_active", ... }`
 instead of starting a second forwarder. This is a correctness boundary, not only a browser disabled
 state: multiple tabs or reconnect races must not be able to start overlapping native turns for one
-thread.
+thread. The browser marks a turn active immediately after successfully sending `SendInput`, before
+any harness `TurnStarted` event, and clears that optimistic state if the server rejects the send for
+anything other than `thread_turn_active`.
 
 > **Durable settings switches (P2/P3).** `SwitchMode`, `SelectModel`, and `SetApprovalPolicy`
 > persist immediately to `<thread_id>.json` before the server acknowledges, then broadcast a

@@ -1533,6 +1533,9 @@ function handleServer(msg) {
       if (msg.action==="send_input" && state.pendingUserEl) {
         failPendingUserMessage(null);
       }
+      if (msg.action==="send_input") {
+        setTurnActive(msg.code === "thread_turn_active");
+      }
       if (msg.action==="interrupt") {
         state.interruptPending = false;
         resetTerminatingToolTasks();
@@ -4141,6 +4144,7 @@ function sendInput() {
     notice(`Message not sent: WebSocket is ${state.wsStatus}.`, "error");
     return;
   }
+  setTurnActive(true);
   state.pendingUserEl = msgEl;
   state.pendingUserText = text;
   ta.value="";
