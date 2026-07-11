@@ -31,7 +31,8 @@ use codex_codes::protocol::{
 /// Maps Codex app-server messages onto `giskard-core` events, owning the id-translation registries
 /// (spec §4.7): native `threadId → ThreadId` (B4), native `turnId → TurnId`, and native
 /// `itemId → ItemId` (B2). The Giskard-owned ids are minted once and reused for every subsequent
-/// delta/completion carrying the same native id, so events for one turn/item stay correlated.
+/// response, delta, or completion carrying the same native id, so events for one turn/item stay
+/// correlated.
 pub struct CodexMapper {
     workspace_root: PathBuf,
     thread_ids: HashMap<String, ThreadId>,
@@ -76,6 +77,24 @@ impl CodexMapper {
 
     pub fn active_native_turn_for_thread(&self, thread: ThreadId) -> Option<&str> {
         self.active_turns.get(&thread).map(String::as_str)
+    }
+
+    /// Register the native turn id returned by `turn/start` before notifications start streaming.
+    ///
+    /// Codex returns the native turn id in the `turn/start` response, then repeats it on
+    /// `turn/started`, deltas, and `turn/completed`. Binding it here keeps the `TurnId` returned to
+    /// the server identical to the ids used by later events and by synthesized failed completions.
+    pub fn register_active_turn(
+        &mut self,
+        thread: ThreadId,
+        native_turn_id: &str,
+    ) -> Option<TurnId> {
+        let native_turn_id = native_turn_id.trim();
+        if native_turn_id.is_empty() {
+            return None;
+        }
+        self.active_turns.insert(thread, native_turn_id.to_string());
+        Some(self.resolve_turn(native_turn_id))
     }
 
     pub fn native_turn_for_process(&self, thread: ThreadId, process_id: &str) -> Option<&str> {
@@ -3208,6 +3227,41 @@ mod tests {
             Some(AgentEvent::TurnCompleted { .. })
         ));
         assert_eq!(mapper.active_native_turn_for_thread(thread), None);
+    }
+
+    #[test]
+    fn turn_start_response_id_is_reused_by_turn_notifications() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let thread = ThreadId::new();
+
+        let acknowledged = mapper
+            .register_active_turn(thread, "native_turn_1")
+            .expect("native turn id registers");
+        assert_eq!(
+            mapper.active_native_turn_for_thread(thread),
+            Some("native_turn_1")
+        );
+
+        match mapper.map_notification(&turn_started("native_turn_1"), thread) {
+            Some(AgentEvent::TurnStarted { turn, .. }) => assert_eq!(turn, acknowledged),
+            other => panic!("expected TurnStarted, got {other:?}"),
+        }
+        match mapper.map_notification(&turn_completed("native_turn_1"), thread) {
+            Some(AgentEvent::TurnCompleted { turn, .. }) => assert_eq!(turn, acknowledged),
+            other => panic!("expected TurnCompleted, got {other:?}"),
+        }
+        assert_eq!(mapper.active_native_turn_for_thread(thread), None);
+    }
+
+    #[test]
+    fn turn_start_response_without_id_is_rejected() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        assert!(mapper.register_active_turn(ThreadId::new(), "").is_none());
+        assert!(
+            mapper
+                .register_active_turn(ThreadId::new(), "   ")
+                .is_none()
+        );
     }
 
     #[test]
