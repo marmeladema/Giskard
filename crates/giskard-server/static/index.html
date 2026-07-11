@@ -3526,7 +3526,9 @@ function renderMarkdown(el, text) {
       state.markdownCache.set(cacheKey, html);
       apply(html);
     })
-    .catch(() => {});
+    .catch((e) => {
+      console.warn("Giskard markdown render failed; keeping plain text fallback.", e);
+    });
 }
 // Wire the server-emitted `.path-link` buttons (they arrive with data attributes but no handler).
 function wirePathLinks(el) {
@@ -3563,7 +3565,9 @@ function renderLinkedText(el, text) {
       state.linkifyCache.set(cacheKey, links);
       apply(links);
     })
-    .catch(() => {});
+    .catch((e) => {
+      console.warn("Giskard linkification failed; keeping plain text fallback.", e);
+    });
 }
 function applyLinkedText(el, text, links) {
   const sorted = links.slice().sort((a, b) => (a.start || 0) - (b.start || 0));

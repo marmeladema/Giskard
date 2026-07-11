@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::{Router, response::Json as AxumJson, routing::get};
 use chrono::Utc;
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ItemId, ProjectId, ThreadId, TurnId};
 use giskard_core::item::{Item, ItemKind, ItemPayload, ItemStart};
@@ -13,7 +13,7 @@ use giskard_core::turn::{TurnStatus, TurnStatusKind};
 use giskard_harness::AgentHarness;
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 use giskard_persist::store::ProjectConfig;
-use giskard_proto::ClientMessage;
+use giskard_proto::{ClientMessage, ErrorSeverity, ServerMessage};
 use giskard_server::{AppState, HarnessFactory, build_app};
 
 struct DiffFactory {
@@ -538,8 +538,6 @@ model_listing = true
 
 #[tokio::test]
 async fn history_pagination_over_websocket() {
-    use futures_util::StreamExt;
-
     let port = 19202;
     let tmp = tempfile::TempDir::new().unwrap();
     let hash = password_hash("testpass");
@@ -697,4 +695,124 @@ async fn history_pagination_over_websocket() {
     assert_eq!(turns.len(), 1);
     assert_eq!(page["has_more"], false);
     assert_eq!(turns[0]["id"].as_str().unwrap(), ids[0]);
+}
+
+#[tokio::test]
+async fn subscribe_corrupt_history_returns_structured_error() {
+    let port = 19203;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let hash = password_hash("testpass");
+    tokio::fs::write(
+        tmp.path().join("config.toml"),
+        format!(
+            "[server]\nbind=\"127.0.0.1:{port}\"\nsecure_cookies=false\n\n[auth]\npassword_hash=\"{hash}\"\nsession_days=30\n"
+        ),
+    )
+    .await
+    .unwrap();
+
+    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
+    let state = AppState::new(
+        store,
+        Arc::new(DiffFactory {
+            fixture: make_fixture(),
+        }),
+        (0..32u8).collect(),
+    );
+    let app = build_app(state.clone());
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let base = format!("http://127.0.0.1:{port}");
+    let (client, cookie) = login(&base).await;
+
+    let proj_dir = tempfile::TempDir::new().unwrap();
+    let pid = ProjectId::new();
+    state
+        .store
+        .create_project(
+            pid,
+            "proj",
+            &proj_dir.path().to_string_lossy(),
+            giskard_core::model::ModelRef {
+                provider: "openai".into(),
+                model: "gpt-5.5".into(),
+                reasoning_effort: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let tid: ThreadId = {
+        let resp: serde_json::Value = client
+            .post(format!("{base}/api/projects/{pid}/threads"))
+            .header("cookie", &cookie)
+            .json(&serde_json::json!({"resume": "th_tok"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        serde_json::from_value(resp["thread_id"].clone()).unwrap()
+    };
+
+    let valid_turn = serde_json::to_string(&make_turn("valid after corrupt line")).unwrap();
+    let history_path = tmp
+        .path()
+        .join("projects")
+        .join(pid.to_string())
+        .join("threads")
+        .join(format!("{tid}.jsonl"));
+    tokio::fs::write(&history_path, format!("not json\n{valid_turn}\n"))
+        .await
+        .unwrap();
+
+    let ws_req = tokio_tungstenite::tungstenite::http::Request::builder()
+        .uri(format!("ws://127.0.0.1:{port}/api/ws"))
+        .header("host", format!("127.0.0.1:{port}"))
+        .header("cookie", &cookie)
+        .header("upgrade", "websocket")
+        .header("connection", "upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .body(())
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_req).await.unwrap();
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::Subscribe { thread_id: tid })
+            .unwrap()
+            .into(),
+    ))
+    .await
+    .unwrap();
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        let text = match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await
+        {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => text,
+            Ok(Some(Ok(_))) | Err(_) => continue,
+            Ok(Some(Err(error))) => {
+                panic!("websocket error while waiting for subscribe error: {error}")
+            }
+            Ok(None) => break,
+        };
+        match serde_json::from_str::<ServerMessage>(&text).unwrap() {
+            ServerMessage::Error { error } => {
+                assert_eq!(error.code, "persistence_error");
+                assert_eq!(error.severity, ErrorSeverity::Error);
+                assert_eq!(error.thread_id, Some(tid));
+                assert_eq!(error.action.as_deref(), Some("subscribe"));
+                assert!(error.detail.unwrap_or_default().contains("line 1"));
+                return;
+            }
+            _ => continue,
+        }
+    }
+
+    panic!("subscribe did not return a structured persistence error");
 }

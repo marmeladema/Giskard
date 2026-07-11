@@ -252,8 +252,17 @@ async fn list_threads(
     let thread_ids = state.store.list_threads(project_id).await?;
     let mut threads = Vec::new();
     for tid in thread_ids {
-        if let Ok(Some(tf)) = state.store.load_thread(project_id, tid).await {
-            threads.push(thread_summary(&tf));
+        match state.store.load_thread(project_id, tid).await {
+            Ok(Some(tf)) => threads.push(thread_summary(&tf)),
+            Ok(None) => {}
+            Err(e) => {
+                warn!(
+                    %project_id,
+                    thread_id = %tid,
+                    error = %e,
+                    "failed to load thread while listing project; omitting thread"
+                );
+            }
         }
     }
     threads.sort_by_key(|t| std::cmp::Reverse(t.updated_at));
@@ -1123,6 +1132,28 @@ fn warning_info(
     }
 }
 
+async fn history_limit_or_default(
+    state: &AppState,
+    thread_id: ThreadId,
+    action: &'static str,
+    select: impl FnOnce(&giskard_persist::Config) -> usize,
+    fallback: usize,
+) -> usize {
+    match state.store.load_config().await {
+        Ok(config) => select(&config),
+        Err(error) => {
+            warn!(
+                %thread_id,
+                action = %action,
+                %error,
+                fallback,
+                "failed to load history config; using fallback page size"
+            );
+            fallback
+        }
+    }
+}
+
 fn harness_error_means_no_active_command(error: &HarnessError) -> bool {
     matches!(error, HarnessError::Transport(message) if message
         .to_ascii_lowercase()
@@ -1248,25 +1279,26 @@ async fn handle_client_msg(
 
             // H4/H6: send the most recent page of history (not the whole thread). Older pages are
             // fetched on demand via `LoadHistory`.
-            let limit = state
-                .store
-                .load_config()
-                .await
-                .map(|c| c.history.initial)
-                .unwrap_or(50);
-            if let Ok((turns, has_more)) = state
+            let limit = history_limit_or_default(
+                state,
+                thread_id,
+                "subscribe_history",
+                |config| config.history.initial,
+                50,
+            )
+            .await;
+            let (turns, has_more) = state
                 .store
                 .load_history(access.project_id, thread_id, None, limit)
                 .await
-            {
-                let _ = tx
-                    .send(ServerMessage::HistoryPage {
-                        thread_id,
-                        turns: turns.into_iter().map(Into::into).collect(),
-                        has_more,
-                    })
-                    .await;
-            }
+                .map_err(|e| WsError::from_persist(e, "subscribe_history", Some(thread_id)))?;
+            let _ = tx
+                .send(ServerMessage::HistoryPage {
+                    thread_id,
+                    turns: turns.into_iter().map(Into::into).collect(),
+                    has_more,
+                })
+                .await;
 
             // H5: the in-flight turn is not in the JSONL yet — reconstruct it from the live buffer.
             if let Some(snap) = state.live_buffers.snapshot(thread_id).await {
@@ -1284,12 +1316,14 @@ async fn handle_client_msg(
             limit,
         } => {
             let project_id = project_for(state, thread_id, "load_history").await?;
-            let default_limit = state
-                .store
-                .load_config()
-                .await
-                .map(|c| c.history.page)
-                .unwrap_or(50);
+            let default_limit = history_limit_or_default(
+                state,
+                thread_id,
+                "load_history",
+                |config| config.history.page,
+                50,
+            )
+            .await;
             let limit = limit.unwrap_or(default_limit);
             let (turns, has_more) = state
                 .store
@@ -1592,26 +1626,17 @@ async fn handle_client_msg(
             }
         }
         ClientMessage::SavePlan { thread_id, path } => {
-            match save_plan(state, thread_id, &path).await {
-                Ok(written) => {
-                    debug!(%thread_id, path = %written, "plan saved");
-                }
-                Err(e) => {
-                    let _ = tx
-                        .send(
-                            WsError::new(
-                                "save_plan_failed",
-                                ErrorSeverity::Error,
-                                "Save plan failed.",
-                            )
-                            .detail(e)
-                            .thread(thread_id)
-                            .action("save_plan")
-                            .into_server_message(),
-                        )
-                        .await;
-                }
-            }
+            let written = save_plan(state, thread_id, &path).await.map_err(|e| {
+                WsError::new(
+                    "save_plan_failed",
+                    ErrorSeverity::Error,
+                    "Save plan failed.",
+                )
+                .detail(e)
+                .thread(thread_id)
+                .action("save_plan")
+            })?;
+            debug!(%thread_id, path = %written, "plan saved");
         }
         ClientMessage::Ping => {
             let _ = tx.send(ServerMessage::Pong).await;
@@ -1916,14 +1941,56 @@ pub enum ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        let (status, msg) = match self {
-            ApiError::NotFound => (axum::http::StatusCode::NOT_FOUND, "not found".into()),
-            ApiError::BadRequest(msg) => (axum::http::StatusCode::BAD_REQUEST, msg),
-            ApiError::Forbidden(msg) => (axum::http::StatusCode::FORBIDDEN, msg),
-            ApiError::Conflict(msg) => (axum::http::StatusCode::CONFLICT, msg),
-            ApiError::Internal(msg) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg),
+        let (status, msg, level) = match self {
+            ApiError::NotFound => (
+                axum::http::StatusCode::NOT_FOUND,
+                "not found".into(),
+                ApiErrorLogLevel::Debug,
+            ),
+            ApiError::BadRequest(msg) => (
+                axum::http::StatusCode::BAD_REQUEST,
+                msg,
+                ApiErrorLogLevel::Debug,
+            ),
+            ApiError::Forbidden(msg) => (
+                axum::http::StatusCode::FORBIDDEN,
+                msg,
+                ApiErrorLogLevel::Debug,
+            ),
+            ApiError::Conflict(msg) => (
+                axum::http::StatusCode::CONFLICT,
+                msg,
+                ApiErrorLogLevel::Warn,
+            ),
+            ApiError::Internal(msg) => (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                msg,
+                ApiErrorLogLevel::Error,
+            ),
         };
+        log_api_error(status, &msg, level);
         (status, msg).into_response()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ApiErrorLogLevel {
+    Debug,
+    Warn,
+    Error,
+}
+
+fn log_api_error(status: axum::http::StatusCode, message: &str, level: ApiErrorLogLevel) {
+    match level {
+        ApiErrorLogLevel::Debug => {
+            debug!(status = %status.as_u16(), message, "HTTP handler returned client error");
+        }
+        ApiErrorLogLevel::Warn => {
+            warn!(status = %status.as_u16(), message, "HTTP handler returned conflict");
+        }
+        ApiErrorLogLevel::Error => {
+            error!(status = %status.as_u16(), message, "HTTP handler returned internal error");
+        }
     }
 }
 

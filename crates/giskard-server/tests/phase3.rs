@@ -14,7 +14,9 @@ use giskard_core::turn::{Mode, TurnStatus, TurnStatusKind};
 use giskard_harness::AgentHarness;
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 use giskard_persist::store::ProjectConfig;
-use giskard_proto::{ClientMessage, ServerMessage, WireAgentEvent, WireApprovalMetadata};
+use giskard_proto::{
+    ClientMessage, ErrorSeverity, ServerMessage, WireAgentEvent, WireApprovalMetadata,
+};
 use giskard_server::{AppState, HarnessFactory, build_app};
 
 struct TestFactory {
@@ -421,6 +423,37 @@ async fn modes_models_approvals_and_plan_dump() {
         contents.contains("Refactor token refresh"),
         "plan content written"
     );
+
+    // Failed plan writes return a structured WS error through the normal handler path.
+    ws.send(ws_text(&ClientMessage::SavePlan {
+        thread_id: tid,
+        path: "../escape.md".into(),
+    }))
+    .await
+    .unwrap();
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            panic!("save_plan failure did not produce a websocket error");
+        }
+        let text = match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await
+        {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => text,
+            Ok(_) | Err(_) => continue,
+        };
+        let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
+        if let ServerMessage::Error { error } = server_msg {
+            assert_eq!(error.code, "save_plan_failed");
+            assert_eq!(error.severity, ErrorSeverity::Error);
+            assert_eq!(error.thread_id, Some(tid));
+            assert_eq!(error.action.as_deref(), Some("save_plan"));
+            assert!(
+                error.detail.unwrap_or_default().contains("workspace root"),
+                "error should include the save failure detail"
+            );
+            break;
+        }
+    }
 }
 
 async fn poll_thread<F>(

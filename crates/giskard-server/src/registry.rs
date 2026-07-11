@@ -48,6 +48,13 @@ enum TurnContextKind {
     ManualCompaction,
 }
 
+fn turn_context_kind_label(kind: TurnContextKind) -> &'static str {
+    match kind {
+        TurnContextKind::User => "user",
+        TurnContextKind::ManualCompaction => "manual_compaction",
+    }
+}
+
 /// Shared handle to the pending-approvals map (`ApprovalId -> ThreadId`), cloneable into the
 /// spawned event forwarder so it can register approvals as they stream in.
 type ApprovalMap = Arc<Mutex<HashMap<ApprovalId, ThreadId>>>;
@@ -103,6 +110,10 @@ impl ThreadTurnLease {
         }
         self.gate.release(self.thread_id);
         self.released = true;
+    }
+
+    fn is_released(&self) -> bool {
+        self.released
     }
 }
 
@@ -240,6 +251,7 @@ impl HarnessRegistry {
             .clone();
         drop(harnesses);
 
+        let request_started = Instant::now();
         let turn_gate = self.turn_gate.reserve(thread_id)?;
         let ctx = TurnContext {
             user_input: input.clone(),
@@ -257,7 +269,36 @@ impl HarnessRegistry {
         let ledger = self.ledger.clone();
 
         let stream = harness.subscribe(&handle);
-        let turn_id = harness.start_turn(&handle, input, overrides).await?;
+        let turn_id = match harness.start_turn(&handle, input, overrides).await {
+            Ok(turn_id) => {
+                info!(
+                    %project_id,
+                    %thread_id,
+                    %turn_id,
+                    harness_thread_id = %handle.harness_thread_id,
+                    mode = ?ctx.mode,
+                    provider = %ctx.model.provider,
+                    model = %ctx.model.model,
+                    ack_elapsed_ms = request_started.elapsed().as_millis(),
+                    "harness accepted turn start request"
+                );
+                turn_id
+            }
+            Err(error) => {
+                warn!(
+                    %project_id,
+                    %thread_id,
+                    harness_thread_id = %handle.harness_thread_id,
+                    mode = ?ctx.mode,
+                    provider = %ctx.model.provider,
+                    model = %ctx.model.model,
+                    error = %error,
+                    ack_elapsed_ms = request_started.elapsed().as_millis(),
+                    "harness rejected turn start request"
+                );
+                return Err(error);
+            }
+        };
 
         tokio::spawn(async move {
             forward_events(
@@ -600,6 +641,18 @@ async fn forward_events(
     let mut seen_notices = HashSet::new();
     let forwarder_started = Instant::now();
     let mut saw_context_compaction_marker = false;
+    debug!(
+        %project_id,
+        %thread_id,
+        context_kind = turn_context_kind_label(ctx.kind),
+        mode = ?ctx.mode,
+        provider = %ctx.model.provider,
+        model = %ctx.model.model,
+        turn_gate_held = turn_gate.as_ref().is_some_and(|lease| !lease.is_released()),
+        persisted_turn_count = seen_turn_ids.len(),
+        persisted_harness_item_count = seen_harness_item_ids.len(),
+        "event forwarder started"
+    );
 
     loop {
         match stream.recv().await {
@@ -617,6 +670,12 @@ async fn forward_events(
                 }
 
                 if should_skip_duplicate_notice(&event, &mut seen_notices) {
+                    debug!(
+                        %project_id,
+                        %thread_id,
+                        event_turn_id = ?event_turn_id(&event),
+                        "skipping duplicate harness notice"
+                    );
                     continue;
                 }
 
@@ -624,6 +683,15 @@ async fn forward_events(
                 if let Some(owned) = owned_turn {
                     if let Some(turn) = event_turn {
                         if turn != owned {
+                            warn!(
+                                %project_id,
+                                %thread_id,
+                                owned_turn = %owned,
+                                event_turn = %turn,
+                                event_kind = event_kind(&event),
+                                elapsed_ms = forwarder_started.elapsed().as_millis(),
+                                "dropping harness event for a different turn on the same thread"
+                            );
                             continue;
                         }
                     } else if owned_turn_completed {
@@ -667,9 +735,37 @@ async fn forward_events(
                 }
 
                 if owned_turn.is_none() && event_turn.is_none() {
-                    match event {
-                        AgentEvent::Error { .. } | AgentEvent::Notice { .. } => {
-                            hub.broadcast_event(thread_id, event).await;
+                    match &event {
+                        AgentEvent::Error { error, .. } => {
+                            warn!(
+                                %project_id,
+                                %thread_id,
+                                context_kind = turn_context_kind_label(ctx.kind),
+                                mode = ?ctx.mode,
+                                provider = %ctx.model.provider,
+                                model = %ctx.model.model,
+                                error = %error,
+                                turn_gate_held = turn_gate
+                                    .as_ref()
+                                    .is_some_and(|lease| !lease.is_released()),
+                                elapsed_ms = forwarder_started.elapsed().as_millis(),
+                                "turnless harness error received before turn ownership"
+                            );
+                            hub.broadcast_event(thread_id, event.clone()).await;
+                        }
+                        AgentEvent::Notice { message, .. } => {
+                            debug!(
+                                %project_id,
+                                %thread_id,
+                                context_kind = turn_context_kind_label(ctx.kind),
+                                message,
+                                turn_gate_held = turn_gate
+                                    .as_ref()
+                                    .is_some_and(|lease| !lease.is_released()),
+                                elapsed_ms = forwarder_started.elapsed().as_millis(),
+                                "turnless harness notice received before turn ownership"
+                            );
+                            hub.broadcast_event(thread_id, event.clone()).await;
                         }
                         _ => {}
                     }
@@ -681,6 +777,15 @@ async fn forward_events(
                     &mut seen_harness_item_ids,
                     &mut duplicate_item_ids,
                 ) {
+                    debug!(
+                        %project_id,
+                        %thread_id,
+                        event_kind = event_kind(&event),
+                        event_turn_id = ?event_turn_id(&event),
+                        item_id = ?event_item_id(&event),
+                        harness_item_id = ?event_harness_item_id(&event),
+                        "skipping duplicate harness item event"
+                    );
                     continue;
                 }
 
@@ -895,6 +1000,36 @@ async fn forward_events(
             }
         }
     }
+    let turn_gate_held = turn_gate.as_ref().is_some_and(|lease| !lease.is_released());
+    if turn_gate_held && !owned_turn_completed {
+        warn!(
+            %project_id,
+            %thread_id,
+            context_kind = turn_context_kind_label(ctx.kind),
+            mode = ?ctx.mode,
+            provider = %ctx.model.provider,
+            model = %ctx.model.model,
+            ?owned_turn,
+            ?turn_id,
+            items_buffered = items.len(),
+            diffs_buffered = diffs.len(),
+            saw_context_compaction_marker,
+            elapsed_ms = forwarder_started.elapsed().as_millis(),
+            "event forwarder exited without turn completion; active-turn gate will be released by drop"
+        );
+    } else {
+        debug!(
+            %project_id,
+            %thread_id,
+            context_kind = turn_context_kind_label(ctx.kind),
+            ?owned_turn,
+            ?turn_id,
+            owned_turn_completed,
+            turn_gate_held,
+            elapsed_ms = forwarder_started.elapsed().as_millis(),
+            "event forwarder exited"
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1037,6 +1172,27 @@ fn event_kind(event: &AgentEvent) -> &'static str {
     }
 }
 
+fn event_item_id(event: &AgentEvent) -> Option<ItemId> {
+    match event {
+        AgentEvent::ItemStarted { item, .. } => Some(item.id),
+        AgentEvent::ItemDelta { item_id, .. } => Some(*item_id),
+        AgentEvent::ItemCompleted { item, .. } => Some(item.id),
+        _ => None,
+    }
+}
+
+fn event_harness_item_id(event: &AgentEvent) -> Option<&str> {
+    match event {
+        AgentEvent::ItemStarted { item, .. } if !item.harness_item_id.is_empty() => {
+            Some(item.harness_item_id.as_str())
+        }
+        AgentEvent::ItemCompleted { item, .. } if !item.harness_item_id.is_empty() => {
+            Some(item.harness_item_id.as_str())
+        }
+        _ => None,
+    }
+}
+
 async fn apply_running_command_event(
     running_commands: &RunningTaskStore,
     event: &AgentEvent,
@@ -1171,13 +1327,18 @@ async fn persisted_turn_ids(
     project_id: ProjectId,
     thread_id: ThreadId,
 ) -> HashSet<TurnId> {
-    store
-        .load_all_turns(project_id, thread_id)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|turn| turn.id)
-        .collect()
+    match store.load_all_turns(project_id, thread_id).await {
+        Ok(turns) => turns.into_iter().map(|turn| turn.id).collect(),
+        Err(error) => {
+            warn!(
+                %project_id,
+                %thread_id,
+                %error,
+                "failed to load persisted turn ids; duplicate-turn detection starts empty"
+            );
+            HashSet::new()
+        }
+    }
 }
 
 async fn persisted_harness_item_ids(
@@ -1185,20 +1346,28 @@ async fn persisted_harness_item_ids(
     project_id: ProjectId,
     thread_id: ThreadId,
 ) -> HashSet<String> {
-    store
-        .load_all_turns(project_id, thread_id)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .flat_map(|turn| turn.items)
-        .filter_map(|item| {
-            if item.harness_item_id.is_empty() {
-                None
-            } else {
-                Some(item.harness_item_id)
-            }
-        })
-        .collect()
+    match store.load_all_turns(project_id, thread_id).await {
+        Ok(turns) => turns
+            .into_iter()
+            .flat_map(|turn| turn.items)
+            .filter_map(|item| {
+                if item.harness_item_id.is_empty() {
+                    None
+                } else {
+                    Some(item.harness_item_id)
+                }
+            })
+            .collect(),
+        Err(error) => {
+            warn!(
+                %project_id,
+                %thread_id,
+                %error,
+                "failed to load persisted harness item ids; duplicate-item detection starts empty"
+            );
+            HashSet::new()
+        }
+    }
 }
 
 /// Append a completed `Turn` to the thread file, fold its usage into the thread ledger, recompute
@@ -1213,7 +1382,18 @@ async fn persist_turn(
     turn: Turn,
 ) {
     // C4: recompute the cached context window from the current model on write.
-    let config = store.load_config().await.ok();
+    let config = match store.load_config().await {
+        Ok(config) => Some(config),
+        Err(error) => {
+            warn!(
+                %project_id,
+                %thread_id,
+                %error,
+                "failed to load config while persisting turn; context window cache will not be refreshed"
+            );
+            None
+        }
+    };
 
     // Only completed/interrupted turns carry real usage; capture the bits we need before `turn`
     // moves into the closure.

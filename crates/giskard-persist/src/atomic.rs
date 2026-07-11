@@ -69,7 +69,14 @@ pub async fn read_json_or_quarantine<T: serde::de::DeserializeOwned>(
             tracing::warn!(path = %path.display(), error = %e, "corrupt JSON file, quarantining");
             let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
             let corrupt_path = PathBuf::from(format!("{}.corrupt-{ts}", path.display()));
-            let _ = fs::rename(path, &corrupt_path).await;
+            if let Err(rename_error) = fs::rename(path, &corrupt_path).await {
+                tracing::warn!(
+                    path = %path.display(),
+                    quarantine_path = %corrupt_path.display(),
+                    error = %rename_error,
+                    "failed to quarantine corrupt JSON file"
+                );
+            }
             Err(PersistError::Corrupt(format!("{}: {}", path.display(), e)))
         }
     }
