@@ -220,7 +220,11 @@ async fn modes_models_approvals_and_plan_dump() {
         .json(&serde_json::json!({
             "name": "proj",
             "dir": proj_dir_path,
-            "default_model": {"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null},
+            "default_model": {
+                "provider": "cloudflare-litellm",
+                "model": "gpt-5.5",
+                "reasoning_effort": null,
+            },
         }))
         .send()
         .await

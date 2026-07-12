@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
@@ -1143,17 +1143,30 @@ async fn stream_turn_events(
                 if let Some(event) = event {
                     let event_thread_id = event_thread(&event);
                     let is_current_thread = event_belongs_to_stream(thread_id, &event);
-                    if is_current_thread {
+                    let is_current_turn =
+                        event_belongs_to_current_turn(thread_id, acknowledged_turn, &event);
+                    if is_current_turn {
                         if let AgentEvent::TurnStarted { turn, .. } = &event {
                             active_turn = Some(*turn);
                         }
                     }
-                    let is_completed = event_completes_stream(thread_id, &event);
+                    let is_completed = event_completes_stream(thread_id, acknowledged_turn, &event);
+                    if is_current_thread
+                        && !is_current_turn
+                        && matches!(event, AgentEvent::TurnCompleted { .. })
+                    {
+                        debug!(
+                            %thread_id,
+                            acknowledged_turn = %acknowledged_turn,
+                            event_turn = ?agent_event_turn(&event),
+                            "ignoring Codex turn completion for a non-current turn"
+                        );
+                    }
                     let _ = broadcast_event(senders, event_thread_id, || event).await;
                     if is_completed {
                         break;
                     }
-                    if is_current_thread {
+                    if is_current_turn {
                         if let Some(message) = mapping::fatal_turn_error(&notif) {
                             emit_fatal_turn_completion(senders, thread_id, active_turn, message)
                                 .await;
@@ -1443,9 +1456,22 @@ fn event_belongs_to_stream(stream_thread: ThreadId, event: &AgentEvent) -> bool 
     event_thread(event) == stream_thread
 }
 
-fn event_completes_stream(stream_thread: ThreadId, event: &AgentEvent) -> bool {
+fn event_belongs_to_current_turn(
+    stream_thread: ThreadId,
+    current_turn: TurnId,
+    event: &AgentEvent,
+) -> bool {
     event_belongs_to_stream(stream_thread, event)
-        && matches!(event, AgentEvent::TurnCompleted { .. })
+        && agent_event_turn(event).is_none_or(|turn| turn == current_turn)
+}
+
+fn event_completes_stream(
+    stream_thread: ThreadId,
+    current_turn: TurnId,
+    event: &AgentEvent,
+) -> bool {
+    event_belongs_to_stream(stream_thread, event)
+        && matches!(event, AgentEvent::TurnCompleted { turn, .. } if *turn == current_turn)
 }
 
 async fn emit_incomplete_turn(
@@ -1883,11 +1909,59 @@ mod tests {
         let stream_thread = ThreadId::new();
         let foreign_thread = ThreadId::new();
         let turn = TurnId::new();
+        let current_turn = TurnId::new();
         let event = completed_event(foreign_thread, turn);
 
         assert!(!event_belongs_to_stream(stream_thread, &event));
-        assert!(!event_completes_stream(stream_thread, &event));
-        assert!(event_completes_stream(foreign_thread, &event));
+        assert!(!event_belongs_to_current_turn(
+            stream_thread,
+            current_turn,
+            &event
+        ));
+        assert!(!event_completes_stream(stream_thread, current_turn, &event));
+        assert!(event_completes_stream(foreign_thread, turn, &event));
+    }
+
+    #[test]
+    fn same_thread_stale_turn_completion_does_not_end_live_stream() {
+        let thread = ThreadId::new();
+        let current_turn = TurnId::new();
+        let previous_turn = TurnId::new();
+        let event = completed_event(thread, previous_turn);
+
+        assert!(event_belongs_to_stream(thread, &event));
+        assert!(!event_belongs_to_current_turn(thread, current_turn, &event));
+        assert!(!event_completes_stream(thread, current_turn, &event));
+        assert!(event_completes_stream(thread, previous_turn, &event));
+    }
+
+    #[test]
+    fn same_thread_stale_turn_error_is_not_current_turn() {
+        let thread = ThreadId::new();
+        let current_turn = TurnId::new();
+        let previous_turn = TurnId::new();
+        let stale_error = AgentEvent::Error {
+            thread,
+            turn: Some(previous_turn),
+            error: HarnessError::Protocol("previous failure".into()),
+        };
+
+        assert!(!event_belongs_to_current_turn(
+            thread,
+            current_turn,
+            &stale_error
+        ));
+
+        let turnless_error = AgentEvent::Error {
+            thread,
+            turn: None,
+            error: HarnessError::Protocol("unscoped failure".into()),
+        };
+        assert!(event_belongs_to_current_turn(
+            thread,
+            current_turn,
+            &turnless_error
+        ));
     }
 
     #[test]

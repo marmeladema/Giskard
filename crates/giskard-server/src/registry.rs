@@ -60,6 +60,13 @@ fn turn_context_kind_label(kind: TurnContextKind) -> &'static str {
 type ApprovalMap = Arc<Mutex<HashMap<ApprovalId, ThreadId>>>;
 type ServerRequestMap = Arc<Mutex<HashMap<ServerRequestId, ThreadId>>>;
 
+#[derive(Clone)]
+struct ThreadBinding {
+    project: ProjectId,
+    handle: ThreadHandle,
+    native_model: ModelRef,
+}
+
 #[derive(Clone, Default)]
 struct ThreadTurnGate {
     active: Arc<StdMutex<HashSet<ThreadId>>>,
@@ -95,6 +102,10 @@ impl ThreadTurnGate {
             debug!(%thread_id, "released active thread turn");
         }
     }
+
+    fn is_active(&self, thread_id: ThreadId) -> bool {
+        self.active_threads().contains(&thread_id)
+    }
 }
 
 struct ThreadTurnLease {
@@ -125,7 +136,7 @@ impl Drop for ThreadTurnLease {
 
 pub struct HarnessRegistry {
     harnesses: Mutex<HashMap<ProjectId, Arc<dyn AgentHarness>>>,
-    threads: Mutex<HashMap<ThreadId, (ProjectId, ThreadHandle)>>,
+    threads: Mutex<HashMap<ThreadId, ThreadBinding>>,
     /// Per-thread turn gate covering both start-in-progress and live turns. `LiveBufferStore` only
     /// becomes active after `TurnStarted`, so it cannot protect the `start_turn` race itself.
     turn_gate: ThreadTurnGate,
@@ -208,11 +219,20 @@ impl HarnessRegistry {
             .await?;
 
         let mut threads = self.threads.lock().await;
-        threads.insert(handle.thread, (config.id, handle.clone()));
+        threads.insert(
+            handle.thread,
+            ThreadBinding {
+                project: config.id,
+                handle: handle.clone(),
+                native_model: initial_model.clone(),
+            },
+        );
         debug!(
             project_id = %config.id,
             thread_id = %handle.thread,
             harness_thread_id = %handle.harness_thread_id,
+            provider = %initial_model.provider,
+            model = %initial_model.model,
             warning = handle.warning.as_ref().map(|w| w.code.as_str()).unwrap_or(""),
             "harness thread opened"
         );
@@ -228,11 +248,11 @@ impl HarnessRegistry {
         effective_model: ModelRef,
     ) -> Result<TurnId, HarnessError> {
         let threads = self.threads.lock().await;
-        let (project_id, handle) = threads
+        let binding = threads
             .get(&thread_id)
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
-        let project_id = *project_id;
-        let handle = handle.clone();
+        let project_id = binding.project;
+        let handle = binding.handle.clone();
         drop(threads);
         debug!(
             %project_id,
@@ -600,12 +620,25 @@ impl HarnessRegistry {
 
     pub async fn get_thread_handle(&self, thread_id: ThreadId) -> Option<ThreadHandle> {
         let threads = self.threads.lock().await;
-        threads.get(&thread_id).map(|(_, h)| h.clone())
+        threads
+            .get(&thread_id)
+            .map(|binding| binding.handle.clone())
+    }
+
+    pub async fn get_thread_native_model(&self, thread_id: ThreadId) -> Option<ModelRef> {
+        let threads = self.threads.lock().await;
+        threads
+            .get(&thread_id)
+            .map(|binding| binding.native_model.clone())
     }
 
     pub async fn get_project_for_thread(&self, thread_id: ThreadId) -> Option<ProjectId> {
         let threads = self.threads.lock().await;
-        threads.get(&thread_id).map(|(p, _)| *p)
+        threads.get(&thread_id).map(|binding| binding.project)
+    }
+
+    pub async fn thread_has_active_turn(&self, thread_id: ThreadId) -> bool {
+        self.turn_gate.is_active(thread_id)
     }
 
     pub async fn forget_thread(&self, thread_id: ThreadId) {
