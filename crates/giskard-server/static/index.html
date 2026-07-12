@@ -546,6 +546,26 @@
     [data-appearance="bubbles"] .msg { max-width:100%; }
     [data-appearance="bubbles"] .msg.user { max-width:88%; }
 
+    /* The IDE/Terminal themes render each row as a fixed role gutter + content. That gutter
+       (~80px + gap) is a big bite out of a phone's width, so on narrow screens collapse the grid
+       to a single column: the role becomes a small label above full-width content. Desktop keeps
+       the two-column gutter. */
+    [data-appearance="ide"] .msg,
+    [data-appearance="terminal"] .msg { grid-template-columns:1fr; }
+    [data-appearance="ide"] .msg .role,
+    [data-appearance="terminal"] .msg .role { text-align:left; margin-bottom:2px; }
+    [data-appearance="ide"] .msg,
+    [data-appearance="terminal"] .msg { padding:8px 12px; }
+
+    /* Reclaim the transcript's side margins on phones. The div carries an inline padding:24px
+       (placeholder spacing) that overrides the theme padding and indents every row; override it
+       here (inline styles need !important) so content runs closer to the edges. `scrollbar-gutter`
+       is dropped too: phones use overlay scrollbars, and the reserved stable gutter was insetting
+       rows on the right only, leaving the left/right margins asymmetric. */
+    #transcript { padding:8px !important; scrollbar-gutter:auto; }
+    [data-appearance="ide"] #transcript,
+    [data-appearance="terminal"] #transcript { padding:0 !important; }
+
     /* Full-screen dialog on phones. */
     .dialog { width:100%; max-width:100%; height:100vh; height:100dvh; max-height:none; border-radius:0; }
     #notices { left:8px; right:8px; bottom:8px; width:auto; }
