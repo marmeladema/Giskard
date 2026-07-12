@@ -151,8 +151,8 @@ optional and falls back to the defaults below.
 | `[server]` | `bind` | `127.0.0.1:8787` | HTTP/WS listen address. |
 | | `secure_cookies` | `true` | `Secure` flag on the session cookie. **Set `false` for plain-HTTP local dev.** |
 | `[auth]` | `password_hash` | — | Argon2 hash of the shared password (or env `GISKARD_PASSWORD_HASH`). Generate with `giskard-admin set-password`. |
-| | `session_days` | `30` | Session lifetime (sliding). |
-| `[browse]` | `roots` | `[]` (whole FS) | Confine the filesystem picker to these absolute subtrees. |
+| | `session_days` | `30` | Session lifetime, sliding: requests in the second half of the window re-issue the cookie for a full window. |
+| `[browse]` | `roots` | `[]` (whole FS) | Confine the filesystem picker **and project creation** to these absolute subtrees (see [Security](#security)). |
 | `[plan]` | `default_dir` / `filename_template` | `docs` / `plan-{slug}-{ts}.md` | Where "Save plan to project" writes. |
 | `[tokens]` | `cost_estimation` | `false` | Show an estimated € cost from `[tokens.rates."provider/model"]`. |
 | `[viz]` | `max_highlight_size` | `10485760` (10 MiB) | Files larger than this aren't syntax-highlighted. |
@@ -168,6 +168,55 @@ actually reach.
 Models with `supports_reasoning_effort = true` expose a thread-header **Effort** selector next to
 the model picker. Choose `Model default` to omit the effort parameter, or select a concrete Codex
 effort (`Minimal` through `Extra High`) for subsequent turns in that thread.
+
+---
+
+## Security
+
+Read this section before exposing an instance beyond `localhost`. Full details in
+[§12 of the spec](specs/giskard-specification.md).
+
+**Threat model in one sentence:** an authenticated client can drive a coding agent (i.e. execute
+code) and read/write files inside project workspaces with the server user's privileges — so the
+shared password is guarding host access, not just a dashboard. Prefer keeping Giskard on a
+private network (VPN/WireGuard/Tailscale). If you do expose it publicly, always front it with a
+TLS-terminating reverse proxy, keep `bind` on `127.0.0.1`, set `secure_cookies = true`, and use a
+long random password.
+
+What the server enforces itself:
+
+- **Password storage & verification.** The password is only ever stored as an Argon2id hash
+  (config or `GISKARD_PASSWORD_HASH`); verification is constant-time.
+- **Login throttling.** After a handful of consecutive failures, `/api/login` locks out with
+  exponentially increasing windows (up to 15 minutes) and answers `429` + `Retry-After`. The
+  check runs *before* the (memory-hard) Argon2 verification, so a password-guessing flood can't
+  be used to burn CPU/RAM either. Failed attempts are logged as `login failed: invalid password`
+  with the client's `X-Forwarded-For` — a stable line you can point fail2ban at when running
+  behind a trusted proxy. The counter is in-memory; restarting the server clears it.
+- **Sessions.** The session cookie is an HMAC-signed, stateless token (`HttpOnly`,
+  `SameSite=Strict`, `Secure` when `secure_cookies = true`) with a sliding `session_days`
+  lifetime. Because it's stateless, **logout only clears the browser cookie** — to actually
+  invalidate outstanding sessions (lost laptop, leaked token), run `giskard-admin
+  revoke-sessions` and restart the server. Changing the password does *not* invalidate existing
+  sessions; rotating the key does.
+- **WebSocket tickets.** `GET /api/ws-ticket` mints a 60-second token for the WS upgrade.
+  Tickets are cryptographically domain-separated from session cookies: a ticket that leaks via a
+  URL (e.g. proxy access logs record `/api/ws?ticket=...`) cannot be replayed as a session
+  cookie, and vice versa.
+- **Response hardening.** Every response carries a strict `Content-Security-Policy`
+  (`script-src 'self'` — the UI has no inline script, so even an HTML-injection bug cannot
+  escalate to script execution), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` /
+  `frame-ancestors 'none'`, `Referrer-Policy: no-referrer`, and same-origin COOP/CORP.
+- **Workspace confinement.** File reads (`highlight`/`raw`), plan writes, and the browse picker
+  are confined to each project's workspace root with symlink-resolving canonicalization. When
+  `[browse] roots` is set, it also constrains **project creation** — without it, an
+  authenticated client can create a project rooted anywhere the server user can read. Set
+  `roots` to your development directories on any exposed instance.
+- **CSRF.** `SameSite=Strict` cookies plus a same-origin-only API surface (no CORS layer) block
+  cross-site request forgery and cross-site WebSocket hijacking in current browsers.
+
+Upgrade note: the session-token format changed when ticket/cookie domain separation was
+introduced — everyone is logged out once after upgrading across that change.
 
 ---
 
@@ -208,6 +257,7 @@ From the checkout without installing, use
 | Command | Description |
 |---------|-------------|
 | `set-password` | Prompt for a password and print its Argon2 hash. |
+| `revoke-sessions` | Rotate the session signing key (`session.key`), invalidating **all** logged-in sessions. Restart `giskard-server` afterwards. |
 | `list-projects` | List projects in the data dir. |
 | `list-threads <project_id>` | List a project's threads. |
 | `dump-thread <project_id> <thread_id>` | Pretty-print a thread's metadata JSON. |
@@ -250,8 +300,10 @@ Cargo workspace under `crates/`:
 | `giskard-ui` | Frontend crate (see note below). |
 
 **Frontend note:** the desktop UI is currently a single self-contained page (HTML/CSS/vanilla JS,
-no npm) served by `giskard-server` at `/`. The spec targets a Dioxus/WASM frontend (`giskard-ui`);
-because the wire contract (`giskard-proto`) is stable, that port can happen without server changes.
+no npm) served by `giskard-server` at `/`, with its stylesheet and script as separate same-origin
+assets (`/app.css`, `/app.js`) so the Content-Security-Policy can forbid inline script. The spec
+targets a Dioxus/WASM frontend (`giskard-ui`); because the wire contract (`giskard-proto`) is
+stable, that port can happen without server changes.
 
 ---
 

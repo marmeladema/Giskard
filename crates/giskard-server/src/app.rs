@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
-use axum::Router;
+use axum::{Router, middleware};
 
 use giskard_persist::PersistStore;
 
+use crate::headers::security_headers_middleware;
 use crate::highlight::Highlighter;
 use crate::hub::Hub;
 use crate::ledger::{self, LedgerHandle};
@@ -11,6 +12,7 @@ use crate::live_buffer::LiveBufferStore;
 use crate::registry::{HarnessFactory, HarnessRegistry};
 use crate::routes::{protected_routes, public_routes};
 use crate::running_commands::RunningTaskStore;
+use crate::throttle::LoginThrottle;
 
 /// Shared application state passed to all Axum handlers and middleware.
 ///
@@ -27,6 +29,8 @@ pub struct AppState {
     /// Single-writer token-ledger actor handle (§5.4).
     pub ledger: LedgerHandle,
     pub session_key: Arc<[u8]>,
+    /// Global brute-force throttle for `/api/login`.
+    pub login_throttle: Arc<LoginThrottle>,
 }
 
 impl AppState {
@@ -73,6 +77,7 @@ impl AppState {
             highlighter,
             ledger,
             session_key: session_key.into(),
+            login_throttle: Arc::new(LoginThrottle::new()),
         }
     }
 }
@@ -81,5 +86,6 @@ pub fn build_app(state: AppState) -> Router {
     Router::new()
         .merge(public_routes())
         .merge(protected_routes(state.clone()))
+        .layer(middleware::from_fn(security_headers_middleware))
         .with_state(state)
 }

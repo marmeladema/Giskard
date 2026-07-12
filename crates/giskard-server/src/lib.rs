@@ -1,5 +1,6 @@
 pub mod app;
 pub mod auth;
+pub mod headers;
 pub mod highlight;
 pub mod hub;
 pub mod ledger;
@@ -11,6 +12,7 @@ pub mod plan;
 pub mod registry;
 pub mod routes;
 pub mod running_commands;
+pub mod throttle;
 pub mod tokens;
 
 pub use app::{AppState, build_app};
