@@ -80,10 +80,12 @@ Then open **http://127.0.0.1:8787**, log in, and:
 
 1. **+** next to *Projects* → name it and give an **absolute directory path** that exists on the
    server machine (the agent's workspace).
-2. **+** on the project → *New thread*.
-3. Type in the composer (Enter to send). The header has the **Plan/Build** toggle, **approval
-   policy**, **model** picker, **Tasks** menu for running commands/tools, **MCP** status menu, and
-   **Context** usage button; scrolling the transcript to the top lazy-loads older history.
+2. **+** on the project → draft a new thread. No Codex thread is created until the first message is
+   sent, so choose the **Plan/Build** mode, **approval policy**, and **model** first if needed.
+3. Type in the composer (Enter to send). The first send creates the Codex thread with the selected
+   provider/model and starts the turn. Existing threads show the **Tasks** menu for running
+   commands/tools, **MCP** status menu, and **Context** usage button; scrolling the transcript to
+   the top lazy-loads older history.
 
 The header context value is a context-window indicator, not a billing total. Codex currently exposes
 the latest turn's input tokens rather than a dedicated context-occupancy field, so Giskard uses that
@@ -220,9 +222,10 @@ From the checkout without installing, use
 The browser (and any client) drives everything through a small REST surface plus one multiplexed
 WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticket`, `GET /api/ws`,
 `GET/POST /api/projects`, `GET/DELETE /api/projects/{id}`, `GET/POST
-/api/projects/{id}/threads`, `DELETE /api/projects/{id}/threads/{thread_id}`, `PATCH
-/api/projects/{id}/threads/{thread_id}/title`, `POST
-/api/projects/{id}/threads/{thread_id}/archive`, `GET /api/models`, `POST /api/models/refresh`,
+/api/projects/{id}/threads`, `POST /api/projects/{id}/threads/start`, `DELETE
+/api/projects/{id}/threads/{thread_id}`, `PATCH /api/projects/{id}/threads/{thread_id}/title`,
+`POST /api/projects/{id}/threads/{thread_id}/archive`, `GET /api/models`, `POST
+/api/models/refresh`,
 `GET /api/tokens`, `GET /api/projects/{id}/tokens`, `GET /api/projects/{id}/highlight|raw`, `POST
 /api/projects/{id}/linkify`, `POST /api/projects/{id}/render`, `GET /api/browse`, `POST
 /api/browse/mkdir`, `GET /api/projects/{id}/mcp`, `POST /api/projects/{id}/mcp/reload`, and `POST

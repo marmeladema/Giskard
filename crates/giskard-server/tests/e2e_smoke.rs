@@ -120,6 +120,12 @@ struct SlowStartHarness {
 struct CountingOpenHarness {
     threads: tokio::sync::Mutex<HashMap<ThreadId, tokio::sync::broadcast::Sender<AgentEvent>>>,
     open_calls: AtomicUsize,
+    start_calls: AtomicUsize,
+    delete_calls: AtomicUsize,
+    opened_models: tokio::sync::Mutex<Vec<ModelRef>>,
+    started_models: tokio::sync::Mutex<Vec<Option<ModelRef>>>,
+    started_inputs: tokio::sync::Mutex<Vec<String>>,
+    start_error: tokio::sync::Mutex<Option<HarnessError>>,
 }
 
 impl SlowStartHarness {
@@ -157,6 +163,30 @@ impl SlowStartHarness {
 impl CountingOpenHarness {
     fn open_calls(&self) -> usize {
         self.open_calls.load(Ordering::SeqCst)
+    }
+
+    async fn opened_models(&self) -> Vec<ModelRef> {
+        self.opened_models.lock().await.clone()
+    }
+
+    fn start_calls(&self) -> usize {
+        self.start_calls.load(Ordering::SeqCst)
+    }
+
+    fn delete_calls(&self) -> usize {
+        self.delete_calls.load(Ordering::SeqCst)
+    }
+
+    async fn started_models(&self) -> Vec<Option<ModelRef>> {
+        self.started_models.lock().await.clone()
+    }
+
+    async fn started_inputs(&self) -> Vec<String> {
+        self.started_inputs.lock().await.clone()
+    }
+
+    async fn fail_start_with(&self, error: HarnessError) {
+        *self.start_error.lock().await = Some(error);
     }
 }
 
@@ -546,26 +576,51 @@ impl AgentHarness for CountingOpenHarness {
     }
 
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
-        self.open_calls.fetch_add(1, Ordering::SeqCst);
+        let open_call = self.open_calls.fetch_add(1, Ordering::SeqCst) + 1;
         let thread = opts.thread.unwrap_or_default();
+        self.opened_models
+            .lock()
+            .await
+            .push(opts.initial_model.clone());
         let (tx, _) = tokio::sync::broadcast::channel(16);
         self.threads.lock().await.insert(thread, tx);
         Ok(ThreadHandle {
             thread,
-            harness_thread_id: opts.resume.unwrap_or_else(|| format!("count_{thread}")),
+            harness_thread_id: opts
+                .resume
+                .unwrap_or_else(|| format!("count_{thread}_{open_call}")),
             warning: None,
         })
     }
 
     async fn start_turn(
         &self,
-        _thread: &ThreadHandle,
-        _input: UserInput,
-        _overrides: TurnOverrides,
+        thread: &ThreadHandle,
+        input: UserInput,
+        overrides: TurnOverrides,
     ) -> Result<TurnId, HarnessError> {
-        Err(HarnessError::Unsupported(
-            "turns are not supported by this harness".into(),
-        ))
+        self.start_calls.fetch_add(1, Ordering::SeqCst);
+        self.started_models.lock().await.push(overrides.model);
+        self.started_inputs
+            .lock()
+            .await
+            .push(input.as_text().unwrap_or_default().to_string());
+
+        if let Some(error) = self.start_error.lock().await.clone() {
+            return Err(error);
+        }
+
+        let turn = TurnId::new();
+        let sender = {
+            let threads = self.threads.lock().await;
+            threads.get(&thread.thread).cloned()
+        }
+        .ok_or(HarnessError::ThreadNotFound(thread.thread))?;
+        let _ = sender.send(AgentEvent::TurnStarted {
+            thread: thread.thread,
+            turn,
+        });
+        Ok(turn)
     }
 
     fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
@@ -595,6 +650,12 @@ impl AgentHarness for CountingOpenHarness {
     }
 
     async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
+        Ok(())
+    }
+
+    async fn delete_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
+        self.delete_calls.fetch_add(1, Ordering::SeqCst);
+        self.threads.lock().await.remove(&thread.thread);
         Ok(())
     }
 
@@ -3304,6 +3365,371 @@ wire_api = "responses"
     let saved_thread = state.store.load_thread(pid, tid).await.unwrap().unwrap();
     assert_eq!(saved_thread.current_model.provider, "proxy");
     assert_eq!(saved_thread.context_window, 262_144);
+}
+
+#[tokio::test]
+async fn blank_thread_creation_without_resume_is_rejected() {
+    let harness = Arc::new(CountingOpenHarness::default());
+    let (_tmp, _state, port) = start_custom_server_with_extra_config_on_available_port(
+        Arc::new(CountingOpenFactory {
+            harness: harness.clone(),
+        }),
+        "",
+    )
+    .await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let cookie = login_cookie(&client, &base).await;
+    let pid = create_project_only(&client, &base, &cookie).await;
+
+    let resp = client
+        .post(format!("{base}/api/projects/{pid}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"resume": null}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("creating a new thread requires an initial message"));
+    assert_eq!(harness.open_calls(), 0);
+}
+
+#[tokio::test]
+async fn start_thread_with_initial_message_uses_selected_provider_and_starts_turn() {
+    let extra_config = r#"
+[[providers]]
+id = "openai"
+name = "OpenAI"
+wire_api = "responses"
+
+  [[providers.models]]
+  id = "gpt-5.5"
+  display_name = "GPT-5.5"
+  context_window = 262144
+  supports_reasoning_effort = true
+
+[[providers]]
+id = "proxy"
+name = "Proxy"
+wire_api = "responses"
+
+  [[providers.models]]
+  id = "glm-5.2-workers-ai"
+  display_name = "GLM Workers"
+  context_window = 131072
+  supports_reasoning_effort = false
+"#;
+    let harness = Arc::new(CountingOpenHarness::default());
+    let (_tmp, state, port) = start_custom_server_with_extra_config_on_available_port(
+        Arc::new(CountingOpenFactory {
+            harness: harness.clone(),
+        }),
+        extra_config,
+    )
+    .await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let cookie = login_cookie(&client, &base).await;
+    let pid = create_project_only(&client, &base, &cookie).await;
+
+    let proxy_model = ModelRef {
+        provider: "proxy".into(),
+        model: "glm-5.2-workers-ai".into(),
+        reasoning_effort: None,
+    };
+    let resp = client
+        .post(format!("{base}/api/projects/{pid}/threads/start"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({
+            "text": "Hello",
+            "model_ref": proxy_model,
+            "mode": "plan",
+            "approval_policy": "read_only",
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body = resp.json::<serde_json::Value>().await.unwrap();
+    let tid: ThreadId = body["thread_id"].as_str().unwrap().parse().unwrap();
+
+    assert_eq!(harness.open_calls(), 1);
+    assert_eq!(harness.start_calls(), 1);
+    let opened = harness.opened_models().await;
+    assert_eq!(opened[0].provider, "proxy");
+    assert_eq!(opened[0].model, "glm-5.2-workers-ai");
+    let started_models = harness.started_models().await;
+    assert_eq!(started_models[0], Some(opened[0].clone()));
+    assert_eq!(harness.started_inputs().await, vec!["Hello".to_string()]);
+
+    let saved_thread = state.store.load_thread(pid, tid).await.unwrap().unwrap();
+    assert_eq!(saved_thread.current_model.provider, "proxy");
+    assert_eq!(saved_thread.current_model.model, "glm-5.2-workers-ai");
+    assert_eq!(saved_thread.mode, Mode::Plan);
+    assert_eq!(saved_thread.approval_policy, ApprovalPolicy::ReadOnly);
+    assert_eq!(
+        saved_thread.harness_thread_id,
+        body["harness_thread_id"].as_str().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn start_thread_turn_rejection_cleans_up_new_thread() {
+    let harness = Arc::new(CountingOpenHarness::default());
+    harness
+        .fail_start_with(HarnessError::Unsupported(
+            "turns are not supported by this harness".into(),
+        ))
+        .await;
+    let (_tmp, state, port) = start_custom_server_with_extra_config_on_available_port(
+        Arc::new(CountingOpenFactory {
+            harness: harness.clone(),
+        }),
+        "",
+    )
+    .await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let cookie = login_cookie(&client, &base).await;
+    let pid = create_project_only(&client, &base, &cookie).await;
+
+    let resp = client
+        .post(format!("{base}/api/projects/{pid}/threads/start"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({
+            "text": "Hello",
+            "model_ref": {"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null},
+            "mode": "build",
+            "approval_policy": "ask",
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("turns are not supported"));
+    assert_eq!(harness.open_calls(), 1);
+    assert_eq!(harness.start_calls(), 1);
+    assert_eq!(harness.delete_calls(), 1);
+    assert!(state.store.list_threads(pid).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn select_model_rejects_provider_change_on_non_empty_thread() {
+    let extra_config = r#"
+[[providers]]
+id = "openai"
+name = "OpenAI"
+wire_api = "responses"
+
+  [[providers.models]]
+  id = "gpt-5.5"
+  display_name = "GPT-5.5"
+  context_window = 262144
+  supports_reasoning_effort = true
+
+[[providers]]
+id = "proxy"
+name = "Proxy"
+wire_api = "responses"
+
+  [[providers.models]]
+  id = "glm-5.2-workers-ai"
+  display_name = "GLM Workers"
+  context_window = 131072
+  supports_reasoning_effort = false
+"#;
+    let harness = Arc::new(CountingOpenHarness::default());
+    let (_tmp, state, port) = start_custom_server_with_extra_config_on_available_port(
+        Arc::new(CountingOpenFactory {
+            harness: harness.clone(),
+        }),
+        extra_config,
+    )
+    .await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let cookie = login_cookie(&client, &base).await;
+    let (pid, tid) = create_project_and_thread(&client, &base, &cookie).await;
+    let now = chrono::Utc::now();
+    let openai_model = ModelRef {
+        provider: "openai".into(),
+        model: "gpt-5.5".into(),
+        reasoning_effort: None,
+    };
+    state
+        .store
+        .append_turn(
+            pid,
+            tid,
+            &giskard_core::turn::Turn {
+                id: TurnId::new(),
+                user_input: UserInput::text("previous"),
+                items: vec![],
+                model: openai_model,
+                mode: Mode::Build,
+                status: TurnStatus {
+                    kind: TurnStatusKind::Completed,
+                    message: None,
+                },
+                usage: TokenUsage::default(),
+                diffs: vec![],
+                started_at: now,
+                completed_at: Some(now),
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut ws = connect_ws(port, &cookie).await;
+    let proxy_model = ModelRef {
+        provider: "proxy".into(),
+        model: "glm-5.2-workers-ai".into(),
+        reasoning_effort: None,
+    };
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SelectModel {
+            thread_id: tid,
+            model_ref: proxy_model,
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    let error = wait_for_ws_error(&mut ws, "select_model", "thread_provider_locked").await;
+    assert!(
+        error
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("native provider: openai; selected provider: proxy")
+    );
+    assert_eq!(harness.open_calls(), 1);
+    let saved_thread = state.store.load_thread(pid, tid).await.unwrap().unwrap();
+    assert_eq!(saved_thread.current_model.provider, "openai");
+}
+
+#[tokio::test]
+async fn send_input_rejects_persisted_provider_mismatch_on_non_empty_thread() {
+    let extra_config = r#"
+[[providers]]
+id = "openai"
+name = "OpenAI"
+wire_api = "responses"
+
+  [[providers.models]]
+  id = "gpt-5.5"
+  display_name = "GPT-5.5"
+  context_window = 262144
+  supports_reasoning_effort = true
+
+[[providers]]
+id = "proxy"
+name = "Proxy"
+wire_api = "responses"
+
+  [[providers.models]]
+  id = "glm-5.2-workers-ai"
+  display_name = "GLM Workers"
+  context_window = 131072
+  supports_reasoning_effort = false
+"#;
+    let harness = Arc::new(CountingOpenHarness::default());
+    let (_tmp, state, port) = start_custom_server_with_extra_config_on_available_port(
+        Arc::new(CountingOpenFactory {
+            harness: harness.clone(),
+        }),
+        extra_config,
+    )
+    .await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let cookie = login_cookie(&client, &base).await;
+    let (pid, tid) = create_project_and_thread(&client, &base, &cookie).await;
+    let now = chrono::Utc::now();
+    let openai_model = ModelRef {
+        provider: "openai".into(),
+        model: "gpt-5.5".into(),
+        reasoning_effort: None,
+    };
+    state
+        .store
+        .append_turn(
+            pid,
+            tid,
+            &giskard_core::turn::Turn {
+                id: TurnId::new(),
+                user_input: UserInput::text("previous"),
+                items: vec![],
+                model: openai_model,
+                mode: Mode::Build,
+                status: TurnStatus {
+                    kind: TurnStatusKind::Completed,
+                    message: None,
+                },
+                usage: TokenUsage::default(),
+                diffs: vec![],
+                started_at: now,
+                completed_at: Some(now),
+            },
+        )
+        .await
+        .unwrap();
+    state
+        .store
+        .update_thread(pid, tid, |thread| {
+            thread.current_model = ModelRef {
+                provider: "proxy".into(),
+                model: "glm-5.2-workers-ai".into(),
+                reasoning_effort: None,
+            };
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut ws = connect_ws(port, &cookie).await;
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SendInput {
+            thread_id: tid,
+            text: "Hello".into(),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    let error = wait_for_ws_error(&mut ws, "send_input", "thread_provider_locked").await;
+    assert!(
+        error
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("native provider: openai; selected provider: proxy")
+    );
+    assert_eq!(harness.open_calls(), 1);
 }
 
 #[tokio::test]

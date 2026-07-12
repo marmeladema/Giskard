@@ -8,7 +8,24 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.36
+**Version:** 1.37
+
+**Changelog (1.36 → 1.37), lazy first-turn thread creation:**
+- **LT1:** The browser's project `+` action opens an unpersisted draft thread. No local
+  `ThreadFile` and no native Codex thread are created until the user sends the first message.
+- **LT2:** New thread creation uses `POST /api/projects/{id}/threads/start` with initial text,
+  model/provider, reasoning effort, mode, and approval policy. The server creates the native Codex
+  thread with `thread/start`, persists the Giskard thread, and starts the first turn as one
+  server-owned operation.
+- **LT3:** Blank `POST /api/projects/{id}/threads` creation is rejected. That endpoint opens
+  existing persisted threads and supports explicit native-id resume/import flows only.
+- **LT4:** If native thread creation fails, no local thread is persisted. If persistence or
+  synchronous `turn/start` fails after native creation, Giskard best-effort deletes the native
+  thread, removes any local partial thread, logs cleanup failures, and surfaces the original
+  browser-visible error.
+- **LT5:** Provider selection for a new thread is fixed at first send. Because no native Codex
+  thread exists during draft editing, the selected provider/model is sent directly to Codex
+  `thread/start`; Giskard no longer creates an empty native thread and later replaces it.
 
 **Changelog (1.35 → 1.36), observability gap closure:**
 - **O1:** Turn startup and forwarding emit structured operator logs at the decision points needed to
@@ -42,7 +59,17 @@
   `turnId`, `itemId`, and `serverRequest/resolved.requestId` drive routing/correlation; approval
   `approvalId`/`itemId`/`callId` values are surfaced as card metadata when present; unknown future
   server requests that carry raw `threadId`/`turnId` are scoped through the same native-id registry
-  instead of being relabeled onto the fallback thread.
+  instead of being relabeled onto the fallback thread. Because Codex can buffer a late
+  `turn/completed` for the previous native turn while acknowledging a new `turn/start`, the Codex
+  harness stream for the new turn only terminates on the acknowledged current `TurnId`; stale
+  same-thread completions/errors are routed normally but must not complete or fail the new turn.
+- **O8:** Codex binds `modelProvider` at native `thread/start`/`thread/resume`; `turn/start` can
+  override `model` but not provider. Giskard records the model/provider used to open the native
+  thread. Provider changes on an already-native-backed thread are rejected with a structured browser
+  error explaining that the Codex thread is provider-bound; `send_input` applies the same rejection
+  for any already-persisted provider mismatch. Same-provider model changes remain per-turn
+  overrides. For new threads, LT1-LT5 avoid the old empty-thread rebinding case by delaying native
+  creation until the first message carries the selected provider/model.
 
 **Changelog (1.34 → 1.35), authoritative reconnect resync:**
 - **RX4:** A browser `Subscribe` response is an authoritative active-thread resync, not an
@@ -229,9 +256,9 @@
   to a single line, and native rename failure preserves the old local title.
 
 **Changelog (1.18 → 1.19), thread archive/delete lifecycle:**
-- **TD1:** Threads continue to create/resume their native Codex thread eagerly when opened. Giskard
-  does not create local-only placeholder threads; accidental threads are handled by explicit
-  archive/delete actions.
+- **TD1:** Historical note: v1.19 kept native Codex thread creation/resume eager when a thread was
+  opened. This is superseded by LT1-LT5 for new thread creation; opening existing persisted threads
+  still resumes eagerly.
 - **TD2:** The thread list exposes a per-thread `...` actions menu. Active threads offer `Archive`
   and `Delete`; archived threads offer `Unarchive` and `Delete`.
 - **TD3:** Archive/unarchive calls the harness first (`thread/archive` / `thread/unarchive` for
@@ -1560,8 +1587,15 @@ Flow: user clicks "New project" → names it → picks a directory via the file 
 
 ### 7.1 Thread lifecycle
 
-- **Create:** user starts a new thread in a project; server calls `open_thread` (Codex
-  `thread/start`), stores the returned `harness_thread_id`, writes `<thread_id>.json`.
+- **Draft new thread:** user starts a new thread in a project; the browser opens an unpersisted
+  draft with project defaults for model, mode, and approval policy. There is no local
+  `<thread_id>.json` and no native Codex thread yet.
+- **Create + first send:** user submits the first message; the browser calls
+  `POST /api/projects/{id}/threads/start` with text, model/provider, mode, and approval policy.
+  The server calls `open_thread` (Codex `thread/start`) with that provider/model, stores the
+  returned `harness_thread_id`, writes `<thread_id>.json`, and immediately calls `start_turn`.
+  If native creation fails, nothing is persisted. If persistence or synchronous `turn/start` fails
+  after native creation, cleanup is best-effort and failures are logged.
 - **Open existing:** selecting a persisted thread calls the same open endpoint with
   `thread_id = Some(existing_id)`. The server reattaches the harness using the stored native
   `harness_thread_id` but preserves the durable Giskard `ThreadId`; opening a thread is
@@ -1721,7 +1755,11 @@ LiteLLM gateway fronting Cloudflare Workers AI.
 > Note: Codex itself reads its own `~/.codex/config.toml` for provider/auth (Codex is
 > "already configured", §12.2). Giskard's provider config governs (a) what the UI offers in
 > the model picker and (b) optional `/v1/models` discovery. The `ModelRef` Giskard sends as a
-> per-turn override must correspond to a model/provider Codex is configured to reach.
+> per-turn override must correspond to a model/provider Codex is configured to reach. For the
+> Codex harness specifically, provider is native-thread-scoped: `thread/start`/`thread/resume`
+> receive `modelProvider`, while `turn/start` only supports a model override. New thread drafts
+> avoid provider rebinding by delaying native creation until the first send. Once a native Codex
+> thread exists, it stays on its native provider; switching providers requires a new Giskard thread.
 
 ### 8.3 Model list: static + dynamic
 
@@ -1804,11 +1842,12 @@ LiteLLM gateway fronting Cloudflare Workers AI.
 - **`auto`** — approvals are granted automatically (full-auto within the workspace sandbox).
 
 Policy is a **thread-level** setting, **not** a per-project or per-turn override (P3/AP1). Project
-creation does not ask for policy. New threads start with `ask`. It is settable via the
-`SetApprovalPolicy` client message (§13.6), which persists immediately and echoes a `ThreadState` to
-all connected tabs — the same durable-switch pattern as `SwitchMode`/`SelectModel` (P2). The `ask`
-policy is only offered when the active harness advertises `live_approvals` (§9.4); otherwise it is
-coerced at attach time.
+creation does not ask for policy. New thread drafts default to `ask`, and the selected draft policy
+is persisted when the first message creates the thread. On existing threads, policy is settable via
+the `SetApprovalPolicy` client message (§13.6), which persists immediately and echoes a
+`ThreadState` to all connected tabs — the same durable-switch pattern as
+`SwitchMode`/`SelectModel` (P2). The `ask` policy is only offered when the active harness advertises
+`live_approvals` (§9.4); otherwise it is coerced at attach time.
 
 **Interaction with Plan mode.** Mode (Plan/Build) and approval policy are **orthogonal
 settings**, but Plan mode changes what the sandbox permits: file writes remain blocked while
@@ -2150,10 +2189,11 @@ This guarantees a coherent experience when a future, less-capable harness is plu
 - **One WebSocket per browser client**, multiplexing all projects/threads (chosen for lowest
   CPU/memory: one connection, one server-side fan-out task, no per-thread sockets).
 - Messages are tagged with `project_id` / `thread_id`. Defined once in `giskard-proto`.
-- **Thread open is REST-backed:** `POST /api/projects/{project_id}/threads` accepts
-  `{ thread_id?: ThreadId, resume?: String }`. `thread_id = None` creates a new Giskard thread;
-  `thread_id = Some(existing)` reopens/reattaches a persisted Giskard thread; `resume` is the
-  optional native harness id for explicit resume/create flows.
+- **Thread open/create is REST-backed:** `POST /api/projects/{project_id}/threads` accepts
+  `{ thread_id?: ThreadId, resume?: String }` and opens/reattaches persisted threads or explicit
+  native resume/import flows. Blank creation is rejected. New first-message creation uses
+  `POST /api/projects/{project_id}/threads/start` with `{ text, model_ref, mode,
+  approval_policy }` and returns `{ thread_id, harness_thread_id, turn_id, warning? }`.
 
 **Client → server** (examples): `Subscribe { thread_id }`, `Unsubscribe { thread_id }`,
 `SendInput { thread_id, text }`, `SwitchMode { thread_id, mode }`,
@@ -2176,7 +2216,8 @@ anything other than `thread_turn_active`.
 > `ThreadState` to all connected tabs. This guarantees the §5 "same state after restart"
 > requirement: a switch is not lost if the app restarts before the user sends the next message.
 > The sandbox/model/policy *effect* still takes hold at the next turn; only the stored *intent* is
-> durable now.
+> durable now. Draft-thread setting changes are local until the first message creates the thread;
+> they become durable as part of `POST /threads/start`.
 
 > **`SendInput` carries text only in v1.** Image/file attachments are out of scope (matching
 > `UserInput` in §4.5). If added later, extend both `UserInput` and this message together.
@@ -2457,8 +2498,9 @@ Artifacts are version-pinned to the Codex binary that produced them; regenerate 
 > collaboration-mode mapping is sent on every turn too: **Plan ⇒ `plan`**, **Build ⇒ `default`**.
 > The Build/default send is intentional because Codex app-server collaboration mode is sticky after
 > a plan turn. Approval policy maps to Codex's approval configuration. `TurnOverrides.model` maps
-> to the per-turn `turn/start` model field; reasoning effort is carried inside
-> `ModelRef.reasoning_effort` (P1: no standalone effort field on `TurnOverrides`).
+> to the per-turn `turn/start` model field, but Codex has no per-turn `modelProvider` override;
+> provider changes are handled at the native-thread boundary (§8.2). Reasoning effort is carried
+> inside `ModelRef.reasoning_effort` (P1: no standalone effort field on `TurnOverrides`).
 > `TurnOverrides.approval_policy` is the thread policy snapshot (P3/AP1: not a per-turn override).
 
 **Client library:** use `codex-codes` (v0.143.0, tested against Codex CLI 0.143.0) with the

@@ -299,6 +299,23 @@ pub struct OpenThreadResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct StartThreadRequest {
+    pub text: String,
+    pub model_ref: ModelRef,
+    pub mode: Mode,
+    pub approval_policy: ApprovalPolicy,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StartThreadResponse {
+    pub thread_id: ThreadId,
+    pub harness_thread_id: String,
+    pub turn_id: TurnId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<ErrorInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ArchiveThreadRequest {
     pub archived: bool,
 }

@@ -660,8 +660,19 @@ async fn index_page_is_served_and_public() {
     assert!(
         body.contains("id=\"wsStatusBadge\"")
             && body.contains("function renderWsStatus()")
-            && body.contains("state-reconnecting"),
+            && body.contains("state-reconnecting")
+            && body.contains("state-draft")
+            && body.contains("case \"draft\": return \"Draft\"")
+            && body.contains("el.hidden = !state.threadId && !isDraftThread()"),
         "UI exposes persistent connection status without toast spam"
+    );
+    assert!(
+        body.contains("setWsStatus(\"draft\", \"Draft thread. Send a message to create it.\")"),
+        "draft threads use a neutral status rather than disconnected"
+    );
+    assert!(
+        body.contains("header.thr button.badge:disabled"),
+        "disabled header buttons share the same muted style"
     );
     assert!(
         body.contains("Connecting to agent"),
@@ -672,8 +683,10 @@ async fn index_page_is_served_and_public() {
         "UI exposes WS reconnecting state"
     );
     assert!(
-        body.contains("$(\"sendBtn\").disabled = state.activeTurn || !ready"),
-        "UI blocks new sends until the WebSocket is open"
+        body.contains("$(\"sendBtn\").disabled = state.activeTurn || (!ready && !draft)")
+            && body.contains("if (isDraftThread()) {")
+            && body.contains("startDraftThread(text);"),
+        "UI allows draft first sends without a WebSocket and blocks existing-thread sends until open"
     );
     assert!(
         body.contains("state.awaitingThreadResync = true;\n    send({ type:\"subscribe\"")

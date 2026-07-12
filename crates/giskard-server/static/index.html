@@ -86,6 +86,9 @@
   /* Header controls are chrome, not content: keep their type a step smaller than the body so the
      transcript stays the focal point. */
   header.thr .badge { font-size:11px; padding:2px 8px; border:1px solid var(--border); border-radius:20px; }
+  header.thr button.badge:disabled {
+    color:var(--muted); border-color:var(--border); background:transparent; opacity:.65;
+  }
   header.thr .gauge { font-size:11px; }
   .mcp-wrap { position:relative; }
   .mcp-btn { display:flex; align-items:center; gap:6px; }
@@ -122,6 +125,8 @@
   .ws-badge::before { content:""; width:8px; height:8px; border-radius:50%; background:var(--muted); }
   .ws-badge.state-open { color:#7ee787; border-color:#238636; }
   .ws-badge.state-open::before { background:#3fb950; }
+  .ws-badge.state-draft { color:var(--muted); border-color:var(--border); background:transparent; }
+  .ws-badge.state-draft::before { background:var(--muted); }
   .ws-badge.state-connecting,
   .ws-badge.state-reconnecting { color:#f0d98c; border-color:#d29922; background:rgba(210,153,34,.08); }
   .ws-badge.state-connecting::before,
@@ -730,6 +735,7 @@ let state = {
   projectId:null, threadId:null, mode:"build", ws:null, wsStatus:"closed", wsConnectId:0,
   wsReconnectTimer:null, wsReconnectAttempt:0, wsStatusDetail:"WebSocket disconnected",
   wsLastProblem:"", wsLastProblemNotice:"", wsLastProblemNoticeAt:0,
+  draftThread:null, firstTurnStartingThreadId:null,
   models:[], streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null,
   streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), itemKindsByItemId:new Map(),
   pendingApprovals:new Map(), pendingServerRequests:new Map(),
@@ -1103,6 +1109,8 @@ function clearThreadView(tid) {
     try { ws.close(); } catch {}
   }
   state.projectId = null; state.threadId = null;
+  state.draftThread = null;
+  state.firstTurnStartingThreadId = null;
   state.pendingUserEl = null; state.pendingUserText = null;
   state.compactPending = false;
   state.currentModel = null;
@@ -1205,15 +1213,82 @@ $("pmCreate").onclick = async () => {
 
 async function newThread(pid) {
   try {
-    const res = await api("POST",`/api/projects/${pid}/threads`,{ resume:null });
-    await loadThreads(pid);
-    await openThread(pid, res.thread_id, "New thread");
+    const project = await api("GET", `/api/projects/${pid}`);
+    openDraftThread(pid, project && project.default_model);
   } catch (e) { alert("New thread failed: "+e.message); }
+}
+
+function fallbackDraftModel() {
+  const first = state.models && state.models[0];
+  if (first && first.provider && first.model) {
+    return { provider:first.provider, model:first.model, reasoning_effort:null };
+  }
+  return { provider:"openai", model:"gpt-5.5", reasoning_effort:null };
+}
+
+function normalizeDraftModel(model) {
+  if (model && model.provider && model.model) {
+    return {
+      provider:String(model.provider),
+      model:String(model.model),
+      reasoning_effort:model.reasoning_effort || null
+    };
+  }
+  return fallbackDraftModel();
+}
+
+function isDraftThread() {
+  return !!state.draftThread && !state.threadId;
+}
+
+function openDraftThread(pid, defaultModel) {
+  clearWsReconnectTimer();
+  const oldWs = state.ws;
+  state.ws = null;
+  if (oldWs) {
+    oldWs._giskardExpectedClose = true;
+    try { oldWs.close(); } catch {}
+  }
+
+  state.projectId = pid;
+  state.threadId = null;
+  state.draftThread = { projectId:pid, title:"New thread" };
+  state.firstTurnStartingThreadId = null;
+  state.pendingUserEl = null;
+  state.pendingUserText = null;
+  state.compactPending = false;
+  state.currentModel = normalizeDraftModel(defaultModel);
+  state.mcpServers = []; state.mcpError = null; state.expandedMcps = new Set();
+  state.mcpCapabilities = { status:false, reload:false, oauth_login:false };
+  $("tasksMenu").hidden = true;
+  $("mcpMenu").hidden = true;
+  $("usageMenu").hidden = true;
+  renderMcpButton();
+  setMode("build");
+  setApprovalPolicy("ask");
+  setTurnActive(false);
+  state.historyLoaded = false; state.oldestTurnId = null; state.hasMoreHistory = false;
+  state.loadingHistory = false; state.pendingOlder = false;
+  state.contextUsed = null; state.contextWindow = 0; state.tokenLedger = null;
+  updateGauge(null, 0);
+  state.awaitingInitialThreadState = false;
+  state.awaitingThreadResync = false;
+  resetRenderState();
+  document.querySelectorAll(".thread").forEach(e => e.classList.remove("active"));
+  $("thrHeader").style.display="flex"; $("composer").style.display="flex";
+  $("pickerBar").style.display="flex";
+  setThreadTitle("New thread");
+  $("transcript").className=""; $("transcript").innerHTML=""; $("notices").innerHTML="";
+  setWsStatus("draft", "Draft thread. Send a message to create it.");
+  syncModelControls();
+  closeDrawers();
+  $("input").focus();
 }
 
 /* ---------- thread view + websocket ---------- */
 async function openThread(pid, tid, title, opts) {
   opts = opts || {};
+  if (!opts.firstTurnStarting) state.firstTurnStartingThreadId = null;
   let res;
   try {
     res = await api("POST",`/api/projects/${pid}/threads`,{ thread_id:tid, resume:null });
@@ -1228,6 +1303,7 @@ async function openThread(pid, tid, title, opts) {
   try { localStorage.setItem("giskard.lastThread", JSON.stringify({ pid, tid })); } catch {}
 
   state.projectId = pid; state.threadId = tid; state.pendingUserEl = null; state.pendingUserText = null;
+  state.draftThread = null;
   state.compactPending = false;
   state.currentModel = null;
   $("effortControl").hidden = true;
@@ -1268,6 +1344,7 @@ function wsIsOpen() {
 function wsStatusLabel(status) {
   switch (status) {
     case "open": return "Connected";
+    case "draft": return "Draft";
     case "connecting": return "Connecting";
     case "reconnecting": return "Reconnecting...";
     default: return "Disconnected";
@@ -1276,7 +1353,7 @@ function wsStatusLabel(status) {
 function renderWsStatus() {
   const el = $("wsStatusBadge");
   if (!el) return;
-  el.hidden = !state.threadId;
+  el.hidden = !state.threadId && !isDraftThread();
   el.className = `badge ws-badge state-${state.wsStatus}`;
   el.textContent = wsStatusLabel(state.wsStatus);
   el.title = state.wsStatusDetail || wsStatusLabel(state.wsStatus);
@@ -1413,28 +1490,31 @@ function setWsStatus(status, detail) {
 }
 function updateComposerControls() {
   const ready = state.wsStatus==="open";
-  $("sendBtn").disabled = state.activeTurn || !ready;
-  $("stopBtn").hidden = !state.activeTurn;
+  const draft = isDraftThread();
+  const hasThreadSurface = !!state.threadId || draft;
+  $("sendBtn").disabled = state.activeTurn || (!ready && !draft);
+  $("stopBtn").hidden = !state.activeTurn || draft;
   $("stopBtn").disabled = !ready || state.interruptPending;
   $("stopBtn").textContent = state.interruptPending ? "Stopping…" : "Stop";
-  $("modelSel").disabled = !state.threadId || !ready;
-  $("modelPickerBtn").disabled = !state.threadId || !ready;
-  $("effortSel").disabled = !state.threadId || !ready;
+  $("modelSel").disabled = !hasThreadSurface || (!ready && !draft);
+  $("modelPickerBtn").disabled = !hasThreadSurface || (!ready && !draft);
+  $("effortSel").disabled = !hasThreadSurface || (!ready && !draft);
   const compactBtn = $("compactBtn");
   if (compactBtn) {
-    compactBtn.disabled = !state.threadId || state.activeTurn || state.compactPending || !ready;
+    compactBtn.disabled = !state.threadId || draft || state.activeTurn || state.compactPending || !ready;
     compactBtn.textContent = state.compactPending ? "Compacting..." : "Compact context";
   }
-  $("input").disabled = !state.threadId;
+  $("input").disabled = !hasThreadSurface;
   $("input").placeholder =
     state.activeTurn ? "Agent is running… draft the next message here." :
+    draft ? "Message the agent…  (Enter to send, Shift+Enter for newline)" :
     state.wsStatus==="open" ? "Message the agent…  (Enter to send, Shift+Enter for newline)" :
     state.wsStatus==="connecting" ? "Connecting to agent…" :
     state.wsStatus==="reconnecting" ? "Reconnecting to agent… keep drafting here." :
     "Disconnected from agent.";
-  $("approvalSel").disabled = !state.threadId || !ready;
-  $("modeSel").disabled = !state.threadId || !ready;
-  $("turnPickerBtn").disabled = !state.threadId || !ready;
+  $("approvalSel").disabled = !hasThreadSurface || (!ready && !draft);
+  $("modeSel").disabled = !hasThreadSurface || (!ready && !draft);
+  $("turnPickerBtn").disabled = !hasThreadSurface || (!ready && !draft);
 }
 function setTurnActive(active) {
   state.activeTurn = active;
@@ -1574,6 +1654,10 @@ function renderThreadState(s) {
   }
 }
 function resetTranscriptForAuthoritativeSnapshot() {
+  const keepFirstTurnActive =
+    state.firstTurnStartingThreadId &&
+    state.threadId &&
+    String(state.firstTurnStartingThreadId) === String(state.threadId);
   // Subscribe/resubscribe snapshots replay persisted history and any live turn from the server.
   // Clear transient browser-only rows first so fallback error/user bubbles cannot be appended
   // again, and so a missed turn_completed while suspended does not leave stale active-turn UI.
@@ -1587,7 +1671,8 @@ function resetTranscriptForAuthoritativeSnapshot() {
   state.interruptPending = false;
   state.compactPending = false;
   resetRenderState();
-  setTurnActive(false);
+  if (keepFirstTurnActive) updateComposerControls();
+  else setTurnActive(false);
 }
 const MODE_LABELS = { build:"Build", plan:"Plan" };
 const APPROVAL_LABELS = { ask:"Ask first", auto:"Auto approve", read_only:"Read only" };
@@ -1675,6 +1760,7 @@ function onTranscriptScroll() {
 function handleEvent(ev) {
   switch (ev.kind) {
     case "turn_started":
+      state.firstTurnStartingThreadId = null;
       breakTaskGroup();
       state.streamEl = null;
       state.streamItemId = null;
@@ -1709,6 +1795,7 @@ function handleEvent(ev) {
       if (isContextCompactionItem(ev.item)) finishCompactPending();
       break;
     case "turn_completed":
+      state.firstTurnStartingThreadId = null;
       updateGaugeFromUsage(ev.usage);
       state.streamEl=null;
       state.streamItemId=null;
@@ -1726,6 +1813,10 @@ function handleEvent(ev) {
     // rather than a toast that vanishes — so looking back at a thread explains why a message got
     // no agent response. The matching failed turn is also persisted server-side (§7.1).
     case "error":
+      if (state.firstTurnStartingThreadId) {
+        state.firstTurnStartingThreadId = null;
+        setTurnActive(false);
+      }
       failPendingUserMessage(null);   // resolve the optimistic bubble to a failed state
       errorBubble(errorText(ev.error));
       break;
@@ -1753,6 +1844,10 @@ function errorText(e) {
 }
 
 function renderLiveTurnSnapshot(snap) {
+  if (snap && snap.turn_id) {
+    state.firstTurnStartingThreadId = null;
+    setTurnActive(true);
+  }
   for (const ev of (snap.accumulated||[])) handleEvent(ev);
   if (snap.pending_approval) renderApprovalRequest(snap.pending_approval);
   for (const request of (snap.pending_server_requests || [])) renderServerRequest(request);
@@ -4125,9 +4220,13 @@ $("codeOverlay").addEventListener("click", (e) => { if (e.target === $("codeOver
 
 /* ---------- composer + controls ---------- */
 function sendInput() {
-  const ta = $("input"); const text = ta.value.trim(); if (!text || !state.threadId) return;
+  const ta = $("input"); const text = ta.value.trim(); if (!text || (!state.threadId && !isDraftThread())) return;
   if (state.activeTurn) {
     notice("Wait for the current turn to finish, or stop it first.", "warning");
+    return;
+  }
+  if (isDraftThread()) {
+    startDraftThread(text);
     return;
   }
   if (!wsIsOpen()) {
@@ -4151,6 +4250,48 @@ function sendInput() {
 }
 $("sendBtn").onclick = sendInput;
 $("input").addEventListener("keydown", (e) => { if (e.key==="Enter" && !e.shiftKey) { e.preventDefault(); sendInput(); } });
+
+async function startDraftThread(text) {
+  const pid = state.projectId;
+  if (!pid || !isDraftThread()) return;
+  if (!state.currentModel || !state.currentModel.provider || !state.currentModel.model) {
+    notice("Choose a model before sending the first message.", "error");
+    return;
+  }
+
+  const body = bubble("user pending","you");
+  body.textContent = text;
+  const msgEl = body.parentElement;
+  state.pendingUserEl = msgEl;
+  state.pendingUserText = text;
+  setTurnActive(true);
+
+  try {
+    const res = await api("POST", `/api/projects/${pid}/threads/start`, {
+      text,
+      model_ref: state.currentModel,
+      mode: state.mode || "build",
+      approval_policy: state.approvalPolicy || "ask"
+    });
+    const tid = res && res.thread_id;
+    if (!tid) throw new Error("new thread response did not include thread_id");
+    state.firstTurnStartingThreadId = String(tid);
+    state.draftThread = null;
+    $("input").value="";
+    await loadThreads(pid);
+    await openThread(pid, tid, "New thread", { firstTurnStarting:true });
+    state.firstTurnStartingThreadId = String(tid);
+    setTurnActive(true);
+    if (res.warning) notice(res.warning.message || "warning", res.warning.severity || "warning");
+  } catch (e) {
+    msgEl.classList.remove("pending");
+    msgEl.classList.add("failed");
+    state.pendingUserEl = null;
+    state.pendingUserText = null;
+    setTurnActive(false);
+    notice("Message not sent: " + e.message, "error");
+  }
+}
 
 function interruptTurn() {
   if (!state.threadId || !state.activeTurn || state.interruptPending) return;
@@ -4182,6 +4323,10 @@ function compactContext() {
 $("modeSel").onchange = () => {
   const previous = state.mode || "build";
   const mode = $("modeSel").value === "plan" ? "plan" : "build";
+  if (isDraftThread()) {
+    setMode(mode);
+    return;
+  }
   if (!state.threadId) {
     setMode(previous);
     return;
@@ -4197,6 +4342,10 @@ $("modeSel").onchange = () => {
 $("approvalSel").onchange = () => {
   const previous = state.approvalPolicy || "ask";
   const policy = $("approvalSel").value || "ask";
+  if (isDraftThread()) {
+    setApprovalPolicy(policy);
+    return;
+  }
   if (!state.threadId) {
     setApprovalPolicy(previous);
     return;
@@ -4298,7 +4447,7 @@ function selectedModelFromControl() {
 }
 function sendSelectedModel() {
   const model = selectedModelFromControl();
-  if (!model || !state.threadId) {
+  if (!model) {
     syncEffortControl();
     return;
   }
@@ -4306,6 +4455,8 @@ function sendSelectedModel() {
   const next = { provider:model.provider, model:model.model, reasoning_effort:null };
   state.currentModel = next;
   syncEffortControl();
+  if (isDraftThread()) return;
+  if (!state.threadId) return;
   if (!send({ type:"select_model", thread_id: state.threadId, model_ref:next })) {
     state.currentModel = previous;
     syncModelControls();
@@ -4314,12 +4465,14 @@ function sendSelectedModel() {
 }
 function sendSelectedEffort() {
   const model = selectedModelFromControl();
-  if (!model || !state.threadId) return;
+  if (!model) return;
   const previous = state.currentModel;
   const effort = $("effortSel").value || null;
   const next = { provider:model.provider, model:model.model, reasoning_effort:effort };
   state.currentModel = next;
   syncEffortControl();
+  if (isDraftThread()) return;
+  if (!state.threadId) return;
   if (!send({ type:"select_model", thread_id: state.threadId, model_ref:next })) {
     state.currentModel = previous;
     syncModelControls();

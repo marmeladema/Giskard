@@ -14,11 +14,12 @@ use axum::{
 };
 use chrono::Utc;
 use serde::Deserialize;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use futures::{SinkExt, StreamExt};
 use giskard_core::error::{HarnessError, PersistError};
 use giskard_core::ids::{ProjectId, ThreadId};
+use giskard_core::model::ModelRef;
 use giskard_core::turn::{ApprovalPolicy, Mode, TurnOverrides};
 use giskard_core::user_input::UserInput;
 use giskard_persist::store::{ProjectConfig, ThreadFile};
@@ -44,6 +45,10 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
         .route(
             "/api/projects/{id}/threads",
             get(list_threads).post(open_thread),
+        )
+        .route(
+            "/api/projects/{id}/threads/start",
+            post(start_thread_with_message),
         )
         .route(
             "/api/projects/{id}/threads/{thread_id}",
@@ -374,13 +379,19 @@ async fn open_thread(
         }));
     }
 
+    let Some(resume) = req.resume else {
+        return Err(ApiError::BadRequest(
+            "creating a new thread requires an initial message".into(),
+        ));
+    };
+
     let handle = state
         .registry
         .open_thread(
             &project_config,
             ws_root,
             None,
-            req.resume,
+            Some(resume),
             project_config.default_model.clone(),
         )
         .await
@@ -423,6 +434,217 @@ async fn open_thread(
         harness_thread_id: handle.harness_thread_id,
         warning,
     }))
+}
+
+async fn start_thread_with_message(
+    State(state): State<AppState>,
+    AxumPath(project_id): AxumPath<ProjectId>,
+    Json(req): Json<StartThreadRequest>,
+) -> Result<Json<StartThreadResponse>, ApiError> {
+    let text = req.text.trim().to_string();
+    if text.is_empty() {
+        return Err(ApiError::BadRequest(
+            "creating a new thread requires a non-empty message".into(),
+        ));
+    }
+
+    let app_config = state.store.load_config().await?;
+    let mut project_config = state
+        .store
+        .load_project(project_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let default_model =
+        crate::models::normalize_model_ref(&app_config, &project_config.default_model);
+    if default_model != project_config.default_model {
+        project_config.default_model = default_model;
+        project_config.updated_at = Utc::now();
+        state.store.save_project(&project_config).await?;
+    }
+
+    let model_ref = resolve_initial_thread_model(&app_config, req.model_ref);
+    let ws_root = project_config
+        .workspace_root
+        .as_deref()
+        .unwrap_or(&project_config.dir);
+    let thread_id = ThreadId::new();
+    info!(
+        %project_id,
+        %thread_id,
+        provider = %model_ref.provider,
+        model = %model_ref.model,
+        mode = ?req.mode,
+        approval_policy = ?req.approval_policy,
+        "starting new thread from initial user message"
+    );
+
+    let handle = state
+        .registry
+        .open_thread(
+            &project_config,
+            ws_root,
+            Some(thread_id),
+            None,
+            model_ref.clone(),
+        )
+        .await
+        .map_err(harness_api_error)?;
+    if handle.thread != thread_id {
+        cleanup_new_thread_after_start_failure(
+            &state,
+            &project_config,
+            handle.thread,
+            handle.harness_thread_id.clone(),
+            false,
+            "open_thread_mismatch",
+        )
+        .await;
+        let detail = format!(
+            "harness opened wrong thread: expected {thread_id}, got {}",
+            handle.thread
+        );
+        warn!(%project_id, %thread_id, detail, "new thread open returned mismatched thread id");
+        return Err(ApiError::Internal(detail));
+    }
+
+    let now = Utc::now();
+    let thread_file = ThreadFile {
+        version: 1,
+        id: thread_id,
+        project_id,
+        title: "New thread".into(),
+        harness_thread_id: handle.harness_thread_id.clone(),
+        mode: req.mode,
+        current_model: model_ref.clone(),
+        context_window: crate::models::context_window_for(&app_config, &model_ref),
+        approval_policy: req.approval_policy,
+        model_efforts: std::collections::HashMap::new(),
+        tokens: giskard_core::token::TokenLedger::default(),
+        created_at: now,
+        updated_at: now,
+        archived: false,
+    };
+
+    if let Err(error) = state.store.save_thread(project_id, &thread_file).await {
+        cleanup_new_thread_after_start_failure(
+            &state,
+            &project_config,
+            thread_id,
+            handle.harness_thread_id.clone(),
+            false,
+            "save_thread",
+        )
+        .await;
+        return Err(ApiError::Internal(error.to_string()));
+    }
+
+    let overrides = TurnOverrides {
+        model: Some(model_ref.clone()),
+        mode: req.mode,
+        approval_policy: req.approval_policy,
+    };
+    let turn_id = match state
+        .registry
+        .start_turn(
+            thread_id,
+            UserInput::text(text),
+            overrides,
+            model_ref.clone(),
+        )
+        .await
+    {
+        Ok(turn_id) => turn_id,
+        Err(error) => {
+            cleanup_new_thread_after_start_failure(
+                &state,
+                &project_config,
+                thread_id,
+                handle.harness_thread_id.clone(),
+                true,
+                "start_turn",
+            )
+            .await;
+            return Err(harness_api_error(error));
+        }
+    };
+
+    let warning = handle.warning.as_ref().map(|warning| {
+        warning_info(
+            warning.code.clone(),
+            warning.message.clone(),
+            warning.detail.clone(),
+            thread_id,
+            "start_thread",
+        )
+    });
+
+    Ok(Json(StartThreadResponse {
+        thread_id,
+        harness_thread_id: handle.harness_thread_id,
+        turn_id,
+        warning,
+    }))
+}
+
+fn resolve_initial_thread_model(config: &giskard_persist::Config, model: ModelRef) -> ModelRef {
+    let mut model = crate::models::normalize_model_ref(config, &model);
+    let descriptor = crate::models::resolve_descriptor(config, &model);
+    if !descriptor.supports_reasoning_effort {
+        model.reasoning_effort = None;
+    }
+    model
+}
+
+async fn cleanup_new_thread_after_start_failure(
+    state: &AppState,
+    project_config: &ProjectConfig,
+    thread_id: ThreadId,
+    harness_thread_id: String,
+    remove_local_thread: bool,
+    failed_action: &str,
+) {
+    match state
+        .registry
+        .delete_thread(project_config, thread_id, harness_thread_id.clone())
+        .await
+    {
+        Ok(()) => {
+            debug!(
+                project_id = %project_config.id,
+                %thread_id,
+                %harness_thread_id,
+                %failed_action,
+                "cleaned up native thread after failed new-thread startup"
+            );
+        }
+        Err(error) => {
+            warn!(
+                project_id = %project_config.id,
+                %thread_id,
+                %harness_thread_id,
+                %failed_action,
+                error = %error,
+                "failed to delete native thread after failed new-thread startup"
+            );
+            state.registry.forget_thread(thread_id).await;
+        }
+    }
+
+    if remove_local_thread {
+        if let Err(error) = state
+            .store
+            .delete_thread(project_config.id, thread_id)
+            .await
+        {
+            warn!(
+                project_id = %project_config.id,
+                %thread_id,
+                %failed_action,
+                error = %error,
+                "failed to delete local thread after failed new-thread startup"
+            );
+        }
+    }
 }
 
 fn thread_summary(tf: &ThreadFile) -> ThreadSummary {
@@ -1373,6 +1595,7 @@ async fn handle_client_msg(
                     .action("send_input")
                 })?;
 
+            let tf = ensure_send_harness_provider_current(state, project_id, thread_id, tf).await?;
             let effective_model = tf.current_model.clone();
 
             // Resolved snapshot the harness applies to `turn/start` (§7.5, §8.4/§8.5):
@@ -1424,6 +1647,14 @@ async fn handle_client_msg(
                 .await
                 .map_err(|e| WsError::from_persist(e, "select_model", Some(thread_id)))?;
             let model_ref = crate::models::normalize_model_ref(&config, &model_ref);
+            ensure_provider_change_allowed(
+                state,
+                project_id,
+                thread_id,
+                &model_ref,
+                "select_model",
+            )
+            .await?;
 
             // All model/effort resolution happens inside the RMW closure so it sees the
             // authoritative current model under the per-thread lock (§5.4, C7 effort retention).
@@ -1820,6 +2051,99 @@ async fn project_for(
     ensure_thread_open(state, thread_id, action)
         .await
         .map(|access| access.project_id)
+}
+
+async fn ensure_provider_change_allowed(
+    state: &AppState,
+    project_id: ProjectId,
+    thread_id: ThreadId,
+    selected_model: &ModelRef,
+    action: &str,
+) -> Result<(), WsError> {
+    let Some(native_model) = state.registry.get_thread_native_model(thread_id).await else {
+        return Ok(());
+    };
+    if native_model.provider == selected_model.provider {
+        return Ok(());
+    }
+
+    let turns = state
+        .store
+        .load_all_turns(project_id, thread_id)
+        .await
+        .map_err(|e| WsError::from_persist(e, action, Some(thread_id)))?;
+    let active = state.registry.thread_has_active_turn(thread_id).await;
+    warn!(
+        %project_id,
+        %thread_id,
+        native_provider = %native_model.provider,
+        selected_provider = %selected_model.provider,
+        active,
+        turn_count = turns.len(),
+        %action,
+        "rejecting provider change on provider-bound Codex thread"
+    );
+    Err(provider_locked_error(
+        thread_id,
+        action,
+        &native_model.provider,
+        &selected_model.provider,
+    ))
+}
+
+async fn ensure_send_harness_provider_current(
+    state: &AppState,
+    project_id: ProjectId,
+    thread_id: ThreadId,
+    tf: ThreadFile,
+) -> Result<ThreadFile, WsError> {
+    let Some(native_model) = state.registry.get_thread_native_model(thread_id).await else {
+        return Ok(tf);
+    };
+    if native_model.provider == tf.current_model.provider {
+        return Ok(tf);
+    }
+
+    let turns = state
+        .store
+        .load_all_turns(project_id, thread_id)
+        .await
+        .map_err(|e| WsError::from_persist(e, "send_input", Some(thread_id)))?;
+    let active = state.registry.thread_has_active_turn(thread_id).await;
+    warn!(
+        %project_id,
+        %thread_id,
+        native_provider = %native_model.provider,
+        selected_provider = %tf.current_model.provider,
+        selected_model = %tf.current_model.model,
+        active,
+        turn_count = turns.len(),
+        "rejecting persisted provider mismatch on provider-bound Codex thread"
+    );
+    Err(provider_locked_error(
+        thread_id,
+        "send_input",
+        &native_model.provider,
+        &tf.current_model.provider,
+    ))
+}
+
+fn provider_locked_error(
+    thread_id: ThreadId,
+    action: &str,
+    native_provider: &str,
+    selected_provider: &str,
+) -> WsError {
+    WsError::new(
+        "thread_provider_locked",
+        ErrorSeverity::Error,
+        "This Codex thread is bound to a different provider. Create a new thread to use the selected provider.",
+    )
+    .detail(format!(
+        "native provider: {native_provider}; selected provider: {selected_provider}"
+    ))
+    .thread(thread_id)
+    .action(action)
 }
 
 /// Load a thread file plus the project it belongs to (via the harness registry).
