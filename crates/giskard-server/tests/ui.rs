@@ -28,13 +28,21 @@ async fn index_page_is_served_and_public() {
         .unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-    // No cookie: the page must load without authentication.
-    let body = reqwest::get(format!("http://127.0.0.1:{port}/"))
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    // No cookie: the page and its same-origin assets must load without authentication. The UI's
+    // script/stylesheet are separate assets (CSP: `script-src 'self'`), so the assertions below
+    // run against the page plus both assets — together they are the full self-contained app.
+    let mut body = String::new();
+    for path in ["/", "/app.js", "/app.css"] {
+        body.push_str(
+            &reqwest::get(format!("http://127.0.0.1:{port}{path}"))
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+        );
+        body.push('\n');
+    }
     assert!(body.contains("<title>Giskard</title>"));
     assert!(body.contains("/api/ws"), "app talks to the WS endpoint");
     assert!(
@@ -1028,7 +1036,7 @@ async fn index_page_is_served_and_public() {
 
 #[test]
 fn browser_resubscribe_replaces_transient_transcript_state() {
-    let body = index_html();
+    let body = app_js();
     let onopen = between(body, "ws.onopen = () => {", "  };\n  ws.onmessage");
     assert_order(
         onopen,
@@ -1091,7 +1099,7 @@ fn browser_resubscribe_replaces_transient_transcript_state() {
 
 #[test]
 fn browser_marks_turn_active_when_send_is_accepted() {
-    let body = index_html();
+    let body = app_js();
     let send_input = between(
         body,
         "function sendInput() {",
@@ -1119,7 +1127,7 @@ fn browser_marks_turn_active_when_send_is_accepted() {
 
 #[test]
 fn browser_websocket_lifecycle_errors_are_not_toasted_directly() {
-    let body = index_html();
+    let body = app_js();
 
     let onerror = between(body, "ws.onerror = () => {", "  };\n  ws.onclose");
     assert!(onerror.contains("ws._giskardHadError = true;"));
@@ -1173,7 +1181,7 @@ fn browser_websocket_lifecycle_errors_are_not_toasted_directly() {
 
 #[test]
 fn browser_backgrounded_socket_recovery_restores_foreground_errors() {
-    let body = index_html();
+    let body = app_js();
 
     let recover = between(
         body,
@@ -1204,8 +1212,10 @@ fn browser_backgrounded_socket_recovery_restores_foreground_errors() {
     );
 }
 
-fn index_html() -> &'static str {
-    include_str!("../static/index.html")
+/// The UI script, as served at `/app.js`. The page's JS is a separate same-origin asset so the
+/// Content-Security-Policy can enforce `script-src 'self'` (no inline execution).
+fn app_js() -> &'static str {
+    include_str!("../static/app.js")
 }
 
 fn between<'a>(haystack: &'a str, start: &str, end: &str) -> &'a str {

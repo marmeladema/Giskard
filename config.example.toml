@@ -17,13 +17,18 @@ secure_cookies = false
 [auth]
 # Argon2 hash of the single shared app password (never the plaintext). Generate via
 # `giskard-admin set-password`. May instead be provided via the GISKARD_PASSWORD_HASH env var.
+# Repeated wrong-password attempts are throttled with escalating lockouts (see README §Security).
 password_hash = "$argon2id$v=19$m=19456,t=2,p=1$REPLACE_ME"
-# Session lifetime in days (sliding).
+# Session lifetime in days. Sliding: activity in the second half of the window renews the cookie
+# for a full window. Sessions are stateless tokens — to force-invalidate all of them, run
+# `giskard-admin revoke-sessions` and restart the server.
 session_days = 30
 
 [browse]
-# Filesystem-picker scope. Empty ⇒ the whole filesystem is browsable. Set to a list of absolute
-# paths to confine the picker (and reject `..`/symlink escapes) to those subtrees.
+# Filesystem scope for the picker AND for project creation. Empty ⇒ the whole filesystem is
+# reachable by an authenticated client. Set to a list of absolute paths to confine both (with
+# `..`/symlink escapes rejected) to those subtrees — strongly recommended on any instance
+# reachable beyond localhost (see README §Security).
 roots = []
 # e.g. roots = ["/home/you/dev"]
 

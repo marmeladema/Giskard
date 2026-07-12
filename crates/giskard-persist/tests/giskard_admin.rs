@@ -92,3 +92,36 @@ async fn list_threads_prints_archived_status() {
         "stdout: {stdout}"
     );
 }
+
+#[test]
+fn revoke_sessions_rotates_the_signing_key() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let key_path = tmp.path().join("session.key");
+    let old_key = [7u8; 32];
+    std::fs::write(&key_path, old_key).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_giskard-admin"))
+        .env("GISKARD_DATA_DIR", tmp.path())
+        .arg("revoke-sessions")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("Restart giskard-server"),
+        "stdout: {stdout}"
+    );
+
+    let new_key = std::fs::read(&key_path).unwrap();
+    assert_eq!(new_key.len(), 32);
+    assert_ne!(new_key.as_slice(), old_key.as_slice());
+    let mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600, "session.key must be private");
+}

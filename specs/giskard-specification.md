@@ -8,7 +8,32 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.38
+**Version:** 1.39
+
+**Changelog (1.38 → 1.39), public-exposure hardening pass:**
+- **SEC1:** Login brute-force throttling: a global lockout with exponential backoff engages after
+  repeated consecutive password failures and is checked **before** Argon2 verification, so failed
+  floods can neither guess the password nor burn server CPU/RAM. Throttled attempts receive
+  `429` + `Retry-After`; failed and throttled logins are logged with a stable message and the
+  `X-Forwarded-For` value for external log watchers (§12.1).
+- **SEC2:** Signed-token domain separation: session cookies and WebSocket tickets share the
+  signing key but MAC distinct purpose domains, so a ticket (which travels in a URL query string
+  and can reach proxy access logs) can never authenticate as a session cookie, nor vice versa.
+  Existing sessions are invalidated by the token-format change (§12.1).
+- **SEC3:** Sliding sessions made concrete: a cookie-authenticated request in the second half of
+  the session lifetime re-issues the cookie for a full `session_days` window, and the cookie's
+  `Max-Age` follows `session_days` instead of a hardcoded constant (§12.1).
+- **SEC4:** Session revocation: `giskard-admin revoke-sessions` rotates `session.key`,
+  invalidating every outstanding session and ticket after a server restart. Stateless HMAC
+  sessions cannot be revoked individually and logout only clears the browser cookie (§12.1, §5.5).
+- **SEC5:** Hardening response headers on every route: a strict `Content-Security-Policy`
+  (`script-src 'self'`, `frame-ancestors 'none'`), `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, COOP/CORP `same-origin`, and a
+  minimal `Permissions-Policy`. The single-page UI's script and stylesheet are served as
+  separate same-origin assets (`/app.js`, `/app.css`) so no inline script executes (§12.1, §13.1).
+- **SEC6:** `browse.roots`, when configured, also confines `POST /api/projects`: a project's
+  `dir`/`workspace_root` must canonicalize into an allowed root, closing the API bypass of the
+  previously picker-only confinement (§6.2, Appendix C).
 
 **Changelog (1.37 → 1.38), provider-bound model picker clarity:**
 - **PB1:** Model picker labels include the provider, rendered as `Model name [provider]`, so models
@@ -2057,18 +2082,44 @@ alongside raw token counts. Off by default; raw token counts are the primary met
 
 ### 12.1 App auth (single shared password)
 
-- **One shared password** gates the whole app. No accounts, no roles, no 2FA (v1).
+- **One shared password** gates the whole app. No accounts, no roles, no 2FA (v1). The threat
+  model to keep in mind: an authenticated client can direct the agent (code execution) and read
+  files within project workspaces, so the password guards host-level access, not just a UI.
 - The password is stored as an **Argon2 hash** in `config.toml` (or an env var
   `GISKARD_PASSWORD_HASH`), never in plaintext. A `giskard-admin set-password` command
   generates the hash.
+- **Brute-force throttling (SEC1):** login failures feed a global (not per-IP) lockout with
+  exponential backoff: a handful of consecutive failures are tolerated, after which the login
+  endpoint answers `429` with `Retry-After` until the window elapses. The lockout check runs
+  **before** Argon2 verification so a flood of wrong passwords cannot be used as a memory-hard
+  CPU/RAM DoS. Failed and throttled attempts are logged with a stable message plus the
+  `X-Forwarded-For` value (meaningful behind a trusted reverse proxy) so external watchers
+  (e.g. fail2ban) can key on them. The counter is in-memory; a restart clears it.
 - **Login:** a POST verifies the password against the hash and issues a **signed session
   cookie** (HMAC-signed, `HttpOnly`, `SameSite=Strict`, `Secure`). Session lifetime is
-  configurable (default 30 days, sliding). A signing key is generated on first run and stored
-  in the data dir (`session.key`, 0600).
+  configurable (default 30 days) and **sliding**: a cookie-authenticated request in the second
+  half of the lifetime re-issues the cookie for a full window, and the cookie `Max-Age` follows
+  `session_days` (SEC3). A signing key is generated on first run and stored in the data dir
+  (`session.key`, 0600).
+- **Revocation (SEC4):** sessions are stateless HMAC tokens — logout clears the browser cookie
+  but cannot invalidate the token server-side. `giskard-admin revoke-sessions` rotates
+  `session.key`; after a server restart every outstanding session and ticket is invalid.
 - **All routes except the login page and static assets require a valid session.** The
   WebSocket upgrade validates either the session cookie or a short-lived signed ticket from
-  authenticated `GET /api/ws-ticket`. The ticket is only for WebSocket upgrade compatibility
-  and carries the same session signing key semantics as the cookie.
+  authenticated `GET /api/ws-ticket`. Tickets and session cookies are **domain-separated**
+  (SEC2): they share the signing key but MAC distinct purpose strings, so the ticket — which
+  travels in the `/api/ws` query string and can land in proxy access logs — is only good for a
+  WebSocket upgrade within its 60-second lifetime, and a session cookie is not accepted in the
+  ticket position.
+- **Hardening headers (SEC5):** every response carries a strict `Content-Security-Policy`
+  (`script-src 'self'`; the UI's script/stylesheet are the separate same-origin assets
+  `/app.js` / `/app.css`, so no inline script executes), `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: DENY` + `frame-ancestors 'none'`, `Referrer-Policy: no-referrer`,
+  COOP/CORP `same-origin`, and a minimal `Permissions-Policy`.
+- **Workspace confinement (SEC6):** when `browse.roots` is configured it bounds not only the
+  filesystem picker but also `POST /api/projects` — the supplied `dir`/`workspace_root` must
+  canonicalize into an allowed root. With no roots configured the whole filesystem remains
+  reachable to an authenticated client (single-user default).
 - TLS is terminated upstream (Nginx). Giskard assumes HTTPS in production; the `Secure`
   cookie flag is on by default and can be disabled via config for local HTTP dev.
 

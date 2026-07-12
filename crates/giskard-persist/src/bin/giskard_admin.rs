@@ -2,6 +2,7 @@
 //!
 //! Commands:
 //!   giskard-admin set-password              Generate an Argon2 hash for the app password.
+//!   giskard-admin revoke-sessions           Rotate the session signing key (logs out everyone).
 //!   giskard-admin list-projects             List all projects.
 //!   giskard-admin list-threads <project>    List threads in a project.
 //!   giskard-admin dump-thread <project> <thread>   Pretty-print thread metadata JSON.
@@ -50,6 +51,9 @@ async fn run() -> Result<(), String> {
                 .to_string();
             println!("{hash}");
             println!("\nAdd this to config.toml under [auth]: password_hash = \"{hash}\"");
+        }
+        "revoke-sessions" => {
+            revoke_sessions(&data_dir)?;
         }
         "list-projects" => {
             let store = giskard_persist::PersistStore::new(data_dir);
@@ -161,6 +165,28 @@ async fn run() -> Result<(), String> {
     Ok(())
 }
 
+/// Rotate `session.key`: sessions are stateless HMAC tokens, so replacing the signing key is the
+/// only way to invalidate every outstanding browser session (and WebSocket ticket) at once —
+/// e.g. after losing a logged-in device. The running server keeps the old key in memory, so it
+/// must be restarted to pick up the new one.
+fn revoke_sessions(data_dir: &std::path::Path) -> Result<(), String> {
+    use rand::RngCore;
+    use std::os::unix::fs::PermissionsExt;
+
+    let key_path = data_dir.join("session.key");
+    let mut key = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut key);
+    std::fs::create_dir_all(data_dir)
+        .map_err(|e| format!("cannot create data dir {}: {e}", data_dir.display()))?;
+    std::fs::write(&key_path, key)
+        .map_err(|e| format!("cannot write {}: {e}", key_path.display()))?;
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("cannot set permissions on {}: {e}", key_path.display()))?;
+    println!("Rotated session signing key at {}.", key_path.display());
+    println!("All existing sessions are now invalid. Restart giskard-server to load the new key.");
+    Ok(())
+}
+
 fn expect_arg<'a>(args: &'a [String], idx: usize, name: &str) -> &'a str {
     args.get(idx).unwrap_or_else(|| {
         eprintln!("Missing {name} argument");
@@ -191,6 +217,8 @@ fn usage(prog: &str) {
 
 Commands:
   set-password              Generate an Argon2 hash for the app password
+  revoke-sessions           Rotate the session signing key, invalidating all sessions
+                            (restart giskard-server afterwards)
   list-projects             List all projects
   list-threads <project>    List threads in a project
   dump-thread <project> <thread>   Pretty-print thread metadata JSON

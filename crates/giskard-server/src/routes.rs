@@ -28,8 +28,8 @@ use tokio::sync::mpsc;
 
 use crate::AppState;
 use crate::auth::{
-    SESSION_COOKIE, auth_middleware, create_session_cookie, get_session_token_from_header,
-    sign_session, verify_session,
+    SESSION_COOKIE, TokenPurpose, auth_middleware, create_session_cookie,
+    get_session_token_from_header, sign_token, verify_token,
 };
 
 const HARNESS_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -87,19 +87,75 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
 pub fn public_routes() -> Router<AppState> {
     Router::new()
         .route("/", get(index))
+        .route("/app.js", get(app_js))
+        .route("/app.css", get(app_css))
         .route("/api/login", post(login))
 }
 
 /// Serve the single-page desktop UI (§13). Self-contained HTML/CSS/JS (no npm); it authenticates
-/// via `/api/login` and drives the app through the same REST + WS API as any client.
+/// via `/api/login` and drives the app through the same REST + WS API as any client. The script
+/// and stylesheet ship as separate same-origin assets (below) so the Content-Security-Policy can
+/// enforce a strict `script-src 'self'` with no inline execution.
 async fn index() -> axum::response::Html<&'static str> {
     axum::response::Html(include_str!("../static/index.html"))
 }
 
+async fn app_js() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        include_str!("../static/app.js"),
+    )
+}
+
+async fn app_css() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../static/app.css"),
+    )
+}
+
+/// Best-effort client identity for login audit logs. The socket peer is not threaded through the
+/// router, so this reports `X-Forwarded-For` — meaningful exactly when Giskard sits behind a
+/// trusted reverse proxy that sets it (the recommended deployment), and attacker-controlled
+/// otherwise, so treat it as diagnostic only.
+fn login_client(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "unknown".into())
+}
+
 async fn login(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<axum::response::Response, (axum::http::StatusCode, String)> {
+    // Brute-force lockout runs before the (memory-hard) Argon2 verification so a flood of wrong
+    // passwords can neither guess the password nor burn server CPU/RAM.
+    if let Err(remaining) = state.login_throttle.check() {
+        let retry_after = remaining.as_secs().max(1);
+        warn!(
+            client = %login_client(&headers),
+            retry_after_secs = retry_after,
+            "login rejected: throttled after repeated failures"
+        );
+        let mut response = (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            format!("too many failed login attempts; retry in {retry_after}s"),
+        )
+            .into_response();
+        if let Ok(value) = axum::http::HeaderValue::from_str(&retry_after.to_string()) {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, value);
+        }
+        return Ok(response);
+    }
+
     let config = state
         .store
         .load_config()
@@ -121,18 +177,35 @@ async fn login(
     };
 
     if !ok {
+        let (failures, lockout) = state.login_throttle.record_failure();
+        // Stable, greppable line for external log watchers (e.g. fail2ban on the proxy host).
+        warn!(
+            client = %login_client(&headers),
+            consecutive_failures = failures,
+            lockout_secs = lockout.map(|d| d.as_secs()).unwrap_or(0),
+            "login failed: invalid password"
+        );
         return Ok(Json(LoginResponse { ok: false }).into_response());
     }
 
-    let expiry = (Utc::now().timestamp() as u64) + (config.auth.session_days as u64) * 86400;
-    let cookie = create_session_cookie(expiry, &state.session_key, config.server.secure_cookies)
-        .map_err(|e| {
-            error!("failed to sign session cookie: {e}");
-            (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to create session cookie".to_string(),
-            )
-        })?;
+    state.login_throttle.record_success();
+    info!(client = %login_client(&headers), "login succeeded");
+
+    let lifetime_secs = (config.auth.session_days as u64) * 86400;
+    let expiry = (Utc::now().timestamp() as u64) + lifetime_secs;
+    let cookie = create_session_cookie(
+        expiry,
+        &state.session_key,
+        config.server.secure_cookies,
+        lifetime_secs,
+    )
+    .map_err(|e| {
+        error!("failed to sign session cookie: {e}");
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to create session cookie".to_string(),
+        )
+    })?;
 
     let mut response = Json(LoginResponse { ok: true }).into_response();
     let cookie = axum::http::HeaderValue::from_str(&cookie).map_err(|e| {
@@ -192,6 +265,13 @@ async fn create_project(
 ) -> Result<Json<CreateProjectResponse>, ApiError> {
     let id = ProjectId::new();
     let config = state.store.load_config().await?;
+    // `browse.roots` must confine more than the folder picker: a project's directory becomes the
+    // agent's workspace and the boundary for the raw/highlight file endpoints, so an arbitrary
+    // `dir` in this API request would bypass the picker's confinement entirely.
+    ensure_dir_within_browse_roots(&req.dir, &config.browse.roots)?;
+    if let Some(ws_root) = &req.workspace_root {
+        ensure_dir_within_browse_roots(ws_root, &config.browse.roots)?;
+    }
     let default_model = crate::models::normalize_model_ref(&config, &req.default_model);
     state
         .store
@@ -836,6 +916,24 @@ async fn browse(
     }))
 }
 
+/// Enforce `browse.roots` on a project directory supplied via the API. With roots configured, the
+/// directory must exist and canonicalize (symlinks resolved) to a path inside one of them. With no
+/// roots configured the whole filesystem is allowed, matching the `browse` endpoint's contract.
+fn ensure_dir_within_browse_roots(dir: &str, roots: &[String]) -> Result<(), ApiError> {
+    if roots.is_empty() {
+        return Ok(());
+    }
+    let canonical = PathBuf::from(dir)
+        .canonicalize()
+        .map_err(|e| ApiError::BadRequest(format!("cannot canonicalize project dir: {e}")))?;
+    if !within_browse_roots(&canonical, roots) {
+        return Err(ApiError::Forbidden(
+            "project directory outside allowed roots".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// True when `path` is inside one of the configured browse roots, or when no roots are configured
 /// (empty ⇒ the whole filesystem is browsable, spec Appendix C / `BrowseConfig`).
 fn within_browse_roots(path: &Path, roots: &[String]) -> bool {
@@ -1194,9 +1292,12 @@ async fn project_tokens(
     Ok(Json(crate::tokens::build_report(&ledger, &config.tokens)))
 }
 
+/// Mint a short-lived WebSocket ticket. Tickets travel in the `/api/ws` query string (which can
+/// land in reverse-proxy access logs), so they are domain-separated from session cookies: a
+/// leaked ticket is only good for a WebSocket upgrade, and only for 60 seconds.
 async fn ws_ticket(State(state): State<AppState>) -> Result<Json<WsTicketResponse>, ApiError> {
     let expiry = (Utc::now().timestamp() as u64) + 60;
-    let ticket = sign_session(expiry, &state.session_key)
+    let ticket = sign_token(TokenPurpose::WsTicket, expiry, &state.session_key)
         .map_err(|e| ApiError::Internal(format!("failed to sign websocket ticket: {e}")))?;
     Ok(Json(WsTicketResponse { ticket }))
 }
@@ -1219,11 +1320,11 @@ async fn ws_handler(
     let valid = cookie_header
         .and_then(get_session_token_from_header)
         .as_ref()
-        .map(|t| verify_session(t, &state.session_key))
+        .map(|t| verify_token(TokenPurpose::Session, t, &state.session_key))
         .unwrap_or(false)
         || q.ticket
             .as_deref()
-            .map(|t| verify_session(t, &state.session_key))
+            .map(|t| verify_token(TokenPurpose::WsTicket, t, &state.session_key))
             .unwrap_or(false);
 
     if !valid {
