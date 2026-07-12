@@ -736,7 +736,7 @@ let state = {
   wsReconnectTimer:null, wsReconnectAttempt:0, wsStatusDetail:"WebSocket disconnected",
   wsLastProblem:"", wsLastProblemNotice:"", wsLastProblemNoticeAt:0,
   draftThread:null, firstTurnStartingThreadId:null,
-  models:[], streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null,
+  models:[], pendingModelBeforeSelect:null, streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null,
   streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), itemKindsByItemId:new Map(),
   pendingApprovals:new Map(), pendingServerRequests:new Map(),
   runningCommands:new Map(), commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null,
@@ -1134,7 +1134,7 @@ function populateModalModels() {
   sel.innerHTML = "";
   for (const m of state.models) {
     const o = document.createElement("option");
-    o.value = `${m.provider}/${m.model}`; o.textContent = m.display_name || m.model;
+    o.value = `${m.provider}/${m.model}`; o.textContent = modelOptionLabel(m);
     o.dataset.provider = m.provider; o.dataset.model = m.model;
     sel.append(o);
   }
@@ -1610,6 +1610,13 @@ function handleServer(msg) {
       break;
     case "approval_request": renderApprovalRequest(msg.request); break;
     case "error":
+      if (msg.action==="select_model") {
+        if (state.pendingModelBeforeSelect) {
+          state.currentModel = state.pendingModelBeforeSelect;
+          state.pendingModelBeforeSelect = null;
+          syncModelControls();
+        }
+      }
       if (msg.action==="send_input" && state.pendingUserEl) {
         failPendingUserMessage(null);
       }
@@ -1641,6 +1648,7 @@ function renderThreadState(s) {
   setApprovalPolicy(s.approval_policy || "ask");
   if (s.current_model) {
     state.currentModel = s.current_model;
+    state.pendingModelBeforeSelect = null;
     syncModelControls();
   }
   if (s.title) {
@@ -4365,7 +4373,7 @@ function renderModelSelect() {
   for (const m of state.models) {
     const o = document.createElement("option");
     o.value = modelKey(m);
-    o.textContent = m.display_name || m.model;
+    o.textContent = modelOptionLabel(m);
     o.dataset.provider=m.provider;
     o.dataset.model=m.model;
     o.dataset.supportsReasoningEffort = m.supports_reasoning_effort ? "true" : "false";
@@ -4373,8 +4381,14 @@ function renderModelSelect() {
   }
   if (!state.models.length) { const o=document.createElement("option"); o.textContent="(no models configured)"; sel.append(o); }
   if (prev) sel.value = prev;   // preserve the current selection across a refresh
+  syncModelOptionAvailability();
   syncEffortControl();
   sel.onchange = sendSelectedModel;
+}
+function modelOptionLabel(m) {
+  if (!m) return "Model";
+  const name = m.display_name || m.model || "Model";
+  return m.provider ? `${name} [${m.provider}]` : name;
 }
 function modelKey(m) {
   return m && m.provider && m.model ? `${m.provider}/${m.model}` : "";
@@ -4394,7 +4408,27 @@ function effortOptionsForModel(desc) {
 }
 function syncModelControls() {
   if (state.currentModel) setModel(modelKey(state.currentModel));
+  syncModelOptionAvailability();
   syncEffortControl();
+}
+function modelProviderLocked(provider) {
+  return !!state.threadId &&
+    !isDraftThread() &&
+    !!state.currentModel &&
+    !!state.currentModel.provider &&
+    provider !== state.currentModel.provider;
+}
+function syncModelOptionAvailability() {
+  const sel = $("modelSel"); if (!sel) return;
+  const lockedProvider = state.currentModel && state.currentModel.provider;
+  for (const o of sel.options) {
+    if (!o.dataset || !o.dataset.provider) continue;
+    const locked = modelProviderLocked(o.dataset.provider);
+    o.disabled = locked;
+    o.title = locked
+      ? `This thread is bound to provider ${lockedProvider}. Create a new thread to use ${o.dataset.provider}.`
+      : "";
+  }
 }
 // Summarise the current model (and effort, when set) on the picker chip below the composer.
 function updateModelButton() {
@@ -4403,7 +4437,7 @@ function updateModelButton() {
   const m = state.currentModel;
   if (!m || !m.model) { label.textContent = "Model"; return; }
   const desc = findModelDescriptor(m.provider, m.model);
-  let txt = (desc && (desc.display_name || desc.model)) || m.model;
+  let txt = modelOptionLabel(desc || m);
   // Models that support reasoning effort always show it — "Default" when left unset — so the chip
   // reflects the same two settings the popover holds. Models without an effort concept show nothing.
   if (effortOptionsForModel(desc).length) {
@@ -4452,12 +4486,19 @@ function sendSelectedModel() {
     return;
   }
   const previous = state.currentModel;
+  if (modelProviderLocked(model.provider)) {
+    syncModelControls();
+    notice(`Create a new thread to use models from provider ${model.provider}.`, "warning");
+    return;
+  }
   const next = { provider:model.provider, model:model.model, reasoning_effort:null };
   state.currentModel = next;
   syncEffortControl();
   if (isDraftThread()) return;
   if (!state.threadId) return;
+  state.pendingModelBeforeSelect = previous ? { ...previous } : null;
   if (!send({ type:"select_model", thread_id: state.threadId, model_ref:next })) {
+    state.pendingModelBeforeSelect = null;
     state.currentModel = previous;
     syncModelControls();
     notice(`Model not changed: WebSocket is ${state.wsStatus}.`, "error");
@@ -4473,7 +4514,9 @@ function sendSelectedEffort() {
   syncEffortControl();
   if (isDraftThread()) return;
   if (!state.threadId) return;
+  state.pendingModelBeforeSelect = previous ? { ...previous } : null;
   if (!send({ type:"select_model", thread_id: state.threadId, model_ref:next })) {
+    state.pendingModelBeforeSelect = null;
     state.currentModel = previous;
     syncModelControls();
     notice(`Reasoning effort not changed: WebSocket is ${state.wsStatus}.`, "error");

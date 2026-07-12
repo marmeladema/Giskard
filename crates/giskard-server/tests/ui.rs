@@ -282,6 +282,24 @@ async fn index_page_is_served_and_public() {
         "reasoning models expose a thread-header effort selector"
     );
     assert!(
+        body.contains("function modelOptionLabel")
+            && body.contains("`${name} [${m.provider}]`")
+            && body.contains("o.textContent = modelOptionLabel(m)"),
+        "model choices show their provider next to the model name"
+    );
+    assert!(
+        body.contains("function modelProviderLocked(provider)")
+            && body.contains("o.disabled = locked")
+            && body.contains("Create a new thread to use"),
+        "provider-bound threads gray out models from other providers"
+    );
+    assert!(
+        body.contains("state.pendingModelBeforeSelect")
+            && body.contains("if (msg.action===\"select_model\")")
+            && body.contains("state.currentModel = state.pendingModelBeforeSelect"),
+        "failed async model selection restores the previous selected model"
+    );
+    assert!(
         body.contains("id=\"compactBtn\"")
             && body.contains("function compactContext")
             && body.contains("type:\"compact_context\", thread_id: state.threadId")
