@@ -8,7 +8,14 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.37
+**Version:** 1.38
+
+**Changelog (1.37 → 1.38), provider-bound model picker clarity:**
+- **PB1:** Model picker labels include the provider, rendered as `Model name [provider]`, so models
+  with the same or similar ids across providers are distinguishable before selection.
+- **PB2:** Draft threads keep all providers selectable because no native Codex thread exists yet.
+  Existing native-backed Codex threads disable model options from different providers and keep the
+  selector on the current provider if a stale/forced `select_model` request is rejected.
 
 **Changelog (1.36 → 1.37), lazy first-turn thread creation:**
 - **LT1:** The browser's project `+` action opens an unpersisted draft thread. No local
