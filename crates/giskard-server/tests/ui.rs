@@ -946,6 +946,18 @@ async fn index_page_is_served_and_public() {
         "UI requests server-rendered Markdown for agent text"
     );
     assert!(
+        body.contains("function wireCodeCopy")
+            && body.contains("wireCodeCopy(el)")
+            && body.contains(".code-block-head")
+            && body.contains("code.textContent"),
+        "rendered code blocks get a copy-to-clipboard button reading the raw source"
+    );
+    assert!(
+        body.contains("navigator.clipboard.writeText")
+            && body.contains("document.execCommand(\"copy\")"),
+        "clipboard copy has an async-API path with a legacy execCommand fallback"
+    );
+    assert!(
         body.contains("openCodeOverlay"),
         "UI opens a source overlay for linked paths"
     );

@@ -2893,6 +2893,7 @@ function renderMarkdown(el, text) {
     el.innerHTML = html;
     el.classList.add("md");
     wirePathLinks(el);
+    wireCodeCopy(el);
   };
 
   if (state.markdownCache.has(cacheKey)) {
@@ -2920,6 +2921,60 @@ function wirePathLinks(el) {
       e.stopPropagation();
       openCodeOverlay(path, line);
     };
+  });
+}
+// Copy text to the clipboard, falling back to a hidden-textarea + execCommand when the async
+// Clipboard API is unavailable (e.g. the app served over plain HTTP, a non-secure context).
+async function copyToClipboard(text) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (e) { /* fall through to the legacy path */ }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-1000px";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return ok;
+  } catch (e) {
+    return false;
+  }
+}
+// Add a "Copy" button to each rendered code block's header so the raw (un-highlighted) source can
+// be lifted straight into an editor or shell. The button reads textContent off the <code>, which
+// strips the syntax-highlight markup and yields the original text.
+function wireCodeCopy(el) {
+  el.querySelectorAll(".code-block").forEach((block) => {
+    const head = block.querySelector(".code-block-head");
+    const code = block.querySelector("pre code") || block.querySelector("pre");
+    if (!head || !code || head.querySelector(".code-copy")) return;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "code-copy";
+    btn.textContent = "Copy";
+    btn.title = "Copy code to clipboard";
+    let resetTimer = 0;
+    btn.onclick = async (e) => {
+      e.stopPropagation();
+      const ok = await copyToClipboard(code.textContent);
+      btn.textContent = ok ? "Copied" : "Failed";
+      btn.classList.toggle("ok", ok);
+      btn.classList.toggle("err", !ok);
+      clearTimeout(resetTimer);
+      resetTimer = setTimeout(() => {
+        btn.textContent = "Copy";
+        btn.classList.remove("ok", "err");
+      }, 1500);
+    };
+    head.appendChild(btn);
   });
 }
 function renderLinkedText(el, text) {
