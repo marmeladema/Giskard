@@ -8,7 +8,16 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.39
+**Version:** 1.40
+
+**Changelog (1.39 → 1.40), orphaned-thread read-only viewing:**
+- **RO1:** Subscribing to a thread whose harness cannot attach — most commonly because its
+  provider was removed from config (e.g. swapping a proxy provider id) — now **degrades to a
+  read-only view** instead of failing the whole subscribe. The persisted history is still served
+  and the attach failure is surfaced as a non-fatal `thread_read_only` warning; only a genuinely
+  missing thread stays a hard error. Reading history is a persistence-only operation and no longer
+  depends on a successful harness attach (extends the degraded-open philosophy of E2/E3 to the
+  subscribe/history paths). New turns still cannot run on such a thread (§13.6).
 
 **Changelog (1.38 → 1.39), public-exposure hardening pass:**
 - **SEC1:** Login brute-force throttling: a global lockout with exponential backoff engages after
