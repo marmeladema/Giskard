@@ -1562,16 +1562,37 @@ async fn handle_client_msg(
 ) -> Result<(), WsError> {
     match msg {
         ClientMessage::Subscribe { thread_id } => {
-            let access = ensure_thread_open(state, thread_id, "subscribe").await?;
+            // Attaching the harness is best-effort. If it fails — most often because the thread's
+            // provider was removed from config — degrade to a read-only view: the persisted
+            // history is still served and the attach failure is surfaced as a non-fatal warning,
+            // so an orphaned thread stays viewable even though it can never run a new turn. Only a
+            // genuinely missing thread remains a hard error.
+            let (project_id, notice) = match ensure_thread_open(state, thread_id, "subscribe").await
+            {
+                Ok(access) => (access.project_id, access.warning),
+                Err(attach_error) => {
+                    let project_id = project_for_readonly(state, thread_id, "subscribe").await?;
+                    warn!(
+                        %thread_id,
+                        code = %attach_error.info.code,
+                        detail = ?attach_error.info.detail,
+                        "thread harness attach failed; serving read-only history"
+                    );
+                    (
+                        project_id,
+                        Some(read_only_warning(&attach_error, thread_id)),
+                    )
+                }
+            };
             state.hub.subscribe(thread_id, client_id, tx.clone()).await;
 
-            if let Some(warning) = access.warning {
+            if let Some(warning) = notice {
                 let _ = tx.send(ServerMessage::Error { error: warning }).await;
             }
 
             let tf = state
                 .store
-                .recompute_aggregates(access.project_id, thread_id)
+                .recompute_aggregates(project_id, thread_id)
                 .await
                 .map_err(|e| WsError::from_persist(e, "subscribe", Some(thread_id)))?
                 .ok_or_else(|| {
@@ -1612,7 +1633,7 @@ async fn handle_client_msg(
             .await;
             let (turns, has_more) = state
                 .store
-                .load_history(access.project_id, thread_id, None, limit)
+                .load_history(project_id, thread_id, None, limit)
                 .await
                 .map_err(|e| WsError::from_persist(e, "subscribe_history", Some(thread_id)))?;
             let _ = tx
@@ -1638,7 +1659,7 @@ async fn handle_client_msg(
             before,
             limit,
         } => {
-            let project_id = project_for(state, thread_id, "load_history").await?;
+            let project_id = project_for_readonly(state, thread_id, "load_history").await?;
             let default_limit = history_limit_or_default(
                 state,
                 thread_id,
@@ -2152,6 +2173,51 @@ async fn project_for(
     ensure_thread_open(state, thread_id, action)
         .await
         .map(|access| access.project_id)
+}
+
+/// Resolve a thread's project using only persistence — **no harness attach**. The read-only paths
+/// (subscribe history, load_history) use this so a thread whose provider was removed from config
+/// stays viewable even though its harness can never re-attach. Prefers an already-open thread's
+/// registered project, then falls back to scanning persistence.
+async fn project_for_readonly(
+    state: &AppState,
+    thread_id: ThreadId,
+    action: &str,
+) -> Result<ProjectId, WsError> {
+    if let Some(project_id) = state.registry.get_project_for_thread(thread_id).await {
+        return Ok(project_id);
+    }
+    match find_persisted_thread(state, thread_id, action).await? {
+        Some((project_config, _)) => Ok(project_config.id),
+        None => Err(WsError::new(
+            "thread_not_found",
+            ErrorSeverity::Error,
+            "Thread not found.",
+        )
+        .thread(thread_id)
+        .action(action)),
+    }
+}
+
+/// Build the non-fatal warning shown when a thread loads read-only because its harness could not
+/// attach (typically its provider was removed from config): history is viewable, new turns are not.
+fn read_only_warning(attach_error: &WsError, thread_id: ThreadId) -> ErrorInfo {
+    ErrorInfo {
+        code: "thread_read_only".into(),
+        severity: ErrorSeverity::Warning,
+        message:
+            "This thread is read-only — its agent could not be started (its provider may have \
+             been removed from config). You can read the history but not send new messages."
+                .into(),
+        detail: attach_error
+            .info
+            .detail
+            .clone()
+            .or_else(|| Some(attach_error.info.message.clone())),
+        thread_id: Some(thread_id),
+        action: Some("subscribe".into()),
+        process_id: None,
+    }
 }
 
 async fn ensure_provider_change_allowed(

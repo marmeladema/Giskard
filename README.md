@@ -282,6 +282,11 @@ WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticke
 /api/projects/{id}/mcp/oauth-login`. Wire types are defined once in `giskard-proto`. See
 [§13.6](specs/giskard-specification.md) for the message protocol.
 
+If you subscribe to a thread whose agent can no longer be started — most often because its
+**provider was removed from config** (e.g. you swapped one proxy provider id for another) — the
+thread still opens **read-only**: its history loads and a non-fatal `thread_read_only` warning is
+shown. You can read the transcript but not send new messages on it.
+
 ---
 
 ## Architecture
