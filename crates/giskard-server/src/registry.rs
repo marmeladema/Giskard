@@ -810,6 +810,25 @@ async fn forward_events(
                             );
                             hub.broadcast_event(thread_id, event.clone()).await;
                         }
+                        AgentEvent::ServerRequestReceived { request, .. } => {
+                            warn!(
+                                %project_id,
+                                %thread_id,
+                                request_id = %request.id,
+                                method = %request.method,
+                                context_kind = turn_context_kind_label(ctx.kind),
+                                turn_gate_held = turn_gate
+                                    .as_ref()
+                                    .is_some_and(|lease| !lease.is_released()),
+                                elapsed_ms = forwarder_started.elapsed().as_millis(),
+                                "turnless server request received before turn ownership"
+                            );
+                            server_requests
+                                .lock()
+                                .await
+                                .insert(request.id.clone(), thread_id);
+                            hub.broadcast_event(thread_id, event.clone()).await;
+                        }
                         _ => {}
                     }
                     continue;
@@ -1935,6 +1954,119 @@ mod tests {
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty)
             ),
             "foreign notices/errors must not be broadcast to target-thread subscribers"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarder_broadcasts_turnless_server_request_before_turn_start() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: None,
+        };
+        store
+            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .await
+            .unwrap();
+        let now = Utc::now();
+        store
+            .save_thread(
+                project_id,
+                &ThreadFile {
+                    version: 1,
+                    id: thread_id,
+                    project_id,
+                    title: "target".into(),
+                    harness_thread_id: "th_target".into(),
+                    mode: Mode::Build,
+                    current_model: model.clone(),
+                    context_window: 128_000,
+                    approval_policy: ApprovalPolicy::Ask,
+                    model_efforts: Default::default(),
+                    tokens: TokenLedger::default(),
+                    created_at: now,
+                    updated_at: now,
+                    archived: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let (tx, _) = broadcast::channel(64);
+        let hub = Arc::new(Hub::new());
+        let live_buffers = Arc::new(LiveBufferStore::new());
+        let running_commands = Arc::new(RunningTaskStore::new());
+        let approvals = Arc::new(Mutex::new(Default::default()));
+        let server_requests = Arc::new(Mutex::new(Default::default()));
+        let ledger = ledger::spawn(store.clone());
+        let (client_tx, mut client_rx) = mpsc::channel(16);
+        hub.subscribe(thread_id, 1, client_tx).await;
+
+        spawn_forwarder(
+            thread_id,
+            project_id,
+            AgentEventStream::new(tx.subscribe()),
+            hub,
+            live_buffers.clone(),
+            running_commands,
+            store.clone(),
+            approvals,
+            server_requests.clone(),
+            ledger,
+            model,
+            "target",
+        );
+
+        let request_id = ServerRequestId("turnless_request".into());
+        tx.send(AgentEvent::ServerRequestReceived {
+            thread: thread_id,
+            turn: None,
+            request: ServerRequest {
+                id: request_id.clone(),
+                method: "mcpServer/elicitation/request".into(),
+                params: serde_json::json!({
+                    "message": "Allow cf-mcp to run tool \"wiki_search\"?"
+                }),
+                received_at: Utc::now(),
+            },
+        })
+        .unwrap();
+
+        let received = tokio::time::timeout(tokio::time::Duration::from_secs(2), client_rx.recv())
+            .await
+            .expect("broadcast")
+            .expect("message");
+        match received {
+            ServerMessage::Event {
+                agent_event: WireAgentEvent::ServerRequestReceived { turn, request, .. },
+                ..
+            } => {
+                assert!(turn.is_none());
+                assert_eq!(request.id, request_id);
+                assert_eq!(request.method, "mcpServer/elicitation/request");
+            }
+            other => panic!("expected turnless server request event, got {other:?}"),
+        }
+
+        assert_eq!(
+            server_requests.lock().await.get(&request_id).copied(),
+            Some(thread_id)
+        );
+        assert!(
+            store
+                .load_all_turns(project_id, thread_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "turnless request alone must not persist a turn"
+        );
+        assert!(
+            live_buffers.snapshot(thread_id).await.is_none(),
+            "turnless request alone must not create target-thread live turn state"
         );
     }
 
