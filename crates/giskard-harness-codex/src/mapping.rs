@@ -641,6 +641,7 @@ impl CodexMapper {
                     approval_id.clone(),
                     PendingApprovalResponse {
                         request_id: id.clone(),
+                        thread,
                         kind: PendingApprovalResponseKind::Decision,
                     },
                 );
@@ -676,6 +677,7 @@ impl CodexMapper {
                     approval_id.clone(),
                     PendingApprovalResponse {
                         request_id: id.clone(),
+                        thread,
                         kind: PendingApprovalResponseKind::Decision,
                     },
                 );
@@ -712,6 +714,7 @@ impl CodexMapper {
                     approval_id.clone(),
                     PendingApprovalResponse {
                         request_id: id.clone(),
+                        thread,
                         kind: PendingApprovalResponseKind::Permissions {
                             permissions: permissions.clone(),
                         },
@@ -755,6 +758,7 @@ impl CodexMapper {
                     approval_id.clone(),
                     PendingApprovalResponse {
                         request_id: id.clone(),
+                        thread,
                         kind: PendingApprovalResponseKind::LegacyReviewDecision,
                     },
                 );
@@ -797,6 +801,7 @@ impl CodexMapper {
                     approval_id.clone(),
                     PendingApprovalResponse {
                         request_id: id.clone(),
+                        thread,
                         kind: PendingApprovalResponseKind::LegacyReviewDecision,
                     },
                 );
@@ -912,6 +917,7 @@ impl CodexMapper {
             Some(PendingApprovalResponse {
                 request_id,
                 kind: PendingApprovalResponseKind::Permissions { permissions },
+                ..
             }) => Ok(ApprovalResponse::from_parts(
                 request_id,
                 map_permissions_approval_decision(decision, permissions),
@@ -919,6 +925,7 @@ impl CodexMapper {
             Some(PendingApprovalResponse {
                 request_id,
                 kind: PendingApprovalResponseKind::LegacyReviewDecision,
+                ..
             }) => Ok(ApprovalResponse::from_parts(
                 request_id,
                 map_legacy_review_decision(decision),
@@ -926,6 +933,7 @@ impl CodexMapper {
             Some(PendingApprovalResponse {
                 request_id,
                 kind: PendingApprovalResponseKind::Decision,
+                ..
             }) => Ok(ApprovalResponse::from_parts(
                 request_id,
                 ApprovalResponseBody::Result(map_approval_decision(decision)),
@@ -937,6 +945,7 @@ impl CodexMapper {
                         transport,
                         question_id,
                     },
+                ..
             }) => Ok(ApprovalResponse::from_parts(
                 request_id,
                 map_mcp_tool_approval_decision(decision, &transport, question_id.as_deref()),
@@ -955,12 +964,18 @@ impl CodexMapper {
             .ok_or_else(|| format!("no pending server request for id {id}"))
     }
 
-    pub fn has_pending_approval(&self, id: &ApprovalId) -> bool {
-        self.pending_approval_responses.contains_key(id)
+    pub fn pending_approval_ids_for_thread(&self, thread: ThreadId) -> Vec<ApprovalId> {
+        self.pending_approval_responses
+            .iter()
+            .filter_map(|(id, pending)| (pending.thread == thread).then_some(id.clone()))
+            .collect()
     }
 
-    pub fn has_pending_server_request(&self, id: &ServerRequestId) -> bool {
-        self.pending_server_requests.contains_key(id)
+    pub fn pending_server_request_ids_for_thread(&self, thread: ThreadId) -> Vec<ServerRequestId> {
+        self.pending_server_requests
+            .iter()
+            .filter_map(|(id, pending)| (pending.thread == thread).then_some(id.clone()))
+            .collect()
     }
 
     pub fn resolve_server_request(&mut self, id: &ServerRequestId) {
@@ -985,6 +1000,7 @@ impl CodexMapper {
             approval_id.clone(),
             PendingApprovalResponse {
                 request_id,
+                thread,
                 kind: PendingApprovalResponseKind::McpToolCall {
                     transport,
                     question_id: detected.question_id.clone(),
@@ -1117,6 +1133,7 @@ pub enum ApprovalResponse {
 
 struct PendingApprovalResponse {
     request_id: RequestId,
+    thread: ThreadId,
     kind: PendingApprovalResponseKind,
 }
 
@@ -3407,6 +3424,64 @@ mod tests {
             mapper
                 .pending_server_request(&ServerRequestId("42".into()))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn pending_request_ids_are_scoped_to_their_owner_thread() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let owner = ThreadId::new();
+        let other = ThreadId::new();
+        mapper.register_thread("thread1".into(), owner);
+        mapper.register_thread("thread2".into(), other);
+
+        let approval = CodexServerRequest::CmdExecApproval(
+            serde_json::from_value(serde_json::json!({
+                "approvalId": "approval1",
+                "commandActions": [],
+                "cwd": "/tmp",
+                "environmentId": "env_1",
+                "itemId": "cmd1",
+                "threadId": "thread1",
+                "turnId": "turn1",
+                "startedAtMs": 123
+            }))
+            .unwrap(),
+        );
+        let generic = CodexServerRequest::ToolRequestUserInput(
+            serde_json::from_value(serde_json::json!({
+                "itemId": "input1",
+                "threadId": "thread1",
+                "turnId": "turn1",
+                "questions": [{
+                    "id": "confirm",
+                    "header": "Confirm",
+                    "question": "Continue?"
+                }]
+            }))
+            .unwrap(),
+        );
+
+        mapper
+            .map_server_request(&RequestId::String("approval_req".into()), &approval, other)
+            .unwrap();
+        mapper
+            .map_server_request(&RequestId::String("server_req".into()), &generic, other)
+            .unwrap();
+
+        assert_eq!(
+            mapper.pending_approval_ids_for_thread(owner),
+            vec![ApprovalId("approval_req".into())]
+        );
+        assert_eq!(
+            mapper.pending_server_request_ids_for_thread(owner),
+            vec![ServerRequestId("server_req".into())]
+        );
+        assert!(mapper.pending_approval_ids_for_thread(other).is_empty());
+        assert!(
+            mapper
+                .pending_server_request_ids_for_thread(other)
+                .is_empty()
         );
     }
 
