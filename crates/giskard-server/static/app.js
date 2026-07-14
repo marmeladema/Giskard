@@ -2899,8 +2899,9 @@ function renderItemBody(body, p) {
       linkify:true
     });
   } else if (p.kind==="agent_message" || p.kind==="reasoning" || p.kind==="user_message") {
-    if (p.kind==="user_message") body.textContent = p.text || "";
-    else renderMarkdown(body, p.text || "");
+    // User messages get the same server-rendered, sanitized Markdown as agent text, so pasted code
+    // fences, lists and emphasis format the same on both sides of the conversation.
+    renderMarkdown(body, p.text || "");
   } else if (p.kind==="file_change") {
     renderFileChange(body, p);
   } else if (p.kind==="tool_call") {
