@@ -8,7 +8,24 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.43
+**Version:** 1.44
+
+**Changelog (1.43 → 1.44), same-project turn concurrency:**
+- **CT1:** A project-scoped Codex harness worker is an event pump, not a single-turn drain loop.
+  After `turn/start` is acknowledged, the worker records that active turn and keeps accepting
+  `thread/start`, `thread/resume`, and `turn/start` requests for other threads in the same project
+  while continuing to drain Codex notifications. This preserves §6.5's same-project concurrent
+  thread guarantee and prevents opening or sending in one thread from waiting behind a long turn in
+  another thread.
+- **CT2:** Codex server requests and approvals are non-blocking from the harness worker's
+  perspective. The worker broadcasts the browser-visible request, records its owning thread, and
+  continues processing Codex messages and normal harness commands; browser responses are routed by
+  the stored request id later. Interrupting a thread best-effort cancels/rejects all pending
+  approval/server requests owned by that thread so Codex is not left waiting on a request from an
+  interrupted turn.
+- **CT3:** Harness operations that are invalid during an active turn (`CompactThread`, archive, and
+  delete) are rejected only for the target thread. Other threads in the same project can still be
+  opened, renamed, compacted when idle, or started while a different thread is running.
 
 **Changelog (1.42 → 1.43), turnless MCP/server-request hardening:**
 - **M3:** MCP tool-call approval promotion no longer invents a `TurnId` when Codex omits

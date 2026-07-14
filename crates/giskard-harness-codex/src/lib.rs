@@ -13,6 +13,8 @@ use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
@@ -107,6 +109,94 @@ enum ControlCommand {
 
 type SenderMap = Arc<StdMutex<HashMap<ThreadId, broadcast::Sender<AgentEvent>>>>;
 
+#[async_trait]
+trait CodexTransport: Send {
+    async fn request_json(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, HarnessError>;
+
+    async fn next_message(&mut self) -> Result<Option<codex_codes::ServerMessage>, HarnessError>;
+
+    async fn respond_json(
+        &mut self,
+        id: codex_codes::jsonrpc::RequestId,
+        value: serde_json::Value,
+    ) -> Result<(), HarnessError>;
+
+    async fn respond_error_json(
+        &mut self,
+        id: codex_codes::jsonrpc::RequestId,
+        code: i64,
+        message: &str,
+    ) -> Result<(), HarnessError>;
+
+    async fn shutdown_transport(self) -> Result<(), HarnessError>
+    where
+        Self: Sized;
+}
+
+#[async_trait]
+impl CodexTransport for codex_codes::AsyncClient {
+    async fn request_json(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, HarnessError> {
+        self.request(method, &params)
+            .await
+            .map_err(|e| HarnessError::Transport(e.to_string()))
+    }
+
+    async fn next_message(&mut self) -> Result<Option<codex_codes::ServerMessage>, HarnessError> {
+        self.next_message()
+            .await
+            .map_err(|e| HarnessError::Transport(e.to_string()))
+    }
+
+    async fn respond_json(
+        &mut self,
+        id: codex_codes::jsonrpc::RequestId,
+        value: serde_json::Value,
+    ) -> Result<(), HarnessError> {
+        self.respond(id, &value)
+            .await
+            .map_err(|e| HarnessError::Transport(e.to_string()))
+    }
+
+    async fn respond_error_json(
+        &mut self,
+        id: codex_codes::jsonrpc::RequestId,
+        code: i64,
+        message: &str,
+    ) -> Result<(), HarnessError> {
+        self.respond_error(id, code, message)
+            .await
+            .map_err(|e| HarnessError::Transport(e.to_string()))
+    }
+
+    async fn shutdown_transport(self) -> Result<(), HarnessError> {
+        self.shutdown()
+            .await
+            .map_err(|e| HarnessError::Transport(e.to_string()))
+    }
+}
+
+async fn codex_request<P, R>(
+    client: &mut dyn CodexTransport,
+    method: &str,
+    params: &P,
+) -> Result<R, HarnessError>
+where
+    P: Serialize + Sync,
+    R: DeserializeOwned,
+{
+    let params = serde_json::to_value(params).map_err(|e| HarnessError::Protocol(e.to_string()))?;
+    let response = client.request_json(method, params).await?;
+    serde_json::from_value(response).map_err(|e| HarnessError::Protocol(e.to_string()))
+}
+
 /// Codex CLI harness adapter (one app-server process per project).
 pub struct CodexHarness {
     cmd_tx: mpsc::Sender<HarnessCommand>,
@@ -131,10 +221,10 @@ impl CodexHarness {
         Self::spawn_harness(client, workspace_root)
     }
 
-    fn spawn_harness(
-        client: codex_codes::AsyncClient,
-        workspace_root: PathBuf,
-    ) -> Result<Arc<Self>, HarnessError> {
+    fn spawn_harness<C>(client: C, workspace_root: PathBuf) -> Result<Arc<Self>, HarnessError>
+    where
+        C: CodexTransport + 'static,
+    {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (control_tx, control_rx) = mpsc::channel(64);
         let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
@@ -420,27 +510,31 @@ impl AgentHarness for CodexHarness {
     }
 }
 
-async fn background_task(
-    mut client: codex_codes::AsyncClient,
+async fn background_task<C>(
+    mut client: C,
     mut cmd_rx: mpsc::Receiver<HarnessCommand>,
     mut control_rx: mpsc::Receiver<ControlCommand>,
     senders: SenderMap,
     workspace_root: PathBuf,
-) {
+) where
+    C: CodexTransport,
+{
     let mut mapper = CodexMapper::new(workspace_root);
     let mut pending_compactions: HashMap<ThreadId, PendingCompaction> = HashMap::new();
+    let mut active_turns: ActiveTurns = HashMap::new();
+    let mut first_event_warn_tick = tokio::time::interval(Duration::from_secs(1));
 
     loop {
         tokio::select! {
-            msg = client.next_message(), if mapper.has_running_commands() || !pending_compactions.is_empty() => {
+            msg = client.next_message(), if should_poll_codex_messages(&mapper, &active_turns, &pending_compactions) => {
                 match msg {
                     Ok(Some(msg)) => {
-                        match handle_idle_server_message(
+                        match handle_background_server_message(
                                 &mut client,
                                 &mut mapper,
                                 &senders,
-                                &mut control_rx,
                                 &mut pending_compactions,
+                                &mut active_turns,
                                 msg,
                             )
                             .await
@@ -455,12 +549,19 @@ async fn background_task(
                                 );
                             }
                             StreamOutcome::Shutdown => {
-                                let _ = client.shutdown().await;
+                            let _ = client.shutdown_transport().await;
                                 break;
                             }
                         }
                     }
                     Ok(None) => {
+                        emit_incomplete_active_turns(
+                            &senders,
+                            &mut mapper,
+                            &mut active_turns,
+                            "Codex stream ended before turn completion",
+                        )
+                        .await;
                         if !pending_compactions.is_empty() {
                             warn!(
                                 pending_compactions = pending_compactions.len(),
@@ -471,11 +572,29 @@ async fn background_task(
                         break;
                     }
                     Err(e) => {
-                        warn!(
-                            pending_compactions = pending_compactions.len(),
-                            pending_compaction_states = ?pending_compaction_states(&pending_compactions),
-                            "Codex idle stream failed while background work was running: {e}"
-                        );
+                        let message = e.to_string();
+                        if active_turns.is_empty() {
+                            warn!(
+                                pending_compactions = pending_compactions.len(),
+                                pending_compaction_states = ?pending_compaction_states(&pending_compactions),
+                                "Codex idle stream failed while background work was running: {message}"
+                            );
+                        } else {
+                            warn!(
+                                active_turns = active_turns.len(),
+                                pending_compactions = pending_compactions.len(),
+                                pending_compaction_states = ?pending_compaction_states(&pending_compactions),
+                                "Codex stream failed before all active turns completed: {message}"
+                            );
+                            emit_incomplete_active_turns(
+                                &senders,
+                                &mut mapper,
+                                &mut active_turns,
+                                format!("Codex stream failed before turn completion: {message}"),
+                            )
+                            .await;
+                            break;
+                        }
                     }
                 }
             }
@@ -506,281 +625,355 @@ async fn background_task(
                         .await;
                         let acknowledged_turn = result.as_ref().ok().copied();
                         let _ = response.send(result);
-                        if let Some(acknowledged_turn) = acknowledged_turn
-                            && matches!(
-                            stream_turn_events(
-                                &mut client,
-                                &mut mapper,
-                                &thread,
-                                acknowledged_turn,
-                                &senders,
-                                &mut control_rx,
-                            )
-                            .await,
-                            StreamOutcome::Shutdown,
-                        )
-                        {
-                            let _ = client.shutdown().await;
-                            break;
+                        if let Some(acknowledged_turn) = acknowledged_turn {
+                            active_turns.insert(
+                                thread.thread,
+                                ActiveTurn::new(thread, acknowledged_turn),
+                            );
                         }
                     }
                 }
             }
             control = control_rx.recv() => {
-                match control {
-                    Some(ControlCommand::RespondApproval {
-                        id,
-                        decision,
-                        response,
-                    }) => {
-                        let result =
-                            handle_respond_approval(&mut client, &mut mapper, &id, &decision)
-                                .await;
-                        let _ = response.send(result);
-                    }
-                    Some(ControlCommand::RespondServerRequest {
-                        id,
-                        response_payload,
-                        response,
-                    }) => {
-                        let result = handle_respond_server_request(
-                            &mut client,
-                            &mut mapper,
-                            &senders,
-                            &id,
-                            response_payload,
-                        )
-                        .await;
-                        let _ = response.send(result);
-                    }
-                    Some(ControlCommand::Interrupt { thread, response }) => {
-                        let result = handle_interrupt(&mut client, &mapper, &thread).await;
-                        let _ = response.send(result);
-                    }
-                    Some(ControlCommand::TerminateCommand {
-                        thread,
-                        process_id,
-                        response,
-                    }) => {
-                        let result =
-                            handle_terminate_command(&mut client, &mapper, &thread, &process_id)
-                                .await;
-                        let _ = response.send(result);
-                    }
-                    Some(ControlCommand::CompactThread { thread, response }) => {
-                        let started = Instant::now();
-                        info!(
-                            thread = %thread.thread,
-                            harness_thread_id = %thread.harness_thread_id,
-                            pending_compactions = pending_compactions.len(),
-                            "requesting Codex context compaction"
-                        );
-                        let result = handle_compact_thread(&mut client, &thread).await;
-                        match &result {
-                            Ok(()) => {
-                                pending_compactions
-                                    .insert(thread.thread, PendingCompaction::new(started));
-                                info!(
-                                    thread = %thread.thread,
-                                    harness_thread_id = %thread.harness_thread_id,
-                                    ack_elapsed_ms = started.elapsed().as_millis(),
-                                    pending_compactions = pending_compactions.len(),
-                                    "Codex accepted context compaction request"
-                                );
-                            }
-                            Err(error) => {
-                                warn!(
-                                    thread = %thread.thread,
-                                    harness_thread_id = %thread.harness_thread_id,
-                                    elapsed_ms = started.elapsed().as_millis(),
-                                    "Codex context compaction request failed: {error}"
-                                );
-                            }
-                        }
-                        let _ = response.send(result);
-                    }
-                    Some(ControlCommand::SetThreadName {
-                        thread,
-                        name,
-                        response,
-                    }) => {
-                        let result = handle_set_thread_name(&mut client, &thread, &name).await;
-                        let _ = response.send(result);
-                    }
-                    Some(ControlCommand::SetThreadArchived {
-                        thread,
-                        archived,
-                        response,
-                    }) => {
-                        let result = handle_set_thread_archived(&mut client, &thread, archived)
-                            .await;
-                        let _ = response.send(result);
-                    }
-                    Some(ControlCommand::DeleteThread { thread, response }) => {
-                        let result = handle_delete_thread(&mut client, &thread).await;
-                        if result.is_ok() {
-                            lock_senders(&senders).remove(&thread.thread);
-                        }
-                        let _ = response.send(result);
-                    }
-                    Some(ControlCommand::ListMcpServers { response }) => {
-                        let result = handle_list_mcp_servers(&mut client).await;
-                        let _ = response.send(result);
-                    }
-                    Some(ControlCommand::ReloadMcpServers { response }) => {
-                        let result = handle_reload_mcp_servers(&mut client).await;
-                        let _ = response.send(result);
-                    }
-                    Some(ControlCommand::StartMcpOauthLogin { name, response }) => {
-                        let result = handle_start_mcp_oauth_login(&mut client, &name).await;
-                        let _ = response.send(result);
-                    }
-                    Some(ControlCommand::Shutdown { response }) => {
-                        let _ = client.shutdown().await;
-                        let _ = response.send(Ok(()));
-                        break;
-                    }
-                    None => break,
+                if matches!(
+                    handle_control_command(
+                        &mut client,
+                        &mut mapper,
+                        &senders,
+                        &mut pending_compactions,
+                        &active_turns,
+                        control,
+                    )
+                    .await,
+                    StreamOutcome::Shutdown,
+                ) {
+                    let _ = client.shutdown_transport().await;
+                    break;
                 }
+            }
+            _ = first_event_warn_tick.tick(), if !active_turns.is_empty() => {
+                warn_slow_first_events(&mut active_turns);
             }
         }
     }
 }
 
-async fn handle_idle_server_message(
-    client: &mut codex_codes::AsyncClient,
+#[derive(Debug)]
+struct ActiveTurn {
+    thread: ThreadHandle,
+    acknowledged_turn: TurnId,
+    active_turn: Option<TurnId>,
+    started_at: Instant,
+    saw_server_message: bool,
+    warned_no_server_message: bool,
+}
+
+impl ActiveTurn {
+    fn new(thread: ThreadHandle, acknowledged_turn: TurnId) -> Self {
+        Self {
+            thread,
+            acknowledged_turn,
+            active_turn: Some(acknowledged_turn),
+            started_at: Instant::now(),
+            saw_server_message: false,
+            warned_no_server_message: false,
+        }
+    }
+
+    fn mark_server_message(&mut self) {
+        self.saw_server_message = true;
+    }
+
+    fn event_is_current_turn(&self, event: &AgentEvent) -> bool {
+        agent_event_turn(event).is_none_or(|turn| turn == self.acknowledged_turn)
+    }
+}
+
+type ActiveTurns = HashMap<ThreadId, ActiveTurn>;
+
+fn should_poll_codex_messages(
+    mapper: &CodexMapper,
+    active_turns: &ActiveTurns,
+    pending_compactions: &HashMap<ThreadId, PendingCompaction>,
+) -> bool {
+    !active_turns.is_empty() || mapper.has_running_commands() || !pending_compactions.is_empty()
+}
+
+fn fallback_thread(mapper: &CodexMapper, active_turns: &ActiveTurns) -> ThreadId {
+    mapper
+        .running_command_fallback_thread()
+        .or_else(|| {
+            (active_turns.len() == 1)
+                .then(|| active_turns.keys().next().copied())
+                .flatten()
+        })
+        .unwrap_or_default()
+}
+
+fn warn_slow_first_events(active_turns: &mut ActiveTurns) {
+    for active in active_turns.values_mut() {
+        if !active.saw_server_message
+            && !active.warned_no_server_message
+            && active.started_at.elapsed() >= TURN_FIRST_EVENT_WARN_AFTER
+        {
+            active.warned_no_server_message = true;
+            warn!(
+                thread_id = %active.thread.thread,
+                harness_thread_id = %active.thread.harness_thread_id,
+                acknowledged_turn = %active.acknowledged_turn,
+                active_turn = ?active.active_turn,
+                elapsed_ms = active.started_at.elapsed().as_millis(),
+                "Codex accepted turn/start but has not emitted a server message yet"
+            );
+        }
+    }
+}
+
+fn completed_current_active_turn(
+    active_turns: &ActiveTurns,
+    event: &AgentEvent,
+) -> Option<(ThreadId, TurnId)> {
+    let AgentEvent::TurnCompleted { thread, turn, .. } = event else {
+        return None;
+    };
+    let active = active_turns.get(thread)?;
+    (*turn == active.acknowledged_turn).then_some((*thread, *turn))
+}
+
+async fn handle_background_server_message(
+    client: &mut dyn CodexTransport,
     mapper: &mut CodexMapper,
     senders: &SenderMap,
-    control_rx: &mut mpsc::Receiver<ControlCommand>,
     pending_compactions: &mut HashMap<ThreadId, PendingCompaction>,
+    active_turns: &mut ActiveTurns,
     msg: codex_codes::ServerMessage,
 ) -> StreamOutcome {
-    let fallback_thread = mapper.running_command_fallback_thread().unwrap_or_default();
+    let fallback_thread = fallback_thread(mapper, active_turns);
     match msg {
         codex_codes::ServerMessage::Notification(notif) => {
             if let Some(event) = mapper.map_notification(&notif, fallback_thread) {
                 let thread = event_thread(&event);
+                if let Some(active) = active_turns.get_mut(&thread) {
+                    active.mark_server_message();
+                    if let AgentEvent::TurnStarted { turn, .. } = &event
+                        && *turn == active.acknowledged_turn
+                    {
+                        active.active_turn = Some(*turn);
+                    }
+                }
                 let completed_compaction =
                     observe_pending_compaction(pending_compactions, thread, &event);
+                let completed_active_turn =
+                    completed_current_active_turn(active_turns, &event).map(|(_, turn)| turn);
+                if active_turns.contains_key(&thread)
+                    && matches!(&event, AgentEvent::TurnCompleted { .. })
+                    && completed_active_turn.is_none()
+                {
+                    debug!(
+                        %thread,
+                        acknowledged_turn = ?active_turns.get(&thread).map(|active| active.acknowledged_turn),
+                        event_turn = ?agent_event_turn(&event),
+                        "ignoring Codex turn completion for a non-current turn"
+                    );
+                }
+                let fatal_completion = active_turns.get(&thread).and_then(|active| {
+                    active
+                        .event_is_current_turn(&event)
+                        .then(|| {
+                            mapping::fatal_turn_error(&notif)
+                                .map(|message| (active.active_turn, message))
+                        })
+                        .flatten()
+                });
                 let _ = broadcast_event(senders, thread, || event).await;
+                if let Some(turn) = completed_active_turn {
+                    active_turns.remove(&thread);
+                    mapper.clear_active_turn(thread);
+                    debug!(
+                        %thread,
+                        %turn,
+                        remaining_active_turns = active_turns.len(),
+                        "Codex turn completion observed"
+                    );
+                } else if let Some((turn, message)) = fatal_completion {
+                    if emit_fatal_turn_completion(senders, thread, turn, message).await {
+                        active_turns.remove(&thread);
+                        mapper.clear_active_turn(thread);
+                    }
+                }
                 if let Some(elapsed_ms) = completed_compaction {
                     return StreamOutcome::CompactionCompleted { thread, elapsed_ms };
                 }
+            } else if let Some(message) = mapping::fatal_turn_error(&notif) {
+                warn!(
+                    fallback_thread = %fallback_thread,
+                    "dropping fatal Codex error notification that could not be mapped to a known thread: {message}"
+                );
             }
             StreamOutcome::TurnEnded
         }
         codex_codes::ServerMessage::Request { id, request } => {
-            let waiting_for = id.to_string();
             let Some(event) = mapper.map_server_request(&id, &request, fallback_thread) else {
                 respond_unroutable_server_request(client, &id).await;
                 return StreamOutcome::TurnEnded;
             };
             let thread = event_thread(&event);
+            if let Some(active) = active_turns.get_mut(&thread) {
+                active.mark_server_message();
+            }
             let _ = broadcast_event(senders, thread, || event).await;
+            StreamOutcome::TurnEnded
+        }
+    }
+}
 
-            loop {
-                match control_rx.recv().await {
-                    Some(ControlCommand::RespondApproval {
-                        id: resp_id,
-                        decision,
-                        response,
-                    }) => {
-                        let is_waiting = resp_id.0 == waiting_for;
-                        let result =
-                            handle_respond_approval(client, mapper, &resp_id, &decision).await;
-                        let should_end = is_waiting && result.is_ok();
-                        let _ = response.send(result);
-                        if should_end {
-                            return StreamOutcome::TurnEnded;
-                        }
-                    }
-                    Some(ControlCommand::RespondServerRequest {
-                        id: resp_id,
-                        response_payload,
-                        response,
-                    }) => {
-                        let is_waiting = resp_id.0 == waiting_for;
-                        let result = handle_respond_server_request(
-                            client,
-                            mapper,
-                            senders,
-                            &resp_id,
-                            response_payload,
-                        )
-                        .await;
-                        let should_end = is_waiting && result.is_ok();
-                        let _ = response.send(result);
-                        if should_end {
-                            return StreamOutcome::TurnEnded;
-                        }
-                    }
-                    Some(ControlCommand::Interrupt { thread, response }) => {
-                        let result = handle_interrupt(client, mapper, &thread).await;
-                        if result.is_ok() {
-                            cancel_waiting_request_after_interrupt(
-                                client,
-                                mapper,
-                                senders,
-                                &waiting_for,
-                            )
-                            .await;
-                            let _ = response.send(result);
-                            return StreamOutcome::TurnEnded;
-                        }
-                        let _ = response.send(result);
-                    }
-                    Some(ControlCommand::TerminateCommand {
-                        thread,
-                        process_id,
-                        response,
-                    }) => {
-                        let result =
-                            handle_terminate_command(client, mapper, &thread, &process_id).await;
-                        let _ = response.send(result);
-                    }
-                    Some(ControlCommand::CompactThread { response, .. }) => {
-                        let _ = response.send(Err(HarnessError::Unsupported(
-                            "context compaction is not available during an active turn".into(),
-                        )));
-                    }
-                    Some(ControlCommand::SetThreadName {
-                        thread,
-                        name,
-                        response,
-                    }) => {
-                        let result = handle_set_thread_name(client, &thread, &name).await;
-                        let _ = response.send(result);
-                    }
-                    Some(ControlCommand::SetThreadArchived { response, .. }) => {
-                        let _ = response.send(Err(HarnessError::Unsupported(
-                            "thread archiving is not available during an active turn".into(),
-                        )));
-                    }
-                    Some(ControlCommand::DeleteThread { response, .. }) => {
-                        let _ = response.send(Err(HarnessError::Unsupported(
-                            "thread deletion is not available during an active turn".into(),
-                        )));
-                    }
-                    Some(ControlCommand::ListMcpServers { response }) => {
-                        let result = handle_list_mcp_servers(client).await;
-                        let _ = response.send(result);
-                    }
-                    Some(ControlCommand::ReloadMcpServers { response }) => {
-                        let result = handle_reload_mcp_servers(client).await;
-                        let _ = response.send(result);
-                    }
-                    Some(ControlCommand::StartMcpOauthLogin { name, response }) => {
-                        let result = handle_start_mcp_oauth_login(client, &name).await;
-                        let _ = response.send(result);
-                    }
-                    Some(ControlCommand::Shutdown { response }) => {
-                        let _ = response.send(Ok(()));
-                        return StreamOutcome::Shutdown;
-                    }
-                    None => return StreamOutcome::TurnEnded,
+async fn handle_control_command(
+    client: &mut dyn CodexTransport,
+    mapper: &mut CodexMapper,
+    senders: &SenderMap,
+    pending_compactions: &mut HashMap<ThreadId, PendingCompaction>,
+    active_turns: &ActiveTurns,
+    control: Option<ControlCommand>,
+) -> StreamOutcome {
+    match control {
+        Some(ControlCommand::RespondApproval {
+            id,
+            decision,
+            response,
+        }) => {
+            let result = handle_respond_approval(client, mapper, &id, &decision).await;
+            let _ = response.send(result);
+            StreamOutcome::TurnEnded
+        }
+        Some(ControlCommand::RespondServerRequest {
+            id,
+            response_payload,
+            response,
+        }) => {
+            let result =
+                handle_respond_server_request(client, mapper, senders, &id, response_payload).await;
+            let _ = response.send(result);
+            StreamOutcome::TurnEnded
+        }
+        Some(ControlCommand::Interrupt { thread, response }) => {
+            let result = handle_interrupt(client, mapper, &thread).await;
+            if result.is_ok() {
+                reject_pending_requests_for_interrupted_thread(
+                    client,
+                    mapper,
+                    senders,
+                    thread.thread,
+                )
+                .await;
+            }
+            let _ = response.send(result);
+            StreamOutcome::TurnEnded
+        }
+        Some(ControlCommand::TerminateCommand {
+            thread,
+            process_id,
+            response,
+        }) => {
+            let result = handle_terminate_command(client, mapper, &thread, &process_id).await;
+            let _ = response.send(result);
+            StreamOutcome::TurnEnded
+        }
+        Some(ControlCommand::CompactThread { thread, response }) => {
+            if active_turns.contains_key(&thread.thread) {
+                let _ = response.send(Err(HarnessError::Unsupported(
+                    "context compaction is not available during an active turn".into(),
+                )));
+                return StreamOutcome::TurnEnded;
+            }
+            let started = Instant::now();
+            info!(
+                thread = %thread.thread,
+                harness_thread_id = %thread.harness_thread_id,
+                pending_compactions = pending_compactions.len(),
+                "requesting Codex context compaction"
+            );
+            let result = handle_compact_thread(client, &thread).await;
+            match &result {
+                Ok(()) => {
+                    pending_compactions.insert(thread.thread, PendingCompaction::new(started));
+                    info!(
+                        thread = %thread.thread,
+                        harness_thread_id = %thread.harness_thread_id,
+                        ack_elapsed_ms = started.elapsed().as_millis(),
+                        pending_compactions = pending_compactions.len(),
+                        "Codex accepted context compaction request"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        thread = %thread.thread,
+                        harness_thread_id = %thread.harness_thread_id,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "Codex context compaction request failed: {error}"
+                    );
                 }
             }
+            let _ = response.send(result);
+            StreamOutcome::TurnEnded
         }
+        Some(ControlCommand::SetThreadName {
+            thread,
+            name,
+            response,
+        }) => {
+            let result = handle_set_thread_name(client, &thread, &name).await;
+            let _ = response.send(result);
+            StreamOutcome::TurnEnded
+        }
+        Some(ControlCommand::SetThreadArchived {
+            thread,
+            archived,
+            response,
+        }) => {
+            let result = if active_turns.contains_key(&thread.thread) {
+                Err(HarnessError::Unsupported(
+                    "thread archiving is not available during an active turn".into(),
+                ))
+            } else {
+                handle_set_thread_archived(client, &thread, archived).await
+            };
+            let _ = response.send(result);
+            StreamOutcome::TurnEnded
+        }
+        Some(ControlCommand::DeleteThread { thread, response }) => {
+            let result = if active_turns.contains_key(&thread.thread) {
+                Err(HarnessError::Unsupported(
+                    "thread deletion is not available during an active turn".into(),
+                ))
+            } else {
+                handle_delete_thread(client, &thread).await
+            };
+            if result.is_ok() {
+                lock_senders(senders).remove(&thread.thread);
+            }
+            let _ = response.send(result);
+            StreamOutcome::TurnEnded
+        }
+        Some(ControlCommand::ListMcpServers { response }) => {
+            let result = handle_list_mcp_servers(client).await;
+            let _ = response.send(result);
+            StreamOutcome::TurnEnded
+        }
+        Some(ControlCommand::ReloadMcpServers { response }) => {
+            let result = handle_reload_mcp_servers(client).await;
+            let _ = response.send(result);
+            StreamOutcome::TurnEnded
+        }
+        Some(ControlCommand::StartMcpOauthLogin { name, response }) => {
+            let result = handle_start_mcp_oauth_login(client, &name).await;
+            let _ = response.send(result);
+            StreamOutcome::TurnEnded
+        }
+        Some(ControlCommand::Shutdown { response }) => {
+            let _ = response.send(Ok(()));
+            StreamOutcome::Shutdown
+        }
+        None => StreamOutcome::Shutdown,
     }
 }
 
@@ -902,7 +1095,7 @@ fn is_context_compaction_activity(item: &giskard_core::item::Item) -> bool {
 }
 
 async fn handle_open_thread(
-    client: &mut codex_codes::AsyncClient,
+    client: &mut dyn CodexTransport,
     mapper: &mut CodexMapper,
     opts: &OpenThreadOptions,
     senders: &SenderMap,
@@ -984,7 +1177,7 @@ fn effective_model(
 }
 
 async fn resume_thread(
-    client: &mut codex_codes::AsyncClient,
+    client: &mut dyn CodexTransport,
     resume_id: &str,
     cwd: &str,
     model: &giskard_core::model::ModelRef,
@@ -996,16 +1189,18 @@ async fn resume_thread(
         "modelProvider": model.provider,
     }))
     .map_err(|e| HarnessError::Protocol(e.to_string()))?;
-    let resp = client
-        .thread_resume(&params)
-        .await
-        .map_err(|e| HarnessError::Transport(e.to_string()))?;
+    let resp: codex_codes::ThreadResumeResponse = codex_request(
+        client,
+        codex_codes::protocol::methods::THREAD_RESUME,
+        &params,
+    )
+    .await?;
     let resumed = effective_model(&resp.model, &resp.model_provider, model);
     Ok((resp.thread.id, resumed))
 }
 
 async fn start_thread(
-    client: &mut codex_codes::AsyncClient,
+    client: &mut dyn CodexTransport,
     cwd: &str,
     initial_model: &giskard_core::model::ModelRef,
 ) -> Result<(String, Option<giskard_core::model::ModelRef>), HarnessError> {
@@ -1015,26 +1210,26 @@ async fn start_thread(
         "modelProvider": initial_model.provider,
     }))
     .map_err(|e| HarnessError::Protocol(e.to_string()))?;
-    let resp = client
-        .thread_start(&params)
-        .await
-        .map_err(|e| HarnessError::Transport(e.to_string()))?;
+    let resp: codex_codes::ThreadStartResponse = codex_request(
+        client,
+        codex_codes::protocol::methods::THREAD_START,
+        &params,
+    )
+    .await?;
     let started = effective_model(&resp.model, &resp.model_provider, initial_model);
     Ok((resp.thread.id, started))
 }
 
 async fn handle_start_turn(
-    client: &mut codex_codes::AsyncClient,
+    client: &mut dyn CodexTransport,
     mapper: &mut CodexMapper,
     thread: &ThreadHandle,
     input: &UserInput,
     overrides: &TurnOverrides,
 ) -> Result<TurnId, HarnessError> {
     let params = build_turn_start_params(thread, input, overrides)?;
-    let resp: codex_codes::TurnStartResponse = client
-        .request(codex_codes::protocol::methods::TURN_START, &params)
-        .await
-        .map_err(|e| HarnessError::Transport(e.to_string()))?;
+    let resp: codex_codes::TurnStartResponse =
+        codex_request(client, codex_codes::protocol::methods::TURN_START, &params).await?;
 
     mapper
         .register_active_turn(thread.thread, &resp.turn.id)
@@ -1090,350 +1285,6 @@ fn build_turn_start_params(
     Ok(params)
 }
 
-async fn stream_turn_events(
-    client: &mut codex_codes::AsyncClient,
-    mapper: &mut CodexMapper,
-    thread: &ThreadHandle,
-    acknowledged_turn: TurnId,
-    senders: &SenderMap,
-    control_rx: &mut mpsc::Receiver<ControlCommand>,
-) -> StreamOutcome {
-    let thread_id = thread.thread;
-    let mut active_turn: Option<TurnId> = Some(acknowledged_turn);
-    let stream_started = Instant::now();
-    let mut saw_server_message = false;
-    let mut warned_no_server_message = false;
-    let first_event_warning = tokio::time::sleep(TURN_FIRST_EVENT_WARN_AFTER);
-    tokio::pin!(first_event_warning);
-
-    loop {
-        let msg = tokio::select! {
-            msg = client.next_message() => {
-                saw_server_message = true;
-                msg
-            },
-            _ = &mut first_event_warning, if !saw_server_message && !warned_no_server_message => {
-                warned_no_server_message = true;
-                warn!(
-                    %thread_id,
-                    harness_thread_id = %thread.harness_thread_id,
-                    acknowledged_turn = %acknowledged_turn,
-                    ?active_turn,
-                    elapsed_ms = stream_started.elapsed().as_millis(),
-                    "Codex accepted turn/start but has not emitted a server message yet"
-                );
-                continue;
-            },
-            control = control_rx.recv() => {
-                match handle_stream_control(client, mapper, senders, control).await {
-                    StreamControlOutcome::Continue => continue,
-                    StreamControlOutcome::Shutdown => return StreamOutcome::Shutdown,
-                }
-            }
-        };
-
-        let msg = match msg {
-            Ok(Some(msg)) => msg,
-            Ok(None) => {
-                warn!(
-                    %thread_id,
-                    ?active_turn,
-                    "Codex stream ended before turn completion"
-                );
-                emit_incomplete_turn(
-                    senders,
-                    thread_id,
-                    active_turn,
-                    "Codex stream ended before turn completion",
-                )
-                .await;
-                break;
-            }
-            Err(e) => {
-                let message = e.to_string();
-                warn!(
-                    %thread_id,
-                    ?active_turn,
-                    error = %message,
-                    "Codex stream failed before turn completion"
-                );
-                emit_incomplete_turn(
-                    senders,
-                    thread_id,
-                    active_turn,
-                    format!("Codex stream failed before turn completion: {message}"),
-                )
-                .await;
-                break;
-            }
-        };
-
-        match msg {
-            codex_codes::ServerMessage::Notification(notif) => {
-                // A non-retryable error ends the turn without Codex sending `turn/completed`.
-                // Capture its message so we can synthesize a terminal Failed turn below (§7.1),
-                // giving history a persistent record of why the turn produced no agent output.
-                let event = mapper.map_notification(&notif, thread_id);
-                if let Some(event) = event {
-                    let event_thread_id = event_thread(&event);
-                    let is_current_thread = event_belongs_to_stream(thread_id, &event);
-                    let is_current_turn =
-                        event_belongs_to_current_turn(thread_id, acknowledged_turn, &event);
-                    if is_current_turn {
-                        if let AgentEvent::TurnStarted { turn, .. } = &event {
-                            active_turn = Some(*turn);
-                        }
-                    }
-                    let is_completed = event_completes_stream(thread_id, acknowledged_turn, &event);
-                    if is_current_thread
-                        && !is_current_turn
-                        && matches!(event, AgentEvent::TurnCompleted { .. })
-                    {
-                        debug!(
-                            %thread_id,
-                            acknowledged_turn = %acknowledged_turn,
-                            event_turn = ?agent_event_turn(&event),
-                            "ignoring Codex turn completion for a non-current turn"
-                        );
-                    }
-                    let _ = broadcast_event(senders, event_thread_id, || event).await;
-                    if is_completed {
-                        break;
-                    }
-                    if is_current_turn {
-                        if let Some(message) = mapping::fatal_turn_error(&notif) {
-                            emit_fatal_turn_completion(senders, thread_id, active_turn, message)
-                                .await;
-                            mapper.clear_active_turn(thread_id);
-                            break;
-                        }
-                    }
-                } else if let Some(message) = mapping::fatal_turn_error(&notif) {
-                    warn!(
-                        %thread_id,
-                        "dropping fatal Codex error notification that could not be mapped to a known thread: {message}"
-                    );
-                }
-            }
-            codex_codes::ServerMessage::Request { id, request } => {
-                let waiting_for = id.to_string();
-                let Some(event) = mapper.map_server_request(&id, &request, thread_id) else {
-                    respond_unroutable_server_request(client, &id).await;
-                    continue;
-                };
-                let event_thread_id = event_thread(&event);
-                let _ = broadcast_event(senders, event_thread_id, || event).await;
-
-                // Wait for the browser response. Normal harness commands keep queuing on the main
-                // command channel while this live turn waits for control input.
-                loop {
-                    match control_rx.recv().await {
-                        Some(ControlCommand::RespondApproval {
-                            id: resp_id,
-                            decision,
-                            response,
-                        }) => {
-                            let is_waiting = resp_id.0 == waiting_for;
-                            let result =
-                                handle_respond_approval(client, mapper, &resp_id, &decision).await;
-                            let should_break = is_waiting && result.is_ok();
-                            let _ = response.send(result);
-                            if should_break {
-                                break;
-                            }
-                        }
-                        Some(ControlCommand::RespondServerRequest {
-                            id: resp_id,
-                            response_payload,
-                            response,
-                        }) => {
-                            let is_waiting = resp_id.0 == waiting_for;
-                            let result = handle_respond_server_request(
-                                client,
-                                mapper,
-                                senders,
-                                &resp_id,
-                                response_payload,
-                            )
-                            .await;
-                            let should_break = is_waiting && result.is_ok();
-                            let _ = response.send(result);
-                            if should_break {
-                                break;
-                            }
-                        }
-                        Some(ControlCommand::Interrupt {
-                            thread: t,
-                            response,
-                        }) => {
-                            let result = handle_interrupt(client, mapper, &t).await;
-                            if result.is_ok() {
-                                cancel_waiting_request_after_interrupt(
-                                    client,
-                                    mapper,
-                                    senders,
-                                    &waiting_for,
-                                )
-                                .await;
-                                let _ = response.send(result);
-                                break;
-                            }
-                            let _ = response.send(result);
-                        }
-                        Some(ControlCommand::TerminateCommand {
-                            thread,
-                            process_id,
-                            response,
-                        }) => {
-                            let result =
-                                handle_terminate_command(client, mapper, &thread, &process_id)
-                                    .await;
-                            let _ = response.send(result);
-                        }
-                        Some(ControlCommand::CompactThread { response, .. }) => {
-                            let _ = response.send(Err(HarnessError::Unsupported(
-                                "context compaction is not available during an active turn".into(),
-                            )));
-                        }
-                        Some(ControlCommand::SetThreadName {
-                            thread,
-                            name,
-                            response,
-                        }) => {
-                            let result = handle_set_thread_name(client, &thread, &name).await;
-                            let _ = response.send(result);
-                        }
-                        Some(ControlCommand::SetThreadArchived { response, .. }) => {
-                            let _ = response.send(Err(HarnessError::Unsupported(
-                                "thread archiving is not available during an active turn".into(),
-                            )));
-                        }
-                        Some(ControlCommand::DeleteThread { response, .. }) => {
-                            let _ = response.send(Err(HarnessError::Unsupported(
-                                "thread deletion is not available during an active turn".into(),
-                            )));
-                        }
-                        Some(ControlCommand::ListMcpServers { response }) => {
-                            let result = handle_list_mcp_servers(client).await;
-                            let _ = response.send(result);
-                        }
-                        Some(ControlCommand::ReloadMcpServers { response }) => {
-                            let result = handle_reload_mcp_servers(client).await;
-                            let _ = response.send(result);
-                        }
-                        Some(ControlCommand::StartMcpOauthLogin { name, response }) => {
-                            let result = handle_start_mcp_oauth_login(client, &name).await;
-                            let _ = response.send(result);
-                        }
-                        Some(ControlCommand::Shutdown { response }) => {
-                            let _ = response.send(Ok(()));
-                            return StreamOutcome::Shutdown;
-                        }
-                        None => return StreamOutcome::TurnEnded,
-                    }
-                }
-            }
-        }
-    }
-
-    StreamOutcome::TurnEnded
-}
-
-enum StreamControlOutcome {
-    Continue,
-    Shutdown,
-}
-
-async fn handle_stream_control(
-    client: &mut codex_codes::AsyncClient,
-    mapper: &mut CodexMapper,
-    senders: &SenderMap,
-    control: Option<ControlCommand>,
-) -> StreamControlOutcome {
-    match control {
-        Some(ControlCommand::RespondApproval {
-            id,
-            decision,
-            response,
-        }) => {
-            let result = handle_respond_approval(client, mapper, &id, &decision).await;
-            let _ = response.send(result);
-            StreamControlOutcome::Continue
-        }
-        Some(ControlCommand::RespondServerRequest {
-            id,
-            response_payload,
-            response,
-        }) => {
-            let result =
-                handle_respond_server_request(client, mapper, senders, &id, response_payload).await;
-            let _ = response.send(result);
-            StreamControlOutcome::Continue
-        }
-        Some(ControlCommand::Interrupt { thread, response }) => {
-            let result = handle_interrupt(client, mapper, &thread).await;
-            let _ = response.send(result);
-            StreamControlOutcome::Continue
-        }
-        Some(ControlCommand::TerminateCommand {
-            thread,
-            process_id,
-            response,
-        }) => {
-            let result = handle_terminate_command(client, mapper, &thread, &process_id).await;
-            let _ = response.send(result);
-            StreamControlOutcome::Continue
-        }
-        Some(ControlCommand::CompactThread { response, .. }) => {
-            let _ = response.send(Err(HarnessError::Unsupported(
-                "context compaction is not available during an active turn".into(),
-            )));
-            StreamControlOutcome::Continue
-        }
-        Some(ControlCommand::SetThreadName {
-            thread,
-            name,
-            response,
-        }) => {
-            let result = handle_set_thread_name(client, &thread, &name).await;
-            let _ = response.send(result);
-            StreamControlOutcome::Continue
-        }
-        Some(ControlCommand::SetThreadArchived { response, .. }) => {
-            let _ = response.send(Err(HarnessError::Unsupported(
-                "thread archiving is not available during an active turn".into(),
-            )));
-            StreamControlOutcome::Continue
-        }
-        Some(ControlCommand::DeleteThread { response, .. }) => {
-            let _ = response.send(Err(HarnessError::Unsupported(
-                "thread deletion is not available during an active turn".into(),
-            )));
-            StreamControlOutcome::Continue
-        }
-        Some(ControlCommand::ListMcpServers { response }) => {
-            let result = handle_list_mcp_servers(client).await;
-            let _ = response.send(result);
-            StreamControlOutcome::Continue
-        }
-        Some(ControlCommand::ReloadMcpServers { response }) => {
-            let result = handle_reload_mcp_servers(client).await;
-            let _ = response.send(result);
-            StreamControlOutcome::Continue
-        }
-        Some(ControlCommand::StartMcpOauthLogin { name, response }) => {
-            let result = handle_start_mcp_oauth_login(client, &name).await;
-            let _ = response.send(result);
-            StreamControlOutcome::Continue
-        }
-        Some(ControlCommand::Shutdown { response }) => {
-            let _ = response.send(Ok(()));
-            StreamControlOutcome::Shutdown
-        }
-        None => StreamControlOutcome::Shutdown,
-    }
-}
-
 async fn broadcast_event<F: FnOnce() -> AgentEvent>(senders: &SenderMap, thread: ThreadId, f: F) {
     let sender = sender_for_thread(senders, thread);
     if let Some(sender) = sender {
@@ -1469,11 +1320,11 @@ fn ensure_thread_sender(
 }
 
 async fn respond_unroutable_server_request(
-    client: &mut codex_codes::AsyncClient,
+    client: &mut dyn CodexTransport,
     id: &codex_codes::jsonrpc::RequestId,
 ) {
     let message = "Giskard cannot route this Codex server request to a known thread.";
-    if let Err(error) = client.respond_error(id.clone(), -32000, message).await {
+    if let Err(error) = client.respond_error_json(id.clone(), -32000, message).await {
         warn!(%id, %error, "failed to reject unroutable Codex server request");
     } else {
         warn!(%id, "rejected unroutable Codex server request");
@@ -1497,10 +1348,12 @@ fn event_thread(event: &AgentEvent) -> ThreadId {
     }
 }
 
+#[cfg(test)]
 fn event_belongs_to_stream(stream_thread: ThreadId, event: &AgentEvent) -> bool {
     event_thread(event) == stream_thread
 }
 
+#[cfg(test)]
 fn event_belongs_to_current_turn(
     stream_thread: ThreadId,
     current_turn: TurnId,
@@ -1510,6 +1363,7 @@ fn event_belongs_to_current_turn(
         && agent_event_turn(event).is_none_or(|turn| turn == current_turn)
 }
 
+#[cfg(test)]
 fn event_completes_stream(
     stream_thread: ThreadId,
     current_turn: TurnId,
@@ -1545,6 +1399,24 @@ async fn emit_incomplete_turn(
         })
         .await;
     }
+}
+
+async fn emit_incomplete_active_turns(
+    senders: &SenderMap,
+    mapper: &mut CodexMapper,
+    active_turns: &mut ActiveTurns,
+    message: impl Into<String>,
+) {
+    let message = message.into();
+    let turns: Vec<(ThreadId, Option<TurnId>)> = active_turns
+        .iter()
+        .map(|(thread, active)| (*thread, active.active_turn))
+        .collect();
+    for (thread, turn) in turns {
+        emit_incomplete_turn(senders, thread, turn, message.clone()).await;
+        mapper.clear_active_turn(thread);
+    }
+    active_turns.clear();
 }
 
 async fn emit_fatal_turn_completion(
@@ -1583,7 +1455,7 @@ async fn emit_fatal_turn_completion(
 }
 
 async fn handle_respond_approval(
-    client: &mut codex_codes::AsyncClient,
+    client: &mut dyn CodexTransport,
     mapper: &mut CodexMapper,
     id: &ApprovalId,
     decision: &ApprovalDecision,
@@ -1593,7 +1465,7 @@ async fn handle_respond_approval(
         .map_err(HarnessError::Protocol)?
     {
         mapping::ApprovalResponse::Result { request_id, value } => client
-            .respond(request_id, &value)
+            .respond_json(request_id, value)
             .await
             .map_err(|e| HarnessError::Transport(e.to_string())),
         mapping::ApprovalResponse::Error {
@@ -1601,14 +1473,14 @@ async fn handle_respond_approval(
             code,
             message,
         } => client
-            .respond_error(request_id, code, &message)
+            .respond_error_json(request_id, code, &message)
             .await
             .map_err(|e| HarnessError::Transport(e.to_string())),
     }
 }
 
 async fn handle_respond_server_request(
-    client: &mut codex_codes::AsyncClient,
+    client: &mut dyn CodexTransport,
     mapper: &mut CodexMapper,
     senders: &SenderMap,
     id: &ServerRequestId,
@@ -1619,11 +1491,11 @@ async fn handle_respond_server_request(
         .map_err(HarnessError::Protocol)?;
     match response {
         ServerRequestResponse::Result { value } => client
-            .respond(pending.request_id, &value)
+            .respond_json(pending.request_id, value)
             .await
             .map_err(|e| HarnessError::Transport(e.to_string()))?,
         ServerRequestResponse::Error { code, message } => client
-            .respond_error(pending.request_id, code, &message)
+            .respond_error_json(pending.request_id, code, &message)
             .await
             .map_err(|e| HarnessError::Transport(e.to_string()))?,
     }
@@ -1640,28 +1512,37 @@ async fn handle_respond_server_request(
     Ok(())
 }
 
-async fn cancel_waiting_request_after_interrupt(
-    client: &mut codex_codes::AsyncClient,
+async fn reject_pending_requests_for_interrupted_thread(
+    client: &mut dyn CodexTransport,
     mapper: &mut CodexMapper,
     senders: &SenderMap,
-    waiting_for: &str,
+    thread: ThreadId,
 ) {
-    let approval_id = ApprovalId(waiting_for.to_owned());
-    if mapper.has_pending_approval(&approval_id) {
+    let approval_ids = mapper.pending_approval_ids_for_thread(thread);
+    let server_request_ids = mapper.pending_server_request_ids_for_thread(thread);
+
+    if approval_ids.is_empty() && server_request_ids.is_empty() {
+        debug!(
+            %thread,
+            "interrupt accepted with no pending Codex approval/server request to reject"
+        );
+        return;
+    }
+
+    for approval_id in approval_ids {
         if let Err(error) =
             handle_respond_approval(client, mapper, &approval_id, &ApprovalDecision::Cancel).await
         {
             warn!(
-                request_id = waiting_for,
+                %thread,
+                request_id = %approval_id,
                 %error,
                 "failed to cancel pending approval after interrupt"
             );
         }
-        return;
     }
 
-    let server_request_id = ServerRequestId(waiting_for.to_owned());
-    if mapper.has_pending_server_request(&server_request_id) {
+    for server_request_id in server_request_ids {
         let response = ServerRequestResponse::Error {
             code: -32000,
             message: "Turn interrupted before this server request was answered.".into(),
@@ -1671,22 +1552,17 @@ async fn cancel_waiting_request_after_interrupt(
                 .await
         {
             warn!(
-                request_id = waiting_for,
+                %thread,
+                request_id = %server_request_id,
                 %error,
                 "failed to reject pending server request after interrupt"
             );
         }
-        return;
     }
-
-    warn!(
-        request_id = waiting_for,
-        "interrupt accepted while waiting for a Codex request that is no longer pending"
-    );
 }
 
 async fn handle_interrupt(
-    client: &mut codex_codes::AsyncClient,
+    client: &mut dyn CodexTransport,
     mapper: &CodexMapper,
     thread: &ThreadHandle,
 ) -> Result<(), HarnessError> {
@@ -1697,7 +1573,7 @@ async fn handle_interrupt(
 }
 
 async fn handle_terminate_command(
-    client: &mut codex_codes::AsyncClient,
+    client: &mut dyn CodexTransport,
     mapper: &CodexMapper,
     thread: &ThreadHandle,
     process_id: &str,
@@ -1714,24 +1590,23 @@ async fn handle_terminate_command(
 }
 
 async fn handle_compact_thread(
-    client: &mut codex_codes::AsyncClient,
+    client: &mut dyn CodexTransport,
     thread: &ThreadHandle,
 ) -> Result<(), HarnessError> {
     let params = codex_codes::ThreadCompactStartParams {
         thread_id: thread.harness_thread_id.clone(),
     };
-    let _: codex_codes::ThreadCompactStartResponse = client
-        .request(
-            codex_codes::protocol::methods::THREAD_COMPACT_START,
-            &params,
-        )
-        .await
-        .map_err(|e| HarnessError::Transport(e.to_string()))?;
+    let _: codex_codes::ThreadCompactStartResponse = codex_request(
+        client,
+        codex_codes::protocol::methods::THREAD_COMPACT_START,
+        &params,
+    )
+    .await?;
     Ok(())
 }
 
 async fn handle_set_thread_archived(
-    client: &mut codex_codes::AsyncClient,
+    client: &mut dyn CodexTransport,
     thread: &ThreadHandle,
     archived: bool,
 ) -> Result<(), HarnessError> {
@@ -1739,24 +1614,28 @@ async fn handle_set_thread_archived(
         let params = codex_codes::ThreadArchiveParams {
             thread_id: thread.harness_thread_id.clone(),
         };
-        client
-            .thread_archive(&params)
-            .await
-            .map_err(|e| HarnessError::Transport(e.to_string()))?;
+        let _: codex_codes::ThreadArchiveResponse = codex_request(
+            client,
+            codex_codes::protocol::methods::THREAD_ARCHIVE,
+            &params,
+        )
+        .await?;
     } else {
         let params = codex_codes::ThreadUnarchiveParams {
             thread_id: thread.harness_thread_id.clone(),
         };
-        let _: codex_codes::ThreadUnarchiveResponse = client
-            .request(codex_codes::protocol::methods::THREAD_UNARCHIVE, &params)
-            .await
-            .map_err(|e| HarnessError::Transport(e.to_string()))?;
+        let _: codex_codes::ThreadUnarchiveResponse = codex_request(
+            client,
+            codex_codes::protocol::methods::THREAD_UNARCHIVE,
+            &params,
+        )
+        .await?;
     }
     Ok(())
 }
 
 async fn handle_set_thread_name(
-    client: &mut codex_codes::AsyncClient,
+    client: &mut dyn CodexTransport,
     thread: &ThreadHandle,
     name: &str,
 ) -> Result<(), HarnessError> {
@@ -1764,15 +1643,17 @@ async fn handle_set_thread_name(
         thread_id: thread.harness_thread_id.clone(),
         name: name.to_owned(),
     };
-    let _: codex_codes::ThreadSetNameResponse = client
-        .request(codex_codes::protocol::methods::THREAD_NAME_SET, &params)
-        .await
-        .map_err(|e| HarnessError::Transport(e.to_string()))?;
+    let _: codex_codes::ThreadSetNameResponse = codex_request(
+        client,
+        codex_codes::protocol::methods::THREAD_NAME_SET,
+        &params,
+    )
+    .await?;
     Ok(())
 }
 
 async fn handle_list_mcp_servers(
-    client: &mut codex_codes::AsyncClient,
+    client: &mut dyn CodexTransport,
 ) -> Result<Vec<McpServerStatus>, HarnessError> {
     let mut out = Vec::new();
     let mut cursor = None;
@@ -1784,13 +1665,12 @@ async fn handle_list_mcp_servers(
             limit: None,
             thread_id: None,
         };
-        let page: codex_codes::ListMcpServerStatusResponse = client
-            .request(
-                codex_codes::protocol::methods::MCPSERVERSTATUS_LIST,
-                &params,
-            )
-            .await
-            .map_err(|e| HarnessError::Transport(e.to_string()))?;
+        let page: codex_codes::ListMcpServerStatusResponse = codex_request(
+            client,
+            codex_codes::protocol::methods::MCPSERVERSTATUS_LIST,
+            &params,
+        )
+        .await?;
 
         out.extend(page.data.into_iter().map(map_mcp_server_status));
         cursor = page.next_cursor;
@@ -1802,21 +1682,18 @@ async fn handle_list_mcp_servers(
     Ok(out)
 }
 
-async fn handle_reload_mcp_servers(
-    client: &mut codex_codes::AsyncClient,
-) -> Result<(), HarnessError> {
-    let _: codex_codes::McpServerRefreshResponse = client
-        .request(
-            codex_codes::protocol::methods::CONFIG_MCPSERVER_RELOAD,
-            &serde_json::json!({}),
-        )
-        .await
-        .map_err(|e| HarnessError::Transport(e.to_string()))?;
+async fn handle_reload_mcp_servers(client: &mut dyn CodexTransport) -> Result<(), HarnessError> {
+    let _: codex_codes::McpServerRefreshResponse = codex_request(
+        client,
+        codex_codes::protocol::methods::CONFIG_MCPSERVER_RELOAD,
+        &serde_json::json!({}),
+    )
+    .await?;
     Ok(())
 }
 
 async fn handle_start_mcp_oauth_login(
-    client: &mut codex_codes::AsyncClient,
+    client: &mut dyn CodexTransport,
     name: &str,
 ) -> Result<McpOauthStart, HarnessError> {
     let params = codex_codes::McpServerOauthLoginParams {
@@ -1825,13 +1702,12 @@ async fn handle_start_mcp_oauth_login(
         thread_id: None,
         timeout_secs: None,
     };
-    let response: codex_codes::McpServerOauthLoginResponse = client
-        .request(
-            codex_codes::protocol::methods::MCPSERVER_OAUTH_LOGIN,
-            &params,
-        )
-        .await
-        .map_err(|e| HarnessError::Transport(e.to_string()))?;
+    let response: codex_codes::McpServerOauthLoginResponse = codex_request(
+        client,
+        codex_codes::protocol::methods::MCPSERVER_OAUTH_LOGIN,
+        &params,
+    )
+    .await?;
     Ok(McpOauthStart {
         authorization_url: response.authorization_url,
     })
@@ -1903,21 +1779,23 @@ fn map_mcp_resource_template(template: codex_codes::ResourceTemplate) -> McpReso
 }
 
 async fn handle_delete_thread(
-    client: &mut codex_codes::AsyncClient,
+    client: &mut dyn CodexTransport,
     thread: &ThreadHandle,
 ) -> Result<(), HarnessError> {
     let params = codex_codes::ThreadDeleteParams {
         thread_id: thread.harness_thread_id.clone(),
     };
-    client
-        .thread_delete(&params)
-        .await
-        .map_err(|e| HarnessError::Transport(e.to_string()))?;
+    let _: codex_codes::ThreadDeleteResponse = codex_request(
+        client,
+        codex_codes::protocol::methods::THREAD_DELETE,
+        &params,
+    )
+    .await?;
     Ok(())
 }
 
 async fn handle_interrupt_turn(
-    client: &mut codex_codes::AsyncClient,
+    client: &mut dyn CodexTransport,
     native_thread_id: &str,
     native_turn_id: &str,
 ) -> Result<(), HarnessError> {
@@ -1925,10 +1803,12 @@ async fn handle_interrupt_turn(
         thread_id: native_thread_id.to_owned(),
         turn_id: native_turn_id.to_owned(),
     };
-    client
-        .turn_interrupt(&params)
-        .await
-        .map_err(|e| HarnessError::Transport(e.to_string()))?;
+    let _: codex_codes::TurnInterruptResponse = codex_request(
+        client,
+        codex_codes::protocol::methods::TURN_INTERRUPT,
+        &params,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1936,10 +1816,13 @@ async fn handle_interrupt_turn(
 mod tests {
     use super::*;
     use chrono::Utc;
-    use giskard_core::ids::ItemId;
+    use giskard_core::ids::{ItemId, ProjectId};
     use giskard_core::item::{Item, ItemPayload};
     use giskard_core::model::{Effort, ModelRef};
     use giskard_core::turn::{ApprovalPolicy, Mode};
+    use serde_json::{Value, json};
+    use tokio::sync::Mutex;
+    use tokio::time::timeout;
 
     fn test_thread() -> ThreadHandle {
         ThreadHandle {
@@ -1964,6 +1847,301 @@ mod tests {
             mode,
             approval_policy: ApprovalPolicy::Ask,
         }
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct FakeRequest {
+        method: String,
+        params: Value,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct FakeResponse {
+        id: codex_codes::jsonrpc::RequestId,
+        value: Value,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct FakeResponseError {
+        id: codex_codes::jsonrpc::RequestId,
+        code: i64,
+        message: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct FakeStartedTurn {
+        native_thread_id: String,
+        native_turn_id: String,
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeCodexState {
+        thread_counter: usize,
+        turn_counter: usize,
+        requests: Vec<FakeRequest>,
+        responses: Vec<FakeResponse>,
+        response_errors: Vec<FakeResponseError>,
+        started_turns: Vec<FakeStartedTurn>,
+        shutdowns: usize,
+    }
+
+    struct FakeCodexTransport {
+        state: Arc<Mutex<FakeCodexState>>,
+        events_rx: mpsc::Receiver<codex_codes::ServerMessage>,
+    }
+
+    #[derive(Clone)]
+    struct FakeCodexController {
+        state: Arc<Mutex<FakeCodexState>>,
+        events_tx: mpsc::Sender<codex_codes::ServerMessage>,
+    }
+
+    impl FakeCodexController {
+        async fn send_server_message(&self, msg: codex_codes::ServerMessage) {
+            self.events_tx
+                .send(msg)
+                .await
+                .expect("fake Codex event receiver should be open");
+        }
+
+        async fn requests(&self) -> Vec<FakeRequest> {
+            self.state.lock().await.requests.clone()
+        }
+
+        async fn responses(&self) -> Vec<FakeResponse> {
+            self.state.lock().await.responses.clone()
+        }
+
+        async fn response_errors(&self) -> Vec<FakeResponseError> {
+            self.state.lock().await.response_errors.clone()
+        }
+
+        async fn started_turns(&self) -> Vec<FakeStartedTurn> {
+            self.state.lock().await.started_turns.clone()
+        }
+    }
+
+    fn fake_codex() -> (FakeCodexTransport, FakeCodexController) {
+        let (events_tx, events_rx) = mpsc::channel(32);
+        let state = Arc::new(Mutex::new(FakeCodexState::default()));
+        (
+            FakeCodexTransport {
+                state: state.clone(),
+                events_rx,
+            },
+            FakeCodexController { state, events_tx },
+        )
+    }
+
+    #[async_trait]
+    impl CodexTransport for FakeCodexTransport {
+        async fn request_json(
+            &mut self,
+            method: &str,
+            params: Value,
+        ) -> Result<Value, HarnessError> {
+            let mut state = self.state.lock().await;
+            state.requests.push(FakeRequest {
+                method: method.to_owned(),
+                params: params.clone(),
+            });
+
+            match method {
+                codex_codes::protocol::methods::THREAD_START => {
+                    state.thread_counter += 1;
+                    let native_thread_id = format!("native-thread-{}", state.thread_counter);
+                    Ok(thread_open_response(
+                        &native_thread_id,
+                        params["model"].as_str().unwrap_or("gpt-5.5"),
+                        params["modelProvider"].as_str().unwrap_or("openai"),
+                    ))
+                }
+                codex_codes::protocol::methods::THREAD_RESUME => {
+                    let native_thread_id = params["threadId"]
+                        .as_str()
+                        .filter(|id| !id.is_empty())
+                        .unwrap_or("native-resumed");
+                    Ok(thread_open_response(
+                        native_thread_id,
+                        params["model"].as_str().unwrap_or("gpt-5.5"),
+                        params["modelProvider"].as_str().unwrap_or("openai"),
+                    ))
+                }
+                codex_codes::protocol::methods::TURN_START => {
+                    state.turn_counter += 1;
+                    let native_thread_id =
+                        params["threadId"].as_str().unwrap_or_default().to_owned();
+                    let native_turn_id = format!("native-turn-{}", state.turn_counter);
+                    state.started_turns.push(FakeStartedTurn {
+                        native_thread_id,
+                        native_turn_id: native_turn_id.clone(),
+                    });
+                    Ok(json!({
+                        "turn": {
+                            "id": native_turn_id,
+                            "status": "inProgress"
+                        }
+                    }))
+                }
+                codex_codes::protocol::methods::THREAD_COMPACT_START
+                | codex_codes::protocol::methods::THREAD_ARCHIVE
+                | codex_codes::protocol::methods::THREAD_UNARCHIVE
+                | codex_codes::protocol::methods::THREAD_NAME_SET
+                | codex_codes::protocol::methods::CONFIG_MCPSERVER_RELOAD
+                | codex_codes::protocol::methods::THREAD_DELETE
+                | codex_codes::protocol::methods::TURN_INTERRUPT => Ok(json!({})),
+                codex_codes::protocol::methods::MCPSERVERSTATUS_LIST => Ok(json!({
+                    "data": [],
+                    "nextCursor": null
+                })),
+                codex_codes::protocol::methods::MCPSERVER_OAUTH_LOGIN => Ok(json!({
+                    "authorizationUrl": "https://example.invalid/oauth"
+                })),
+                other => Err(HarnessError::Unsupported(format!(
+                    "fake Codex transport has no response for {other}"
+                ))),
+            }
+        }
+
+        async fn next_message(
+            &mut self,
+        ) -> Result<Option<codex_codes::ServerMessage>, HarnessError> {
+            Ok(self.events_rx.recv().await)
+        }
+
+        async fn respond_json(
+            &mut self,
+            id: codex_codes::jsonrpc::RequestId,
+            value: Value,
+        ) -> Result<(), HarnessError> {
+            self.state
+                .lock()
+                .await
+                .responses
+                .push(FakeResponse { id, value });
+            Ok(())
+        }
+
+        async fn respond_error_json(
+            &mut self,
+            id: codex_codes::jsonrpc::RequestId,
+            code: i64,
+            message: &str,
+        ) -> Result<(), HarnessError> {
+            self.state
+                .lock()
+                .await
+                .response_errors
+                .push(FakeResponseError {
+                    id,
+                    code,
+                    message: message.to_owned(),
+                });
+            Ok(())
+        }
+
+        async fn shutdown_transport(self) -> Result<(), HarnessError> {
+            self.state.lock().await.shutdowns += 1;
+            Ok(())
+        }
+    }
+
+    fn thread_open_response(native_thread_id: &str, model: &str, provider: &str) -> Value {
+        json!({
+            "approvalPolicy": "never",
+            "approvalsReviewer": null,
+            "cwd": "/tmp",
+            "model": model,
+            "modelProvider": provider,
+            "sandbox": {},
+            "thread": {
+                "id": native_thread_id
+            }
+        })
+    }
+
+    fn open_opts(thread: Option<ThreadId>, resume: Option<&str>) -> OpenThreadOptions {
+        OpenThreadOptions {
+            project: ProjectId::new(),
+            thread,
+            workspace_root: PathBuf::from("/tmp"),
+            resume: resume.map(str::to_owned),
+            initial_model: test_model(None),
+        }
+    }
+
+    fn build_turn_overrides() -> TurnOverrides {
+        turn_overrides(Mode::Build, None)
+    }
+
+    fn spawn_fake_harness() -> (Arc<CodexHarness>, FakeCodexController) {
+        let (transport, controller) = fake_codex();
+        let harness = CodexHarness::spawn_harness(transport, PathBuf::from("/tmp"))
+            .expect("fake harness should spawn");
+        (harness, controller)
+    }
+
+    fn generic_user_input_request(
+        id: &str,
+        native_thread_id: &str,
+        native_turn_id: &str,
+    ) -> codex_codes::ServerMessage {
+        codex_codes::ServerMessage::Request {
+            id: codex_codes::jsonrpc::RequestId::String(id.to_owned()),
+            request: codex_codes::messages::ServerRequest::ToolRequestUserInput(
+                serde_json::from_value(json!({
+                    "itemId": format!("input-{id}"),
+                    "threadId": native_thread_id,
+                    "turnId": native_turn_id,
+                    "questions": [{
+                        "id": "confirm",
+                        "header": "Confirm",
+                        "question": "Continue?"
+                    }]
+                }))
+                .expect("test user input request should deserialize"),
+            ),
+        }
+    }
+
+    fn command_approval_request(
+        id: &str,
+        native_thread_id: &str,
+        native_turn_id: &str,
+    ) -> codex_codes::ServerMessage {
+        codex_codes::ServerMessage::Request {
+            id: codex_codes::jsonrpc::RequestId::String(id.to_owned()),
+            request: codex_codes::messages::ServerRequest::CmdExecApproval(
+                serde_json::from_value(json!({
+                    "approvalId": id,
+                    "commandActions": [],
+                    "cwd": "/tmp",
+                    "environmentId": "env_1",
+                    "itemId": format!("cmd-{id}"),
+                    "threadId": native_thread_id,
+                    "turnId": native_turn_id,
+                    "startedAtMs": 123
+                }))
+                .expect("test approval request should deserialize"),
+            ),
+        }
+    }
+
+    async fn recv_matching_event(
+        stream: &mut AgentEventStream,
+        label: &str,
+        matches: impl Fn(&AgentEvent) -> bool,
+    ) -> AgentEvent {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let event = stream.recv().await.expect("event stream should stay open");
+                if matches(&event) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
     }
 
     fn context_compacted_event(thread: ThreadId, turn: TurnId) -> AgentEvent {
@@ -2053,6 +2231,446 @@ mod tests {
             current_turn,
             &turnless_error
         ));
+    }
+
+    #[test]
+    fn active_turn_table_completes_only_matching_thread_and_turn() {
+        let first_thread = test_thread();
+        let second_thread = ThreadHandle {
+            thread: ThreadId::new(),
+            harness_thread_id: "native-thread-2".into(),
+            warning: None,
+            resumed_model: None,
+        };
+        let first_turn = TurnId::new();
+        let second_turn = TurnId::new();
+        let stale_turn = TurnId::new();
+        let mut active_turns = ActiveTurns::new();
+        active_turns.insert(
+            first_thread.thread,
+            ActiveTurn::new(first_thread.clone(), first_turn),
+        );
+        active_turns.insert(
+            second_thread.thread,
+            ActiveTurn::new(second_thread.clone(), second_turn),
+        );
+
+        assert_eq!(
+            completed_current_active_turn(
+                &active_turns,
+                &completed_event(second_thread.thread, second_turn)
+            ),
+            Some((second_thread.thread, second_turn))
+        );
+        assert_eq!(
+            completed_current_active_turn(
+                &active_turns,
+                &completed_event(first_thread.thread, stale_turn)
+            ),
+            None
+        );
+        assert_eq!(
+            completed_current_active_turn(
+                &active_turns,
+                &completed_event(ThreadId::new(), first_turn)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_messages_are_polled_while_any_turn_is_active() {
+        let mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let mut active_turns = ActiveTurns::new();
+        let thread = test_thread();
+        active_turns.insert(thread.thread, ActiveTurn::new(thread, TurnId::new()));
+
+        assert!(should_poll_codex_messages(
+            &mapper,
+            &active_turns,
+            &HashMap::new()
+        ));
+    }
+
+    #[tokio::test]
+    async fn codex_worker_opens_new_thread_while_turn_is_active() {
+        let (harness, controller) = spawn_fake_harness();
+        let first = harness.open_thread(open_opts(None, None)).await.unwrap();
+        harness
+            .start_turn(
+                &first,
+                UserInput::text("keep running"),
+                build_turn_overrides(),
+            )
+            .await
+            .unwrap();
+
+        let second = timeout(
+            Duration::from_secs(1),
+            harness.open_thread(open_opts(None, None)),
+        )
+        .await
+        .expect("opening another thread must not wait for the active turn")
+        .unwrap();
+
+        assert_eq!(second.harness_thread_id, "native-thread-2");
+        assert_eq!(
+            controller
+                .requests()
+                .await
+                .iter()
+                .filter(|req| req.method == codex_codes::protocol::methods::THREAD_START)
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_worker_resumes_thread_while_turn_is_active() {
+        let (harness, controller) = spawn_fake_harness();
+        let first = harness.open_thread(open_opts(None, None)).await.unwrap();
+        harness
+            .start_turn(
+                &first,
+                UserInput::text("keep running"),
+                build_turn_overrides(),
+            )
+            .await
+            .unwrap();
+        let resumed_thread = ThreadId::new();
+
+        let resumed = timeout(
+            Duration::from_secs(1),
+            harness.open_thread(open_opts(Some(resumed_thread), Some("native-existing"))),
+        )
+        .await
+        .expect("resuming another thread must not wait for the active turn")
+        .unwrap();
+
+        assert_eq!(resumed.thread, resumed_thread);
+        assert_eq!(resumed.harness_thread_id, "native-existing");
+        assert!(controller.requests().await.iter().any(|req| {
+            req.method == codex_codes::protocol::methods::THREAD_RESUME
+                && req.params["threadId"] == "native-existing"
+        }));
+    }
+
+    #[tokio::test]
+    async fn codex_worker_starts_other_thread_turn_while_first_turn_is_active() {
+        let (harness, controller) = spawn_fake_harness();
+        let first = harness.open_thread(open_opts(None, None)).await.unwrap();
+        let second = harness.open_thread(open_opts(None, None)).await.unwrap();
+        harness
+            .start_turn(
+                &first,
+                UserInput::text("keep running"),
+                build_turn_overrides(),
+            )
+            .await
+            .unwrap();
+
+        let second_turn = timeout(
+            Duration::from_secs(1),
+            harness.start_turn(
+                &second,
+                UserInput::text("run concurrently"),
+                build_turn_overrides(),
+            ),
+        )
+        .await
+        .expect("starting another thread turn must not wait for the first turn")
+        .unwrap();
+
+        let started = controller.started_turns().await;
+        assert_eq!(started.len(), 2);
+        assert_eq!(started[0].native_thread_id, first.harness_thread_id);
+        assert_eq!(started[1].native_thread_id, second.harness_thread_id);
+        assert_ne!(started[0].native_turn_id, started[1].native_turn_id);
+        assert!(second_turn != TurnId::default());
+    }
+
+    #[tokio::test]
+    async fn codex_worker_pending_server_request_does_not_block_other_thread_start() {
+        let (harness, controller) = spawn_fake_harness();
+        let first = harness.open_thread(open_opts(None, None)).await.unwrap();
+        let first_turn = harness
+            .start_turn(&first, UserInput::text("ask later"), build_turn_overrides())
+            .await
+            .unwrap();
+        let first_native_turn = controller.started_turns().await[0].native_turn_id.clone();
+        let mut first_stream = harness.subscribe(&first);
+
+        controller
+            .send_server_message(generic_user_input_request(
+                "server_req",
+                &first.harness_thread_id,
+                &first_native_turn,
+            ))
+            .await;
+        let event = recv_matching_event(&mut first_stream, "server request", |event| {
+            matches!(
+                event,
+                AgentEvent::ServerRequestReceived {
+                    thread,
+                    turn,
+                    request,
+                } if *thread == first.thread
+                    && *turn == Some(first_turn)
+                    && request.id == ServerRequestId("server_req".into())
+            )
+        })
+        .await;
+        assert!(matches!(event, AgentEvent::ServerRequestReceived { .. }));
+
+        let second = harness.open_thread(open_opts(None, None)).await.unwrap();
+        timeout(
+            Duration::from_secs(1),
+            harness.start_turn(
+                &second,
+                UserInput::text("not blocked"),
+                build_turn_overrides(),
+            ),
+        )
+        .await
+        .expect("pending server request in one thread must not block another thread")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_worker_routes_server_request_response_while_other_thread_is_active() {
+        let (harness, controller) = spawn_fake_harness();
+        let first = harness.open_thread(open_opts(None, None)).await.unwrap();
+        let second = harness.open_thread(open_opts(None, None)).await.unwrap();
+        harness
+            .start_turn(
+                &first,
+                UserInput::text("ask a question"),
+                build_turn_overrides(),
+            )
+            .await
+            .unwrap();
+        harness
+            .start_turn(
+                &second,
+                UserInput::text("also running"),
+                build_turn_overrides(),
+            )
+            .await
+            .unwrap();
+        let first_native_turn = controller.started_turns().await[0].native_turn_id.clone();
+        let mut first_stream = harness.subscribe(&first);
+        controller
+            .send_server_message(generic_user_input_request(
+                "server_req",
+                &first.harness_thread_id,
+                &first_native_turn,
+            ))
+            .await;
+        recv_matching_event(&mut first_stream, "server request", |event| {
+            matches!(
+                event,
+                AgentEvent::ServerRequestReceived { request, .. }
+                    if request.id == ServerRequestId("server_req".into())
+            )
+        })
+        .await;
+
+        timeout(
+            Duration::from_secs(1),
+            harness.respond_server_request(
+                ServerRequestId("server_req".into()),
+                ServerRequestResponse::result(json!({"answer": true})),
+            ),
+        )
+        .await
+        .expect("server request response must be routed while another thread is active")
+        .unwrap();
+
+        let responses = controller.responses().await;
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            responses[0].id,
+            codex_codes::jsonrpc::RequestId::String("server_req".into())
+        );
+        assert_eq!(responses[0].value, json!({"answer": true}));
+        recv_matching_event(&mut first_stream, "server request resolution", |event| {
+            matches!(
+                event,
+                AgentEvent::ServerRequestResolved { request_id, .. }
+                    if *request_id == ServerRequestId("server_req".into())
+            )
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn codex_worker_routes_approval_response_while_other_thread_is_active() {
+        let (harness, controller) = spawn_fake_harness();
+        let first = harness.open_thread(open_opts(None, None)).await.unwrap();
+        let second = harness.open_thread(open_opts(None, None)).await.unwrap();
+        harness
+            .start_turn(
+                &first,
+                UserInput::text("needs approval"),
+                build_turn_overrides(),
+            )
+            .await
+            .unwrap();
+        harness
+            .start_turn(
+                &second,
+                UserInput::text("also running"),
+                build_turn_overrides(),
+            )
+            .await
+            .unwrap();
+        let first_native_turn = controller.started_turns().await[0].native_turn_id.clone();
+        let mut first_stream = harness.subscribe(&first);
+        controller
+            .send_server_message(command_approval_request(
+                "approval_req",
+                &first.harness_thread_id,
+                &first_native_turn,
+            ))
+            .await;
+        recv_matching_event(&mut first_stream, "approval request", |event| {
+            matches!(
+                event,
+                AgentEvent::ApprovalRequested { request, .. }
+                    if request.id == ApprovalId("approval_req".into())
+            )
+        })
+        .await;
+
+        timeout(
+            Duration::from_secs(1),
+            harness.respond_approval(ApprovalId("approval_req".into()), ApprovalDecision::Accept),
+        )
+        .await
+        .expect("approval response must be routed while another thread is active")
+        .unwrap();
+
+        let responses = controller.responses().await;
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            responses[0].id,
+            codex_codes::jsonrpc::RequestId::String("approval_req".into())
+        );
+        assert_eq!(responses[0].value, json!({"decision": "accept"}));
+    }
+
+    #[tokio::test]
+    async fn codex_worker_interrupt_rejects_only_interrupted_thread_requests() {
+        let (harness, controller) = spawn_fake_harness();
+        let first = harness.open_thread(open_opts(None, None)).await.unwrap();
+        let second = harness.open_thread(open_opts(None, None)).await.unwrap();
+        harness
+            .start_turn(
+                &first,
+                UserInput::text("waits on input"),
+                build_turn_overrides(),
+            )
+            .await
+            .unwrap();
+        harness
+            .start_turn(
+                &second,
+                UserInput::text("also waits"),
+                build_turn_overrides(),
+            )
+            .await
+            .unwrap();
+        let started = controller.started_turns().await;
+        let first_native_turn = started[0].native_turn_id.clone();
+        let second_native_turn = started[1].native_turn_id.clone();
+        let mut first_stream = harness.subscribe(&first);
+        let mut second_stream = harness.subscribe(&second);
+
+        controller
+            .send_server_message(generic_user_input_request(
+                "first_server_req",
+                &first.harness_thread_id,
+                &first_native_turn,
+            ))
+            .await;
+        recv_matching_event(&mut first_stream, "first server request", |event| {
+            matches!(
+                event,
+                AgentEvent::ServerRequestReceived { request, .. }
+                    if request.id == ServerRequestId("first_server_req".into())
+            )
+        })
+        .await;
+        controller
+            .send_server_message(command_approval_request(
+                "first_approval_req",
+                &first.harness_thread_id,
+                &first_native_turn,
+            ))
+            .await;
+        recv_matching_event(&mut first_stream, "first approval request", |event| {
+            matches!(
+                event,
+                AgentEvent::ApprovalRequested { request, .. }
+                    if request.id == ApprovalId("first_approval_req".into())
+            )
+        })
+        .await;
+        controller
+            .send_server_message(generic_user_input_request(
+                "second_server_req",
+                &second.harness_thread_id,
+                &second_native_turn,
+            ))
+            .await;
+        recv_matching_event(&mut second_stream, "second server request", |event| {
+            matches!(
+                event,
+                AgentEvent::ServerRequestReceived { request, .. }
+                    if request.id == ServerRequestId("second_server_req".into())
+            )
+        })
+        .await;
+
+        timeout(Duration::from_secs(1), harness.interrupt(&first))
+            .await
+            .expect("interrupt must be processed while another thread is active")
+            .unwrap();
+
+        let requests = controller.requests().await;
+        assert!(requests.iter().any(|req| {
+            req.method == codex_codes::protocol::methods::TURN_INTERRUPT
+                && req.params["threadId"] == first.harness_thread_id
+                && req.params["turnId"] == first_native_turn
+        }));
+        let responses = controller.responses().await;
+        assert!(responses.iter().any(|response| {
+            response.id == codex_codes::jsonrpc::RequestId::String("first_approval_req".into())
+                && response.value == json!({"decision": "cancel"})
+        }));
+        let response_errors = controller.response_errors().await;
+        assert!(response_errors.iter().any(|error| {
+            error.id == codex_codes::jsonrpc::RequestId::String("first_server_req".into())
+        }));
+        assert!(!response_errors.iter().any(|error| {
+            error.id == codex_codes::jsonrpc::RequestId::String("second_server_req".into())
+        }));
+
+        timeout(
+            Duration::from_secs(1),
+            harness.respond_server_request(
+                ServerRequestId("second_server_req".into()),
+                ServerRequestResponse::result(json!({"still": "routable"})),
+            ),
+        )
+        .await
+        .expect("interrupting one thread must not discard another thread request")
+        .unwrap();
+        let responses = controller.responses().await;
+        assert!(responses.iter().any(|response| {
+            response.id == codex_codes::jsonrpc::RequestId::String("second_server_req".into())
+                && response.value == json!({"still": "routable"})
+        }));
     }
 
     #[test]
