@@ -716,6 +716,17 @@ async fn handle_idle_server_message(
                     }
                     Some(ControlCommand::Interrupt { thread, response }) => {
                         let result = handle_interrupt(client, mapper, &thread).await;
+                        if result.is_ok() {
+                            cancel_waiting_request_after_interrupt(
+                                client,
+                                mapper,
+                                senders,
+                                &waiting_for,
+                            )
+                            .await;
+                            let _ = response.send(result);
+                            return StreamOutcome::TurnEnded;
+                        }
                         let _ = response.send(result);
                     }
                     Some(ControlCommand::TerminateCommand {
@@ -1256,6 +1267,17 @@ async fn stream_turn_events(
                             response,
                         }) => {
                             let result = handle_interrupt(client, mapper, &t).await;
+                            if result.is_ok() {
+                                cancel_waiting_request_after_interrupt(
+                                    client,
+                                    mapper,
+                                    senders,
+                                    &waiting_for,
+                                )
+                                .await;
+                                let _ = response.send(result);
+                                break;
+                            }
                             let _ = response.send(result);
                         }
                         Some(ControlCommand::TerminateCommand {
@@ -1616,6 +1638,51 @@ async fn handle_respond_server_request(
     })
     .await;
     Ok(())
+}
+
+async fn cancel_waiting_request_after_interrupt(
+    client: &mut codex_codes::AsyncClient,
+    mapper: &mut CodexMapper,
+    senders: &SenderMap,
+    waiting_for: &str,
+) {
+    let approval_id = ApprovalId(waiting_for.to_owned());
+    if mapper.has_pending_approval(&approval_id) {
+        if let Err(error) =
+            handle_respond_approval(client, mapper, &approval_id, &ApprovalDecision::Cancel).await
+        {
+            warn!(
+                request_id = waiting_for,
+                %error,
+                "failed to cancel pending approval after interrupt"
+            );
+        }
+        return;
+    }
+
+    let server_request_id = ServerRequestId(waiting_for.to_owned());
+    if mapper.has_pending_server_request(&server_request_id) {
+        let response = ServerRequestResponse::Error {
+            code: -32000,
+            message: "Turn interrupted before this server request was answered.".into(),
+        };
+        if let Err(error) =
+            handle_respond_server_request(client, mapper, senders, &server_request_id, response)
+                .await
+        {
+            warn!(
+                request_id = waiting_for,
+                %error,
+                "failed to reject pending server request after interrupt"
+            );
+        }
+        return;
+    }
+
+    warn!(
+        request_id = waiting_for,
+        "interrupt accepted while waiting for a Codex request that is no longer pending"
+    );
 }
 
 async fn handle_interrupt(

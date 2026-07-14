@@ -120,6 +120,19 @@ impl CodexMapper {
         Some(self.resolve_turn(native_turn_id))
     }
 
+    fn active_turn_for_thread(&mut self, thread: ThreadId) -> Option<TurnId> {
+        let native = self.active_turns.get(&thread).cloned()?;
+        Some(self.resolve_turn(&native))
+    }
+
+    fn explicit_or_active_turn(
+        &mut self,
+        thread: ThreadId,
+        explicit: Option<TurnId>,
+    ) -> Option<TurnId> {
+        explicit.or_else(|| self.active_turn_for_thread(thread))
+    }
+
     pub fn native_turn_for_process(&self, thread: ThreadId, process_id: &str) -> Option<&str> {
         self.running_command_turns
             .get(process_id)
@@ -728,12 +741,15 @@ impl CodexMapper {
                     serde_json::to_value(&params.conversation_id).ok().as_ref(),
                     fallback_thread,
                 )?;
-                let turn = self
-                    .active_turns
-                    .get(&thread)
-                    .cloned()
-                    .map(|native| self.resolve_turn(&native))
-                    .unwrap_or_default();
+                let Some(turn) = self.active_turn_for_thread(thread) else {
+                    warn!(
+                        %thread,
+                        request_id = %req_id,
+                        method = request.method(),
+                        "dropping Codex approval request without an active turn"
+                    );
+                    return None;
+                };
                 let approval_id = ApprovalId(req_id);
                 self.pending_approval_responses.insert(
                     approval_id.clone(),
@@ -767,12 +783,15 @@ impl CodexMapper {
                     serde_json::to_value(&params.conversation_id).ok().as_ref(),
                     fallback_thread,
                 )?;
-                let turn = self
-                    .active_turns
-                    .get(&thread)
-                    .cloned()
-                    .map(|native| self.resolve_turn(&native))
-                    .unwrap_or_default();
+                let Some(turn) = self.active_turn_for_thread(thread) else {
+                    warn!(
+                        %thread,
+                        request_id = %req_id,
+                        method = request.method(),
+                        "dropping Codex approval request without an active turn"
+                    );
+                    return None;
+                };
                 let approval_id = ApprovalId(req_id);
                 self.pending_approval_responses.insert(
                     approval_id.clone(),
@@ -812,14 +831,29 @@ impl CodexMapper {
                 match detect_mcp_tool_approval_from_user_input(params) {
                     Some(detected) => {
                         let (thread, turn) = self.server_request_scope(request, fallback_thread)?;
-                        self.build_mcp_tool_approval_event(
-                            id.clone(),
-                            req_id,
-                            thread,
-                            turn,
-                            detected,
-                            McpToolApprovalTransport::RequestUserInput,
-                        )
+                        if let Some(turn) = self.explicit_or_active_turn(thread, turn) {
+                            self.build_mcp_tool_approval_event(
+                                id.clone(),
+                                req_id,
+                                thread,
+                                turn,
+                                detected,
+                                McpToolApprovalTransport::RequestUserInput,
+                            )
+                        } else {
+                            warn!(
+                                %thread,
+                                request_id = %req_id,
+                                method = request.method(),
+                                "surfacing MCP tool approval as generic server request because no turn id is available"
+                            );
+                            self.map_generic_server_request(
+                                id.clone(),
+                                req_id,
+                                request,
+                                fallback_thread,
+                            )
+                        }
                     }
                     None => self.map_generic_server_request(
                         id.clone(),
@@ -833,14 +867,29 @@ impl CodexMapper {
                 match detect_mcp_tool_approval_from_elicitation(params) {
                     Some(detected) => {
                         let (thread, turn) = self.server_request_scope(request, fallback_thread)?;
-                        self.build_mcp_tool_approval_event(
-                            id.clone(),
-                            req_id,
-                            thread,
-                            turn,
-                            detected,
-                            McpToolApprovalTransport::Elicitation,
-                        )
+                        if let Some(turn) = self.explicit_or_active_turn(thread, turn) {
+                            self.build_mcp_tool_approval_event(
+                                id.clone(),
+                                req_id,
+                                thread,
+                                turn,
+                                detected,
+                                McpToolApprovalTransport::Elicitation,
+                            )
+                        } else {
+                            warn!(
+                                %thread,
+                                request_id = %req_id,
+                                method = request.method(),
+                                "surfacing MCP tool approval as generic server request because no turn id is available"
+                            );
+                            self.map_generic_server_request(
+                                id.clone(),
+                                req_id,
+                                request,
+                                fallback_thread,
+                            )
+                        }
                     }
                     None => self.map_generic_server_request(
                         id.clone(),
@@ -906,6 +955,14 @@ impl CodexMapper {
             .ok_or_else(|| format!("no pending server request for id {id}"))
     }
 
+    pub fn has_pending_approval(&self, id: &ApprovalId) -> bool {
+        self.pending_approval_responses.contains_key(id)
+    }
+
+    pub fn has_pending_server_request(&self, id: &ServerRequestId) -> bool {
+        self.pending_server_requests.contains_key(id)
+    }
+
     pub fn resolve_server_request(&mut self, id: &ServerRequestId) {
         self.pending_server_requests.remove(id);
     }
@@ -919,7 +976,7 @@ impl CodexMapper {
         request_id: RequestId,
         req_id: String,
         thread: ThreadId,
-        turn: Option<TurnId>,
+        turn: TurnId,
         detected: McpToolApprovalDetected,
         transport: McpToolApprovalTransport,
     ) -> Option<AgentEvent> {
@@ -936,7 +993,7 @@ impl CodexMapper {
         );
         Some(AgentEvent::ApprovalRequested {
             thread,
-            turn: turn.unwrap_or_default(),
+            turn,
             request: ApprovalRequest {
                 id: approval_id,
                 kind: ApprovalKind::McpToolCall {
@@ -3222,6 +3279,8 @@ mod tests {
         let workspace = test_workspace("legacy-patch");
         write_test_file(&workspace, "src/main.rs", "fn main() {}\n");
         let mut mapper = CodexMapper::new(workspace);
+        let fallback = ThreadId::new();
+        mapper.register_active_turn(fallback, "legacy-turn");
         let request = CodexServerRequest::ApplyPatchApproval(
             serde_json::from_value(serde_json::json!({
                 "callId": "call1",
@@ -3239,11 +3298,7 @@ mod tests {
             .unwrap(),
         );
         match mapper
-            .map_server_request(
-                &RequestId::String("patch_req".into()),
-                &request,
-                ThreadId::new(),
-            )
+            .map_server_request(&RequestId::String("patch_req".into()), &request, fallback)
             .unwrap()
         {
             AgentEvent::ApprovalRequested { request, .. } => {
@@ -3614,6 +3669,8 @@ mod tests {
         write_test_file(&workspace, "src/lib.rs", "pub fn lib() {}\n");
         let cwd_string = workspace.to_string_lossy().to_string();
         let mut mapper = CodexMapper::new(workspace);
+        let fallback = ThreadId::new();
+        mapper.register_active_turn(fallback, "legacy-turn");
         let request = CodexServerRequest::ExecCommandApproval(
             serde_json::from_value(serde_json::json!({
                 "callId": "call1",
@@ -3633,11 +3690,7 @@ mod tests {
         );
 
         match mapper
-            .map_server_request(
-                &RequestId::String("legacy_cmd".into()),
-                &request,
-                ThreadId::new(),
-            )
+            .map_server_request(&RequestId::String("legacy_cmd".into()), &request, fallback)
             .unwrap()
         {
             AgentEvent::ApprovalRequested { request, .. } => match request.kind {
@@ -3669,6 +3722,31 @@ mod tests {
                 panic!("legacy review decisions should use result payloads")
             }
         }
+    }
+
+    #[test]
+    fn legacy_approval_without_active_turn_is_not_mapped() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let request = CodexServerRequest::ExecCommandApproval(
+            serde_json::from_value(serde_json::json!({
+                "callId": "call1",
+                "conversationId": "thread1",
+                "command": ["cargo", "test"],
+                "cwd": "/tmp/project",
+                "parsedCmd": []
+            }))
+            .unwrap(),
+        );
+
+        assert!(
+            mapper
+                .map_server_request(
+                    &RequestId::String("legacy_cmd".into()),
+                    &request,
+                    ThreadId::new(),
+                )
+                .is_none()
+        );
     }
 
     #[test]
@@ -4358,6 +4436,80 @@ mod tests {
     }
 
     #[test]
+    fn mcp_tool_approval_without_turn_uses_active_turn() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let fallback = ThreadId::new();
+        let active_turn = mapper
+            .register_active_turn(fallback, "active-turn")
+            .expect("active turn");
+        let request = CodexServerRequest::ToolRequestUserInput(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "",
+                "turnId": "",
+                "itemId": "i1",
+                "questions": [{
+                    "id": "mcp_tool_call_approval_call_1",
+                    "header": "Approve app tool call?",
+                    "question": "Allow cf-mcp to run tool \"wiki_search\"?",
+                    "options": [
+                        { "label": "Allow", "description": "" },
+                        { "label": "Allow for this session", "description": "" },
+                        { "label": "Cancel", "description": "" }
+                    ]
+                }]
+            }))
+            .unwrap(),
+        );
+
+        match mapper
+            .map_server_request(&RequestId::Integer(11), &request, fallback)
+            .unwrap()
+        {
+            AgentEvent::ApprovalRequested { turn, request, .. } => {
+                assert_eq!(turn, active_turn);
+                assert_eq!(request.id, ApprovalId("11".into()));
+            }
+            other => panic!("expected ApprovalRequested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_tool_approval_without_turn_or_active_turn_stays_generic() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let fallback = ThreadId::new();
+        let request = CodexServerRequest::ToolRequestUserInput(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "",
+                "turnId": "",
+                "itemId": "i1",
+                "questions": [{
+                    "id": "mcp_tool_call_approval_call_1",
+                    "header": "Approve app tool call?",
+                    "question": "Allow cf-mcp to run tool \"wiki_search\"?",
+                    "options": [
+                        { "label": "Allow", "description": "" },
+                        { "label": "Allow for this session", "description": "" },
+                        { "label": "Cancel", "description": "" }
+                    ]
+                }]
+            }))
+            .unwrap(),
+        );
+
+        match mapper
+            .map_server_request(&RequestId::Integer(12), &request, fallback)
+            .unwrap()
+        {
+            AgentEvent::ServerRequestReceived { turn, request, .. } => {
+                assert!(turn.is_none());
+                assert_eq!(request.id, ServerRequestId("12".into()));
+                assert_eq!(request.method, "item/tool/requestUserInput");
+            }
+            other => panic!("expected ServerRequestReceived, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn non_mcp_request_user_input_stays_generic_server_request() {
         let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
         let fallback = ThreadId::new();
@@ -4422,6 +4574,39 @@ mod tests {
                         .available
                         .contains(&ApprovalDecision::AcceptForSession)
                 );
+            }
+            other => panic!("expected ApprovalRequested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_elicitation_approval_without_turn_uses_active_turn() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let fallback = ThreadId::new();
+        let active_turn = mapper
+            .register_active_turn(fallback, "active-turn")
+            .expect("active turn");
+        let request = CodexServerRequest::McpServerElicitationRequest(
+            serde_json::from_value(serde_json::json!({
+                "mode": "form",
+                "_meta": {
+                    "codex_approval_kind": "mcp_tool_call",
+                    "persist": "session",
+                    "tool_name": "wiki_search"
+                },
+                "message": "Allow cf-mcp to run tool \"wiki_search\"?",
+                "requestedSchema": { "type": "object", "properties": {} }
+            }))
+            .unwrap(),
+        );
+
+        match mapper
+            .map_server_request(&RequestId::String("mcp-active".into()), &request, fallback)
+            .unwrap()
+        {
+            AgentEvent::ApprovalRequested { turn, request, .. } => {
+                assert_eq!(turn, active_turn);
+                assert_eq!(request.id, ApprovalId("mcp-active".into()));
             }
             other => panic!("expected ApprovalRequested, got {other:?}"),
         }

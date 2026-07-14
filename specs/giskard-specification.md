@@ -8,7 +8,23 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.42
+**Version:** 1.43
+
+**Changelog (1.42 → 1.43), turnless MCP/server-request hardening:**
+- **M3:** MCP tool-call approval promotion no longer invents a `TurnId` when Codex omits
+  `turnId`. Promotion uses the explicit native turn when present, otherwise the currently active
+  turn for the thread; if neither exists, the request remains visible as a generic
+  `ServerRequestReceived` card instead of becoming a fake-turn approval. Older Codex approval
+  methods with no active turn are rejected through the unroutable-request path and logged.
+- **SR5:** Turnless `ServerRequestReceived` events are registered for response routing and
+  broadcast even if they arrive before the forwarder has seen `TurnStarted`. This preserves the
+  browser prompt for MCP elicitations whose `turnId` is nullable while keeping them out of turn
+  persistence until a real turn is owned.
+- **INT3:** Interrupting a live turn while the Codex adapter is blocked on an approval/server-request
+  response must not leave the adapter waiting for that original response. After a successful
+  `turn/interrupt`, the adapter best-effort cancels/rejects the pending JSON-RPC request, logs any
+  cleanup failure, and resumes draining Codex messages so `turn/completed` can release the active
+  turn.
 
 **Changelog (1.41 → 1.42), orphaned-thread recovery — read-only open + verified provider switch:**
 - **RO2:** RO1's read-only degrade now also applies to `POST /api/projects/{id}/threads` for an
@@ -1970,6 +1986,19 @@ attestation, and future method names. These use `AgentEvent::ServerRequestReceiv
 sends `respond_server_request`. Giskard may provide first-class UI for known methods, but unknown
 methods must still be visible and answerable; silent best-effort rejection is not a valid normal
 path.
+
+Some Codex server requests can legitimately omit `turnId` (notably MCP elicitations, where the
+JSON-RPC request id is the protocol identity and turn correlation is best-effort). Giskard must not
+mint a synthetic `TurnId` to force these into an approval card. When a first-class approval card
+requires a turn, the adapter may use the thread's active native turn if one is already registered;
+otherwise it must surface the request as a generic pending server request or reject it with a logged
+unroutable-request error rather than creating fake turn ownership.
+
+If the user interrupts a turn while the harness adapter is waiting for an approval or generic server
+request response, the adapter must keep the turn stoppable: send the harness interrupt, best-effort
+cancel/reject the pending request, and resume draining harness messages. Waiting forever for the
+original approval response after an accepted interrupt is a correctness bug because it leaves the UI
+in an active turn with no remaining user action that can complete it.
 
 **Decision granularity** (mirrors Codex):
 - `accept` (this once), `accept_for_session` (don't ask again this session for this kind),
