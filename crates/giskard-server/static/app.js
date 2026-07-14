@@ -5,6 +5,7 @@ const WS_RECONNECT_BASE_MS = 600;
 const WS_RECONNECT_MAX_MS = 8000;
 const WS_PROBLEM_NOTICE_INTERVAL_MS = 30000;
 const WS_BACKGROUND_CLOSE_GRACE_MS = 10000;
+const TRANSCRIPT_BOTTOM_STICKY_PX = 96;
 let state = {
   projectId:null, threadId:null, mode:"build", ws:null, wsStatus:"closed", wsConnectId:0,
   wsReconnectTimer:null, wsReconnectAttempt:0, wsStatusDetail:"WebSocket disconnected",
@@ -1697,14 +1698,35 @@ function safeHttpUrl(value) {
 // Where new bubbles are appended: the live transcript, or a detached container when rendering an
 // older history page for prepending (infinite scroll).
 function renderTarget() { return state.renderTarget || $("transcript"); }
+function transcriptShouldStickToBottom() {
+  if (state.renderTarget) return false;
+  const t = $("transcript");
+  return t ? (t.scrollHeight - t.scrollTop - t.clientHeight) <= TRANSCRIPT_BOTTOM_STICKY_PX : false;
+}
+function scrollTranscriptToBottom() {
+  if (state.renderTarget) return;
+  const t = $("transcript");
+  if (t) t.scrollTop = t.scrollHeight;
+}
+function keepTranscriptAtBottom(shouldStick) {
+  if (!shouldStick || state.renderTarget) return;
+  scrollTranscriptToBottom();
+  requestAnimationFrame(scrollTranscriptToBottom);
+}
+function keepTranscriptRowAnchored(el) {
+  const msg = el && el.closest ? el.closest(".msg") : null;
+  keepTranscriptAtBottom(!!(msg && msg.dataset.followBottom === "true"));
+}
 function appendBubble(cls, role) {
+  const followBottom = transcriptShouldStickToBottom();
   const el = document.createElement("div"); el.className="msg "+cls;
   const r = document.createElement("div"); r.className="role"; r.textContent=role;
   const body = document.createElement("div"); body.className="body";
   el.append(r, body);
+  if (followBottom) el.dataset.followBottom = "true";
   const t = renderTarget();
   t.append(el);
-  if (!state.renderTarget) t.scrollTop = t.scrollHeight;
+  keepTranscriptAtBottom(followBottom);
   return body;
 }
 function bubble(cls, role) {
@@ -2951,6 +2973,7 @@ function renderMarkdown(el, text) {
     el.classList.add("md");
     wirePathLinks(el);
     wireCodeCopy(el);
+    keepTranscriptRowAnchored(el);
   };
 
   if (state.markdownCache.has(cacheKey)) {
@@ -3044,6 +3067,7 @@ function renderLinkedText(el, text) {
   const apply = (links) => {
     if (!el.isConnected || projectId !== state.projectId) return;
     applyLinkedText(el, text, links || []);
+    keepTranscriptRowAnchored(el);
   };
 
   if (state.linkifyCache.has(cacheKey)) {
