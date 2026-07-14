@@ -8,7 +8,22 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.40
+**Version:** 1.41
+
+**Changelog (1.40 → 1.41), MCP tool-call approval promotion:**
+- **M1:** Codex surfaces MCP tool-call approvals as generic `ToolRequestUserInput` or
+  `McpServerElicitationRequest` server requests rather than first-class approval requests.
+  When the `codex_approval_kind: "mcp_tool_call"` marker is present (elicitation) or the
+  question header is `"Approve app tool call?"` (requestUserInput), Giskard now promotes the
+  request to a first-class `ApprovalRequested` event with `ApprovalKind::McpToolCall { server,
+  tool_name }`. The user gets the same Accept / Accept-for-session / Decline / Cancel card as
+  command and file approvals, and `AcceptForSession` is only offered when Codex advertised it.
+  Non-MCP-tool requests fall through to the generic server-request path unchanged.
+- **M2:** The approval response is built in the wire shape Codex expects for each transport:
+  `requestUserInput` gets an answer map keyed by question id with the chosen option label
+  (`"Allow"` / `"Allow for this session"` / `"Cancel"`); `elicitation` gets
+  `{action: "accept", _meta: {persist: "session"}}` for session-scoped approval. Codex reads
+  these to apply the session-remembered grant for the tool.
 
 **Changelog (1.39 → 1.40), orphaned-thread read-only viewing:**
 - **RO1:** Subscribing to a thread whose harness cannot attach — most commonly because its
@@ -337,8 +352,10 @@
 **Changelog (1.14 → 1.15), pending Codex server requests:**
 - **SR1:** Codex `ServerRequest`s are no longer rejected as the normal unsupported path.
   Command, file, permissions, `execCommandApproval`, and `applyPatchApproval` requests are mapped
-  to first-class approvals; all other request methods are surfaced as pending transcript cards and
-  wait for an explicit browser response.
+  to first-class approvals; MCP tool-call approvals (surfaced as `ToolRequestUserInput` or
+  `McpServerElicitationRequest` carrying the `codex_approval_kind: "mcp_tool_call"` marker) are
+  likewise promoted to first-class `McpToolCall` approval cards (M1). All other request methods
+  are surfaced as pending transcript cards and wait for an explicit browser response.
 - **SR2:** The neutral harness contract includes `respond_server_request`, and the browser sends
   `ServerRequestResponse { result | error }` for non-approval server requests. The Codex adapter
   preserves the original JSON-RPC request id (integer or string) when sending the response.
@@ -1920,7 +1937,8 @@ path.
 **Decision granularity** (mirrors Codex):
 - `accept` (this once), `accept_for_session` (don't ask again this session for this kind),
   `decline`, `cancel`. For command exec, an optional "accept with amended exec policy" may be
-  offered if the harness provides it.
+  offered if the harness provides it. For MCP tool calls, `accept_for_session` is only offered
+  when the harness advertises it (Codex gates it on the tool's approval mode).
 
 #### 9.2.1 Definition of "session" for `accept_for_session`
 

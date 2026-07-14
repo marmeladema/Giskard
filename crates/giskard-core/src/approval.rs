@@ -32,6 +32,16 @@ pub enum ApprovalKind {
     Permission {
         detail: String,
     },
+    /// An MCP tool call that the agent wants to execute (spec §9.2).
+    ///
+    /// Surfaced by Codex as a `ToolRequestUserInput` or `McpServerElicitationRequest`
+    /// carrying the `codex_approval_kind: "mcp_tool_call"` marker. Giskard promotes
+    /// these to first-class approval cards so the user can approve once, for the
+    /// session, or decline — mirroring the command/file approval flow.
+    McpToolCall {
+        server: String,
+        tool_name: String,
+    },
 }
 
 /// Structured, card-facing metadata for approval prompts.
@@ -116,5 +126,31 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let back: ApprovalRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
+    }
+
+    #[test]
+    fn mcp_tool_call_approval_roundtrip() {
+        let req = ApprovalRequest {
+            id: ApprovalId("ap_mcp_1".into()),
+            kind: ApprovalKind::McpToolCall {
+                server: "brave-search".into(),
+                tool_name: "brave_web_search".into(),
+            },
+            reason: Some(r#"Allow brave-search to run tool "brave_web_search"?"#.into()),
+            metadata: vec![],
+            available: vec![
+                ApprovalDecision::Accept,
+                ApprovalDecision::AcceptForSession,
+                ApprovalDecision::Decline,
+                ApprovalDecision::Cancel,
+            ],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: ApprovalRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+        // The wire tag is snake_case.
+        assert!(json.contains(r#""kind":"mcp_tool_call""#));
+        assert!(json.contains(r#""server":"brave-search""#));
+        assert!(json.contains(r#""tool_name":"brave_web_search""#));
     }
 }
