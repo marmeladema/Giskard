@@ -964,6 +964,12 @@ async fn index_page_is_served_and_public() {
         "UI renders completed agent/reasoning text as Markdown through the server"
     );
     assert!(
+        body.contains(
+            "p.kind===\"agent_message\" || p.kind===\"reasoning\" || p.kind===\"user_message\""
+        ) && !body.contains("if (p.kind===\"user_message\") body.textContent"),
+        "user messages render as Markdown like agent text, not as plain text"
+    );
+    assert!(
         body.contains("/render`, { text }"),
         "UI requests server-rendered Markdown for agent text"
     );
