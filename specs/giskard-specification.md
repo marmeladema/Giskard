@@ -8,7 +8,15 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.44
+**Version:** 1.45
+
+**Changelog (1.44 → 1.45), transcript sticky-scroll after expanded cards:**
+- **SC1:** Live transcript auto-scroll captures whether the user was already near the bottom before
+  appending a new row. If so, the browser keeps the row anchored after synchronous card population
+  and after asynchronous Markdown rendering or path linkification. Approval cards, generic server
+  request cards, and completed transcript rows must remain visible when they arrive at the bottom;
+  history prepends still preserve scroll position, and user-scrolled-up transcript views are not
+  pulled to the bottom by unrelated live updates.
 
 **Changelog (1.43 → 1.44), same-project turn concurrency:**
 - **CT1:** A project-scoped Codex harness worker is an event pump, not a single-turn drain loop.

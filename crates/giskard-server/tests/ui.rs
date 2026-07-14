@@ -1160,6 +1160,61 @@ fn browser_marks_turn_active_when_send_is_accepted() {
 }
 
 #[test]
+fn browser_keeps_appended_transcript_rows_anchored_to_bottom() {
+    let body = app_js();
+    assert!(
+        body.contains("const TRANSCRIPT_BOTTOM_STICKY_PX = 96;"),
+        "UI defines a bottom-stickiness threshold for transcript rows"
+    );
+    assert!(
+        body.contains("function transcriptShouldStickToBottom()")
+            && body.contains("function keepTranscriptAtBottom(shouldStick)")
+            && body.contains("requestAnimationFrame(scrollTranscriptToBottom)")
+            && body.contains("function keepTranscriptRowAnchored(el)"),
+        "UI has shared sticky-scroll helpers for expanded transcript rows"
+    );
+
+    let append = between(
+        body,
+        "function appendBubble(cls, role) {",
+        "function bubble(cls, role)",
+    );
+    assert_order(
+        append,
+        "const followBottom = transcriptShouldStickToBottom();",
+        "t.append(el);",
+    );
+    assert_order(
+        append,
+        "t.append(el);",
+        "keepTranscriptAtBottom(followBottom);",
+    );
+    assert!(
+        append.contains("if (followBottom) el.dataset.followBottom = \"true\";"),
+        "new rows remember whether they should stay anchored after content expands"
+    );
+
+    let markdown = between(
+        body,
+        "function renderMarkdown(el, text) {",
+        "// Wire the server-emitted",
+    );
+    assert!(
+        markdown.contains("keepTranscriptRowAnchored(el);"),
+        "async markdown rendering keeps newly appended rows visible"
+    );
+    let linkify = between(
+        body,
+        "function renderLinkedText(el, text) {",
+        "function applyLinkedText",
+    );
+    assert!(
+        linkify.contains("keepTranscriptRowAnchored(el);"),
+        "async path linkification keeps newly appended rows visible"
+    );
+}
+
+#[test]
 fn browser_websocket_lifecycle_errors_are_not_toasted_directly() {
     let body = app_js();
 
