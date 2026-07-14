@@ -413,7 +413,12 @@ async fn open_thread(
             }));
         }
 
-        let handle = state
+        // Opening an existing thread must not hard-fail when the harness can't attach — most
+        // often because the thread's provider was removed from config. The browser opens a
+        // thread through this endpoint *before* subscribing over the WebSocket, so a 500 here
+        // would make the whole thread unviewable. Degrade to a read-only open instead: the
+        // client proceeds to subscribe and the persisted history loads; only new turns fail.
+        let handle = match state
             .registry
             .open_thread(
                 &project_config,
@@ -423,7 +428,36 @@ async fn open_thread(
                 current_model.clone(),
             )
             .await
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                warn!(
+                    %project_id,
+                    %thread_id,
+                    harness_thread_id = %thread_file.harness_thread_id,
+                    %error,
+                    action = "open_thread",
+                    "harness attach failed; opening thread read-only"
+                );
+                let context = ReadOnlyProviderContext {
+                    provider: current_model.provider.clone(),
+                    configured: app_config
+                        .providers
+                        .iter()
+                        .any(|p| p.id == current_model.provider),
+                };
+                return Ok(Json(OpenThreadResponse {
+                    thread_id,
+                    harness_thread_id: thread_file.harness_thread_id,
+                    warning: Some(read_only_info(
+                        Some(&context),
+                        Some(error.to_string()),
+                        thread_id,
+                        "open_thread",
+                    )),
+                }));
+            }
+        };
 
         if handle.thread != thread_id {
             return Err(ApiError::Internal(format!(
@@ -1580,7 +1614,7 @@ async fn handle_client_msg(
                     );
                     (
                         project_id,
-                        Some(read_only_warning(&attach_error, thread_id)),
+                        Some(read_only_warning(state, project_id, &attach_error, thread_id).await),
                     )
                 }
             };
@@ -1762,21 +1796,64 @@ async fn handle_client_msg(
             thread_id,
             model_ref,
         } => {
-            let project_id = project_for(state, thread_id, "select_model").await?;
+            // Resolve the project without forcing a harness attach: model selection must work on
+            // a *cold* thread too — that is exactly how an orphaned thread (provider removed from
+            // config) gets rescued.
+            let project_id = project_for_readonly(state, thread_id, "select_model").await?;
             let config = state
                 .store
                 .load_config()
                 .await
                 .map_err(|e| WsError::from_persist(e, "select_model", Some(thread_id)))?;
             let model_ref = crate::models::normalize_model_ref(&config, &model_ref);
-            ensure_provider_change_allowed(
-                state,
-                project_id,
-                thread_id,
-                &model_ref,
-                "select_model",
-            )
-            .await?;
+
+            if state
+                .registry
+                .get_thread_native_model(thread_id)
+                .await
+                .is_some()
+            {
+                // Warm thread: the provider is bound to the loaded Codex session (PB2) —
+                // cross-provider changes stay rejected because a loaded thread can silently
+                // ignore resume overrides.
+                ensure_provider_change_allowed(
+                    state,
+                    project_id,
+                    thread_id,
+                    &model_ref,
+                    "select_model",
+                )
+                .await?;
+            } else {
+                // Cold thread (not loaded in this server process): a cross-provider switch is
+                // reliable via a *verified* cold re-resume — Codex applies `thread/resume`
+                // model/provider overrides when the thread is not loaded, and we confirm the
+                // response before persisting anything (spec PS1). Same-provider selections need
+                // no attach: persisting is enough, the next open resumes with the new model.
+                let stored_provider = state
+                    .store
+                    .load_thread(project_id, thread_id)
+                    .await
+                    .map_err(|e| WsError::from_persist(e, "select_model", Some(thread_id)))?
+                    .ok_or_else(|| {
+                        WsError::new(
+                            "thread_not_found",
+                            ErrorSeverity::Error,
+                            "Thread not found.",
+                        )
+                        .thread(thread_id)
+                        .action("select_model")
+                    })?
+                    .current_model
+                    .provider;
+                if stored_provider != model_ref.provider {
+                    if let Some(warning) =
+                        switch_provider_cold(state, project_id, thread_id, &model_ref).await?
+                    {
+                        let _ = tx.send(ServerMessage::Error { error: warning }).await;
+                    }
+                }
+            }
 
             // All model/effort resolution happens inside the RMW closure so it sees the
             // authoritative current model under the per-thread lock (§5.4, C7 effort retention).
@@ -2199,25 +2276,218 @@ async fn project_for_readonly(
     }
 }
 
+/// The thread's provider id plus whether it is still declared in config — the context that lets
+/// the read-only message name the culprit precisely instead of hedging.
+struct ReadOnlyProviderContext {
+    provider: String,
+    configured: bool,
+}
+
+/// Best-effort provider context for a read-only warning; `None` when persistence can't be read
+/// (the warning then falls back to generic wording rather than failing the whole degrade path).
+async fn read_only_provider_context(
+    state: &AppState,
+    project_id: ProjectId,
+    thread_id: ThreadId,
+) -> Option<ReadOnlyProviderContext> {
+    let provider = state
+        .store
+        .load_thread(project_id, thread_id)
+        .await
+        .ok()??
+        .current_model
+        .provider;
+    let configured = state
+        .store
+        .load_config()
+        .await
+        .map(|config| config.providers.iter().any(|p| p.id == provider))
+        .unwrap_or(true); // Unknown config ⇒ don't claim the provider is missing.
+    Some(ReadOnlyProviderContext {
+        provider,
+        configured,
+    })
+}
+
 /// Build the non-fatal warning shown when a thread loads read-only because its harness could not
-/// attach (typically its provider was removed from config): history is viewable, new turns are not.
-fn read_only_warning(attach_error: &WsError, thread_id: ThreadId) -> ErrorInfo {
+/// attach: history stays viewable and the model picker is unlocked so the user can reactivate the
+/// thread under a configured provider (PS1). Shared by the HTTP `open_thread` handler and the
+/// WebSocket subscribe path so both surface the same `thread_read_only` code. The wording is
+/// action-first and only claims the provider is missing when config verifiably lacks it — attach
+/// failures can also be auth or spawn problems.
+fn read_only_info(
+    context: Option<&ReadOnlyProviderContext>,
+    detail: Option<String>,
+    thread_id: ThreadId,
+    action: &str,
+) -> ErrorInfo {
+    let message = match context {
+        Some(ctx) if !ctx.configured => format!(
+            "Read-only: provider \"{}\" is no longer configured, so this thread's agent could \
+             not be started. Pick a model from a configured provider to reactivate the thread.",
+            ctx.provider
+        ),
+        Some(ctx) => format!(
+            "Read-only: this thread's agent (provider \"{}\") could not be started. Pick a model \
+             from a configured provider to reactivate the thread.",
+            ctx.provider
+        ),
+        None => "Read-only: this thread's agent could not be started. Pick a model from a \
+                 configured provider to reactivate the thread."
+            .into(),
+    };
     ErrorInfo {
         code: "thread_read_only".into(),
         severity: ErrorSeverity::Warning,
-        message:
-            "This thread is read-only — its agent could not be started (its provider may have \
-             been removed from config). You can read the history but not send new messages."
-                .into(),
-        detail: attach_error
-            .info
-            .detail
-            .clone()
-            .or_else(|| Some(attach_error.info.message.clone())),
+        message,
+        detail,
         thread_id: Some(thread_id),
-        action: Some("subscribe".into()),
+        action: Some(action.to_string()),
         process_id: None,
     }
+}
+
+async fn read_only_warning(
+    state: &AppState,
+    project_id: ProjectId,
+    attach_error: &WsError,
+    thread_id: ThreadId,
+) -> ErrorInfo {
+    let context = read_only_provider_context(state, project_id, thread_id).await;
+    let detail = attach_error
+        .info
+        .detail
+        .clone()
+        .or_else(|| Some(attach_error.info.message.clone()));
+    read_only_info(context.as_ref(), detail, thread_id, "subscribe")
+}
+
+/// Switch a **cold** thread to a different provider via a verified native re-resume (spec PS1).
+///
+/// Calls `thread/resume` with the requested model/provider and requires the harness to confirm
+/// them as effective before the caller persists anything: Codex answers JSON-RPC success even
+/// when it ignores resume overrides (loaded-thread rejoin), so success alone proves nothing. On
+/// an unconfirmed switch the fresh registry binding is dropped again and a structured
+/// `thread_provider_switch_ignored` error is returned, leaving persisted state untouched.
+///
+/// Returns the harness's non-fatal open warning (e.g. `codex_resume_failed` when Codex lost the
+/// native context and started a fresh session under the new provider) for the caller to forward.
+async fn switch_provider_cold(
+    state: &AppState,
+    project_id: ProjectId,
+    thread_id: ThreadId,
+    requested: &ModelRef,
+) -> Result<Option<ErrorInfo>, WsError> {
+    let project_config = state
+        .store
+        .load_project(project_id)
+        .await
+        .map_err(|e| WsError::from_persist(e, "select_model", Some(thread_id)))?
+        .ok_or_else(|| {
+            WsError::new(
+                "project_not_found",
+                ErrorSeverity::Error,
+                "Project not found.",
+            )
+            .thread(thread_id)
+            .action("select_model")
+        })?;
+    let thread_file = state
+        .store
+        .load_thread(project_id, thread_id)
+        .await
+        .map_err(|e| WsError::from_persist(e, "select_model", Some(thread_id)))?
+        .ok_or_else(|| {
+            WsError::new(
+                "thread_not_found",
+                ErrorSeverity::Error,
+                "Thread not found.",
+            )
+            .thread(thread_id)
+            .action("select_model")
+        })?;
+    let ws_root = project_config
+        .workspace_root
+        .as_deref()
+        .unwrap_or(&project_config.dir);
+
+    info!(
+        %project_id,
+        %thread_id,
+        harness_thread_id = %thread_file.harness_thread_id,
+        from_provider = %thread_file.current_model.provider,
+        to_provider = %requested.provider,
+        to_model = %requested.model,
+        "attempting verified cold-resume provider switch"
+    );
+
+    let handle = state
+        .registry
+        .open_thread(
+            &project_config,
+            ws_root,
+            Some(thread_id),
+            Some(thread_file.harness_thread_id.clone()),
+            requested.clone(),
+        )
+        .await
+        .map_err(|e| WsError::from_harness(e, "select_model", Some(thread_id)))?;
+
+    let confirmed = handle.resumed_model.as_ref().is_some_and(|effective| {
+        effective.provider == requested.provider && effective.model == requested.model
+    });
+    if !confirmed {
+        // Unwind: drop the just-created binding so the thread returns to cold instead of staying
+        // bound under an unverified model.
+        state.registry.forget_thread(thread_id).await;
+        let effective = handle
+            .resumed_model
+            .as_ref()
+            .map(|m| format!("{}/{}", m.provider, m.model))
+            .unwrap_or_else(|| "unreported".into());
+        warn!(
+            %project_id,
+            %thread_id,
+            requested = %format!("{}/{}", requested.provider, requested.model),
+            %effective,
+            "harness did not confirm provider switch; keeping old binding"
+        );
+        return Err(WsError::new(
+            "thread_provider_switch_ignored",
+            ErrorSeverity::Error,
+            "The agent did not apply the provider switch. Retry after restarting the server, or \
+             create a new thread with the selected provider.",
+        )
+        .detail(format!(
+            "requested {}/{}, harness reported {effective}",
+            requested.provider, requested.model
+        ))
+        .thread(thread_id)
+        .action("select_model"));
+    }
+
+    // The C5 fallback (native context lost ⇒ fresh Codex session) yields a new native id; keep
+    // the persisted mapping in sync exactly like the normal open path does.
+    if handle.harness_thread_id != thread_file.harness_thread_id {
+        state
+            .store
+            .update_thread(project_id, thread_id, |tf| {
+                tf.harness_thread_id = handle.harness_thread_id.clone();
+                tf.updated_at = Utc::now();
+            })
+            .await
+            .map_err(|e| WsError::from_persist(e, "select_model", Some(thread_id)))?;
+    }
+
+    Ok(handle.warning.as_ref().map(|warning| {
+        warning_info(
+            warning.code.clone(),
+            warning.message.clone(),
+            warning.detail.clone(),
+            thread_id,
+            "select_model",
+        )
+    }))
 }
 
 async fn ensure_provider_change_allowed(

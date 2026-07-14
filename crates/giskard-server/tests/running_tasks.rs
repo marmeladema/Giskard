@@ -67,6 +67,7 @@ impl AgentHarness for ToolHarness {
             thread: opts.thread.unwrap_or_default(),
             harness_thread_id: opts.resume.unwrap_or_else(|| "tool_harness".into()),
             warning: None,
+            resumed_model: Some(opts.initial_model.clone()),
         })
     }
 

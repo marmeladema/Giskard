@@ -93,6 +93,7 @@ impl AgentHarness for ServerRequestHarness {
                 .resume
                 .unwrap_or_else(|| "server_request_harness".into()),
             warning: None,
+            resumed_model: Some(opts.initial_model.clone()),
         })
     }
 

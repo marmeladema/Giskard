@@ -299,6 +299,7 @@
   .notice { margin:0; padding:8px 10px; border-radius:8px; border:1px solid var(--border); background:var(--panel); box-shadow:0 4px 16px rgba(0,0,0,.35); font-size:13px; pointer-events:auto; }
   .notice.err { border-color:#f85149; color:#ffb4ae; }
   .notice.warn { border-color:#d29922; color:#f0d98c; }
+  .readonly-banner { margin:0 12px 6px; padding:8px 12px; border-radius:8px; border:1px solid #d29922; background:#241d10; color:#f0d98c; font-size:13px; }
   h3.sec { margin:16px 0 8px; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
   .row { display:flex; gap:6px; margin:6px 0; }
   .kv { font-size:13px; margin:4px 0; }

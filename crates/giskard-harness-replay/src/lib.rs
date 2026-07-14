@@ -200,6 +200,9 @@ impl AgentHarness for ReplayHarness {
             thread: thread_id,
             harness_thread_id,
             warning: None,
+            // A deterministic replay applies exactly the requested model, so echo it as
+            // effective — this is what lets server tests exercise verified provider switches.
+            resumed_model: Some(opts.initial_model.clone()),
         })
     }
 

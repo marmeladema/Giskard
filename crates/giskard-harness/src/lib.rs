@@ -63,6 +63,13 @@ pub struct ThreadHandle {
     pub thread: ThreadId,
     pub harness_thread_id: String,
     pub warning: Option<HarnessNotice>,
+    /// The model/provider the harness reports as *effective* for the opened thread, when the
+    /// native protocol exposes it (Codex `thread/resume` echoes `model`/`modelProvider`). Callers
+    /// switching a thread's provider must verify this against what they requested: Codex can
+    /// intentionally ignore resume overrides for already-loaded threads while still answering
+    /// success (see `specs/model-provider-switching-analysis.md`). `None` ⇒ the harness gave no
+    /// signal and the requested model must be assumed.
+    pub resumed_model: Option<ModelRef>,
 }
 
 #[derive(Debug, Clone)]

@@ -221,6 +221,7 @@ impl AgentHarness for UnsupportedCompactionHarness {
             thread,
             harness_thread_id: opts.resume.unwrap_or_else(|| format!("test_{thread}")),
             warning: None,
+            resumed_model: Some(opts.initial_model.clone()),
         })
     }
 
@@ -307,6 +308,7 @@ impl AgentHarness for SlowCompactionHarness {
             thread,
             harness_thread_id: opts.resume.unwrap_or_else(|| format!("test_{thread}")),
             warning: None,
+            resumed_model: Some(opts.initial_model.clone()),
         })
     }
 
@@ -460,6 +462,7 @@ impl AgentHarness for SlowStartHarness {
             thread,
             harness_thread_id: opts.resume.unwrap_or_else(|| format!("test_{thread}")),
             warning: None,
+            resumed_model: Some(opts.initial_model.clone()),
         })
     }
 
@@ -590,6 +593,7 @@ impl AgentHarness for CountingOpenHarness {
                 .resume
                 .unwrap_or_else(|| format!("count_{thread}_{open_call}")),
             warning: None,
+            resumed_model: Some(opts.initial_model.clone()),
         })
     }
 
