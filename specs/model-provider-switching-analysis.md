@@ -235,12 +235,16 @@ Codex-harness unit tests should cover response validation:
 
 ## Current Patch
 
-The current Giskard patch is intentionally conservative for already-native-backed threads:
+Spec v1.42 (PS1–PS3) implements the verified re-resume for the **cold** case:
 
-- It fixes first-message provider failures by delaying native Codex thread creation until the first
-  message carries the selected provider/model.
-- It rejects provider changes on already-native-backed threads instead of assuming `thread/resume`
-  will apply the override.
+- First-message provider failures remain fixed by delaying native Codex thread creation until the
+  first message carries the selected provider/model.
+- Provider changes on **loaded** (warm) threads are still rejected (`thread_provider_locked`),
+  because a loaded thread can silently ignore `thread/resume` overrides.
+- Provider changes on **cold** threads (not loaded this server run — restarts, or orphaned
+  threads whose provider left the config) perform a verified `thread/resume` with the requested
+  `modelProvider`: the response's effective model/provider must match the request before anything
+  is persisted, otherwise the switch fails with `thread_provider_switch_ignored` and the old
+  binding/state is preserved.
 
-Based on the Codex source analysis above, that conservative rejection can likely be relaxed for
-non-empty threads by implementing verified re-resume.
+The remaining unimplemented piece is the already-loaded idle case (unload/reopen flow).

@@ -302,6 +302,26 @@ async fn index_page_is_served_and_public() {
         "provider-bound threads gray out models from other providers"
     );
     assert!(
+        body.contains("if (state.threadReadOnly) return false;"),
+        "read-only threads unlock the picker so a replacement provider can be selected"
+    );
+    assert!(
+        body.contains("state.threadReadOnly = true;") && body.contains("thread_read_only"),
+        "the thread_read_only warning marks the thread read-only in client state"
+    );
+    assert!(
+        body.contains("Thread resumed under provider"),
+        "a confirmed provider switch clears the read-only state and announces the new provider"
+    );
+    assert!(
+        body.contains("id=\"readOnlyBanner\"") && body.contains("function updateReadOnlyBanner"),
+        "read-only threads show a persistent banner instead of only a transient toast"
+    );
+    assert!(
+        body.contains("Read-only thread — pick a model above to reactivate it."),
+        "the composer is disabled with an actionable placeholder on read-only threads"
+    );
+    assert!(
         body.contains("state.pendingModelBeforeSelect")
             && body.contains("if (msg.action===\"select_model\")")
             && body.contains("state.currentModel = state.pendingModelBeforeSelect"),
@@ -709,10 +729,12 @@ async fn index_page_is_served_and_public() {
         "UI exposes WS reconnecting state"
     );
     assert!(
-        body.contains("$(\"sendBtn\").disabled = state.activeTurn || (!ready && !draft)")
-            && body.contains("if (isDraftThread()) {")
+        body.contains(
+            "$(\"sendBtn\").disabled = readOnly || state.activeTurn || (!ready && !draft)"
+        ) && body.contains("if (isDraftThread()) {")
             && body.contains("startDraftThread(text);"),
-        "UI allows draft first sends without a WebSocket and blocks existing-thread sends until open"
+        "UI allows draft first sends without a WebSocket, blocks existing-thread sends until open, \
+         and blocks sends on read-only threads"
     );
     assert!(
         body.contains("state.awaitingThreadResync = true;\n    send({ type:\"subscribe\"")

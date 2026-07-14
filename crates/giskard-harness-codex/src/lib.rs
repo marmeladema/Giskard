@@ -902,9 +902,9 @@ async fn handle_open_thread(
     // warn the caller that agent context was lost while keeping the Giskard-side history.
     let mut resume_warning = None;
 
-    let harness_thread_id = if let Some(ref resume_id) = opts.resume {
+    let (harness_thread_id, resumed_model) = if let Some(ref resume_id) = opts.resume {
         match resume_thread(client, resume_id, &cwd, &opts.initial_model).await {
-            Ok(id) => id,
+            Ok(opened) => opened,
             Err(e) => {
                 // C5: Codex thread store purged/rotated. Start fresh instead of hard-failing.
                 resume_warning = Some(HarnessNotice {
@@ -948,6 +948,27 @@ async fn handle_open_thread(
         thread: thread_id,
         harness_thread_id,
         warning: resume_warning,
+        resumed_model,
+    })
+}
+
+/// The model/provider a `thread/start` / `thread/resume` response reports as effective. Codex can
+/// intentionally ignore resume overrides for an already-loaded thread while still answering
+/// success, so callers switching providers must compare this against what they requested (see
+/// `specs/model-provider-switching-analysis.md`). Empty response fields (older servers) yield
+/// `None`; the reasoning effort is not part of the response and is carried from the request.
+fn effective_model(
+    model: &str,
+    model_provider: &str,
+    requested: &giskard_core::model::ModelRef,
+) -> Option<giskard_core::model::ModelRef> {
+    if model.is_empty() || model_provider.is_empty() {
+        return None;
+    }
+    Some(giskard_core::model::ModelRef {
+        provider: model_provider.to_string(),
+        model: model.to_string(),
+        reasoning_effort: requested.reasoning_effort,
     })
 }
 
@@ -956,7 +977,7 @@ async fn resume_thread(
     resume_id: &str,
     cwd: &str,
     model: &giskard_core::model::ModelRef,
-) -> Result<String, HarnessError> {
+) -> Result<(String, Option<giskard_core::model::ModelRef>), HarnessError> {
     let params: codex_codes::ThreadResumeParams = serde_json::from_value(serde_json::json!({
         "threadId": resume_id,
         "cwd": cwd,
@@ -968,14 +989,15 @@ async fn resume_thread(
         .thread_resume(&params)
         .await
         .map_err(|e| HarnessError::Transport(e.to_string()))?;
-    Ok(resp.thread.id)
+    let resumed = effective_model(&resp.model, &resp.model_provider, model);
+    Ok((resp.thread.id, resumed))
 }
 
 async fn start_thread(
     client: &mut codex_codes::AsyncClient,
     cwd: &str,
     initial_model: &giskard_core::model::ModelRef,
-) -> Result<String, HarnessError> {
+) -> Result<(String, Option<giskard_core::model::ModelRef>), HarnessError> {
     let params: codex_codes::ThreadStartParams = serde_json::from_value(serde_json::json!({
         "cwd": cwd,
         "model": initial_model.model,
@@ -986,7 +1008,8 @@ async fn start_thread(
         .thread_start(&params)
         .await
         .map_err(|e| HarnessError::Transport(e.to_string()))?;
-    Ok(resp.thread.id)
+    let started = effective_model(&resp.model, &resp.model_provider, initial_model);
+    Ok((resp.thread.id, started))
 }
 
 async fn handle_start_turn(
@@ -1856,6 +1879,7 @@ mod tests {
             thread: ThreadId::new(),
             harness_thread_id: "native-thread".into(),
             warning: None,
+            resumed_model: None,
         }
     }
 

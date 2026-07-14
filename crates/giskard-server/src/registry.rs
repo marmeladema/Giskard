@@ -218,13 +218,20 @@ impl HarnessRegistry {
             })
             .await?;
 
+        // Bind the model the harness reports as effective when it says so — Codex can ignore
+        // resume overrides for a loaded thread, and the binding must reflect reality, not the
+        // request (spec: model-provider-switching analysis).
+        let native_model = handle
+            .resumed_model
+            .clone()
+            .unwrap_or_else(|| initial_model.clone());
         let mut threads = self.threads.lock().await;
         threads.insert(
             handle.thread,
             ThreadBinding {
                 project: config.id,
                 handle: handle.clone(),
-                native_model: initial_model.clone(),
+                native_model,
             },
         );
         debug!(
@@ -545,6 +552,7 @@ impl HarnessRegistry {
                 thread: thread_id,
                 harness_thread_id,
                 warning: None,
+                resumed_model: None,
             });
         harness.set_thread_archived(&handle, archived).await
     }
@@ -564,6 +572,7 @@ impl HarnessRegistry {
                 thread: thread_id,
                 harness_thread_id,
                 warning: None,
+                resumed_model: None,
             });
         harness.set_thread_name(&handle, &name).await
     }
@@ -612,6 +621,7 @@ impl HarnessRegistry {
                 thread: thread_id,
                 harness_thread_id,
                 warning: None,
+                resumed_model: None,
             });
         harness.delete_thread(&handle).await?;
         self.forget_thread(thread_id).await;

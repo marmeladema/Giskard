@@ -158,6 +158,7 @@ impl AgentHarness for InterruptHarness {
             thread,
             harness_thread_id: opts.resume.unwrap_or_else(|| "interrupt_harness".into()),
             warning: None,
+            resumed_model: Some(opts.initial_model.clone()),
         })
     }
 

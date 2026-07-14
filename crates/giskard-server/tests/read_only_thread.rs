@@ -175,6 +175,36 @@ session_days = 30
         .unwrap()
         .to_string();
 
+    // The browser opens a thread over HTTP *before* subscribing on the WebSocket, so this
+    // endpoint must also degrade to a read-only open (200 + warning) instead of a 500 when the
+    // harness can't attach — otherwise the UI aborts before the WS path is ever reached.
+    let resp = client
+        .post(format!("{base}/api/projects/{pid}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"thread_id": tid, "resume": null}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "HTTP open of an orphaned thread must not hard-fail"
+    );
+    let open: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(open["thread_id"].as_str().unwrap(), tid.to_string());
+    assert_eq!(open["warning"]["code"], "thread_read_only");
+    let http_message = open["warning"]["message"].as_str().unwrap_or_default();
+    assert!(
+        http_message.contains("\"cloudflare-litellm\"")
+            && http_message.contains("no longer configured")
+            && http_message.contains("Pick a model"),
+        "read-only message must name the missing provider and the recovery action: {http_message}"
+    );
+    assert_eq!(
+        open["harness_thread_id"].as_str().unwrap(),
+        format!("harness-{tid}")
+    );
+
     let ws_req = tokio_tungstenite::tungstenite::http::Request::builder()
         .uri(format!("ws://127.0.0.1:{port}/api/ws"))
         .header("host", format!("127.0.0.1:{port}"))
@@ -225,6 +255,11 @@ session_days = 30
     let warning =
         read_only_warning.expect("read-only subscribe must surface a thread_read_only warning");
     assert_eq!(warning["severity"], "warning");
+    let message = warning["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("\"cloudflare-litellm\"") && message.contains("Pick a model"),
+        "subscribe warning must name the provider and the recovery action: {message}"
+    );
     let detail = warning["detail"].as_str().unwrap_or_default();
     assert!(
         detail.contains("cloudflare-litellm"),

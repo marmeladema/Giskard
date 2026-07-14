@@ -21,6 +21,7 @@ let state = {
   linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, activeTurn:false, interruptPending:false, compactPending:false,
   awaitingInitialThreadState:false, awaitingThreadResync:false, contextWindow:0, contextUsed:null, tokenLedger:null, approvalPolicy:"ask", currentModel:null,
   mcpServers:[], mcpCapabilities:{ status:false, reload:false, oauth_login:false }, mcpLoading:false, mcpError:null, expandedMcps:new Set(),
+  threadReadOnly:false, readOnlyProvider:null, readOnlyMessage:null,
   collapsedProjects:new Set(loadCollapsedProjects())
 };
 const COMMAND_AUTO_COLLAPSE_LINES = 120;
@@ -577,6 +578,8 @@ async function openThread(pid, tid, title, opts) {
   try { localStorage.setItem("giskard.lastThread", JSON.stringify({ pid, tid })); } catch {}
 
   state.projectId = pid; state.threadId = tid; state.pendingUserEl = null; state.pendingUserText = null;
+  state.threadReadOnly = false; state.readOnlyProvider = null; state.readOnlyMessage = null;
+  updateReadOnlyBanner();
   state.draftThread = null;
   state.compactPending = false;
   state.currentModel = null;
@@ -602,7 +605,20 @@ async function openThread(pid, tid, title, opts) {
   setThreadTitle(title || tid.slice(0,8));
   $("transcript").className=""; $("transcript").innerHTML=""; $("notices").innerHTML="";
   closeDrawers();   // on mobile, reveal the transcript after picking a thread
-  if (res.warning) notice(res.warning.message || "warning", res.warning.severity || "warning");
+  if (res.warning) {
+    // A read-only open (provider removed from config) shows a persistent banner and unlocks the
+    // model picker so the user can rescue the thread by selecting a configured model; other
+    // warnings stay transient toasts.
+    if (res.warning.code === "thread_read_only") {
+      state.threadReadOnly = true;
+      state.readOnlyMessage = res.warning.message || "This thread is read-only.";
+      updateReadOnlyBanner();
+      syncModelOptionAvailability();
+      updateComposerControls();
+    } else {
+      notice(res.warning.message || "warning", res.warning.severity || "warning");
+    }
+  }
   connectWs();
 }
 
@@ -762,11 +778,21 @@ function setWsStatus(status, detail) {
   renderWsStatus();
   updateComposerControls();
 }
+/// Persistent banner above the composer while a thread is read-only; hidden otherwise.
+function updateReadOnlyBanner() {
+  const banner = $("readOnlyBanner");
+  if (!banner) return;
+  banner.hidden = !state.threadReadOnly;
+  banner.textContent = state.threadReadOnly ? (state.readOnlyMessage || "This thread is read-only.") : "";
+}
+
 function updateComposerControls() {
   const ready = state.wsStatus==="open";
   const draft = isDraftThread();
   const hasThreadSurface = !!state.threadId || draft;
-  $("sendBtn").disabled = state.activeTurn || (!ready && !draft);
+  const readOnly = state.threadReadOnly && !draft;
+  $("sendBtn").disabled = readOnly || state.activeTurn || (!ready && !draft);
+  $("sendBtn").title = readOnly ? "Read-only thread — pick a model from a configured provider to reactivate it." : "";
   $("stopBtn").hidden = !state.activeTurn || draft;
   $("stopBtn").disabled = !ready || state.interruptPending;
   $("stopBtn").textContent = state.interruptPending ? "Stopping…" : "Stop";
@@ -778,8 +804,9 @@ function updateComposerControls() {
     compactBtn.disabled = !state.threadId || draft || state.activeTurn || state.compactPending || !ready;
     compactBtn.textContent = state.compactPending ? "Compacting..." : "Compact context";
   }
-  $("input").disabled = !hasThreadSurface;
+  $("input").disabled = !hasThreadSurface || readOnly;
   $("input").placeholder =
+    readOnly ? "Read-only thread — pick a model above to reactivate it." :
     state.activeTurn ? "Agent is running… draft the next message here." :
     draft ? "Message the agent…  (Enter to send, Shift+Enter for newline)" :
     state.wsStatus==="open" ? "Message the agent…  (Enter to send, Shift+Enter for newline)" :
@@ -884,6 +911,17 @@ function handleServer(msg) {
       break;
     case "approval_request": renderApprovalRequest(msg.request); break;
     case "error":
+      if (msg.code === "thread_read_only") {
+        state.threadReadOnly = true;
+        state.readOnlyMessage = msg.message || state.readOnlyMessage || "This thread is read-only.";
+        if (!state.readOnlyProvider && state.currentModel) {
+          state.readOnlyProvider = state.currentModel.provider;
+        }
+        updateReadOnlyBanner();
+        syncModelOptionAvailability();
+        updateComposerControls();
+        break;   // the persistent banner replaces the transient toast
+      }
       if (msg.action==="select_model") {
         if (state.pendingModelBeforeSelect) {
           state.currentModel = state.pendingModelBeforeSelect;
@@ -923,6 +961,20 @@ function renderThreadState(s) {
   if (s.current_model) {
     state.currentModel = s.current_model;
     state.pendingModelBeforeSelect = null;
+    if (state.threadReadOnly) {
+      if (!state.readOnlyProvider) {
+        state.readOnlyProvider = s.current_model.provider;
+      } else if (s.current_model.provider !== state.readOnlyProvider) {
+        // The verified cold-resume switch landed: the thread is live again under the new
+        // provider, so normal provider-lock rules apply from here on.
+        state.threadReadOnly = false;
+        state.readOnlyProvider = null;
+        state.readOnlyMessage = null;
+        updateReadOnlyBanner();
+        updateComposerControls();
+        notice(`Thread resumed under provider ${s.current_model.provider}.`);
+      }
+    }
     syncModelControls();
   }
   if (s.title) {
@@ -3746,6 +3798,7 @@ function syncModelControls() {
   syncEffortControl();
 }
 function modelProviderLocked(provider) {
+  if (state.threadReadOnly) return false;
   return !!state.threadId &&
     !isDraftThread() &&
     !!state.currentModel &&

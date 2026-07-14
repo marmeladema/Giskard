@@ -8,7 +8,44 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.41
+**Version:** 1.42
+
+**Changelog (1.41 → 1.42), orphaned-thread recovery — read-only open + verified provider switch:**
+- **RO2:** RO1's read-only degrade now also applies to `POST /api/projects/{id}/threads` for an
+  existing `thread_id`. The browser opens a thread over HTTP *before* subscribing on the
+  WebSocket, so a harness-attach failure there returned a 500 and the UI aborted before RO1's
+  subscribe-side degrade could ever run. The endpoint now answers 200 with the persisted
+  `harness_thread_id` and a `thread_read_only` warning, letting the client proceed to the
+  (already degrading) subscribe. New-thread creation and explicit resume imports still fail hard
+  (§13.6).
+- **PS1:** Selecting a model from a different provider is now allowed on a **cold** thread (one
+  not loaded in any harness process this server run — e.g. after a restart, or a read-only thread
+  whose provider was removed from config). The switch performs a native `thread/resume` with the
+  requested `model`/`modelProvider` and **verifies** the response reports them as effective
+  before anything is persisted; Codex answers JSON-RPC success even when it ignores resume
+  overrides for loaded threads, so success alone is never trusted (see
+  `specs/model-provider-switching-analysis.md`). On an unconfirmed switch the fresh binding is
+  dropped, a structured `thread_provider_switch_ignored` error is surfaced, and persisted state
+  is untouched. Warm (loaded) threads keep the PB2 `thread_provider_locked` rejection.
+- **PS2:** `ThreadHandle` carries `resumed_model` — the model/provider the harness reports as
+  effective on open — and the registry binds the native model from it (truth over request). The
+  Codex adapter populates it from the `thread/start`/`thread/resume` responses; the replay
+  harness echoes the request. (Codex protocol SDK `codex-codes` bumped 0.143.0 → 0.143.2; the
+  `model`/`modelProvider`/`thread.id` response fields the verification relies on are unchanged.)
+- **PS3:** Selection stays **explicit**: no fuzzy matching picks a replacement provider
+  automatically. The existing exact-id normalization (§8.4/E5) still auto-heals a stale provider
+  when the model id exists under exactly one configured provider; otherwise the thread loads
+  read-only (RO1/RO2) with the model picker **unlocked**, and the user chooses. The
+  `thread_read_only` client state clears once a thread-state snapshot arrives under a different
+  provider (the switch confirmed).
+- **RO3:** The read-only state is now impossible to miss and tells the user what to do. The
+  `thread_read_only` warning is **action-first** and **names the thread's provider** — claiming
+  "provider \"X\" is no longer configured" only when config verifiably lacks it (attach failures
+  can also be auth/spawn problems, which get neutral wording). The client renders it as a
+  **persistent banner** above the composer instead of only an 8-second toast, disables the
+  composer input and Send button with an explanatory placeholder/tooltip, and clears everything
+  (banner, disabled state, picker lock rules) once a verified provider switch lands. The
+  transient toast is suppressed for this code — the banner replaces it (§13.6).
 
 **Changelog (1.40 → 1.41), MCP tool-call approval promotion:**
 - **M1:** Codex surfaces MCP tool-call approvals as generic `ToolRequestUserInput` or

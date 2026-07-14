@@ -282,10 +282,16 @@ WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticke
 /api/projects/{id}/mcp/oauth-login`. Wire types are defined once in `giskard-proto`. See
 [§13.6](specs/giskard-specification.md) for the message protocol.
 
-If you subscribe to a thread whose agent can no longer be started — most often because its
+If you open a thread whose agent can no longer be started — most often because its
 **provider was removed from config** (e.g. you swapped one proxy provider id for another) — the
-thread still opens **read-only**: its history loads and a non-fatal `thread_read_only` warning is
-shown. You can read the transcript but not send new messages on it.
+thread still opens **read-only**: its history loads, a persistent banner above the composer names
+the missing provider, and the composer is disabled. To rescue such a thread, pick a model from a
+configured provider in the model picker (it
+is unlocked for read-only threads): Giskard re-resumes the native thread under the new provider,
+verifies the agent actually applied the switch before persisting it, and the thread becomes live
+again with its history intact. The same verified switch works for any thread that hasn't been
+opened since the server started; threads with a live agent session stay bound to their provider
+(create a new thread to change providers there).
 
 ---
 
