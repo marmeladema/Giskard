@@ -1179,6 +1179,7 @@ function approvalTitle(request) {
   if (kind.kind==="command_execution") return "Run command?";
   if (kind.kind==="file_change") return "Apply file changes?";
   if (kind.kind==="permission") return "Grant permissions?";
+  if (kind.kind==="mcp_tool_call") return "Run MCP tool?";
   return "Approval required";
 }
 function approvalDetail(request) {
@@ -1189,6 +1190,10 @@ function approvalDetail(request) {
   }
   if (kind.kind==="file_change") return [kind.change, kind.path].filter(Boolean).join(" ");
   if (kind.kind==="permission") return kind.detail || "";
+  if (kind.kind==="mcp_tool_call") {
+    const server = kind.server ? `${kind.server}:` : "";
+    return `${server}${kind.tool_name || ""}`;
+  }
   return hasMeaningfulJson(kind) ? JSON.stringify(kind) : "";
 }
 function renderApprovalMetadata(body, metadata) {

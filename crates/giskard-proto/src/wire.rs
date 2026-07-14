@@ -222,6 +222,10 @@ pub enum WireApprovalKind {
     Permission {
         detail: String,
     },
+    McpToolCall {
+        server: String,
+        tool_name: String,
+    },
 }
 
 /// Wire-mirror of [`ApprovalMetadata`] (paths as `String`).
@@ -489,6 +493,9 @@ impl From<ApprovalKind> for WireApprovalKind {
                 change,
             },
             ApprovalKind::Permission { detail } => Self::Permission { detail },
+            ApprovalKind::McpToolCall { server, tool_name } => {
+                Self::McpToolCall { server, tool_name }
+            }
         }
     }
 }

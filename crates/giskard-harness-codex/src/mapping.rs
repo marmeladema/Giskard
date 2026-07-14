@@ -28,6 +28,25 @@ use codex_codes::protocol::{
     TurnCompletedNotification, TurnDiffUpdatedNotification, TurnStartedNotification,
 };
 
+// ---- MCP tool-call approval detection (spec §9.2) ----
+//
+// Codex surfaces MCP tool-call approvals as generic `ToolRequestUserInput` or
+// `McpServerElicitationRequest` server requests rather than first-class approval
+// requests.  Both carry a marker that lets Giskard promote them to approval cards
+// with `AcceptForSession` support, mirroring the command/file/permission flow.
+//
+// Marker constants mirror `codex-rs/protocol/src/mcp_approval_meta.rs`.
+const MCP_APPROVAL_KIND_KEY: &str = "codex_approval_kind";
+const MCP_APPROVAL_KIND_MCP_TOOL_CALL: &str = "mcp_tool_call";
+const MCP_APPROVAL_PERSIST_KEY: &str = "persist";
+const MCP_APPROVAL_PERSIST_SESSION: &str = "session";
+/// Header Codex sets on the requestUserInput question for MCP tool approvals.
+const MCP_TOOL_APPROVAL_QUESTION_HEADER: &str = "Approve app tool call?";
+/// Labels for the requestUserInput answer options (mcp_tool_call.rs).
+const MCP_TOOL_APPROVAL_LABEL_ACCEPT: &str = "Allow";
+const MCP_TOOL_APPROVAL_LABEL_ACCEPT_FOR_SESSION: &str = "Allow for this session";
+const MCP_TOOL_APPROVAL_LABEL_CANCEL: &str = "Cancel";
+
 /// Maps Codex app-server messages onto `giskard-core` events, owning the id-translation registries
 /// (spec §4.7): native `threadId → ThreadId` (B4), native `turnId → TurnId`, and native
 /// `itemId → ItemId` (B2). The Giskard-owned ids are minted once and reused for every subsequent
@@ -782,28 +801,56 @@ impl CodexMapper {
                     },
                 })
             }
-            _ => {
-                let (thread, turn) = self.server_request_scope(request, fallback_thread)?;
-                let server_request_id = ServerRequestId(req_id);
-                self.pending_server_requests.insert(
-                    server_request_id.clone(),
-                    PendingServerRequest {
-                        request_id: id.clone(),
-                        thread,
-                        turn,
-                    },
-                );
-                Some(AgentEvent::ServerRequestReceived {
-                    thread,
-                    turn,
-                    request: GiskardServerRequest {
-                        id: server_request_id,
-                        method: request.method().to_owned(),
-                        params: server_request_params(request),
-                        received_at: Utc::now(),
-                    },
-                })
+            // MCP tool-call approvals are surfaced by Codex as generic
+            // `ToolRequestUserInput` / `McpServerElicitationRequest` server
+            // requests.  When the MCP approval marker is present, promote the
+            // request to a first-class approval card so the user gets the same
+            // Accept / Accept-for-session / Decline / Cancel affordance as
+            // command and file approvals (spec §9.2).  Non-MCP-tool requests
+            // fall through to the generic server-request path unchanged.
+            CodexServerRequest::ToolRequestUserInput(params) => {
+                match detect_mcp_tool_approval_from_user_input(params) {
+                    Some(detected) => {
+                        let (thread, turn) = self.server_request_scope(request, fallback_thread)?;
+                        self.build_mcp_tool_approval_event(
+                            id.clone(),
+                            req_id,
+                            thread,
+                            turn,
+                            detected,
+                            McpToolApprovalTransport::RequestUserInput,
+                        )
+                    }
+                    None => self.map_generic_server_request(
+                        id.clone(),
+                        req_id,
+                        request,
+                        fallback_thread,
+                    ),
+                }
             }
+            CodexServerRequest::McpServerElicitationRequest(params) => {
+                match detect_mcp_tool_approval_from_elicitation(params) {
+                    Some(detected) => {
+                        let (thread, turn) = self.server_request_scope(request, fallback_thread)?;
+                        self.build_mcp_tool_approval_event(
+                            id.clone(),
+                            req_id,
+                            thread,
+                            turn,
+                            detected,
+                            McpToolApprovalTransport::Elicitation,
+                        )
+                    }
+                    None => self.map_generic_server_request(
+                        id.clone(),
+                        req_id,
+                        request,
+                        fallback_thread,
+                    ),
+                }
+            }
+            _ => self.map_generic_server_request(id.clone(), req_id, request, fallback_thread),
         }
     }
 
@@ -834,6 +881,17 @@ impl CodexMapper {
                 request_id,
                 ApprovalResponseBody::Result(map_approval_decision(decision)),
             )),
+            Some(PendingApprovalResponse {
+                request_id,
+                kind:
+                    PendingApprovalResponseKind::McpToolCall {
+                        transport,
+                        question_id,
+                    },
+            }) => Ok(ApprovalResponse::from_parts(
+                request_id,
+                map_mcp_tool_approval_decision(decision, &transport, question_id.as_deref()),
+            )),
             None => Err(format!("no pending approval for id {id}")),
         }
     }
@@ -850,6 +908,79 @@ impl CodexMapper {
 
     pub fn resolve_server_request(&mut self, id: &ServerRequestId) {
         self.pending_server_requests.remove(id);
+    }
+
+    /// Build a first-class MCP tool-call approval event from a detected
+    /// `ToolRequestUserInput` / `McpServerElicitationRequest`, registering a
+    /// pending approval response so `respond_approval` can route the decision
+    /// back to Codex in the correct wire shape.
+    fn build_mcp_tool_approval_event(
+        &mut self,
+        request_id: RequestId,
+        req_id: String,
+        thread: ThreadId,
+        turn: Option<TurnId>,
+        detected: McpToolApprovalDetected,
+        transport: McpToolApprovalTransport,
+    ) -> Option<AgentEvent> {
+        let approval_id = ApprovalId(req_id);
+        self.pending_approval_responses.insert(
+            approval_id.clone(),
+            PendingApprovalResponse {
+                request_id,
+                kind: PendingApprovalResponseKind::McpToolCall {
+                    transport,
+                    question_id: detected.question_id.clone(),
+                },
+            },
+        );
+        Some(AgentEvent::ApprovalRequested {
+            thread,
+            turn: turn.unwrap_or_default(),
+            request: ApprovalRequest {
+                id: approval_id,
+                kind: ApprovalKind::McpToolCall {
+                    server: detected.server.clone(),
+                    tool_name: detected.tool_name.clone(),
+                },
+                reason: Some(detected.message.clone()),
+                metadata: vec![],
+                available: mcp_tool_approval_available_decisions(&detected),
+            },
+        })
+    }
+
+    /// Fallback path: a non-MCP-tool `ToolRequestUserInput` or
+    /// `McpServerElicitationRequest` (or any unknown request) is surfaced as a
+    /// generic pending server request, unchanged from the pre-promotion
+    /// behaviour.
+    fn map_generic_server_request(
+        &mut self,
+        id: RequestId,
+        req_id: String,
+        request: &CodexServerRequest,
+        fallback_thread: ThreadId,
+    ) -> Option<AgentEvent> {
+        let (thread, turn) = self.server_request_scope(request, fallback_thread)?;
+        let server_request_id = ServerRequestId(req_id);
+        self.pending_server_requests.insert(
+            server_request_id.clone(),
+            PendingServerRequest {
+                request_id: id,
+                thread,
+                turn,
+            },
+        );
+        Some(AgentEvent::ServerRequestReceived {
+            thread,
+            turn,
+            request: GiskardServerRequest {
+                id: server_request_id,
+                method: request.method().to_owned(),
+                params: server_request_params(request),
+                received_at: Utc::now(),
+            },
+        })
     }
 
     fn server_request_scope(
@@ -934,8 +1065,33 @@ struct PendingApprovalResponse {
 
 enum PendingApprovalResponseKind {
     Decision,
-    Permissions { permissions: Value },
+    Permissions {
+        permissions: Value,
+    },
     LegacyReviewDecision,
+    /// MCP tool-call approval promoted from a generic server request.
+    ///
+    /// `transport` records whether Codex surfaced the approval as a
+    /// `ToolRequestUserInput` (answer-based) or an
+    /// `McpServerElicitationRequest` (meta-based) so the response can be built
+    /// in the shape Codex expects.
+    McpToolCall {
+        transport: McpToolApprovalTransport,
+        /// The requestUserInput question id, when applicable.  Codex keys the
+        /// answer map by this id.
+        question_id: Option<String>,
+    },
+}
+
+/// How Codex transported the MCP tool approval prompt.
+#[derive(Debug, Clone)]
+enum McpToolApprovalTransport {
+    /// `item/tool/requestUserInput` — response is an answer map keyed by
+    /// question id with the chosen option label.
+    RequestUserInput,
+    /// `mcpServer/elicitation/request` — response is an action + optional
+    /// `_meta.persist` marker that Codex reads to decide session/always scope.
+    Elicitation,
 }
 
 enum ApprovalResponseBody {
@@ -1525,6 +1681,193 @@ pub fn map_approval_decision(decision: &ApprovalDecision) -> Value {
                 },
             })
         }
+    }
+}
+
+// ---- MCP tool-call approval detection & response building (spec §9.2) ----
+
+/// Information extracted from a detected MCP tool approval request.
+#[derive(Debug, Clone)]
+struct McpToolApprovalDetected {
+    /// Best-effort MCP server name.  May be empty when Codex did not include it.
+    server: String,
+    /// Best-effort tool name.  May fall back to a title or empty string.
+    tool_name: String,
+    /// Human-readable approval prompt message.
+    message: String,
+    /// Whether Codex offered a session-scoped "remember" option.
+    allow_session_remember: bool,
+    /// `requestUserInput` only: the question id Codex expects the answer keyed by.
+    question_id: Option<String>,
+}
+
+/// Detect an MCP tool-call approval from a `ToolRequestUserInput` request.
+///
+/// Codex builds the question with header `"Approve app tool call?"` and option
+/// labels `"Allow"` / `"Allow for this session"` / `"Cancel"`.  The server and
+/// tool name are not structured fields here, so we extract them best-effort from
+/// the question text (`Allow <server> to run tool "<tool>"?`).
+fn detect_mcp_tool_approval_from_user_input(
+    params: &codex_codes::protocol::ToolRequestUserInputParams,
+) -> Option<McpToolApprovalDetected> {
+    let question = params.questions.first()?;
+    if question.header != MCP_TOOL_APPROVAL_QUESTION_HEADER {
+        return None;
+    }
+    let options = question.options.as_deref().unwrap_or(&[]);
+    let allow_session_remember = options
+        .iter()
+        .any(|o| o.label == MCP_TOOL_APPROVAL_LABEL_ACCEPT_FOR_SESSION);
+    let (server, tool_name) = parse_mcp_tool_approval_question(&question.question);
+    Some(McpToolApprovalDetected {
+        server,
+        tool_name,
+        message: question.question.clone(),
+        allow_session_remember,
+        question_id: Some(question.id.clone()),
+    })
+}
+
+/// Detect an MCP tool-call approval from an `McpServerElicitationRequest`.
+///
+/// The elicitation `_meta` carries `codex_approval_kind: "mcp_tool_call"` and
+/// optionally `persist: "session"` / `persist: ["session", "always"]` plus
+/// `tool_name`.  The server name is not a structured field in the vendored
+/// protocol params, so we extract it best-effort from the message text.
+fn detect_mcp_tool_approval_from_elicitation(
+    params: &codex_codes::protocol::McpServerElicitationRequestParams,
+) -> Option<McpToolApprovalDetected> {
+    let meta = mcp_elicitation_meta(params)?.as_object()?;
+    let kind = meta.get(MCP_APPROVAL_KIND_KEY).and_then(Value::as_str)?;
+    if kind != MCP_APPROVAL_KIND_MCP_TOOL_CALL {
+        return None;
+    }
+    let tool_name = meta
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let allow_session_remember = match meta.get(MCP_APPROVAL_PERSIST_KEY) {
+        Some(Value::String(s)) => *s == MCP_APPROVAL_PERSIST_SESSION,
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .any(|v| v.as_str() == Some(MCP_APPROVAL_PERSIST_SESSION)),
+        _ => false,
+    };
+    let message = match params {
+        codex_codes::protocol::McpServerElicitationRequestParams::Form { message, .. }
+        | codex_codes::protocol::McpServerElicitationRequestParams::OpenaiForm {
+            message, ..
+        }
+        | codex_codes::protocol::McpServerElicitationRequestParams::Url { message, .. } => {
+            message.clone()
+        }
+    };
+    let (parsed_server, parsed_tool) = parse_mcp_tool_approval_question(&message);
+    let server = parsed_server;
+    let tool_name = if tool_name.is_empty() {
+        parsed_tool
+    } else {
+        tool_name
+    };
+    Some(McpToolApprovalDetected {
+        server,
+        tool_name,
+        message,
+        allow_session_remember,
+        question_id: None,
+    })
+}
+
+/// Parse `Allow <server> to run tool "<tool>"?` into `(server, tool)`.
+/// Falls back to empty strings when the message shape is unrecognized.
+fn parse_mcp_tool_approval_question(question: &str) -> (String, String) {
+    // "Allow <actor> to run tool "<tool>"?"
+    let after_allow = question.strip_prefix("Allow ").unwrap_or(question);
+    if let Some(tool_idx) = after_allow.rfind(r#" to run tool ""#) {
+        let server = after_allow[..tool_idx].to_owned();
+        let rest = &after_allow[tool_idx + r#" to run tool ""#.len()..];
+        // Strip trailing "?" or ""?" then the closing quote.
+        let tool = rest
+            .strip_suffix(r#""?"#)
+            .or_else(|| rest.strip_suffix(r#"""#))
+            .or_else(|| rest.strip_suffix('"'))
+            .unwrap_or(rest)
+            .to_owned();
+        return (server, tool);
+    }
+    (String::new(), String::new())
+}
+
+/// Decisions the approval card should offer for an MCP tool approval.
+/// `AcceptForSession` is only offered when Codex advertised it.
+fn mcp_tool_approval_available_decisions(
+    detected: &McpToolApprovalDetected,
+) -> Vec<ApprovalDecision> {
+    let mut available = vec![
+        ApprovalDecision::Accept,
+        ApprovalDecision::Decline,
+        ApprovalDecision::Cancel,
+    ];
+    if detected.allow_session_remember {
+        available.insert(1, ApprovalDecision::AcceptForSession);
+    }
+    available
+}
+
+/// Build the wire response Codex expects for an MCP tool approval decision.
+///
+/// `RequestUserInput` responses are an answer map keyed by question id with the
+/// chosen option label.  `Elicitation` responses are `{action, _meta?, content?}`
+/// where `_meta.persist = "session"` signals `AcceptForSession`.
+fn map_mcp_tool_approval_decision(
+    decision: &ApprovalDecision,
+    transport: &McpToolApprovalTransport,
+    question_id: Option<&str>,
+) -> ApprovalResponseBody {
+    match transport {
+        McpToolApprovalTransport::RequestUserInput => {
+            let label = match decision {
+                ApprovalDecision::Accept => MCP_TOOL_APPROVAL_LABEL_ACCEPT,
+                ApprovalDecision::AcceptForSession => MCP_TOOL_APPROVAL_LABEL_ACCEPT_FOR_SESSION,
+                ApprovalDecision::Decline | ApprovalDecision::Cancel => {
+                    MCP_TOOL_APPROVAL_LABEL_CANCEL
+                }
+                ApprovalDecision::AcceptWithExecPolicyAmendment { .. } => {
+                    MCP_TOOL_APPROVAL_LABEL_ACCEPT
+                }
+            };
+            let answers = match question_id {
+                Some(qid) => {
+                    let mut map = serde_json::Map::new();
+                    map.insert(qid.to_owned(), json!({ "answers": [label] }));
+                    serde_json::Value::Object(map)
+                }
+                None => json!({}),
+            };
+            ApprovalResponseBody::Result(json!({ "answers": answers }))
+        }
+        McpToolApprovalTransport::Elicitation => match decision {
+            ApprovalDecision::Accept => ApprovalResponseBody::Result(json!({
+                "action": "accept",
+                "content": {},
+            })),
+            ApprovalDecision::AcceptForSession => ApprovalResponseBody::Result(json!({
+                "action": "accept",
+                "content": {},
+                "_meta": { MCP_APPROVAL_PERSIST_KEY: MCP_APPROVAL_PERSIST_SESSION },
+            })),
+            ApprovalDecision::Decline => {
+                ApprovalResponseBody::Result(json!({ "action": "decline" }))
+            }
+            ApprovalDecision::Cancel => ApprovalResponseBody::Result(json!({ "action": "cancel" })),
+            ApprovalDecision::AcceptWithExecPolicyAmendment { .. } => {
+                ApprovalResponseBody::Result(json!({
+                    "action": "accept",
+                    "content": {},
+                }))
+            }
+        },
     }
 }
 
@@ -3924,6 +4267,300 @@ mod tests {
         {
             AgentEvent::TurnCompleted { usage, .. } => assert_eq!(usage.total, 0),
             other => panic!("expected TurnCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_tool_approval_from_request_user_input_is_promoted() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let fallback = ThreadId::new();
+        let scoped_thread = ThreadId::new();
+        mapper.register_thread("thread1".into(), scoped_thread);
+        let request = CodexServerRequest::ToolRequestUserInput(
+            serde_json::from_value(serde_json::json!({
+                "itemId": "input1",
+                "threadId": "thread1",
+                "turnId": "turn1",
+                "questions": [{
+                    "id": "mcp_tool_call_approval_call_42",
+                    "header": "Approve app tool call?",
+                    "question": "Allow brave-search to run tool \"brave_web_search\"?",
+                    "options": [
+                        { "label": "Allow", "description": "Run the tool and continue." },
+                        { "label": "Allow for this session", "description": "Run the tool and remember this choice for this session." },
+                        { "label": "Cancel", "description": "Cancel this tool call." }
+                    ]
+                }]
+            }))
+            .unwrap(),
+        );
+        let event = mapper
+            .map_server_request(&RequestId::String("mcp1".into()), &request, fallback)
+            .unwrap();
+        match event {
+            AgentEvent::ApprovalRequested {
+                thread, request, ..
+            } => {
+                assert_eq!(thread, scoped_thread);
+                assert_eq!(request.id, ApprovalId("mcp1".into()));
+                match request.kind {
+                    ApprovalKind::McpToolCall { server, tool_name } => {
+                        assert_eq!(server, "brave-search");
+                        assert_eq!(tool_name, "brave_web_search");
+                    }
+                    other => panic!("expected McpToolCall, got {other:?}"),
+                }
+                // Session option was advertised by Codex.
+                assert!(
+                    request
+                        .available
+                        .contains(&ApprovalDecision::AcceptForSession)
+                );
+            }
+            other => panic!("expected ApprovalRequested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_tool_approval_without_session_option_omits_accept_for_session() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let fallback = ThreadId::new();
+        let request = CodexServerRequest::ToolRequestUserInput(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "th1",
+                "turnId": "t1",
+                "itemId": "i1",
+                "questions": [{
+                    "id": "mcp_tool_call_approval_call_1",
+                    "header": "Approve app tool call?",
+                    "question": "Allow my-server to run tool \"my_tool\"?",
+                    "options": [
+                        { "label": "Allow", "description": "" },
+                        { "label": "Cancel", "description": "" }
+                    ]
+                }]
+            }))
+            .unwrap(),
+        );
+        let event = mapper
+            .map_server_request(&RequestId::Integer(7), &request, fallback)
+            .unwrap();
+        match event {
+            AgentEvent::ApprovalRequested { request, .. } => {
+                assert!(
+                    !request
+                        .available
+                        .contains(&ApprovalDecision::AcceptForSession)
+                );
+            }
+            other => panic!("expected ApprovalRequested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_mcp_request_user_input_stays_generic_server_request() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let fallback = ThreadId::new();
+        let request = CodexServerRequest::ToolRequestUserInput(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "th1",
+                "turnId": "t1",
+                "itemId": "i1",
+                "questions": [{
+                    "id": "q1",
+                    "header": "Confirm",
+                    "question": "Continue?"
+                }]
+            }))
+            .unwrap(),
+        );
+        let event = mapper
+            .map_server_request(&RequestId::String("ru1".into()), &request, fallback)
+            .unwrap();
+        match event {
+            AgentEvent::ServerRequestReceived { request, .. } => {
+                assert_eq!(request.method, "item/tool/requestUserInput");
+            }
+            other => panic!("expected ServerRequestReceived, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_tool_approval_from_elicitation_is_promoted() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let fallback = ThreadId::new();
+        let request = CodexServerRequest::McpServerElicitationRequest(
+            serde_json::from_value(serde_json::json!({
+                "mode": "form",
+                "_meta": {
+                    "codex_approval_kind": "mcp_tool_call",
+                    "persist": "session",
+                    "tool_name": "brave_web_search",
+                    "threadId": "th1",
+                    "turnId": "t1"
+                },
+                "message": "Allow brave-search to run tool \"brave_web_search\"?",
+                "requestedSchema": { "type": "object", "properties": {} }
+            }))
+            .unwrap(),
+        );
+        let event = mapper
+            .map_server_request(&RequestId::String("mcp2".into()), &request, fallback)
+            .unwrap();
+        match event {
+            AgentEvent::ApprovalRequested { request, .. } => {
+                assert_eq!(request.id, ApprovalId("mcp2".into()));
+                match request.kind {
+                    ApprovalKind::McpToolCall { server, tool_name } => {
+                        assert_eq!(server, "brave-search");
+                        assert_eq!(tool_name, "brave_web_search");
+                    }
+                    other => panic!("expected McpToolCall, got {other:?}"),
+                }
+                assert!(
+                    request
+                        .available
+                        .contains(&ApprovalDecision::AcceptForSession)
+                );
+            }
+            other => panic!("expected ApprovalRequested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_mcp_elicitation_stays_generic_server_request() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let fallback = ThreadId::new();
+        let request = CodexServerRequest::McpServerElicitationRequest(
+            serde_json::from_value(serde_json::json!({
+                "mode": "form",
+                "message": "Need input",
+                "requestedSchema": { "type": "object", "properties": {} }
+            }))
+            .unwrap(),
+        );
+        let event = mapper
+            .map_server_request(&RequestId::String("e1".into()), &request, fallback)
+            .unwrap();
+        match event {
+            AgentEvent::ServerRequestReceived { request, .. } => {
+                assert_eq!(request.method, "mcpServer/elicitation/request");
+            }
+            other => panic!("expected ServerRequestReceived, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_tool_approval_response_request_user_input_shape() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let fallback = ThreadId::new();
+        let request = CodexServerRequest::ToolRequestUserInput(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "th1",
+                "turnId": "t1",
+                "itemId": "i1",
+                "questions": [{
+                    "id": "mcp_tool_call_approval_call_5",
+                    "header": "Approve app tool call?",
+                    "question": "Allow srv to run tool \"t\"?",
+                    "options": [
+                        { "label": "Allow" },
+                        { "label": "Allow for this session" },
+                        { "label": "Cancel" }
+                    ]
+                }]
+            }))
+            .unwrap(),
+        );
+        mapper
+            .map_server_request(&RequestId::String("mcp3".into()), &request, fallback)
+            .unwrap();
+
+        // Accept (once)
+        let resp = mapper
+            .map_approval_response(&ApprovalId("mcp3".into()), &ApprovalDecision::Accept)
+            .unwrap();
+        match resp {
+            ApprovalResponse::Result { value, .. } => {
+                let answers = value.get("answers").unwrap();
+                let q = answers.get("mcp_tool_call_approval_call_5").unwrap();
+                assert_eq!(q["answers"][0], "Allow");
+            }
+            other => panic!("expected Result, got {other:?}"),
+        }
+
+        // Re-register and test AcceptForSession
+        mapper
+            .map_server_request(&RequestId::String("mcp4".into()), &request, fallback)
+            .unwrap();
+        let resp = mapper
+            .map_approval_response(
+                &ApprovalId("mcp4".into()),
+                &ApprovalDecision::AcceptForSession,
+            )
+            .unwrap();
+        match resp {
+            ApprovalResponse::Result { value, .. } => {
+                let q = value
+                    .get("answers")
+                    .unwrap()
+                    .get("mcp_tool_call_approval_call_5")
+                    .unwrap();
+                assert_eq!(q["answers"][0], "Allow for this session");
+            }
+            other => panic!("expected Result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_tool_approval_response_elicitation_shape() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let fallback = ThreadId::new();
+        let request = CodexServerRequest::McpServerElicitationRequest(
+            serde_json::from_value(serde_json::json!({
+                "mode": "form",
+                "_meta": {
+                    "codex_approval_kind": "mcp_tool_call",
+                    "persist": "session",
+                    "tool_name": "t",
+                    "threadId": "th1",
+                    "turnId": "t1"
+                },
+                "message": "Allow srv to run tool \"t\"?",
+                "requestedSchema": { "type": "object", "properties": {} }
+            }))
+            .unwrap(),
+        );
+        mapper
+            .map_server_request(&RequestId::String("mcp5".into()), &request, fallback)
+            .unwrap();
+
+        let resp = mapper
+            .map_approval_response(
+                &ApprovalId("mcp5".into()),
+                &ApprovalDecision::AcceptForSession,
+            )
+            .unwrap();
+        match resp {
+            ApprovalResponse::Result { value, .. } => {
+                assert_eq!(value["action"], "accept");
+                assert_eq!(value["_meta"]["persist"], "session");
+            }
+            other => panic!("expected Result, got {other:?}"),
+        }
+
+        // Decline
+        mapper
+            .map_server_request(&RequestId::String("mcp6".into()), &request, fallback)
+            .unwrap();
+        let resp = mapper
+            .map_approval_response(&ApprovalId("mcp6".into()), &ApprovalDecision::Decline)
+            .unwrap();
+        match resp {
+            ApprovalResponse::Result { value, .. } => {
+                assert_eq!(value["action"], "decline");
+            }
+            other => panic!("expected Result, got {other:?}"),
         }
     }
 }
