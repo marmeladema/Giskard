@@ -1,12 +1,13 @@
 //! The persistence store: load/save projects, threads, token ledgers (spec §5).
 
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use giskard_core::ids::{ProjectId, ThreadId, TurnId};
 use giskard_core::model::{Effort, ModelRef};
@@ -88,6 +89,45 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn parse_turn_history(path: &Path, data: &str) -> Result<Vec<Turn>, PersistError> {
+    let lines: Vec<&str> = data.lines().filter(|l| !l.trim().is_empty()).collect();
+    let mut turns = Vec::with_capacity(lines.len());
+    let mut seen_turn_ids = HashSet::new();
+    let last = lines.len().saturating_sub(1);
+    for (i, line) in lines.iter().enumerate() {
+        match serde_json::from_str::<Turn>(line) {
+            Ok(turn) => {
+                if !seen_turn_ids.insert(turn.id) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        turn_id = %turn.id,
+                        line = i + 1,
+                        "skipping duplicate turn id in history"
+                    );
+                    continue;
+                }
+                turns.push(turn);
+            }
+            Err(e) if i == last => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "skipping torn final turn line in history"
+                );
+            }
+            Err(e) => {
+                return Err(PersistError::Corrupt(format!(
+                    "{}: line {}: {}",
+                    path.display(),
+                    i + 1,
+                    e
+                )));
+            }
+        }
+    }
+    Ok(turns)
+}
+
 // ---- Store ----
 
 /// The flat-file persistence store.
@@ -101,6 +141,22 @@ pub struct PersistStore {
     project_index_lock: Mutex<()>,
     /// Per-thread-id write locks so read-modify-write of a thread file is single-writer (§5.4).
     thread_locks: Mutex<HashMap<ThreadId, Arc<Mutex<()>>>>,
+    /// Parsed JSONL history cache, keyed by `(project, thread)`.
+    ///
+    /// The JSONL remains authoritative. This per-process cache only avoids reparsing unchanged
+    /// histories when the user switches between already-opened threads.
+    history_cache: RwLock<HashMap<(ProjectId, ThreadId), Arc<HistoryCacheEntry>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HistoryFileMeta {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+struct HistoryCacheEntry {
+    turns: RwLock<Vec<Turn>>,
+    meta: Mutex<HistoryFileMeta>,
 }
 
 impl PersistStore {
@@ -111,6 +167,7 @@ impl PersistStore {
             config: Mutex::new(None),
             project_index_lock: Mutex::new(()),
             thread_locks: Mutex::new(HashMap::new()),
+            history_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -162,6 +219,162 @@ impl PersistStore {
 
     fn thread_jsonl_path(&self, project: ProjectId, thread: ThreadId) -> PathBuf {
         self.threads_dir(project).join(format!("{}.jsonl", thread))
+    }
+
+    async fn history_file_meta(
+        &self,
+        path: &Path,
+    ) -> Result<Option<HistoryFileMeta>, PersistError> {
+        match tokio::fs::metadata(path).await {
+            Ok(meta) => Ok(Some(HistoryFileMeta {
+                len: meta.len(),
+                modified: meta.modified().ok(),
+            })),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(PersistError::Io(e.to_string())),
+        }
+    }
+
+    async fn history_cache_entry(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+    ) -> Option<Arc<HistoryCacheEntry>> {
+        self.history_cache
+            .read()
+            .await
+            .get(&(project, thread))
+            .cloned()
+    }
+
+    async fn install_history_cache(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+        turns: Vec<Turn>,
+        meta: HistoryFileMeta,
+    ) -> Arc<HistoryCacheEntry> {
+        let entry = Arc::new(HistoryCacheEntry {
+            turns: RwLock::new(turns),
+            meta: Mutex::new(meta),
+        });
+        self.history_cache
+            .write()
+            .await
+            .insert((project, thread), entry.clone());
+        entry
+    }
+
+    async fn current_history_cache_entry(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+    ) -> Result<Option<Arc<HistoryCacheEntry>>, PersistError> {
+        let path = self.thread_jsonl_path(project, thread);
+        let Some(meta) = self.history_file_meta(&path).await? else {
+            self.invalidate_history_cache(project, thread).await;
+            return Ok(None);
+        };
+
+        if let Some(entry) = self.history_cache_entry(project, thread).await {
+            let cached_meta = *entry.meta.lock().await;
+            if cached_meta == meta {
+                return Ok(Some(entry));
+            }
+        }
+
+        let Some((turns, meta)) = self.load_all_turns_uncached(&path, meta).await? else {
+            self.invalidate_history_cache(project, thread).await;
+            return Ok(None);
+        };
+        Ok(Some(
+            self.install_history_cache(project, thread, turns, meta)
+                .await,
+        ))
+    }
+
+    async fn invalidate_history_cache(&self, project: ProjectId, thread: ThreadId) {
+        self.history_cache.write().await.remove(&(project, thread));
+    }
+
+    async fn invalidate_project_history_cache(&self, project: ProjectId) {
+        self.history_cache
+            .write()
+            .await
+            .retain(|(cached_project, _), _| *cached_project != project);
+    }
+
+    async fn update_history_cache_after_append(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+        turn: &Turn,
+        meta_before: Option<HistoryFileMeta>,
+        meta_after: Option<HistoryFileMeta>,
+        appended_len: u64,
+    ) {
+        let Some(entry) = self.history_cache_entry(project, thread).await else {
+            return;
+        };
+        let Some(meta_after) = meta_after else {
+            tracing::error!(
+                %project,
+                %thread,
+                "history append succeeded but metadata refresh failed; invalidating parsed history cache"
+            );
+            self.invalidate_history_cache(project, thread).await;
+            return;
+        };
+
+        let cached_meta = *entry.meta.lock().await;
+
+        let Some(meta_before) = meta_before else {
+            tracing::error!(
+                %project,
+                %thread,
+                "parsed history cache existed but history file metadata was missing before append; invalidating cache"
+            );
+            self.invalidate_history_cache(project, thread).await;
+            return;
+        };
+
+        if cached_meta != meta_before {
+            tracing::debug!(
+                %project,
+                %thread,
+                "history cache was stale before append; invalidating instead of appending in memory"
+            );
+            self.invalidate_history_cache(project, thread).await;
+            return;
+        };
+
+        if meta_after.len != meta_before.len + appended_len {
+            tracing::warn!(
+                %project,
+                %thread,
+                cached_len = meta_before.len,
+                appended_len,
+                actual_len = meta_after.len,
+                "history file changed by more than the appended turn; invalidating parsed history cache"
+            );
+            self.invalidate_history_cache(project, thread).await;
+            return;
+        }
+
+        {
+            let mut turns = entry.turns.write().await;
+            if turns.iter().any(|cached| cached.id == turn.id) {
+                tracing::warn!(
+                    %project,
+                    %thread,
+                    turn_id = %turn.id,
+                    "skipping duplicate turn id in parsed history cache"
+                );
+            } else {
+                turns.push(turn.clone());
+            }
+        }
+        *entry.meta.lock().await = meta_after;
     }
 
     fn tokens_json_path(&self, project: ProjectId) -> PathBuf {
@@ -249,6 +462,7 @@ impl PersistStore {
                 .await
                 .map_err(|e| PersistError::Io(e.to_string()))?;
         }
+        self.invalidate_project_history_cache(id).await;
         Ok(())
     }
 
@@ -327,6 +541,7 @@ impl PersistStore {
         let mut line =
             serde_json::to_string(turn).map_err(|e| PersistError::Serialize(e.to_string()))?;
         line.push('\n');
+        let appended_len = line.len() as u64;
 
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -334,17 +549,61 @@ impl PersistStore {
                 .map_err(|e| PersistError::Io(e.to_string()))?;
         }
 
+        let meta_before = self.history_file_meta(&path).await.ok().flatten();
+        let write_path = path.clone();
         tokio::task::spawn_blocking(move || {
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(&path)?;
+                .open(&write_path)?;
             file.write_all(line.as_bytes())
         })
         .await
         .map_err(|e| PersistError::Io(e.to_string()))?
-        .map_err(|e| PersistError::Io(e.to_string()))
+        .map_err(|e| PersistError::Io(e.to_string()))?;
+
+        let meta_after = self.history_file_meta(&path).await.ok().flatten();
+        self.update_history_cache_after_append(
+            project,
+            thread,
+            turn,
+            meta_before,
+            meta_after,
+            appended_len,
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn load_all_turns_uncached(
+        &self,
+        path: &Path,
+        mut meta_before: HistoryFileMeta,
+    ) -> Result<Option<(Vec<Turn>, HistoryFileMeta)>, PersistError> {
+        for attempt in 0..3 {
+            let data = match tokio::fs::read_to_string(path).await {
+                Ok(d) => d,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(PersistError::Io(e.to_string())),
+            };
+            let Some(meta_after) = self.history_file_meta(path).await? else {
+                return Ok(None);
+            };
+            if meta_after != meta_before {
+                if attempt < 2 {
+                    meta_before = meta_after;
+                    continue;
+                }
+                return Err(PersistError::Io(
+                    "history file changed while loading; retry limit exceeded".into(),
+                ));
+            }
+            return Ok(Some((parse_turn_history(path, &data)?, meta_after)));
+        }
+        Err(PersistError::Io(
+            "history file changed while loading; retry limit exceeded".into(),
+        ))
     }
 
     /// Load every persisted turn from the JSONL history, in order (H4).
@@ -356,49 +615,10 @@ impl PersistStore {
         project: ProjectId,
         thread: ThreadId,
     ) -> Result<Vec<Turn>, PersistError> {
-        let path = self.thread_jsonl_path(project, thread);
-        let data = match tokio::fs::read_to_string(&path).await {
-            Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-            Err(e) => return Err(PersistError::Io(e.to_string())),
+        let Some(entry) = self.current_history_cache_entry(project, thread).await? else {
+            return Ok(vec![]);
         };
-
-        let lines: Vec<&str> = data.lines().filter(|l| !l.trim().is_empty()).collect();
-        let mut turns = Vec::with_capacity(lines.len());
-        let mut seen_turn_ids = HashSet::new();
-        let last = lines.len().saturating_sub(1);
-        for (i, line) in lines.iter().enumerate() {
-            match serde_json::from_str::<Turn>(line) {
-                Ok(turn) => {
-                    if !seen_turn_ids.insert(turn.id) {
-                        tracing::warn!(
-                            path = %path.display(),
-                            turn_id = %turn.id,
-                            line = i + 1,
-                            "skipping duplicate turn id in history"
-                        );
-                        continue;
-                    }
-                    turns.push(turn);
-                }
-                Err(e) if i == last => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "skipping torn final turn line in history"
-                    );
-                }
-                Err(e) => {
-                    return Err(PersistError::Corrupt(format!(
-                        "{}: line {}: {}",
-                        path.display(),
-                        i + 1,
-                        e
-                    )));
-                }
-            }
-        }
-        Ok(turns)
+        Ok(entry.turns.read().await.clone())
     }
 
     /// Load a page of history for display (H4): the last `limit` turns ending just before the
@@ -411,7 +631,10 @@ impl PersistStore {
         before: Option<TurnId>,
         limit: usize,
     ) -> Result<(Vec<Turn>, bool), PersistError> {
-        let all = self.load_all_turns(project, thread).await?;
+        let Some(entry) = self.current_history_cache_entry(project, thread).await? else {
+            return Ok((vec![], false));
+        };
+        let all = entry.turns.read().await;
         let end = match before {
             Some(cursor) => all.iter().position(|t| t.id == cursor).unwrap_or(all.len()),
             None => all.len(),
@@ -486,6 +709,7 @@ impl PersistStore {
                 Err(e) => return Err(PersistError::Io(e.to_string())),
             }
         }
+        self.invalidate_history_cache(project, thread).await;
         Ok(())
     }
 
@@ -923,6 +1147,81 @@ mod tests {
         // 100+200+300 input, 30 output.
         assert_eq!(tf.tokens.total.input, 600);
         assert_eq!(tf.tokens.total.output, 30);
+    }
+
+    #[tokio::test]
+    async fn jsonl_history_cache_updates_on_append_and_invalidates_on_file_change() {
+        use giskard_core::token::TokenUsage;
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+
+        let first = make_turn(TokenUsage::new(100, 10));
+        let second = make_turn(TokenUsage::new(200, 20));
+        store.append_turn(pid, tid, &first).await.unwrap();
+        store.append_turn(pid, tid, &second).await.unwrap();
+
+        let loaded = store.load_all_turns(pid, tid).await.unwrap();
+        assert_eq!(
+            loaded.iter().map(|turn| turn.id).collect::<Vec<_>>(),
+            vec![first.id, second.id,]
+        );
+
+        let entry = store.history_cache_entry(pid, tid).await.unwrap();
+        assert_eq!(entry.turns.read().await.len(), 2);
+
+        let third = make_turn(TokenUsage::new(300, 30));
+        store.append_turn(pid, tid, &third).await.unwrap();
+        assert_eq!(
+            entry
+                .turns
+                .read()
+                .await
+                .iter()
+                .map(|turn| turn.id)
+                .collect::<Vec<_>>(),
+            vec![first.id, second.id, third.id]
+        );
+
+        let (tail, has_more) = store.load_history(pid, tid, None, 2).await.unwrap();
+        assert!(has_more);
+        assert_eq!(
+            tail.iter().map(|turn| turn.id).collect::<Vec<_>>(),
+            vec![second.id, third.id]
+        );
+
+        let path = store.thread_jsonl_path(pid, tid);
+        tokio::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&first).unwrap()),
+        )
+        .await
+        .unwrap();
+        let reloaded = store.load_all_turns(pid, tid).await.unwrap();
+        assert_eq!(
+            reloaded.iter().map(|turn| turn.id).collect::<Vec<_>>(),
+            vec![first.id]
+        );
+
+        let entry = store.history_cache_entry(pid, tid).await.unwrap();
+        let cached_meta = *entry.meta.lock().await;
+        store
+            .update_history_cache_after_append(
+                pid,
+                tid,
+                &second,
+                Some(cached_meta),
+                Some(HistoryFileMeta {
+                    len: cached_meta.len + 2,
+                    modified: cached_meta.modified,
+                }),
+                1,
+            )
+            .await;
+        assert!(store.history_cache_entry(pid, tid).await.is_none());
+
+        store.delete_thread(pid, tid).await.unwrap();
+        assert!(store.history_cache_entry(pid, tid).await.is_none());
     }
 
     #[tokio::test]
