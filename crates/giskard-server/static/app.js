@@ -3197,10 +3197,27 @@ function renderFileChange(body, p) {
   list.className = "item-list";
   for (const c of changes) {
     const li = document.createElement("li");
+    li.className = "file-change-entry";
+    const row = document.createElement("div");
+    row.className = "file-change-row";
     const kind = document.createElement("span");
     kind.className = "mono";
     kind.textContent = c.change || "modified";
-    li.append(kind, document.createTextNode(" "), makePathLink(c.path || "", c.path || "", null));
+    row.append(kind, document.createTextNode(" "), makePathLink(c.path || "", c.path || "", null));
+    if (c.diff) {
+      row.append(document.createTextNode(" "));
+      const diffBtn = document.createElement("button");
+      diffBtn.type = "button";
+      diffBtn.className = "diff-open";
+      diffBtn.textContent = "View diff";
+      diffBtn.title = "Open rendered diff";
+      diffBtn.onclick = (e) => {
+        e.stopPropagation();
+        openDiffOverlay(c.path || "File change", c.diff);
+      };
+      row.append(diffBtn);
+    }
+    li.append(row);
     list.append(li);
   }
   body.append(title, list);
@@ -3687,11 +3704,29 @@ document.addEventListener("click", (e) => {
 function projectFileUrl(kind, path) {
   return `/api/projects/${state.projectId}/${kind}?path=${encodeURIComponent(path)}`;
 }
+function diffStats(diff) {
+  let added = 0;
+  let removed = 0;
+  const lines = String(diff || "").split(/\r?\n/);
+  for (const line of lines) {
+    if (line.startsWith("+++") || line.startsWith("---")) continue;
+    if (line.startsWith("+")) added += 1;
+    else if (line.startsWith("-")) removed += 1;
+  }
+  return { added, removed, lines: lines.length };
+}
+function markdownCodeFence(language, text) {
+  text = String(text || "");
+  const longest = (text.match(/`+/g) || []).reduce((max, run) => Math.max(max, run.length), 0);
+  const fence = "`".repeat(Math.max(3, longest + 1));
+  return `${fence}${language || ""}\n${text}${text.endsWith("\n") ? "" : "\n"}${fence}`;
+}
 async function openCodeOverlay(path, line) {
   if (!state.projectId || !path) return;
   state.codePath = path;
   state.codeLine = normalizeLine(line, null);
   $("codeOverlay").classList.add("open");
+  delete $("codeOverlay").dataset.requestId;
   $("codePath").textContent = state.codeLine ? `${path}#${state.codeLine}` : path;
   $("codeMeta").textContent = "Loading…";
   $("codeView").innerHTML = `<div class="code-empty">Loading source…</div>`;
@@ -3720,8 +3755,49 @@ async function openCodeOverlay(path, line) {
     $("codeDownload").disabled = true;
   }
 }
+async function openDiffOverlay(path, diff) {
+  diff = String(diff || "");
+  if (!state.projectId || !diff.trim()) return;
+  state.codePath = null;
+  state.codeLine = null;
+  $("codeOverlay").classList.add("open");
+  $("codePath").textContent = `Diff: ${path || "File change"}`;
+  const requestId = Math.random().toString(36).slice(2);
+  $("codeOverlay").dataset.requestId = requestId;
+  const stats = diffStats(diff);
+  $("codeMeta").textContent = `Rendering diff... +${stats.added} -${stats.removed} · ${stats.lines.toLocaleString()} lines`;
+  $("codeView").innerHTML = `<div class="code-empty">Rendering diff...</div>`;
+  $("codeDownload").disabled = true;
+
+  const projectId = state.projectId;
+  const markdown = markdownCodeFence("diff", diff);
+  const cacheKey = projectId + "\n" + markdown;
+  const apply = (html) => {
+    if (!$("codeOverlay").classList.contains("open") || $("codeOverlay").dataset.requestId !== requestId || state.codePath !== null || state.projectId !== projectId) return;
+    $("codeMeta").textContent = `Rendered diff · +${stats.added} -${stats.removed} · ${stats.lines.toLocaleString()} lines`;
+    $("codeView").innerHTML = `<div class="diff-overlay md">${html}</div>`;
+    wireCodeCopy($("codeView"));
+  };
+
+  try {
+    if (state.markdownCache.has(cacheKey)) {
+      apply(state.markdownCache.get(cacheKey));
+      return;
+    }
+    const res = await api("POST", `/api/projects/${projectId}/render`, { text: markdown });
+    const html = res && typeof res.html === "string" ? res.html : "";
+    state.markdownCache.set(cacheKey, html);
+    apply(html);
+  } catch (e) {
+    if (!$("codeOverlay").classList.contains("open") || $("codeOverlay").dataset.requestId !== requestId || state.codePath !== null || state.projectId !== projectId) return;
+    console.warn("Giskard diff render failed; hiding raw diff preview.", e);
+    $("codeMeta").textContent = "Could not render diff";
+    $("codeView").innerHTML = `<div class="code-empty">Could not render diff preview.</div>`;
+  }
+}
 function closeCodeOverlay() {
   $("codeOverlay").classList.remove("open");
+  delete $("codeOverlay").dataset.requestId;
   state.codePath = null;
   state.codeLine = null;
 }
