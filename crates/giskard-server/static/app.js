@@ -23,6 +23,7 @@ let state = {
   awaitingInitialThreadState:false, awaitingThreadResync:false, contextWindow:0, contextUsed:null, tokenLedger:null, approvalPolicy:"ask", currentModel:null,
   mcpServers:[], mcpCapabilities:{ status:false, reload:false, oauth_login:false }, mcpLoading:false, mcpError:null, expandedMcps:new Set(),
   threadReadOnly:false, readOnlyProvider:null, readOnlyMessage:null,
+  currentPlan:null, planExpanded:localStorage.getItem("giskard.planExpanded")==="1",
   collapsedProjects:new Set(loadCollapsedProjects())
 };
 const COMMAND_AUTO_COLLAPSE_LINES = 120;
@@ -1074,7 +1075,7 @@ function renderPersistedTurn(turn) {
   if (!hasUserItem && inputText) {
     renderItemBody(bubble("user","you"), { kind:"user_message", text: inputText });
   }
-  for (const it of items) addItem(it);
+  for (const it of items) addItem(it, true);
   const st = turn.status;
   if (st && (st.kind==="failed" || st.kind==="interrupted")) {
     errorBubble(st.message || (st.kind==="interrupted" ? "Turn interrupted." : "Turn failed."));
@@ -1101,6 +1102,7 @@ function handleEvent(ev) {
       state.streamItemId = null;
       state.streamElsByItemId.clear();
       state.itemKindsByItemId.clear();
+      clearPlanCard();   // a new turn starts a fresh plan
       setTurnActive(true);
       break;
     case "item_started":
@@ -1138,6 +1140,7 @@ function handleEvent(ev) {
       state.itemKindsByItemId.clear();
       detachRunningCommands();
       finishCompactPending();
+      clearPlanCard();   // the plan ends with its turn
       setTurnActive(false);
       breakTaskGroup();
       break;
@@ -2752,9 +2755,16 @@ function finalizeStreamedItem(item) {
   $("transcript").scrollTop = $("transcript").scrollHeight;
   return true;
 }
-function addItem(item) {
+function addItem(item, fromHistory) {
   const p = item && item.payload ? item.payload : item;
   if (!p) return;
+  // Plan updates are shown in the pinned plan card above the composer, not as transcript rows. Live
+  // updates drive the card; persisted (history) plan rows are simply dropped — a finished plan's
+  // card has already disappeared, so there is nothing to replay.
+  if (isPlanItem(item)) {
+    if (!fromHistory) updatePlanCard(item);
+    return;
+  }
   if (isRenderedItem(item)) return;
   if (!hasVisiblePayload(p)) {
     markRenderedItem(item);
@@ -2796,6 +2806,7 @@ function addItem(item) {
   markRenderedItem(item);
 }
 function resetRenderState() {
+  clearPlanCard();   // dropping/switching threads clears any pinned plan
   state.streamEl = null;
   state.streamItemId = null;
   state.streamElsByItemId = new Map();
@@ -3315,6 +3326,87 @@ function renderActivity(p) {
   const meta = metadata ? `<pre class="out">${escapeHtml(jsonPreview(metadata))}</pre>` : "";
   return `<div>${escapeHtml(p.title||"Activity")}</div>${detail}${meta}`;
 }
+// A plan-update activity carries its steps as a `[{ step, status }]` metadata array (status is one
+// of "pending" | "inProgress" | "completed"). Detect it by shape so the check is independent of the
+// activity title.
+function planFromActivity(p) {
+  const md = p && p.metadata;
+  if (!Array.isArray(md) || !md.length) return null;
+  const ok = md.every(it => it && typeof it === "object"
+    && typeof it.step === "string" && typeof it.status === "string");
+  return ok ? md : null;
+}
+function isPlanItem(item) {
+  const p = item && (item.payload || item);
+  return !!(p && p.kind === "activity" && planFromActivity(p));
+}
+const PLAN_STEP_STATES = { completed:"done", inProgress:"doing", pending:"todo" };
+const PLAN_STEP_ICONS = { done:"✓", doing:"◐", todo:"○" };
+// The "current" step is the one being worked on: the first in-progress step, or the first pending
+// step if none is in progress. Returns null once every step is completed (the plan is finished).
+function currentPlanStepIndex(steps) {
+  const doing = steps.findIndex(s => s.status === "inProgress");
+  if (doing !== -1) return doing;
+  const pending = steps.findIndex(s => s.status !== "completed");
+  return pending === -1 ? null : pending;
+}
+// The plan activity `detail` is "explanation\n<status>: <step>\n…"; strip the trailing step lines
+// (which duplicate the checklist) to isolate the agent's explanation.
+function planExplanation(p, steps) {
+  const stepLines = steps.map(s => `${s.status}: ${s.step}`);
+  const lines = String(p && p.detail || "").split("\n");
+  for (let i = stepLines.length - 1; i >= 0 && lines.length; i--) {
+    if (lines[lines.length - 1] === stepLines[i]) lines.pop();
+    else break;
+  }
+  return lines.join("\n").trim();
+}
+function renderPlanSteps(steps) {
+  const items = steps.map(s => {
+    const cls = PLAN_STEP_STATES[s.status] || "todo";
+    return `<li class="plan-step ${cls}"><span class="plan-step-icon" aria-hidden="true">${PLAN_STEP_ICONS[cls]}</span><span class="plan-step-text">${escapeHtml(s.step)}</span></li>`;
+  }).join("");
+  return `<ul class="plan-steps">${items}</ul>`;
+}
+
+/* ---------- plan card (pinned above the composer) ---------- */
+// Take a live plan-update activity and reflect it in the card. A plan whose steps are all completed
+// is finished, so the card is cleared instead of shown.
+function updatePlanCard(item) {
+  const p = item && (item.payload || item);
+  const steps = planFromActivity(p);
+  if (!steps) return;
+  if (currentPlanStepIndex(steps) === null) { clearPlanCard(); return; }
+  state.currentPlan = { steps, explanation: planExplanation(p, steps) };
+  renderPlanCard();
+}
+function clearPlanCard() {
+  state.currentPlan = null;
+  renderPlanCard();
+}
+function setPlanExpanded(expanded) {
+  state.planExpanded = !!expanded;
+  localStorage.setItem("giskard.planExpanded", state.planExpanded ? "1" : "0");
+  renderPlanCard();
+}
+function renderPlanCard() {
+  const card = $("planCard");
+  if (!card) return;
+  const plan = state.currentPlan;
+  const idx = plan ? currentPlanStepIndex(plan.steps) : null;
+  if (!plan || idx === null) { card.hidden = true; return; }
+  const steps = plan.steps;
+  $("planCardCount").textContent = `${idx + 1}/${steps.length}`;
+  $("planCardCurrent").textContent = steps[idx].step;
+  const body = $("planCardBody");
+  const expl = plan.explanation ? `<div class="plan-explanation">${escapeHtml(plan.explanation)}</div>` : "";
+  body.innerHTML = expl + renderPlanSteps(steps);
+  card.classList.toggle("expanded", state.planExpanded);   // CSS rotates the caret when expanded
+  body.hidden = !state.planExpanded;
+  $("planCardToggle").setAttribute("aria-expanded", state.planExpanded ? "true" : "false");
+  card.hidden = false;
+}
+$("planCardToggle").onclick = () => setPlanExpanded(!state.planExpanded);
 function visibleActivityMetadata(p) {
   if (!p || !p.metadata) return null;
   if (isContextCompactionPayload(p)) return null;

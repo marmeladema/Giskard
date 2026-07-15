@@ -74,6 +74,17 @@
       </header>
       <div id="transcript" class="muted" style="padding:24px">Select or create a thread to begin.</div>
       <div class="readonly-banner" id="readOnlyBanner" hidden></div>
+      <!-- Live plan for the active turn: a collapsible card pinned above the composer. Collapsed it
+           shows "task N/total · current step"; expanded it shows the full checklist. It appears while
+           a turn has an unfinished plan and hides when the plan completes or the turn ends. -->
+      <div class="plan-card" id="planCard" hidden>
+        <button type="button" class="plan-card-head" id="planCardToggle" aria-expanded="false" aria-controls="planCardBody">
+          <span class="plan-card-caret" id="planCardCaret" aria-hidden="true">▸</span>
+          <span class="plan-card-count mono" id="planCardCount">0/0</span>
+          <span class="plan-card-current" id="planCardCurrent"></span>
+        </button>
+        <div class="plan-card-body" id="planCardBody" hidden></div>
+      </div>
       <div class="composer" id="composer" style="display:none">
         <textarea id="input" placeholder="Message the agent…  (Enter to send, Shift+Enter for newline)"></textarea>
         <button class="primary" id="sendBtn">Send</button>
