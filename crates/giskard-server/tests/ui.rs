@@ -887,6 +887,31 @@ async fn index_page_is_served_and_public() {
         "UI renders generic activity items"
     );
     assert!(
+        body.contains("function planFromActivity")
+            && body.contains("completed:\"done\", inProgress:\"doing\", pending:\"todo\"")
+            && body.contains("class=\"plan-step"),
+        "plan steps are detected by shape and rendered as a status checklist"
+    );
+    assert!(
+        body.contains("id=\"planCard\"")
+            && body.contains("function renderPlanCard")
+            && body.contains("if (isPlanItem(item)) {")
+            && body.contains("if (!fromHistory) updatePlanCard(item);"),
+        "plan updates drive a card above the composer instead of a transcript row"
+    );
+    assert!(
+        body.contains("function currentPlanStepIndex")
+            && body.contains("`${idx + 1}/${steps.length}`")
+            && body.contains("planCardCurrent")
+            && body.contains("if (!plan || idx === null) { card.hidden = true; return; }"),
+        "collapsed plan card shows current/total and the current step, and hides when finished"
+    );
+    assert!(
+        body.contains("clearPlanCard();   // the plan ends with its turn")
+            && body.contains("clearPlanCard();   // a new turn starts a fresh plan"),
+        "the plan card is cleared when the turn starts and ends"
+    );
+    assert!(
         body.contains("visibleActivityMetadata")
             && body.contains("if (isContextCompactionPayload(p)) return null"),
         "UI hides protocol-only context compaction metadata from old persisted activity rows"
@@ -1034,7 +1059,7 @@ async fn index_page_is_served_and_public() {
         "UI renders completed events with full item metadata"
     );
     assert!(
-        body.contains("addItem(it)"),
+        body.contains("addItem(it, true)"),
         "UI replays persisted history with full item metadata"
     );
     assert!(

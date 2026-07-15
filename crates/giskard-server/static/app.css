@@ -185,6 +185,34 @@
   .msg.tool { background:#151521; border:1px solid #3b3b67; }
   .msg.tasks { max-width:100%; background:#10151c; border:1px solid var(--border); }
   .msg.activity { background:#13181c; border:1px solid var(--border); color:#c9d1d9; }
+  /* Plan progress: rendered as a collapsible card pinned above the composer (see .plan-card). */
+  .plan-explanation { color:var(--muted); font-size:13px; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .plan-steps { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:4px; }
+  .plan-step { display:grid; grid-template-columns:16px minmax(0,1fr); gap:8px; align-items:baseline; }
+  .plan-step-icon { font-size:12px; line-height:1.5; text-align:center; }
+  .plan-step-text { min-width:0; overflow-wrap:anywhere; }
+  .plan-step.todo { color:var(--muted); }
+  .plan-step.todo .plan-step-icon { color:var(--muted); }
+  .plan-step.doing { color:var(--fg); font-weight:600; }
+  .plan-step.doing .plan-step-icon { color:var(--accent); }
+  .plan-step.done { color:var(--muted); }
+  .plan-step.done .plan-step-icon { color:#3fb950; }
+  .plan-step.done .plan-step-text { text-decoration:line-through; text-decoration-color:var(--border); }
+  /* Collapsible plan card above the composer. */
+  .plan-card { border-top:1px solid var(--border); background:var(--panel); }
+  .plan-card[hidden] { display:none; }
+  .plan-card-head {
+    display:flex; align-items:center; gap:8px; width:100%; padding:8px 12px;
+    border:0; border-radius:0; background:transparent; color:var(--fg); font:inherit; text-align:left; cursor:pointer;
+  }
+  .plan-card-head:hover { background:var(--panel2); }
+  .plan-card-caret { flex:none; font-size:10px; color:var(--muted); transition:transform .12s; }
+  .plan-card.expanded .plan-card-caret { transform:rotate(90deg); }
+  .plan-card-count { flex:none; font-size:12px; font-weight:600; color:var(--accent); }
+  .plan-card-current { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--muted); font-size:13px; }
+  .plan-card-body { padding:6px 12px 12px; max-height:40vh; overflow:auto; border-top:1px solid var(--border); }
+  .plan-card-body[hidden] { display:none; }
+  .plan-card-body .plan-explanation { margin-bottom:8px; }
   .msg.approval { background:#241d10; border:1px solid #d29922; max-width:100%; }
   .msg.approval.resolved { opacity:.72; }
   .msg.server-request { background:#161826; border:1px solid #6e40c9; max-width:100%; }
