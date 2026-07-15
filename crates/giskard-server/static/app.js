@@ -13,7 +13,7 @@ let state = {
   draftThread:null, firstTurnStartingThreadId:null,
   models:[], pendingModelBeforeSelect:null, streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null,
   streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), itemKindsByItemId:new Map(),
-  pendingApprovals:new Map(), pendingServerRequests:new Map(),
+  pendingApprovals:new Map(), answeredApprovals:new Map(), renderedApprovalStateKeys:new Set(), pendingServerRequests:new Map(),
   runningCommands:new Map(), commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null,
   commandPayloadsByItemId:new Map(), endedCommandsByItemId:new Map(), expandedCommandOutputs:new Set(), manuallyToggledCommandOutputs:new Set(),
   toolPayloadsByItemId:new Map(), toolBodyElsByItemId:new Map(), expandedToolOutputs:new Set(), manuallyToggledToolOutputs:new Set(),
@@ -1060,6 +1060,7 @@ function renderHistoryPage(msg) {
     t.scrollTop += t.scrollHeight - heightBefore;
   } else {
     for (const turn of turns) renderPersistedTurn(turn);
+    renderAnsweredApprovalDecisionsForThread();
   }
 }
 
@@ -1194,11 +1195,15 @@ function renderLiveTurnSnapshot(snap) {
 function renderApprovalRequest(request) {
   if (!request || !request.id) return;
   const id = String(request.id);
-  if (state.pendingApprovals.has(id)) return;
+  const stateKey = approvalStateKey(request);
+  if (state.pendingApprovals.has(id) || state.renderedApprovalStateKeys.has(stateKey)) return;
+  const answered = state.answeredApprovals.get(stateKey);
   const body = bubble("approval","approval");
   const msg = body.parentElement;
   msg.dataset.approvalId = id;
-  state.pendingApprovals.set(id, msg);
+  msg.dataset.approvalStateKey = stateKey;
+  state.renderedApprovalStateKeys.add(stateKey);
+  if (!answered) state.pendingApprovals.set(id, { msg, request, stateKey });
 
   const title = document.createElement("div");
   title.className = "approval-title";
@@ -1220,6 +1225,11 @@ function renderApprovalRequest(request) {
     body.append(detailEl);
   }
   renderApprovalMetadata(body, request.metadata || []);
+
+  if (answered) {
+    applyApprovalDecision(msg, answered.decision);
+    return;
+  }
 
   const actions = document.createElement("div");
   actions.className = "approval-actions";
@@ -1312,21 +1322,68 @@ function addApprovalButton(container, id, decision, label, cls, available) {
   container.append(btn);
 }
 function respondApproval(id, decision) {
-  const msg = state.pendingApprovals.get(id);
-  if (!msg) return;
+  const entry = state.pendingApprovals.get(id);
+  if (!entry) return;
+  const msg = entry.msg;
   msg.querySelectorAll("button").forEach(btn => btn.disabled = true);
   if (!send({ type:"approval_decision", request_id:id, decision })) {
     msg.querySelectorAll("button").forEach(btn => btn.disabled = false);
     notice(`Approval response not sent: WebSocket is ${state.wsStatus}.`, "error");
     return;
   }
-  msg.classList.add("resolved");
-  const body = msg.querySelector(".body");
-  const status = document.createElement("div");
-  status.className = "meta";
-  status.textContent = `Sent: ${approvalDecisionLabel(decision)}`;
-  body.append(status);
+  state.answeredApprovals.set(entry.stateKey || msg.dataset.approvalStateKey || approvalStateKey(id), {
+    request: entry.request,
+    decision
+  });
+  applyApprovalDecision(msg, decision);
   state.pendingApprovals.delete(id);
+}
+function renderAnsweredApprovalDecisionsForThread() {
+  if (!state.threadId) return;
+  const prefix = `${state.threadId}\n`;
+  for (const [key, answered] of state.answeredApprovals.entries()) {
+    if (!key.startsWith(prefix) || !answered || !answered.request) continue;
+    renderApprovalRequest(answered.request);
+  }
+}
+function approvalStateKey(requestOrId) {
+  if (requestOrId && typeof requestOrId === "object") {
+    return [
+      state.threadId || "",
+      String(requestOrId.id || ""),
+      JSON.stringify(requestOrId.kind || {}),
+      String(requestOrId.reason || ""),
+      JSON.stringify(requestOrId.metadata || [])
+    ].join("\n");
+  }
+  return `${state.threadId || ""}\n${String(requestOrId || "")}`;
+}
+function applyApprovalDecision(msg, decision) {
+  if (!msg) return;
+  msg.classList.add("resolved");
+  msg.classList.remove("decision-accept", "decision-session", "decision-decline", "decision-cancel");
+  msg.classList.add(approvalDecisionClass(decision));
+  msg.querySelectorAll(".approval-actions").forEach(el => el.remove());
+  msg.querySelectorAll("button").forEach(btn => btn.disabled = true);
+  const title = msg.querySelector(".approval-title");
+  if (title && !title.dataset.baseTitle) title.dataset.baseTitle = title.textContent || "";
+  if (title) title.textContent = `${approvalDecisionLabel(decision)}: ${title.dataset.baseTitle || "Approval"}`;
+  const body = msg.querySelector(".body");
+  if (!body) return;
+  let status = body.querySelector(".approval-result");
+  if (!status) {
+    status = document.createElement("div");
+    status.className = "approval-result";
+    body.append(status);
+  }
+  status.textContent = `Decision: ${approvalDecisionLabel(decision)}`;
+}
+function approvalDecisionClass(decision) {
+  if (decision==="accept") return "decision-accept";
+  if (decision==="accept_for_session") return "decision-session";
+  if (decision==="decline") return "decision-decline";
+  if (decision==="cancel") return "decision-cancel";
+  return "decision-cancel";
 }
 function approvalDecisionLabel(decision) {
   if (decision==="accept_for_session") return "Session";
@@ -2855,6 +2912,7 @@ function resetRenderState() {
   state.renderedHarnessItemIds = new Set();
   state.itemKindsByItemId = new Map();
   state.pendingApprovals = new Map();
+  state.renderedApprovalStateKeys = new Set();
   state.pendingServerRequests = new Map();
   state.runningCommands = new Map();
   state.commandBodyElsByItemId = new Map();

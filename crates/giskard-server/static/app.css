@@ -233,13 +233,19 @@
   .plan-card-body[hidden] { display:none; }
   .plan-card-body .plan-explanation { margin-bottom:8px; }
   .msg.approval { background:#241d10; border:1px solid #d29922; max-width:100%; }
-  .msg.approval.resolved { opacity:.72; }
+  .msg.approval.resolved.decision-accept,
+  .msg.approval.resolved.decision-session { background:#172217; border-color:#3fb950; }
+  .msg.approval.resolved.decision-decline { background:#2b1618; border-color:#f85149; }
+  .msg.approval.resolved.decision-cancel { background:#221d14; border-color:#d29922; }
   .msg.server-request { background:#161826; border:1px solid #6e40c9; max-width:100%; }
   .msg.server-request.resolved { opacity:.72; }
   .msg .role { font-size:11px; text-transform:uppercase; letter-spacing:.05em; opacity:.7; margin-bottom:4px; }
   .msg .body { min-width:0; max-width:100%; overflow-wrap:anywhere; }
   .approval-title { font-weight:600; margin-bottom:4px; }
   .approval-detail { font-family:var(--mono); font-size:12.5px; color:#f0d98c; margin-top:6px; }
+  .approval-result { margin-top:8px; color:#7ee787; font-size:12.5px; font-weight:600; }
+  .decision-decline .approval-result { color:#ffb4ae; }
+  .decision-cancel .approval-result { color:#f0d98c; }
   .approval-metadata { display:grid; gap:5px; margin-top:8px; }
   .approval-meta-row { display:grid; grid-template-columns:minmax(120px,max-content) minmax(0,1fr); gap:8px; align-items:start; font-size:12.5px; }
   .approval-meta-label { color:var(--muted); }
