@@ -128,6 +128,52 @@ async fn index_page_is_served_and_public() {
         "UI de-duplicates pending approval cards"
     );
     assert!(
+        body.contains("answeredApprovals")
+            && body.contains("approvalStateKey(request)")
+            && body.contains("JSON.stringify(requestOrId.kind")
+            && body.contains("String(requestOrId.reason")
+            && body.contains("JSON.stringify(requestOrId.metadata")
+            && body.contains("state.answeredApprovals.set")
+            && body.contains("request: entry.request"),
+        "UI remembers answered approvals without matching different reused request ids"
+    );
+    assert!(
+        body.contains("renderAnsweredApprovalDecisionsForThread")
+            && body.contains("renderApprovalRequest(answered.request)")
+            && body.contains("state.renderedApprovalStateKeys"),
+        "UI replays answered approval decisions after thread history resyncs"
+    );
+    assert!(
+        body.contains("applyApprovalDecision")
+            && body.contains(".approval-actions")
+            && body.contains("approval-result")
+            && body.contains("approvalDecisionClass"),
+        "UI renders answered approvals as decision cards instead of disabled prompts"
+    );
+    assert!(
+        body.contains("decision-decline") && body.contains("decision-cancel"),
+        "UI styles declined and cancelled approvals distinctly from accepted approvals"
+    );
+    assert!(
+        body.contains("if (decision===\"accept\") return \"decision-accept\"")
+            && body.contains("if (decision===\"accept_for_session\") return \"decision-session\"")
+            && body.contains("if (decision===\"decline\") return \"decision-decline\"")
+            && body.contains("if (decision===\"cancel\") return \"decision-cancel\""),
+        "UI maps every approval decision to an explicit resolved-card class"
+    );
+    assert!(
+        body.contains("if (decision===\"accept_for_session\") return \"Session\"")
+            && body.contains("return decision.charAt(0).toUpperCase() + decision.slice(1)"),
+        "UI labels session approvals explicitly and labels other decisions predictably"
+    );
+    assert!(
+        body.contains(".msg.approval.resolved.decision-accept")
+            && body.contains(".msg.approval.resolved.decision-session")
+            && body.contains(".msg.approval.resolved.decision-decline")
+            && body.contains(".msg.approval.resolved.decision-cancel"),
+        "UI has distinct resolved approval styles for accept, session, decline, and cancel"
+    );
+    assert!(
         body.contains("renderApprovalMetadata(body, request.metadata || [])"),
         "approval cards render structured approval metadata"
     );
