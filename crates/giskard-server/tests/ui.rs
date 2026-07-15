@@ -1018,11 +1018,11 @@ async fn index_page_is_served_and_public() {
         "transcript rows get a copy button that prefers the raw message source"
     );
     assert!(
-        body.contains("function revealRowCopy")
-            && body.contains(".msg.copy-revealed")
-            && body.contains("@media (hover:none)")
-            && body.contains("@media (hover:hover)"),
-        "the row copy button reveals on hover (pointer) and on tap (touch)"
+        body.contains("@media (hover:hover)")
+            && body.contains(".touch .row-copy")
+            && body.contains("navigator.maxTouchPoints > 0")
+            && body.contains("document.documentElement.classList.add(\"touch\")"),
+        "row copy button reveals on hover for pointers and stays visible on touch-capable devices"
     );
     assert!(
         body.contains("openCodeOverlay"),

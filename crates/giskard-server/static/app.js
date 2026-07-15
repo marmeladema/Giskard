@@ -1758,9 +1758,19 @@ function attachRowCopy(el) {
     resetTimer = setTimeout(() => { btn.textContent = "Copy"; btn.classList.remove("ok", "err"); }, 1500);
   };
   el.append(btn);
-  // Touch reveal: a tap on the row (not on a link/button/other control) shows this row's button.
-  el.addEventListener("click", (e) => {
-    if (e.target.closest("button, a, input, select, textarea")) return;
+  // Touch/pen reveal: tapping the row (not an in-row control) shows this row's button. Use pointer
+  // events with a tap check rather than `click` — `click` doesn't fire on plain elements in iOS
+  // Safari, and pointer events don't depend on the `hover` media query being reported correctly.
+  let down = null;
+  el.addEventListener("pointerdown", (e) => {
+    down = e.pointerType === "mouse" ? null : { x:e.clientX, y:e.clientY, t:Date.now() };
+  });
+  el.addEventListener("pointercancel", () => { down = null; });
+  el.addEventListener("pointerup", (e) => {
+    const d = down; down = null;
+    if (!d) return;                                             // mouse, or no matching down
+    if (Math.hypot(e.clientX - d.x, e.clientY - d.y) > 10 || Date.now() - d.t > 700) return; // scroll/long-press
+    if (e.target.closest("button, a, input, select, textarea")) return;   // let controls do their thing
     revealRowCopy(el);
   });
 }
@@ -1768,11 +1778,16 @@ function revealRowCopy(el) {
   document.querySelectorAll(".msg.copy-revealed").forEach(m => { if (m !== el) m.classList.remove("copy-revealed"); });
   el.classList.toggle("copy-revealed");
 }
-// A tap away from any row dismisses the revealed copy button on touch devices.
-document.addEventListener("click", (e) => {
+// A tap away from any row dismisses the revealed copy button.
+document.addEventListener("pointerup", (e) => {
   if (e.target.closest(".msg")) return;
   document.querySelectorAll(".msg.copy-revealed").forEach(m => m.classList.remove("copy-revealed"));
 });
+// Mark touch-capable devices so the row copy button stays faintly visible (and tappable) there,
+// rather than depending on the `hover` media query, which some devices report incorrectly.
+if (navigator.maxTouchPoints > 0 || "ontouchstart" in window) {
+  document.documentElement.classList.add("touch");
+}
 function bubble(cls, role) {
   breakTaskGroup();
   return appendBubble(cls, role);
