@@ -8,7 +8,15 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.45
+**Version:** 1.46
+
+**Changelog (1.45 → 1.46), per-process parsed history cache:**
+- **HC1:** `PersistStore` maintains a per-process parsed JSONL history cache keyed by
+  `(ProjectId, ThreadId)`. The authoritative source remains `<thread_id>.jsonl`; cache entries are
+  only reused when file metadata still matches, appended to only after the disk append succeeds, and
+  invalidated on thread/project deletion or unexpected metadata changes. This keeps thread switching
+  and repeated history paging from reparsing unchanged histories while preserving the history-first
+  crash-consistency contract.
 
 **Changelog (1.44 → 1.45), transcript sticky-scroll after expanded cards:**
 - **SC1:** Live transcript auto-scroll captures whether the user was already near the bottom before
@@ -1634,7 +1642,10 @@ there is one source of truth to correct if needed.
   scope (§1.2). After appending, the server updates `<thread_id>.json` (token aggregates,
   `updated_at`) — history-first, so a crash between the two leaves the turn recoverable and the
   aggregates rebuildable from the JSONL (`recompute_aggregates`, treating aggregates as a cache like
-  `context_window`, C4). The metadata `.json` never holds `turns[]`.
+  `context_window`, C4). The metadata `.json` never holds `turns[]`. The server may cache the parsed
+  history in memory for the process lifetime, but the cache is never authoritative: reads validate
+  file metadata before reuse, disk append succeeds before in-memory append, and delete/repair paths
+  invalidate stale entries.
 - **Crash consistency:** because writes are atomic renames, a crash leaves either the old or
   the new complete file, never a partial one. On startup the server validates each JSON file;
   a corrupt file is moved aside to `<file>.corrupt-<ts>` and logged, and the app continues
