@@ -1011,6 +1011,20 @@ async fn index_page_is_served_and_public() {
         "clipboard copy has an async-API path with a legacy execCommand fallback"
     );
     assert!(
+        body.contains("function attachRowCopy")
+            && body.contains("btn.className = \"row-copy\"")
+            && body.contains("el.dataset.copyText != null")
+            && body.contains("msg.dataset.copyText = p.text"),
+        "transcript rows get a copy button that prefers the raw message source"
+    );
+    assert!(
+        body.contains("function revealRowCopy")
+            && body.contains(".msg.copy-revealed")
+            && body.contains("@media (hover:none)")
+            && body.contains("@media (hover:hover)"),
+        "the row copy button reveals on hover (pointer) and on tap (touch)"
+    );
+    assert!(
         body.contains("openCodeOverlay"),
         "UI opens a source overlay for linked paths"
     );

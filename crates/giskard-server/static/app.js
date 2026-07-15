@@ -1726,12 +1726,53 @@ function appendBubble(cls, role) {
   const r = document.createElement("div"); r.className="role"; r.textContent=role;
   const body = document.createElement("div"); body.className="body";
   el.append(r, body);
+  // The task-group container is a wrapper, not a message; its child rows get their own buttons.
+  if (!cls.includes("task-group")) attachRowCopy(el);
   if (followBottom) el.dataset.followBottom = "true";
   const t = renderTarget();
   t.append(el);
   keepTranscriptAtBottom(followBottom);
   return body;
 }
+// Give a transcript row a small copy button. It copies the row's raw source when we have it
+// (`dataset.copyText`, set for Markdown messages so they paste back as Markdown), otherwise the
+// rendered text. On touch devices the button is revealed by tapping the row (see revealRowCopy).
+function attachRowCopy(el) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "row-copy";
+  btn.textContent = "Copy";
+  btn.title = "Copy this message";
+  btn.setAttribute("aria-label", "Copy this message");
+  let resetTimer = 0;
+  btn.onclick = async (e) => {
+    e.stopPropagation();
+    const raw = el.dataset.copyText != null
+      ? el.dataset.copyText
+      : (el.querySelector(".body") ? el.querySelector(".body").textContent : "");
+    const ok = await copyToClipboard(raw);
+    btn.textContent = ok ? "Copied" : "Failed";
+    btn.classList.toggle("ok", ok);
+    btn.classList.toggle("err", !ok);
+    clearTimeout(resetTimer);
+    resetTimer = setTimeout(() => { btn.textContent = "Copy"; btn.classList.remove("ok", "err"); }, 1500);
+  };
+  el.append(btn);
+  // Touch reveal: a tap on the row (not on a link/button/other control) shows this row's button.
+  el.addEventListener("click", (e) => {
+    if (e.target.closest("button, a, input, select, textarea")) return;
+    revealRowCopy(el);
+  });
+}
+function revealRowCopy(el) {
+  document.querySelectorAll(".msg.copy-revealed").forEach(m => { if (m !== el) m.classList.remove("copy-revealed"); });
+  el.classList.toggle("copy-revealed");
+}
+// A tap away from any row dismisses the revealed copy button on touch devices.
+document.addEventListener("click", (e) => {
+  if (e.target.closest(".msg")) return;
+  document.querySelectorAll(".msg.copy-revealed").forEach(m => m.classList.remove("copy-revealed"));
+});
 function bubble(cls, role) {
   breakTaskGroup();
   return appendBubble(cls, role);
@@ -2870,6 +2911,13 @@ function renderItemBody(body, p) {
   msg.className = "msg " + classForPayload(p);
   msg.querySelector(".role").textContent = roleForPayload(p);
   clearRowToggle(msg);
+  // Markdown messages keep their raw source so the row copy button yields Markdown, not rendered
+  // text; other rows fall back to the rendered text.
+  if (p.kind==="agent_message" || p.kind==="reasoning" || p.kind==="user_message") {
+    msg.dataset.copyText = p.text || "";
+  } else {
+    delete msg.dataset.copyText;
+  }
   body.replaceChildren();
   if (p.kind==="command_execution") {
     const itemId = msg.dataset.commandItemId || "";

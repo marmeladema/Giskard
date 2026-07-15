@@ -174,8 +174,27 @@
   #transcript::-webkit-scrollbar-thumb:hover { background:var(--scroll-thumb-hover); }
   #transcript::-webkit-scrollbar-corner { background:var(--scroll-track); }
   .msg {
+    position:relative;
     max-width:80%; min-width:0; margin:10px 0; padding:10px 12px; border-radius:10px;
     white-space:pre-wrap; overflow-wrap:anywhere; word-wrap:break-word;
+  }
+  /* Per-row copy button: small and translucent, top-right of a transcript row. It reveals on hover
+     on pointer devices, and on tap (via .copy-revealed) on touch devices where there is no hover. */
+  .row-copy {
+    position:absolute; top:6px; right:8px; z-index:3;
+    padding:1px 7px; font-size:11px; line-height:1.6;
+    color:var(--muted); background:var(--panel); border:1px solid var(--border); border-radius:5px;
+    opacity:0; transition:opacity .12s; cursor:pointer;
+  }
+  .row-copy:hover { color:var(--fg); border-color:var(--accent); }
+  .row-copy.ok { color:#3fb950; border-color:#238636; opacity:1; }
+  .row-copy.err { color:#f85149; border-color:#da3633; opacity:1; }
+  @media (hover:hover) {
+    .msg:hover > .row-copy, .msg:focus-within > .row-copy { opacity:.6; }
+    .msg > .row-copy:hover, .msg > .row-copy:focus { opacity:1; }
+  }
+  @media (hover:none) {
+    .msg.copy-revealed > .row-copy { opacity:.9; }
   }
   .msg.user { background:var(--accent); color:#fff; margin-left:auto; }
   .msg.agent { background:var(--panel2); }
