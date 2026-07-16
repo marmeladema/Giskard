@@ -152,6 +152,12 @@ async fn index_page_is_served_and_public() {
         "UI renders answered approvals as decision cards instead of disabled prompts"
     );
     assert!(
+        body.contains(
+            "msg.querySelectorAll(\".approval-actions\").forEach(el => el.remove());\n  const title = msg.querySelector(\".approval-title\");"
+        ),
+        "resolved approvals keep the row copy button enabled"
+    );
+    assert!(
         body.contains("decision-decline") && body.contains("decision-cancel"),
         "UI styles declined and cancelled approvals distinctly from accepted approvals"
     );
@@ -181,6 +187,11 @@ async fn index_page_is_served_and_public() {
     assert!(
         body.contains("approval-meta-row"),
         "approval metadata is rendered as dedicated rows"
+    );
+    assert!(
+        body.contains("return kind.command || \"(empty command)\"")
+            && !body.contains("const cwd = kind.cwd ? `\\n${kind.cwd}` : \"\""),
+        "command approval cwd is rendered as metadata, not as a second detail line"
     );
     assert!(
         body.contains("item.kind === \"path\" && item.source_link"),
