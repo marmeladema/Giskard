@@ -154,6 +154,7 @@ fn server_message_kind(msg: &ServerMessage) -> &'static str {
         ServerMessage::RunningTasks { .. } => "running_tasks",
         ServerMessage::TokenUpdate { .. } => "token_update",
         ServerMessage::ApprovalRequest { .. } => "approval_request",
+        ServerMessage::ApprovalResolved { .. } => "approval_resolved",
         ServerMessage::Error { .. } => "error",
         ServerMessage::Pong => "pong",
     }

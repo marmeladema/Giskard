@@ -1317,6 +1317,7 @@ function isThreadScopedServerMessage(msg) {
     case "running_tasks":
     case "event":
     case "approval_request":
+    case "approval_resolved":
       return true;
     case "token_update":
       return msg.scope === "thread";
@@ -1352,6 +1353,9 @@ function handleServer(msg) {
       handleIncomingApprovalRequest(msg.request, msg.thread_id || state.threadId, {
         source: "server_message_approval_request"
       });
+      break;
+    case "approval_resolved":
+      resolveApprovalRequest(msg.request_id, msg.decision);
       break;
     case "error":
       if (msg.code === "thread_read_only") {
@@ -2011,12 +2015,21 @@ function respondApproval(id, decision) {
     notice(`Approval response not sent: WebSocket is ${state.wsStatus}.`, "error");
     return;
   }
-  state.answeredApprovals.set(entry.stateKey || msg.dataset.approvalStateKey || approvalStateKey(id), {
-    request: entry.request,
-    decision
-  });
-  applyApprovalDecision(msg, decision);
+  resolveApprovalRequest(id, decision);
+}
+function resolveApprovalRequest(id, decision) {
+  if (!id) return;
+  id = String(id);
+  const entry = state.pendingApprovals.get(id);
+  const msg = entry ? entry.msg : approvalRowById(id);
+  if (entry) {
+    state.answeredApprovals.set(entry.stateKey || (msg && msg.dataset.approvalStateKey) || approvalStateKey(id), {
+      request: entry.request,
+      decision
+    });
+  }
   state.pendingApprovals.delete(id);
+  if (msg) applyApprovalDecision(msg, decision);
 }
 function approvalStateKey(requestOrId) {
   if (requestOrId && typeof requestOrId === "object") {

@@ -1554,6 +1554,62 @@ async fn wait_for_turn_completed(
     panic!("turn completion for {thread_id} was not observed");
 }
 
+async fn wait_for_approval_request(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    thread_id: ThreadId,
+) -> String {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                if let Ok(ServerMessage::Event {
+                    thread_id: event_thread,
+                    agent_event: WireAgentEvent::ApprovalRequested { request, .. },
+                }) = serde_json::from_str(&text)
+                {
+                    if event_thread == thread_id {
+                        return request.id.to_string();
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => {}
+        }
+    }
+    panic!("approval request for {thread_id} was not observed");
+}
+
+async fn wait_for_approval_resolved(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    thread_id: ThreadId,
+    request_id: &str,
+) -> ApprovalDecision {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                if let Ok(ServerMessage::ApprovalResolved {
+                    thread_id: resolved_thread,
+                    request_id: resolved_request,
+                    decision,
+                }) = serde_json::from_str(&text)
+                {
+                    if resolved_thread == thread_id && resolved_request == request_id {
+                        return decision;
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => {}
+        }
+    }
+    panic!("approval resolution for {thread_id}/{request_id} was not observed");
+}
+
 async fn wait_for_thread_activity(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -1607,6 +1663,7 @@ async fn wait_for_thread_activity(
                     }
                     ServerMessage::ThreadState(_)
                     | ServerMessage::TokenUpdate { .. }
+                    | ServerMessage::ApprovalResolved { .. }
                     | ServerMessage::Error { .. }
                     | ServerMessage::Pong => {}
                 }
@@ -2041,6 +2098,7 @@ async fn inactive_thread_progress_sends_activity_without_full_event_subscription
                     ServerMessage::TokenUpdate {
                         thread_id: None, ..
                     }
+                    | ServerMessage::ApprovalResolved { .. }
                     | ServerMessage::Error { .. }
                     | ServerMessage::ApprovalRequest { .. }
                     | ServerMessage::Pong => {}
@@ -2197,6 +2255,62 @@ async fn inactive_thread_requests_send_activity_and_route_responses() {
     )
     .await;
     assert!(!completion_activity.active_turn);
+}
+
+#[tokio::test]
+async fn approval_decision_broadcasts_resolution_to_other_tabs() {
+    let harness = Arc::new(ActivityHarness::default());
+    let (_tmp, _state, port) = start_activity_server_on_available_port(harness.clone()).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let (_project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    let mut first_ws = connect_ws(port, &cookie).await;
+    let mut second_ws = connect_ws(port, &cookie).await;
+
+    for ws in [&mut first_ws, &mut second_ws] {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&ClientMessage::Subscribe { thread_id })
+                .unwrap()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    }
+
+    first_ws
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&ClientMessage::SendInput {
+                thread_id,
+                text: "approval please".into(),
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let first_approval_id = wait_for_approval_request(&mut first_ws, thread_id).await;
+    let second_approval_id = wait_for_approval_request(&mut second_ws, thread_id).await;
+    assert_eq!(second_approval_id, first_approval_id);
+
+    first_ws
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&ClientMessage::ApprovalDecision {
+                request_id: first_approval_id.clone(),
+                decision: ApprovalDecision::Accept,
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let decision = wait_for_approval_resolved(&mut second_ws, thread_id, &first_approval_id).await;
+    assert_eq!(decision, ApprovalDecision::Accept);
+    let (handled_approval, handled_decision) = harness.wait_for_approval_response().await;
+    assert_eq!(handled_approval.0, first_approval_id);
+    assert_eq!(handled_decision, ApprovalDecision::Accept);
 }
 
 #[tokio::test]

@@ -92,6 +92,14 @@ async fn index_page_is_served_and_public() {
         "UI renders approval requests as actionable transcript cards"
     );
     assert!(
+        body.contains("case \"approval_resolved\"")
+            && body.contains("resolveApprovalRequest(msg.request_id, msg.decision)")
+            && body.contains("function resolveApprovalRequest(id, decision)")
+            && body.contains("const msg = entry ? entry.msg : approvalRowById(id)")
+            && body.contains("state.pendingApprovals.delete(id)"),
+        "approval decisions broadcast from another tab resolve pending approval cards"
+    );
+    assert!(
         body.contains("type:\"approval_decision\""),
         "approval cards send approval decisions over the WebSocket"
     );

@@ -236,6 +236,11 @@ pub enum ServerMessage {
         thread_id: ThreadId,
         request: WireApprovalRequest,
     },
+    ApprovalResolved {
+        thread_id: ThreadId,
+        request_id: String,
+        decision: ApprovalDecision,
+    },
     Error {
         #[serde(flatten)]
         error: ErrorInfo,
@@ -723,6 +728,36 @@ mod tests {
             err.to_string().contains("missing field `approval_id`"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn server_message_approval_resolved_serde() {
+        let tid = ThreadId::new();
+        let msg = ServerMessage::ApprovalResolved {
+            thread_id: tid,
+            request_id: "approval-1".into(),
+            decision: ApprovalDecision::Accept,
+        };
+
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "approval_resolved");
+        assert_eq!(json["thread_id"], tid.to_string());
+        assert_eq!(json["request_id"], "approval-1");
+        assert_eq!(json["decision"], "accept");
+
+        let back: ServerMessage = serde_json::from_value(json).unwrap();
+        match back {
+            ServerMessage::ApprovalResolved {
+                thread_id,
+                request_id,
+                decision,
+            } => {
+                assert_eq!(thread_id, tid);
+                assert_eq!(request_id, "approval-1");
+                assert_eq!(decision, ApprovalDecision::Accept);
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]
