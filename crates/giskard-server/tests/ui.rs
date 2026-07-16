@@ -130,18 +130,19 @@ async fn index_page_is_served_and_public() {
     assert!(
         body.contains("answeredApprovals")
             && body.contains("approvalStateKey(request)")
+            && body.contains("const answered = state.answeredApprovals.get(stateKey)")
             && body.contains("JSON.stringify(requestOrId.kind")
             && body.contains("String(requestOrId.reason")
             && body.contains("JSON.stringify(requestOrId.metadata")
             && body.contains("state.answeredApprovals.set")
             && body.contains("request: entry.request"),
-        "UI remembers answered approvals without matching different reused request ids"
+        "UI remembers answered approvals and matches them only to the replayed request"
     );
     assert!(
-        body.contains("renderAnsweredApprovalDecisionsForThread")
-            && body.contains("renderApprovalRequest(answered.request)")
+        !body.contains("renderAnsweredApprovalDecisionsForThread")
+            && !body.contains("renderApprovalRequest(answered.request)")
             && body.contains("state.renderedApprovalStateKeys"),
-        "UI replays answered approval decisions after thread history resyncs"
+        "UI does not append answered approval cards outside transcript replay order"
     );
     assert!(
         body.contains("applyApprovalDecision")

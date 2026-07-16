@@ -199,9 +199,10 @@
   missing feature.
 - **O7:** Codex-provided ids are preserved or consumed at the correct boundary. `threadId`,
   `turnId`, `itemId`, and `serverRequest/resolved.requestId` drive routing/correlation; approval
-  `approvalId`/`itemId`/`callId` values are surfaced as card metadata when present; unknown future
-  server requests that carry raw `threadId`/`turnId` are scoped through the same native-id registry
-  instead of being relabeled onto the fallback thread. Because Codex can buffer a late
+  `approvalId`/`itemId`/`callId` values remain routing/protocol details and must not be surfaced as
+  user-facing card metadata; unknown future server requests that carry raw `threadId`/`turnId` are
+  scoped through the same native-id registry instead of being relabeled onto the fallback thread.
+  Because Codex can buffer a late
   `turn/completed` for the previous native turn while acknowledging a new `turn/start`, the Codex
   harness stream for the new turn only terminates on the acknowledged current `TurnId`; stale
   same-thread completions/errors are routed normally but must not complete or fail the new turn.
@@ -2006,8 +2007,8 @@ overwrite the thread's `approval_policy`.
 
 1. Harness pushes an approval request (command exec / file change / permission escalation);
    `CodexHarness` maps it to `AgentEvent::ApprovalRequested` with the details (command, cwd,
-   reason, target path, Codex approval/item/call ids when present, and the set of available
-   decisions).
+   reason, target path, and the set of available decisions). Codex approval/item/call ids are
+   retained for routing/protocol responses, not shown as card metadata.
 2. UI shows a non-blocking prompt scoped to the thread (with the command/diff preview).
    **Phase 3 (S6):** the preview uses the **raw diff string** from the harness (the text carried
    in the `ApprovalRequest`'s reason/detail). Structured `FileDiff` parsing and the side-by-side

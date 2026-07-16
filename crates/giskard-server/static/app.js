@@ -1125,7 +1125,6 @@ function renderHistoryPage(msg) {
     t.scrollTop += t.scrollHeight - heightBefore;
   } else {
     for (const turn of turns) renderPersistedTurn(turn);
-    renderAnsweredApprovalDecisionsForThread();
   }
 }
 
@@ -1402,14 +1401,6 @@ function respondApproval(id, decision) {
   });
   applyApprovalDecision(msg, decision);
   state.pendingApprovals.delete(id);
-}
-function renderAnsweredApprovalDecisionsForThread() {
-  if (!state.threadId) return;
-  const prefix = `${state.threadId}\n`;
-  for (const [key, answered] of state.answeredApprovals.entries()) {
-    if (!key.startsWith(prefix) || !answered || !answered.request) continue;
-    renderApprovalRequest(answered.request);
-  }
 }
 function approvalStateKey(requestOrId) {
   if (requestOrId && typeof requestOrId === "object") {
