@@ -938,16 +938,65 @@ async fn browse(
         });
     }
 
-    entries.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
+    sort_browse_entries(&mut entries);
 
     Ok(Json(BrowseResponse {
         path: canonical.to_string_lossy().to_string(),
         entries,
     }))
+}
+
+fn sort_browse_entries(entries: &mut [DirEntry]) {
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dir_entry(name: &str, is_dir: bool) -> DirEntry {
+        DirEntry {
+            name: name.to_string(),
+            is_dir,
+            size: 0,
+            mtime: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn browse_entries_sort_directories_first_then_names() {
+        let mut entries = vec![
+            dir_entry("zeta.txt", false),
+            dir_entry("beta", true),
+            dir_entry("Alpha.txt", false),
+            dir_entry("Alpha", true),
+            dir_entry("alpha", true),
+            dir_entry("beta.txt", false),
+        ];
+
+        sort_browse_entries(&mut entries);
+
+        let sorted: Vec<_> = entries
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.is_dir))
+            .collect();
+        assert_eq!(
+            sorted,
+            vec![
+                ("Alpha", true),
+                ("alpha", true),
+                ("beta", true),
+                ("Alpha.txt", false),
+                ("beta.txt", false),
+                ("zeta.txt", false),
+            ]
+        );
+    }
 }
 
 /// Enforce `browse.roots` on a project directory supplied via the API. With roots configured, the

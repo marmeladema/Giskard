@@ -456,11 +456,14 @@
   .pathbar { display:flex; gap:6px; align-items:center; justify-content:space-between; font-size:12px; color:var(--muted); margin-bottom:6px; }
   .pathbar .cur { word-break:break-all; }
   .dirlist { border:1px solid var(--border); border-radius:8px; height:240px; overflow-y:auto; background:var(--panel2); }
+  .dirlist:focus { outline:1px solid var(--accent); outline-offset:2px; }
   .direntry { padding:6px 10px; display:flex; gap:8px; align-items:center; cursor:pointer; font-size:13px; border-bottom:1px solid rgba(255,255,255,.03); }
   .direntry:last-child { border-bottom:0; }
   .direntry:hover { background:var(--bg); }
+  .direntry.selected { background:rgba(79,140,255,.22); outline:1px solid var(--accent); outline-offset:-1px; }
   .direntry.file { color:var(--muted); cursor:default; }
   .direntry.file:hover { background:transparent; }
+  .direntry.file.selected { background:rgba(79,140,255,.14); }
   .direntry .ic { width:16px; text-align:center; opacity:.85; }
   .field { margin-top:12px; }
   .field label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
