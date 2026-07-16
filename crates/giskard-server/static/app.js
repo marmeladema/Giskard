@@ -6,6 +6,7 @@ const WS_RECONNECT_MAX_MS = 8000;
 const WS_PROBLEM_NOTICE_INTERVAL_MS = 30000;
 const WS_BACKGROUND_CLOSE_GRACE_MS = 10000;
 const TRANSCRIPT_BOTTOM_STICKY_PX = 96;
+const PICKER_TYPEAHEAD_RESET_MS = 1000;
 let state = {
   projectId:null, threadId:null, mode:"build", ws:null, wsStatus:"closed", wsConnectId:0,
   wsReconnectTimer:null, wsReconnectAttempt:0, wsStatusDetail:"WebSocket disconnected",
@@ -23,6 +24,7 @@ let state = {
   awaitingInitialThreadState:false, awaitingThreadResync:false, contextWindow:0, contextUsed:null, tokenLedger:null, approvalPolicy:"ask", currentModel:null,
   mcpServers:[], mcpCapabilities:{ status:false, reload:false, oauth_login:false }, mcpLoading:false, mcpError:null, expandedMcps:new Set(),
   threadReadOnly:false, readOnlyProvider:null, readOnlyMessage:null,
+  pickerTypeahead:"", pickerTypeaheadTimer:null, pickerSelectedRow:null,
   currentPlan:null, planExpanded:localStorage.getItem("giskard.planExpanded")==="1",
   collapsedProjects:new Set(loadCollapsedProjects())
 };
@@ -430,6 +432,7 @@ function openProjectModal() {
 function closeProjectModal() { $("projectModal").classList.remove("open"); }
 $("pmCancel").onclick = closeProjectModal;
 $("projectModal").addEventListener("click", (e) => { if (e.target === $("projectModal")) closeProjectModal(); });
+$("projectModal").addEventListener("keydown", handleProjectModalKeydown);
 
 function basename(p) { const s = String(p).replace(/\/+$/,""); const i = s.lastIndexOf("/"); return i>=0 ? s.slice(i+1) : s; }
 function parentOf(p) { const s = String(p).replace(/\/+$/,""); const i = s.lastIndexOf("/"); return i>0 ? s.slice(0,i) : "/"; }
@@ -445,9 +448,12 @@ async function browsePicker(path) {
   $("pmName").value = basename(res.path) || res.path;
   $("pmErr").textContent = "";
 
-  const list = $("pmList"); list.innerHTML = "";
+  resetPickerTypeahead();
+  clearPickerSelection();
+  const list = $("pmList"); list.tabIndex = 0; list.innerHTML = "";
   if (res.path !== "/") {
     const up = document.createElement("div"); up.className = "direntry";
+    up.dataset.nav = "up";
     up.innerHTML = `<span class="ic">↰</span><span>..</span>`;
     up.onclick = () => browsePicker(parentOf(res.path));
     list.append(up);
@@ -455,13 +461,72 @@ async function browsePicker(path) {
   for (const e of res.entries) {
     const row = document.createElement("div");
     row.className = "direntry" + (e.is_dir ? "" : " file");
+    row.dataset.name = e.name;
+    row.dataset.isDir = String(e.is_dir);
     row.innerHTML = `<span class="ic">${e.is_dir ? "📁" : "📄"}</span><span>${escapeHtml(e.name)}</span>`;
     if (e.is_dir) {
       const child = res.path.replace(/\/+$/,"") + "/" + e.name;
+      row.dataset.path = child;
       row.onclick = () => browsePicker(child);
+    } else {
+      row.onclick = () => selectPickerRow(row);
     }
     list.append(row);
   }
+  list.focus({ preventScroll:true });
+}
+
+function clearPickerSelection() {
+  if (state.pickerSelectedRow) state.pickerSelectedRow.classList.remove("selected");
+  state.pickerSelectedRow = null;
+}
+
+function selectPickerRow(row) {
+  clearPickerSelection();
+  state.pickerSelectedRow = row;
+  row.classList.add("selected");
+  row.scrollIntoView({ block:"nearest" });
+}
+
+function resetPickerTypeahead() {
+  state.pickerTypeahead = "";
+  if (state.pickerTypeaheadTimer) clearTimeout(state.pickerTypeaheadTimer);
+  state.pickerTypeaheadTimer = null;
+}
+
+function schedulePickerTypeaheadReset() {
+  if (state.pickerTypeaheadTimer) clearTimeout(state.pickerTypeaheadTimer);
+  state.pickerTypeaheadTimer = setTimeout(resetPickerTypeahead, PICKER_TYPEAHEAD_RESET_MS);
+}
+
+function activeElementAcceptsText() {
+  const el = document.activeElement;
+  if (!el) return false;
+  const tag = el.tagName;
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || tag === "BUTTON" || el.isContentEditable;
+}
+
+function handleProjectModalKeydown(e) {
+  if (!$("projectModal").classList.contains("open")) return;
+  if (activeElementAcceptsText()) return;
+
+  if (e.key === "Enter" && state.pickerSelectedRow && state.pickerSelectedRow.dataset.path) {
+    e.preventDefault();
+    browsePicker(state.pickerSelectedRow.dataset.path);
+    return;
+  }
+
+  if (e.key.length !== 1 || e.ctrlKey || e.metaKey || e.altKey) return;
+  const char = e.key.toLocaleLowerCase();
+  if (char.trim() === "") return;
+  e.preventDefault();
+  state.pickerTypeahead += char;
+  schedulePickerTypeaheadReset();
+
+  const prefix = state.pickerTypeahead;
+  const rows = Array.from($("pmList").querySelectorAll(".direntry[data-name]"));
+  const match = rows.find(row => row.dataset.name.toLocaleLowerCase().startsWith(prefix));
+  if (match) selectPickerRow(match);
 }
 
 $("pmNewFolder").onclick = async () => {
