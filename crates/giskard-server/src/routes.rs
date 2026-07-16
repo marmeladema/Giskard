@@ -1975,11 +1975,23 @@ async fn handle_client_msg(
             request_id,
             decision,
         } => {
-            state
+            let request_id_for_broadcast = request_id.clone();
+            let thread_id = state
                 .registry
-                .respond_approval(giskard_core::ids::ApprovalId(request_id), decision)
+                .respond_approval(giskard_core::ids::ApprovalId(request_id), decision.clone())
                 .await
                 .map_err(|e| WsError::from_harness(e, "approval_decision", None))?;
+            state
+                .hub
+                .broadcast(
+                    thread_id,
+                    ServerMessage::ApprovalResolved {
+                        thread_id,
+                        request_id: request_id_for_broadcast,
+                        decision,
+                    },
+                )
+                .await;
         }
         ClientMessage::ServerRequestResponse {
             request_id,

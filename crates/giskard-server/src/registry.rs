@@ -353,7 +353,7 @@ impl HarnessRegistry {
         &self,
         request_id: ApprovalId,
         decision: ApprovalDecision,
-    ) -> Result<(), HarnessError> {
+    ) -> Result<ThreadId, HarnessError> {
         let thread_id = self
             .approvals
             .lock()
@@ -378,7 +378,8 @@ impl HarnessRegistry {
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
 
         self.approvals.lock().await.remove(&request_id);
-        harness.respond_approval(request_id, decision).await
+        harness.respond_approval(request_id, decision).await?;
+        Ok(thread_id)
     }
 
     /// Route a non-approval server-request response to the harness that raised it.

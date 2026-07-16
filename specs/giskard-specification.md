@@ -8,7 +8,13 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.47
+**Version:** 1.48
+
+**Changelog (1.47 → 1.48), cross-tab approval resolution:**
+- **AR1:** When one browser client answers an approval request, the server broadcasts
+  `ApprovalResolved { thread_id, request_id, decision }` to every client subscribed to that thread
+  after the harness accepts the decision. Other tabs must resolve the matching approval card and
+  remove its actions so a stale duplicate response cannot be submitted.
 
 **Changelog (1.46 → 1.47), cross-thread activity and browser diagnostics:**
 - **TA1:** Inactive threads emit lightweight `ThreadActivity` WebSocket messages to all connected
@@ -2437,7 +2443,7 @@ and unresolved `ServerRequest`s),
 `RunningTasks { thread_id, tasks: [RunningTask] }` (commands and tool/MCP calls still known to be
 running, including commands that outlived an interrupted turn),
 `TokenUpdate { scope, thread_id?, ledger }`, `ApprovalRequest { thread_id, request }` (a
-`WireApprovalRequest`),
+`WireApprovalRequest`), `ApprovalResolved { thread_id, request_id, decision }`,
 `Error { code, severity, message, detail?, thread_id?, action? }`, `Pong`.
 
 For `TokenUpdate`, `thread_id` is required when `scope = "thread"` and omitted for non-thread
@@ -2447,6 +2453,12 @@ when the message `thread_id` matches the active thread.
 `OpenThreadResponse` may also carry `warning: ErrorInfo?` with the same `code` / `severity` /
 `message` shape when the requested thread was opened but degraded (for example, Codex resume
 failed and Giskard started a fresh native session while keeping persisted history).
+
+**Approval resolution invariant (AR1):** approval requests may be visible in multiple tabs for the
+same subscribed thread. A successful `ApprovalDecision` is the single authoritative answer for that
+request id. After forwarding it to the harness, the server must broadcast `ApprovalResolved` to the
+thread subscribers; each browser must remove the pending actions and render the resolved decision
+card. Duplicate/stale decisions for a removed request id remain protocol errors.
 
 **Client rendering invariant (E6):** `ItemDelta { item_id }` and the later `ItemCompleted`
 for the same `Item.id` are one lifecycle. The UI must finalize or replace the streamed body in
