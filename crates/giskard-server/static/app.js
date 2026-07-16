@@ -2936,6 +2936,10 @@ function addItem(item, fromHistory) {
     renderItemBody(bubble("user","you"), p);
   }
   else {
+    if (p.kind==="file_change" && mergeFileChangeWithPrevious(p)) {
+      markRenderedItem(item);
+      return;
+    }
     const key = idKey(item && item.id);
     const body = isTaskPayloadKind(p.kind)
       ? taskBubble(key, p.kind, classForPayload(p), roleForPayload(p))
@@ -3303,8 +3307,56 @@ function makePathLink(path, label, line) {
   };
   return btn;
 }
+function fileChangeEntries(p) {
+  if (p && p.changes && p.changes.length) return p.changes;
+  return [{ path:p && p.path, change:p && p.change, diff:p && p.diff }];
+}
+function normalizedFileChangePayload(p) {
+  const entries = fileChangeEntries(p).map(c => ({
+    path:c && c.path,
+    change:c && c.change,
+    diff:c && c.diff,
+    status:(c && c.status) || (p && p.status)
+  }));
+  const first = entries[0] || {};
+  return {
+    kind:"file_change",
+    path:first.path || (p && p.path) || "",
+    change:first.change || (p && p.change) || "modified",
+    changes:entries
+  };
+}
+function mergeFileChangePayload(existing, next) {
+  const current = normalizedFileChangePayload(existing);
+  const incoming = normalizedFileChangePayload(next);
+  return {
+    kind:"file_change",
+    path:current.path,
+    change:current.change,
+    changes:current.changes.concat(incoming.changes)
+  };
+}
+function mergeFileChangeWithPrevious(p) {
+  breakTaskGroup();
+  const target = renderTarget();
+  const prev = target && target.lastElementChild;
+  if (
+    !prev ||
+    !prev.classList ||
+    !prev.classList.contains("file") ||
+    !prev._fileChangePayload
+  ) return false;
+  const body = prev.querySelector(".body");
+  if (!body) return false;
+  const merged = mergeFileChangePayload(prev._fileChangePayload, p);
+  renderItemBody(body, merged);
+  keepTranscriptRowAnchored(prev);
+  return true;
+}
 function renderFileChange(body, p) {
-  const changes = (p.changes && p.changes.length) ? p.changes : [{ path:p.path, change:p.change }];
+  const normalized = normalizedFileChangePayload(p);
+  body.parentElement._fileChangePayload = normalized;
+  const changes = normalized.changes;
   const title = document.createElement("div");
   title.textContent = `File change${changes.length===1 ? "" : "s"}`;
   const list = document.createElement("ul");
@@ -3331,16 +3383,16 @@ function renderFileChange(body, p) {
       };
       row.append(diffBtn);
     }
+    if (c.status) {
+      const status = document.createElement("span");
+      status.className = "badge file-change-status";
+      status.textContent = c.status;
+      row.append(document.createTextNode(" "), status);
+    }
     li.append(row);
     list.append(li);
   }
   body.append(title, list);
-  if (p.status) {
-    const status = document.createElement("div");
-    status.className = "meta";
-    status.textContent = "status: " + p.status;
-    body.append(status);
-  }
 }
 // Tool calls (esp. MCP results) can return very large input/output payloads. Render them with the
 // same row-owned collapse model as command output: running rows start expanded while small, large

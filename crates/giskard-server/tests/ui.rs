@@ -850,6 +850,23 @@ async fn index_page_is_served_and_public() {
         "UI renders file-change items"
     );
     assert!(
+        body.contains("mergeFileChangeWithPrevious")
+            && body.contains("mergeFileChangePayload")
+            && body.contains("body.parentElement._fileChangePayload"),
+        "UI merges consecutive file-change transcript rows"
+    );
+    assert!(
+        body.contains("file-change-status")
+            && body.contains("status.className = \"badge file-change-status\"")
+            && body.contains("status.textContent = c.status")
+            && body.contains("status:(c && c.status) || (p && p.status)")
+            && !body.contains("status:p && p.status")
+            && !body.contains("status:incoming.status || current.status")
+            && !body.contains("status.textContent = \"status: \" + c.status")
+            && !body.contains("status.textContent = \"status: \" + normalized.status"),
+        "UI renders file-change statuses as per-entry badges"
+    );
+    assert!(
         body.contains("openDiffOverlay")
             && body.contains("diff-open")
             && body.contains("markdownCodeFence(\"diff\", diff)")
