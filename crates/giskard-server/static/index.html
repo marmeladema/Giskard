@@ -19,7 +19,12 @@
 
   <div id="app">
     <div class="col sidebar">
-      <div class="row"><b style="flex:1">Projects</b><button id="newProj" title="New project">+</button></div>
+      <div class="row sidebar-head">
+        <b style="flex:1">Projects</b>
+        <button id="notifyTopBtn" class="notify-permission-btn" type="button"
+                title="Enable approval notifications" aria-label="Enable approval notifications">!</button>
+        <button id="newProj" title="New project">+</button>
+      </div>
       <div id="projects"></div>
       <div class="sidebar-settings">
         <button id="settingsBtn" class="settings-btn" title="Settings" aria-label="Settings">⚙</button>
@@ -39,6 +44,24 @@
           <div class="settings-field">
             <label for="refreshModels">Models</label>
             <button id="refreshModels" type="button" title="Refresh the model list from the provider's /v1/models endpoint">↻ Reload models</button>
+          </div>
+          <div class="settings-field">
+            <label for="notifyBtn">Notifications</label>
+            <button id="notifyBtn" class="notify-permission-btn" type="button"
+                    title="Enable browser notifications for approval requests">Enable approval notifications</button>
+          </div>
+          <div class="settings-field">
+            <label for="browserDiagnosticsBtn">Diagnostics</label>
+            <button id="browserDiagnosticsBtn" type="button"
+                    title="Show recent browser-side diagnostics">Browser diagnostics</button>
+            <div id="browserDiagnosticsPanel" class="browser-diagnostics" hidden>
+              <pre id="browserDiagnosticsLog"></pre>
+              <div class="browser-diagnostics-actions">
+                <button id="copyBrowserDiagnosticsBtn" type="button">Copy</button>
+                <button id="clearBrowserDiagnosticsBtn" type="button">Clear</button>
+                <button id="testNotificationBtn" type="button">Test notification</button>
+              </div>
+            </div>
           </div>
         </div>
       </div>

@@ -105,6 +105,31 @@ pub struct ThreadState {
     pub state: serde_json::Value,
 }
 
+/// Lightweight cross-thread activity update for sidebar badges and browser notifications. This is
+/// intentionally much smaller than a transcript event: inactive threads should show that work is
+/// happening without subscribing every browser to every live delta stream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadActivity {
+    pub thread_id: ThreadId,
+    #[serde(flatten)]
+    pub kind: ThreadActivityKind,
+    pub active_turn: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ThreadActivityKind {
+    TurnStarted,
+    Progress,
+    ApprovalRequested { approval_id: String },
+    ServerRequestReceived { server_request_id: String },
+    TurnCompleted,
+    Error,
+    Notice,
+}
+
 /// In-flight turn reconstruction on reconnect (spec §13.6). Carries wire types (§3.5).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveTurnSnapshot {
@@ -186,6 +211,7 @@ pub enum ServerMessage {
         thread_id: ThreadId,
         agent_event: WireAgentEvent,
     },
+    ThreadActivity(ThreadActivity),
     ThreadState(ThreadState),
     /// A page of persisted history (H6), oldest-first; `has_more` if older turns exist before it.
     HistoryPage {
@@ -646,6 +672,57 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn server_message_thread_activity_is_flattened() {
+        let tid = ThreadId::new();
+        let msg = ServerMessage::ThreadActivity(ThreadActivity {
+            thread_id: tid,
+            kind: ThreadActivityKind::ApprovalRequested {
+                approval_id: "approval-1".into(),
+            },
+            active_turn: true,
+            summary: Some("Approval requested".into()),
+        });
+
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "thread_activity");
+        assert_eq!(json["thread_id"], tid.to_string());
+        assert_eq!(json["kind"], "approval_requested");
+        assert_eq!(json["active_turn"], true);
+        assert_eq!(json["approval_id"], "approval-1");
+        assert!(json.get("server_request_id").is_none());
+
+        let back: ServerMessage = serde_json::from_value(json).unwrap();
+        match back {
+            ServerMessage::ThreadActivity(activity) => {
+                assert_eq!(activity.thread_id, tid);
+                match activity.kind {
+                    ThreadActivityKind::ApprovalRequested { approval_id } => {
+                        assert_eq!(approval_id, "approval-1");
+                    }
+                    other => panic!("expected approval activity, got {other:?}"),
+                }
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn server_message_thread_activity_requires_variant_ids() {
+        let json = serde_json::json!({
+            "type": "thread_activity",
+            "thread_id": ThreadId::new().to_string(),
+            "kind": "approval_requested",
+            "active_turn": true
+        });
+
+        let err = serde_json::from_value::<ServerMessage>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("missing field `approval_id`"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

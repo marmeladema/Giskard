@@ -13,6 +13,7 @@ pub type ClientId = usize;
 type SubList = Vec<(ClientId, mpsc::Sender<ServerMessage>)>;
 
 pub struct Hub {
+    clients: Mutex<HashMap<ClientId, mpsc::Sender<ServerMessage>>>,
     subs: Mutex<HashMap<ThreadId, SubList>>,
     next_id: AtomicUsize,
 }
@@ -20,6 +21,7 @@ pub struct Hub {
 impl Hub {
     pub fn new() -> Self {
         Self {
+            clients: Mutex::new(HashMap::new()),
             subs: Mutex::new(HashMap::new()),
             next_id: AtomicUsize::new(1),
         }
@@ -27,6 +29,11 @@ impl Hub {
 
     pub fn next_client_id(&self) -> ClientId {
         self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub async fn register_client(&self, client_id: ClientId, tx: mpsc::Sender<ServerMessage>) {
+        self.clients.lock().await.insert(client_id, tx);
+        debug!(%client_id, "client registered");
     }
 
     pub async fn subscribe(
@@ -51,6 +58,7 @@ impl Hub {
     }
 
     pub async fn disconnect(&self, client_id: ClientId) {
+        self.clients.lock().await.remove(&client_id);
         let mut subs = self.subs.lock().await;
         let mut empty = Vec::new();
         for (thread_id, list) in subs.iter_mut() {
@@ -63,6 +71,30 @@ impl Hub {
             subs.remove(&tid);
         }
         debug!(%client_id, "client disconnected from all threads");
+    }
+
+    pub async fn broadcast_all(&self, msg: ServerMessage) {
+        let mut clients = self.clients.lock().await;
+        let message_kind = server_message_kind(&msg);
+        clients.retain(|client_id, tx| match tx.try_send(msg.clone()) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(
+                    %client_id,
+                    message_kind = %message_kind,
+                    "client outbound queue full; dropping global message for this client"
+                );
+                true
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                warn!(
+                    %client_id,
+                    message_kind = %message_kind,
+                    "client outbound queue closed; removing global client"
+                );
+                false
+            }
+        });
     }
 
     pub async fn broadcast(&self, thread_id: ThreadId, msg: ServerMessage) {
@@ -115,6 +147,7 @@ impl Default for Hub {
 fn server_message_kind(msg: &ServerMessage) -> &'static str {
     match msg {
         ServerMessage::Event { .. } => "event",
+        ServerMessage::ThreadActivity(_) => "thread_activity",
         ServerMessage::ThreadState(_) => "thread_state",
         ServerMessage::HistoryPage { .. } => "history_page",
         ServerMessage::LiveTurnSnapshot(_) => "live_turn_snapshot",
@@ -159,5 +192,39 @@ mod tests {
 
         let subs = hub.subs.lock().await;
         assert!(subs.get(&thread_id).is_none_or(Vec::is_empty));
+    }
+
+    #[tokio::test]
+    async fn global_broadcast_reaches_unsubscribed_client() {
+        let hub = Hub::new();
+        let client_id = hub.next_client_id();
+        let (tx, mut rx) = mpsc::channel(1);
+        let thread_id = ThreadId::new();
+
+        hub.register_client(client_id, tx).await;
+        hub.broadcast_all(ServerMessage::ThreadActivity(
+            giskard_proto::ThreadActivity {
+                thread_id,
+                kind: giskard_proto::ThreadActivityKind::ApprovalRequested {
+                    approval_id: "approval-1".into(),
+                },
+                active_turn: true,
+                summary: Some("Approval requested".into()),
+            },
+        ))
+        .await;
+
+        match rx.try_recv() {
+            Ok(ServerMessage::ThreadActivity(activity)) => {
+                assert_eq!(activity.thread_id, thread_id);
+                match activity.kind {
+                    giskard_proto::ThreadActivityKind::ApprovalRequested { approval_id } => {
+                        assert_eq!(approval_id, "approval-1");
+                    }
+                    other => panic!("expected approval activity, got {other:?}"),
+                }
+            }
+            other => panic!("expected thread activity, got {other:?}"),
+        }
     }
 }

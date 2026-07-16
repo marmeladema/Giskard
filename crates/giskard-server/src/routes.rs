@@ -1572,6 +1572,8 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
+    state.hub.register_client(client_id, tx.clone()).await;
+
     let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             let json = match serde_json::to_string(&msg) {

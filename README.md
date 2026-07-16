@@ -138,6 +138,12 @@ RUST_LOG=giskard_server::registry=trace,giskard_harness_codex=trace,giskard=info
 Use `debug` first for most issues. `trace` can be very verbose, but it is useful when diagnosing
 stuck turns, harness protocol failures, WebSocket forwarding, or command/tool lifecycle bugs.
 
+For browser-side issues, open Settings → **Browser diagnostics** in the Giskard UI. The panel keeps
+a bounded local buffer of recent WebSocket status changes, notification lifecycle events, approval
+routing decisions, and visibility/focus state. Use **Copy** from that panel when reporting a
+browser-only problem; **Test notification** verifies the browser/OS notification path without
+waiting for an approval request.
+
 ---
 
 ## Configuration

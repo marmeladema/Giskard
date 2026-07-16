@@ -7,6 +7,10 @@ const WS_PROBLEM_NOTICE_INTERVAL_MS = 30000;
 const WS_BACKGROUND_CLOSE_GRACE_MS = 10000;
 const TRANSCRIPT_BOTTOM_STICKY_PX = 96;
 const PICKER_TYPEAHEAD_RESET_MS = 1000;
+const NOTIFICATION_PROMPT_NOTICE_INTERVAL_MS = 30000;
+const BROWSER_DIAGNOSTIC_LIMIT = 120;
+const NOTIFICATION_DEDUP_MS = 15000;
+const BROWSER_DIAGNOSTIC_VERSION = "browser-diagnostics-v1";
 let state = {
   projectId:null, threadId:null, mode:"build", ws:null, wsStatus:"closed", wsConnectId:0,
   wsReconnectTimer:null, wsReconnectAttempt:0, wsStatusDetail:"WebSocket disconnected",
@@ -26,6 +30,8 @@ let state = {
   threadReadOnly:false, readOnlyProvider:null, readOnlyMessage:null,
   pickerTypeahead:"", pickerTypeaheadTimer:null, pickerSelectedRow:null,
   currentPlan:null, planExpanded:localStorage.getItem("giskard.planExpanded")==="1",
+  threadActivity:new Map(), pendingApprovalFocus:null, notifiedApprovals:new Map(), browserDiagnostics:[],
+  lastNotificationPromptNoticeAt:0,
   collapsedProjects:new Set(loadCollapsedProjects())
 };
 const COMMAND_AUTO_COLLAPSE_LINES = 120;
@@ -62,6 +68,7 @@ $("loginForm").onsubmit = async (e) => {
 async function startApp() {
   $("login").style.display="none";
   $("app").classList.add("open");
+  initNotificationSettings();
   try { state.models = (await api("GET","/api/models")).models || []; } catch { state.models=[]; }
   renderModelSelect();
   await loadProjects();
@@ -96,6 +103,288 @@ async function refreshModels(opts) {
   }
 }
 $("refreshModels").onclick = () => refreshModels();
+
+function initNotificationSettings() {
+  const buttons = notificationPermissionButtons();
+  if (!buttons.length) {
+    recordNotificationDiagnostic("init_no_buttons");
+    return;
+  }
+  if (!("Notification" in window)) {
+    for (const btn of buttons) {
+      setNotificationButtonState(btn, "Notifications unavailable", true);
+    }
+    recordNotificationDiagnostic("init_unsupported", { button_count:buttons.length });
+    return;
+  }
+  refreshNotificationButton();
+  for (const btn of buttons) btn.onclick = requestNotificationPermission;
+  recordNotificationDiagnostic("init_ready", { button_count:buttons.length });
+}
+
+function notificationPermissionButtons() {
+  return Array.from(document.querySelectorAll(".notify-permission-btn"));
+}
+
+async function requestNotificationPermission() {
+  recordNotificationDiagnostic("permission_request_click");
+  if (!("Notification" in window)) {
+    recordNotificationDiagnostic("permission_request_unsupported");
+    return;
+  }
+  if (Notification.permission === "granted") {
+    recordNotificationDiagnostic("permission_request_already_granted");
+    return;
+  }
+  if (!window.isSecureContext) {
+    recordNotificationDiagnostic("permission_request_insecure_context");
+    notice("Browser notifications require HTTPS or localhost.", "warning");
+    return;
+  }
+  try {
+    const permission = await Notification.requestPermission();
+    recordNotificationDiagnostic("permission_request_resolved", { permission });
+  } catch (e) {
+    recordNotificationDiagnostic("permission_request_failed", { error: e && e.message ? e.message : String(e) });
+    notice("Notification permission request failed: " + e.message, "warning");
+  }
+  refreshNotificationButton();
+}
+
+function setNotificationButtonState(btn, label, disabled) {
+  if (!btn) return;
+  if (btn.id === "notifyTopBtn") {
+    btn.textContent = "!";
+    btn.title = label;
+    btn.setAttribute("aria-label", label);
+    btn.hidden = label === "Approval notifications enabled" || label === "Notifications unavailable";
+  } else {
+    btn.textContent = label;
+    btn.title = label;
+  }
+  btn.disabled = !!disabled;
+}
+
+function refreshNotificationButton() {
+  const buttons = notificationPermissionButtons();
+  if (!buttons.length || !("Notification" in window)) return;
+  let label = "Enable approval notifications";
+  let disabled = false;
+  if (!window.isSecureContext) {
+    label = "Notifications require HTTPS or localhost";
+    disabled = true;
+  } else if (Notification.permission === "granted") {
+    label = "Approval notifications enabled";
+    disabled = true;
+  } else if (Notification.permission === "denied") {
+    label = "Notifications blocked by browser";
+    disabled = true;
+  }
+  for (const btn of buttons) {
+    setNotificationButtonState(btn, label, disabled);
+  }
+  recordNotificationDiagnostic("permission_button_refreshed", { label, disabled, button_count:buttons.length });
+}
+
+function notificationPermissionState() {
+  if (!("Notification" in window)) return "unsupported";
+  return Notification.permission;
+}
+
+function browserDiagnosticsSnapshot() {
+  const diagnostics = state.browserDiagnostics.slice();
+  return {
+    version: BROWSER_DIAGNOSTIC_VERSION,
+    permission: notificationPermissionState(),
+    secure_context: !!window.isSecureContext,
+    visibility: document.visibilityState,
+    focused: document.hasFocus ? document.hasFocus() : null,
+    thread_id: state.threadId || null,
+    ws_status: state.wsStatus,
+    notified_count: state.notifiedApprovals.size,
+    dedup_window_ms: NOTIFICATION_DEDUP_MS,
+    button_count: notificationPermissionButtons().length,
+    last_approval_decision: lastNotificationDiagnostic(isApprovalNotificationDecision),
+    recent_approval_decisions: recentNotificationDiagnostics(isApprovalNotificationDecision, 6),
+    diagnostics
+  };
+}
+
+function notificationDebugSnapshot() {
+  return browserDiagnosticsSnapshot();
+}
+
+function isApprovalNotificationDecision(entry) {
+  const reason = entry && entry.reason ? entry.reason : "";
+  const detail = entry && entry.detail ? entry.detail : {};
+  return reason === "approval_notify_received" ||
+    reason.startsWith("approval_notify_suppressed_") ||
+    reason === "approval_notify_constructor_failed" ||
+    reason === "approval_notify_created" ||
+    (reason === "browser_notification_created" && detail.kind === "approval") ||
+    (reason.startsWith("browser_notification_") && detail.kind === "approval");
+}
+
+function lastNotificationDiagnostic(predicate) {
+  for (let i = state.browserDiagnostics.length - 1; i >= 0; i--) {
+    const entry = state.browserDiagnostics[i];
+    if (!predicate || predicate(entry)) return entry;
+  }
+  return null;
+}
+
+function recentNotificationDiagnostics(predicate, limit) {
+  const recent = [];
+  for (let i = state.browserDiagnostics.length - 1; i >= 0 && recent.length < limit; i--) {
+    const entry = state.browserDiagnostics[i];
+    if (!predicate || predicate(entry)) recent.push(entry);
+  }
+  return recent.reverse();
+}
+
+function recordBrowserDiagnostic(category, reason, detail) {
+  const entry = {
+    at: new Date().toISOString(),
+    category: category || "browser",
+    reason,
+    detail: detail || {},
+    permission: notificationPermissionState(),
+    secure_context: !!window.isSecureContext,
+    visibility: document.visibilityState,
+    focused: document.hasFocus ? document.hasFocus() : null,
+    thread_id: state.threadId || null,
+    ws_status: state.wsStatus
+  };
+  state.browserDiagnostics.push(entry);
+  if (state.browserDiagnostics.length > BROWSER_DIAGNOSTIC_LIMIT) {
+    state.browserDiagnostics.splice(0, state.browserDiagnostics.length - BROWSER_DIAGNOSTIC_LIMIT);
+  }
+  console.info("[Giskard browser diagnostics]", entry);
+  renderBrowserDiagnosticsPanel();
+}
+
+function recordNotificationDiagnostic(reason, detail) {
+  recordBrowserDiagnostic("notification", reason, detail);
+}
+
+function showBrowserDiagnostics() {
+  const snapshot = browserDiagnosticsSnapshot();
+  console.info("[Giskard browser diagnostics] snapshot", snapshot);
+  if (console.table) console.table(snapshot.diagnostics);
+  renderBrowserDiagnosticsPanel(snapshot, true);
+}
+
+function renderBrowserDiagnosticsPanel(snapshot, reveal) {
+  const panel = $("browserDiagnosticsPanel");
+  if (!panel) return;
+  const log = $("browserDiagnosticsLog");
+  if (!log) return;
+  snapshot = snapshot || browserDiagnosticsSnapshot();
+  const last = snapshot.diagnostics[snapshot.diagnostics.length - 1];
+  const lastApproval = snapshot.last_approval_decision;
+  const approvalDetail = lastApproval && lastApproval.detail ? lastApproval.detail : {};
+  const lines = [
+    `version: ${snapshot.version}`,
+    `permission: ${snapshot.permission}`,
+    `secure: ${snapshot.secure_context}`,
+    `visibility: ${snapshot.visibility}`,
+    `focused: ${snapshot.focused}`,
+    `thread: ${snapshot.thread_id || "none"}`,
+    `ws: ${snapshot.ws_status}`,
+    `dedupMs: ${snapshot.dedup_window_ms}`,
+    `lastApproval: ${lastApproval ? lastApproval.reason : "none"}`,
+    `approvalSource: ${approvalDetail.source || "none"}`,
+    `approvalId: ${approvalDetail.approval_id || "none"}`,
+    `last: ${last ? last.reason : "none"}`
+  ];
+  const recent = snapshot.recent_approval_decisions || [];
+  if (recent.length) {
+    lines.push("recentApprovals:");
+    for (const entry of recent) {
+      const detail = entry.detail || {};
+      const suffix = detail.age_ms !== undefined ? ` age=${detail.age_ms}ms` : "";
+      lines.push(`- ${entry.reason} source=${detail.source || "none"} id=${detail.approval_id || "none"} visible=${entry.visibility} focused=${entry.focused}${suffix}`);
+    }
+  }
+  const latest = snapshot.diagnostics.slice(-20);
+  if (latest.length) {
+    lines.push("recentBrowserEvents:");
+    for (const entry of latest) {
+      const detail = entry.detail || {};
+      const fields = [];
+      if (detail.source) fields.push(`source=${detail.source}`);
+      if (detail.approval_id !== undefined && detail.approval_id !== null) fields.push(`approval=${detail.approval_id}`);
+      if (detail.status) fields.push(`status=${detail.status}`);
+      if (detail.error) fields.push(`error=${detail.error}`);
+      lines.push(`- ${entry.at} ${entry.category}:${entry.reason} visible=${entry.visibility} focused=${entry.focused}${fields.length ? " " + fields.join(" ") : ""}`);
+    }
+  }
+  log.textContent = lines.join("\n");
+  if (reveal || !panel.hidden) panel.hidden = false;
+}
+
+async function copyBrowserDiagnostics() {
+  const snapshot = browserDiagnosticsSnapshot();
+  const text = JSON.stringify(snapshot, null, 2);
+  try {
+    await navigator.clipboard.writeText(text);
+    notice("Browser diagnostics copied.", "info");
+  } catch (e) {
+    console.info("[Giskard browser diagnostics] copy fallback", text);
+    notice("Could not copy diagnostics; logged them to the console.", "warning");
+  }
+}
+
+function clearBrowserDiagnostics() {
+  state.browserDiagnostics = [];
+  renderBrowserDiagnosticsPanel(browserDiagnosticsSnapshot(), true);
+}
+
+window.giskardBrowserDiagnostics = browserDiagnosticsSnapshot;
+window.giskardNotificationDebug = notificationDebugSnapshot;
+const browserDiagnosticsBtn = $("browserDiagnosticsBtn");
+if (browserDiagnosticsBtn) browserDiagnosticsBtn.onclick = showBrowserDiagnostics;
+const copyBrowserDiagnosticsBtn = $("copyBrowserDiagnosticsBtn");
+if (copyBrowserDiagnosticsBtn) copyBrowserDiagnosticsBtn.onclick = copyBrowserDiagnostics;
+const clearBrowserDiagnosticsBtn = $("clearBrowserDiagnosticsBtn");
+if (clearBrowserDiagnosticsBtn) clearBrowserDiagnosticsBtn.onclick = clearBrowserDiagnostics;
+const testNotificationBtn = $("testNotificationBtn");
+if (testNotificationBtn) testNotificationBtn.onclick = sendTestNotification;
+
+function sendTestNotification() {
+  if (!("Notification" in window)) {
+    recordNotificationDiagnostic("test_notify_unsupported");
+    notice("Browser notifications are unavailable.", "warning");
+    return;
+  }
+  if (Notification.permission !== "granted") {
+    recordNotificationDiagnostic("test_notify_suppressed_permission");
+    notice("Notification permission is not granted.", "warning");
+    return;
+  }
+  const tag = `giskard-test-${Date.now()}`;
+  let notification;
+  try {
+    notification = createBrowserNotification("Giskard test notification", {
+      body: "Browser notification display test.",
+      tag,
+      renotify: true,
+      requireInteraction: true,
+      data: { test:true }
+    }, {
+      kind: "test",
+      tag
+    });
+  } catch (e) {
+    recordNotificationDiagnostic("test_notify_constructor_failed", {
+      tag,
+      error: e && e.message ? e.message : String(e)
+    });
+    notice("Test notification failed: " + e.message, "warning");
+    return;
+  }
+  if (notification) recordNotificationDiagnostic("test_notify_created", { tag });
+}
 
 /* ---------- projects & threads ---------- */
 async function loadProjects() {
@@ -152,7 +441,7 @@ function restoreLastThread() {
   if (!last || !last.pid || !last.tid) return;
   const el = document.querySelector(`.thread[data-tid="${last.tid}"]`);
   if (!el) { localStorage.removeItem("giskard.lastThread"); return; }
-  openThread(last.pid, last.tid, el.textContent, { silent:true });
+  openThread(last.pid, last.tid, currentThreadTitle(el), { silent:true });
 }
 
 async function loadThreads(pid) {
@@ -253,11 +542,20 @@ function threadRow(pid, t) {
 }
 
 function applyThreadTitleToElement(el, pid, tid, title) {
-  el.textContent = title;
+  el.innerHTML = "";
+  const status = document.createElement("span");
+  status.className = "thread-status";
+  status.setAttribute("aria-hidden", "true");
+  const label = document.createElement("span");
+  label.className = "thread-title";
+  label.textContent = title;
+  el.append(status, label);
   el.title = title;
+  el.dataset.title = title;
   el.dataset.pid = pid;
   el.dataset.tid = tid;
   el.onclick = () => openThread(pid, tid, title);
+  renderThreadActivityIndicator(tid);
 }
 
 function updateThreadRowTitle(tid, title) {
@@ -270,8 +568,65 @@ function updateThreadRowTitle(tid, title) {
 }
 
 function currentThreadTitle(el) {
-  const title = (el.textContent || "").trim();
+  const title = (el.dataset && el.dataset.title ? el.dataset.title : el.textContent || "").trim();
   return title || (el.dataset.tid || "").slice(0,8);
+}
+
+function threadRowForId(tid) {
+  if (!tid) return null;
+  return document.querySelector(`.thread[data-tid="${tid}"]`);
+}
+
+function threadMetaForId(tid) {
+  const el = threadRowForId(tid);
+  if (!el) return null;
+  return {
+    pid: el.dataset.pid || "",
+    tid: el.dataset.tid || tid,
+    title: currentThreadTitle(el)
+  };
+}
+
+function clearThreadActivity(tid) {
+  if (!tid) return;
+  const activity = state.threadActivity.get(String(tid));
+  if (activity && activity.active_turn) {
+    activity.unread = false;
+    activity.approval_id = null;
+    activity.kind = "progress";
+    state.threadActivity.set(String(tid), activity);
+  } else {
+    state.threadActivity.delete(String(tid));
+  }
+  renderThreadActivityIndicator(tid);
+}
+
+function renderThreadActivityIndicator(tid) {
+  const el = threadRowForId(tid);
+  if (!el) return;
+  const status = el.querySelector(".thread-status");
+  if (!status) return;
+  const activity = state.threadActivity.get(String(tid));
+  const current = state.threadId && String(state.threadId) === String(tid);
+  const visible = !!activity && !current && (activity.unread || activity.active_turn || activity.approval_id);
+  el.classList.toggle("has-activity", visible);
+  el.classList.toggle("activity-approval", visible && activity && activity.kind === "approval_requested");
+  el.classList.toggle("activity-error", visible && activity && activity.kind === "error");
+  el.classList.toggle("activity-running", visible && activity && activity.active_turn && activity.kind !== "approval_requested");
+  if (!visible) {
+    status.textContent = "";
+    status.title = "";
+    return;
+  }
+  if (activity.kind === "approval_requested") status.textContent = "!";
+  else if (activity.kind === "error") status.textContent = "x";
+  else if (activity.active_turn) status.textContent = "o";
+  else status.textContent = "*";
+  status.title = activity.summary || "Thread activity";
+}
+
+function renderAllThreadActivityIndicators() {
+  document.querySelectorAll(".thread").forEach(el => renderThreadActivityIndicator(el.dataset.tid));
 }
 
 function normalizeThreadTitleInput(value) {
@@ -631,6 +986,13 @@ function openDraftThread(pid, defaultModel) {
 async function openThread(pid, tid, title, opts) {
   opts = opts || {};
   if (!opts.firstTurnStarting) state.firstTurnStartingThreadId = null;
+  if (opts.focusApprovalId) {
+    state.pendingApprovalFocus = {
+      threadId:String(tid),
+      approvalId:String(opts.focusApprovalId),
+      attempts:0
+    };
+  }
   let res;
   try {
     res = await api("POST",`/api/projects/${pid}/threads`,{ thread_id:tid, resume:null });
@@ -644,6 +1006,7 @@ async function openThread(pid, tid, title, opts) {
   // Remember this thread so a browser reload resumes it (client-side only).
   try { localStorage.setItem("giskard.lastThread", JSON.stringify({ pid, tid })); } catch {}
 
+  clearThreadActivity(tid);
   state.projectId = pid; state.threadId = tid; state.pendingUserEl = null; state.pendingUserText = null;
   state.threadReadOnly = false; state.readOnlyProvider = null; state.readOnlyMessage = null;
   updateReadOnlyBanner();
@@ -667,6 +1030,7 @@ async function openThread(pid, tid, title, opts) {
   state.awaitingThreadResync = false;
   resetRenderState();
   document.querySelectorAll(".thread").forEach(e => e.classList.toggle("active", e.dataset.tid===tid));
+  renderAllThreadActivityIndicators();
   $("thrHeader").style.display="flex"; $("composer").style.display="flex";
   $("pickerBar").style.display="flex";
   setThreadTitle(title || tid.slice(0,8));
@@ -687,6 +1051,7 @@ async function openThread(pid, tid, title, opts) {
     }
   }
   connectWs();
+  schedulePendingApprovalFocus();
 }
 
 function clearWsReconnectTimer() {
@@ -840,8 +1205,11 @@ async function connectWs(opts) {
   };
 }
 function setWsStatus(status, detail) {
+  const nextDetail = detail || wsStatusLabel(status);
+  const changed = state.wsStatus !== status || state.wsStatusDetail !== nextDetail;
   state.wsStatus = status;
-  state.wsStatusDetail = detail || wsStatusLabel(status);
+  state.wsStatusDetail = nextDetail;
+  if (changed) recordBrowserDiagnostic("websocket", "ws_status_changed", { status, detail:nextDetail });
   renderWsStatus();
   updateComposerControls();
 }
@@ -966,6 +1334,10 @@ function isCurrentThreadServerMessage(msg) {
 }
 
 function handleServer(msg) {
+  if (msg && msg.type === "thread_activity") {
+    handleThreadActivity(msg);
+    return;
+  }
   if (!isCurrentThreadServerMessage(msg)) return;
   switch (msg.type) {
     case "thread_state": renderThreadState(msg.state); break;
@@ -976,7 +1348,11 @@ function handleServer(msg) {
     case "token_update":
       if (msg.scope === "thread") renderTokens(msg.ledger);
       break;
-    case "approval_request": renderApprovalRequest(msg.request); break;
+    case "approval_request":
+      handleIncomingApprovalRequest(msg.request, msg.thread_id || state.threadId, {
+        source: "server_message_approval_request"
+      });
+      break;
     case "error":
       if (msg.code === "thread_read_only") {
         state.threadReadOnly = true;
@@ -1016,6 +1392,207 @@ function handleServer(msg) {
       notice(msg.message||"error", msg.severity||"error");
       break;
   }
+}
+
+function handleThreadActivity(msg) {
+  const tid = msg && msg.thread_id !== undefined && msg.thread_id !== null ? String(msg.thread_id) : "";
+  if (!tid) return;
+  const current = state.threadId && String(state.threadId) === tid;
+  const prior = state.threadActivity.get(tid) || {};
+  const activity = {
+    kind: msg.kind || "progress",
+    active_turn: !!msg.active_turn,
+    approval_id: msg.approval_id || null,
+    server_request_id: msg.server_request_id || null,
+    summary: msg.summary || "",
+    source: "thread_activity",
+    unread: !current
+  };
+  if (activity.kind === "turn_completed") {
+    activity.active_turn = false;
+    activity.approval_id = null;
+    activity.unread = !current;
+  } else if (activity.kind === "approval_requested") {
+    activity.unread = !current;
+  } else if (!activity.active_turn && prior.unread && activity.kind !== "error") {
+    activity.unread = true;
+  }
+  state.threadActivity.set(tid, activity);
+  renderThreadActivityIndicator(tid);
+  if (activity.kind === "approval_requested") maybeNotifyApproval(tid, activity);
+}
+
+function maybeNotifyApproval(tid, activity) {
+  if (!activity || activity.kind !== "approval_requested" || !activity.approval_id) {
+    recordNotificationDiagnostic("approval_notify_skipped_invalid_call", { tid, activity });
+    return;
+  }
+  recordNotificationDiagnostic("approval_notify_received", {
+    tid,
+    approval_id: activity.approval_id,
+    source: activity.source || "unknown",
+    summary: activity.summary || ""
+  });
+  if (document.visibilityState === "visible" && String(tid) === String(state.threadId)) {
+    recordNotificationDiagnostic("approval_notify_suppressed_visible_current_thread", {
+      tid,
+      approval_id: activity.approval_id,
+      source: activity.source || "unknown"
+    });
+    return;
+  }
+  if (!("Notification" in window)) {
+    recordNotificationDiagnostic("approval_notify_suppressed_unsupported", {
+      tid,
+      approval_id: activity.approval_id,
+      source: activity.source || "unknown"
+    });
+    return;
+  }
+  if (Notification.permission !== "granted") {
+    recordNotificationDiagnostic("approval_notify_suppressed_permission", {
+      tid,
+      approval_id: activity.approval_id,
+      source: activity.source || "unknown"
+    });
+    maybeNoticeNotificationPermission();
+    return;
+  }
+  const notificationKey = `${tid}:${activity.approval_id}`;
+  const now = Date.now();
+  pruneNotificationDedup(now);
+  const notifiedAt = state.notifiedApprovals.get(notificationKey);
+  if (notifiedAt && now - notifiedAt < NOTIFICATION_DEDUP_MS) {
+    recordNotificationDiagnostic("approval_notify_suppressed_duplicate", {
+      tid,
+      approval_id: activity.approval_id,
+      source: activity.source || "unknown",
+      age_ms: now - notifiedAt
+    });
+    return;
+  }
+  const meta = threadMetaForId(tid);
+  const title = meta && meta.title ? meta.title : tid.slice(0,8);
+  const notificationTag = `giskard-approval-${tid}-${activity.approval_id}-${now}`;
+  let notification;
+  try {
+    notification = createBrowserNotification("Approval requested", {
+      body: activity.summary ? `${title}: ${activity.summary}` : title,
+      tag: notificationTag,
+      renotify: true,
+      requireInteraction: true,
+      data: { threadId:tid, approvalId:activity.approval_id }
+    }, {
+      kind: "approval",
+      tid,
+      approval_id: activity.approval_id,
+      source: activity.source || "unknown",
+      tag: notificationTag
+    });
+  } catch (e) {
+    recordNotificationDiagnostic("approval_notify_constructor_failed", {
+      tid,
+      approval_id: activity.approval_id,
+      source: activity.source || "unknown",
+      error: e && e.message ? e.message : String(e)
+    });
+    console.warn("Giskard notification failed", e);
+    return;
+  }
+  if (!notification) return;
+  state.notifiedApprovals.set(notificationKey, now);
+  recordNotificationDiagnostic("approval_notify_created", {
+    tid,
+    approval_id: activity.approval_id,
+    source: activity.source || "unknown",
+    title,
+    tag: notificationTag
+  });
+  notification.onclick = () => {
+    recordNotificationDiagnostic("approval_notification_clicked", {
+      tid,
+      approval_id: activity.approval_id,
+      source: activity.source || "unknown"
+    });
+    notification.close();
+    focusApprovalTarget(tid, activity.approval_id);
+  };
+}
+
+function createBrowserNotification(title, options, diagnosticDetail) {
+  const notification = new Notification(title, options);
+  diagnosticDetail = diagnosticDetail || {};
+  recordNotificationDiagnostic("browser_notification_created", diagnosticDetail);
+  notification.onshow = () => recordNotificationDiagnostic("browser_notification_show", diagnosticDetail);
+  notification.onerror = () => recordNotificationDiagnostic("browser_notification_error", diagnosticDetail);
+  notification.onclose = () => recordNotificationDiagnostic("browser_notification_close", diagnosticDetail);
+  return notification;
+}
+
+function pruneNotificationDedup(now) {
+  now = now || Date.now();
+  for (const [key, notifiedAt] of state.notifiedApprovals) {
+    if (now - notifiedAt >= NOTIFICATION_DEDUP_MS) state.notifiedApprovals.delete(key);
+  }
+}
+
+function maybeNoticeNotificationPermission() {
+  if (Notification.permission !== "default") return;
+  const now = Date.now();
+  if (now - state.lastNotificationPromptNoticeAt < NOTIFICATION_PROMPT_NOTICE_INTERVAL_MS) return;
+  state.lastNotificationPromptNoticeAt = now;
+  notice("Enable approval notifications from the sidebar alert button.", "warning");
+}
+
+async function focusApprovalTarget(tid, approvalId) {
+  window.focus();
+  const meta = threadMetaForId(tid);
+  if (!meta || !meta.pid) {
+    notice("Approval thread is not in the current project list.", "warning");
+    return;
+  }
+  if (String(state.threadId) !== String(tid)) {
+    await openThread(meta.pid, tid, meta.title, { focusApprovalId:approvalId });
+  } else {
+    state.pendingApprovalFocus = {
+      threadId:String(tid),
+      approvalId:String(approvalId),
+      attempts:0
+    };
+    schedulePendingApprovalFocus();
+  }
+}
+
+function notifyApprovalRequest(request, tid, opts) {
+  opts = opts || {};
+  if (!request || !request.id || !tid) {
+    recordNotificationDiagnostic("incoming_approval_skipped_invalid_request", {
+      tid,
+      request_id: request && request.id ? String(request.id) : null
+    });
+    return;
+  }
+  maybeNotifyApproval(String(tid), {
+    kind:"approval_requested",
+    active_turn:true,
+    approval_id:String(request.id),
+    server_request_id:null,
+    summary:approvalTitle(request),
+    source:opts.source || "incoming_approval_request",
+    unread:false
+  });
+}
+
+function handleIncomingApprovalRequest(request, tid, opts) {
+  opts = opts || {};
+  recordNotificationDiagnostic("incoming_approval_request", {
+    tid,
+    request_id: request && request.id ? String(request.id) : null,
+    source: opts.source || "unknown",
+    notify: opts.notify !== false
+  });
+  if (opts.notify !== false) notifyApprovalRequest(request, tid, { source: opts.source });
+  renderApprovalRequest(request);
 }
 
 function renderThreadState(s) {
@@ -1209,7 +1786,11 @@ function handleEvent(ev) {
       setTurnActive(false);
       breakTaskGroup();
       break;
-    case "approval_requested": renderApprovalRequest(ev.request); break;
+    case "approval_requested":
+      handleIncomingApprovalRequest(ev.request, ev.thread || state.threadId, {
+        source: "agent_event_approval_requested"
+      });
+      break;
     case "server_request_received": renderServerRequest(ev.request); break;
     case "server_request_resolved": resolveServerRequest(ev.request_id); break;
     // Render errors as a persistent transcript entry (tied to the turn/message that caused them)
@@ -1252,7 +1833,11 @@ function renderLiveTurnSnapshot(snap) {
     setTurnActive(true);
   }
   for (const ev of (snap.accumulated||[])) handleEvent(ev);
-  if (snap.pending_approval) renderApprovalRequest(snap.pending_approval);
+  if (snap.pending_approval) {
+    handleIncomingApprovalRequest(snap.pending_approval, snap.thread_id || state.threadId, {
+      source: "live_turn_snapshot_pending_approval"
+    });
+  }
   for (const request of (snap.pending_server_requests || [])) renderServerRequest(request);
 }
 
@@ -1303,7 +1888,39 @@ function renderApprovalRequest(request) {
   addApprovalButton(actions, id, "decline", "Decline", "danger", available);
   addApprovalButton(actions, id, "cancel", "Cancel", "", available);
   body.append(actions);
+  schedulePendingApprovalFocus();
 }
+
+function approvalRowById(id) {
+  if (!id) return null;
+  const target = String(id);
+  return Array.from(document.querySelectorAll("[data-approval-id]"))
+    .find(el => String(el.dataset.approvalId) === target) || null;
+}
+
+function schedulePendingApprovalFocus() {
+  const pending = state.pendingApprovalFocus;
+  if (!pending || !pending.approvalId) return;
+  if (!state.threadId || String(state.threadId) !== String(pending.threadId)) return;
+  const row = approvalRowById(pending.approvalId);
+  if (row) {
+    state.pendingApprovalFocus = null;
+    row.scrollIntoView({ block:"center", behavior:"smooth" });
+    row.classList.add("approval-target");
+    row.setAttribute("tabindex", "-1");
+    row.focus({ preventScroll:true });
+    setTimeout(() => row.classList.remove("approval-target"), 5000);
+    return;
+  }
+  pending.attempts = (pending.attempts || 0) + 1;
+  if (pending.attempts > 40) {
+    state.pendingApprovalFocus = null;
+    notice("Approval is no longer pending.", "warning");
+    return;
+  }
+  setTimeout(schedulePendingApprovalFocus, 150);
+}
+
 function approvalTitle(request) {
   const kind = request.kind || {};
   if (kind.kind==="command_execution") return "Run command?";
