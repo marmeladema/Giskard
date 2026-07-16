@@ -20,7 +20,7 @@ use giskard_core::user_input::UserInput;
 use giskard_harness::{AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle};
 use giskard_persist::PersistStore;
 use giskard_persist::store::ProjectConfig;
-use giskard_proto::{RunningTask, ServerMessage, TokenScope};
+use giskard_proto::{RunningTask, ServerMessage, ThreadActivity, ThreadActivityKind, TokenScope};
 
 use crate::hub::Hub;
 use crate::ledger::LedgerHandle;
@@ -794,6 +794,7 @@ async fn forward_events(
                                 elapsed_ms = forwarder_started.elapsed().as_millis(),
                                 "turnless harness error received before turn ownership"
                             );
+                            broadcast_thread_activity(&hub, thread_id, &event, false).await;
                             hub.broadcast_event(thread_id, event.clone()).await;
                         }
                         AgentEvent::Notice { message, .. } => {
@@ -808,6 +809,7 @@ async fn forward_events(
                                 elapsed_ms = forwarder_started.elapsed().as_millis(),
                                 "turnless harness notice received before turn ownership"
                             );
+                            broadcast_thread_activity(&hub, thread_id, &event, true).await;
                             hub.broadcast_event(thread_id, event.clone()).await;
                         }
                         AgentEvent::ServerRequestReceived { request, .. } => {
@@ -827,6 +829,7 @@ async fn forward_events(
                                 .lock()
                                 .await
                                 .insert(request.id.clone(), thread_id);
+                            broadcast_thread_activity(&hub, thread_id, &event, true).await;
                             hub.broadcast_event(thread_id, event.clone()).await;
                         }
                         _ => {}
@@ -972,6 +975,7 @@ async fn forward_events(
                     )
                     .await;
                     owned_turn_completed = true;
+                    broadcast_thread_activity(&hub, thread_id, &event, false).await;
                     hub.broadcast_event(thread_id, event).await;
                     if command_state_changed {
                         broadcast_running_commands(&hub, &running_commands, thread_id).await;
@@ -982,6 +986,7 @@ async fn forward_events(
                     continue;
                 }
 
+                broadcast_thread_activity(&hub, thread_id, &event, true).await;
                 hub.broadcast_event(thread_id, event).await;
 
                 if command_state_changed {
@@ -1033,6 +1038,7 @@ async fn forward_events(
                     )
                     .await;
                     owned_turn_completed = true;
+                    broadcast_thread_activity(&hub, thread_id, &completion_event, false).await;
                     hub.broadcast_event(thread_id, completion_event).await;
                     if !running_commands.has_running_for_turn(thread_id, tid).await {
                         break;
@@ -1232,6 +1238,118 @@ fn event_kind(event: &AgentEvent) -> &'static str {
         AgentEvent::Error { .. } => "error",
         AgentEvent::Notice { .. } => "notice",
     }
+}
+
+async fn broadcast_thread_activity(
+    hub: &Hub,
+    thread_id: ThreadId,
+    event: &AgentEvent,
+    fallback_active_turn: bool,
+) {
+    let Some(activity) = thread_activity_from_event(thread_id, event, fallback_active_turn) else {
+        return;
+    };
+    hub.broadcast_all(ServerMessage::ThreadActivity(activity))
+        .await;
+}
+
+fn thread_activity_from_event(
+    thread_id: ThreadId,
+    event: &AgentEvent,
+    fallback_active_turn: bool,
+) -> Option<ThreadActivity> {
+    let mut activity = ThreadActivity {
+        thread_id,
+        kind: ThreadActivityKind::Progress,
+        active_turn: fallback_active_turn,
+        summary: None,
+    };
+
+    match event {
+        AgentEvent::ThreadOpened { .. } => return None,
+        AgentEvent::TurnStarted { .. } => {
+            activity.kind = ThreadActivityKind::TurnStarted;
+            activity.active_turn = true;
+            activity.summary = Some("Turn started".into());
+        }
+        AgentEvent::ItemStarted { item, .. } => {
+            activity.active_turn = true;
+            activity.summary = Some(match &item.kind {
+                giskard_core::item::ItemKind::CommandExecution => item
+                    .command
+                    .as_ref()
+                    .map(|cmd| format!("Running {}", cmd.command))
+                    .unwrap_or_else(|| "Command started".into()),
+                giskard_core::item::ItemKind::ToolCall => item
+                    .tool
+                    .as_ref()
+                    .map(|tool| format!("Tool {}", tool.name))
+                    .unwrap_or_else(|| "Tool started".into()),
+                giskard_core::item::ItemKind::FileChange => "File change started".into(),
+                giskard_core::item::ItemKind::Activity => "Activity started".into(),
+                giskard_core::item::ItemKind::Reasoning => "Reasoning".into(),
+                giskard_core::item::ItemKind::AgentMessage => "Agent message".into(),
+                giskard_core::item::ItemKind::UserMessage => "User message".into(),
+            });
+        }
+        AgentEvent::ItemDelta { .. } => return None,
+        AgentEvent::ItemCompleted { item, .. } => {
+            activity.active_turn = true;
+            activity.summary = Some(match &item.payload {
+                ItemPayload::CommandExecution { command, .. } => {
+                    format!("Command finished {command}")
+                }
+                ItemPayload::ToolCall { name, .. } => format!("Tool finished {name}"),
+                ItemPayload::FileChange { path, .. } => {
+                    format!("Changed {}", path.to_string_lossy())
+                }
+                ItemPayload::Activity { title, .. } => title.clone(),
+                ItemPayload::AgentMessage { .. } => "Agent replied".into(),
+                ItemPayload::Reasoning { .. } => "Reasoning updated".into(),
+                ItemPayload::UserMessage { .. } => "User message recorded".into(),
+            });
+        }
+        AgentEvent::DiffUpdated { diff, .. } => {
+            activity.active_turn = true;
+            activity.summary = Some(format!("Diff updated {}", diff.path.to_string_lossy()));
+        }
+        AgentEvent::ApprovalRequested { request, .. } => {
+            activity.kind = ThreadActivityKind::ApprovalRequested {
+                approval_id: request.id.to_string(),
+            };
+            activity.active_turn = true;
+            activity.summary = Some("Approval requested".into());
+        }
+        AgentEvent::ServerRequestReceived { request, .. } => {
+            activity.kind = ThreadActivityKind::ServerRequestReceived {
+                server_request_id: request.id.to_string(),
+            };
+            activity.active_turn = true;
+            activity.summary = Some(format!("{} request", request.method));
+        }
+        AgentEvent::ServerRequestResolved { .. } => {
+            activity.summary = Some("Request resolved".into());
+        }
+        AgentEvent::TurnCompleted { status, .. } => {
+            activity.kind = ThreadActivityKind::TurnCompleted;
+            activity.active_turn = false;
+            activity.summary = status
+                .message
+                .clone()
+                .or_else(|| Some("Turn completed".into()));
+        }
+        AgentEvent::Error { error, .. } => {
+            activity.kind = ThreadActivityKind::Error;
+            activity.active_turn = false;
+            activity.summary = Some(error.to_string());
+        }
+        AgentEvent::Notice { message, .. } => {
+            activity.kind = ThreadActivityKind::Notice;
+            activity.summary = Some(message.clone());
+        }
+    }
+
+    Some(activity)
 }
 
 fn event_item_id(event: &AgentEvent) -> Option<ItemId> {
@@ -1542,12 +1660,12 @@ mod tests {
     use giskard_harness::AgentEventStream;
     use giskard_persist::PersistStore;
     use giskard_persist::store::ThreadFile;
-    use giskard_proto::{ServerMessage, WireAgentEvent};
+    use giskard_proto::{ServerMessage, ThreadActivityKind, WireAgentEvent};
     use tokio::sync::{Mutex, broadcast, mpsc};
 
     use super::{
         ThreadTurnGate, TurnContext, TurnContextKind, command_completion_is_normal_success,
-        command_status_is_running, forward_events,
+        command_status_is_running, forward_events, thread_activity_from_event,
     };
     use crate::hub::Hub;
     use crate::ledger;
@@ -1576,6 +1694,125 @@ mod tests {
 
         assert!(!command_status_is_running("completed"));
         assert!(!command_status_is_running("interrupted"));
+    }
+
+    #[test]
+    fn thread_activity_mapper_covers_request_and_terminal_events() {
+        let thread_id = ThreadId::new();
+        let turn_id = TurnId::new();
+        let approval_id = ApprovalId("approval_1".into());
+        let server_request_id = ServerRequestId("server_request_1".into());
+
+        let approval = thread_activity_from_event(
+            thread_id,
+            &AgentEvent::ApprovalRequested {
+                thread: thread_id,
+                turn: turn_id,
+                request: ApprovalRequest {
+                    id: approval_id.clone(),
+                    kind: ApprovalKind::Permission {
+                        detail: "network".into(),
+                    },
+                    reason: Some("needs network".into()),
+                    metadata: Vec::new(),
+                    available: vec![ApprovalDecision::Accept, ApprovalDecision::Decline],
+                },
+            },
+            true,
+        )
+        .expect("approval should map to thread activity");
+        assert!(approval.active_turn);
+        match approval.kind {
+            ThreadActivityKind::ApprovalRequested { approval_id: id } => {
+                assert_eq!(id, approval_id.0);
+            }
+            other => panic!("expected approval activity, got {other:?}"),
+        }
+
+        let request = thread_activity_from_event(
+            thread_id,
+            &AgentEvent::ServerRequestReceived {
+                thread: thread_id,
+                turn: Some(turn_id),
+                request: ServerRequest {
+                    id: server_request_id.clone(),
+                    method: "item/tool/requestUserInput".into(),
+                    params: serde_json::json!({ "question": "Continue?" }),
+                    received_at: Utc::now(),
+                },
+            },
+            true,
+        )
+        .expect("server request should map to thread activity");
+        assert!(request.active_turn);
+        match request.kind {
+            ThreadActivityKind::ServerRequestReceived {
+                server_request_id: id,
+            } => {
+                assert_eq!(id, server_request_id.0);
+            }
+            other => panic!("expected server request activity, got {other:?}"),
+        }
+
+        let completed = thread_activity_from_event(
+            thread_id,
+            &AgentEvent::TurnCompleted {
+                thread: thread_id,
+                turn: turn_id,
+                usage: TokenUsage::default(),
+                status: TurnStatus {
+                    kind: TurnStatusKind::Completed,
+                    message: Some("done".into()),
+                },
+            },
+            true,
+        )
+        .expect("turn completion should map to thread activity");
+        assert_eq!(completed.kind, ThreadActivityKind::TurnCompleted);
+        assert!(!completed.active_turn);
+        assert_eq!(completed.summary.as_deref(), Some("done"));
+
+        let error = thread_activity_from_event(
+            thread_id,
+            &AgentEvent::Error {
+                thread: thread_id,
+                turn: Some(turn_id),
+                error: HarnessError::Protocol("bad frame".into()),
+            },
+            true,
+        )
+        .expect("errors should map to thread activity");
+        assert_eq!(error.kind, ThreadActivityKind::Error);
+        assert!(!error.active_turn);
+        assert!(
+            error
+                .summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains("bad frame"))
+        );
+    }
+
+    #[test]
+    fn thread_activity_mapper_skips_high_volume_deltas() {
+        let thread_id = ThreadId::new();
+        let turn_id = TurnId::new();
+        let item_id = ItemId::new();
+        let activity = thread_activity_from_event(
+            thread_id,
+            &AgentEvent::ItemDelta {
+                thread: thread_id,
+                turn: turn_id,
+                item_id,
+                delta: giskard_core::item::ItemDelta::Text {
+                    text: "streaming".into(),
+                },
+            },
+            true,
+        );
+        assert!(
+            activity.is_none(),
+            "text/output deltas should not become cross-thread activity"
+        );
     }
 
     #[tokio::test]

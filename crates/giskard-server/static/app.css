@@ -33,6 +33,15 @@
     display:flex; flex-direction:column; min-height:0; overflow:visible;
   }
   #projects { flex:1; min-height:0; overflow-y:auto; }
+  .sidebar-head { align-items:center; gap:6px; margin-bottom:6px; }
+  .notify-permission-btn {
+    width:28px; height:28px; padding:0; flex:none; font-weight:700; line-height:1;
+    border-color:#8a6d1d; background:#3a2f15; color:#f0d98c;
+  }
+  .notify-permission-btn:hover { border-color:#d29922; }
+  .notify-permission-btn:disabled {
+    cursor:default; opacity:.7; border-color:var(--border); background:var(--panel2); color:var(--muted);
+  }
   .sidebar-settings { position:relative; margin-top:10px; padding-top:10px; border-top:1px solid var(--border); }
   .settings-btn { width:32px; height:32px; padding:0; font-size:17px; line-height:1; }
   .settings-popover {
@@ -47,6 +56,17 @@
   .settings-field label { display:block; color:var(--muted); font-size:12px; margin-bottom:4px; }
   .settings-field select { width:100%; }
   .settings-field button { width:100%; }
+  .settings-field .notify-permission-btn { height:auto; min-height:32px; padding:6px 8px; text-align:left; }
+  .browser-diagnostics {
+    margin:8px 0 0; padding:8px;
+    border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--muted);
+  }
+  .browser-diagnostics[hidden] { display:none; }
+  .browser-diagnostics pre {
+    margin:0; max-height:180px; overflow:auto; white-space:pre-wrap; font:11px/1.4 var(--mono);
+  }
+  .browser-diagnostics-actions { display:flex; gap:6px; margin-top:8px; }
+  .browser-diagnostics-actions button { flex:1; padding:4px 6px; font-size:12px; }
   /* The center column owns both dividers, so each delimiter line hugs the thread and the drag
      bar sits just outside it — symmetric on the left and right. */
   .center { display:flex; flex-direction:column; border-left:1px solid var(--border); border-right:1px solid var(--border); }
@@ -63,9 +83,15 @@
   .project-add { width:28px; height:28px; padding:0; }
   .project-threads[hidden] { display:none; }
   .thread-row { position:relative; display:flex; align-items:center; gap:4px; margin:3px 0 3px 8px; border-radius:6px; }
-  .thread { flex:1; min-width:0; padding:5px 8px; border-radius:6px; cursor:pointer; color:var(--muted); font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .thread { flex:1; min-width:0; padding:5px 8px; border-radius:6px; cursor:pointer; color:var(--muted); font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:flex; align-items:center; gap:6px; }
   .thread:hover { background:var(--panel2); }
   .thread.active { background:var(--panel2); color:var(--fg); }
+  .thread-status { flex:none; width:10px; text-align:center; color:var(--muted); font-weight:700; }
+  .thread-title { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .thread.has-activity .thread-title { color:var(--fg); }
+  .thread.activity-running .thread-status { color:#d29922; }
+  .thread.activity-approval .thread-status { color:#f0d98c; }
+  .thread.activity-error .thread-status { color:#f85149; }
   .thread-title-input { flex:1; min-width:0; height:28px; padding:4px 7px; font-size:13px; }
   .thread-menu-btn { width:28px; height:28px; padding:0; border-color:transparent; background:transparent; color:var(--muted); }
   .thread-menu-btn:hover { border-color:var(--border); color:var(--fg); }
@@ -233,6 +259,7 @@
   .plan-card-body[hidden] { display:none; }
   .plan-card-body .plan-explanation { margin-bottom:8px; }
   .msg.approval { background:#241d10; border:1px solid #d29922; max-width:100%; }
+  .msg.approval-target { outline:2px solid #f0d98c; outline-offset:3px; }
   .msg.approval.resolved.decision-accept,
   .msg.approval.resolved.decision-session { background:#172217; border-color:#3fb950; }
   .msg.approval.resolved.decision-decline { background:#2b1618; border-color:#f85149; }

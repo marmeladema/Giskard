@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use futures_util::{SinkExt, StreamExt};
-use giskard_core::approval::ApprovalDecision;
+use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalRequest};
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
@@ -11,7 +11,7 @@ use giskard_core::item::{
     CommandExecutionStart, Item, ItemDelta, ItemKind, ItemPayload, ItemStart,
 };
 use giskard_core::model::ModelRef;
-use giskard_core::server_request::ServerRequestResponse;
+use giskard_core::server_request::{ServerRequest, ServerRequestResponse};
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{ApprovalPolicy, Mode, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
@@ -20,7 +20,9 @@ use giskard_harness::{
 };
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 use giskard_persist::store::ProjectConfig;
-use giskard_proto::{ClientMessage, ErrorSeverity, ServerMessage, WireAgentEvent};
+use giskard_proto::{
+    ClientMessage, ErrorSeverity, ServerMessage, ThreadActivity, ThreadActivityKind, WireAgentEvent,
+};
 use giskard_server::{AppState, HarnessFactory, build_app};
 
 struct TestFactory {
@@ -42,6 +44,9 @@ struct UnsupportedCompactionFactory;
 struct SlowCompactionFactory;
 struct SlowStartFactory {
     harness: Arc<SlowStartHarness>,
+}
+struct ActivityFactory {
+    harness: Arc<ActivityHarness>,
 }
 struct CountingOpenFactory {
     harness: Arc<CountingOpenHarness>,
@@ -88,6 +93,16 @@ impl HarnessFactory for SlowStartFactory {
 }
 
 #[async_trait::async_trait]
+impl HarnessFactory for ActivityFactory {
+    async fn create(
+        &self,
+        _config: &ProjectConfig,
+    ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
+        Ok(self.harness.clone())
+    }
+}
+
+#[async_trait::async_trait]
 impl HarnessFactory for CountingOpenFactory {
     async fn create(
         &self,
@@ -114,6 +129,15 @@ struct SlowStartHarness {
     start_calls: AtomicUsize,
     hold_first_start: AtomicBool,
     release_first_start: AtomicBool,
+}
+
+#[derive(Default)]
+struct ActivityHarness {
+    threads: tokio::sync::Mutex<HashMap<ThreadId, tokio::sync::broadcast::Sender<AgentEvent>>>,
+    approval_responses: tokio::sync::Mutex<Vec<(ApprovalId, ApprovalDecision)>>,
+    server_responses: tokio::sync::Mutex<Vec<(ServerRequestId, ServerRequestResponse)>>,
+    pending_approvals: tokio::sync::Mutex<HashMap<ApprovalId, (ThreadId, TurnId)>>,
+    pending_server_requests: tokio::sync::Mutex<HashMap<ServerRequestId, (ThreadId, TurnId)>>,
 }
 
 #[derive(Default)]
@@ -157,6 +181,50 @@ impl SlowStartHarness {
 
     fn release_first_start(&self) {
         self.release_first_start.store(true, Ordering::SeqCst);
+    }
+}
+
+impl ActivityHarness {
+    async fn wait_for_approval_response(&self) -> (ApprovalId, ApprovalDecision) {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            if let Some(response) = self.approval_responses.lock().await.first().cloned() {
+                return response;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("approval response did not reach harness");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn wait_for_server_response(&self) -> (ServerRequestId, ServerRequestResponse) {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            if let Some(response) = self.server_responses.lock().await.first().cloned() {
+                return response;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("server request response did not reach harness");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn complete_turn(&self, thread: ThreadId, turn: TurnId) -> Result<(), HarnessError> {
+        let Some(sender) = self.threads.lock().await.get(&thread).cloned() else {
+            return Err(HarnessError::ThreadNotFound(thread));
+        };
+        let _ = sender.send(AgentEvent::TurnCompleted {
+            thread,
+            turn,
+            usage: TokenUsage::default(),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        });
+        Ok(())
     }
 }
 
@@ -423,6 +491,161 @@ impl AgentHarness for SlowCompactionHarness {
                 },
             });
         });
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> Result<(), HarnessError> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentHarness for ActivityHarness {
+    fn capabilities(&self) -> HarnessCapabilities {
+        HarnessCapabilities {
+            live_approvals: true,
+            plan_build_modes: true,
+            per_turn_model: true,
+            reasoning_effort: true,
+            structured_diffs: false,
+            resumable_threads: true,
+            model_listing: false,
+            token_usage: false,
+            mcp_status: false,
+            mcp_reload: false,
+            mcp_oauth_login: false,
+            context_compaction: false,
+        }
+    }
+
+    async fn list_models(&self) -> Result<Vec<giskard_core::ModelDescriptor>, HarnessError> {
+        Ok(Vec::new())
+    }
+
+    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
+        let thread = opts.thread.unwrap_or_default();
+        let (tx, _) = tokio::sync::broadcast::channel(32);
+        self.threads.lock().await.insert(thread, tx);
+        Ok(ThreadHandle {
+            thread,
+            harness_thread_id: opts.resume.unwrap_or_else(|| format!("test_{thread}")),
+            warning: None,
+            resumed_model: Some(opts.initial_model.clone()),
+        })
+    }
+
+    async fn start_turn(
+        &self,
+        thread: &ThreadHandle,
+        input: UserInput,
+        _overrides: TurnOverrides,
+    ) -> Result<TurnId, HarnessError> {
+        let Some(sender) = self.threads.lock().await.get(&thread.thread).cloned() else {
+            return Err(HarnessError::ThreadNotFound(thread.thread));
+        };
+        let thread_id = thread.thread;
+        let turn = TurnId::new();
+        let text = input.as_text().unwrap_or_default().to_string();
+        let _ = sender.send(AgentEvent::TurnStarted {
+            thread: thread_id,
+            turn,
+        });
+
+        if text.contains("approval") {
+            let approval_id = ApprovalId(format!("approval_{thread_id}"));
+            self.pending_approvals
+                .lock()
+                .await
+                .insert(approval_id.clone(), (thread_id, turn));
+            let _ = sender.send(AgentEvent::ApprovalRequested {
+                thread: thread_id,
+                turn,
+                request: ApprovalRequest {
+                    id: approval_id,
+                    kind: ApprovalKind::CommandExecution {
+                        command: "cargo test".into(),
+                        cwd: "/tmp".into(),
+                    },
+                    reason: Some("inactive approval".into()),
+                    metadata: Vec::new(),
+                    available: vec![ApprovalDecision::Accept, ApprovalDecision::Decline],
+                },
+            });
+        } else if text.contains("server request") {
+            let request_id = ServerRequestId(format!("server_request_{thread_id}"));
+            self.pending_server_requests
+                .lock()
+                .await
+                .insert(request_id.clone(), (thread_id, turn));
+            let _ = sender.send(AgentEvent::ServerRequestReceived {
+                thread: thread_id,
+                turn: Some(turn),
+                request: ServerRequest {
+                    id: request_id,
+                    method: "item/tool/requestUserInput".into(),
+                    params: serde_json::json!({
+                        "questions": [{
+                            "id": "confirm",
+                            "header": "Confirm",
+                            "question": "Continue?",
+                            "options": [{ "label": "Yes", "description": "Continue" }],
+                        }]
+                    }),
+                    received_at: chrono::Utc::now(),
+                },
+            });
+        } else {
+            self.complete_turn(thread_id, turn).await?;
+        }
+
+        Ok(turn)
+    }
+
+    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
+        if let Ok(threads) = self.threads.try_lock() {
+            if let Some(sender) = threads.get(&thread.thread) {
+                return AgentEventStream::new(sender.subscribe());
+            }
+        }
+        let (_, rx) = tokio::sync::broadcast::channel(1);
+        AgentEventStream::new(rx)
+    }
+
+    async fn respond_approval(
+        &self,
+        req: ApprovalId,
+        decision: ApprovalDecision,
+    ) -> Result<(), HarnessError> {
+        self.approval_responses
+            .lock()
+            .await
+            .push((req.clone(), decision));
+        let Some((thread, turn)) = self.pending_approvals.lock().await.remove(&req) else {
+            return Err(HarnessError::Protocol(format!(
+                "unknown approval response {req}"
+            )));
+        };
+        self.complete_turn(thread, turn).await
+    }
+
+    async fn respond_server_request(
+        &self,
+        req: ServerRequestId,
+        response: ServerRequestResponse,
+    ) -> Result<(), HarnessError> {
+        self.server_responses
+            .lock()
+            .await
+            .push((req.clone(), response));
+        let Some((thread, turn)) = self.pending_server_requests.lock().await.remove(&req) else {
+            return Err(HarnessError::Protocol(format!(
+                "unknown server request response {req}"
+            )));
+        };
+        self.complete_turn(thread, turn).await
+    }
+
+    async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
         Ok(())
     }
 
@@ -1145,6 +1368,12 @@ async fn start_slow_start_server_on_available_port(
     start_custom_server_on_available_port(Arc::new(SlowStartFactory { harness })).await
 }
 
+async fn start_activity_server_on_available_port(
+    harness: Arc<ActivityHarness>,
+) -> (tempfile::TempDir, Arc<AppState>, u16) {
+    start_custom_server_on_available_port(Arc::new(ActivityFactory { harness })).await
+}
+
 async fn start_custom_server_on_available_port(
     factory: Arc<dyn HarnessFactory>,
 ) -> (tempfile::TempDir, Arc<AppState>, u16) {
@@ -1323,6 +1552,82 @@ async fn wait_for_turn_completed(
         }
     }
     panic!("turn completion for {thread_id} was not observed");
+}
+
+async fn wait_for_thread_activity(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    active_thread: ThreadId,
+    inactive_thread: ThreadId,
+    expected: fn(&ThreadActivityKind) -> bool,
+    expected_name: &str,
+) -> ThreadActivity {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                let Ok(server_msg) = serde_json::from_str::<ServerMessage>(&text) else {
+                    continue;
+                };
+                match server_msg {
+                    ServerMessage::ThreadActivity(activity)
+                        if activity.thread_id == inactive_thread && expected(&activity.kind) =>
+                    {
+                        return activity;
+                    }
+                    ServerMessage::ThreadActivity(_) => {}
+                    ServerMessage::Event {
+                        thread_id,
+                        agent_event,
+                    } if thread_id == inactive_thread => {
+                        panic!(
+                            "inactive thread full event leaked without subscription: {agent_event:?}"
+                        );
+                    }
+                    ServerMessage::Event { thread_id, .. }
+                    | ServerMessage::HistoryPage { thread_id, .. }
+                    | ServerMessage::RunningTasks { thread_id, .. } => {
+                        assert_eq!(
+                            thread_id, active_thread,
+                            "thread-scoped message should belong to subscribed thread"
+                        );
+                    }
+                    ServerMessage::LiveTurnSnapshot(snapshot) => {
+                        assert_eq!(
+                            snapshot.thread_id, active_thread,
+                            "live snapshot should belong to subscribed thread"
+                        );
+                    }
+                    ServerMessage::ApprovalRequest { thread_id, .. } => {
+                        assert_eq!(
+                            thread_id, active_thread,
+                            "approval request card should belong to subscribed thread"
+                        );
+                    }
+                    ServerMessage::ThreadState(_)
+                    | ServerMessage::TokenUpdate { .. }
+                    | ServerMessage::Error { .. }
+                    | ServerMessage::Pong => {}
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => {}
+        }
+    }
+    panic!("thread activity {expected_name} for {inactive_thread} was not observed");
+}
+
+fn is_approval_requested_activity(kind: &ThreadActivityKind) -> bool {
+    matches!(kind, ThreadActivityKind::ApprovalRequested { .. })
+}
+
+fn is_server_request_received_activity(kind: &ThreadActivityKind) -> bool {
+    matches!(kind, ThreadActivityKind::ServerRequestReceived { .. })
+}
+
+fn is_turn_completed_activity(kind: &ThreadActivityKind) -> bool {
+    matches!(kind, ThreadActivityKind::TurnCompleted)
 }
 
 #[tokio::test]
@@ -1629,6 +1934,269 @@ async fn compact_context_does_not_block_turns_on_other_threads_or_projects() {
         state.live_buffers.is_active(compacting_thread).await,
         "precondition check: compaction should still be active while the other thread completed"
     );
+}
+
+#[tokio::test]
+async fn inactive_thread_progress_sends_activity_without_full_event_subscription() {
+    let (_tmp, _state, port) = start_slow_compaction_server_on_available_port().await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let (project_id, active_thread) = create_project_and_thread(&client, &base, &cookie).await;
+    let inactive_thread =
+        open_thread_with_resume(&client, &base, &cookie, project_id, "inactive_thread").await;
+    let mut ws = connect_ws(port, &cookie).await;
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::Subscribe {
+            thread_id: active_thread,
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SendInput {
+            thread_id: inactive_thread,
+            text: "work in inactive thread".into(),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    let mut saw_inactive_start = false;
+    let mut saw_inactive_progress = false;
+    let mut saw_inactive_completed = false;
+    let mut saw_active_state = false;
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
+                match server_msg {
+                    ServerMessage::ThreadState(state) => {
+                        if state.thread_id == active_thread {
+                            saw_active_state = true;
+                        }
+                    }
+                    ServerMessage::ThreadActivity(activity) => {
+                        if activity.thread_id == inactive_thread {
+                            match activity.kind {
+                                ThreadActivityKind::TurnStarted => {
+                                    assert!(activity.active_turn);
+                                    saw_inactive_start = true;
+                                }
+                                ThreadActivityKind::Progress => {
+                                    assert!(activity.active_turn);
+                                    saw_inactive_progress = true;
+                                }
+                                ThreadActivityKind::TurnCompleted => {
+                                    assert!(!activity.active_turn);
+                                    saw_inactive_completed = true;
+                                }
+                                other => panic!("unexpected inactive-thread activity: {other:?}"),
+                            }
+                        }
+                    }
+                    ServerMessage::Event {
+                        thread_id,
+                        agent_event,
+                    } if thread_id == inactive_thread => {
+                        panic!(
+                            "inactive thread full event leaked without subscription: {agent_event:?}"
+                        );
+                    }
+                    ServerMessage::Event { thread_id, .. } => {
+                        assert_eq!(
+                            thread_id, active_thread,
+                            "only the subscribed thread may deliver full events"
+                        );
+                    }
+                    ServerMessage::HistoryPage { thread_id, .. }
+                    | ServerMessage::RunningTasks { thread_id, .. } => {
+                        assert_eq!(
+                            thread_id, active_thread,
+                            "snapshots should belong to the subscribed thread"
+                        );
+                    }
+                    ServerMessage::LiveTurnSnapshot(snapshot) => {
+                        assert_eq!(
+                            snapshot.thread_id, active_thread,
+                            "live snapshot should belong to the subscribed thread"
+                        );
+                    }
+                    ServerMessage::TokenUpdate {
+                        thread_id: Some(thread_id),
+                        ..
+                    } => {
+                        assert_eq!(
+                            thread_id, inactive_thread,
+                            "inactive completed turn may update only lightweight token state"
+                        );
+                    }
+                    ServerMessage::TokenUpdate {
+                        thread_id: None, ..
+                    }
+                    | ServerMessage::Error { .. }
+                    | ServerMessage::ApprovalRequest { .. }
+                    | ServerMessage::Pong => {}
+                }
+                if saw_inactive_start && saw_inactive_progress && saw_inactive_completed {
+                    break;
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => {}
+        }
+    }
+
+    assert!(
+        saw_active_state,
+        "subscribe should return active thread state"
+    );
+    assert!(
+        saw_inactive_start,
+        "inactive thread should announce turn start activity"
+    );
+    assert!(
+        saw_inactive_progress,
+        "inactive thread should announce progress activity"
+    );
+    assert!(
+        saw_inactive_completed,
+        "inactive thread should announce completion activity"
+    );
+}
+
+#[tokio::test]
+async fn inactive_thread_requests_send_activity_and_route_responses() {
+    let harness = Arc::new(ActivityHarness::default());
+    let (_tmp, _state, port) = start_activity_server_on_available_port(harness.clone()).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let (project_id, active_thread) = create_project_and_thread(&client, &base, &cookie).await;
+    let inactive_thread =
+        open_thread_with_resume(&client, &base, &cookie, project_id, "inactive_requests").await;
+    let mut ws = connect_ws(port, &cookie).await;
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::Subscribe {
+            thread_id: active_thread,
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SendInput {
+            thread_id: inactive_thread,
+            text: "approval please".into(),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    let approval_activity = wait_for_thread_activity(
+        &mut ws,
+        active_thread,
+        inactive_thread,
+        is_approval_requested_activity,
+        "approval_requested",
+    )
+    .await;
+    assert!(approval_activity.active_turn);
+    let ThreadActivityKind::ApprovalRequested { approval_id } = approval_activity.kind else {
+        panic!("approval activity should carry approval_id");
+    };
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::ApprovalDecision {
+            request_id: approval_id.clone(),
+            decision: ApprovalDecision::Accept,
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    let (handled_approval, decision) = harness.wait_for_approval_response().await;
+    assert_eq!(handled_approval.0, approval_id);
+    assert_eq!(decision, ApprovalDecision::Accept);
+    let completion_activity = wait_for_thread_activity(
+        &mut ws,
+        active_thread,
+        inactive_thread,
+        is_turn_completed_activity,
+        "turn_completed",
+    )
+    .await;
+    assert!(!completion_activity.active_turn);
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SendInput {
+            thread_id: inactive_thread,
+            text: "server request please".into(),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    let request_activity = wait_for_thread_activity(
+        &mut ws,
+        active_thread,
+        inactive_thread,
+        is_server_request_received_activity,
+        "server_request_received",
+    )
+    .await;
+    assert!(request_activity.active_turn);
+    let ThreadActivityKind::ServerRequestReceived { server_request_id } = request_activity.kind
+    else {
+        panic!("server-request activity should carry server_request_id");
+    };
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::ServerRequestResponse {
+            request_id: server_request_id.clone(),
+            response: ServerRequestResponse::result(serde_json::json!({
+                "answers": { "confirm": "Yes" }
+            })),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    let (handled_request, response) = harness.wait_for_server_response().await;
+    assert_eq!(handled_request.0, server_request_id);
+    match response {
+        ServerRequestResponse::Result { value } => {
+            assert_eq!(value["answers"]["confirm"], "Yes");
+        }
+        other => panic!("expected result response, got {other:?}"),
+    }
+    let completion_activity = wait_for_thread_activity(
+        &mut ws,
+        active_thread,
+        inactive_thread,
+        is_turn_completed_activity,
+        "turn_completed",
+    )
+    .await;
+    assert!(!completion_activity.active_turn);
 }
 
 #[tokio::test]

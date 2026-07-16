@@ -8,7 +8,22 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.46
+**Version:** 1.47
+
+**Changelog (1.46 → 1.47), cross-thread activity and browser diagnostics:**
+- **TA1:** Inactive threads emit lightweight `ThreadActivity` WebSocket messages to all connected
+  browser clients. These messages carry the thread id, activity kind, active-turn flag, optional
+  kind-specific approval/server-request ids, and a short summary. They are intentionally separate
+  from full transcript events so the sidebar can show progress without subscribing the browser to
+  every thread's live stream.
+- **TA2:** Approval requests from inactive threads, or from the focused thread while the browser tab
+  is hidden, may create browser notifications when permission is granted. Notification clicks focus
+  the target thread and scroll to the matching approval row when it is still pending. Duplicate
+  lightweight/full approval paths are deduplicated client-side.
+- **BD1:** The browser exposes a tucked-away Settings → Browser diagnostics panel with a bounded
+  client-side event buffer, copy/clear actions, and a test-notification action. Diagnostics include
+  notification lifecycle decisions, visibility/focus state, approval routing decisions, and
+  WebSocket status changes.
 
 **Changelog (1.45 → 1.46), per-process parsed history cache:**
 - **HC1:** `PersistStore` maintains a per-process parsed JSONL history cache keyed by
@@ -2412,6 +2427,9 @@ anything other than `thread_turn_active`.
 
 **Server → client** (examples): `Event { thread_id, agent_event }` (a serialized
 `WireAgentEvent` — the path-mirrored wire form of `AgentEvent`, §3.5),
+`ThreadActivity { thread_id, kind, active_turn, summary?, ...kind_payload }`
+(lightweight cross-thread sidebar/notification signal; `approval_requested` carries
+`approval_id`, and `server_request_received` carries `server_request_id`),
 `ThreadState { thread_id, state }` (persisted snapshot on subscribe/resync),
 `LiveTurnSnapshot { thread_id, turn_id, accumulated, pending_approval?, pending_server_requests }`
 (in-flight turn reconstruction on reconnect, carrying `WireAgentEvent`s, a `WireApprovalRequest`,
@@ -2469,10 +2487,22 @@ events through the same event handler used for live WebSocket events.
 > fan-out boundary, so paths are UTF-8 `String`s on the wire. Client→server messages are path-free
 > (`SendInput` is text; `SavePlan.path` is a `String` re-validated server-side).
 
-- **Fan-out:** the server keeps `thread_id → set<client_conn>`. An `AgentEvent` is serialized
-  once and sent only to subscribed clients. Background threads keep producing events; a client
-  that isn't subscribed to a thread still receives lightweight `ThreadState`/badge updates so
-  the sidebar shows activity, but not the full delta stream (bandwidth control).
+- **Fan-out:** the server keeps `thread_id → set<client_conn>` for full transcript traffic and a
+  global connected-client registry for lightweight browser activity. An `AgentEvent` is serialized
+  once and sent only to clients subscribed to that thread. Background threads keep producing events;
+  a client that isn't subscribed to a thread still receives lightweight `ThreadActivity` updates so
+  the sidebar shows activity and approval notifications can fire, but it does not receive the full
+  delta stream or history/live snapshots (bandwidth control).
+- **ThreadActivity:** `kind` is an internally tagged payload: `turn_started`, `progress`,
+  `approval_requested { approval_id }`, `server_request_received { server_request_id }`,
+  `turn_completed`, `error`, or `notice`. The JSON object stays flat for browser consumption
+  (`kind`, `approval_id`, `server_request_id` as top-level fields), but the derived Rust protocol
+  type must make invalid server-side construction unrepresentable. High-volume text deltas are
+  intentionally skipped. Clients must use request ids only for notification/targeting/routing
+  affordances and must still subscribe/open the thread before rendering full transcript state.
+  Current-thread approvals are not notified while the page is visible, but may notify when the page
+  is hidden. The browser must deduplicate the lightweight activity path against the later full
+  approval event for the same `(thread_id, approval_id)`.
 - **Backpressure:** per-connection bounded queue; if a client falls behind, coalesce deltas
   (keep latest) rather than unbounded buffering. Heartbeat ping/pong; auto-reconnect on the
   client with resubscribe + state resync. Browser disconnects caused by mobile/tab suspension are

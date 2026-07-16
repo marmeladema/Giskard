@@ -1428,6 +1428,164 @@ fn browser_backgrounded_socket_recovery_restores_foreground_errors() {
     );
 }
 
+#[test]
+fn browser_diagnostics_panel_is_exposed_from_settings() {
+    let body = app_js();
+
+    assert!(body.contains("browserDiagnostics:[]"));
+    assert!(body.contains("BROWSER_DIAGNOSTIC_VERSION"));
+    assert!(body.contains("browser-diagnostics-v1"));
+    assert!(body.contains("BROWSER_DIAGNOSTIC_LIMIT"));
+    assert!(body.contains("function browserDiagnosticsSnapshot()"));
+    assert!(body.contains("function notificationDebugSnapshot()"));
+    assert!(body.contains("last_approval_decision: lastNotificationDiagnostic"));
+    assert!(body.contains("recent_approval_decisions: recentNotificationDiagnostics"));
+    assert!(body.contains("function isApprovalNotificationDecision(entry)"));
+    assert!(body.contains("detail.kind === \"approval\""));
+    assert!(body.contains("function lastNotificationDiagnostic(predicate)"));
+    assert!(body.contains("function recentNotificationDiagnostics(predicate, limit)"));
+    assert!(body.contains("function recordBrowserDiagnostic(category, reason, detail)"));
+    assert!(body.contains("category: category || \"browser\""));
+    assert!(body.contains("function recordNotificationDiagnostic(reason, detail)"));
+    assert!(body.contains("recordBrowserDiagnostic(\"notification\", reason, detail);"));
+    assert!(body.contains("function renderBrowserDiagnosticsPanel(snapshot, reveal)"));
+    assert!(body.contains("log.textContent = lines.join(\"\\n\");"));
+    assert!(body.contains("`lastApproval: ${lastApproval ? lastApproval.reason : \"none\"}`"));
+    assert!(body.contains("`dedupMs: ${snapshot.dedup_window_ms}`"));
+    assert!(body.contains("recentApprovals:"));
+    assert!(body.contains("recentBrowserEvents:"));
+    assert!(body.contains("visible=${entry.visibility} focused=${entry.focused}"));
+    assert!(body.contains("`approvalSource: ${approvalDetail.source || \"none\"}`"));
+    assert!(body.contains("window.giskardBrowserDiagnostics = browserDiagnosticsSnapshot;"));
+    assert!(body.contains("window.giskardNotificationDebug = notificationDebugSnapshot;"));
+    assert!(body.contains("function showBrowserDiagnostics()"));
+    assert!(body.contains("function copyBrowserDiagnostics()"));
+    assert!(body.contains("await navigator.clipboard.writeText(text);"));
+    assert!(body.contains("function clearBrowserDiagnostics()"));
+    assert!(body.contains("state.browserDiagnostics = [];"));
+    assert!(body.contains("ws_status_changed"));
+    assert!(body.contains("recordBrowserDiagnostic(\"websocket\", \"ws_status_changed\""));
+
+    let index = include_str!("../static/index.html");
+    assert!(index.contains("id=\"browserDiagnosticsBtn\""));
+    assert!(index.contains("id=\"browserDiagnosticsPanel\""));
+    assert!(index.contains("id=\"browserDiagnosticsLog\""));
+    assert!(index.contains("id=\"copyBrowserDiagnosticsBtn\""));
+    assert!(index.contains("id=\"clearBrowserDiagnosticsBtn\""));
+    assert!(index.contains("id=\"testNotificationBtn\""));
+    assert!(index.contains("class=\"browser-diagnostics\""));
+    assert!(index.contains("Browser diagnostics"));
+    assert!(index.contains("Test notification"));
+    assert!(!index.contains("notificationDebugBtn"));
+    assert!(!index.contains("notificationDebugPanel"));
+
+    let css = include_str!("../static/app.css");
+    assert!(css.contains(".browser-diagnostics"));
+    assert!(css.contains(".browser-diagnostics-actions"));
+}
+
+#[test]
+fn sidebar_activity_notifications_target_approval_rows() {
+    let body = app_js();
+
+    assert!(body.contains("threadActivity:new Map()"));
+    assert!(body.contains("pendingApprovalFocus:null"));
+    assert!(body.contains("notifiedApprovals:new Map()"));
+    assert!(body.contains("lastNotificationPromptNoticeAt:0"));
+    assert!(body.contains("NOTIFICATION_DEDUP_MS"));
+    assert!(body.contains("function handleThreadActivity(msg)"));
+    assert!(body.contains("if (msg && msg.type === \"thread_activity\")"));
+    assert!(body.contains("function renderThreadActivityIndicator(tid)"));
+    assert!(body.contains("activity.kind === \"approval_requested\""));
+    assert!(body.contains(
+        "if (activity.kind === \"approval_requested\") maybeNotifyApproval(tid, activity);"
+    ));
+    assert!(body.contains("server_request_id: msg.server_request_id || null"));
+    assert!(body.contains("activity.active_turn && activity.kind !== \"approval_requested\""));
+    assert!(body.contains("else if (activity.active_turn) status.textContent = \"o\""));
+    assert!(!body.contains("else if (activity.active_turn) status.textContent = \">\""));
+    assert!(body.contains("function initNotificationSettings()"));
+    assert!(body.contains("function notificationPermissionButtons()"));
+    assert!(body.contains("document.querySelectorAll(\".notify-permission-btn\")"));
+    assert!(body.contains("async function requestNotificationPermission()"));
+    assert!(body.contains("await Notification.requestPermission()"));
+    assert!(body.contains("Browser notifications require HTTPS or localhost."));
+    assert!(body.contains("function refreshNotificationButton()"));
+    assert!(body.contains("label = \"Approval notifications enabled\""));
+    assert!(body.contains("label = \"Notifications blocked by browser\""));
+    assert!(body.contains("label = \"Notifications require HTTPS or localhost\""));
+    assert!(body.contains("function maybeNoticeNotificationPermission()"));
+    assert!(body.contains("Notification.permission !== \"default\""));
+    assert!(body.contains("Enable approval notifications from the sidebar alert button."));
+    assert!(body.contains("const notificationKey = `${tid}:${activity.approval_id}`;"));
+    assert!(body.contains("pruneNotificationDedup(now);"));
+    assert!(body.contains("const notifiedAt = state.notifiedApprovals.get(notificationKey);"));
+    assert!(body.contains("now - notifiedAt < NOTIFICATION_DEDUP_MS"));
+    assert!(body.contains("state.notifiedApprovals.set(notificationKey, now);"));
+    assert!(body.contains("function pruneNotificationDedup(now)"));
+    assert!(body.contains(
+        "const notificationTag = `giskard-approval-${tid}-${activity.approval_id}-${now}`;"
+    ));
+    assert!(body.contains("tag: notificationTag"));
+    assert!(body.contains("function notifyApprovalRequest(request, tid, opts)"));
+    assert!(body.contains("function handleIncomingApprovalRequest(request, tid, opts)"));
+    assert!(body.contains(
+        "if (opts.notify !== false) notifyApprovalRequest(request, tid, { source: opts.source });"
+    ));
+    assert!(body.contains("source: \"agent_event_approval_requested\""));
+    assert!(body.contains("source: \"server_message_approval_request\""));
+    assert!(body.contains("source: \"live_turn_snapshot_pending_approval\""));
+    assert!(body.contains("source: \"thread_activity\""));
+    assert!(body.contains("approval_notify_received"));
+    assert!(body.contains("approval_notify_suppressed_visible_current_thread"));
+    assert!(body.contains("approval_notify_constructor_failed"));
+    assert!(body.contains("approval_notify_created"));
+    assert!(body.contains("function createBrowserNotification(title, options, diagnosticDetail)"));
+    assert!(body.contains("const notification = new Notification(title, options);"));
+    assert!(body.contains("browser_notification_created"));
+    assert!(body.contains("browser_notification_show"));
+    assert!(body.contains("browser_notification_error"));
+    assert!(body.contains("browser_notification_close"));
+    assert!(body.contains("notification.onshow = () => recordNotificationDiagnostic"));
+    assert!(body.contains("notification.onerror = () => recordNotificationDiagnostic"));
+    assert!(body.contains("notification.onclose = () => recordNotificationDiagnostic"));
+    assert!(body.contains("function isApprovalNotificationDecision(entry)"));
+    assert!(body.contains("detail.kind === \"approval\""));
+    assert!(body.contains("last_approval_decision: lastNotificationDiagnostic"));
+    assert!(body.contains("recent_approval_decisions: recentNotificationDiagnostics"));
+    assert!(body.contains("`lastApproval: ${lastApproval ? lastApproval.reason : \"none\"}`"));
+    assert!(body.contains("function sendTestNotification()"));
+    assert!(body.contains("Giskard test notification"));
+    assert!(body.contains("test_notify_created"));
+    assert!(body.contains("test_notify_constructor_failed"));
+    assert!(body.contains("requireInteraction: true"));
+    assert!(!body.contains("approval_notify_skipped_invalid_activity"));
+    assert!(body.contains("approval_notify_skipped_invalid_call"));
+    assert!(body.contains("`lastApproval: ${lastApproval ? lastApproval.reason : \"none\"}`"));
+    assert!(!body.contains("notifyApprovalRequest(ev.request"));
+    assert!(!body.contains("notifyApprovalRequest(msg.request"));
+    assert!(!body.contains("notifyApprovalRequest(snap.pending_approval"));
+    assert!(body.contains("createBrowserNotification(\"Approval requested\""));
+    assert!(body.contains(
+        "if (document.visibilityState === \"visible\" && String(tid) === String(state.threadId))"
+    ));
+    assert!(body.contains("notification.onclick = () =>"));
+    assert!(body.contains("openThread(meta.pid, tid, meta.title, { focusApprovalId:approvalId })"));
+    assert!(body.contains("function approvalRowById(id)"));
+    assert!(body.contains("row.scrollIntoView({ block:\"center\", behavior:\"smooth\" });"));
+    assert!(body.contains("row.classList.add(\"approval-target\")"));
+
+    let index = include_str!("../static/index.html");
+    assert!(index.contains("id=\"notifyTopBtn\""));
+    assert!(index.contains("class=\"notify-permission-btn\""));
+    assert!(index.contains("id=\"notifyBtn\""));
+    assert!(index.contains("Enable approval notifications"));
+
+    let css = include_str!("../static/app.css");
+    assert!(css.contains(".sidebar-head"));
+    assert!(css.contains(".notify-permission-btn"));
+}
+
 /// The UI script, as served at `/app.js`. The page's JS is a separate same-origin asset so the
 /// Content-Security-Policy can enforce `script-src 'self'` (no inline execution).
 fn app_js() -> &'static str {
