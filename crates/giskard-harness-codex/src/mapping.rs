@@ -1303,6 +1303,9 @@ fn command_approval_metadata(
     if let Some(environment_id) = &params.environment_id {
         add_text_metadata(&mut metadata, "Environment", environment_id);
     }
+    if let Some(cwd) = &params.cwd {
+        add_path_metadata(&mut metadata, "Working directory", &cwd.0, false);
+    }
     if let Some(context) = &params.network_approval_context {
         add_host_metadata(
             &mut metadata,
@@ -1328,10 +1331,10 @@ fn command_approval_metadata(
     if let Some(amendment) = &params.proposed_execpolicy_amendment {
         let value = amendment
             .iter()
-            .filter(|part| !part.trim().is_empty())
-            .cloned()
+            .map(|part| part.trim())
+            .filter(|part| !part.is_empty())
             .collect::<Vec<_>>()
-            .join("\n");
+            .join(" ");
         add_text_metadata(&mut metadata, "Proposed exec policy", &value);
     }
     if let Some(actions) = &params.command_actions {
@@ -3088,7 +3091,7 @@ mod tests {
                     "host": "api.openai.com",
                     "protocol": "https"
                 },
-                "proposedExecpolicyAmendment": ["rg marmeladema tf"],
+                "proposedExecpolicyAmendment": ["cargo", "check"],
                 "proposedNetworkPolicyAmendments": [
                     { "action": "allow", "host": "api.openai.com" }
                 ],
@@ -3112,6 +3115,12 @@ mod tests {
                     assert_eq!(command, "rg marmeladema tf");
                     assert_no_opaque_approval_ids(&request.metadata);
                     assert!(metadata_has_text(&request.metadata, "Environment", "env_1"));
+                    assert!(metadata_has_path(
+                        &request.metadata,
+                        "Working directory",
+                        &cwd,
+                        false
+                    ));
                     assert!(metadata_has_host(
                         &request.metadata,
                         "Network host",
@@ -3127,7 +3136,7 @@ mod tests {
                     assert!(metadata_has_text(
                         &request.metadata,
                         "Proposed exec policy",
-                        "rg marmeladema tf"
+                        "cargo check"
                     ));
                     assert!(metadata_has_path(
                         &request.metadata,
@@ -3185,7 +3194,24 @@ mod tests {
             .unwrap()
         {
             AgentEvent::ApprovalRequested { request, .. } => {
-                assert!(request.metadata.is_empty());
+                assert_eq!(request.metadata.len(), 1);
+                assert!(metadata_has_path(
+                    &request.metadata,
+                    "Working directory",
+                    "/tmp/project",
+                    false
+                ));
+                assert!(!metadata_has_host(
+                    &request.metadata,
+                    "Network host",
+                    "",
+                    Some("https")
+                ));
+                assert!(!metadata_has_text(
+                    &request.metadata,
+                    "Proposed exec policy",
+                    ""
+                ));
             }
             other => panic!("expected command approval event, got {other:?}"),
         }

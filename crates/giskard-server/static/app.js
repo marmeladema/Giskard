@@ -1315,8 +1315,7 @@ function approvalTitle(request) {
 function approvalDetail(request) {
   const kind = request.kind || {};
   if (kind.kind==="command_execution") {
-    const cwd = kind.cwd ? `\n${kind.cwd}` : "";
-    return `${kind.command || "(empty command)"}${cwd}`;
+    return kind.command || "(empty command)";
   }
   if (kind.kind==="file_change") return [kind.change, kind.path].filter(Boolean).join(" ");
   if (kind.kind==="permission") return kind.detail || "";
@@ -1420,7 +1419,6 @@ function applyApprovalDecision(msg, decision) {
   msg.classList.remove("decision-accept", "decision-session", "decision-decline", "decision-cancel");
   msg.classList.add(approvalDecisionClass(decision));
   msg.querySelectorAll(".approval-actions").forEach(el => el.remove());
-  msg.querySelectorAll("button").forEach(btn => btn.disabled = true);
   const title = msg.querySelector(".approval-title");
   if (title && !title.dataset.baseTitle) title.dataset.baseTitle = title.textContent || "";
   if (title) title.textContent = `${approvalDecisionLabel(decision)}: ${title.dataset.baseTitle || "Approval"}`;
