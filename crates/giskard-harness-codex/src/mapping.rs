@@ -1300,10 +1300,6 @@ fn command_approval_metadata(
     params: &codex_codes::protocol::CommandExecutionRequestApprovalParams,
 ) -> Vec<ApprovalMetadata> {
     let mut metadata = Vec::new();
-    if let Some(approval_id) = &params.approval_id {
-        add_text_metadata(&mut metadata, "Approval id", approval_id);
-    }
-    add_text_metadata(&mut metadata, "Item id", &params.item_id);
     if let Some(environment_id) = &params.environment_id {
         add_text_metadata(&mut metadata, "Environment", environment_id);
     }
@@ -1350,7 +1346,6 @@ fn file_change_approval_metadata(
     params: &codex_codes::protocol::FileChangeRequestApprovalParams,
 ) -> Vec<ApprovalMetadata> {
     let mut metadata = Vec::new();
-    add_text_metadata(&mut metadata, "Item id", &params.item_id);
     if let Some(grant_root) = &params.grant_root {
         add_path_metadata(&mut metadata, "Grant root", grant_root, false);
     }
@@ -1362,7 +1357,6 @@ fn permissions_approval_metadata(
     params: &codex_codes::protocol::PermissionsRequestApprovalParams,
 ) -> Vec<ApprovalMetadata> {
     let mut metadata = Vec::new();
-    add_text_metadata(&mut metadata, "Item id", &params.item_id);
     add_path_metadata(&mut metadata, "Working directory", &params.cwd.0, false);
     if let Some(environment_id) = &params.environment_id {
         add_text_metadata(&mut metadata, "Environment", environment_id);
@@ -1376,10 +1370,6 @@ fn legacy_exec_approval_metadata(
     params: &codex_codes::protocol::ExecCommandApprovalParams,
 ) -> Vec<ApprovalMetadata> {
     let mut metadata = Vec::new();
-    if let Some(approval_id) = &params.approval_id {
-        add_text_metadata(&mut metadata, "Approval id", approval_id);
-    }
-    add_text_metadata(&mut metadata, "Call id", &params.call_id);
     for parsed in &params.parsed_cmd {
         add_parsed_command_metadata(&mut metadata, workspace_root, parsed);
     }
@@ -1391,7 +1381,6 @@ fn legacy_patch_approval_metadata(
     params: &codex_codes::protocol::ApplyPatchApprovalParams,
 ) -> Vec<ApprovalMetadata> {
     let mut metadata = Vec::new();
-    add_text_metadata(&mut metadata, "Call id", &params.call_id);
     if let Some(grant_root) = &params.grant_root {
         add_path_metadata(&mut metadata, "Grant root", grant_root, false);
     }
@@ -2713,6 +2702,17 @@ mod tests {
         })
     }
 
+    fn assert_no_opaque_approval_ids(metadata: &[ApprovalMetadata]) {
+        for label in ["Approval id", "Item id", "Call id"] {
+            assert!(
+                !metadata.iter().any(|item| {
+                    matches!(item, ApprovalMetadata::Text { label: got_label, .. } if got_label == label)
+                }),
+                "{label} should stay out of user-facing approval metadata"
+            );
+        }
+    }
+
     /// Usage from a `thread/tokenUsage/updated` notification is cached per turn and surfaced on the
     /// matching `TurnCompleted` (spec §10.1) — regression guard for the previous zero stub.
     #[test]
@@ -2955,7 +2955,7 @@ mod tests {
                 assert_eq!(request.id, ApprovalId("perm_req".into()));
                 assert!(matches!(request.kind, ApprovalKind::Permission { .. }));
                 assert_eq!(request.reason.as_deref(), Some("Need network access"));
-                assert!(metadata_has_text(&request.metadata, "Item id", "perm1"));
+                assert_no_opaque_approval_ids(&request.metadata);
                 assert!(metadata_has_path(
                     &request.metadata,
                     "Working directory",
@@ -3110,12 +3110,7 @@ mod tests {
             AgentEvent::ApprovalRequested { request, .. } => match request.kind {
                 ApprovalKind::CommandExecution { command, .. } => {
                     assert_eq!(command, "rg marmeladema tf");
-                    assert!(metadata_has_text(
-                        &request.metadata,
-                        "Approval id",
-                        "approval1"
-                    ));
-                    assert!(metadata_has_text(&request.metadata, "Item id", "cmd1"));
+                    assert_no_opaque_approval_ids(&request.metadata);
                     assert!(metadata_has_text(&request.metadata, "Environment", "env_1"));
                     assert!(metadata_has_host(
                         &request.metadata,
@@ -3190,8 +3185,7 @@ mod tests {
             .unwrap()
         {
             AgentEvent::ApprovalRequested { request, .. } => {
-                assert_eq!(request.metadata.len(), 1);
-                assert!(metadata_has_text(&request.metadata, "Item id", "cmd1"));
+                assert!(request.metadata.is_empty());
             }
             other => panic!("expected command approval event, got {other:?}"),
         }
@@ -3262,7 +3256,7 @@ mod tests {
                 ApprovalKind::FileChange { path, change } => {
                     assert_eq!(path, PathBuf::from("/tmp/project"));
                     assert_eq!(change, FileChangeKind::Modified);
-                    assert!(metadata_has_text(&request.metadata, "Item id", "file1"));
+                    assert_no_opaque_approval_ids(&request.metadata);
                     assert!(metadata_has_path(
                         &request.metadata,
                         "Grant root",
@@ -3319,7 +3313,7 @@ mod tests {
             .unwrap()
         {
             AgentEvent::ApprovalRequested { request, .. } => {
-                assert!(metadata_has_text(&request.metadata, "Call id", "call1"));
+                assert_no_opaque_approval_ids(&request.metadata);
                 assert!(metadata_has_path(
                     &request.metadata,
                     "Grant root",
@@ -3772,7 +3766,7 @@ mod tests {
                 ApprovalKind::CommandExecution { command, cwd } => {
                     assert_eq!(command, "cargo test");
                     assert_eq!(cwd, PathBuf::from(&cwd_string));
-                    assert!(metadata_has_text(&request.metadata, "Call id", "call1"));
+                    assert_no_opaque_approval_ids(&request.metadata);
                     assert!(metadata_has_path(
                         &request.metadata,
                         "Read path",
