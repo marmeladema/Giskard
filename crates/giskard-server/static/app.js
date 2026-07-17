@@ -10,6 +10,7 @@ const PICKER_TYPEAHEAD_RESET_MS = 1000;
 const NOTIFICATION_PROMPT_NOTICE_INTERVAL_MS = 30000;
 const BROWSER_DIAGNOSTIC_LIMIT = 120;
 const NOTIFICATION_DEDUP_MS = 15000;
+const ACTIVE_THREAD_COMPLETED_MARK_MS = 2500;
 const BROWSER_DIAGNOSTIC_VERSION = "browser-diagnostics-v1";
 let state = {
   projectId:null, threadId:null, mode:"build", ws:null, wsStatus:"closed", wsConnectId:0,
@@ -626,8 +627,7 @@ function renderThreadActivityIndicator(tid) {
   const status = el.querySelector(".thread-status");
   if (!status) return;
   const activity = state.threadActivity.get(String(tid));
-  const current = state.threadId && String(state.threadId) === String(tid);
-  const visible = !!activity && !current && (activity.unread || activity.active_turn || activity.approval_id);
+  const visible = !!activity && (activity.unread || activity.active_turn || activity.approval_id || activity.kind === "turn_completed" || activity.kind === "error");
   el.classList.toggle("has-activity", visible);
   el.classList.toggle("activity-approval", visible && activity && activity.kind === "approval_requested");
   el.classList.toggle("activity-error", visible && activity && activity.kind === "error");
@@ -646,6 +646,75 @@ function renderThreadActivityIndicator(tid) {
 
 function renderAllThreadActivityIndicators() {
   document.querySelectorAll(".thread").forEach(el => renderThreadActivityIndicator(el.dataset.tid));
+}
+
+function setThreadActivity(tid, activity) {
+  if (!tid || !activity) return;
+  const key = String(tid);
+  state.threadActivity.set(key, activity);
+  renderThreadActivityIndicator(key);
+}
+
+function setActiveThreadActivity(kind, activeTurn, summary, extra) {
+  if (!state.threadId) return;
+  const tid = String(state.threadId);
+  setThreadActivity(tid, Object.assign({
+    kind,
+    active_turn: !!activeTurn,
+    approval_id: null,
+    server_request_id: null,
+    summary: summary || "",
+    source: "active_thread_event",
+    unread: false
+  }, extra || {}));
+  if (kind === "turn_completed" && !activeTurn) {
+    clearActiveThreadActivityLater(tid, kind);
+  }
+}
+
+function clearActiveThreadActivityLater(tid, kind) {
+  const key = String(tid || "");
+  if (!key) return;
+  setTimeout(() => {
+    const activity = state.threadActivity.get(key);
+    if (!activity || activity.source !== "active_thread_event" || activity.kind !== kind || activity.active_turn) return;
+    state.threadActivity.delete(key);
+    renderThreadActivityIndicator(key);
+  }, ACTIVE_THREAD_COMPLETED_MARK_MS);
+}
+
+function clearApprovalThreadActivity(tid, approvalId) {
+  if (!tid || !approvalId) return;
+  const key = String(tid);
+  const activity = state.threadActivity.get(key);
+  if (!activity || String(activity.approval_id || "") !== String(approvalId)) return;
+  activity.approval_id = null;
+  if (activity.active_turn) {
+    activity.kind = "progress";
+    activity.summary = "Turn running";
+    activity.unread = state.threadId ? String(state.threadId) !== key : activity.unread;
+    state.threadActivity.set(key, activity);
+  } else {
+    state.threadActivity.delete(key);
+  }
+  renderThreadActivityIndicator(key);
+}
+
+function clearServerRequestThreadActivity(tid, requestId) {
+  if (!tid || !requestId) return;
+  const key = String(tid);
+  const activity = state.threadActivity.get(key);
+  if (!activity || String(activity.server_request_id || "") !== String(requestId)) return;
+  activity.server_request_id = null;
+  if (activity.active_turn) {
+    activity.kind = "progress";
+    activity.summary = "Turn running";
+    activity.unread = state.threadId ? String(state.threadId) !== key : activity.unread;
+    state.threadActivity.set(key, activity);
+  } else {
+    state.threadActivity.delete(key);
+  }
+  renderThreadActivityIndicator(key);
 }
 
 function normalizeThreadTitleInput(value) {
@@ -1761,6 +1830,15 @@ function handleIncomingApprovalRequest(request, tid, opts) {
     notify: opts.notify !== false
   });
   if (opts.notify !== false) notifyApprovalRequest(request, tid, { source: opts.source });
+  setThreadActivity(tid, {
+    kind:"approval_requested",
+    active_turn:true,
+    approval_id:request && request.id ? String(request.id) : null,
+    server_request_id:null,
+    summary:approvalTitle(request),
+    source:opts.source || "incoming_approval_request",
+    unread:state.threadId ? String(state.threadId) !== String(tid) : true
+  });
   renderApprovalRequest(request);
 }
 
@@ -1915,6 +1993,7 @@ function handleEvent(ev) {
       state.itemKindsByItemId.clear();
       clearPlanCard();   // a new turn starts a fresh plan
       setTurnActive(true);
+      setActiveThreadActivity("progress", true, "Turn running");
       break;
     case "item_started":
       if (ev.item) {
@@ -1953,6 +2032,7 @@ function handleEvent(ev) {
       finishCompactPending();
       clearPlanCard();   // the plan ends with its turn
       setTurnActive(false);
+      setActiveThreadActivity("turn_completed", false, "Turn completed");
       breakTaskGroup();
       break;
     case "approval_requested":
@@ -1960,7 +2040,12 @@ function handleEvent(ev) {
         source: "agent_event_approval_requested"
       });
       break;
-    case "server_request_received": renderServerRequest(ev.request); break;
+    case "server_request_received":
+      setActiveThreadActivity("server_request_received", true, "Waiting for input", {
+        server_request_id:ev.request && ev.request.id ? String(ev.request.id) : null
+      });
+      renderServerRequest(ev.request);
+      break;
     case "server_request_resolved": resolveServerRequest(ev.request_id); break;
     // Render errors as a persistent transcript entry (tied to the turn/message that caused them)
     // rather than a toast that vanishes — so looking back at a thread explains why a message got
@@ -1970,6 +2055,7 @@ function handleEvent(ev) {
         state.firstTurnStartingThreadId = null;
         setTurnActive(false);
       }
+      setActiveThreadActivity("error", false, errorText(ev.error));
       failPendingUserMessage(null);   // resolve the optimistic bubble to a failed state
       errorBubble(errorText(ev.error));
       break;
@@ -2000,6 +2086,7 @@ function renderLiveTurnSnapshot(snap) {
   if (snap && snap.turn_id) {
     state.firstTurnStartingThreadId = null;
     setTurnActive(true);
+    setActiveThreadActivity("progress", true, "Turn running");
   }
   for (const ev of (snap.accumulated||[])) handleEvent(ev);
   if (snap.pending_approval) {
@@ -2007,7 +2094,12 @@ function renderLiveTurnSnapshot(snap) {
       source: "live_turn_snapshot_pending_approval"
     });
   }
-  for (const request of (snap.pending_server_requests || [])) renderServerRequest(request);
+  for (const request of (snap.pending_server_requests || [])) {
+    setActiveThreadActivity("server_request_received", true, "Waiting for input", {
+      server_request_id:request && request.id ? String(request.id) : null
+    });
+    renderServerRequest(request);
+  }
 }
 
 function renderApprovalRequest(request) {
@@ -2192,6 +2284,7 @@ function resolveApprovalRequest(id, decision) {
     ? entry.request.thread_id
     : (msg && msg.dataset.threadId ? msg.dataset.threadId : state.threadId);
   closeApprovalNotification(tid, id);
+  clearApprovalThreadActivity(tid, id);
   if (entry) {
     state.answeredApprovals.set(entry.stateKey || (msg && msg.dataset.approvalStateKey) || approvalStateKey(id), {
       request: entry.request,
@@ -2250,6 +2343,7 @@ function renderServerRequest(request) {
   const body = bubble("server-request","request");
   const msg = body.parentElement;
   msg.dataset.serverRequestId = id;
+  if (state.threadId) msg.dataset.threadId = state.threadId;
   state.pendingServerRequests.set(id, { msg, request });
 
   const title = document.createElement("div");
@@ -2288,6 +2382,8 @@ function resolveServerRequest(id) {
   id = String(id || "");
   const entry = state.pendingServerRequests.get(id);
   if (!entry) return;
+  const tid = entry.msg && entry.msg.dataset.threadId ? entry.msg.dataset.threadId : state.threadId;
+  clearServerRequestThreadActivity(tid, id);
   entry.msg.classList.add("resolved");
   entry.msg.querySelectorAll("button,input,select,textarea").forEach(el => el.disabled = true);
   const body = entry.msg.querySelector(".body");

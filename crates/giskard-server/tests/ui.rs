@@ -1630,6 +1630,17 @@ fn sidebar_activity_notifications_target_approval_rows() {
     assert!(body.contains("activity.active_turn && activity.kind !== \"approval_requested\""));
     assert!(body.contains("else if (activity.active_turn) status.textContent = \"o\""));
     assert!(!body.contains("else if (activity.active_turn) status.textContent = \">\""));
+    assert!(body.contains("function setActiveThreadActivity(kind, activeTurn, summary, extra)"));
+    assert!(body.contains("source: \"active_thread_event\""));
+    assert!(body.contains("setActiveThreadActivity(\"progress\", true, \"Turn running\")"));
+    assert!(
+        body.contains("setActiveThreadActivity(\"turn_completed\", false, \"Turn completed\")")
+    );
+    assert!(body.contains("ACTIVE_THREAD_COMPLETED_MARK_MS = 2500"));
+    assert!(body.contains("function clearActiveThreadActivityLater(tid, kind)"));
+    assert!(body.contains("clearApprovalThreadActivity(tid, id)"));
+    assert!(body.contains("clearServerRequestThreadActivity(tid, id)"));
+    assert!(!body.contains("!!activity && !current &&"));
     assert!(body.contains("function initNotificationSettings()"));
     assert!(body.contains("function notificationPermissionButtons()"));
     assert!(body.contains("document.querySelectorAll(\".notify-permission-btn\")"));
