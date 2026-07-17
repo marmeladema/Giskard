@@ -14,7 +14,9 @@
 - **AR1:** When one browser client answers an approval request, the server broadcasts
   `ApprovalResolved { thread_id, request_id, decision }` to every client subscribed to that thread
   after the harness accepts the decision. Other tabs must resolve the matching approval card and
-  remove its actions so a stale duplicate response cannot be submitted.
+  remove its actions so a stale duplicate response cannot be submitted. Browser clients that created
+  native notifications for that approval close only notifications keyed to the resolved
+  `(thread_id, request_id)`.
 
 **Changelog (1.46 → 1.47), cross-thread activity and browser diagnostics:**
 - **TA1:** Inactive threads emit lightweight `ThreadActivity` WebSocket messages to all connected
@@ -2458,7 +2460,8 @@ failed and Giskard started a fresh native session while keeping persisted histor
 same subscribed thread. A successful `ApprovalDecision` is the single authoritative answer for that
 request id. After forwarding it to the harness, the server must broadcast `ApprovalResolved` to the
 thread subscribers; each browser must remove the pending actions and render the resolved decision
-card. Duplicate/stale decisions for a removed request id remain protocol errors.
+card, and close only native browser notifications keyed to that request id. Duplicate/stale
+decisions for a removed request id remain protocol errors.
 
 **Client rendering invariant (E6):** `ItemDelta { item_id }` and the later `ItemCompleted`
 for the same `Item.id` are one lifecycle. The UI must finalize or replace the streamed body in
