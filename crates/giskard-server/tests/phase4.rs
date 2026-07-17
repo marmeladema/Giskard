@@ -18,6 +18,14 @@ use giskard_persist::store::{ProjectConfig, ThreadFile};
 use giskard_proto::ClientMessage;
 use giskard_server::{AppState, HarnessFactory, build_app};
 
+const TINY_PNG: &[u8] = &[
+    0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H', b'D', b'R',
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0a, b'I', b'D', b'A', b'T', 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xae,
+    0x42, 0x60, 0x82,
+];
+
 struct DummyFactory;
 
 #[async_trait::async_trait]
@@ -232,6 +240,15 @@ session_days = 30
     tokio::fs::write(proj_dir.path().join("data.bin"), b"bin\x00ary\x00data")
         .await
         .unwrap();
+    tokio::fs::write(proj_dir.path().join("image.png"), TINY_PNG)
+        .await
+        .unwrap();
+    tokio::fs::write(
+        proj_dir.path().join("vector.svg"),
+        r#"<svg xmlns="http://www.w3.org/2000/svg"></svg>"#,
+    )
+    .await
+    .unwrap();
 
     let cookie = {
         let client = reqwest::Client::new();
@@ -315,6 +332,47 @@ async fn download_raw_file() {
     assert_eq!(resp.status(), 200);
     let content = resp.text().await.unwrap();
     assert!(content.contains("fn main"));
+}
+
+#[tokio::test]
+async fn image_preview_serves_raster_image_inline() {
+    let port = 19027;
+    let (_data_dir, _proj_dir, _state, pid, cookie) = start_server(port).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base}/api/projects/{pid}/image?path=image.png"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("image/png")
+    );
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), TINY_PNG);
+}
+
+#[tokio::test]
+async fn image_preview_rejects_svg() {
+    let port = 19028;
+    let (_data_dir, _proj_dir, _state, pid, cookie) = start_server(port).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base}/api/projects/{pid}/image?path=vector.svg"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
 }
 
 #[tokio::test]
@@ -578,7 +636,7 @@ async fn highlight_and_raw_reject_missing_files() {
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
-    for endpoint in ["highlight", "raw"] {
+    for endpoint in ["highlight", "raw", "image"] {
         let resp = client
             .get(format!(
                 "{base}/api/projects/{pid}/{endpoint}?path=missing.rs"
@@ -606,6 +664,7 @@ async fn code_overlay_endpoints_return_not_found_for_missing_project() {
     for (method, endpoint) in [
         ("GET", "highlight?path=main.rs"),
         ("GET", "raw?path=main.rs"),
+        ("GET", "image?path=image.png"),
         ("POST", "linkify"),
         ("POST", "render"),
     ] {
@@ -640,7 +699,7 @@ async fn highlight_and_raw_reject_symlink_escape() {
 
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
-    for endpoint in ["highlight", "raw"] {
+    for endpoint in ["highlight", "raw", "image"] {
         let resp = client
             .get(format!(
                 "{base}/api/projects/{pid}/{endpoint}?path=linked.rs"

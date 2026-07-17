@@ -1017,6 +1017,14 @@ async fn index_page_is_served_and_public() {
         "UI renders generic activity items"
     );
     assert!(
+        body.contains("function isImageViewActivity")
+            && body.contains("p.title === \"Image viewed\"")
+            && body.contains("function renderImageViewActivity")
+            && body.contains("projectFileUrl(\"image\", path)")
+            && body.contains("activity-image-preview"),
+        "UI renders ImageView activity rows as inline image previews"
+    );
+    assert!(
         body.contains("function planFromActivity")
             && body.contains("completed:\"done\", inProgress:\"doing\", pending:\"todo\"")
             && body.contains("class=\"plan-step"),
@@ -1173,6 +1181,10 @@ async fn index_page_is_served_and_public() {
     assert!(
         body.contains("projectFileUrl(\"raw\""),
         "UI exposes raw file downloads"
+    );
+    assert!(
+        body.contains("projectFileUrl(\"image\""),
+        "UI exposes confined image preview URLs"
     );
     assert!(
         body.contains("codeDownload"),

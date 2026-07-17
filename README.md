@@ -213,7 +213,7 @@ What the server enforces itself:
   (`script-src 'self'` — the UI has no inline script, so even an HTML-injection bug cannot
   escalate to script execution), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` /
   `frame-ancestors 'none'`, `Referrer-Policy: no-referrer`, and same-origin COOP/CORP.
-- **Workspace confinement.** File reads (`highlight`/`raw`), plan writes, and the browse picker
+- **Workspace confinement.** File reads (`highlight`/`raw`/`image`), plan writes, and the browse picker
   are confined to each project's workspace root with symlink-resolving canonicalization. When
   `[browse] roots` is set, it also constrains **project creation** — without it, an
   authenticated client can create a project rooted anywhere the server user can read. Set
@@ -282,7 +282,8 @@ WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticke
 /api/projects/{id}/threads/{thread_id}`, `PATCH /api/projects/{id}/threads/{thread_id}/title`,
 `POST /api/projects/{id}/threads/{thread_id}/archive`, `GET /api/models`, `POST
 /api/models/refresh`,
-`GET /api/tokens`, `GET /api/projects/{id}/tokens`, `GET /api/projects/{id}/highlight|raw`, `POST
+`GET /api/tokens`, `GET /api/projects/{id}/tokens`,
+`GET /api/projects/{id}/highlight|raw|image`, `POST
 /api/projects/{id}/linkify`, `POST /api/projects/{id}/render`, `GET /api/browse`, `POST
 /api/browse/mkdir`, `GET /api/projects/{id}/mcp`, `POST /api/projects/{id}/mcp/reload`, and `POST
 /api/projects/{id}/mcp/oauth-login`. Wire types are defined once in `giskard-proto`. See
