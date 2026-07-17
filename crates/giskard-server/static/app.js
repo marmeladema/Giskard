@@ -30,7 +30,7 @@ let state = {
   threadReadOnly:false, readOnlyProvider:null, readOnlyMessage:null,
   pickerTypeahead:"", pickerTypeaheadTimer:null, pickerSelectedRow:null,
   currentPlan:null, planExpanded:localStorage.getItem("giskard.planExpanded")==="1",
-  threadActivity:new Map(), pendingApprovalFocus:null, notifiedApprovals:new Map(), browserDiagnostics:[],
+  threadActivity:new Map(), pendingApprovalFocus:null, notifiedApprovals:new Map(), approvalNotifications:new Map(), browserDiagnostics:[],
   lastNotificationPromptNoticeAt:0,
   collapsedProjects:new Set(loadCollapsedProjects()), pendingRemoveProject:null
 };
@@ -1500,7 +1500,8 @@ function handleThreadActivity(msg) {
 }
 
 function maybeNotifyApproval(tid, activity) {
-  if (!activity || activity.kind !== "approval_requested" || !activity.approval_id) {
+  const notificationKey = approvalNotificationKey(tid, activity && activity.approval_id);
+  if (!activity || activity.kind !== "approval_requested" || !notificationKey) {
     recordNotificationDiagnostic("approval_notify_skipped_invalid_call", { tid, activity });
     return;
   }
@@ -1535,7 +1536,6 @@ function maybeNotifyApproval(tid, activity) {
     maybeNoticeNotificationPermission();
     return;
   }
-  const notificationKey = `${tid}:${activity.approval_id}`;
   const now = Date.now();
   pruneNotificationDedup(now);
   const notifiedAt = state.notifiedApprovals.get(notificationKey);
@@ -1578,6 +1578,7 @@ function maybeNotifyApproval(tid, activity) {
   }
   if (!notification) return;
   state.notifiedApprovals.set(notificationKey, now);
+  trackApprovalNotification(notificationKey, notification);
   recordNotificationDiagnostic("approval_notify_created", {
     tid,
     approval_id: activity.approval_id,
@@ -1591,7 +1592,7 @@ function maybeNotifyApproval(tid, activity) {
       approval_id: activity.approval_id,
       source: activity.source || "unknown"
     });
-    notification.close();
+    closeApprovalNotification(tid, activity.approval_id);
     focusApprovalTarget(tid, activity.approval_id);
   };
 }
@@ -1602,7 +1603,15 @@ function createBrowserNotification(title, options, diagnosticDetail) {
   recordNotificationDiagnostic("browser_notification_created", diagnosticDetail);
   notification.onshow = () => recordNotificationDiagnostic("browser_notification_show", diagnosticDetail);
   notification.onerror = () => recordNotificationDiagnostic("browser_notification_error", diagnosticDetail);
-  notification.onclose = () => recordNotificationDiagnostic("browser_notification_close", diagnosticDetail);
+  notification.onclose = () => {
+    if (diagnosticDetail.kind === "approval") {
+      untrackApprovalNotification(
+        approvalNotificationKey(diagnosticDetail.tid, diagnosticDetail.approval_id),
+        notification
+      );
+    }
+    recordNotificationDiagnostic("browser_notification_close", diagnosticDetail);
+  };
   return notification;
 }
 
@@ -1610,6 +1619,53 @@ function pruneNotificationDedup(now) {
   now = now || Date.now();
   for (const [key, notifiedAt] of state.notifiedApprovals) {
     if (now - notifiedAt >= NOTIFICATION_DEDUP_MS) state.notifiedApprovals.delete(key);
+  }
+}
+
+function approvalNotificationKey(tid, approvalId) {
+  const threadKey = tid === undefined || tid === null ? "" : String(tid);
+  const approvalKey = approvalId === undefined || approvalId === null ? "" : String(approvalId);
+  if (!threadKey || !approvalKey) return "";
+  return `${threadKey}:${approvalKey}`;
+}
+
+function trackApprovalNotification(key, notification) {
+  if (!key || !notification) return;
+  let notifications = state.approvalNotifications.get(key);
+  if (!notifications) {
+    notifications = new Set();
+    state.approvalNotifications.set(key, notifications);
+  }
+  notifications.add(notification);
+}
+
+function untrackApprovalNotification(key, notification) {
+  const notifications = state.approvalNotifications.get(key);
+  if (!notifications) return;
+  notifications.delete(notification);
+  if (notifications.size === 0) state.approvalNotifications.delete(key);
+}
+
+function closeApprovalNotification(tid, approvalId) {
+  const key = approvalNotificationKey(tid, approvalId);
+  if (!key) return;
+  const notifications = state.approvalNotifications.get(key);
+  if (!notifications) return;
+  state.approvalNotifications.delete(key);
+  for (const notification of notifications) {
+    try {
+      notification.close();
+      recordNotificationDiagnostic("approval_notification_closed", {
+        tid,
+        approval_id: approvalId
+      });
+    } catch (e) {
+      recordNotificationDiagnostic("approval_notification_close_failed", {
+        tid,
+        approval_id: approvalId,
+        error: e && e.message ? e.message : String(e)
+      });
+    }
   }
 }
 
@@ -1928,6 +1984,7 @@ function renderApprovalRequest(request) {
   const msg = body.parentElement;
   msg.dataset.approvalId = id;
   msg.dataset.approvalStateKey = stateKey;
+  if (state.threadId) msg.dataset.threadId = state.threadId;
   state.renderedApprovalStateKeys.add(stateKey);
   if (!answered) state.pendingApprovals.set(id, { msg, request, stateKey });
 
@@ -2091,10 +2148,14 @@ function respondApproval(id, decision) {
   resolveApprovalRequest(id, decision);
 }
 function resolveApprovalRequest(id, decision) {
-  if (!id) return;
+  if (id === undefined || id === null || String(id) === "") return;
   id = String(id);
   const entry = state.pendingApprovals.get(id);
   const msg = entry ? entry.msg : approvalRowById(id);
+  const tid = entry && entry.request && entry.request.thread_id
+    ? entry.request.thread_id
+    : (msg && msg.dataset.threadId ? msg.dataset.threadId : state.threadId);
+  closeApprovalNotification(tid, id);
   if (entry) {
     state.answeredApprovals.set(entry.stateKey || (msg && msg.dataset.approvalStateKey) || approvalStateKey(id), {
       request: entry.request,

@@ -95,6 +95,7 @@ async fn index_page_is_served_and_public() {
         body.contains("case \"approval_resolved\"")
             && body.contains("resolveApprovalRequest(msg.request_id, msg.decision)")
             && body.contains("function resolveApprovalRequest(id, decision)")
+            && body.contains("closeApprovalNotification(tid, id)")
             && body.contains("const msg = entry ? entry.msg : approvalRowById(id)")
             && body.contains("state.pendingApprovals.delete(id)"),
         "approval decisions broadcast from another tab resolve pending approval cards"
@@ -1516,6 +1517,7 @@ fn sidebar_activity_notifications_target_approval_rows() {
     assert!(body.contains("threadActivity:new Map()"));
     assert!(body.contains("pendingApprovalFocus:null"));
     assert!(body.contains("notifiedApprovals:new Map()"));
+    assert!(body.contains("approvalNotifications:new Map()"));
     assert!(body.contains("lastNotificationPromptNoticeAt:0"));
     assert!(body.contains("NOTIFICATION_DEDUP_MS"));
     assert!(body.contains("function handleThreadActivity(msg)"));
@@ -1542,12 +1544,34 @@ fn sidebar_activity_notifications_target_approval_rows() {
     assert!(body.contains("function maybeNoticeNotificationPermission()"));
     assert!(body.contains("Notification.permission !== \"default\""));
     assert!(body.contains("Enable approval notifications from the sidebar alert button."));
-    assert!(body.contains("const notificationKey = `${tid}:${activity.approval_id}`;"));
+    assert!(body.contains(
+        "const notificationKey = approvalNotificationKey(tid, activity && activity.approval_id);"
+    ));
     assert!(body.contains("pruneNotificationDedup(now);"));
     assert!(body.contains("const notifiedAt = state.notifiedApprovals.get(notificationKey);"));
     assert!(body.contains("now - notifiedAt < NOTIFICATION_DEDUP_MS"));
     assert!(body.contains("state.notifiedApprovals.set(notificationKey, now);"));
+    assert!(body.contains("trackApprovalNotification(notificationKey, notification);"));
     assert!(body.contains("function pruneNotificationDedup(now)"));
+    assert!(body.contains("function approvalNotificationKey(tid, approvalId)"));
+    assert!(body.contains("const approvalKey = approvalId === undefined || approvalId === null"));
+    assert!(body.contains("String(approvalId)"));
+    assert!(body.contains("if (!threadKey || !approvalKey) return \"\";"));
+    assert!(body.contains("return `${threadKey}:${approvalKey}`;"));
+    assert!(body.contains("function trackApprovalNotification(key, notification)"));
+    assert!(body.contains("notifications = new Set();"));
+    assert!(body.contains("notifications.add(notification);"));
+    assert!(body.contains("function untrackApprovalNotification(key, notification)"));
+    assert!(body.contains("notifications.delete(notification);"));
+    assert!(
+        body.contains("if (notifications.size === 0) state.approvalNotifications.delete(key);")
+    );
+    assert!(body.contains("function closeApprovalNotification(tid, approvalId)"));
+    assert!(body.contains("const notifications = state.approvalNotifications.get(key);"));
+    assert!(body.contains("state.approvalNotifications.delete(key);"));
+    assert!(body.contains("for (const notification of notifications)"));
+    assert!(body.contains("approval_notification_closed"));
+    assert!(!body.contains("closeAllApprovalNotifications"));
     assert!(body.contains(
         "const notificationTag = `giskard-approval-${tid}-${activity.approval_id}-${now}`;"
     ));
@@ -1573,7 +1597,17 @@ fn sidebar_activity_notifications_target_approval_rows() {
     assert!(body.contains("browser_notification_close"));
     assert!(body.contains("notification.onshow = () => recordNotificationDiagnostic"));
     assert!(body.contains("notification.onerror = () => recordNotificationDiagnostic"));
-    assert!(body.contains("notification.onclose = () => recordNotificationDiagnostic"));
+    assert!(body.contains("notification.onclose = () => {"));
+    assert!(body.contains("diagnosticDetail.kind === \"approval\""));
+    assert!(
+        body.contains(
+            "approvalNotificationKey(diagnosticDetail.tid, diagnosticDetail.approval_id),"
+        )
+    );
+    assert!(body.contains("untrackApprovalNotification("));
+    assert!(body.contains(
+        "recordNotificationDiagnostic(\"browser_notification_close\", diagnosticDetail);"
+    ));
     assert!(body.contains("function isApprovalNotificationDecision(entry)"));
     assert!(body.contains("detail.kind === \"approval\""));
     assert!(body.contains("last_approval_decision: lastNotificationDiagnostic"));
@@ -1595,6 +1629,7 @@ fn sidebar_activity_notifications_target_approval_rows() {
         "if (document.visibilityState === \"visible\" && String(tid) === String(state.threadId))"
     ));
     assert!(body.contains("notification.onclick = () =>"));
+    assert!(body.contains("closeApprovalNotification(tid, activity.approval_id);"));
     assert!(body.contains("openThread(meta.pid, tid, meta.title, { focusApprovalId:approvalId })"));
     assert!(body.contains("function approvalRowById(id)"));
     assert!(body.contains("row.scrollIntoView({ block:\"center\", behavior:\"smooth\" });"));
