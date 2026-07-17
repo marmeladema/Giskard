@@ -293,6 +293,18 @@ impl RunningTaskStore {
             })
             .unwrap_or(false)
     }
+
+    pub async fn has_running_for_thread(&self, thread_id: ThreadId) -> bool {
+        let commands = self.tasks.lock().await;
+        commands
+            .get(&thread_id)
+            .map(|thread_commands| {
+                thread_commands
+                    .values()
+                    .any(|cmd| command_status_is_running(&cmd.status))
+            })
+            .unwrap_or(false)
+    }
 }
 
 /// Normalized fields extracted from a completed command or tool item before the shared

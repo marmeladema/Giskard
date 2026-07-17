@@ -196,6 +196,27 @@
     </div>
   </div>
 
+  <!-- Remove-project confirmation. This removes only Giskard's saved project lifecycle data; it
+       never touches the source/workspace directory. -->
+  <div class="overlay" id="removeProjectModal">
+    <div class="dialog remove-project-dialog">
+      <h2>Remove project from Giskard?</h2>
+      <div class="content">
+        <p>
+          This removes <strong id="removeProjectName">this project</strong> from Giskard, including
+          its saved threads, transcripts, and project metadata.
+        </p>
+        <p class="muted">Your source directory will not be touched:</p>
+        <div class="remove-project-path mono" id="removeProjectDir"></div>
+      </div>
+      <div class="foot">
+        <span class="err" id="removeProjectErr"></span>
+        <button id="removeProjectCancel">Cancel</button>
+        <button class="danger" id="removeProjectConfirm">Remove from Giskard</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Source/code overlay opened from linkified transcript paths. Highlighting and downloads are
        served by the backend so the browser does not need a JS highlighter or filesystem access. -->
   <div class="overlay" id="codeOverlay">
