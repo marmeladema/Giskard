@@ -104,7 +104,7 @@ async fn security_headers_are_set_on_all_responses() {
     let (_tmp, base) = start_server("").await;
     let client = client();
 
-    for path in ["/", "/app.js", "/app.css", "/api/projects"] {
+    for path in ["/", "/favicon.svg", "/app.js", "/app.css", "/api/projects"] {
         let resp = client.get(format!("{base}{path}")).send().await.unwrap();
         let headers = resp.headers();
         let csp = headers
@@ -138,6 +138,12 @@ async fn index_page_has_no_inline_script() {
     assert!(!body.contains("<script>"), "index.html must not inline JS");
     assert!(!body.contains("<style>"), "index.html must not inline CSS");
     assert!(body.contains(r#"<script src="/app.js"></script>"#));
+    assert!(body.contains(r#"<link rel="icon" href="/favicon.svg" type="image/svg+xml" />"#));
+    assert!(
+        body.contains(
+            r#"<img class="sidebar-logo" src="/favicon.svg" alt="" aria-hidden="true" />"#
+        )
+    );
     assert!(body.contains(r#"<link rel="stylesheet" href="/app.css" />"#));
 }
 

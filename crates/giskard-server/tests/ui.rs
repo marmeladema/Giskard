@@ -29,10 +29,10 @@ async fn index_page_is_served_and_public() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     // No cookie: the page and its same-origin assets must load without authentication. The UI's
-    // script/stylesheet are separate assets (CSP: `script-src 'self'`), so the assertions below
-    // run against the page plus both assets — together they are the full self-contained app.
+    // script/stylesheet are separate assets (CSP: `script-src 'self'`), and the favicon is
+    // same-origin app chrome.
     let mut body = String::new();
-    for path in ["/", "/app.js", "/app.css"] {
+    for path in ["/", "/favicon.svg", "/app.js", "/app.css"] {
         body.push_str(
             &reqwest::get(format!("http://127.0.0.1:{port}{path}"))
                 .await
@@ -44,6 +44,12 @@ async fn index_page_is_served_and_public() {
         body.push('\n');
     }
     assert!(body.contains("<title>Giskard</title>"));
+    assert!(
+        body.contains(
+            r#"<img class="sidebar-logo" src="/favicon.svg" alt="" aria-hidden="true" />"#
+        ),
+        "sidebar shows the Giskard icon"
+    );
     assert!(body.contains("/api/ws"), "app talks to the WS endpoint");
     assert!(
         body.contains("/api/ws-ticket"),
@@ -1232,8 +1238,13 @@ async fn index_page_is_served_and_public() {
         body.contains("data-mcp-login"),
         "MCP servers that need auth render an authenticate action"
     );
-    // Self-contained: no external script/style hosts.
-    assert!(!body.contains("http://"), "no external http asset refs");
+    // Self-contained: no external script/style hosts. SVG XML namespaces are allowed to use
+    // `http://` identifiers; asset-bearing `src`/`href` attributes must stay same-origin.
+    assert!(!body.contains(r#"src="http"#), "no external script refs");
+    assert!(
+        !body.contains(r#"href="http"#),
+        "no external stylesheet refs"
+    );
     assert!(!body.contains("cdn"), "no CDN references");
 }
 
@@ -1720,6 +1731,7 @@ fn sidebar_activity_notifications_target_approval_rows() {
 
     let css = include_str!("../static/app.css");
     assert!(css.contains(".sidebar-head"));
+    assert!(css.contains(".sidebar-logo"));
     assert!(css.contains(".notify-permission-btn"));
 }
 

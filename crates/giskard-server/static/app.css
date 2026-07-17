@@ -36,6 +36,8 @@
   }
   #projects { flex:1; min-height:0; overflow-y:auto; }
   .sidebar-head { align-items:center; gap:6px; margin-bottom:6px; }
+  .sidebar-logo { width:24px; height:24px; flex:none; display:block; border-radius:6px; }
+  .sidebar-title { flex:1; min-width:0; }
   .notify-permission-btn {
     width:28px; height:28px; padding:0; flex:none; font-weight:700; line-height:1;
     border-color:#8a6d1d; background:#3a2f15; color:#f0d98c;

@@ -170,7 +170,8 @@
   (`script-src 'self'`, `frame-ancestors 'none'`), `X-Content-Type-Options: nosniff`,
   `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, COOP/CORP `same-origin`, and a
   minimal `Permissions-Policy`. The single-page UI's script and stylesheet are served as
-  separate same-origin assets (`/app.js`, `/app.css`) so no inline script executes (§12.1, §13.1).
+  separate same-origin assets (`/app.js`, `/app.css`, `/favicon.svg`) so no inline script executes
+  (§12.1, §13.1).
 - **SEC6:** `browse.roots`, when configured, also confines `POST /api/projects`: a project's
   `dir`/`workspace_root` must canonicalize into an allowed root, closing the API bypass of the
   previously picker-only confinement (§6.2, Appendix C).
@@ -2273,7 +2274,8 @@ alongside raw token counts. Off by default; raw token counts are the primary met
   ticket position.
 - **Hardening headers (SEC5):** every response carries a strict `Content-Security-Policy`
   (`script-src 'self'`; the UI's script/stylesheet are the separate same-origin assets
-  `/app.js` / `/app.css`, so no inline script executes), `X-Content-Type-Options: nosniff`,
+  `/app.js` / `/app.css`, with app chrome at `/favicon.svg`, so no inline script executes),
+  `X-Content-Type-Options: nosniff`,
   `X-Frame-Options: DENY` + `frame-ancestors 'none'`, `Referrer-Policy: no-referrer`,
   COOP/CORP `same-origin`, and a minimal `Permissions-Policy`.
 - **Workspace confinement (SEC6):** when `browse.roots` is configured it bounds not only the
