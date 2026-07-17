@@ -64,6 +64,7 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
         )
         .route("/api/projects/{id}/highlight", get(highlight_file))
         .route("/api/projects/{id}/raw", get(download_file))
+        .route("/api/projects/{id}/image", get(image_file))
         .route("/api/projects/{id}/linkify", post(linkify))
         .route("/api/projects/{id}/render", post(render_markdown))
         .route("/api/browse", get(browse))
@@ -1190,6 +1191,47 @@ async fn download_file(
         bytes,
     )
         .into_response())
+}
+
+/// `GET /api/projects/{id}/image` — inline raster image preview.
+///
+/// This deliberately serves a narrower surface than `/raw`: only common raster formats are
+/// returned with image MIME types for browser `<img>` rendering. SVG remains a normal file link.
+async fn image_file(
+    State(state): State<AppState>,
+    AxumPath(project_id): AxumPath<ProjectId>,
+    Query(q): Query<RawQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let project = state
+        .store
+        .load_project(project_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+    let workspace_root = PathBuf::from(project.workspace_root.as_deref().unwrap_or(&project.dir));
+    let resolved = resolve_confined_path(&workspace_root, &q.path)
+        .ok_or(ApiError::Forbidden("path escapes workspace root".into()))?;
+    let content_type = raster_image_content_type(&resolved)
+        .ok_or(ApiError::BadRequest("unsupported image type".into()))?;
+
+    let bytes = tokio::fs::read(&resolved)
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("cannot read image: {e}")))?;
+
+    Ok(([(axum::http::header::CONTENT_TYPE, content_type)], bytes).into_response())
+}
+
+fn raster_image_content_type(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        "avif" => Some("image/avif"),
+        _ => None,
+    }
 }
 
 /// `POST /api/projects/{id}/linkify` — detect file paths in agent text (spec §11.2).

@@ -4141,6 +4141,34 @@ mod tests {
     }
 
     #[test]
+    fn image_view_item_maps_to_previewable_activity() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let notif = completed_item(serde_json::json!({
+            "type": "imageView",
+            "id": "image1",
+            "path": "/tmp/project/screenshot.png"
+        }));
+
+        match mapper.map_notification(&notif, ThreadId::new()).unwrap() {
+            AgentEvent::ItemCompleted { item, .. } => match item.payload {
+                ItemPayload::Activity {
+                    title,
+                    detail,
+                    metadata,
+                } => {
+                    assert_eq!(title, "Image viewed");
+                    assert_eq!(detail.as_deref(), Some("/tmp/project/screenshot.png"));
+                    let metadata = metadata.expect("raw Codex item metadata is preserved");
+                    assert_eq!(metadata["type"], "imageView");
+                    assert_eq!(metadata["id"], "image1");
+                }
+                other => panic!("expected activity, got {other:?}"),
+            },
+            other => panic!("expected item completion, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn context_compaction_item_maps_to_clean_activity() {
         let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
         let notif = completed_item(serde_json::json!({

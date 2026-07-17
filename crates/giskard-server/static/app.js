@@ -4350,10 +4350,31 @@ function toolTerminalDurationMs(msg, startedAtMs) {
   return durationMs;
 }
 function renderActivity(p) {
+  if (isImageViewActivity(p)) return renderImageViewActivity(p);
   const detail = p.detail ? `<div>${escapeHtml(p.detail)}</div>` : "";
   const metadata = visibleActivityMetadata(p);
   const meta = metadata ? `<pre class="out">${escapeHtml(jsonPreview(metadata))}</pre>` : "";
   return `<div>${escapeHtml(p.title||"Activity")}</div>${detail}${meta}`;
+}
+function isImageViewActivity(p) {
+  return !!(p && p.kind === "activity" && p.title === "Image viewed" && imageViewPath(p));
+}
+function imageViewPath(p) {
+  const detail = String((p && p.detail) || "").trim();
+  if (detail) return detail;
+  const md = p && p.metadata;
+  return md && typeof md.path === "string" ? md.path.trim() : "";
+}
+function renderImageViewActivity(p) {
+  const path = imageViewPath(p);
+  const src = projectFileUrl("image", path);
+  return [
+    `<div class="activity-image-title">${escapeHtml(p.title || "Image viewed")}</div>`,
+    `<a class="activity-image-link" href="${escapeAttr(src)}" target="_blank" rel="noopener" title="Open image">`,
+    `<img class="activity-image-preview" src="${escapeAttr(src)}" alt="${escapeAttr(path)}" loading="lazy" decoding="async">`,
+    `</a>`,
+    `<div class="activity-image-caption">${escapeHtml(path)}</div>`
+  ].join("");
 }
 // A plan-update activity carries its steps as a `[{ step, status }]` metadata array (status is one
 // of "pending" | "inProgress" | "completed"). Detect it by shape so the check is independent of the

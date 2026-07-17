@@ -8,7 +8,13 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.49
+**Version:** 1.50
+
+**Changelog (1.49 → 1.50), ImageView activity previews:**
+- **IV1:** Codex `ImageView` activity rows render a bounded inline raster image preview in the
+  transcript instead of exposing protocol metadata such as call ids. The preview is sourced through
+  a project-confined `GET /api/projects/{id}/image?path=…` endpoint. SVG is intentionally excluded
+  from inline preview v1 and remains a normal file/path link.
 
 **Changelog (1.48 → 1.49), composer drafts and approval button contrast:**
 - **UI1:** Unsent composer text is browser-local and scoped to the selected persisted thread, or to
@@ -2216,6 +2222,10 @@ alongside raw token counts. Off by default; raw token counts are the primary met
   `GET /api/projects/{id}/highlight?path=…` in the code overlay, and downloads through
   `GET /api/projects/{id}/raw?path=…`. This is intentionally whole-file oriented until the
   virtualized line-range viewer in §11.3 is implemented.
+- **Image previews (IV1):** completed Codex `ImageView` activity rows render a thumbnail through
+  `GET /api/projects/{id}/image?path=…`. The endpoint uses the same workspace confinement as
+  `highlight`/`raw`, serves only common raster image types with image MIME types, and rejects SVG
+  for inline preview.
 - **Markdown rendering (M1–M3):** agent/reasoning text is Markdown, so finalized messages are sent
   to `POST /api/projects/{id}/render` instead of `/linkify`. The server parses the Markdown
   (`pulldown-cmark`) and emits **sanitized** HTML with a custom serializer: all text is escaped,
