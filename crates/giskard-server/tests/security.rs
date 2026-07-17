@@ -141,7 +141,7 @@ async fn index_page_has_no_inline_script() {
     assert!(body.contains(r#"<link rel="icon" href="/favicon.svg" type="image/svg+xml" />"#));
     assert!(
         body.contains(
-            r#"<img class="sidebar-logo" src="/favicon.svg" alt="" aria-hidden="true" />"#
+            r#"<img class="sidebar-logo" src="/favicon.svg" width="24" height="24" alt="" aria-hidden="true" />"#
         )
     );
     assert!(body.contains(r#"<link rel="stylesheet" href="/app.css" />"#));

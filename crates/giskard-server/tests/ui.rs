@@ -46,7 +46,7 @@ async fn index_page_is_served_and_public() {
     assert!(body.contains("<title>Giskard</title>"));
     assert!(
         body.contains(
-            r#"<img class="sidebar-logo" src="/favicon.svg" alt="" aria-hidden="true" />"#
+            r#"<img class="sidebar-logo" src="/favicon.svg" width="24" height="24" alt="" aria-hidden="true" />"#
         ),
         "sidebar shows the Giskard icon"
     );
@@ -1755,6 +1755,8 @@ fn sidebar_activity_notifications_target_approval_rows() {
     let css = include_str!("../static/app.css");
     assert!(css.contains(".sidebar-head"));
     assert!(css.contains(".sidebar-logo"));
+    assert!(css.contains("flex:0 0 24px"));
+    assert!(css.contains("max-width:24px"));
     assert!(css.contains(".notify-permission-btn"));
 }
 
