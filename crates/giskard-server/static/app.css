@@ -72,7 +72,7 @@
   .center { display:flex; flex-direction:column; border-left:1px solid var(--border); border-right:1px solid var(--border); }
   .proj { margin-bottom:10px; }
   .proj.collapsed { margin-bottom:6px; }
-  .proj > .name { font-weight:600; display:flex; gap:4px; align-items:center; }
+  .proj > .name { position:relative; font-weight:600; display:flex; gap:4px; align-items:center; }
   .project-toggle { width:24px; height:24px; padding:0; border-color:transparent; background:transparent; color:var(--muted); line-height:1; }
   .project-toggle:hover { border-color:var(--border); color:var(--fg); }
   .project-name {
@@ -81,6 +81,12 @@
   }
   .project-name:hover { border-color:transparent; color:var(--accent); }
   .project-add { width:28px; height:28px; padding:0; }
+  .project-menu-btn { width:28px; height:28px; padding:0; border-color:transparent; background:transparent; color:var(--muted); }
+  .project-menu-btn:hover { border-color:var(--border); color:var(--fg); }
+  .project-menu { position:absolute; right:0; top:30px; z-index:20; min-width:150px; padding:4px; border:1px solid var(--border); border-radius:6px; background:var(--panel); box-shadow:0 12px 32px rgba(0,0,0,.35); }
+  .project-menu[hidden] { display:none; }
+  .project-menu button { display:block; width:100%; padding:6px 8px; border:0; background:transparent; text-align:left; }
+  .project-menu button:hover { background:var(--panel2); }
   .project-threads[hidden] { display:none; }
   .thread-row { position:relative; display:flex; align-items:center; gap:4px; margin:3px 0 3px 8px; border-radius:6px; }
   .thread { flex:1; min-width:0; padding:5px 8px; border-radius:6px; cursor:pointer; color:var(--muted); font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:flex; align-items:center; gap:6px; }
@@ -497,6 +503,9 @@
   .field label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
   .field input, .field select { width:100%; }
   .field .hint { font-size:11px; color:var(--muted); margin-top:4px; }
+  .remove-project-dialog { width:min(520px,92vw); }
+  .remove-project-dialog p { margin:0 0 10px; }
+  .remove-project-path { padding:8px 10px; border:1px solid var(--border); border-radius:8px; background:var(--panel2); font-size:12px; word-break:break-all; }
   .code-dialog { width:min(1120px,94vw); height:min(860px,90vh); }
   .code-head { padding:14px 18px; border-bottom:1px solid var(--border); display:flex; gap:10px; align-items:flex-start; }
   .code-head-main { flex:1; min-width:0; }

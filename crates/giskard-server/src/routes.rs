@@ -309,6 +309,37 @@ async fn delete_project(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<ProjectId>,
 ) -> Result<axum::http::StatusCode, ApiError> {
+    state
+        .store
+        .load_project(id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let thread_ids = state.store.list_threads(id).await?;
+    for thread_id in thread_ids {
+        if state.live_buffers.is_active(thread_id).await
+            || state.registry.thread_has_active_turn(thread_id).await
+        {
+            return Err(ApiError::Conflict(
+                "project has a thread with an active turn; stop it before removing the project"
+                    .into(),
+            ));
+        }
+        if state
+            .running_commands
+            .has_running_for_thread(thread_id)
+            .await
+        {
+            return Err(ApiError::Conflict(
+                "project has a thread with running commands; stop them before removing the project"
+                    .into(),
+            ));
+        }
+    }
+    state
+        .registry
+        .delete_project(id)
+        .await
+        .map_err(harness_api_error)?;
     state.store.delete_project(id).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

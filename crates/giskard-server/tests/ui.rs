@@ -435,6 +435,23 @@ async fn index_page_is_served_and_public() {
         "project rows can collapse and persist their thread-list visibility"
     );
     assert!(
+        body.contains("className = \"project-menu-btn\"")
+            && body.contains("Remove project")
+            && body.contains("Remove project from Giskard?")
+            && body.contains("Your source directory will not be touched:")
+            && body.contains("Remove from Giskard")
+            && body.contains(
+                "including\n          its saved threads, transcripts, and project metadata"
+            )
+            && body.contains("openRemoveProjectModal(p)")
+            && body.contains("api(\"DELETE\", `/api/projects/${project.id}`)")
+            && body.contains("Project removed from Giskard.")
+            && body.contains("function clearProjectView(pid)")
+            && body.contains("clearStoredLastThreadForProject(pid)")
+            && body.contains("querySelectorAll(\".thread-menu, .project-menu\")"),
+        "project rows expose a remove action with source-directory-safe confirmation"
+    );
+    assert!(
         body.contains("overflow:visible")
             && body.contains("z-index:40")
             && body.contains("z-index:70"),

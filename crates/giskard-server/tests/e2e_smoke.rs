@@ -146,6 +146,7 @@ struct CountingOpenHarness {
     open_calls: AtomicUsize,
     start_calls: AtomicUsize,
     delete_calls: AtomicUsize,
+    shutdown_calls: AtomicUsize,
     opened_models: tokio::sync::Mutex<Vec<ModelRef>>,
     started_models: tokio::sync::Mutex<Vec<Option<ModelRef>>>,
     started_inputs: tokio::sync::Mutex<Vec<String>>,
@@ -243,6 +244,10 @@ impl CountingOpenHarness {
 
     fn delete_calls(&self) -> usize {
         self.delete_calls.load(Ordering::SeqCst)
+    }
+
+    fn shutdown_calls(&self) -> usize {
+        self.shutdown_calls.load(Ordering::SeqCst)
     }
 
     async fn started_models(&self) -> Vec<Option<ModelRef>> {
@@ -887,6 +892,7 @@ impl AgentHarness for CountingOpenHarness {
     }
 
     async fn shutdown(&self) -> Result<(), HarnessError> {
+        self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -2610,6 +2616,106 @@ async fn thread_delete_removes_native_and_persisted_thread() {
 }
 
 #[tokio::test]
+async fn project_remove_shuts_down_harness_and_removes_giskard_data_only() {
+    let harness = Arc::new(CountingOpenHarness::default());
+    let (tmp, state, port) = start_custom_server_with_extra_config_on_available_port(
+        Arc::new(CountingOpenFactory {
+            harness: harness.clone(),
+        }),
+        "",
+    )
+    .await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let source_dir = tmp.path().join("source-project");
+    tokio::fs::create_dir_all(&source_dir).await.unwrap();
+
+    let project_resp = client
+        .post(format!("{base}/api/projects"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({
+            "name": "remove-me",
+            "dir": source_dir.to_string_lossy(),
+            "default_model": {"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null},
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(project_resp.status(), 200);
+    let project_id: ProjectId = project_resp.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let thread_resp = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"resume": "th_remove_project"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(thread_resp.status(), 200);
+    let thread_id: ThreadId = thread_resp.json::<serde_json::Value>().await.unwrap()["thread_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        state.registry.get_project_for_thread(thread_id).await,
+        Some(project_id)
+    );
+
+    let resp = client
+        .delete(format!("{base}/api/projects/{project_id}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    assert_eq!(harness.shutdown_calls(), 1);
+    assert_eq!(state.registry.get_project_for_thread(thread_id).await, None);
+    assert!(
+        state
+            .store
+            .load_project(project_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        state
+            .store
+            .list_threads(project_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "project lifecycle data should be removed from Giskard storage"
+    );
+    assert!(
+        source_dir.is_dir(),
+        "removing a project from Giskard must not touch the source directory"
+    );
+}
+
+#[tokio::test]
+async fn project_remove_returns_not_found_for_missing_project() {
+    let (_tmp, _state, port) = start_server_with_extra_config_on_available_port("").await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+
+    let resp = client
+        .delete(format!("{base}/api/projects/{}", ProjectId::new()))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
 async fn thread_archive_and_delete_reject_active_turns() {
     let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
     let base = format!("http://127.0.0.1:{port}");
@@ -2638,6 +2744,32 @@ async fn thread_archive_and_delete_reject_active_turns() {
         .await
         .unwrap();
     assert_eq!(delete.status(), 409);
+}
+
+#[tokio::test]
+async fn project_remove_rejects_active_turns() {
+    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    state.live_buffers.start_turn(thread_id).await;
+
+    let resp = client
+        .delete(format!("{base}/api/projects/{project_id}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    assert!(
+        state
+            .store
+            .load_project(project_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 /// A running command must block archive/delete even when there is no live turn: the guard checks
@@ -2698,6 +2830,53 @@ async fn thread_archive_and_delete_reject_running_commands() {
         .await
         .unwrap();
     assert_eq!(delete.status(), 409);
+}
+
+#[tokio::test]
+async fn project_remove_rejects_running_commands() {
+    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+
+    let tracked = state
+        .running_commands
+        .apply_event(&AgentEvent::ItemStarted {
+            thread: thread_id,
+            turn: TurnId::new(),
+            item: ItemStart {
+                id: ItemId::new(),
+                harness_item_id: "cmd_project_guard".into(),
+                kind: ItemKind::CommandExecution,
+                command: Some(CommandExecutionStart {
+                    command: "sleep 60".into(),
+                    cwd: "/tmp/thread-actions".into(),
+                    status: Some("in_progress".into()),
+                    process_id: Some("proc_project_guard".into()),
+                    started_at_ms: None,
+                }),
+                tool: None,
+            },
+        })
+        .await;
+    assert!(tracked, "command should be tracked as running");
+
+    let resp = client
+        .delete(format!("{base}/api/projects/{project_id}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    assert!(
+        state
+            .store
+            .load_project(project_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 /// AP2: approval policy is thread-scoped, so two threads in the same project keep independent

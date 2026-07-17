@@ -656,6 +656,36 @@ impl HarnessRegistry {
         let mut threads = self.threads.lock().await;
         threads.remove(&thread_id);
     }
+
+    pub async fn delete_project(&self, project_id: ProjectId) -> Result<(), HarnessError> {
+        let harness = self.harnesses.lock().await.get(&project_id).cloned();
+        if let Some(harness) = harness {
+            harness.shutdown().await?;
+            self.harnesses.lock().await.remove(&project_id);
+        }
+
+        let thread_ids = {
+            let mut threads = self.threads.lock().await;
+            let thread_ids = threads
+                .iter()
+                .filter_map(|(thread_id, binding)| {
+                    (binding.project == project_id).then_some(*thread_id)
+                })
+                .collect::<HashSet<_>>();
+            threads.retain(|_, binding| binding.project != project_id);
+            thread_ids
+        };
+
+        if !thread_ids.is_empty() {
+            let mut approvals = self.approvals.lock().await;
+            approvals.retain(|_, thread_id| !thread_ids.contains(thread_id));
+
+            let mut server_requests = self.server_requests.lock().await;
+            server_requests.retain(|_, thread_id| !thread_ids.contains(thread_id));
+        }
+
+        Ok(())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

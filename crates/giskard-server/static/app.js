@@ -32,7 +32,7 @@ let state = {
   currentPlan:null, planExpanded:localStorage.getItem("giskard.planExpanded")==="1",
   threadActivity:new Map(), pendingApprovalFocus:null, notifiedApprovals:new Map(), browserDiagnostics:[],
   lastNotificationPromptNoticeAt:0,
-  collapsedProjects:new Set(loadCollapsedProjects())
+  collapsedProjects:new Set(loadCollapsedProjects()), pendingRemoveProject:null
 };
 const COMMAND_AUTO_COLLAPSE_LINES = 120;
 const COMMAND_AUTO_COLLAPSE_BYTES = 16 * 1024;
@@ -420,7 +420,26 @@ async function loadProjects() {
       setProjectCollapsed(p.id, false);
       newThread(p.id);
     };
-    name.append(toggle, label, add); d.append(name);
+    const menuBtn = document.createElement("button");
+    menuBtn.type = "button"; menuBtn.className = "project-menu-btn";
+    menuBtn.textContent = "..."; menuBtn.title = "Project actions";
+    menuBtn.setAttribute("aria-label", "Project actions");
+    const menu = document.createElement("div"); menu.className = "project-menu"; menu.hidden = true;
+    const remove = document.createElement("button");
+    remove.type = "button"; remove.textContent = "Remove project"; remove.className = "danger";
+    remove.onclick = (e) => {
+      e.stopPropagation();
+      closeThreadMenus();
+      openRemoveProjectModal(p);
+    };
+    menu.append(remove);
+    menuBtn.onclick = (e) => {
+      e.stopPropagation();
+      const wasHidden = menu.hidden;
+      closeThreadMenus();
+      menu.hidden = !wasHidden;
+    };
+    name.append(toggle, label, add, menuBtn, menu); d.append(name);
     const threads = document.createElement("div");
     threads.id = "threads-"+p.id; threads.className = "project-threads";
     threads.hidden = collapsed;
@@ -702,7 +721,7 @@ function beginRenameThread(el, pid, tid) {
 }
 
 function closeThreadMenus() {
-  document.querySelectorAll(".thread-menu").forEach(m => m.hidden = true);
+  document.querySelectorAll(".thread-menu, .project-menu").forEach(m => m.hidden = true);
 }
 
 document.addEventListener("click", closeThreadMenus);
@@ -757,6 +776,21 @@ function clearThreadView(tid) {
   $("pickerBar").style.display="none"; closeModelPicker(); closeTurnPicker();
   $("transcript").innerHTML="";
   setWsStatus("closed", "No thread selected.");
+}
+
+function clearStoredLastThreadForProject(pid) {
+  try {
+    const last = JSON.parse(localStorage.getItem("giskard.lastThread") || "null");
+    if (last && last.pid === pid) localStorage.removeItem("giskard.lastThread");
+  } catch {
+    localStorage.removeItem("giskard.lastThread");
+  }
+}
+
+function clearProjectView(pid) {
+  clearStoredLastThreadForProject(pid);
+  if (state.projectId !== pid) return;
+  clearThreadView(state.threadId);
 }
 
 /* ---------- new-project modal + directory picker ---------- */
@@ -906,6 +940,45 @@ $("pmCreate").onclick = async () => {
     closeProjectModal();
     await loadProjects();
   } catch (e) { $("pmErr").textContent = "Create project failed: "+e.message; }
+};
+
+function openRemoveProjectModal(project) {
+  closeDrawers();
+  state.pendingRemoveProject = project;
+  $("removeProjectErr").textContent = "";
+  $("removeProjectName").textContent = project.name || "this project";
+  $("removeProjectDir").textContent = project.dir || "(unknown source directory)";
+  $("removeProjectModal").classList.add("open");
+  $("removeProjectConfirm").focus();
+}
+
+function closeRemoveProjectModal() {
+  $("removeProjectModal").classList.remove("open");
+  state.pendingRemoveProject = null;
+}
+
+$("removeProjectCancel").onclick = closeRemoveProjectModal;
+$("removeProjectModal").addEventListener("click", (e) => {
+  if (e.target === $("removeProjectModal")) closeRemoveProjectModal();
+});
+
+$("removeProjectConfirm").onclick = async () => {
+  const project = state.pendingRemoveProject;
+  if (!project || !project.id) return;
+  const btn = $("removeProjectConfirm");
+  btn.disabled = true;
+  $("removeProjectErr").textContent = "";
+  try {
+    await api("DELETE", `/api/projects/${project.id}`);
+    clearProjectView(project.id);
+    closeRemoveProjectModal();
+    await loadProjects();
+    notice("Project removed from Giskard.");
+  } catch (e) {
+    $("removeProjectErr").textContent = "Remove project failed: " + e.message;
+  } finally {
+    btn.disabled = false;
+  }
 };
 
 async function newThread(pid) {
