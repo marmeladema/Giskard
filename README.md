@@ -318,9 +318,10 @@ Cargo workspace under `crates/`:
 
 **Frontend note:** the desktop UI is currently a single self-contained page (HTML/CSS/vanilla JS,
 no npm) served by `giskard-server` at `/`, with its stylesheet and script as separate same-origin
-assets (`/app.css`, `/app.js`) so the Content-Security-Policy can forbid inline script. The spec
-targets a Dioxus/WASM frontend (`giskard-ui`); because the wire contract (`giskard-proto`) is
-stable, that port can happen without server changes.
+assets (`/app.css`, `/app.js`) so the Content-Security-Policy can forbid inline script. The
+favicon is served as a same-origin SVG at `/favicon.svg`. The spec targets a Dioxus/WASM frontend
+(`giskard-ui`); because the wire contract (`giskard-proto`) is stable, that port can happen
+without server changes.
 
 ---
 

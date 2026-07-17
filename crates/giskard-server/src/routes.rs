@@ -87,6 +87,7 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
 pub fn public_routes() -> Router<AppState> {
     Router::new()
         .route("/", get(index))
+        .route("/favicon.svg", get(favicon_svg))
         .route("/app.js", get(app_js))
         .route("/app.css", get(app_css))
         .route("/api/login", post(login))
@@ -114,6 +115,13 @@ async fn app_css() -> impl IntoResponse {
     (
         [(axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8")],
         include_str!("../static/app.css"),
+    )
+}
+
+async fn favicon_svg() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "image/svg+xml")],
+        include_str!("../static/favicon.svg"),
     )
 }
 
