@@ -1345,6 +1345,13 @@ async fn list_mcp_servers(
         .capabilities(&project_config)
         .await
         .map_err(harness_api_error)?;
+    if !capabilities.mcp_status {
+        warn!(
+            %project_id,
+            harness = %project_config.harness,
+            "MCP status requested but harness reports it unsupported"
+        );
+    }
     let servers = if capabilities.mcp_status {
         state
             .registry
@@ -1354,6 +1361,15 @@ async fn list_mcp_servers(
     } else {
         Vec::new()
     };
+    info!(
+        %project_id,
+        harness = %project_config.harness,
+        mcp_status_supported = capabilities.mcp_status,
+        mcp_reload_supported = capabilities.mcp_reload,
+        mcp_oauth_login_supported = capabilities.mcp_oauth_login,
+        server_count = servers.len(),
+        "MCP server status loaded"
+    );
     Ok(Json(ListMcpServersResponse {
         servers,
         capabilities: McpCapabilitiesResponse {
@@ -1379,6 +1395,11 @@ async fn reload_mcp_servers(
         .await
         .map_err(harness_api_error)?;
     if !capabilities.mcp_reload {
+        warn!(
+            %project_id,
+            harness = %project_config.harness,
+            "MCP reload requested but harness reports it unsupported"
+        );
         return Err(ApiError::BadRequest(
             "MCP server reload is not supported by this harness".into(),
         ));
@@ -1388,6 +1409,11 @@ async fn reload_mcp_servers(
         .reload_mcp_servers(&project_config)
         .await
         .map_err(harness_api_error)?;
+    info!(
+        %project_id,
+        harness = %project_config.harness,
+        "MCP server reload completed"
+    );
     Ok(Json(ReloadMcpServersResponse { ok: true }))
 }
 
@@ -1413,6 +1439,12 @@ async fn start_mcp_oauth_login(
         .await
         .map_err(harness_api_error)?;
     if !capabilities.mcp_oauth_login {
+        warn!(
+            %project_id,
+            harness = %project_config.harness,
+            server = name,
+            "MCP OAuth login requested but harness reports it unsupported"
+        );
         return Err(ApiError::BadRequest(
             "MCP OAuth login is not supported by this harness".into(),
         ));
@@ -1422,6 +1454,13 @@ async fn start_mcp_oauth_login(
         .start_mcp_oauth_login(&project_config, name)
         .await
         .map_err(harness_api_error)?;
+    info!(
+        %project_id,
+        harness = %project_config.harness,
+        server = name,
+        authorization_url_returned = !login.authorization_url.is_empty(),
+        "MCP OAuth login started"
+    );
     Ok(Json(login))
 }
 
@@ -2078,6 +2117,7 @@ async fn handle_client_msg(
             request_id,
             response,
         } => {
+            let request_id_for_log = request_id.clone();
             let req_id = giskard_core::ids::ServerRequestId(request_id);
             tokio::time::timeout(
                 HARNESS_CONTROL_TIMEOUT,
@@ -2085,6 +2125,11 @@ async fn handle_client_msg(
             )
             .await
             .map_err(|_| {
+                error!(
+                    request_id = %request_id_for_log,
+                    timeout_ms = HARNESS_CONTROL_TIMEOUT.as_millis(),
+                    "server request response timed out waiting for Codex"
+                );
                 WsError::from_harness(
                     HarnessError::Timeout(
                         "server request response timed out waiting for Codex".into(),
@@ -2099,6 +2144,11 @@ async fn handle_client_msg(
             tokio::time::timeout(HARNESS_CONTROL_TIMEOUT, state.registry.interrupt(thread_id))
                 .await
                 .map_err(|_| {
+                    error!(
+                        %thread_id,
+                        timeout_ms = HARNESS_CONTROL_TIMEOUT.as_millis(),
+                        "interrupt request timed out waiting for Codex"
+                    );
                     WsError::from_harness(
                         HarnessError::Timeout(
                             "interrupt request timed out waiting for Codex".into(),
@@ -2133,6 +2183,11 @@ async fn handle_client_msg(
             )
             .await
             .map_err(|_| {
+                error!(
+                    %thread_id,
+                    timeout_ms = HARNESS_CONTROL_TIMEOUT.as_millis(),
+                    "context compaction request timed out waiting for Codex"
+                );
                 WsError::from_harness(
                     HarnessError::Timeout(
                         "context compaction request timed out waiting for Codex".into(),
@@ -2165,6 +2220,17 @@ async fn handle_client_msg(
             )
             .await
             .map_err(|_| {
+                error!(
+                    %thread_id,
+                    process_id = %process_id_for_state,
+                    timeout_ms = HARNESS_CONTROL_TIMEOUT.as_millis(),
+                    had_running_task = existing_command.is_some(),
+                    running_task_after_turn = existing_command
+                        .as_ref()
+                        .map(|cmd| cmd.after_turn)
+                        .unwrap_or(false),
+                    "terminate command request timed out waiting for Codex"
+                );
                 HarnessError::Timeout(
                     "terminate command request timed out waiting for Codex".into(),
                 )

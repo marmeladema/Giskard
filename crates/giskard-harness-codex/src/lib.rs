@@ -9,7 +9,7 @@ mod mapping;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ApprovalId, ServerRequestId, ThreadId, TurnId};
+use giskard_core::ids::{ApprovalId, ProjectId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::mcp::{
     McpAuthStatus, McpOauthStart, McpResource, McpResourceTemplate, McpServerInfo, McpServerStatus,
     McpTool,
@@ -40,6 +40,28 @@ use mapping::CodexMapper;
 
 const BROADCAST_CAPACITY: usize = 256;
 const TURN_FIRST_EVENT_WARN_AFTER: Duration = Duration::from_secs(15);
+#[cfg(not(test))]
+const CODEX_JSON_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const CODEX_JSON_RPC_TIMEOUT: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
+const CODEX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const CODEX_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
+const WORKER_QUEUE_WARN_AFTER: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const WORKER_QUEUE_WARN_AFTER: Duration = Duration::from_millis(50);
+
+struct QueuedHarnessCommand {
+    token: WorkerQueueToken,
+    command: HarnessCommand,
+}
+
+struct QueuedControlCommand {
+    token: WorkerQueueToken,
+    command: ControlCommand,
+}
 
 enum HarnessCommand {
     OpenThread {
@@ -108,6 +130,286 @@ enum ControlCommand {
 }
 
 type SenderMap = Arc<StdMutex<HashMap<ThreadId, broadcast::Sender<AgentEvent>>>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerQueueKind {
+    Command,
+    Control,
+}
+
+impl WorkerQueueKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Command => "command",
+            Self::Control => "control",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WorkerQueueToken {
+    id: u64,
+    kind: WorkerQueueKind,
+    action: &'static str,
+    enqueued_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct WorkerQueueEntrySnapshot {
+    id: u64,
+    kind: WorkerQueueKind,
+    action: &'static str,
+    elapsed_ms: u128,
+}
+
+#[derive(Debug, Clone)]
+struct WorkerQueueSnapshot {
+    active: Option<WorkerQueueEntrySnapshot>,
+    oldest_pending: Option<WorkerQueueEntrySnapshot>,
+    command_pending: usize,
+    control_pending: usize,
+}
+
+#[derive(Debug)]
+struct WorkerQueueState {
+    next_id: u64,
+    pending: HashMap<u64, WorkerQueueToken>,
+    active: Option<WorkerQueueToken>,
+    closed: bool,
+}
+
+#[derive(Debug)]
+struct WorkerQueueWatchdog {
+    state: StdMutex<WorkerQueueState>,
+}
+
+impl WorkerQueueWatchdog {
+    fn new() -> Self {
+        Self {
+            state: StdMutex::new(WorkerQueueState {
+                next_id: 1,
+                pending: HashMap::new(),
+                active: None,
+                closed: false,
+            }),
+        }
+    }
+
+    fn enqueue(&self, kind: WorkerQueueKind, action: &'static str) -> WorkerQueueToken {
+        let mut state = self.lock_state();
+        let token = WorkerQueueToken {
+            id: state.next_id,
+            kind,
+            action,
+            enqueued_at: Instant::now(),
+        };
+        state.next_id = state.next_id.saturating_add(1);
+        state.pending.insert(token.id, token);
+        token
+    }
+
+    fn cancel(&self, token: WorkerQueueToken) {
+        self.lock_state().pending.remove(&token.id);
+    }
+
+    fn mark_started(&self, token: WorkerQueueToken) {
+        let mut state = self.lock_state();
+        state.pending.remove(&token.id);
+        state.active = Some(token);
+    }
+
+    fn mark_finished(&self, token: WorkerQueueToken) {
+        let mut state = self.lock_state();
+        if state.active.is_some_and(|active| active.id == token.id) {
+            state.active = None;
+        }
+    }
+
+    fn close(&self) {
+        self.lock_state().closed = true;
+    }
+
+    fn snapshot(&self) -> WorkerQueueSnapshot {
+        let state = self.lock_state();
+        let now = Instant::now();
+        let mut command_pending = 0;
+        let mut control_pending = 0;
+        let mut oldest_pending: Option<WorkerQueueToken> = None;
+        for token in state.pending.values().copied() {
+            match token.kind {
+                WorkerQueueKind::Command => command_pending += 1,
+                WorkerQueueKind::Control => control_pending += 1,
+            }
+            if oldest_pending.is_none_or(|oldest| token.enqueued_at < oldest.enqueued_at) {
+                oldest_pending = Some(token);
+            }
+        }
+
+        WorkerQueueSnapshot {
+            active: state.active.map(|token| snapshot_queue_token(token, now)),
+            oldest_pending: oldest_pending.map(|token| snapshot_queue_token(token, now)),
+            command_pending,
+            control_pending,
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.lock_state().closed
+    }
+
+    fn lock_state(&self) -> StdMutexGuard<'_, WorkerQueueState> {
+        match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("Codex worker queue watchdog lock was poisoned; recovering state");
+                poisoned.into_inner()
+            }
+        }
+    }
+}
+
+fn snapshot_queue_token(token: WorkerQueueToken, now: Instant) -> WorkerQueueEntrySnapshot {
+    WorkerQueueEntrySnapshot {
+        id: token.id,
+        kind: token.kind,
+        action: token.action,
+        elapsed_ms: now.duration_since(token.enqueued_at).as_millis(),
+    }
+}
+
+async fn run_worker_queue_watchdog(watchdog: Weak<WorkerQueueWatchdog>) {
+    let mut tick = tokio::time::interval(WORKER_QUEUE_WARN_AFTER);
+    loop {
+        tick.tick().await;
+        let Some(watchdog) = watchdog.upgrade() else {
+            break;
+        };
+        if watchdog.is_closed() {
+            break;
+        }
+        let snapshot = watchdog.snapshot();
+        let active_is_slow = snapshot
+            .active
+            .as_ref()
+            .is_some_and(|active| active.elapsed_ms >= WORKER_QUEUE_WARN_AFTER.as_millis());
+        let pending_is_slow = snapshot
+            .oldest_pending
+            .as_ref()
+            .is_some_and(|pending| pending.elapsed_ms >= WORKER_QUEUE_WARN_AFTER.as_millis());
+        if active_is_slow || pending_is_slow {
+            warn!(
+                active_id = ?snapshot.active.as_ref().map(|entry| entry.id),
+                active_kind = ?snapshot.active.as_ref().map(|entry| entry.kind.as_str()),
+                active_action = ?snapshot.active.as_ref().map(|entry| entry.action),
+                active_elapsed_ms = ?snapshot.active.as_ref().map(|entry| entry.elapsed_ms),
+                oldest_pending_id = ?snapshot.oldest_pending.as_ref().map(|entry| entry.id),
+                oldest_pending_kind = ?snapshot.oldest_pending.as_ref().map(|entry| entry.kind.as_str()),
+                oldest_pending_action = ?snapshot.oldest_pending.as_ref().map(|entry| entry.action),
+                oldest_pending_elapsed_ms = ?snapshot.oldest_pending.as_ref().map(|entry| entry.elapsed_ms),
+                command_pending = snapshot.command_pending,
+                control_pending = snapshot.control_pending,
+                "Codex worker queue has slow active or pending work"
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CodexOperationContext<'a> {
+    action: &'static str,
+    project_id: Option<ProjectId>,
+    thread_id: Option<ThreadId>,
+    turn_id: Option<TurnId>,
+    harness_thread_id: Option<&'a str>,
+    native_turn_id: Option<&'a str>,
+    process_id: Option<&'a str>,
+    server: Option<&'a str>,
+    request_id: Option<&'a codex_codes::jsonrpc::RequestId>,
+}
+
+impl<'a> CodexOperationContext<'a> {
+    fn new(action: &'static str) -> Self {
+        Self {
+            action,
+            project_id: None,
+            thread_id: None,
+            turn_id: None,
+            harness_thread_id: None,
+            native_turn_id: None,
+            process_id: None,
+            server: None,
+            request_id: None,
+        }
+    }
+
+    fn for_project(action: &'static str, project_id: ProjectId) -> Self {
+        Self::new(action).with_project_id(project_id)
+    }
+
+    fn for_thread(action: &'static str, thread: &'a ThreadHandle) -> Self {
+        Self::new(action)
+            .with_thread_id(thread.thread)
+            .with_harness_thread_id(&thread.harness_thread_id)
+    }
+
+    fn with_project_id(mut self, project_id: ProjectId) -> Self {
+        self.project_id = Some(project_id);
+        self
+    }
+
+    fn with_thread_id(mut self, thread_id: ThreadId) -> Self {
+        self.thread_id = Some(thread_id);
+        self
+    }
+
+    fn with_giskard_turn_id(mut self, turn_id: TurnId) -> Self {
+        self.turn_id = Some(turn_id);
+        self
+    }
+
+    fn with_harness_thread_id(mut self, harness_thread_id: &'a str) -> Self {
+        self.harness_thread_id = Some(harness_thread_id);
+        self
+    }
+
+    fn with_native_turn_id(mut self, native_turn_id: &'a str) -> Self {
+        self.native_turn_id = Some(native_turn_id);
+        self
+    }
+
+    fn with_process_id(mut self, process_id: &'a str) -> Self {
+        self.process_id = Some(process_id);
+        self
+    }
+
+    fn with_server(mut self, server: &'a str) -> Self {
+        self.server = Some(server);
+        self
+    }
+
+    fn with_request_id(mut self, request_id: &'a codex_codes::jsonrpc::RequestId) -> Self {
+        self.request_id = Some(request_id);
+        self
+    }
+
+    fn log_timeout(self, method: Option<&str>, elapsed: Duration, message: &'static str) {
+        warn!(
+            action = self.action,
+            method,
+            project_id = ?self.project_id,
+            thread_id = ?self.thread_id,
+            turn_id = ?self.turn_id,
+            harness_thread_id = ?self.harness_thread_id,
+            native_turn_id = ?self.native_turn_id,
+            process_id = ?self.process_id,
+            server = ?self.server,
+            request_id = ?self.request_id,
+            elapsed_ms = elapsed.as_millis(),
+            timeout_ms = CODEX_JSON_RPC_TIMEOUT.as_millis(),
+            "{message}"
+        );
+    }
+}
 
 #[async_trait]
 trait CodexTransport: Send {
@@ -185,6 +487,7 @@ impl CodexTransport for codex_codes::AsyncClient {
 
 async fn codex_request<P, R>(
     client: &mut dyn CodexTransport,
+    context: CodexOperationContext<'_>,
     method: &str,
     params: &P,
 ) -> Result<R, HarnessError>
@@ -193,15 +496,74 @@ where
     R: DeserializeOwned,
 {
     let params = serde_json::to_value(params).map_err(|e| HarnessError::Protocol(e.to_string()))?;
-    let response = client.request_json(method, params).await?;
+    let started = Instant::now();
+    let response =
+        tokio::time::timeout(CODEX_JSON_RPC_TIMEOUT, client.request_json(method, params))
+            .await
+            .map_err(|_| {
+                context.log_timeout(
+                    Some(method),
+                    started.elapsed(),
+                    "Codex JSON-RPC request timed out; worker will resume processing commands",
+                );
+                HarnessError::Timeout(format!("Codex JSON-RPC request {method} timed out"))
+            })??;
     serde_json::from_value(response).map_err(|e| HarnessError::Protocol(e.to_string()))
+}
+
+async fn codex_respond_json(
+    client: &mut dyn CodexTransport,
+    context: CodexOperationContext<'_>,
+    id: codex_codes::jsonrpc::RequestId,
+    value: serde_json::Value,
+) -> Result<(), HarnessError> {
+    let started = Instant::now();
+    let id_for_log = id.clone();
+    tokio::time::timeout(CODEX_JSON_RPC_TIMEOUT, client.respond_json(id, value))
+        .await
+        .map_err(|_| {
+            context.with_request_id(&id_for_log).log_timeout(
+                None,
+                started.elapsed(),
+                "Codex JSON-RPC response timed out; worker will resume processing commands",
+            );
+            HarnessError::Timeout(format!("Codex JSON-RPC response {id_for_log} timed out"))
+        })?
+}
+
+async fn codex_respond_error_json(
+    client: &mut dyn CodexTransport,
+    context: CodexOperationContext<'_>,
+    id: codex_codes::jsonrpc::RequestId,
+    code: i64,
+    message: &str,
+) -> Result<(), HarnessError> {
+    let started = Instant::now();
+    let id_for_log = id.clone();
+    tokio::time::timeout(
+        CODEX_JSON_RPC_TIMEOUT,
+        client.respond_error_json(id, code, message),
+    )
+    .await
+    .map_err(|_| {
+        context.with_request_id(&id_for_log).log_timeout(
+            None,
+            started.elapsed(),
+            "Codex JSON-RPC error response timed out; worker will resume processing commands",
+        );
+        warn!(code, "Codex JSON-RPC error response timed out");
+        HarnessError::Timeout(format!(
+            "Codex JSON-RPC error response {id_for_log} timed out"
+        ))
+    })?
 }
 
 /// Codex CLI harness adapter (one app-server process per project).
 pub struct CodexHarness {
-    cmd_tx: mpsc::Sender<HarnessCommand>,
-    control_tx: mpsc::Sender<ControlCommand>,
+    cmd_tx: mpsc::Sender<QueuedHarnessCommand>,
+    control_tx: mpsc::Sender<QueuedControlCommand>,
     senders: SenderMap,
+    worker_queue: Arc<WorkerQueueWatchdog>,
     shutdown_called: AtomicBool,
     capabilities: HarnessCapabilities,
 }
@@ -228,11 +590,13 @@ impl CodexHarness {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (control_tx, control_rx) = mpsc::channel(64);
         let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
+        let worker_queue = Arc::new(WorkerQueueWatchdog::new());
 
         let harness = Arc::new(Self {
             cmd_tx,
             control_tx,
             senders: senders.clone(),
+            worker_queue: worker_queue.clone(),
             shutdown_called: AtomicBool::new(false),
             capabilities: HarnessCapabilities {
                 live_approvals: true,
@@ -250,14 +614,46 @@ impl CodexHarness {
             },
         });
 
+        tokio::spawn(run_worker_queue_watchdog(Arc::downgrade(&worker_queue)));
         tokio::spawn(background_task(
             client,
             cmd_rx,
             control_rx,
             senders,
+            worker_queue,
             workspace_root,
         ));
         Ok(harness)
+    }
+
+    async fn enqueue_command(
+        &self,
+        action: &'static str,
+        command: HarnessCommand,
+    ) -> Result<(), HarnessError> {
+        let token = self.worker_queue.enqueue(WorkerQueueKind::Command, action);
+        self.cmd_tx
+            .send(QueuedHarnessCommand { token, command })
+            .await
+            .map_err(|_| {
+                self.worker_queue.cancel(token);
+                HarnessError::Transport("background task closed".into())
+            })
+    }
+
+    async fn enqueue_control(
+        &self,
+        action: &'static str,
+        command: ControlCommand,
+    ) -> Result<(), HarnessError> {
+        let token = self.worker_queue.enqueue(WorkerQueueKind::Control, action);
+        self.control_tx
+            .send(QueuedControlCommand { token, command })
+            .await
+            .map_err(|_| {
+                self.worker_queue.cancel(token);
+                HarnessError::Transport("background task closed".into())
+            })
     }
 }
 
@@ -302,43 +698,47 @@ impl AgentHarness for CodexHarness {
 
     async fn list_mcp_servers(&self) -> Result<Vec<McpServerStatus>, HarnessError> {
         let (tx, rx) = oneshot::channel();
-        self.control_tx
-            .send(ControlCommand::ListMcpServers { response: tx })
-            .await
-            .map_err(|_| HarnessError::Transport("background task closed".into()))?;
+        self.enqueue_control(
+            "list_mcp_servers",
+            ControlCommand::ListMcpServers { response: tx },
+        )
+        .await?;
         rx.await
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
 
     async fn reload_mcp_servers(&self) -> Result<(), HarnessError> {
         let (tx, rx) = oneshot::channel();
-        self.control_tx
-            .send(ControlCommand::ReloadMcpServers { response: tx })
-            .await
-            .map_err(|_| HarnessError::Transport("background task closed".into()))?;
+        self.enqueue_control(
+            "reload_mcp_servers",
+            ControlCommand::ReloadMcpServers { response: tx },
+        )
+        .await?;
         rx.await
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
 
     async fn start_mcp_oauth_login(&self, name: &str) -> Result<McpOauthStart, HarnessError> {
         let (tx, rx) = oneshot::channel();
-        self.control_tx
-            .send(ControlCommand::StartMcpOauthLogin {
+        self.enqueue_control(
+            "start_mcp_oauth_login",
+            ControlCommand::StartMcpOauthLogin {
                 name: name.to_owned(),
                 response: tx,
-            })
-            .await
-            .map_err(|_| HarnessError::Transport("background task closed".into()))?;
+            },
+        )
+        .await?;
         rx.await
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
 
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(HarnessCommand::OpenThread { opts, response: tx })
-            .await
-            .map_err(|_| HarnessError::Transport("background task closed".into()))?;
+        self.enqueue_command(
+            "open_thread",
+            HarnessCommand::OpenThread { opts, response: tx },
+        )
+        .await?;
         rx.await
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
@@ -350,15 +750,16 @@ impl AgentHarness for CodexHarness {
         overrides: TurnOverrides,
     ) -> Result<TurnId, HarnessError> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(HarnessCommand::StartTurn {
+        self.enqueue_command(
+            "start_turn",
+            HarnessCommand::StartTurn {
                 thread: thread.clone(),
                 input,
                 overrides,
                 response: tx,
-            })
-            .await
-            .map_err(|_| HarnessError::Transport("background task closed".into()))?;
+            },
+        )
+        .await?;
         rx.await
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
@@ -377,14 +778,15 @@ impl AgentHarness for CodexHarness {
         decision: ApprovalDecision,
     ) -> Result<(), HarnessError> {
         let (tx, rx) = oneshot::channel();
-        self.control_tx
-            .send(ControlCommand::RespondApproval {
+        self.enqueue_control(
+            "respond_approval",
+            ControlCommand::RespondApproval {
                 id,
                 decision,
                 response: tx,
-            })
-            .await
-            .map_err(|_| HarnessError::Transport("background task closed".into()))?;
+            },
+        )
+        .await?;
         rx.await
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
@@ -395,40 +797,43 @@ impl AgentHarness for CodexHarness {
         response_payload: ServerRequestResponse,
     ) -> Result<(), HarnessError> {
         let (tx, rx) = oneshot::channel();
-        self.control_tx
-            .send(ControlCommand::RespondServerRequest {
+        self.enqueue_control(
+            "respond_server_request",
+            ControlCommand::RespondServerRequest {
                 id,
                 response_payload,
                 response: tx,
-            })
-            .await
-            .map_err(|_| HarnessError::Transport("background task closed".into()))?;
+            },
+        )
+        .await?;
         rx.await
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
 
     async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
         let (tx, rx) = oneshot::channel();
-        self.control_tx
-            .send(ControlCommand::Interrupt {
+        self.enqueue_control(
+            "interrupt",
+            ControlCommand::Interrupt {
                 thread: thread.clone(),
                 response: tx,
-            })
-            .await
-            .map_err(|_| HarnessError::Transport("background task closed".into()))?;
+            },
+        )
+        .await?;
         rx.await
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
 
     async fn compact_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
         let (tx, rx) = oneshot::channel();
-        self.control_tx
-            .send(ControlCommand::CompactThread {
+        self.enqueue_control(
+            "compact_thread",
+            ControlCommand::CompactThread {
                 thread: thread.clone(),
                 response: tx,
-            })
-            .await
-            .map_err(|_| HarnessError::Transport("background task closed".into()))?;
+            },
+        )
+        .await?;
         rx.await
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
@@ -439,28 +844,30 @@ impl AgentHarness for CodexHarness {
         process_id: &str,
     ) -> Result<(), HarnessError> {
         let (tx, rx) = oneshot::channel();
-        self.control_tx
-            .send(ControlCommand::TerminateCommand {
+        self.enqueue_control(
+            "terminate_command",
+            ControlCommand::TerminateCommand {
                 thread: thread.clone(),
                 process_id: process_id.to_owned(),
                 response: tx,
-            })
-            .await
-            .map_err(|_| HarnessError::Transport("background task closed".into()))?;
+            },
+        )
+        .await?;
         rx.await
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
 
     async fn set_thread_name(&self, thread: &ThreadHandle, name: &str) -> Result<(), HarnessError> {
         let (tx, rx) = oneshot::channel();
-        self.control_tx
-            .send(ControlCommand::SetThreadName {
+        self.enqueue_control(
+            "set_thread_name",
+            ControlCommand::SetThreadName {
                 thread: thread.clone(),
                 name: name.to_owned(),
                 response: tx,
-            })
-            .await
-            .map_err(|_| HarnessError::Transport("background task closed".into()))?;
+            },
+        )
+        .await?;
         rx.await
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
@@ -471,27 +878,29 @@ impl AgentHarness for CodexHarness {
         archived: bool,
     ) -> Result<(), HarnessError> {
         let (tx, rx) = oneshot::channel();
-        self.control_tx
-            .send(ControlCommand::SetThreadArchived {
+        self.enqueue_control(
+            "set_thread_archived",
+            ControlCommand::SetThreadArchived {
                 thread: thread.clone(),
                 archived,
                 response: tx,
-            })
-            .await
-            .map_err(|_| HarnessError::Transport("background task closed".into()))?;
+            },
+        )
+        .await?;
         rx.await
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
 
     async fn delete_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
         let (tx, rx) = oneshot::channel();
-        self.control_tx
-            .send(ControlCommand::DeleteThread {
+        self.enqueue_control(
+            "delete_thread",
+            ControlCommand::DeleteThread {
                 thread: thread.clone(),
                 response: tx,
-            })
-            .await
-            .map_err(|_| HarnessError::Transport("background task closed".into()))?;
+            },
+        )
+        .await?;
         rx.await
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
@@ -502,8 +911,7 @@ impl AgentHarness for CodexHarness {
         }
         let (tx, rx) = oneshot::channel();
         let _ = self
-            .control_tx
-            .send(ControlCommand::Shutdown { response: tx })
+            .enqueue_control("shutdown", ControlCommand::Shutdown { response: tx })
             .await;
         let _ = rx.await;
         Ok(())
@@ -512,9 +920,10 @@ impl AgentHarness for CodexHarness {
 
 async fn background_task<C>(
     mut client: C,
-    mut cmd_rx: mpsc::Receiver<HarnessCommand>,
-    mut control_rx: mpsc::Receiver<ControlCommand>,
+    mut cmd_rx: mpsc::Receiver<QueuedHarnessCommand>,
+    mut control_rx: mpsc::Receiver<QueuedControlCommand>,
     senders: SenderMap,
+    worker_queue: Arc<WorkerQueueWatchdog>,
     workspace_root: PathBuf,
 ) where
     C: CodexTransport,
@@ -549,7 +958,7 @@ async fn background_task<C>(
                                 );
                             }
                             StreamOutcome::Shutdown => {
-                            let _ = client.shutdown_transport().await;
+                                shutdown_codex_transport(client).await;
                                 break;
                             }
                         }
@@ -598,13 +1007,14 @@ async fn background_task<C>(
                     }
                 }
             }
-            cmd = cmd_rx.recv() => {
-                let cmd = match cmd {
-                    Some(cmd) => cmd,
+            queued = cmd_rx.recv() => {
+                let queued = match queued {
+                    Some(queued) => queued,
                     None => break,
                 };
+                worker_queue.mark_started(queued.token);
 
-                match cmd {
+                match queued.command {
                     HarnessCommand::OpenThread { opts, response } => {
                         let result = handle_open_thread(&mut client, &mut mapper, &opts, &senders).await;
                         let _ = response.send(result);
@@ -633,27 +1043,62 @@ async fn background_task<C>(
                         }
                     }
                 }
+                worker_queue.mark_finished(queued.token);
             }
-            control = control_rx.recv() => {
-                if matches!(
+            queued = control_rx.recv() => {
+                let Some(queued) = queued else {
+                    break;
+                };
+                worker_queue.mark_started(queued.token);
+                let token = queued.token;
+                let outcome =
                     handle_control_command(
                         &mut client,
                         &mut mapper,
                         &senders,
                         &mut pending_compactions,
                         &active_turns,
-                        control,
+                        Some(queued.command),
                     )
-                    .await,
-                    StreamOutcome::Shutdown,
-                ) {
-                    let _ = client.shutdown_transport().await;
+                    .await;
+                worker_queue.mark_finished(token);
+                if matches!(outcome, StreamOutcome::Shutdown) {
+                    shutdown_codex_transport(client).await;
                     break;
                 }
             }
             _ = first_event_warn_tick.tick(), if !active_turns.is_empty() => {
                 warn_slow_first_events(&mut active_turns);
             }
+        }
+    }
+    worker_queue.close();
+}
+
+async fn shutdown_codex_transport<C>(client: C)
+where
+    C: CodexTransport,
+{
+    let started = Instant::now();
+    match tokio::time::timeout(CODEX_SHUTDOWN_TIMEOUT, client.shutdown_transport()).await {
+        Ok(Ok(())) => {
+            info!(
+                elapsed_ms = started.elapsed().as_millis(),
+                "Codex transport shutdown completed"
+            );
+        }
+        Ok(Err(error)) => {
+            warn!(
+                elapsed_ms = started.elapsed().as_millis(),
+                "Codex transport shutdown failed: {error}"
+            );
+        }
+        Err(_) => {
+            warn!(
+                elapsed_ms = started.elapsed().as_millis(),
+                timeout_ms = CODEX_SHUTDOWN_TIMEOUT.as_millis(),
+                "Codex transport shutdown timed out; dropping transport"
+            );
         }
     }
 }
@@ -856,7 +1301,17 @@ async fn handle_control_command(
             StreamOutcome::TurnEnded
         }
         Some(ControlCommand::Interrupt { thread, response }) => {
-            let result = handle_interrupt(client, mapper, &thread).await;
+            let native_turn_id = mapper
+                .active_native_turn_for_thread(thread.thread)
+                .map(str::to_owned);
+            let result = timeout_codex_control(
+                "interrupt",
+                Some(&thread),
+                None,
+                native_turn_id.as_deref(),
+                handle_interrupt(client, mapper, &thread),
+            )
+            .await;
             if result.is_ok() {
                 reject_pending_requests_for_interrupted_thread(
                     client,
@@ -874,7 +1329,18 @@ async fn handle_control_command(
             process_id,
             response,
         }) => {
-            let result = handle_terminate_command(client, mapper, &thread, &process_id).await;
+            let native_turn_id = mapper
+                .native_turn_for_process(thread.thread, &process_id)
+                .or_else(|| mapper.active_native_turn_for_thread(thread.thread))
+                .map(str::to_owned);
+            let result = timeout_codex_control(
+                "terminate_command",
+                Some(&thread),
+                Some(&process_id),
+                native_turn_id.as_deref(),
+                handle_terminate_command(client, mapper, &thread, &process_id),
+            )
+            .await;
             let _ = response.send(result);
             StreamOutcome::TurnEnded
         }
@@ -955,17 +1421,38 @@ async fn handle_control_command(
             StreamOutcome::TurnEnded
         }
         Some(ControlCommand::ListMcpServers { response }) => {
-            let result = handle_list_mcp_servers(client).await;
+            let result = timeout_codex_control(
+                "list_mcp_servers",
+                None,
+                None,
+                None,
+                handle_list_mcp_servers(client),
+            )
+            .await;
             let _ = response.send(result);
             StreamOutcome::TurnEnded
         }
         Some(ControlCommand::ReloadMcpServers { response }) => {
-            let result = handle_reload_mcp_servers(client).await;
+            let result = timeout_codex_control(
+                "reload_mcp_servers",
+                None,
+                None,
+                None,
+                handle_reload_mcp_servers(client),
+            )
+            .await;
             let _ = response.send(result);
             StreamOutcome::TurnEnded
         }
         Some(ControlCommand::StartMcpOauthLogin { name, response }) => {
-            let result = handle_start_mcp_oauth_login(client, &name).await;
+            let result = timeout_codex_control(
+                "start_mcp_oauth_login",
+                None,
+                Some(&name),
+                None,
+                handle_start_mcp_oauth_login(client, &name),
+            )
+            .await;
             let _ = response.send(result);
             StreamOutcome::TurnEnded
         }
@@ -975,6 +1462,30 @@ async fn handle_control_command(
         }
         None => StreamOutcome::Shutdown,
     }
+}
+
+async fn timeout_codex_control<T>(
+    action: &'static str,
+    thread: Option<&ThreadHandle>,
+    process_id: Option<&str>,
+    native_turn_id: Option<&str>,
+    future: impl std::future::Future<Output = Result<T, HarnessError>>,
+) -> Result<T, HarnessError> {
+    let started = Instant::now();
+    let result = future.await;
+    if matches!(result, Err(HarnessError::Timeout(_))) {
+        warn!(
+            thread_id = ?thread.map(|thread| thread.thread),
+            harness_thread_id = ?thread.map(|thread| thread.harness_thread_id.as_str()),
+            action,
+            process_id = ?process_id,
+            native_turn_id = ?native_turn_id,
+            elapsed_ms = started.elapsed().as_millis(),
+            timeout_ms = CODEX_JSON_RPC_TIMEOUT.as_millis(),
+            "Codex control request timed out; worker will resume processing commands"
+        );
+    }
+    result
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1101,13 +1612,17 @@ async fn handle_open_thread(
     senders: &SenderMap,
 ) -> Result<ThreadHandle, HarnessError> {
     let cwd = opts.workspace_root.to_string_lossy().to_string();
+    let thread_id = opts.thread.unwrap_or_default();
 
     // Track whether resume-by-id failed and we fell back to a fresh native thread (C5), so we can
     // warn the caller that agent context was lost while keeping the Giskard-side history.
     let mut resume_warning = None;
 
     let (harness_thread_id, resumed_model) = if let Some(ref resume_id) = opts.resume {
-        match resume_thread(client, resume_id, &cwd, &opts.initial_model).await {
+        let context = CodexOperationContext::for_project("thread_resume", opts.project)
+            .with_thread_id(thread_id)
+            .with_harness_thread_id(resume_id);
+        match resume_thread(client, context, resume_id, &cwd, &opts.initial_model).await {
             Ok(opened) => opened,
             Err(e) => {
                 // C5: Codex thread store purged/rotated. Start fresh instead of hard-failing.
@@ -1118,14 +1633,20 @@ async fn handle_open_thread(
                             .into(),
                     detail: Some(e.to_string()),
                 });
-                start_thread(client, &cwd, &opts.initial_model).await?
+                let context = CodexOperationContext::for_project(
+                    "thread_start_after_resume_failed",
+                    opts.project,
+                )
+                .with_thread_id(thread_id);
+                start_thread(client, context, &cwd, &opts.initial_model).await?
             }
         }
     } else {
-        start_thread(client, &cwd, &opts.initial_model).await?
+        let context = CodexOperationContext::for_project("thread_start", opts.project)
+            .with_thread_id(thread_id);
+        start_thread(client, context, &cwd, &opts.initial_model).await?
     };
 
-    let thread_id = opts.thread.unwrap_or_default();
     // B4: bind the (possibly re-established) native id to the durable ThreadId.
     mapper.register_thread(harness_thread_id.clone(), thread_id);
 
@@ -1178,6 +1699,7 @@ fn effective_model(
 
 async fn resume_thread(
     client: &mut dyn CodexTransport,
+    context: CodexOperationContext<'_>,
     resume_id: &str,
     cwd: &str,
     model: &giskard_core::model::ModelRef,
@@ -1191,6 +1713,7 @@ async fn resume_thread(
     .map_err(|e| HarnessError::Protocol(e.to_string()))?;
     let resp: codex_codes::ThreadResumeResponse = codex_request(
         client,
+        context,
         codex_codes::protocol::methods::THREAD_RESUME,
         &params,
     )
@@ -1201,6 +1724,7 @@ async fn resume_thread(
 
 async fn start_thread(
     client: &mut dyn CodexTransport,
+    context: CodexOperationContext<'_>,
     cwd: &str,
     initial_model: &giskard_core::model::ModelRef,
 ) -> Result<(String, Option<giskard_core::model::ModelRef>), HarnessError> {
@@ -1212,6 +1736,7 @@ async fn start_thread(
     .map_err(|e| HarnessError::Protocol(e.to_string()))?;
     let resp: codex_codes::ThreadStartResponse = codex_request(
         client,
+        context,
         codex_codes::protocol::methods::THREAD_START,
         &params,
     )
@@ -1228,8 +1753,13 @@ async fn handle_start_turn(
     overrides: &TurnOverrides,
 ) -> Result<TurnId, HarnessError> {
     let params = build_turn_start_params(thread, input, overrides)?;
-    let resp: codex_codes::TurnStartResponse =
-        codex_request(client, codex_codes::protocol::methods::TURN_START, &params).await?;
+    let resp: codex_codes::TurnStartResponse = codex_request(
+        client,
+        CodexOperationContext::for_thread("turn_start", thread),
+        codex_codes::protocol::methods::TURN_START,
+        &params,
+    )
+    .await?;
 
     mapper
         .register_active_turn(thread.thread, &resp.turn.id)
@@ -1324,7 +1854,10 @@ async fn respond_unroutable_server_request(
     id: &codex_codes::jsonrpc::RequestId,
 ) {
     let message = "Giskard cannot route this Codex server request to a known thread.";
-    if let Err(error) = client.respond_error_json(id.clone(), -32000, message).await {
+    let context =
+        CodexOperationContext::new("reject_unroutable_server_request").with_request_id(id);
+    if let Err(error) = codex_respond_error_json(client, context, id.clone(), -32000, message).await
+    {
         warn!(%id, %error, "failed to reject unroutable Codex server request");
     } else {
         warn!(%id, "rejected unroutable Codex server request");
@@ -1464,18 +1997,40 @@ async fn handle_respond_approval(
         .map_approval_response(id, decision)
         .map_err(HarnessError::Protocol)?
     {
-        mapping::ApprovalResponse::Result { request_id, value } => client
-            .respond_json(request_id, value)
+        mapping::ApprovalResponse::Result {
+            request_id,
+            owner,
+            value,
+        } => {
+            codex_respond_json(
+                client,
+                CodexOperationContext::new("respond_approval")
+                    .with_thread_id(owner.thread)
+                    .with_giskard_turn_id(owner.turn)
+                    .with_request_id(&request_id),
+                request_id.clone(),
+                value,
+            )
             .await
-            .map_err(|e| HarnessError::Transport(e.to_string())),
+        }
         mapping::ApprovalResponse::Error {
             request_id,
+            owner,
             code,
             message,
-        } => client
-            .respond_error_json(request_id, code, &message)
+        } => {
+            codex_respond_error_json(
+                client,
+                CodexOperationContext::new("respond_approval")
+                    .with_thread_id(owner.thread)
+                    .with_giskard_turn_id(owner.turn)
+                    .with_request_id(&request_id),
+                request_id.clone(),
+                code,
+                &message,
+            )
             .await
-            .map_err(|e| HarnessError::Transport(e.to_string())),
+        }
     }
 }
 
@@ -1489,15 +2044,17 @@ async fn handle_respond_server_request(
     let pending = mapper
         .pending_server_request(id)
         .map_err(HarnessError::Protocol)?;
+    let request_id = pending.request_id.clone();
+    let context = CodexOperationContext::new("respond_server_request")
+        .with_thread_id(pending.thread)
+        .with_request_id(&request_id);
     match response {
-        ServerRequestResponse::Result { value } => client
-            .respond_json(pending.request_id, value)
-            .await
-            .map_err(|e| HarnessError::Transport(e.to_string()))?,
-        ServerRequestResponse::Error { code, message } => client
-            .respond_error_json(pending.request_id, code, &message)
-            .await
-            .map_err(|e| HarnessError::Transport(e.to_string()))?,
+        ServerRequestResponse::Result { value } => {
+            codex_respond_json(client, context, request_id.clone(), value).await?
+        }
+        ServerRequestResponse::Error { code, message } => {
+            codex_respond_error_json(client, context, request_id.clone(), code, &message).await?
+        }
     }
     mapper.resolve_server_request(id);
     let thread = pending.thread;
@@ -1569,7 +2126,13 @@ async fn handle_interrupt(
     let native_turn_id = mapper
         .active_native_turn_for_thread(thread.thread)
         .ok_or_else(|| HarnessError::Unsupported("no active Codex turn to interrupt".into()))?;
-    handle_interrupt_turn(client, &thread.harness_thread_id, native_turn_id).await
+    handle_interrupt_turn(
+        client,
+        CodexOperationContext::for_thread("interrupt", thread).with_native_turn_id(native_turn_id),
+        &thread.harness_thread_id,
+        native_turn_id,
+    )
+    .await
 }
 
 async fn handle_terminate_command(
@@ -1586,7 +2149,15 @@ async fn handle_terminate_command(
                 "Codex has no active turn for command process {process_id}"
             ))
         })?;
-    handle_interrupt_turn(client, &thread.harness_thread_id, native_turn_id).await
+    handle_interrupt_turn(
+        client,
+        CodexOperationContext::for_thread("terminate_command", thread)
+            .with_native_turn_id(native_turn_id)
+            .with_process_id(process_id),
+        &thread.harness_thread_id,
+        native_turn_id,
+    )
+    .await
 }
 
 async fn handle_compact_thread(
@@ -1598,6 +2169,7 @@ async fn handle_compact_thread(
     };
     let _: codex_codes::ThreadCompactStartResponse = codex_request(
         client,
+        CodexOperationContext::for_thread("compact_thread", thread),
         codex_codes::protocol::methods::THREAD_COMPACT_START,
         &params,
     )
@@ -1616,6 +2188,7 @@ async fn handle_set_thread_archived(
         };
         let _: codex_codes::ThreadArchiveResponse = codex_request(
             client,
+            CodexOperationContext::for_thread("archive_thread", thread),
             codex_codes::protocol::methods::THREAD_ARCHIVE,
             &params,
         )
@@ -1626,6 +2199,7 @@ async fn handle_set_thread_archived(
         };
         let _: codex_codes::ThreadUnarchiveResponse = codex_request(
             client,
+            CodexOperationContext::for_thread("unarchive_thread", thread),
             codex_codes::protocol::methods::THREAD_UNARCHIVE,
             &params,
         )
@@ -1645,6 +2219,7 @@ async fn handle_set_thread_name(
     };
     let _: codex_codes::ThreadSetNameResponse = codex_request(
         client,
+        CodexOperationContext::for_thread("set_thread_name", thread),
         codex_codes::protocol::methods::THREAD_NAME_SET,
         &params,
     )
@@ -1667,6 +2242,7 @@ async fn handle_list_mcp_servers(
         };
         let page: codex_codes::ListMcpServerStatusResponse = codex_request(
             client,
+            CodexOperationContext::new("list_mcp_servers"),
             codex_codes::protocol::methods::MCPSERVERSTATUS_LIST,
             &params,
         )
@@ -1685,6 +2261,7 @@ async fn handle_list_mcp_servers(
 async fn handle_reload_mcp_servers(client: &mut dyn CodexTransport) -> Result<(), HarnessError> {
     let _: codex_codes::McpServerRefreshResponse = codex_request(
         client,
+        CodexOperationContext::new("reload_mcp_servers"),
         codex_codes::protocol::methods::CONFIG_MCPSERVER_RELOAD,
         &serde_json::json!({}),
     )
@@ -1704,6 +2281,7 @@ async fn handle_start_mcp_oauth_login(
     };
     let response: codex_codes::McpServerOauthLoginResponse = codex_request(
         client,
+        CodexOperationContext::new("start_mcp_oauth_login").with_server(name),
         codex_codes::protocol::methods::MCPSERVER_OAUTH_LOGIN,
         &params,
     )
@@ -1787,6 +2365,7 @@ async fn handle_delete_thread(
     };
     let _: codex_codes::ThreadDeleteResponse = codex_request(
         client,
+        CodexOperationContext::for_thread("delete_thread", thread),
         codex_codes::protocol::methods::THREAD_DELETE,
         &params,
     )
@@ -1796,6 +2375,7 @@ async fn handle_delete_thread(
 
 async fn handle_interrupt_turn(
     client: &mut dyn CodexTransport,
+    context: CodexOperationContext<'_>,
     native_thread_id: &str,
     native_turn_id: &str,
 ) -> Result<(), HarnessError> {
@@ -1805,6 +2385,7 @@ async fn handle_interrupt_turn(
     };
     let _: codex_codes::TurnInterruptResponse = codex_request(
         client,
+        context,
         codex_codes::protocol::methods::TURN_INTERRUPT,
         &params,
     )
@@ -1816,11 +2397,12 @@ async fn handle_interrupt_turn(
 mod tests {
     use super::*;
     use chrono::Utc;
-    use giskard_core::ids::{ItemId, ProjectId};
+    use giskard_core::ids::ItemId;
     use giskard_core::item::{Item, ItemPayload};
     use giskard_core::model::{Effort, ModelRef};
     use giskard_core::turn::{ApprovalPolicy, Mode};
     use serde_json::{Value, json};
+    use std::collections::HashSet;
     use tokio::sync::Mutex;
     use tokio::time::timeout;
 
@@ -1878,6 +2460,9 @@ mod tests {
     struct FakeCodexState {
         thread_counter: usize,
         turn_counter: usize,
+        hang_methods: HashSet<String>,
+        hang_response_json: bool,
+        hang_shutdown: bool,
         requests: Vec<FakeRequest>,
         responses: Vec<FakeResponse>,
         response_errors: Vec<FakeResponseError>,
@@ -1919,6 +2504,26 @@ mod tests {
         async fn started_turns(&self) -> Vec<FakeStartedTurn> {
             self.state.lock().await.started_turns.clone()
         }
+
+        async fn shutdowns(&self) -> usize {
+            self.state.lock().await.shutdowns
+        }
+
+        async fn hang_method(&self, method: &'static str) {
+            self.state.lock().await.hang_methods.insert(method.into());
+        }
+
+        async fn resume_method(&self, method: &'static str) {
+            self.state.lock().await.hang_methods.remove(method);
+        }
+
+        async fn hang_json_responses(&self) {
+            self.state.lock().await.hang_response_json = true;
+        }
+
+        async fn hang_shutdown(&self) {
+            self.state.lock().await.hang_shutdown = true;
+        }
     }
 
     fn fake_codex() -> (FakeCodexTransport, FakeCodexController) {
@@ -1946,60 +2551,65 @@ mod tests {
                 params: params.clone(),
             });
 
-            match method {
-                codex_codes::protocol::methods::THREAD_START => {
-                    state.thread_counter += 1;
-                    let native_thread_id = format!("native-thread-{}", state.thread_counter);
-                    Ok(thread_open_response(
-                        &native_thread_id,
-                        params["model"].as_str().unwrap_or("gpt-5.5"),
-                        params["modelProvider"].as_str().unwrap_or("openai"),
-                    ))
+            if state.hang_methods.contains(method) {
+                drop(state);
+                std::future::pending().await
+            } else {
+                match method {
+                    codex_codes::protocol::methods::THREAD_START => {
+                        state.thread_counter += 1;
+                        let native_thread_id = format!("native-thread-{}", state.thread_counter);
+                        Ok(thread_open_response(
+                            &native_thread_id,
+                            params["model"].as_str().unwrap_or("gpt-5.5"),
+                            params["modelProvider"].as_str().unwrap_or("openai"),
+                        ))
+                    }
+                    codex_codes::protocol::methods::THREAD_RESUME => {
+                        let native_thread_id = params["threadId"]
+                            .as_str()
+                            .filter(|id| !id.is_empty())
+                            .unwrap_or("native-resumed");
+                        Ok(thread_open_response(
+                            native_thread_id,
+                            params["model"].as_str().unwrap_or("gpt-5.5"),
+                            params["modelProvider"].as_str().unwrap_or("openai"),
+                        ))
+                    }
+                    codex_codes::protocol::methods::TURN_START => {
+                        state.turn_counter += 1;
+                        let native_thread_id =
+                            params["threadId"].as_str().unwrap_or_default().to_owned();
+                        let native_turn_id = format!("native-turn-{}", state.turn_counter);
+                        state.started_turns.push(FakeStartedTurn {
+                            native_thread_id,
+                            native_turn_id: native_turn_id.clone(),
+                        });
+                        Ok(json!({
+                            "turn": {
+                                "id": native_turn_id,
+                                "status": "inProgress"
+                            }
+                        }))
+                    }
+                    codex_codes::protocol::methods::THREAD_COMPACT_START
+                    | codex_codes::protocol::methods::THREAD_ARCHIVE
+                    | codex_codes::protocol::methods::THREAD_UNARCHIVE
+                    | codex_codes::protocol::methods::THREAD_NAME_SET
+                    | codex_codes::protocol::methods::CONFIG_MCPSERVER_RELOAD
+                    | codex_codes::protocol::methods::THREAD_DELETE
+                    | codex_codes::protocol::methods::TURN_INTERRUPT => Ok(json!({})),
+                    codex_codes::protocol::methods::MCPSERVERSTATUS_LIST => Ok(json!({
+                        "data": [],
+                        "nextCursor": null
+                    })),
+                    codex_codes::protocol::methods::MCPSERVER_OAUTH_LOGIN => Ok(json!({
+                        "authorizationUrl": "https://example.invalid/oauth"
+                    })),
+                    other => Err(HarnessError::Unsupported(format!(
+                        "fake Codex transport has no response for {other}"
+                    ))),
                 }
-                codex_codes::protocol::methods::THREAD_RESUME => {
-                    let native_thread_id = params["threadId"]
-                        .as_str()
-                        .filter(|id| !id.is_empty())
-                        .unwrap_or("native-resumed");
-                    Ok(thread_open_response(
-                        native_thread_id,
-                        params["model"].as_str().unwrap_or("gpt-5.5"),
-                        params["modelProvider"].as_str().unwrap_or("openai"),
-                    ))
-                }
-                codex_codes::protocol::methods::TURN_START => {
-                    state.turn_counter += 1;
-                    let native_thread_id =
-                        params["threadId"].as_str().unwrap_or_default().to_owned();
-                    let native_turn_id = format!("native-turn-{}", state.turn_counter);
-                    state.started_turns.push(FakeStartedTurn {
-                        native_thread_id,
-                        native_turn_id: native_turn_id.clone(),
-                    });
-                    Ok(json!({
-                        "turn": {
-                            "id": native_turn_id,
-                            "status": "inProgress"
-                        }
-                    }))
-                }
-                codex_codes::protocol::methods::THREAD_COMPACT_START
-                | codex_codes::protocol::methods::THREAD_ARCHIVE
-                | codex_codes::protocol::methods::THREAD_UNARCHIVE
-                | codex_codes::protocol::methods::THREAD_NAME_SET
-                | codex_codes::protocol::methods::CONFIG_MCPSERVER_RELOAD
-                | codex_codes::protocol::methods::THREAD_DELETE
-                | codex_codes::protocol::methods::TURN_INTERRUPT => Ok(json!({})),
-                codex_codes::protocol::methods::MCPSERVERSTATUS_LIST => Ok(json!({
-                    "data": [],
-                    "nextCursor": null
-                })),
-                codex_codes::protocol::methods::MCPSERVER_OAUTH_LOGIN => Ok(json!({
-                    "authorizationUrl": "https://example.invalid/oauth"
-                })),
-                other => Err(HarnessError::Unsupported(format!(
-                    "fake Codex transport has no response for {other}"
-                ))),
             }
         }
 
@@ -2014,12 +2624,14 @@ mod tests {
             id: codex_codes::jsonrpc::RequestId,
             value: Value,
         ) -> Result<(), HarnessError> {
-            self.state
-                .lock()
-                .await
-                .responses
-                .push(FakeResponse { id, value });
-            Ok(())
+            let mut state = self.state.lock().await;
+            if state.hang_response_json {
+                drop(state);
+                std::future::pending().await
+            } else {
+                state.responses.push(FakeResponse { id, value });
+                Ok(())
+            }
         }
 
         async fn respond_error_json(
@@ -2041,7 +2653,12 @@ mod tests {
         }
 
         async fn shutdown_transport(self) -> Result<(), HarnessError> {
-            self.state.lock().await.shutdowns += 1;
+            let mut state = self.state.lock().await;
+            state.shutdowns += 1;
+            if state.hang_shutdown {
+                drop(state);
+                std::future::pending().await
+            }
             Ok(())
         }
     }
@@ -2671,6 +3288,137 @@ mod tests {
             response.id == codex_codes::jsonrpc::RequestId::String("second_server_req".into())
                 && response.value == json!({"still": "routable"})
         }));
+    }
+
+    #[tokio::test]
+    async fn codex_worker_recovers_after_hung_interrupt_request() {
+        let (harness, controller) = spawn_fake_harness();
+        controller
+            .hang_method(codex_codes::protocol::methods::TURN_INTERRUPT)
+            .await;
+        let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
+        harness
+            .start_turn(&thread, UserInput::text("first"), build_turn_overrides())
+            .await
+            .unwrap();
+
+        let err = timeout(Duration::from_secs(1), harness.interrupt(&thread))
+            .await
+            .expect("worker-side timeout should answer the harness caller")
+            .expect_err("hung interrupt should return a timeout");
+        assert!(matches!(err, HarnessError::Timeout(_)));
+
+        timeout(
+            Duration::from_secs(1),
+            harness.start_turn(&thread, UserInput::text("second"), build_turn_overrides()),
+        )
+        .await
+        .expect("worker must keep processing commands after a hung interrupt")
+        .unwrap();
+
+        assert_eq!(controller.started_turns().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn codex_worker_recovers_after_hung_turn_start_request() {
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
+        controller
+            .hang_method(codex_codes::protocol::methods::TURN_START)
+            .await;
+
+        let err = timeout(
+            Duration::from_secs(1),
+            harness.start_turn(&thread, UserInput::text("first"), build_turn_overrides()),
+        )
+        .await
+        .expect("worker-side timeout should answer the start-turn caller")
+        .expect_err("hung turn/start should return a timeout");
+        assert!(matches!(err, HarnessError::Timeout(_)));
+
+        controller
+            .resume_method(codex_codes::protocol::methods::TURN_START)
+            .await;
+        timeout(
+            Duration::from_secs(1),
+            harness.start_turn(&thread, UserInput::text("second"), build_turn_overrides()),
+        )
+        .await
+        .expect("worker must keep processing commands after a hung turn/start")
+        .unwrap();
+
+        assert_eq!(controller.started_turns().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn codex_worker_recovers_after_hung_approval_response() {
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
+        harness
+            .start_turn(
+                &thread,
+                UserInput::text("needs approval"),
+                build_turn_overrides(),
+            )
+            .await
+            .unwrap();
+        let native_turn = controller.started_turns().await[0].native_turn_id.clone();
+        let mut stream = harness.subscribe(&thread);
+
+        controller
+            .send_server_message(command_approval_request(
+                "approval_req",
+                &thread.harness_thread_id,
+                &native_turn,
+            ))
+            .await;
+        recv_matching_event(&mut stream, "approval request", |event| {
+            matches!(
+                event,
+                AgentEvent::ApprovalRequested { request, .. }
+                    if request.id == ApprovalId("approval_req".into())
+            )
+        })
+        .await;
+
+        controller.hang_json_responses().await;
+        let err = timeout(
+            Duration::from_secs(1),
+            harness.respond_approval(ApprovalId("approval_req".into()), ApprovalDecision::Accept),
+        )
+        .await
+        .expect("worker-side timeout should answer the approval caller")
+        .expect_err("hung approval response should return a timeout");
+        assert!(matches!(err, HarnessError::Timeout(_)));
+
+        timeout(
+            Duration::from_secs(1),
+            harness.open_thread(open_opts(None, None)),
+        )
+        .await
+        .expect("worker must keep processing commands after a hung approval response")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_worker_drops_transport_after_hung_shutdown() {
+        let (harness, controller) = spawn_fake_harness();
+        controller.hang_shutdown().await;
+
+        timeout(Duration::from_secs(1), harness.shutdown())
+            .await
+            .expect("shutdown command should be acknowledged before transport shutdown")
+            .unwrap();
+        assert_eq!(controller.shutdowns().await, 1);
+
+        let err = timeout(
+            Duration::from_secs(1),
+            harness.open_thread(open_opts(None, None)),
+        )
+        .await
+        .expect("bounded shutdown should eventually drop the worker receiver")
+        .expect_err("worker should be closed after shutdown");
+        assert!(matches!(err, HarnessError::Transport(_)));
     }
 
     #[test]

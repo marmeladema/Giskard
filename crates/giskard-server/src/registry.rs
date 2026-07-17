@@ -69,16 +69,74 @@ struct ThreadBinding {
 
 #[derive(Clone, Default)]
 struct ThreadTurnGate {
-    active: Arc<StdMutex<HashSet<ThreadId>>>,
+    active: Arc<StdMutex<HashMap<ThreadId, ActiveTurnOwner>>>,
+}
+
+#[derive(Clone)]
+struct ActiveTurnOwner {
+    project_id: ProjectId,
+    acknowledged_turn: Option<TurnId>,
+    harness_thread_id: String,
+    mode: Mode,
+    provider: String,
+    model: String,
+    context_kind: &'static str,
+    reserved_at: Instant,
+}
+
+impl ActiveTurnOwner {
+    fn new(project_id: ProjectId, handle: &ThreadHandle, ctx: &TurnContext) -> Self {
+        Self {
+            project_id,
+            acknowledged_turn: None,
+            harness_thread_id: handle.harness_thread_id.clone(),
+            mode: ctx.mode,
+            provider: ctx.model.provider.clone(),
+            model: ctx.model.model.clone(),
+            context_kind: turn_context_kind_label(ctx.kind),
+            reserved_at: Instant::now(),
+        }
+    }
 }
 
 impl ThreadTurnGate {
-    fn reserve(&self, thread_id: ThreadId) -> Result<ThreadTurnLease, HarnessError> {
+    fn reserve(
+        &self,
+        thread_id: ThreadId,
+        owner: ActiveTurnOwner,
+    ) -> Result<ThreadTurnLease, HarnessError> {
         let mut active = self.active_threads();
-        if !active.insert(thread_id) {
+        if let Some(existing) = active.get(&thread_id) {
+            warn!(
+                %thread_id,
+                owner_project_id = %existing.project_id,
+                owner_turn_id = ?existing.acknowledged_turn,
+                owner_harness_thread_id = %existing.harness_thread_id,
+                owner_context_kind = existing.context_kind,
+                owner_mode = ?existing.mode,
+                owner_provider = %existing.provider,
+                owner_model = %existing.model,
+                owner_elapsed_ms = existing.reserved_at.elapsed().as_millis(),
+                rejected_project_id = %owner.project_id,
+                rejected_context_kind = owner.context_kind,
+                rejected_mode = ?owner.mode,
+                rejected_provider = %owner.provider,
+                rejected_model = %owner.model,
+                "rejecting turn start because thread turn gate is already active"
+            );
             return Err(HarnessError::ThreadBusy { thread: thread_id });
         }
-        debug!(%thread_id, "reserved active thread turn");
+        debug!(
+            %thread_id,
+            project_id = %owner.project_id,
+            harness_thread_id = %owner.harness_thread_id,
+            context_kind = owner.context_kind,
+            mode = ?owner.mode,
+            provider = %owner.provider,
+            model = %owner.model,
+            "reserved active thread turn"
+        );
+        active.insert(thread_id, owner);
         Ok(ThreadTurnLease {
             gate: self.clone(),
             thread_id,
@@ -86,7 +144,7 @@ impl ThreadTurnGate {
         })
     }
 
-    fn active_threads(&self) -> StdMutexGuard<'_, HashSet<ThreadId>> {
+    fn active_threads(&self) -> StdMutexGuard<'_, HashMap<ThreadId, ActiveTurnOwner>> {
         match self.active.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -96,15 +154,55 @@ impl ThreadTurnGate {
         }
     }
 
-    fn release(&self, thread_id: ThreadId) {
+    fn acknowledge_turn(&self, thread_id: ThreadId, turn_id: TurnId) {
         let mut active = self.active_threads();
-        if active.remove(&thread_id) {
-            debug!(%thread_id, "released active thread turn");
+        let Some(owner) = active.get_mut(&thread_id) else {
+            warn!(
+                %thread_id,
+                %turn_id,
+                "turn acknowledgement observed but no active turn gate owner was registered"
+            );
+            return;
+        };
+        owner.acknowledged_turn = Some(turn_id);
+        debug!(
+            %thread_id,
+            %turn_id,
+            project_id = %owner.project_id,
+            harness_thread_id = %owner.harness_thread_id,
+            context_kind = owner.context_kind,
+            elapsed_ms = owner.reserved_at.elapsed().as_millis(),
+            "recorded active turn owner"
+        );
+    }
+
+    fn release(&self, thread_id: ThreadId) -> Option<ActiveTurnOwner> {
+        let mut active = self.active_threads();
+        let owner = active.remove(&thread_id);
+        if let Some(owner) = &owner {
+            debug!(
+                %thread_id,
+                project_id = %owner.project_id,
+                turn_id = ?owner.acknowledged_turn,
+                harness_thread_id = %owner.harness_thread_id,
+                context_kind = owner.context_kind,
+                mode = ?owner.mode,
+                provider = %owner.provider,
+                model = %owner.model,
+                elapsed_ms = owner.reserved_at.elapsed().as_millis(),
+                "released active thread turn"
+            );
+        } else {
+            warn!(
+                %thread_id,
+                "active thread turn release requested but no owner was registered"
+            );
         }
+        owner
     }
 
     fn is_active(&self, thread_id: ThreadId) -> bool {
-        self.active_threads().contains(&thread_id)
+        self.active_threads().contains_key(&thread_id)
     }
 }
 
@@ -115,6 +213,18 @@ struct ThreadTurnLease {
 }
 
 impl ThreadTurnLease {
+    fn acknowledge_turn(&mut self, turn_id: TurnId) {
+        if self.released {
+            warn!(
+                thread_id = %self.thread_id,
+                %turn_id,
+                "attempted to acknowledge turn after active turn gate was released"
+            );
+            return;
+        }
+        self.gate.acknowledge_turn(self.thread_id, turn_id);
+    }
+
     fn release(&mut self) {
         if self.released {
             return;
@@ -278,14 +388,16 @@ impl HarnessRegistry {
             .clone();
         drop(harnesses);
 
-        let request_started = Instant::now();
-        let turn_gate = self.turn_gate.reserve(thread_id)?;
         let ctx = TurnContext {
             user_input: input.clone(),
             model: effective_model,
             mode: overrides.mode,
             kind: TurnContextKind::User,
         };
+        let request_started = Instant::now();
+        let mut turn_gate = self
+            .turn_gate
+            .reserve(thread_id, ActiveTurnOwner::new(project_id, &handle, &ctx))?;
 
         let hub = self.hub.clone();
         let live_buffers = self.live_buffers.clone();
@@ -309,6 +421,7 @@ impl HarnessRegistry {
                     ack_elapsed_ms = request_started.elapsed().as_millis(),
                     "harness accepted turn start request"
                 );
+                turn_gate.acknowledge_turn(turn_id);
                 turn_id
             }
             Err(error) => {
@@ -434,7 +547,32 @@ impl HarnessRegistry {
             .get(&project_id)
             .cloned()
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
-        harness.interrupt(&handle).await
+        let started = Instant::now();
+        info!(
+            %project_id,
+            %thread_id,
+            harness_thread_id = %handle.harness_thread_id,
+            "sending interrupt request to harness"
+        );
+        let result = harness.interrupt(&handle).await;
+        match &result {
+            Ok(()) => info!(
+                %project_id,
+                %thread_id,
+                harness_thread_id = %handle.harness_thread_id,
+                elapsed_ms = started.elapsed().as_millis(),
+                "harness interrupt request completed"
+            ),
+            Err(error) => warn!(
+                %project_id,
+                %thread_id,
+                harness_thread_id = %handle.harness_thread_id,
+                elapsed_ms = started.elapsed().as_millis(),
+                %error,
+                "harness interrupt request failed"
+            ),
+        }
+        result
     }
 
     pub async fn compact_thread(
@@ -469,13 +607,15 @@ impl HarnessRegistry {
             mode = ?mode,
             "starting context compaction"
         );
-        let turn_gate = self.turn_gate.reserve(thread_id)?;
         let ctx = TurnContext {
             user_input: UserInput::text("/compact"),
             model: effective_model,
             mode,
             kind: TurnContextKind::ManualCompaction,
         };
+        let turn_gate = self
+            .turn_gate
+            .reserve(thread_id, ActiveTurnOwner::new(project_id, &handle, &ctx))?;
 
         let hub = self.hub.clone();
         let live_buffers = self.live_buffers.clone();
@@ -535,7 +675,35 @@ impl HarnessRegistry {
             .get(&project_id)
             .cloned()
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
-        harness.terminate_command(&handle, &process_id).await
+        let started = Instant::now();
+        info!(
+            %project_id,
+            %thread_id,
+            harness_thread_id = %handle.harness_thread_id,
+            process_id = %process_id,
+            "sending terminate command request to harness"
+        );
+        let result = harness.terminate_command(&handle, &process_id).await;
+        match &result {
+            Ok(()) => info!(
+                %project_id,
+                %thread_id,
+                harness_thread_id = %handle.harness_thread_id,
+                process_id = %process_id,
+                elapsed_ms = started.elapsed().as_millis(),
+                "harness terminate command request completed"
+            ),
+            Err(error) => warn!(
+                %project_id,
+                %thread_id,
+                harness_thread_id = %handle.harness_thread_id,
+                process_id = %process_id,
+                elapsed_ms = started.elapsed().as_millis(),
+                %error,
+                "harness terminate command request failed"
+            ),
+        }
+        result
     }
 
     pub async fn set_thread_archived(
@@ -787,7 +955,7 @@ async fn forward_events(
                 if let Some(turn) = event_turn {
                     if seen_turn_ids.contains(&turn) {
                         let command_state_changed =
-                            apply_running_command_event(&running_commands, &event).await;
+                            apply_seen_turn_running_command_event(&running_commands, &event).await;
                         if command_state_changed {
                             if is_terminal_command_completion(&event) {
                                 hub.broadcast_event(thread_id, event).await;
@@ -892,6 +1060,9 @@ async fn forward_events(
                     AgentEvent::TurnStarted { turn, .. } => {
                         turn_id = Some(*turn);
                         started_at = Utc::now();
+                        if let Some(turn_gate) = turn_gate.as_mut() {
+                            turn_gate.acknowledge_turn(*turn);
+                        }
                         if ctx.kind == TurnContextKind::ManualCompaction {
                             info!(
                                 %project_id,
@@ -974,6 +1145,18 @@ async fn forward_events(
                 }
 
                 if let Some((completed_turn, usage, status)) = completed {
+                    info!(
+                        %project_id,
+                        %thread_id,
+                        turn = %completed_turn,
+                        started_turn = ?turn_id,
+                        status = ?status.kind,
+                        context_kind = turn_context_kind_label(ctx.kind),
+                        items_buffered = items.len(),
+                        diffs_buffered = diffs.len(),
+                        elapsed_ms = forwarder_started.elapsed().as_millis(),
+                        "turn completion event received"
+                    );
                     if ctx.kind == TurnContextKind::ManualCompaction {
                         info!(
                             %project_id,
@@ -1153,6 +1336,7 @@ async fn complete_forwarded_turn(
     let tid = turn_id.unwrap_or(completed_turn);
     seen_turn_ids.insert(tid);
     let item_count = items.len();
+    let diff_count = diffs.len();
     let has_context_compaction_marker = items.iter().any(is_context_compaction_item);
     if ctx.kind == TurnContextKind::ManualCompaction {
         info!(
@@ -1173,13 +1357,13 @@ async fn complete_forwarded_turn(
         items: std::mem::take(items),
         model: ctx.model.clone(),
         mode: ctx.mode,
-        status,
+        status: status.clone(),
         usage,
         diffs: std::mem::take(diffs),
         started_at,
         completed_at: Some(Utc::now()),
     };
-    persist_turn(store, hub, ledger, project_id, thread_id, turn).await;
+    let persist_outcome = persist_turn(store, hub, ledger, project_id, thread_id, turn).await;
     if ctx.kind == TurnContextKind::ManualCompaction {
         info!(
             %project_id,
@@ -1187,6 +1371,8 @@ async fn complete_forwarded_turn(
             turn = %tid,
             item_count,
             has_context_compaction_marker,
+            history_appended = persist_outcome.history_appended,
+            metadata_updated = persist_outcome.metadata_updated,
             "context compaction persistence path finished"
         );
     }
@@ -1194,6 +1380,19 @@ async fn complete_forwarded_turn(
     if let Some(turn_gate) = turn_gate {
         turn_gate.release();
     }
+    info!(
+        %project_id,
+        %thread_id,
+        turn = %tid,
+        completed_turn = %completed_turn,
+        status = ?status.kind,
+        context_kind = turn_context_kind_label(ctx.kind),
+        item_count,
+        diff_count,
+        history_appended = persist_outcome.history_appended,
+        metadata_updated = persist_outcome.metadata_updated,
+        "completed turn cleanup finished"
+    );
     tid
 }
 
@@ -1415,6 +1614,40 @@ async fn apply_running_command_event(
     changed
 }
 
+async fn apply_seen_turn_running_command_event(
+    running_commands: &RunningTaskStore,
+    event: &AgentEvent,
+) -> bool {
+    if !is_terminal_command_completion(event) {
+        log_ignored_seen_turn_running_task_start(event);
+        return false;
+    }
+    apply_running_command_event(running_commands, event).await
+}
+
+fn log_ignored_seen_turn_running_task_start(event: &AgentEvent) {
+    let AgentEvent::ItemStarted { thread, turn, item } = event else {
+        return;
+    };
+    let Some(command) = &item.command else {
+        return;
+    };
+    let status = command.status.as_deref().unwrap_or("in_progress");
+    if !command_status_is_running(status) {
+        return;
+    }
+    warn!(
+        thread_id = %thread,
+        turn_id = %turn,
+        item_id = %item.id,
+        harness_item_id = %item.harness_item_id,
+        process_id = ?command.process_id,
+        command = %command.command,
+        status,
+        "ignoring running command start for already-persisted turn"
+    );
+}
+
 async fn terminating_command_before_terminal_completion(
     running_commands: &RunningTaskStore,
     event: &AgentEvent,
@@ -1584,6 +1817,12 @@ async fn persisted_harness_item_ids(
 /// Append a completed `Turn` to the thread file, fold its usage into the thread ledger, recompute
 /// the cached context window, persist atomically (§7.1), and hand the usage delta to the global +
 /// project ledger actor (§10.2). Best-effort: logs on failure.
+#[derive(Clone, Copy, Debug, Default)]
+struct PersistTurnOutcome {
+    history_appended: bool,
+    metadata_updated: bool,
+}
+
 async fn persist_turn(
     store: &PersistStore,
     hub: &Hub,
@@ -1591,7 +1830,7 @@ async fn persist_turn(
     project_id: ProjectId,
     thread_id: ThreadId,
     turn: Turn,
-) {
+) -> PersistTurnOutcome {
     // C4: recompute the cached context window from the current model on write.
     let config = match store.load_config().await {
         Ok(config) => Some(config),
@@ -1615,14 +1854,40 @@ async fn persist_turn(
     let provider = turn.model.provider.clone();
     let model = turn.model.model.clone();
     let usage = turn.usage;
+    let turn_id = turn.id;
+    let item_count = turn.items.len();
+    let diff_count = turn.diffs.len();
+    let status_kind = turn.status.kind;
+    let started_at = turn.started_at;
+    let completed_at = turn.completed_at;
 
     // H3 ordering: append the turn to the authoritative JSONL history FIRST, then update the
     // metadata aggregates. A crash between the two leaves the turn in history but not yet in the
     // aggregates cache — recoverable via `recompute_aggregates`.
     if let Err(e) = store.append_turn(project_id, thread_id, &turn).await {
-        warn!(%thread_id, %e, "failed to append turn to history; skipping metadata update");
-        return;
+        warn!(
+            %project_id,
+            %thread_id,
+            turn = %turn_id,
+            status = ?status_kind,
+            item_count,
+            diff_count,
+            %e,
+            "failed to append turn to history; skipping metadata update"
+        );
+        return PersistTurnOutcome::default();
     }
+    info!(
+        %project_id,
+        %thread_id,
+        turn = %turn_id,
+        status = ?status_kind,
+        item_count,
+        diff_count,
+        started_at = %started_at,
+        completed_at = ?completed_at,
+        "appended completed turn to history"
+    );
 
     // Metadata-only RMW under the per-thread lock (§5.4): fold usage into the aggregates cache and
     // refresh the context window. The history no longer lives here.
@@ -1642,14 +1907,39 @@ async fn persist_turn(
     let tf = match updated {
         Ok(Some(tf)) => tf,
         Ok(None) => {
-            warn!(%thread_id, "thread file missing on turn completion");
-            return;
+            warn!(
+                %project_id,
+                %thread_id,
+                turn = %turn_id,
+                "thread file missing on turn completion after history append"
+            );
+            return PersistTurnOutcome {
+                history_appended: true,
+                metadata_updated: false,
+            };
         }
         Err(e) => {
-            warn!(%thread_id, %e, "failed to persist thread on turn completion");
-            return;
+            warn!(
+                %project_id,
+                %thread_id,
+                turn = %turn_id,
+                %e,
+                "failed to persist thread metadata on turn completion after history append"
+            );
+            return PersistTurnOutcome {
+                history_appended: true,
+                metadata_updated: false,
+            };
         }
     };
+    info!(
+        %project_id,
+        %thread_id,
+        turn = %turn_id,
+        status = ?status_kind,
+        should_record_usage = should_record,
+        "updated thread metadata for completed turn"
+    );
 
     // Fold the same usage into the project + global ledgers via the single-writer actor (§10.2).
     if should_record {
@@ -1671,6 +1961,11 @@ async fn persist_turn(
         )
         .await;
     }
+
+    PersistTurnOutcome {
+        history_appended: true,
+        metadata_updated: true,
+    }
 }
 
 #[cfg(test)]
@@ -1686,17 +1981,18 @@ mod tests {
     use giskard_core::model::ModelRef;
     use giskard_core::server_request::ServerRequest;
     use giskard_core::token::{TokenLedger, TokenUsage};
-    use giskard_core::turn::{ApprovalPolicy, Mode, TurnStatus, TurnStatusKind};
+    use giskard_core::turn::{ApprovalPolicy, Mode, Turn, TurnStatus, TurnStatusKind};
     use giskard_core::user_input::UserInput;
-    use giskard_harness::AgentEventStream;
+    use giskard_harness::{AgentEventStream, ThreadHandle};
     use giskard_persist::PersistStore;
     use giskard_persist::store::ThreadFile;
     use giskard_proto::{ServerMessage, ThreadActivityKind, WireAgentEvent};
     use tokio::sync::{Mutex, broadcast, mpsc};
 
     use super::{
-        ThreadTurnGate, TurnContext, TurnContextKind, command_completion_is_normal_success,
-        command_status_is_running, forward_events, thread_activity_from_event,
+        ActiveTurnOwner, ThreadTurnGate, TurnContext, TurnContextKind,
+        command_completion_is_normal_success, command_status_is_running, forward_events,
+        thread_activity_from_event,
     };
     use crate::hub::Hub;
     use crate::ledger;
@@ -1964,6 +2260,133 @@ mod tests {
         assert_eq!(saved[0].user_input, UserInput::text("first"));
         assert_eq!(saved[1].id, second_turn);
         assert_eq!(saved[1].user_input, UserInput::text("second"));
+    }
+
+    #[tokio::test]
+    async fn persisted_turn_command_starts_do_not_recreate_running_tasks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: None,
+        };
+        store
+            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .await
+            .unwrap();
+        let now = Utc::now();
+        store
+            .save_thread(
+                project_id,
+                &ThreadFile {
+                    version: 1,
+                    id: thread_id,
+                    project_id,
+                    title: "target".into(),
+                    harness_thread_id: "th_target".into(),
+                    mode: Mode::Build,
+                    current_model: model.clone(),
+                    context_window: 128_000,
+                    approval_policy: ApprovalPolicy::Ask,
+                    model_efforts: Default::default(),
+                    tokens: TokenLedger::default(),
+                    created_at: now,
+                    updated_at: now,
+                    archived: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let turn = TurnId::new();
+        let item_id = ItemId::new();
+        let harness_item_id = "cmd_1".to_string();
+        store
+            .append_turn(
+                project_id,
+                thread_id,
+                &Turn {
+                    id: turn,
+                    user_input: UserInput::text("already done"),
+                    items: vec![Item {
+                        id: item_id,
+                        harness_item_id: harness_item_id.clone(),
+                        payload: ItemPayload::CommandExecution {
+                            command: "sleep 1".into(),
+                            cwd: "/tmp/test".into(),
+                            output: "done".into(),
+                            exit_code: Some(0),
+                            status: Some("completed".into()),
+                            process_id: Some("proc_1".into()),
+                            duration_ms: Some(1_000),
+                        },
+                        created_at: now,
+                    }],
+                    model: model.clone(),
+                    mode: Mode::Build,
+                    status: TurnStatus {
+                        kind: TurnStatusKind::Completed,
+                        message: None,
+                    },
+                    usage: TokenUsage::default(),
+                    diffs: Vec::new(),
+                    started_at: now,
+                    completed_at: Some(now),
+                },
+            )
+            .await
+            .unwrap();
+
+        let (tx, _) = broadcast::channel(16);
+        let hub = Arc::new(Hub::new());
+        let live_buffers = Arc::new(LiveBufferStore::new());
+        let running_commands = Arc::new(RunningTaskStore::new());
+        let approvals = Arc::new(Mutex::new(Default::default()));
+        let server_requests = Arc::new(Mutex::new(Default::default()));
+        let ledger = ledger::spawn(store.clone());
+
+        spawn_forwarder(
+            thread_id,
+            project_id,
+            AgentEventStream::new(tx.subscribe()),
+            hub,
+            live_buffers,
+            running_commands.clone(),
+            store,
+            approvals,
+            server_requests,
+            ledger,
+            model,
+            "next",
+        );
+
+        tx.send(AgentEvent::ItemStarted {
+            thread: thread_id,
+            turn,
+            item: ItemStart {
+                id: item_id,
+                harness_item_id,
+                kind: ItemKind::CommandExecution,
+                command: Some(CommandExecutionStart {
+                    command: "sleep 1".into(),
+                    cwd: "/tmp/test".into(),
+                    status: Some("in_progress".into()),
+                    process_id: Some("proc_1".into()),
+                    started_at_ms: Some(1),
+                }),
+                tool: None,
+            },
+        })
+        .unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        assert!(
+            running_commands.snapshot(thread_id).await.is_empty(),
+            "historical starts for already-persisted turns must not create stale running tasks"
+        );
     }
 
     #[tokio::test]
@@ -2495,8 +2918,6 @@ mod tests {
         let approvals = Arc::new(Mutex::new(Default::default()));
         let server_requests = Arc::new(Mutex::new(Default::default()));
         let ledger = ledger::spawn(store.clone());
-        let gate = ThreadTurnGate::default();
-        let lease = gate.reserve(thread_id).unwrap();
         let stream = AgentEventStream::new(tx.subscribe());
         let ctx = TurnContext {
             user_input: UserInput::text("/compact"),
@@ -2504,6 +2925,17 @@ mod tests {
             mode: Mode::Build,
             kind: TurnContextKind::ManualCompaction,
         };
+        let gate = ThreadTurnGate::default();
+        let handle = ThreadHandle {
+            thread: thread_id,
+            harness_thread_id: "native-test-thread".into(),
+            resumed_model: None,
+            warning: None,
+        };
+        let lease = gate
+            .reserve(thread_id, ActiveTurnOwner::new(project_id, &handle, &ctx))
+            .unwrap();
+        let ctx_for_second_reserve = ctx.clone();
 
         tokio::spawn({
             let hub = hub.clone();
@@ -2575,7 +3007,11 @@ mod tests {
             ItemPayload::Activity { title, .. } if title == "Context compacted"
         )));
         assert!(
-            gate.reserve(thread_id).is_ok(),
+            gate.reserve(
+                thread_id,
+                ActiveTurnOwner::new(project_id, &handle, &ctx_for_second_reserve)
+            )
+            .is_ok(),
             "manual compaction completion should release the turn gate"
         );
     }
