@@ -642,6 +642,7 @@ impl CodexMapper {
                     PendingApprovalResponse {
                         request_id: id.clone(),
                         thread,
+                        turn,
                         kind: PendingApprovalResponseKind::Decision,
                     },
                 );
@@ -678,6 +679,7 @@ impl CodexMapper {
                     PendingApprovalResponse {
                         request_id: id.clone(),
                         thread,
+                        turn,
                         kind: PendingApprovalResponseKind::Decision,
                     },
                 );
@@ -715,6 +717,7 @@ impl CodexMapper {
                     PendingApprovalResponse {
                         request_id: id.clone(),
                         thread,
+                        turn,
                         kind: PendingApprovalResponseKind::Permissions {
                             permissions: permissions.clone(),
                         },
@@ -759,6 +762,7 @@ impl CodexMapper {
                     PendingApprovalResponse {
                         request_id: id.clone(),
                         thread,
+                        turn,
                         kind: PendingApprovalResponseKind::LegacyReviewDecision,
                     },
                 );
@@ -802,6 +806,7 @@ impl CodexMapper {
                     PendingApprovalResponse {
                         request_id: id.clone(),
                         thread,
+                        turn,
                         kind: PendingApprovalResponseKind::LegacyReviewDecision,
                     },
                 );
@@ -916,38 +921,46 @@ impl CodexMapper {
         match self.pending_approval_responses.remove(id) {
             Some(PendingApprovalResponse {
                 request_id,
+                thread,
+                turn,
                 kind: PendingApprovalResponseKind::Permissions { permissions },
-                ..
             }) => Ok(ApprovalResponse::from_parts(
                 request_id,
+                ApprovalResponseOwner { thread, turn },
                 map_permissions_approval_decision(decision, permissions),
             )),
             Some(PendingApprovalResponse {
                 request_id,
+                thread,
+                turn,
                 kind: PendingApprovalResponseKind::LegacyReviewDecision,
-                ..
             }) => Ok(ApprovalResponse::from_parts(
                 request_id,
+                ApprovalResponseOwner { thread, turn },
                 map_legacy_review_decision(decision),
             )),
             Some(PendingApprovalResponse {
                 request_id,
+                thread,
+                turn,
                 kind: PendingApprovalResponseKind::Decision,
-                ..
             }) => Ok(ApprovalResponse::from_parts(
                 request_id,
+                ApprovalResponseOwner { thread, turn },
                 ApprovalResponseBody::Result(map_approval_decision(decision)),
             )),
             Some(PendingApprovalResponse {
                 request_id,
+                thread,
+                turn,
                 kind:
                     PendingApprovalResponseKind::McpToolCall {
                         transport,
                         question_id,
                     },
-                ..
             }) => Ok(ApprovalResponse::from_parts(
                 request_id,
+                ApprovalResponseOwner { thread, turn },
                 map_mcp_tool_approval_decision(decision, &transport, question_id.as_deref()),
             )),
             None => Err(format!("no pending approval for id {id}")),
@@ -1001,6 +1014,7 @@ impl CodexMapper {
             PendingApprovalResponse {
                 request_id,
                 thread,
+                turn,
                 kind: PendingApprovalResponseKind::McpToolCall {
                     transport,
                     question_id: detected.question_id.clone(),
@@ -1118,14 +1132,22 @@ pub struct PendingServerRequest {
     pub turn: Option<TurnId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApprovalResponseOwner {
+    pub thread: ThreadId,
+    pub turn: TurnId,
+}
+
 #[derive(Debug)]
 pub enum ApprovalResponse {
     Result {
         request_id: RequestId,
+        owner: ApprovalResponseOwner,
         value: Value,
     },
     Error {
         request_id: RequestId,
+        owner: ApprovalResponseOwner,
         code: i64,
         message: String,
     },
@@ -1134,6 +1156,7 @@ pub enum ApprovalResponse {
 struct PendingApprovalResponse {
     request_id: RequestId,
     thread: ThreadId,
+    turn: TurnId,
     kind: PendingApprovalResponseKind,
 }
 
@@ -1174,11 +1197,20 @@ enum ApprovalResponseBody {
 }
 
 impl ApprovalResponse {
-    fn from_parts(request_id: RequestId, body: ApprovalResponseBody) -> Self {
+    fn from_parts(
+        request_id: RequestId,
+        owner: ApprovalResponseOwner,
+        body: ApprovalResponseBody,
+    ) -> Self {
         match body {
-            ApprovalResponseBody::Result(value) => Self::Result { request_id, value },
+            ApprovalResponseBody::Result(value) => Self::Result {
+                request_id,
+                owner,
+                value,
+            },
             ApprovalResponseBody::Error { code, message } => Self::Error {
                 request_id,
+                owner,
                 code,
                 message,
             },
@@ -2950,11 +2982,15 @@ mod tests {
         );
         let request_id = RequestId::String("perm_req".into());
 
-        match mapper
+        let (expected_thread, expected_turn) = match mapper
             .map_server_request(&request_id, &request, ThreadId::new())
             .unwrap()
         {
-            AgentEvent::ApprovalRequested { request, .. } => {
+            AgentEvent::ApprovalRequested {
+                thread,
+                turn,
+                request,
+            } => {
                 assert_eq!(request.id, ApprovalId("perm_req".into()));
                 assert!(matches!(request.kind, ApprovalKind::Permission { .. }));
                 assert_eq!(request.reason.as_deref(), Some("Need network access"));
@@ -3004,9 +3040,10 @@ mod tests {
                     "Glob scan max depth",
                     "3"
                 ));
+                (thread, turn)
             }
             other => panic!("expected permissions approval, got {other:?}"),
-        }
+        };
 
         match mapper
             .map_approval_response(
@@ -3015,8 +3052,14 @@ mod tests {
             )
             .unwrap()
         {
-            ApprovalResponse::Result { request_id, value } => {
+            ApprovalResponse::Result {
+                request_id,
+                owner,
+                value,
+            } => {
                 assert_eq!(request_id, RequestId::String("perm_req".into()));
+                assert_eq!(owner.thread, expected_thread);
+                assert_eq!(owner.turn, expected_turn);
                 assert_eq!(value["permissions"]["network"]["enabled"], true);
                 assert_eq!(value["scope"], "session");
             }
@@ -3049,6 +3092,7 @@ mod tests {
         {
             ApprovalResponse::Error {
                 request_id,
+                owner: _,
                 code,
                 message,
             } => {
