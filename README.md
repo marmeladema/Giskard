@@ -150,7 +150,9 @@ waiting for an approval request.
 
 Config lives at `${GISKARD_DATA_DIR:-~/.local/share/giskard}/config.toml`. A fully annotated,
 copy-pasteable template is in [`config.example.toml`](config.example.toml). Every section is
-optional and falls back to the defaults below.
+optional and falls back to the defaults below, but the `config.toml` file itself must exist:
+`giskard-server` refuses to start when it is missing, unreadable, or invalid so a mis-pointed
+service does not silently run with an empty provider list.
 
 | Section | Key | Default | Purpose |
 |---------|-----|---------|---------|
