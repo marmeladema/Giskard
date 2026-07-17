@@ -31,10 +31,10 @@
   kind-specific approval/server-request ids, and a short summary. They are intentionally separate
   from full transcript events so the sidebar can show progress without subscribing the browser to
   every thread's live stream.
-- **TA2:** Approval requests from inactive threads, or from the focused thread while the browser tab
-  is hidden, may create browser notifications when permission is granted. Notification clicks focus
-  the target thread and scroll to the matching approval row when it is still pending. Duplicate
-  lightweight/full approval paths are deduplicated client-side.
+- **TA2:** Approval requests from inactive threads, or from the focused thread while the page is
+  hidden or the browser window is not focused, may create browser notifications when permission is
+  granted. Notification clicks focus the target thread and scroll to the matching approval row when
+  it is still pending. Duplicate lightweight/full approval paths are deduplicated client-side.
 - **BD1:** The browser exposes a tucked-away Settings → Browser diagnostics panel with a bounded
   client-side event buffer, copy/clear actions, and a test-notification action. Diagnostics include
   notification lifecycle decisions, visibility/focus state, approval routing decisions, and
@@ -2528,9 +2528,10 @@ events through the same event handler used for live WebSocket events.
   type must make invalid server-side construction unrepresentable. High-volume text deltas are
   intentionally skipped. Clients must use request ids only for notification/targeting/routing
   affordances and must still subscribe/open the thread before rendering full transcript state.
-  Current-thread approvals are not notified while the page is visible, but may notify when the page
-  is hidden. The browser must deduplicate the lightweight activity path against the later full
-  approval event for the same `(thread_id, approval_id)`.
+  Current-thread approvals are not notified while the page is visible and focused, but may notify
+  when the page is hidden or the browser window is not focused. The browser must deduplicate the
+  lightweight activity path against the later full approval event for the same
+  `(thread_id, approval_id)`.
 - **Backpressure:** per-connection bounded queue; if a client falls behind, coalesce deltas
   (keep latest) rather than unbounded buffering. Heartbeat ping/pong; auto-reconnect on the
   client with resubscribe + state resync. Browser disconnects caused by mobile/tab suspension are

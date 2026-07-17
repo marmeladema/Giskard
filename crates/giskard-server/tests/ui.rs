@@ -1700,9 +1700,10 @@ fn sidebar_activity_notifications_target_approval_rows() {
     assert!(!body.contains("notifyApprovalRequest(ev.request"));
     assert!(!body.contains("notifyApprovalRequest(msg.request"));
     assert!(!body.contains("notifyApprovalRequest(snap.pending_approval"));
-    assert!(body.contains("createBrowserNotification(\"Approval requested\""));
+    assert!(body.contains("createBrowserNotification(\"Giskard: approval needed\""));
+    assert!(body.contains("const focused = document.hasFocus ? document.hasFocus() : true;"));
     assert!(body.contains(
-        "if (document.visibilityState === \"visible\" && String(tid) === String(state.threadId))"
+        "if (document.visibilityState === \"visible\" && focused && String(tid) === String(state.threadId))"
     ));
     assert!(body.contains("notification.onclick = () =>"));
     assert!(body.contains("closeApprovalNotification(tid, activity.approval_id);"));

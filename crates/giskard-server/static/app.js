@@ -1546,7 +1546,8 @@ function maybeNotifyApproval(tid, activity) {
     source: activity.source || "unknown",
     summary: activity.summary || ""
   });
-  if (document.visibilityState === "visible" && String(tid) === String(state.threadId)) {
+  const focused = document.hasFocus ? document.hasFocus() : true;
+  if (document.visibilityState === "visible" && focused && String(tid) === String(state.threadId)) {
     recordNotificationDiagnostic("approval_notify_suppressed_visible_current_thread", {
       tid,
       approval_id: activity.approval_id,
@@ -1588,7 +1589,7 @@ function maybeNotifyApproval(tid, activity) {
   const notificationTag = `giskard-approval-${tid}-${activity.approval_id}-${now}`;
   let notification;
   try {
-    notification = createBrowserNotification("Approval requested", {
+    notification = createBrowserNotification("Giskard: approval needed", {
       body: activity.summary ? `${title}: ${activity.summary}` : title,
       tag: notificationTag,
       renotify: true,
