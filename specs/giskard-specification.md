@@ -2808,6 +2808,8 @@ supports, including `collaborationMode` and `item/tool/requestUserInput`.
 
 ```toml
 # ${XDG_DATA_HOME:-~/.local/share}/giskard/config.toml   (path overridable via GISKARD_DATA_DIR)
+# The file must exist and parse for giskard-server startup. Individual sections/keys may be omitted
+# and then fall back to the defaults shown here.
 
 [server]
 bind = "127.0.0.1:8787"
