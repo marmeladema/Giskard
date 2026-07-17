@@ -8,6 +8,8 @@
   button { font:inherit; color:var(--fg); background:var(--panel2); border:1px solid var(--border); border-radius:6px; padding:6px 10px; cursor:pointer; }
   button:hover { border-color:var(--accent); }
   button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.session { background:#30264f; border-color:#7c5cff; color:#eee9ff; }
+  button.session:hover { border-color:#a78bfa; }
   button.danger { background:#7f1d1d; border-color:#b91c1c; color:#fff; }
   button.danger:hover { border-color:#f87171; }
   input,select,textarea { font:inherit; color:var(--fg); background:var(--panel2); border:1px solid var(--border); border-radius:6px; padding:6px 8px; }

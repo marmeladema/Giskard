@@ -8,7 +8,14 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.48
+**Version:** 1.49
+
+**Changelog (1.48 → 1.49), composer drafts and approval button contrast:**
+- **UI1:** Unsent composer text is browser-local and scoped to the selected persisted thread, or to
+  the per-project new-thread draft. Switching threads must save and restore the matching draft
+  instead of sharing one textarea value globally.
+- **UI2:** Approval action buttons must make `accept_for_session` visually distinct from the
+  default/cancel button treatment while keeping Cancel in the neutral/default style.
 
 **Changelog (1.47 → 1.48), cross-tab approval resolution:**
 - **AR1:** When one browser client answers an approval request, the server broadcasts
@@ -2364,6 +2371,12 @@ sessions, so clarity and low visual noise beat flourish. Explicitly avoid the ge
   collapse state is browser-local and persists across reloads.
 - **Center:** thread header (mode, model, approval policy, tasks menu, MCP menu, context usage menu
   with manual compact action, plan-dump & interrupt actions) + transcript + composer.
+- **Composer drafts:** unsent text is browser-local and scoped to the active persisted thread id.
+  A new-thread draft uses a per-project draft key until the first message creates the thread.
+  Switching threads saves the previous draft and restores the target draft; sending successfully
+  clears only that draft.
+- **Approval buttons:** `accept_for_session` uses a distinct secondary treatment so it does not
+  read like the neutral/default Cancel action.
 - Source/code previews and downloads open as overlays from linkified transcript paths rather than
   occupying a permanent right column.
 

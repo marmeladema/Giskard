@@ -109,6 +109,12 @@ async fn index_page_is_served_and_public() {
         "approval cards expose session-scoped approval"
     );
     assert!(
+        body.contains("addApprovalButton(actions, id, \"accept_for_session\", \"Session\", \"session\", available)")
+            && body.contains("button.session {")
+            && body.contains("button.session:hover"),
+        "approval cards style session separately from the default cancel button"
+    );
+    assert!(
         body.contains("id=\"approvalSel\""),
         "approval policy is exposed as a selector"
     );
@@ -821,6 +827,16 @@ async fn index_page_is_served_and_public() {
          and blocks sends on read-only threads"
     );
     assert!(
+        body.contains("inputDrafts:new Map()")
+            && body.contains("function composerDraftKey()")
+            && body.contains("return `thread:${state.threadId}`")
+            && body.contains("return `draft:${state.draftThread.projectId}`")
+            && body.contains("function saveComposerDraft()")
+            && body.contains("function restoreComposerDraft()")
+            && body.contains("$(\"input\").addEventListener(\"input\", saveComposerDraft);"),
+        "pending composer text is cached per existing thread and per project draft"
+    );
+    assert!(
         body.contains("state.awaitingThreadResync = true;\n    send({ type:\"subscribe\"")
             && body.contains("awaitingThreadResync:false"),
         "resubscribe marks the next thread state as an authoritative resync"
@@ -1309,6 +1325,66 @@ fn browser_marks_turn_active_when_send_is_accepted() {
             "if (msg.action===\"send_input\") {\n        setTurnActive(msg.code === \"thread_turn_active\");\n      }"
         ),
         "send_input errors must reconcile optimistic active-turn state"
+    );
+}
+
+#[test]
+fn browser_scopes_unsent_composer_text_to_thread() {
+    let body = app_js();
+
+    let open_draft = between(
+        body,
+        "function openDraftThread(pid, defaultModel) {",
+        "/* ---------- thread view + websocket ---------- */",
+    );
+    assert_order(open_draft, "saveComposerDraft();", "state.projectId = pid;");
+    assert_order(
+        open_draft,
+        "state.draftThread = { projectId:pid",
+        "restoreComposerDraft();",
+    );
+
+    let open_thread = between(
+        body,
+        "async function openThread(pid, tid, title, opts) {",
+        "function clearWsReconnectTimer()",
+    );
+    assert_order(
+        open_thread,
+        "saveComposerDraft();",
+        "state.projectId = pid; state.threadId = tid;",
+    );
+    assert_order(
+        open_thread,
+        "state.draftThread = null;",
+        "restoreComposerDraft();",
+    );
+
+    let send_input = between(
+        body,
+        "function sendInput() {",
+        "$(\"sendBtn\").onclick = sendInput;",
+    );
+    assert_order(
+        send_input,
+        "const draftKey = composerDraftKey();",
+        "clearComposerDraft(draftKey);",
+    );
+
+    let start_draft = between(
+        body,
+        "async function startDraftThread(text) {",
+        "function interruptTurn()",
+    );
+    assert_order(
+        start_draft,
+        "const draftKey = composerDraftKey();",
+        "clearComposerDraft(draftKey);",
+    );
+    assert_order(
+        start_draft,
+        "clearComposerDraft(draftKey);",
+        "state.draftThread = null;",
     );
 }
 
