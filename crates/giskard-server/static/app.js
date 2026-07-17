@@ -15,7 +15,7 @@ let state = {
   projectId:null, threadId:null, mode:"build", ws:null, wsStatus:"closed", wsConnectId:0,
   wsReconnectTimer:null, wsReconnectAttempt:0, wsStatusDetail:"WebSocket disconnected",
   wsLastProblem:"", wsLastProblemNotice:"", wsLastProblemNoticeAt:0,
-  draftThread:null, firstTurnStartingThreadId:null,
+  draftThread:null, firstTurnStartingThreadId:null, inputDrafts:new Map(),
   models:[], pendingModelBeforeSelect:null, streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null,
   streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), itemKindsByItemId:new Map(),
   pendingApprovals:new Map(), answeredApprovals:new Map(), renderedApprovalStateKeys:new Set(), pendingServerRequests:new Map(),
@@ -753,6 +753,7 @@ async function deleteThread(pid, tid, title) {
 
 function clearThreadView(tid) {
   if (state.threadId !== tid) return;
+  saveComposerDraft();
   try { localStorage.removeItem("giskard.lastThread"); } catch {}
   clearWsReconnectTimer();
   const ws = state.ws;
@@ -775,6 +776,7 @@ function clearThreadView(tid) {
   $("thrHeader").style.display="none"; $("composer").style.display="none";
   $("pickerBar").style.display="none"; closeModelPicker(); closeTurnPicker();
   $("transcript").innerHTML="";
+  restoreComposerDraft();
   setWsStatus("closed", "No thread selected.");
 }
 
@@ -1011,7 +1013,37 @@ function isDraftThread() {
   return !!state.draftThread && !state.threadId;
 }
 
+function composerDraftKey() {
+  if (state.threadId) return `thread:${state.threadId}`;
+  if (isDraftThread() && state.draftThread.projectId) return `draft:${state.draftThread.projectId}`;
+  return "";
+}
+
+function saveComposerDraft() {
+  const input = $("input");
+  if (!input) return;
+  const key = composerDraftKey();
+  if (!key) return;
+  const value = input.value || "";
+  if (value) state.inputDrafts.set(key, value);
+  else state.inputDrafts.delete(key);
+}
+
+function restoreComposerDraft() {
+  const input = $("input");
+  if (!input) return;
+  const key = composerDraftKey();
+  input.value = key ? (state.inputDrafts.get(key) || "") : "";
+}
+
+function clearComposerDraft(key) {
+  if (key) state.inputDrafts.delete(key);
+  const input = $("input");
+  if (input && composerDraftKey() === key) input.value = "";
+}
+
 function openDraftThread(pid, defaultModel) {
+  saveComposerDraft();
   clearWsReconnectTimer();
   const oldWs = state.ws;
   state.ws = null;
@@ -1052,12 +1084,14 @@ function openDraftThread(pid, defaultModel) {
   setWsStatus("draft", "Draft thread. Send a message to create it.");
   syncModelControls();
   closeDrawers();
+  restoreComposerDraft();
   $("input").focus();
 }
 
 /* ---------- thread view + websocket ---------- */
 async function openThread(pid, tid, title, opts) {
   opts = opts || {};
+  saveComposerDraft();
   if (!opts.firstTurnStarting) state.firstTurnStartingThreadId = null;
   if (opts.focusApprovalId) {
     state.pendingApprovalFocus = {
@@ -1109,6 +1143,7 @@ async function openThread(pid, tid, title, opts) {
   setThreadTitle(title || tid.slice(0,8));
   $("transcript").className=""; $("transcript").innerHTML=""; $("notices").innerHTML="";
   closeDrawers();   // on mobile, reveal the transcript after picking a thread
+  restoreComposerDraft();
   if (res.warning) {
     // A read-only open (provider removed from config) shows a persistent banner and unlocks the
     // model picker so the user can rescue the thread by selecting a configured model; other
@@ -2018,7 +2053,7 @@ function renderApprovalRequest(request) {
   actions.className = "approval-actions";
   const available = new Set(request.available || []);
   addApprovalButton(actions, id, "accept", "Accept", "primary", available);
-  addApprovalButton(actions, id, "accept_for_session", "Session", "", available);
+  addApprovalButton(actions, id, "accept_for_session", "Session", "session", available);
   addApprovalButton(actions, id, "decline", "Decline", "danger", available);
   addApprovalButton(actions, id, "cancel", "Cancel", "", available);
   body.append(actions);
@@ -4797,6 +4832,7 @@ function sendInput() {
     reconnectIfNeeded("send requested while disconnected");
     return;
   }
+  const draftKey = composerDraftKey();
   const body = bubble("user pending","you");
   body.textContent = text;
   const msgEl = body.parentElement;
@@ -4809,10 +4845,11 @@ function sendInput() {
   setTurnActive(true);
   state.pendingUserEl = msgEl;
   state.pendingUserText = text;
-  ta.value="";
+  clearComposerDraft(draftKey);
 }
 $("sendBtn").onclick = sendInput;
 $("input").addEventListener("keydown", (e) => { if (e.key==="Enter" && !e.shiftKey) { e.preventDefault(); sendInput(); } });
+$("input").addEventListener("input", saveComposerDraft);
 
 async function startDraftThread(text) {
   const pid = state.projectId;
@@ -4822,6 +4859,7 @@ async function startDraftThread(text) {
     return;
   }
 
+  const draftKey = composerDraftKey();
   const body = bubble("user pending","you");
   body.textContent = text;
   const msgEl = body.parentElement;
@@ -4839,8 +4877,8 @@ async function startDraftThread(text) {
     const tid = res && res.thread_id;
     if (!tid) throw new Error("new thread response did not include thread_id");
     state.firstTurnStartingThreadId = String(tid);
+    clearComposerDraft(draftKey);
     state.draftThread = null;
-    $("input").value="";
     await loadThreads(pid);
     await openThread(pid, tid, "New thread", { firstTurnStarting:true });
     state.firstTurnStartingThreadId = String(tid);
