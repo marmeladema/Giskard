@@ -1560,6 +1560,35 @@ async fn wait_for_turn_completed(
     panic!("turn completion for {thread_id} was not observed");
 }
 
+/// Wait for the `TurnStarted` event and return the turn id carried on the wire — the id the browser
+/// stamps transcript rows with.
+async fn wait_for_turn_started(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    thread_id: ThreadId,
+) -> TurnId {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                if let Ok(ServerMessage::Event {
+                    thread_id: event_thread,
+                    agent_event: WireAgentEvent::TurnStarted { turn, .. },
+                }) = serde_json::from_str(&text)
+                {
+                    if event_thread == thread_id {
+                        return turn;
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => {}
+        }
+    }
+    panic!("turn start for {thread_id} was not observed");
+}
+
 async fn wait_for_approval_request(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -1896,6 +1925,65 @@ async fn compact_context_streams_and_persists_compaction_turn() {
             ItemPayload::Activity { title, .. } if title == "Context compacted"
         )),
         "persisted compaction turn should contain the activity item"
+    );
+}
+
+/// The turn id the browser receives on the wire (`TurnStarted` / `LiveTurnSnapshot`) is the id it
+/// stamps transcript rows with. Incremental reconnect uses the *persisted* turn id as its "give me
+/// turns after this" cursor, so the two must be the same value — otherwise a resync would re-render
+/// the in-flight turn instead of skipping it. This is not tautological: the replay harness returns a
+/// fresh id from `start_turn` that differs from the id it streams, so this also pins the registry to
+/// the streamed/persisted id rather than the harness return value.
+#[tokio::test]
+async fn wire_turn_id_matches_persisted_turn_id() {
+    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    let mut ws = connect_ws(port, &cookie).await;
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::Subscribe { thread_id })
+            .unwrap()
+            .into(),
+    ))
+    .await
+    .unwrap();
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::CompactContext { thread_id })
+            .unwrap()
+            .into(),
+    ))
+    .await
+    .unwrap();
+
+    // The id the browser would stamp rows with.
+    let wire_turn = wait_for_turn_started(&mut ws, thread_id).await;
+    wait_for_turn_completed(&mut ws, thread_id).await;
+
+    // The persisted turn — the resync cursor — must carry that same id.
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    let saved_turns = loop {
+        let turns = state
+            .store
+            .load_all_turns(project_id, thread_id)
+            .await
+            .unwrap();
+        if !turns.is_empty() {
+            break turns;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("turn was not persisted");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+    };
+    assert!(
+        saved_turns.iter().any(|turn| turn.id == wire_turn),
+        "persisted history must carry the turn under the same id the browser saw on the wire \
+         (wire={wire_turn}, persisted={:?})",
+        saved_turns.iter().map(|t| t.id).collect::<Vec<_>>()
     );
 }
 

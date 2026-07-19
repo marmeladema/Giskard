@@ -1467,6 +1467,66 @@ fn browser_keeps_appended_transcript_rows_anchored_to_bottom() {
 }
 
 #[test]
+fn browser_stamps_transcript_rows_with_their_turn_id() {
+    let body = app_js();
+
+    // Every top-level row is stamped at the single creation site with the turn it belongs to.
+    let append = between(
+        body,
+        "function appendBubble(cls, role) {",
+        "function bubble(cls, role)",
+    );
+    assert!(
+        append.contains("el.dataset.turn = state.currentRenderTurnId || \"pending\";"),
+        "appendBubble stamps each row with the current turn id (or 'pending' before turn_started)"
+    );
+
+    // Persisted turns stamp their rows with the turn's own id, saved/restored around rendering.
+    let persisted = between(
+        body,
+        "function renderPersistedTurn(turn) {",
+        "// Load older history",
+    );
+    assert_order(
+        persisted,
+        "const prevRenderTurnId = state.currentRenderTurnId;",
+        "state.currentRenderTurnId = turn.id;",
+    );
+    assert_order(
+        persisted,
+        "for (const it of items) addItem(it, true);",
+        "state.currentRenderTurnId = prevRenderTurnId;",
+    );
+
+    // A starting live turn adopts its id and upgrades the optimistic "pending" rows to it.
+    let started = between(body, "case \"turn_started\":", "case \"item_started\":");
+    assert!(started.contains("state.currentRenderTurnId = ev.turn;"));
+    assert!(
+        started.contains("document.querySelectorAll('.msg[data-turn=\"pending\"]')"),
+        "turn_started re-stamps optimistic pending rows with the real turn id"
+    );
+
+    // A completing turn advances the high-water cursor and stops stamping rows to it.
+    let completed = between(
+        body,
+        "case \"turn_completed\":",
+        "case \"approval_requested\":",
+    );
+    assert!(completed.contains("if (ev.turn) state.newestPersistedTurnId = ev.turn;"));
+    assert!(completed.contains("state.currentRenderTurnId = null;"));
+
+    // The initial history page seeds the high-water cursor; older pages must not lower it.
+    let history = between(
+        body,
+        "function renderHistoryPage(msg) {",
+        "function maybeAutoFillHistory",
+    );
+    assert!(history.contains(
+        "if (!older && turns.length) state.newestPersistedTurnId = turns[turns.length - 1].id;"
+    ));
+}
+
+#[test]
 fn browser_websocket_lifecycle_errors_are_not_toasted_directly() {
     let body = app_js();
 
