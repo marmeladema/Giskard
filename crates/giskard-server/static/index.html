@@ -53,18 +53,31 @@
             <button id="notifyBtn" class="notify-permission-btn" type="button"
                     title="Enable browser notifications for approval requests">Enable approval notifications</button>
           </div>
+         <div class="settings-field">
+           <label for="browserDiagnosticsBtn">Diagnostics</label>
+           <button id="browserDiagnosticsBtn" type="button"
+                   title="Show recent browser-side diagnostics">Browser diagnostics</button>
+           <div id="browserDiagnosticsPanel" class="browser-diagnostics" hidden>
+             <pre id="browserDiagnosticsLog"></pre>
+             <div class="browser-diagnostics-actions">
+               <button id="copyBrowserDiagnosticsBtn" type="button">Copy</button>
+               <button id="clearBrowserDiagnosticsBtn" type="button">Clear</button>
+               <button id="testNotificationBtn" type="button">Test notification</button>
+             </div>
+           </div>
+         </div>
           <div class="settings-field">
-            <label for="browserDiagnosticsBtn">Diagnostics</label>
-            <button id="browserDiagnosticsBtn" type="button"
-                    title="Show recent browser-side diagnostics">Browser diagnostics</button>
-            <div id="browserDiagnosticsPanel" class="browser-diagnostics" hidden>
-              <pre id="browserDiagnosticsLog"></pre>
-              <div class="browser-diagnostics-actions">
-                <button id="copyBrowserDiagnosticsBtn" type="button">Copy</button>
-                <button id="clearBrowserDiagnosticsBtn" type="button">Clear</button>
-                <button id="testNotificationBtn" type="button">Test notification</button>
-              </div>
+            <label for="traceArmBtn">Tracing
+              <span id="traceStatus" class="trace-status" title="Capture is off">●</span>
+            </label>
+            <button id="traceArmBtn" type="button"
+                    title="Arm on-demand tracing to record where time is spent, then download a Perfetto/Chrome trace. No terminal needed.">Arm tracing</button>
+            <div class="tracing-actions">
+              <button id="traceDownloadBtn" type="button" disabled
+                      title="Download the captured trace as Chrome trace-event JSON (chrome://tracing or perfetto.dev)">Download trace</button>
             </div>
+            <p class="tracing-hint" id="traceHint">Off. Arm, trigger the flow (e.g. open a thread), then Download.</p>
+            <p class="tracing-count" id="traceCount" hidden></p>
           </div>
           <div class="settings-field">
             <label for="giskardVersion">Version</label>

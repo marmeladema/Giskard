@@ -646,6 +646,8 @@ async fn history_pagination_over_websocket() {
         serde_json::to_string(&ClientMessage::Subscribe {
             thread_id: tid,
             since: None,
+            trace_id: None,
+            parent_span_id: None,
         })
         .unwrap()
         .into(),
@@ -818,6 +820,8 @@ async fn resync_delta_over_websocket() {
         serde_json::to_string(&ClientMessage::Subscribe {
             thread_id: tid,
             since: Some(cursor),
+            trace_id: None,
+            parent_span_id: None,
         })
         .unwrap()
         .into(),
@@ -838,6 +842,8 @@ async fn resync_delta_over_websocket() {
         serde_json::to_string(&ClientMessage::Subscribe {
             thread_id: tid,
             since: Some(bogus),
+            trace_id: None,
+            parent_span_id: None,
         })
         .unwrap()
         .into(),
@@ -941,6 +947,8 @@ async fn subscribe_corrupt_history_returns_structured_error() {
         serde_json::to_string(&ClientMessage::Subscribe {
             thread_id: tid,
             since: None,
+            trace_id: None,
+            parent_span_id: None,
         })
         .unwrap()
         .into(),

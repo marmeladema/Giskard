@@ -434,6 +434,8 @@ async fn websocket_interrupt_reaches_live_harness_turn() {
     ws.send(ws_text(&ClientMessage::Subscribe {
         thread_id,
         since: None,
+        trace_id: None,
+        parent_span_id: None,
     }))
     .await
     .unwrap();
@@ -479,6 +481,8 @@ async fn websocket_interrupt_timeout_surfaces_error() {
     ws.send(ws_text(&ClientMessage::Subscribe {
         thread_id,
         since: None,
+        trace_id: None,
+        parent_span_id: None,
     }))
     .await
     .unwrap();
@@ -508,6 +512,8 @@ async fn websocket_terminate_running_command_marks_terminating_until_terminal_ev
     ws.send(ws_text(&ClientMessage::Subscribe {
         thread_id,
         since: None,
+        trace_id: None,
+        parent_span_id: None,
     }))
     .await
     .unwrap();
@@ -555,6 +561,8 @@ async fn websocket_subscribe_replays_running_command_snapshot() {
         .send(ws_text(&ClientMessage::Subscribe {
             thread_id,
             since: None,
+            trace_id: None,
+            parent_span_id: None,
         }))
         .await
         .unwrap();
@@ -574,6 +582,8 @@ async fn websocket_subscribe_replays_running_command_snapshot() {
         .send(ws_text(&ClientMessage::Subscribe {
             thread_id,
             since: None,
+            trace_id: None,
+            parent_span_id: None,
         }))
         .await
         .unwrap();
@@ -635,6 +645,8 @@ async fn no_active_for_after_turn_command_clears_stale_snapshot(behavior: Termin
     ws.send(ws_text(&ClientMessage::Subscribe {
         thread_id,
         since: None,
+        trace_id: None,
+        parent_span_id: None,
     }))
     .await
     .unwrap();
@@ -704,6 +716,8 @@ async fn terminate_failure_preserves_snapshot(behavior: TerminateBehavior, expec
     ws.send(ws_text(&ClientMessage::Subscribe {
         thread_id,
         since: None,
+        trace_id: None,
+        parent_span_id: None,
     }))
     .await
     .unwrap();

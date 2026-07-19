@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
+use tracing::instrument;
 use tracing::{debug, info, warn};
 
 use giskard_core::approval::ApprovalDecision;
@@ -757,6 +758,7 @@ impl AgentHarness for CodexHarness {
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
 
+    #[instrument(skip(self, input, overrides), fields(thread_id = %thread.thread, harness = "codex", op = "turn_start"))]
     async fn start_turn(
         &self,
         thread: &ThreadHandle,
@@ -824,6 +826,7 @@ impl AgentHarness for CodexHarness {
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
 
+    #[instrument(skip(self), fields(thread_id = %thread.thread, harness = "codex", op = "interrupt"))]
     async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
         let (tx, rx) = oneshot::channel();
         self.enqueue_control(
@@ -838,6 +841,7 @@ impl AgentHarness for CodexHarness {
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
 
+    #[instrument(skip(self), fields(thread_id = %thread.thread, harness = "codex", op = "compact"))]
     async fn compact_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
         let (tx, rx) = oneshot::channel();
         self.enqueue_control(

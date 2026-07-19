@@ -125,6 +125,7 @@ impl Hub {
         }
     }
 
+    #[tracing::instrument(skip(self, event), fields(thread_id = %thread_id, op = "broadcast_event"))]
     pub async fn broadcast_event(&self, thread_id: ThreadId, event: AgentEvent) {
         // C1/§3.5: narrow core → wire (lossy `PathBuf → String`) at the outbound edge.
         self.broadcast(

@@ -1739,6 +1739,8 @@ async fn send_input_rejects_second_turn_before_turn_started() {
             serde_json::to_string(&ClientMessage::Subscribe {
                 thread_id,
                 since: None,
+                trace_id: None,
+                parent_span_id: None,
             })
             .unwrap()
             .into(),
@@ -1809,6 +1811,8 @@ async fn send_input_rejects_same_thread_during_compaction() {
         serde_json::to_string(&ClientMessage::Subscribe {
             thread_id,
             since: None,
+            trace_id: None,
+            parent_span_id: None,
         })
         .unwrap()
         .into(),
@@ -1860,6 +1864,8 @@ async fn compact_context_streams_and_persists_compaction_turn() {
         serde_json::to_string(&ClientMessage::Subscribe {
             thread_id,
             since: None,
+            trace_id: None,
+            parent_span_id: None,
         })
         .unwrap()
         .into(),
@@ -1957,6 +1963,8 @@ async fn wire_turn_id_matches_persisted_turn_id() {
         serde_json::to_string(&ClientMessage::Subscribe {
             thread_id,
             since: None,
+            trace_id: None,
+            parent_span_id: None,
         })
         .unwrap()
         .into(),
@@ -2017,6 +2025,8 @@ async fn compact_context_does_not_block_turns_on_other_threads_or_projects() {
             serde_json::to_string(&ClientMessage::Subscribe {
                 thread_id,
                 since: None,
+                trace_id: None,
+                parent_span_id: None,
             })
             .unwrap()
             .into(),
@@ -2118,6 +2128,8 @@ async fn inactive_thread_progress_sends_activity_without_full_event_subscription
         serde_json::to_string(&ClientMessage::Subscribe {
             thread_id: active_thread,
             since: None,
+            trace_id: None,
+            parent_span_id: None,
         })
         .unwrap()
         .into(),
@@ -2258,6 +2270,8 @@ async fn inactive_thread_requests_send_activity_and_route_responses() {
         serde_json::to_string(&ClientMessage::Subscribe {
             thread_id: active_thread,
             since: None,
+            trace_id: None,
+            parent_span_id: None,
         })
         .unwrap()
         .into(),
@@ -2386,6 +2400,8 @@ async fn approval_decision_broadcasts_resolution_to_other_tabs() {
             serde_json::to_string(&ClientMessage::Subscribe {
                 thread_id,
                 since: None,
+                trace_id: None,
+                parent_span_id: None,
             })
             .unwrap()
             .into(),
@@ -3152,6 +3168,8 @@ async fn subscribe_unknown_thread_returns_structured_error() {
         serde_json::to_string(&ClientMessage::Subscribe {
             thread_id: tid,
             since: None,
+            trace_id: None,
+            parent_span_id: None,
         })
         .unwrap()
         .into(),
@@ -3331,6 +3349,8 @@ async fn websocket_serializes_harness_error_events() {
         serde_json::to_string(&ClientMessage::Subscribe {
             thread_id: tid,
             since: None,
+            trace_id: None,
+            parent_span_id: None,
         })
         .unwrap()
         .into(),
@@ -3483,6 +3503,8 @@ async fn subscribe_reopens_persisted_thread() {
         serde_json::to_string(&ClientMessage::Subscribe {
             thread_id: tid,
             since: None,
+            trace_id: None,
+            parent_span_id: None,
         })
         .unwrap()
         .into(),
@@ -3623,6 +3645,8 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
         serde_json::to_string(&ClientMessage::Subscribe {
             thread_id: tid,
             since: None,
+            trace_id: None,
+            parent_span_id: None,
         })
         .unwrap()
         .into(),
@@ -3813,6 +3837,8 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
         serde_json::to_string(&ClientMessage::Subscribe {
             thread_id: tid,
             since: None,
+            trace_id: None,
+            parent_span_id: None,
         })
         .unwrap()
         .into(),
@@ -3969,6 +3995,8 @@ async fn failed_turn_is_persisted_with_error_message() {
         serde_json::to_string(&ClientMessage::Subscribe {
             thread_id: tid,
             since: None,
+            trace_id: None,
+            parent_span_id: None,
         })
         .unwrap()
         .into(),
@@ -4107,6 +4135,8 @@ async fn notice_event_is_delivered_to_client() {
         serde_json::to_string(&ClientMessage::Subscribe {
             thread_id: tid,
             since: None,
+            trace_id: None,
+            parent_span_id: None,
         })
         .unwrap()
         .into(),
@@ -4824,6 +4854,8 @@ async fn login_project_thread_message() {
     let subscribe = serde_json::to_string(&ClientMessage::Subscribe {
         thread_id: thread_id.parse().unwrap(),
         since: None,
+        trace_id: None,
+        parent_span_id: None,
     })
     .unwrap();
     ws.send(tokio_tungstenite::tungstenite::Message::Text(

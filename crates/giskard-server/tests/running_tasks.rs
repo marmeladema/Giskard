@@ -260,6 +260,8 @@ async fn running_tool_call_surfaces_in_running_tasks_snapshot() {
     ws.send(ws_text(&ClientMessage::Subscribe {
         thread_id,
         since: None,
+        trace_id: None,
+        parent_span_id: None,
     }))
     .await
     .unwrap();

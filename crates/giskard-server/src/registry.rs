@@ -5,6 +5,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use chrono::Utc;
 use tokio::sync::Mutex;
+use tracing::instrument;
 use tracing::{debug, error, info, warn};
 
 use giskard_core::approval::ApprovalDecision;
@@ -376,6 +377,7 @@ impl HarnessRegistry {
         Ok(handle)
     }
 
+    #[instrument(skip(self, input, overrides, effective_model), fields(thread_id = %thread_id, op = "turn_start"))]
     pub async fn start_turn(
         &self,
         thread_id: ThreadId,
@@ -876,6 +878,7 @@ impl HarnessRegistry {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[instrument(skip(stream, hub, live_buffers, running_commands, store, ledger, approvals, server_requests, ctx, turn_gate), fields(thread_id = %thread_id, project_id = %project_id, op = "forward_events"))]
 async fn forward_events(
     thread_id: ThreadId,
     project_id: ProjectId,

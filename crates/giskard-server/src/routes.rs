@@ -19,7 +19,7 @@ use tracing::{debug, error, info, warn};
 
 use futures::{SinkExt, StreamExt};
 use giskard_core::error::{HarnessError, PersistError};
-use giskard_core::ids::{ProjectId, ThreadId};
+use giskard_core::ids::{ProjectId, ThreadId, TurnId};
 use giskard_core::model::ModelRef;
 use giskard_core::turn::{ApprovalPolicy, Mode, TurnOverrides};
 use giskard_core::user_input::UserInput;
@@ -35,6 +35,10 @@ use crate::auth::{
 
 const HARNESS_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_THREAD_TITLE_CHARS: usize = 120;
+use crate::trace::{
+    ArmRequest, RecordedSpan, TraceConfigResponse, UI_SPAN_BATCH_MAX, UI_SPAN_LABEL_COUNT_MAX,
+    UI_SPAN_LABEL_FIELD_MAX, UI_SPAN_NAME_MAX,
+};
 
 pub fn protected_routes(state: AppState) -> Router<AppState> {
     Router::new()
@@ -83,6 +87,11 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
         .route("/api/logout", post(logout))
         .route("/api/ws-ticket", get(ws_ticket))
         .route("/api/ws", get(ws_handler))
+        .route("/api/traces/config", get(trace_config))
+        .route("/api/traces/ui", post(ingest_ui_spans))
+        .route("/admin/trace", get(admin_trace))
+        .route("/admin/trace/arm", post(admin_trace_arm))
+        .route_layer(middleware::from_fn(crate::app::request_span_middleware))
         .layer(middleware::from_fn_with_state(state, auth_middleware))
 }
 
@@ -100,6 +109,7 @@ pub fn public_routes() -> Router<AppState> {
         // the browser's update check can re-fetch the same URL — hence not content-hashed.
         .route("/sw.js", get(service_worker))
         .route("/api/login", post(login))
+        .route_layer(middleware::from_fn(crate::app::request_span_middleware))
 }
 
 /// Build/version identity, stamped in by `build.rs`: a human-readable git short hash (with a
@@ -1170,6 +1180,7 @@ struct HighlightQuery {
 /// Returns highlighted HTML, detected language, binary flag, total line count,
 /// and file size. The `start`/`end` query params enable line-range pagination
 /// for large files. Path is confined to the project's workspace root.
+#[tracing::instrument(skip(state, q), fields(project_id = %project_id, op = "highlight"))]
 async fn highlight_file(
     State(state): State<AppState>,
     AxumPath(project_id): AxumPath<ProjectId>,
@@ -1294,6 +1305,7 @@ fn raster_image_content_type(path: &Path) -> Option<&'static str> {
 /// resolves them against the project's workspace root, and returns byte-offset
 /// spans for each path that points to an existing file. The client uses these
 /// spans to render clickable links in agent messages.
+#[tracing::instrument(skip(state, req), fields(project_id = %project_id, op = "linkify"))]
 async fn linkify(
     State(state): State<AppState>,
     AxumPath(project_id): AxumPath<ProjectId>,
@@ -1328,6 +1340,7 @@ async fn linkify(
 /// Detected workspace paths are wrapped in `.path-link` buttons (the same affordance `/linkify`
 /// feeds), so rendering and linkification are a single pass. See [`crate::markdown`] for the
 /// sanitization guarantees.
+#[tracing::instrument(skip(state, req), fields(project_id = %project_id, op = "render"))]
 async fn render_markdown(
     State(state): State<AppState>,
     AxumPath(project_id): AxumPath<ProjectId>,
@@ -1816,6 +1829,170 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
     send_task.abort();
 }
 
+/// Handle a `Subscribe`: attach the harness, send thread state + history + live snapshot, and
+/// record the operation as a `ws.subscribe` span for the thread-load tracing investigation. The
+/// span records the W3C trace context propagated from the browser (spec §17.4) so it nests under
+/// the browser's `ui.open_thread` span; `since` selects incremental-resync vs fresh-open
+/// snapshot ordering.
+#[tracing::instrument(
+    skip(state, tx),
+    name = "ws.subscribe",
+    fields(
+        thread_id = %thread_id,
+        // W3C trace context propagated from the browser so this server span nests under the
+        // browser's ui.open_thread span (spec §17.4). Empty when the client is not tracing.
+        trace_id = tracing::field::Empty,
+        parent_span_id = tracing::field::Empty,
+    )
+)]
+async fn handle_subscribe(
+    state: &AppState,
+    client_id: usize,
+    tx: &mpsc::Sender<ServerMessage>,
+    thread_id: ThreadId,
+    since: Option<TurnId>,
+    trace_id: Option<String>,
+    parent_span_id: Option<String>,
+) -> Result<(), WsError> {
+    if let Some(tid) = trace_id.filter(|t| !t.is_empty()) {
+        tracing::Span::current().record("trace_id", tid);
+    }
+    if let Some(psid) = parent_span_id.filter(|p| !p.is_empty()) {
+        tracing::Span::current().record("parent_span_id", psid);
+    }
+    // Attaching the harness is best-effort. If it fails — most often because the thread's
+    // provider was removed from config — degrade to a read-only view: the persisted
+    // history is still served and the attach failure is surfaced as a non-fatal warning,
+    // so an orphaned thread stays viewable even though it can never run a new turn. Only a
+    // genuinely missing thread remains a hard error.
+    let (project_id, notice) = match ensure_thread_open(state, thread_id, "subscribe").await {
+        Ok(access) => (access.project_id, access.warning),
+        Err(attach_error) => {
+            let project_id = project_for_readonly(state, thread_id, "subscribe").await?;
+            warn!(
+                %thread_id,
+                code = %attach_error.info.code,
+                detail = ?attach_error.info.detail,
+                "thread harness attach failed; serving read-only history"
+            );
+            (
+                project_id,
+                Some(read_only_warning(state, project_id, &attach_error, thread_id).await),
+            )
+        }
+    };
+    state.hub.subscribe(thread_id, client_id, tx.clone()).await;
+
+    if let Some(warning) = notice {
+        let _ = tx.send(ServerMessage::Error { error: warning }).await;
+    }
+
+    let tf = state
+        .store
+        .recompute_aggregates(project_id, thread_id)
+        .await
+        .map_err(|e| WsError::from_persist(e, "subscribe", Some(thread_id)))?
+        .ok_or_else(|| {
+            WsError::new(
+                "thread_not_found",
+                ErrorSeverity::Error,
+                "Thread not found.",
+            )
+            .thread(thread_id)
+            .action("subscribe")
+        })?;
+    let thread_state = serde_json::to_value(&tf).map_err(|e| {
+        WsError::new(
+            "thread_state_serialize_failed",
+            ErrorSeverity::Error,
+            "Thread state could not be serialized.",
+        )
+        .detail(e.to_string())
+        .thread(thread_id)
+        .action("subscribe")
+    })?;
+    let _ = tx
+        .send(ServerMessage::ThreadState(giskard_proto::ThreadState {
+            thread_id,
+            state: thread_state,
+        }))
+        .await;
+
+    // Two snapshot shapes, distinguished by whether the client sent a resync cursor:
+    //
+    // * Resync (`since` present): history-first ordering. Send the persisted history — a
+    //   `HistoryDelta` of the turns after the cursor when we can resolve it, or a full
+    //   `HistoryPage` when we can't (stale cursor) — *before* the live turn and tasks. The
+    //   client reconciles or rebuilds the transcript while it still owns it, then the live
+    //   turn appends on top; nothing needs mid-transcript insertion.
+    // * Fresh (`since` absent): live-first ordering. The in-flight turn (H5) isn't in the
+    //   JSONL yet, so reconstruct it from the live buffer and send it — with its tasks —
+    //   before the history page, for the fastest first paint. The browser prepends older
+    //   history above it.
+    let resync_delta = match since {
+        Some(cursor) => state
+            .store
+            .load_turns_after(project_id, thread_id, cursor)
+            .await
+            .map_err(|e| WsError::from_persist(e, "subscribe_resync", Some(thread_id)))?,
+        None => None,
+    };
+
+    // The persisted-history message: a delta after a resolvable cursor, otherwise a full
+    // initial page (fresh open, or a stale cursor that fell back to a full rebuild).
+    let history_message = if let Some(turns) = resync_delta {
+        ServerMessage::HistoryDelta {
+            thread_id,
+            turns: turns.into_iter().map(Into::into).collect(),
+        }
+    } else {
+        // H4/H6: the most recent page of persisted history (not the whole thread). The
+        // initial page is deliberately small (see `HistoryConfig::initial`); the browser
+        // tops it up to fill the viewport. Older pages are fetched via `LoadHistory`.
+        let limit = history_limit_or_default(
+            state,
+            thread_id,
+            "subscribe_history",
+            |config| config.history.initial,
+            5,
+        )
+        .await;
+        let (turns, has_more) = state
+            .store
+            .load_history(project_id, thread_id, None, limit)
+            .await
+            .map_err(|e| WsError::from_persist(e, "subscribe_history", Some(thread_id)))?;
+        ServerMessage::HistoryPage {
+            thread_id,
+            turns: turns.into_iter().map(Into::into).collect(),
+            has_more,
+        }
+    };
+
+    // The live turn (H5) isn't in the JSONL yet — reconstruct it from the live buffer — and
+    // its running tasks. On a fresh open (`since` absent) these go first, for the fastest
+    // first paint. On a resync (`since` present, delta or stale-cursor rebuild) the history
+    // goes first so the client reconciles/rebuilds the transcript before the live turn
+    // appends on top; that ordering needs no mid-transcript insertion.
+    let live_snapshot = state.live_buffers.snapshot(thread_id).await;
+    let tasks = state.running_commands.snapshot(thread_id).await;
+    let running_tasks = ServerMessage::RunningTasks { thread_id, tasks };
+    if since.is_some() {
+        let _ = tx.send(history_message).await;
+        if let Some(snap) = live_snapshot {
+            let _ = tx.send(ServerMessage::LiveTurnSnapshot(snap)).await;
+        }
+        let _ = tx.send(running_tasks).await;
+    } else {
+        if let Some(snap) = live_snapshot {
+            let _ = tx.send(ServerMessage::LiveTurnSnapshot(snap)).await;
+        }
+        let _ = tx.send(running_tasks).await;
+        let _ = tx.send(history_message).await;
+    }
+    Ok(())
+}
+
 async fn handle_client_msg(
     state: &AppState,
     client_id: usize,
@@ -1823,138 +2000,22 @@ async fn handle_client_msg(
     msg: ClientMessage,
 ) -> Result<(), WsError> {
     match msg {
-        ClientMessage::Subscribe { thread_id, since } => {
-            // Attaching the harness is best-effort. If it fails — most often because the thread's
-            // provider was removed from config — degrade to a read-only view: the persisted
-            // history is still served and the attach failure is surfaced as a non-fatal warning,
-            // so an orphaned thread stays viewable even though it can never run a new turn. Only a
-            // genuinely missing thread remains a hard error.
-            let (project_id, notice) = match ensure_thread_open(state, thread_id, "subscribe").await
-            {
-                Ok(access) => (access.project_id, access.warning),
-                Err(attach_error) => {
-                    let project_id = project_for_readonly(state, thread_id, "subscribe").await?;
-                    warn!(
-                        %thread_id,
-                        code = %attach_error.info.code,
-                        detail = ?attach_error.info.detail,
-                        "thread harness attach failed; serving read-only history"
-                    );
-                    (
-                        project_id,
-                        Some(read_only_warning(state, project_id, &attach_error, thread_id).await),
-                    )
-                }
-            };
-            state.hub.subscribe(thread_id, client_id, tx.clone()).await;
-
-            if let Some(warning) = notice {
-                let _ = tx.send(ServerMessage::Error { error: warning }).await;
-            }
-
-            let tf = state
-                .store
-                .recompute_aggregates(project_id, thread_id)
-                .await
-                .map_err(|e| WsError::from_persist(e, "subscribe", Some(thread_id)))?
-                .ok_or_else(|| {
-                    WsError::new(
-                        "thread_not_found",
-                        ErrorSeverity::Error,
-                        "Thread not found.",
-                    )
-                    .thread(thread_id)
-                    .action("subscribe")
-                })?;
-            let thread_state = serde_json::to_value(&tf).map_err(|e| {
-                WsError::new(
-                    "thread_state_serialize_failed",
-                    ErrorSeverity::Error,
-                    "Thread state could not be serialized.",
-                )
-                .detail(e.to_string())
-                .thread(thread_id)
-                .action("subscribe")
-            })?;
-            let _ = tx
-                .send(ServerMessage::ThreadState(giskard_proto::ThreadState {
-                    thread_id,
-                    state: thread_state,
-                }))
-                .await;
-
-            // Two snapshot shapes, distinguished by whether the client sent a resync cursor:
-            //
-            // * Resync (`since` present): history-first ordering. Send the persisted history — a
-            //   `HistoryDelta` of the turns after the cursor when we can resolve it, or a full
-            //   `HistoryPage` when we can't (stale cursor) — *before* the live turn and tasks. The
-            //   client reconciles or rebuilds the transcript while it still owns it, then the live
-            //   turn appends on top; nothing needs mid-transcript insertion.
-            // * Fresh (`since` absent): live-first ordering. The in-flight turn (H5) isn't in the
-            //   JSONL yet, so reconstruct it from the live buffer and send it — with its tasks —
-            //   before the history page, for the fastest first paint. The browser prepends older
-            //   history above it.
-            let resync_delta = match since {
-                Some(cursor) => state
-                    .store
-                    .load_turns_after(project_id, thread_id, cursor)
-                    .await
-                    .map_err(|e| WsError::from_persist(e, "subscribe_resync", Some(thread_id)))?,
-                None => None,
-            };
-
-            // The persisted-history message: a delta after a resolvable cursor, otherwise a full
-            // initial page (fresh open, or a stale cursor that fell back to a full rebuild).
-            let history_message = if let Some(turns) = resync_delta {
-                ServerMessage::HistoryDelta {
-                    thread_id,
-                    turns: turns.into_iter().map(Into::into).collect(),
-                }
-            } else {
-                // H4/H6: the most recent page of persisted history (not the whole thread). The
-                // initial page is deliberately small (see `HistoryConfig::initial`); the browser
-                // tops it up to fill the viewport. Older pages are fetched via `LoadHistory`.
-                let limit = history_limit_or_default(
-                    state,
-                    thread_id,
-                    "subscribe_history",
-                    |config| config.history.initial,
-                    5,
-                )
-                .await;
-                let (turns, has_more) = state
-                    .store
-                    .load_history(project_id, thread_id, None, limit)
-                    .await
-                    .map_err(|e| WsError::from_persist(e, "subscribe_history", Some(thread_id)))?;
-                ServerMessage::HistoryPage {
-                    thread_id,
-                    turns: turns.into_iter().map(Into::into).collect(),
-                    has_more,
-                }
-            };
-
-            // The live turn (H5) isn't in the JSONL yet — reconstruct it from the live buffer — and
-            // its running tasks. On a fresh open (`since` absent) these go first, for the fastest
-            // first paint. On a resync (`since` present, delta or stale-cursor rebuild) the history
-            // goes first so the client reconciles/rebuilds the transcript before the live turn
-            // appends on top; that ordering needs no mid-transcript insertion.
-            let live_snapshot = state.live_buffers.snapshot(thread_id).await;
-            let tasks = state.running_commands.snapshot(thread_id).await;
-            let running_tasks = ServerMessage::RunningTasks { thread_id, tasks };
-            if since.is_some() {
-                let _ = tx.send(history_message).await;
-                if let Some(snap) = live_snapshot {
-                    let _ = tx.send(ServerMessage::LiveTurnSnapshot(snap)).await;
-                }
-                let _ = tx.send(running_tasks).await;
-            } else {
-                if let Some(snap) = live_snapshot {
-                    let _ = tx.send(ServerMessage::LiveTurnSnapshot(snap)).await;
-                }
-                let _ = tx.send(running_tasks).await;
-                let _ = tx.send(history_message).await;
-            }
+        ClientMessage::Subscribe {
+            thread_id,
+            since,
+            trace_id,
+            parent_span_id,
+        } => {
+            handle_subscribe(
+                state,
+                client_id,
+                tx,
+                thread_id,
+                since,
+                trace_id,
+                parent_span_id,
+            )
+            .await?;
         }
         ClientMessage::LoadHistory {
             thread_id,
@@ -3088,4 +3149,143 @@ impl From<giskard_core::PersistError> for ApiError {
     fn from(e: giskard_core::PersistError) -> Self {
         ApiError::Internal(e.to_string())
     }
+}
+
+// ---- Tracing endpoints (spec §17) ----
+//
+// On-demand tracing: `GET /admin/trace` returns Chrome trace-event JSON; `POST /admin/trace/arm`
+// arms/disarms capture; `POST /api/traces/ui` merges browser spans into the shared buffer; and
+// `GET /api/traces/config` lets the browser learn whether to emit UI spans. All auth-gated.
+
+/// `GET /api/traces/config` — tell the browser whether capture is armed and UI ingest is allowed.
+async fn trace_config(State(state): State<AppState>) -> Json<TraceConfigResponse> {
+    let ui_ingest_enabled = state
+        .store
+        .load_config()
+        .await
+        .map(|c| c.tracing.ui_ingest_enabled)
+        .unwrap_or(true);
+    let (trace_count, span_count) = state.trace.counts();
+    Json(TraceConfigResponse {
+        armed: state.trace.is_armed(),
+        ui_ingest_enabled,
+        trace_count,
+        span_count,
+    })
+}
+
+/// `POST /api/traces/ui` — merge a batch of browser spans into the shared trace buffer.
+async fn ingest_ui_spans(
+    State(state): State<AppState>,
+    Json(batch): Json<giskard_proto::UiSpanBatch>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    let ui_ingest_enabled = state
+        .store
+        .load_config()
+        .await
+        .map(|c| c.tracing.ui_ingest_enabled)
+        .unwrap_or(true);
+    if !ui_ingest_enabled {
+        return Err(ApiError::NotFound);
+    }
+    if !state.trace.is_armed() {
+        // Expected when capture is off: degrade with a structured conflict so the browser can
+        // distinguish "not armed" from a real error and log a console warning (O6-style).
+        return Err(ApiError::Conflict("trace capture is not armed".into()));
+    }
+    if batch.spans.len() > UI_SPAN_BATCH_MAX {
+        return Err(ApiError::BadRequest(format!(
+            "too many spans in batch ({} > {UI_SPAN_BATCH_MAX})",
+            batch.spans.len()
+        )));
+    }
+    let recorded: Vec<RecordedSpan> = batch
+        .spans
+        .into_iter()
+        .filter_map(|s| {
+            let labels_ok = s.labels.len() <= UI_SPAN_LABEL_COUNT_MAX
+                && s
+                    .labels
+                    .iter()
+                    .all(|(k, v)| k.len() <= UI_SPAN_LABEL_FIELD_MAX && v.len() <= UI_SPAN_LABEL_FIELD_MAX);
+            if s.trace_id.is_empty()
+                || s.span_id.is_empty()
+                || s.end_us < s.start_us
+                || s.name.len() > UI_SPAN_NAME_MAX
+                || !labels_ok
+            {
+                debug!(
+                    name = %s.name,
+                    name_len = s.name.len(),
+                    label_count = s.labels.len(),
+                    "dropping malformed UI span (empty ids, negative duration, or oversized name/labels)"
+                );
+                None
+            } else {
+                Some(RecordedSpan {
+                    name: s.name,
+                    trace_id: s.trace_id,
+                    span_id: s.span_id,
+                    parent_span_id: s.parent_span_id,
+                    start_us: s.start_us,
+                    end_us: s.end_us,
+                    labels: s.labels,
+                })
+            }
+        })
+        .collect();
+    if !recorded.is_empty() {
+        state.trace.record(recorded);
+    }
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// `GET /admin/trace` — flush the armed buffer and return Chrome trace-event JSON.
+///
+/// **Draining side effect:** this GET clears the armed buffer. It is intentionally a GET so the
+/// browser can trigger a download with a plain `fetch`, but it is **not** idempotent — a
+/// speculative/prefetch/proxy GET would silently discard the captured traces. The UI Download
+/// button relies on this one-shot export; treat it as such.
+async fn admin_trace(
+    State(state): State<AppState>,
+    Query(params): Query<TraceQueryParams>,
+) -> Result<axum::response::Response, ApiError> {
+    if !state.trace.is_armed() {
+        return Err(ApiError::Conflict("trace capture is not armed".into()));
+    }
+    let json = state.trace.render_perfetto_json(params.trace_id.as_deref());
+    Ok((
+        [(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json; charset=utf-8"),
+        )],
+        json,
+    )
+        .into_response())
+}
+
+#[derive(Debug, Deserialize)]
+struct TraceQueryParams {
+    trace_id: Option<String>,
+}
+
+/// `POST /admin/trace/arm` — arm or disarm capture.
+async fn admin_trace_arm(
+    State(state): State<AppState>,
+    Json(req): Json<ArmRequest>,
+) -> Json<TraceConfigResponse> {
+    state.trace.set_armed(req.armed);
+    let ui_ingest_enabled = state
+        .store
+        .load_config()
+        .await
+        .map(|c| c.tracing.ui_ingest_enabled)
+        .unwrap_or(true);
+    let (trace_count, span_count) = state.trace.counts();
+    Json(TraceConfigResponse {
+        armed: state.trace.is_armed(),
+        ui_ingest_enabled,
+        trace_count,
+        span_count,
+    })
 }

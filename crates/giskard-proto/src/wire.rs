@@ -564,6 +564,40 @@ impl From<Turn> for WireTurn {
     }
 }
 
+// ---- UI tracing spans (spec §17) ----
+//
+// The browser emits render-pass and interaction spans and submits them to the server, which
+// merges them into the on-demand trace buffer keyed by `trace_id` (W3C `traceparent` context
+// propagated on outbound requests). `GET /admin/trace` then returns one combined Chrome
+// trace-event JSON containing both server-side and browser spans.
+
+/// A single browser-emitted span, in the same trace tree as server-side spans.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiSpan {
+    /// Human-readable span name, e.g. `"ui.render_turns"`.
+    pub name: String,
+    /// W3C trace id (32 hex chars) shared with the server-side spans of the same flow.
+    pub trace_id: String,
+    /// Span id (16 hex chars).
+    pub span_id: String,
+    /// Parent span id within the same trace, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_span_id: Option<String>,
+    /// Span start, microseconds since the Unix epoch.
+    pub start_us: i64,
+    /// Span end, microseconds since the Unix epoch.
+    pub end_us: i64,
+    /// Structured labels (e.g. `view`, `thread_id`, `action`, `turns`).
+    #[serde(default)]
+    pub labels: std::collections::HashMap<String, String>,
+}
+
+/// A bounded batch of browser spans submitted via `POST /api/traces/ui`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UiSpanBatch {
+    pub spans: Vec<UiSpan>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

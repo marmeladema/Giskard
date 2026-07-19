@@ -317,6 +317,8 @@ async fn websocket_server_request_response_routes_to_harness() {
     ws.send(ws_text(&ClientMessage::Subscribe {
         thread_id,
         since: None,
+        trace_id: None,
+        parent_span_id: None,
     }))
     .await
     .unwrap();
@@ -354,6 +356,8 @@ async fn websocket_server_request_error_response_routes_to_harness() {
     ws.send(ws_text(&ClientMessage::Subscribe {
         thread_id,
         since: None,
+        trace_id: None,
+        parent_span_id: None,
     }))
     .await
     .unwrap();
@@ -390,6 +394,8 @@ async fn websocket_server_request_response_failure_can_be_retried() {
     ws.send(ws_text(&ClientMessage::Subscribe {
         thread_id,
         since: None,
+        trace_id: None,
+        parent_span_id: None,
     }))
     .await
     .unwrap();
@@ -451,6 +457,8 @@ async fn websocket_subscribe_replays_pending_server_request_snapshot() {
     ws.send(ws_text(&ClientMessage::Subscribe {
         thread_id,
         since: None,
+        trace_id: None,
+        parent_span_id: None,
     }))
     .await
     .unwrap();
@@ -468,6 +476,8 @@ async fn websocket_subscribe_replays_pending_server_request_snapshot() {
         .send(ws_text(&ClientMessage::Subscribe {
             thread_id,
             since: None,
+            trace_id: None,
+            parent_span_id: None,
         }))
         .await
         .unwrap();
@@ -492,6 +502,8 @@ async fn websocket_unknown_server_request_response_surfaces_error() {
     ws.send(ws_text(&ClientMessage::Subscribe {
         thread_id,
         since: None,
+        trace_id: None,
+        parent_span_id: None,
     }))
     .await
     .unwrap();

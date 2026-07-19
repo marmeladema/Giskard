@@ -15,6 +15,7 @@ pub struct Config {
     pub history: HistoryConfig,
     pub providers: Vec<ProviderConfig>,
     pub harness: HarnessConfig,
+    pub tracing: TracingConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,6 +203,41 @@ impl Default for HarnessConfig {
     }
 }
 
+/// On-demand tracing configuration (spec §17).
+///
+/// Tracing records per-flow `tracing` spans into a bounded in-memory buffer and exposes them as
+/// Chrome trace-event JSON (`GET /admin/trace`), so you can see where a request or flow spends
+/// time. Capture is **off by default** and must be armed (either via config or the admin
+/// endpoint) to bound overhead. No on-disk persistence; the buffer is reset on restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TracingConfig {
+    /// Initial capture mode: `"off"` (default) or `"armed"`.
+    pub capture: TracingCapture,
+    /// Maximum number of traces kept in the in-memory ring buffer (oldest evicted).
+    pub buffer_max_traces: usize,
+    /// Whether the browser may submit UI spans via `POST /api/traces/ui`.
+    pub ui_ingest_enabled: bool,
+}
+
+impl Default for TracingConfig {
+    fn default() -> Self {
+        Self {
+            capture: TracingCapture::Off,
+            buffer_max_traces: 256,
+            ui_ingest_enabled: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TracingCapture {
+    #[default]
+    Off,
+    Armed,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +325,39 @@ idle_shutdown_secs = 0
         let config: Config = toml::from_str("").unwrap();
         assert_eq!(config.server.bind, "127.0.0.1:8787");
         assert_eq!(config.harness.kind, "codex");
+    }
+
+    #[test]
+    fn tracing_defaults_off() {
+        let config = Config::default();
+        assert_eq!(config.tracing.capture, TracingCapture::Off);
+        assert_eq!(config.tracing.buffer_max_traces, 256);
+        assert!(config.tracing.ui_ingest_enabled);
+    }
+
+    #[test]
+    fn tracing_config_parses() {
+        let toml = r#"
+[tracing]
+capture = "armed"
+buffer_max_traces = 16
+ui_ingest_enabled = false
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.tracing.capture, TracingCapture::Armed);
+        assert_eq!(config.tracing.buffer_max_traces, 16);
+        assert!(!config.tracing.ui_ingest_enabled);
+    }
+
+    #[test]
+    fn tracing_invalid_capture_is_rejected() {
+        let toml = "[tracing]\ncapture = \"always\"\n";
+        let err = toml::from_str::<Config>(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown variant") || msg.contains("always"),
+            "unexpected error: {msg}"
+        );
     }
 
     /// The annotated `config.example.toml` shipped at the repo root must always parse against the

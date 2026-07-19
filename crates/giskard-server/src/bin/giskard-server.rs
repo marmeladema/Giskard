@@ -5,8 +5,13 @@ use async_trait::async_trait;
 use giskard_core::error::{HarnessError, PersistError};
 use giskard_persist::Config;
 use giskard_persist::store::ProjectConfig;
-use giskard_server::{AppState, HarnessFactory, build_app};
+use giskard_server::{
+    AppState, HarnessFactory, build_app,
+    trace::{TraceCaptureLayer, TraceHandle},
+};
 use tracing::{error, info, warn};
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::{EnvFilter, fmt};
 
 struct CodexFactory;
 
@@ -113,21 +118,27 @@ fn load_or_create_session_key(data_dir: &std::path::Path) -> std::io::Result<Vec
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "giskard=info,tower_http=info".into()),
-        )
+    // Build the trace capture handle before installing the subscriber so the capture layer and
+    // AppState share one in-memory buffer (spec §17).
+    let trace_handle = TraceHandle::new(256, false);
+    let capture_layer = TraceCaptureLayer::new(trace_handle.clone());
+    let fmt_layer = fmt::layer();
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| "giskard=info,tower_http=info".into());
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer)
+        .with(capture_layer)
         .init();
 
-    if let Err(e) = run().await {
+    if let Err(e) = run(trace_handle).await {
         error!("{e}");
         eprintln!("giskard-server: {e}");
         std::process::exit(1);
     }
 }
 
-async fn run() -> Result<(), String> {
+async fn run(trace_handle: TraceHandle) -> Result<(), String> {
     let data_dir = default_data_dir();
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| format!("cannot create data dir {}: {e}", data_dir.display()))?;
@@ -141,7 +152,20 @@ async fn run() -> Result<(), String> {
 
     let factory = Arc::new(CodexFactory);
 
-    let state = AppState::new_with_config(store, factory, session_key, Some(&config.viz));
+    // Honor the configured initial capture mode (the buffer max_traces was set to the default in
+    // `main`; the armed flag is cheap to set here once config is known).
+    trace_handle
+        .set_armed(config.tracing.capture == giskard_persist::config::TracingCapture::Armed);
+    trace_handle.set_buffer_max_traces(config.tracing.buffer_max_traces);
+
+    let state = AppState::new_full(
+        store,
+        factory,
+        session_key,
+        Some(&config.viz),
+        Some(&config.tracing),
+        Some(trace_handle),
+    );
 
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind(&bind)

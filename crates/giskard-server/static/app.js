@@ -63,11 +63,257 @@ setInterval(updateRunningCommandDurations, 1000);
 async function api(method, path, body) {
   const opts = { method, headers:{} };
   if (body !== undefined) { opts.headers["Content-Type"]="application/json"; opts.body=JSON.stringify(body); }
+  // Join this request to the active browser trace (if any). The server's request_span_middleware
+  // nests its http.request span under our trace_id. No-op when capture is off.
+  const tp = trace.traceparent();
+  if (tp) opts.headers["traceparent"] = tp;
   const r = await fetch(path, opts);
   if (!r.ok) throw new Error((await r.text()) || r.status);
   const ct = r.headers.get("content-type")||"";
   return ct.includes("json") ? r.json() : r.text();
 }
+
+/* ---------- browser tracing recorder (spec §17.4) ----------
+   The server can only see its own compute; for a phone-over-network session the client-perceived
+   latency (network transit, HTTP/1.1 request queueing, connection setup) is invisible server-
+   side. This recorder emits UiSpans and joins them to server spans via a W3C `traceparent` header
+   on outbound fetch and via trace_id/parent_span_id carried on the WS Subscribe message. The
+   delta between a client span and its nested server span *is* the network/queue overhead.
+
+   Off = zero overhead: when capture is not armed (or ui_ingest is disabled), startSpan() returns
+   a no-op guard and no traceparent is propagated, no recorder state is allocated. The armed flag
+   is cached from GET /api/traces/config by refreshTraceConfig() and re-checked on arm. */
+const trace = (() => {
+  // Cached config gate — updated by refreshTraceConfig(). When false, all recorder operations
+  // are no-ops and no traceparent is emitted, preserving the "off = zero overhead" property.
+  let armed = false;
+  function setArmed(v) { armed = !!v; }
+  function isArmed() { return armed; }
+
+  // One active trace context (root span id + active span stack) at a time. A user action opens
+  // a root span; child spans push/pop on the stack for parent linkage.
+  let activeTraceId = null;
+  let activeSpanStack = [];   // stack of span_id strings, top is the current parent
+  let pending = [];           // buffered UiSpans awaiting flush
+
+  // Coerce every label value to a string. The server's wire contract is
+  // HashMap<String,String> (giskard-proto::UiSpan); JSON numbers/bools fail to deserialize and
+  // axum rejects the whole batch (422), dropping every span in it. Callers pass numeric/bool
+  // labels (e.g. turns: 50, has_more: true), so stringify here at the recorder boundary.
+  function stringifyLabels(obj) {
+    if (!obj) return {};
+    const out = {};
+    for (const k in obj) {
+      if (Object.prototype.hasOwnProperty.call(obj, k)) {
+        const v = obj[k];
+        out[k] = (v === null || v === undefined) ? "" : String(v);
+      }
+    }
+    return out;
+  }
+
+  // Microseconds since the Unix epoch, matching the server's SystemTime-based span times.
+  // performance.timeOrigin is the wall-clock epoch ms when navigation started; performance.now()
+  // is the monotonic ms since then. Sum -> epoch us.
+  function epochUs() {
+    return Math.round((performance.timeOrigin + performance.now()) * 1000);
+  }
+
+  // 32-hex trace id and 16-hex span id via crypto.getRandomValues (matches W3C shapes the server
+  // validates in parse_traceparent; random ids avoid the server-side tracing::Id recycling edge).
+  function randomHex(bytes) {
+    const a = new Uint8Array(bytes);
+    crypto.getRandomValues(a);
+    let s = "";
+    for (let i = 0; i < a.length; i++) s += a[i].toString(16).padStart(2, "0");
+    return s;
+  }
+  function newTraceId() { return randomHex(16); }      // 32 hex chars
+  function newSpanId() { return randomHex(8); }       // 16 hex chars
+
+  // Build a W3C traceparent header value for the *current* active span, so the server's
+  // request_span_middleware nests its http.request span under our trace. Returns "" when off.
+  function traceparent() {
+    if (!armed || !activeTraceId || activeSpanStack.length === 0) return "";
+    return `00-${activeTraceId}-${activeSpanStack[activeSpanStack.length-1]}-01`;
+  }
+
+  // Begin a named span. Returns a guard with .end(extraLabels) — or a no-op guard when off.
+  // When a trace context is active, the new span parents to the current top of stack; when not,
+  // the span becomes a root (fresh trace_id). Labels are an optional {k:v} object applied at start.
+  function startSpan(name, labels) {
+    if (!armed) return { end(){}, discard(){}, detach(){}, endWithResourceTiming(){} };
+    const traceId = activeTraceId || (activeTraceId = newTraceId());
+    const spanId = newSpanId();
+    const parentId = activeSpanStack.length ? activeSpanStack[activeSpanStack.length-1] : null;
+    const start = epochUs();
+    const startLabels = stringifyLabels(labels);
+    activeSpanStack.push(spanId);
+    let ended = false;
+    return {
+      // Detach this span from the active stack so later startSpan() calls parent to the same
+      // parent instead of chaining under this one. Needed for overlapping async fetch spans
+      // (renderMarkdown/renderLinkedText are called synchronously in a loop): without detach,
+      // each new fetch span takes the previous still-open fetch span as its parent, producing a
+      // degenerate chain (render_turns → fetch1 → fetch2 → …) instead of N siblings under
+      // render_turns. parent_span_id is captured at creation, so detaching after the
+      // synchronous initiation (e.g. after api() has read traceparent) is safe; the span still
+      // closes normally via end()/discard().
+      detach() {
+        const idx = activeSpanStack.lastIndexOf(spanId);
+        if (idx >= 0) activeSpanStack.splice(idx, 1);
+      },
+      end(extraLabels) {
+        if (ended) return; ended = true;
+        // Pop only our own id, so concurrent/overlapping guards can't desync the stack.
+        const idx = activeSpanStack.lastIndexOf(spanId);
+        if (idx >= 0) activeSpanStack.splice(idx, 1);
+        const span = {
+          name: name,
+          trace_id: traceId,
+          span_id: spanId,
+          parent_span_id: parentId,
+          start_us: start,
+          end_us: epochUs(),
+          labels: Object.assign({}, startLabels, stringifyLabels(extraLabels))
+        };
+        pending.push(span);
+        // If the root closed (stack empty), reset the trace context so the next user action
+        // starts a fresh trace_id (B-2: without this, every later action reuses one trace,
+        // collapsing the whole session into a giant trace and defeating the ring-buffer cap),
+        // then flush. Also cap pending so a runaway flow can't bloat memory before the root
+        // closes.
+        if (activeSpanStack.length === 0) { activeTraceId = null; flush(); }
+        else if (pending.length >= 64) flush();
+      },
+      // Close the span and attach Resource Timing labels for `url`. Same as end() but passes
+      // this span's own [start, end_us] window to resourceTimingLabels so a burst of fetches to
+      // the same URL disambiguate by overlap instead of every span picking the latest entry
+      // (N-2). extraLabels are merged after the timing labels (callers may override).
+      endWithResourceTiming(url, extraLabels) {
+        if (ended) return; ended = true;
+        const idx = activeSpanStack.lastIndexOf(spanId);
+        if (idx >= 0) activeSpanStack.splice(idx, 1);
+        const end = epochUs();
+        const span = {
+          name: name,
+          trace_id: traceId,
+          span_id: spanId,
+          parent_span_id: parentId,
+          start_us: start,
+          end_us: end,
+          labels: Object.assign({}, startLabels,
+            stringifyLabels(resourceTimingLabels(url, start, end)),
+            stringifyLabels(extraLabels))
+        };
+        pending.push(span);
+        if (activeSpanStack.length === 0) { activeTraceId = null; flush(); }
+        else if (pending.length >= 64) flush();
+      },
+      discard() {
+        // Drop this span without recording (used when a flow errors before its span closes,
+        // so the stack doesn't wedge on a never-ending root). Idempotent vs end().
+        if (ended) return; ended = true;
+        const idx = activeSpanStack.lastIndexOf(spanId);
+        if (idx >= 0) activeSpanStack.splice(idx, 1);
+        if (activeSpanStack.length === 0) activeTraceId = null;
+      }
+    };
+  }
+
+  // Discard any dangling open spans and reset the trace context. Called at the top of openThread
+  // (before starting a new flow), on subscribe error, and on ws.onclose, so a flow that errored
+  // before its spans closed (no HistoryPage, network failure) does not wedge the recorder with a
+  // never-closing root that every later span nests under (B-3).
+  function reset() {
+    activeSpanStack = [];
+    activeTraceId = null;
+    // Keep pending spans so a partial capture still flushes; reset only the live context.
+    flush();
+  }
+
+  // Flush pending spans to POST /api/traces/ui. 409 (not armed) / 404 (ingest off) degrade to a
+  // console.debug per the O6 contract — never a toast, never a retry loop.
+  let flushing = false;
+  async function flush() {
+    if (pending.length === 0 || flushing) return;
+    const batch = pending.splice(0, pending.length);
+    flushing = true;
+    try {
+      await fetch("/api/traces/ui", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ spans: batch })
+      }).then(r => {
+        if (r.status === 404 || r.status === 409) {
+          console.debug("[giskard trace] ui ingest dropped", r.status);
+        } else if (!r.ok) {
+          console.debug("[giskard trace] ui ingest failed", r.status);
+        }
+      });
+    } catch (e) {
+      console.debug("[giskard trace] ui ingest error", e && e.message);
+    } finally {
+      flushing = false;
+    }
+  }
+
+  // Return the current active trace context ({trace_id, span_id}) so a WS Subscribe message
+  // can carry it and the server's ws.subscribe span nests under the current browser span.
+  // Returns null when off or no trace is active.
+  function openThreadContext() {
+    if (!armed || !activeTraceId || activeSpanStack.length === 0) return null;
+    return { trace_id: activeTraceId, span_id: activeSpanStack[activeSpanStack.length-1] };
+  }
+
+  // Extract Resource Timing labels for a fetch URL. The server only sees its own compute; the
+  // client↔server delta is the network/queue overhead, and Resource Timing turns that opaque
+  // gap into an actual breakdown (dns / tcp / tls / ttfb / download / transfer_size). Returns
+  // numeric values; the recorder stringifies them at span-close (stringifyLabels), so callers
+  // may pass numbers directly. Returns {} when the Performance API is unavailable or no entry
+  // matches (e.g. the resource was served from cache with no timing).
+  //
+  // Attribution: a burst of POSTs to the same URL produces many entries with the same `name`,
+  // so "last match by name" mis-attributes (every span gets the latest entry). When a span
+  // window [startUs, endUs] is supplied, we pick the entry whose [startTime, responseEnd]
+  // (in ms since navigation) overlaps the span's window (converted to ms since navigation),
+  // falling back to last-by-name only when no entry overlaps. This makes per-call network
+  // breakdowns accurate for the burst case these labels exist to illuminate (N-2).
+  function resourceTimingLabels(url, startUs, endUs) {
+    const labels = {};
+    if (!url || !performance || !performance.getEntriesByType) return labels;
+    const entries = performance.getEntriesByType("resource");
+    let entry = null;
+    if (startUs !== undefined && endUs !== undefined) {
+      // span window in ms since navigation: epochUs = (timeOrigin + now)*1000, so
+      // ms-since-navigation = (us / 1000) - timeOrigin.
+      const spanStartMs = startUs / 1000 - performance.timeOrigin;
+      const spanEndMs = endUs / 1000 - performance.timeOrigin;
+      for (let i = entries.length - 1; i >= 0; i--) {
+        const e = entries[i];
+        if (e.name === url && e.startTime <= spanEndMs && e.responseEnd >= spanStartMs) {
+          entry = e; break;
+        }
+      }
+    }
+    if (!entry) {
+      for (let i = entries.length - 1; i >= 0; i--) {
+        if (entries[i].name === url) { entry = entries[i]; break; }
+      }
+    }
+    if (!entry) return labels;
+    labels.dns_ms = Math.round(entry.domainLookupEnd - entry.domainLookupStart);
+    labels.tcp_ms = Math.round(entry.connectEnd - entry.connectStart);
+    labels.tls_ms = Math.round(entry.secureConnectionStart > 0
+      ? entry.connectEnd - entry.secureConnectionStart : 0);
+    labels.ttfb_ms = Math.round(entry.responseStart - entry.requestStart);
+    labels.download_ms = Math.round(entry.responseEnd - entry.responseStart);
+    labels.transfer_size = entry.transferSize || 0;
+    return labels;
+  }
+
+  return { setArmed, isArmed, startSpan, traceparent, flush, openThreadContext, reset, resourceTimingLabels };
+})();
 
 /* ---------- auth ---------- */
 $("loginForm").onsubmit = async (e) => {
@@ -1230,6 +1476,17 @@ function openDraftThread(pid, defaultModel) {
 /* ---------- thread view + websocket ---------- */
 async function openThread(pid, tid, title, opts) {
   opts = opts || {};
+  // Reset any dangling trace context from a prior flow that errored before its spans closed
+  // (no HistoryPage, WS failure) so the recorder doesn't wedge on a never-closing root and the
+  // next action starts a fresh trace_id. No-op when capture is off.
+  trace.reset();
+  // Browser tracing root span for the thread-open flow (spec §17.3/17.4). When capture is off,
+  // startSpan returns a no-op guard. The root spans tap→paint; children below nest under it.
+  const openSpan = trace.startSpan("ui.open_thread", { thread_id: String(tid) });
+  // Child span from "Subscribe sent" to "HistoryPage received" — the gap between this and the
+  // server's ws.subscribe span IS the network + queue overhead the server can't see.
+  state.traceAwaitHistory = trace.startSpan("ui.await_history_page", { thread_id: String(tid) });
+  state.traceOpenSpan = openSpan;
   saveComposerDraft();
   if (!opts.firstTurnStarting) state.firstTurnStartingThreadId = null;
   if (opts.focusApprovalId) {
@@ -1244,6 +1501,9 @@ async function openThread(pid, tid, title, opts) {
     res = await api("POST",`/api/projects/${pid}/threads`,{ thread_id:tid, resume:null });
     tid = res.thread_id || tid;
   } catch (e) {
+    // Thread-open failed: discard the trace spans we just started so they don't wedge the
+    // recorder (B-3). reset() drops the dangling context; the next openThread starts fresh.
+    trace.reset();
     if (opts.silent) { localStorage.removeItem("giskard.lastThread"); return; }
     alert("Open thread failed: "+e.message);
     return;
@@ -1418,15 +1678,20 @@ async function connectWs(opts) {
     // after our newest one (`since`). The server replies with a HistoryDelta and we keep the
     // immutable completed-turn DOM, repainting only the in-flight turn. Without a cursor (nothing
     // rendered yet) fall back to a full resync that rewrites the transcript.
+    // Carry the active browser trace context (if any) on either branch so the server's
+    // ws.subscribe span nests under ui.open_thread (spec §17.4). No-op when capture is off.
+    const sub = { type:"subscribe", thread_id: state.threadId };
     if (state.newestPersistedTurnId) {
       state.awaitingIncrementalResync = true;
       state.awaitingThreadResync = false;
-      send({ type:"subscribe", thread_id: state.threadId, since: state.newestPersistedTurnId });
+      sub.since = state.newestPersistedTurnId;
     } else {
       state.awaitingThreadResync = true;
       state.awaitingIncrementalResync = false;
-      send({ type:"subscribe", thread_id: state.threadId });
     }
+    const ctx = trace.openThreadContext();
+    if (ctx) { sub.trace_id = ctx.trace_id; sub.parent_span_id = ctx.span_id; }
+    send(sub);
   };
   ws.onmessage = (m) => {
     if (state.ws !== ws) return;
@@ -1445,6 +1710,10 @@ async function connectWs(opts) {
   ws.onclose = (ev) => {
     if (state.ws !== ws) return;
     state.ws = null;
+    // The WS closed before a HistoryPage could arrive: any in-flight ui.await_history_page /
+    // ui.open_thread span would never close, wedging the recorder (B-3). Discard the dangling
+    // trace context so the next openThread starts fresh. No-op when capture is off.
+    trace.reset();
     if (ws._giskardExpectedClose) return;
     const reason = ev.reason ? ` ${ev.reason}` : "";
     const code = ev.code ? ` (${ev.code})` : "";
@@ -2069,6 +2338,16 @@ function renderHistoryPage(msg) {
   // aggregates) own the gauge, so a staler value from the newest persisted turn must not clobber it.
   if (!older && !state.activeTurn) updateGaugeFromTurns(turns);
 
+  // Browser tracing: the first (non-older) HistoryPage closes the await-history child span —
+  // the gap between this and the server's ws.subscribe span is the network/queue overhead. The
+  // render span wraps the DOM build and closes on the next rAF to include layout/paint; the root
+  // ui.open_thread closes with it (tap→paint). No-ops when capture is off.
+  let renderSpan = null;
+  if (!older) {
+    if (state.traceAwaitHistory) { state.traceAwaitHistory.end({ turns: turns.length, has_more: !!msg.has_more }); state.traceAwaitHistory = null; }
+    renderSpan = trace.startSpan("ui.render_turns", { turns: turns.length });
+  }
+
   // Every page renders into a detached container and is prepended above existing content, so the
   // live turn (rendered first, at the bottom) and any already-loaded history stay in place.
   const container = document.createElement("div");
@@ -2084,6 +2363,7 @@ function renderHistoryPage(msg) {
   const heightBefore = t.scrollHeight;
   const anchor = t.firstChild;   // insert before current top-most content (or append if empty)
   while (container.firstChild) t.insertBefore(container.firstChild, anchor);
+
   if (older) {
     // Preserve the viewport so it doesn't jump while older content is inserted (infinite scroll).
     t.scrollTop += t.scrollHeight - heightBefore;
@@ -2176,6 +2456,16 @@ function maybeAutoFillHistory() {
   if (!send({ type:"load_history", thread_id: state.threadId, before: state.oldestTurnId, limit: HISTORY_FILL_BATCH })) {
     state.loadingHistory = false;
     state.pendingOlder = false;
+  }
+
+  // Close the render span (and the root ui.open_thread) after layout/paint lands, so the span
+  // covers the actual click→paint latency the user feels. requestAnimationFrame fires just
+  // before paint; a second nested rAF fires after the paint of this frame, capturing it.
+  if (renderSpan) {
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      renderSpan.end();
+      if (state.traceOpenSpan) { state.traceOpenSpan.end(); state.traceOpenSpan = null; }
+    }));
   }
 }
 
@@ -4303,13 +4593,31 @@ function renderMarkdown(el, text) {
     return;
   }
 
-  api("POST", `/api/projects/${projectId}/render`, { text })
+  // Wrap the render fetch in a client span so the client↔server delta (network + HTTP/1.1
+  // request queueing) is visible. resourceTimingLabels turns the delta into a network
+  // breakdown (dns/tcp/tls/ttfb/download/transfer_size). The api() helper injects
+  // traceparent, so the server's http.request span nests under this fetch span. No-op
+  // when capture is off. route uses a template (not the literal id) per the spec's
+  // cardinality rule.
+  const renderUrl = `/api/projects/${projectId}/render`;
+  const fetchSpan = trace.startSpan("ui.fetch.render_markdown", { route: "/api/projects/{id}/render" });
+  // The traceparent header is captured synchronously inside api() from the top of the active
+  // stack (= fetchSpan). Detach now so a sibling fetch started later in the same render pass
+  // doesn't chain-parent under this still-open span (N-1: overlapping async fetch spans must
+  // be siblings under ui.render_turns, not a degenerate chain).
+  const p = api("POST", renderUrl, { text });
+  fetchSpan.detach();
+  p
     .then((res) => {
+      // The server's http.request span (nested via traceparent) carries the actual HTTP
+      // status; here we only attach the client-visible network breakdown.
+      fetchSpan.endWithResourceTiming(location.origin + renderUrl);
       const html = res && typeof res.html === "string" ? res.html : "";
       state.markdownCache.set(cacheKey, html);
       apply(html);
     })
     .catch((e) => {
+      fetchSpan.discard();
       console.warn("Giskard markdown render failed; keeping plain text fallback.", e);
     });
 }
@@ -4397,13 +4705,22 @@ function renderLinkedText(el, text) {
     return;
   }
 
-  api("POST", `/api/projects/${projectId}/linkify`, { text })
+  const linkifyUrl = `/api/projects/${projectId}/linkify`;
+  const fetchSpan = trace.startSpan("ui.fetch.linkify", { route: "/api/projects/{id}/linkify" });
+  // Detach after api() captures the traceparent header synchronously, so sibling linkify
+  // fetches started later in the same render pass parent to render_turns, not under this
+  // span (N-1).
+  const p = api("POST", linkifyUrl, { text });
+  fetchSpan.detach();
+  p
     .then((res) => {
+      fetchSpan.endWithResourceTiming(location.origin + linkifyUrl);
       const links = Array.isArray(res.links) ? res.links : [];
       state.linkifyCache.set(cacheKey, links);
       apply(links);
     })
     .catch((e) => {
+      fetchSpan.discard();
       console.warn("Giskard linkification failed; keeping plain text fallback.", e);
     });
 }
@@ -5115,10 +5432,22 @@ async function openDiffOverlay(path, diff) {
       apply(state.markdownCache.get(cacheKey));
       return;
     }
-    const res = await api("POST", `/api/projects/${projectId}/render`, { text: markdown });
-    const html = res && typeof res.html === "string" ? res.html : "";
-    state.markdownCache.set(cacheKey, html);
-    apply(html);
+    const diffRenderUrl = `/api/projects/${projectId}/render`;
+    const fetchSpan = trace.startSpan("ui.fetch.render_diff", { route: "/api/projects/{id}/render" });
+    // The traceparent header is captured synchronously at the start of api() (before the
+    // await). Detach before awaiting so a later sibling doesn't chain-parent under this span.
+    const fetchP = api("POST", diffRenderUrl, { text: markdown });
+    fetchSpan.detach();
+    try {
+      const res = await fetchP;
+      fetchSpan.endWithResourceTiming(location.origin + diffRenderUrl);
+      const html = res && typeof res.html === "string" ? res.html : "";
+      state.markdownCache.set(cacheKey, html);
+      apply(html);
+    } catch (inner) {
+      fetchSpan.discard();
+      throw inner;
+    }
   } catch (e) {
     if (!$("codeOverlay").classList.contains("open") || $("codeOverlay").dataset.requestId !== requestId || state.codePath !== null || state.projectId !== projectId) return;
     console.warn("Giskard diff render failed; hiding raw diff preview.", e);
@@ -5649,12 +5978,119 @@ function setupResizer(handle, cssVar, storeKey, isLeft, fallback) {
 initResizers();
 
 /* ---------- settings menu ---------- */
+
+/* ---------- on-demand tracing controls (spec §17) ----------
+   Lets the user arm/disarm capture and download a Perfetto/Chrome trace from the UI,
+   so a phone-only session can profile a flow (e.g. slow thread load) without a terminal.
+   - GET /api/traces/config -> {armed, ui_ingest_enabled}
+   - POST /admin/trace/arm {armed:true|false} -> same shape
+   - GET /admin/trace -> Chrome trace-event JSON (only meaningful while armed; flushes buffer) */
+let traceArmed = false;
+async function refreshTraceConfig() {
+  const statusEl = $("traceStatus");
+  const armBtn = $("traceArmBtn");
+  const dlBtn = $("traceDownloadBtn");
+  const hint = $("traceHint");
+  const countEl = $("traceCount");
+  if (!statusEl) return;
+  let traceCount = 0, spanCount = 0;
+  try {
+    const cfg = await api("GET", "/api/traces/config");
+    traceArmed = !!(cfg && cfg.armed);
+    traceCount = (cfg && cfg.trace_count) || 0;
+    spanCount = (cfg && cfg.span_count) || 0;
+    // Drive the recorder gate: spans/traceparent are emitted only when capture is armed AND UI
+    // ingest is enabled. When off, startSpan/traceparent are no-ops (zero overhead).
+    trace.setArmed(traceArmed && !!(cfg && cfg.ui_ingest_enabled));
+  } catch (err) {
+    // Not authenticated or endpoint unavailable: keep panel inert, no toasts.
+    traceArmed = false;
+    trace.setArmed(false);
+  }
+  statusEl.textContent = traceArmed ? "●" : "○";
+  statusEl.classList.toggle("armed", traceArmed);
+  statusEl.title = traceArmed ? "Capture is armed" : "Capture is off";
+  if (armBtn) armBtn.textContent = traceArmed ? "Disarm tracing" : "Arm tracing";
+  // Download is meaningful only when armed AND there is something in the buffer to drain.
+  if (dlBtn) dlBtn.disabled = !traceArmed || spanCount === 0;
+  if (hint) hint.textContent = traceArmed
+    ? "Armed. Trigger the flow (e.g. open a thread), then Download."
+    : "Off. Arm, trigger the flow (e.g. open a thread), then Download.";
+  if (countEl) {
+    if (traceArmed && spanCount > 0) {
+      countEl.hidden = false;
+      countEl.textContent = `${spanCount} span${spanCount === 1 ? "" : "s"} across ${traceCount} trace${traceCount === 1 ? "" : "s"}.`;
+    } else {
+      countEl.hidden = true;
+      countEl.textContent = "";
+    }
+  }
+}
+if ($("traceArmBtn")) $("traceArmBtn").onclick = async () => {
+  const btn = $("traceArmBtn");
+  if (btn) btn.disabled = true;
+  try {
+    await api("POST", "/admin/trace/arm", { armed: !traceArmed });
+  } catch (err) {
+    notice("Tracing arm failed: " + err.message, "warning");
+  } finally {
+    if (btn) btn.disabled = false;
+    refreshTraceConfig();
+  }
+};
+if ($("traceDownloadBtn")) $("traceDownloadBtn").onclick = async () => {
+  if (!traceArmed) { notice("Arm tracing first, then Download.", "warning"); return; }
+  const btn = $("traceDownloadBtn");
+  if (btn) { btn.disabled = true; btn.textContent = "Capturing…"; }
+  // Snapshot the buffer counts before the draining export so the toast can report what shipped.
+  let beforeTraces = 0, beforeSpans = 0;
+  try {
+    const cfg = await api("GET", "/api/traces/config");
+    beforeTraces = (cfg && cfg.trace_count) || 0;
+    beforeSpans = (cfg && cfg.span_count) || 0;
+  } catch {}
+  if (beforeSpans === 0) {
+    if (btn) { btn.disabled = false; btn.textContent = "Download trace"; }
+    notice("Nothing captured yet. Trigger the flow (e.g. open a thread), then Download.", "warning");
+    return;
+  }
+  try {
+    // Ask the server to flush and return Chrome trace-event JSON. Trigger via fetch (not api())
+    // because api() tries to parse JSON; we want the raw Blob for download.
+    const r = await fetch("/admin/trace", { method: "GET" });
+    if (!r.ok) {
+      const msg = (await r.text()) || r.status;
+      throw new Error(msg);
+    }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    // Include a timestamp so repeated captures don't clobber each other on the phone.
+    const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    a.href = url;
+    a.download = `giskard-trace-${ts}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    notice(`Exported ${beforeSpans} span${beforeSpans === 1 ? "" : "s"} across ${beforeTraces} trace${beforeTraces === 1 ? "" : "s"}. Open in chrome://tracing or perfetto.dev.`, "info");
+  } catch (err) {
+    notice("Trace download failed: " + err.message, "warning");
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "Download trace"; }
+    // Refresh status so the count resets to 0 after the draining download (avoids a second
+    // download returning an empty file, which would look broken).
+    refreshTraceConfig();
+  }
+};
+
 function closeSettingsMenu() {
   $("settingsMenu").hidden = true;
 }
 function toggleSettingsMenu() {
   const menu = $("settingsMenu");
   menu.hidden = !menu.hidden;
+  if (!menu.hidden) refreshTraceConfig();
 }
 $("settingsBtn").onclick = (e) => { e.stopPropagation(); toggleSettingsMenu(); };
 $("settingsMenu").onclick = (e) => e.stopPropagation();

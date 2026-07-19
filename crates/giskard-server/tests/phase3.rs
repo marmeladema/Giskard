@@ -269,6 +269,8 @@ async fn modes_models_approvals_and_plan_dump() {
     ws.send(ws_text(&ClientMessage::Subscribe {
         thread_id: tid,
         since: None,
+        trace_id: None,
+        parent_span_id: None,
     }))
     .await
     .unwrap();

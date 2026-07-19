@@ -786,6 +786,7 @@
 14. [Testing Strategy](#14-testing-strategy)
 15. [Implementation Phases](#15-implementation-phases)
 16. [Appendices](#16-appendices)
+17. [Tracing](#17-tracing)
 
 ---
 
@@ -2736,6 +2737,137 @@ prerequisite, config reference, admin tooling); corruption/crash-recovery tests.
 
 
 ---
+
+## 17. Tracing
+
+On-demand **tracing** answers "where is the time spent for a given request or flow" by recording
+`tracing` spans across backend operations, HTTP/WebSocket networking, and UI rendering into a
+single Perfetto waterfall. It **complements** (does not replace) the O1–O8 structured logs: logs
+diagnose *what* happened at decision points; traces show *how long* each step took and how the
+steps nest.
+
+### 17.1 Representation & storage
+
+- The source is `tracing` `#[instrument]` spans carrying stable fields (`project_id`,
+  `thread_id`, `turn_id`, `method`, `route`, `op`, `harness`, `outcome`).
+- A custom `tracing_subscriber::Layer` (`giskard-server/src/trace.rs`) records completed spans
+  into a **bounded in-memory ring buffer keyed by W3C `trace_id`** (oldest evicted on overflow).
+- Capture is **off by default** and must be **armed** (config `[tracing].capture = "armed"` or
+  `POST /admin/trace/arm`). When disarmed the layer is a no-op (no allocation).
+- The buffer is per-process, in-memory, and **reset on restart** — no on-disk persistence and no
+  retention (local-first, single-user v1). No external collector is required; OTLP export to
+  Jaeger/Tempo is a future opt-in, out of scope for this cut.
+
+### 17.2 Export & endpoints (all auth-gated)
+
+- `GET /admin/trace[?trace_id=…]` — flushes the armed buffer and returns **Chrome trace-event
+  JSON** (`Content-Type: application/json; charset=utf-8`), viewable in `chrome://tracing` or
+  perfetto.dev. Each span is emitted as an **async** begin/end pair (`{"ph":"b"}` at `start_us`,
+  `{"ph":"e"}` at `end_us`, shared `id = span_id`) so overlapping/concurrent spans do not require
+  strict timestamp nesting on a single track. **Note:** this GET is **draining** (it clears the
+  armed buffer as a side effect), so it is neither safe nor idempotent despite the method. A
+  speculative/prefetch/proxy GET would silently discard traces; treat it as a one-shot export.
+  The UI download button relies on this side effect.
+- `POST /admin/trace/arm` (`{"armed": bool}`) — arms or disarms capture.
+- `GET /api/traces/config` — returns `{"armed": bool, "ui_ingest_enabled": bool}` so the browser
+  learns whether to emit UI spans.
+- `POST /api/traces/ui` — merges a browser `UiSpanBatch` into the shared buffer (see §17.4).
+- When capture is **not armed**, `GET /admin/trace` and `POST /api/traces/ui` return `409` with a
+  structured "capture is not armed" message (browser logs a console warning, O6-style
+  degradation). Arming is dynamic via `POST /admin/trace/arm`; the `[tracing].capture` config only
+  sets the *initial* armed state, so there is no separate "feature disabled" response at runtime.
+- `POST /api/traces/ui` returns `404` when `[tracing].ui_ingest_enabled = false` (the feature is
+  hidden from the browser).
+- All endpoints are behind the app auth gate; traces carry workspace/turn context and must not
+  be public.
+
+### 17.3 Span taxonomy
+
+- **HTTP request span** (middleware): one span per request with `method` + matched **template**
+  route (`/api/projects/{id}`, never the literal id) + `status`.
+- **Thread-load flow** (the motivating investigation): a WS `Subscribe` opens a `ws.subscribe`
+  root with sub-spans for the project metadata read (`load_thread`), the history load
+  (`load_history` → `current_history_cache_entry[cache_hit]` → `load_all_turns_uncached[bytes,
+  turns, attempts]` / `install_history_cache` → `history_page_slice[page_turns]`), the live
+  snapshot, the running-tasks snapshot, and the outbound `HistoryPage` send. This pinpoints
+  whether a slow thread open is the full-file JSONL read+parse, the cache miss, the page clone,
+  the WS send, or the browser render.
+- **Turn/harness flow**: `registry` turn startup/forwarding → child harness spans
+  (`turn_start`, `interrupt`, `compact`, with `harness="codex"`) → hub/ledger children.
+- **WebSocket**: one long-lived session span per connection; per-message spans as children.
+- **UI render spans** (browser, *scaffolding*): the wire types and `/api/traces/ui` ingest
+  endpoint exist (§17.4), but the shipped vanilla-JS UI does **not** yet emit `UiSpan`s. The
+  future Dioxus/`giskard-ui` crate is expected to emit per-render-pass and per-interaction
+  spans as children of the flow root. Until then a trace is server-side only.
+- **Browser spans** (shipped vanilla-JS UI): the recorder in `app.js` emits `ui.open_thread`
+  (tap→paint root), `ui.await_history_page` (Subscribe sent → HistoryPage received), and
+  `ui.render_turns` (DOM build, closed on the next `requestAnimationFrame` to include
+  layout/paint). These nest server-side spans via `traceparent` (§17.4); the gap between
+  `ui.await_history_page` and the server `ws.subscribe` span *is* the network + browser-queue
+ overhead the server cannot see — the deliverable for a phone-over-network session.
+- **Per-call fetch spans** (browser): the recorder wraps each `api("POST", .../render |
+  .../linkify | .../render (diff)` call in a `ui.fetch.render_markdown` / `ui.fetch.linkify` /
+  `ui.fetch.render_diff` span (label `route` uses the template path, never the literal id).
+  On success the span closes with Resource Timing labels (`dns_ms` / `tcp_ms` / `tls_ms` /
+  `ttfb_ms` / `download_ms` / `transfer_size`) extracted from `performance.getEntriesByType(
+  "resource")`, turning the client↔server delta into an actual network breakdown rather than an
+  opaque gap. The server's `http.request` span nests under the fetch span via the `traceparent`
+  header the `api()` helper injects, so a single waterfall shows the client wall-clock, the
+  network breakdown, and the server compute. Fetch spans are discarded (not recorded) when the
+  request fails, so the recorder does not wedge on an errored fetch. Because the render helpers
+  call these fetches synchronously in a loop, each fetch span is `detach()`ed from the active
+  stack right after `api()` captures the `traceparent` header, so sibling fetches parent to
+  `ui.render_turns` instead of chaining under the previous still-open fetch span; and Resource
+  Timing attribution disambiguates a burst of same-URL fetches by overlap with the span's own
+  `[start_us, end_us]` window (not "last match by name"), so each span gets its own network
+  breakdown rather than every span picking the latest entry.
+
+
+### 17.4 UI span ingest & `traceparent` propagation
+
+- `giskard-proto` defines `UiSpan { name, trace_id, span_id, parent_span_id, start_us, end_us,
+  labels }` and `UiSpanBatch { spans }` (batch capped at 256).
+- `POST /api/traces/ui` validates the batch size and required fields; malformed spans (empty
+  ids, negative duration) are dropped with a `debug` log (never silently). Unknown/oversized
+  batches return `400`.
+- The browser generates the root trace context for a user action and propagates it as a W3C
+  `traceparent` header on outbound `fetch`/WS so server-side spans attach as children of the
+  same `trace_id`; the server merges browser and server spans into one Perfetto file. For the
+  WebSocket thread-load flow (the motivating case, which has no HTTP request span), the
+  `Subscribe` message carries `trace_id` + `parent_span_id` in its payload so `ws.subscribe`
+  nests under the browser's `ui.open_thread` span — the HTTP `traceparent` header does not
+  cover per-message flows. `GET /api/traces/config` also returns non-draining `trace_count` and
+  `span_count` so the UI can show "N spans" without consuming the capture.
+  The `Subscribe` payload carries the incremental-resync `since` cursor (§13.6 / H8) and the
+  W3C trace context together, so a reconnect can request a delta *and* nest its `ws.subscribe`
+  span under the browser's `ui.open_thread` span in the same message.
+- All label values are coerced to strings at the recorder boundary (`String(v)`), because
+  the wire contract is `HashMap<String,String>` and raw JSON numbers/bools cause axum to
+  reject the whole batch (422). The per-call fetch spans attach Resource Timing labels as
+  numeric values that the recorder stringifies on close, so callers may pass numbers directly.
+- The served UI (today the vanilla-JS single page in `giskard-server/static`) exposes a
+  **Settings → Tracing** panel that arms/disarms capture and downloads the Perfetto JSON
+  directly, so a phone-only session can profile a flow without a terminal. The vanilla-JS UI
+  ships a browser recorder (`app.js`): `startSpan(name, labels)` returns a guard with
+  `.end(extraLabels)`, ids are 32/16-hex via `crypto.getRandomValues`, timestamps are
+  `performance.timeOrigin + performance.now()` in microseconds, and spans are flushed to
+  `POST /api/traces/ui` in batches. The recorder is gated on `armed && ui_ingest_enabled`
+  (zero overhead when off). The future Dioxus/`giskard-ui` crate is expected to reuse this
+  wire contract.
+
+### 17.5 Config
+
+```toml
+[tracing]
+capture = "off"            # "off" (default) | "armed"
+buffer_max_traces = 256    # in-memory ring buffer size (oldest evicted)
+ui_ingest_enabled = true   # whether the browser may POST /api/traces/ui
+```
+
+Label cardinality is bounded: the HTTP `route` label uses template paths (no literal ids); UI
+span label keys are accepted as given and the recorder is single-user, so cardinality is
+naturally limited. No `unwrap`/`expect`/`panic!` in the runtime paths; buffer eviction, header
+parse, and batch validation return typed errors and log stable context.
 
 ## 16. Appendices
 

@@ -144,6 +144,52 @@ routing decisions, and visibility/focus state. Use **Copy** from that panel when
 browser-only problem; **Test notification** verifies the browser/OS notification path without
 waiting for an approval request.
 
+### On-demand tracing (where is the time spent)
+
+Giskard can record per-flow `tracing` spans across backend operations, HTTP/WebSocket, and the
+browser, and export them as a Perfetto/Chrome trace waterfall so you can see exactly where a
+request or flow spends time. Capture is **off by default**.
+
+**From the UI (no terminal needed, works from a phone):** open **Settings → Tracing**, tap
+**Arm tracing**, trigger the flow you want to profile (e.g. open a slow thread), then tap
+**Download trace**. The browser downloads `giskard-trace-<timestamp>.json`; open it in
+`chrome://tracing` or upload it to <https://perfetto.dev>. Tap **Disarm tracing** to stop.
+
+**From a terminal (headless/operator):** arm it, trigger the flow, then download the trace:
+
+```bash
+# 1. Arm capture (auth cookie required; log in first to get giskard_session=...):
+curl -sS -X POST http://127.0.0.1:8787/admin/trace/arm \
+  -H 'cookie: giskard_session=<your-session>' -H 'content-type: application/json' \
+  -d '{"armed": true}'
+
+# 2. Trigger the flow you want to profile (e.g. open a slow thread in the UI).
+
+# 3. Download the trace (Chrome trace-event JSON) and disarm:
+curl -sS http://127.0.0.1:8787/admin/trace -H 'cookie: giskard_session=<your-session>' \
+  -o /tmp/giskard-trace.json
+curl -sS -X POST http://127.0.0.1:8787/admin/trace/arm \
+  -H 'cookie: giskard_session=<your-session>' -H 'content-type: application/json' \
+  -d '{"armed": false}'
+```
+
+Open the downloaded `.json` in `chrome://tracing` or upload it to <https://perfetto.dev>. For a
+slow thread open, look for the browser's `ui.open_thread` root span and its children:
+`ui.await_history_page` (Subscribe sent → HistoryPage received) and `ui.render_turns` (DOM
+build → paint), nesting the server's `ws.subscribe` span with its children `load_thread` (the
+project metadata read), `current_history_cache_entry` (`cache_hit` label),
+`load_all_turns_uncached` (`bytes`/`turns`/`attempts` labels) with `install_history_cache` after
+a cache miss, and `history_page_slice` (`page_turns`/`has_more` labels). The gap between
+`ui.await_history_page` and `ws.subscribe` is the network + browser-queue overhead the server
+cannot see — the answer for a phone-over-network session. Set `[tracing] capture = "armed"` in
+`config.toml` to start armed at startup, and `ui_ingest_enabled = false` to keep the browser
+out of traces. Per-call HTTP helper calls (`/api/projects/{id}/render`, `.../linkify`, and the
+diff `/api/projects/{id}/render`) are also wrapped in `ui.fetch.render_markdown` /
+`ui.fetch.linkify` / `ui.fetch.render_diff` client spans that close with Resource Timing labels
+(`dns_ms`/`tcp_ms`/`tls_ms`/`ttfb_ms`/`download_ms`/`transfer_size`), so the same waterfall shows
+the per-call network breakdown and the HTTP/1.1 request queueing that serializes bursts of
+render/linkify calls during a transcript paint. See spec §17 for the full model.
+
 ---
 
 ## Configuration
@@ -167,6 +213,9 @@ service does not silently run with an empty provider list.
 | `[history]` | `initial` / `page` | `5` / `5` | Turns fetched on open (topped up client-side to ~2 screens) / per scroll-up page. |
 | `[harness]` | `kind` | `codex` | Agent harness (v1: `codex`). |
 | | `idle_shutdown_secs` | `0` (keep alive) | Terminate an idle project's harness after N seconds. |
+| `[tracing]` | `capture` | `off` | On-demand tracing: `off` or `armed` (start armed at startup). |
+| | `buffer_max_traces` | `256` | In-memory trace ring buffer size (oldest evicted). |
+| | `ui_ingest_enabled` | `true` | Whether the browser may submit UI spans to `POST /api/traces/ui`. |
 | `[[providers]]` | `id`, `name`, `wire_api`, `base_url?`, `model_listing`, `api_key?` / `api_key_env?`, `[[providers.models]]` | — | What the model picker offers. With `model_listing = true` + `base_url` the picker is refreshed from `GET {base_url}/models` (on load, and via the ↻ button), so `[[providers.models]]` becomes optional. Set `api_key` (inline) or `api_key_env` (env-var name) for endpoints that require auth — sent as `Authorization: Bearer …`. |
 
 Provider config governs the **picker** and optional `/v1/models` discovery only — Codex itself

@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use giskard_core::ids::{ProjectId, ThreadId, TurnId};
 
 pub mod wire;
+pub use wire::{UiSpan, UiSpanBatch};
 pub use wire::{
     WireAgentEvent, WireApprovalKind, WireApprovalMetadata, WireApprovalRequest, WireFileDiff,
     WireHarnessError, WireItem, WireItemPayload, WireTurn,
@@ -48,6 +49,12 @@ pub enum ClientMessage {
         /// and repaints only the in-flight turn. Omitted (or unresolvable) → a full snapshot.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         since: Option<TurnId>,
+        /// Optional W3C trace context so the server's `ws.subscribe` span nests under the
+        /// browser's `ui.open_thread` span (spec §17.4). Absent on older clients.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trace_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_span_id: Option<String>,
     },
     Unsubscribe {
         thread_id: ThreadId,

@@ -650,6 +650,7 @@ dependencies = [
  "giskard-persist",
  "giskard-proto",
  "hmac",
+ "parking_lot",
  "pulldown-cmark",
  "rand 0.8.6",
  "regex",

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
+use tracing::instrument;
 
 use giskard_core::ids::{ProjectId, ThreadId, TurnId};
 use giskard_core::model::{Effort, ModelRef};
@@ -247,6 +248,7 @@ impl PersistStore {
             .cloned()
     }
 
+    #[instrument(skip(self, turns), name = "install_history_cache", fields(thread_id = %thread, turns = turns.len()))]
     async fn install_history_cache(
         &self,
         project: ProjectId,
@@ -265,6 +267,7 @@ impl PersistStore {
         entry
     }
 
+    #[instrument(skip(self), fields(thread_id = %thread, cache_hit = tracing::field::Empty))]
     async fn current_history_cache_entry(
         &self,
         project: ProjectId,
@@ -279,10 +282,12 @@ impl PersistStore {
         if let Some(entry) = self.history_cache_entry(project, thread).await {
             let cached_meta = *entry.meta.lock().await;
             if cached_meta == meta {
+                tracing::Span::current().record("cache_hit", true);
                 return Ok(Some(entry));
             }
         }
 
+        tracing::Span::current().record("cache_hit", false);
         let Some((turns, meta)) = self.load_all_turns_uncached(&path, meta).await? else {
             self.invalidate_history_cache(project, thread).await;
             return Ok(None);
@@ -469,6 +474,7 @@ impl PersistStore {
     // ---- Threads ----
 
     /// Load a thread file.
+    #[instrument(skip(self), fields(thread_id = %thread, bytes, turns, attempts))]
     pub async fn load_thread(
         &self,
         project: ProjectId,
@@ -576,6 +582,7 @@ impl PersistStore {
         Ok(())
     }
 
+    #[instrument(skip(self, meta_before), fields(bytes = tracing::field::Empty, turns = tracing::field::Empty, attempts = tracing::field::Empty))]
     async fn load_all_turns_uncached(
         &self,
         path: &Path,
@@ -587,6 +594,8 @@ impl PersistStore {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(e) => return Err(PersistError::Io(e.to_string())),
             };
+            tracing::Span::current().record("bytes", data.len() as u64);
+            tracing::Span::current().record("attempts", attempt);
             let Some(meta_after) = self.history_file_meta(path).await? else {
                 return Ok(None);
             };
@@ -599,7 +608,9 @@ impl PersistStore {
                     "history file changed while loading; retry limit exceeded".into(),
                 ));
             }
-            return Ok(Some((parse_turn_history(path, &data)?, meta_after)));
+            let parsed = parse_turn_history(path, &data)?;
+            tracing::Span::current().record("turns", parsed.len() as u64);
+            return Ok(Some((parsed, meta_after)));
         }
         Err(PersistError::Io(
             "history file changed while loading; retry limit exceeded".into(),
@@ -624,6 +635,7 @@ impl PersistStore {
     /// Load a page of history for display (H4): the last `limit` turns ending just before the
     /// `before` cursor (a `TurnId`), or the tail when `before` is `None`. Returns the page (oldest
     /// first) and `has_more` (whether older turns exist before the page).
+    #[instrument(skip(self), name = "history_page_slice", fields(thread_id = %thread, page_turns = tracing::field::Empty, has_more = tracing::field::Empty))]
     pub async fn load_history(
         &self,
         project: ProjectId,
@@ -640,7 +652,11 @@ impl PersistStore {
             None => all.len(),
         };
         let start = end.saturating_sub(limit);
-        Ok((all[start..end].to_vec(), start > 0))
+        let page = all[start..end].to_vec();
+        let has_more = start > 0;
+        tracing::Span::current().record("page_turns", page.len() as u64);
+        tracing::Span::current().record("has_more", has_more);
+        Ok((page, has_more))
     }
 
     /// Load the turns persisted strictly after the `after` cursor (a `TurnId`), oldest-first — the

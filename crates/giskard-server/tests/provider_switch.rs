@@ -364,6 +364,8 @@ async fn cold_provider_switch_succeeds_and_binds_the_thread() {
         &ClientMessage::Subscribe {
             thread_id: srv.tid,
             since: None,
+            trace_id: None,
+            parent_span_id: None,
         },
     )
     .await;
@@ -437,6 +439,8 @@ async fn unconfirmed_provider_switch_is_rejected_and_persists_nothing() {
         &ClientMessage::Subscribe {
             thread_id: srv.tid,
             since: None,
+            trace_id: None,
+            parent_span_id: None,
         },
     )
     .await;

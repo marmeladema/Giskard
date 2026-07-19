@@ -826,6 +826,8 @@ session_days = 30
         serde_json::to_string(&ClientMessage::Subscribe {
             thread_id,
             since: None,
+            trace_id: None,
+            parent_span_id: None,
         })
         .unwrap()
         .into(),

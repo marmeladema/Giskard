@@ -862,11 +862,13 @@ async fn index_page_is_served_and_public() {
     );
     assert!(
         body.contains(
-            "state.awaitingIncrementalResync = true;\n      state.awaitingThreadResync = false;\n      send({ type:\"subscribe\", thread_id: state.threadId, since: state.newestPersistedTurnId });"
-        ) && body.contains("state.awaitingThreadResync = true;\n      state.awaitingIncrementalResync = false;\n      send({ type:\"subscribe\", thread_id: state.threadId });")
+            "state.awaitingIncrementalResync = true;\n      state.awaitingThreadResync = false;\n      sub.since = state.newestPersistedTurnId;"
+        ) && body.contains("state.awaitingThreadResync = true;\n      state.awaitingIncrementalResync = false;")
             && body.contains("awaitingThreadResync:false")
-            && body.contains("awaitingIncrementalResync:false"),
-        "reconnect asks for an incremental delta when it has a cursor, else a full authoritative resync"
+            && body.contains("awaitingIncrementalResync:false")
+            && body.contains("const sub = { type:\"subscribe\", thread_id: state.threadId };")
+            && body.contains("send(sub);"),
+        "reconnect builds a Subscribe object, asks for an incremental delta when it has a cursor, else a full authoritative resync, and sends it"
     );
     assert!(
         body.contains("const WS_BACKGROUND_CLOSE_GRACE_MS = 10000")
@@ -1154,7 +1156,7 @@ async fn index_page_is_served_and_public() {
         "user messages render as Markdown like agent text, not as plain text"
     );
     assert!(
-        body.contains("/render`, { text }"),
+        body.contains("/api/projects/${projectId}/render") && body.contains("{ text }"),
         "UI requests server-rendered Markdown for agent text"
     );
     assert!(
@@ -1358,11 +1360,7 @@ async fn version_meta_and_immutable_asset_caching() {
 fn browser_resubscribe_replaces_transient_transcript_state() {
     let body = app_js();
     let onopen = between(body, "ws.onopen = () => {", "  };\n  ws.onmessage");
-    assert_order(
-        onopen,
-        "state.awaitingThreadResync = true;",
-        "send({ type:\"subscribe\", thread_id: state.threadId });",
-    );
+    assert_order(onopen, "state.awaitingThreadResync = true;", "send(sub);");
 
     let render_thread_state = between(
         body,
@@ -1626,9 +1624,9 @@ fn browser_incremental_resync_reconciles_in_flight_turn() {
 
     // Reconnect asks for a delta when it has a cursor, else a full resync.
     let onopen = between(body, "ws.onopen = () => {", "ws.onmessage = (m) => {");
-    assert!(onopen.contains(
-        "send({ type:\"subscribe\", thread_id: state.threadId, since: state.newestPersistedTurnId });"
-    ));
+    assert!(onopen.contains("const sub = { type:\"subscribe\", thread_id: state.threadId };"));
+    assert!(onopen.contains("sub.since = state.newestPersistedTurnId;"));
+    assert!(onopen.contains("send(sub);"));
     assert!(onopen.contains("state.awaitingIncrementalResync = true;"));
 
     // A delta keeps the transcript: repaint the in-flight turn, append new turns, advance the cursor.
@@ -1821,6 +1819,190 @@ fn browser_diagnostics_panel_is_exposed_from_settings() {
     let css = include_str!("../static/app.css");
     assert!(css.contains(".browser-diagnostics"));
     assert!(css.contains(".browser-diagnostics-actions"));
+}
+
+/// The Settings popover exposes an in-UI Tracing panel (spec §17) so a phone-only session can
+/// arm/disarm capture and download a Perfetto/Chrome trace without a terminal. Guards the
+/// markup ids, JS handlers, and CSS classes the panel relies on.
+#[test]
+fn tracing_panel_is_exposed_from_settings() {
+    let body = app_js();
+    assert!(
+        body.contains("async function refreshTraceConfig()"),
+        "refreshTraceConfig polls /api/traces/config to reflect armed state"
+    );
+    assert!(body.contains("api(\"GET\", \"/api/traces/config\")"));
+    assert!(body.contains("api(\"POST\", \"/admin/trace/arm\", { armed: !traceArmed })"));
+    // Download must fetch raw bytes (not parse JSON) and offer a Blob download.
+    assert!(body.contains("fetch(\"/admin/trace\", { method: \"GET\" })"));
+    assert!(body.contains("URL.createObjectURL(blob)"));
+    assert!(body.contains(".download = `giskard-trace-"));
+    // The menu open path refreshes trace status so the phone sees live state.
+    assert!(body.contains("if (!menu.hidden) refreshTraceConfig();"));
+
+    // Browser recorder + traceparent propagation (spec §17.4) — the join the whole feature
+    // exists for. Guards the recorder IIFE, id shapes, epoch-micros conversion, the
+    // traceparent header injection on fetch, and the WS Subscribe trace-context propagation.
+    assert!(
+        body.contains("const trace = (() => {"),
+        "recorder module is defined"
+    );
+    assert!(
+        body.contains("crypto.getRandomValues"),
+        "ids use the W3C-shaped random source"
+    );
+    assert!(
+        body.contains("performance.timeOrigin + performance.now()"),
+        "epoch-micros via performance"
+    );
+    assert!(
+        body.contains("function traceparent()"),
+        "traceparent builder present"
+    );
+    assert!(
+        body.contains("opts.headers[\"traceparent\"] = tp"),
+        "traceparent injected on fetch"
+    );
+    assert!(
+        body.contains("openThreadContext"),
+        "WS trace-context accessor present"
+    );
+    assert!(
+        body.contains("sub.trace_id = ctx.trace_id"),
+        "WS Subscribe carries trace_id"
+    );
+    assert!(
+        body.contains("sub.parent_span_id = ctx.span_id"),
+        "WS Subscribe carries parent_span_id"
+    );
+    // High-value spans (ui.open_thread, ui.await_history_page, ui.render_turns).
+    assert!(
+        body.contains("startSpan(\"ui.open_thread\""),
+        "ui.open_thread root span"
+    );
+    assert!(
+        body.contains("startSpan(\"ui.await_history_page\""),
+        "ui.await_history_page child span"
+    );
+    assert!(
+        body.contains("startSpan(\"ui.render_turns\""),
+        "ui.render_turns child span"
+    );
+    // Per-call fetch spans (Part 1.4) wrap each render/linkify fetch in a client span so the
+    // client↔server delta (network + HTTP/1.1 request queueing) is visible, with Resource
+    // Timing labels turning that delta into a network breakdown.
+    assert!(
+        body.contains("startSpan(\"ui.fetch.render_markdown\""),
+        "render fetch span"
+    );
+    assert!(
+        body.contains("startSpan(\"ui.fetch.linkify\""),
+        "linkify fetch span"
+    );
+    assert!(
+        body.contains("startSpan(\"ui.fetch.render_diff\""),
+        "diff render fetch span"
+    );
+    assert!(
+        body.contains("function resourceTimingLabels"),
+        "Resource Timing label extraction present"
+    );
+    assert!(
+        body.contains("getEntriesByType(\"resource\")"),
+        "resourceTimingLabels reads the Performance API resource buffer"
+    );
+    // N-2: Resource Timing attribution disambiguates same-URL bursts by overlap with the
+    // span's own window, not "last match by name" (which mis-attributes every span in a burst
+    // to the latest entry). endWithResourceTiming passes the span's [start, end] to the lookup.
+    assert!(
+        body.contains("endWithResourceTiming(url, extraLabels)"),
+        "guard exposes endWithResourceTiming for windowed Resource Timing attribution"
+    );
+    assert!(
+        body.contains("e.startTime <= spanEndMs && e.responseEnd >= spanStartMs"),
+        "resourceTimingLabels matches entries overlapping the span window"
+    );
+    // N-1: overlapping async fetch spans are detached from the active stack right after
+    // api() captures the traceparent header, so sibling fetches parent to render_turns
+    // instead of chaining under the previous still-open fetch span.
+    assert!(
+        body.contains("fetchSpan.detach();"),
+        "fetch spans detach after the traceparent header is captured"
+    );
+    assert!(
+        body.contains("detach() {"),
+        "guard exposes detach() for overlapping-span sibling parenting"
+    );
+    // B-1: labels must be stringified at the recorder boundary (server wire contract is
+    // HashMap<String,String>; raw numbers/bools get the whole batch 422-rejected).
+    assert!(
+        body.contains("function stringifyLabels"),
+        "recorder stringifies label values"
+    );
+    assert!(
+        body.contains("out[k] = (v === null || v === undefined) ? \"\" : String(v)"),
+        "stringifyLabels coerces values to strings"
+    );
+    // B-2: the trace context resets when the root closes, so the next action gets a fresh
+    // trace_id instead of collapsing the whole session into one trace.
+    assert!(
+        body.contains("if (activeSpanStack.length === 0) { activeTraceId = null;"),
+        "activeTraceId resets when the root span closes"
+    );
+    // B-3: reset() discards dangling spans (errored flow / WS close) so the recorder does not
+    // wedge on a never-closing root; wired into openThread, the open-failure path, and ws.onclose.
+    assert!(
+        body.contains("function reset()"),
+        "recorder reset() defined"
+    );
+    assert!(
+        body.contains("trace.reset();"),
+        "reset() wired into the thread-open flow"
+    );
+    assert!(
+        body.contains("discard()"),
+        "span guards expose discard() for errored flows"
+    );
+    // Gating: recorder armed only when armed && ui_ingest_enabled (zero overhead when off).
+    assert!(body.contains("trace.setArmed(traceArmed && !!(cfg && cfg.ui_ingest_enabled))"));
+
+    // Non-draining stats display (spec §17.2 / F2.1).
+    assert!(
+        body.contains("cfg && cfg.trace_count"),
+        "config response carries trace_count"
+    );
+    assert!(
+        body.contains("cfg && cfg.span_count"),
+        "config response carries span_count"
+    );
+    assert!(
+        body.contains("Exported ${beforeSpans}"),
+        "download toasts the exported span count"
+    );
+    assert!(
+        body.contains("spanCount === 0"),
+        "Download disabled when the buffer is empty"
+    );
+
+    let index = include_str!("../static/index.html");
+    assert!(index.contains("id=\"traceArmBtn\""));
+    assert!(index.contains("id=\"traceStatus\""));
+    assert!(index.contains("id=\"traceDownloadBtn\""));
+    assert!(index.contains("id=\"traceHint\""));
+    assert!(
+        index.contains("id=\"traceCount\""),
+        "span-count element present"
+    );
+    assert!(index.contains("class=\"tracing-actions\""));
+    assert!(index.contains("Arm tracing"));
+    assert!(index.contains("Download trace"));
+
+    let css = include_str!("../static/app.css");
+    assert!(css.contains(".trace-status"));
+    assert!(css.contains(".trace-status.armed"));
+    assert!(css.contains(".tracing-actions"));
+    assert!(css.contains(".tracing-hint"));
+    assert!(css.contains(".tracing-count"), "span-count CSS present");
 }
 
 #[test]

@@ -72,8 +72,14 @@
   }
   .browser-diagnostics-actions { display:flex; gap:6px; margin-top:8px; }
   .browser-diagnostics-actions button { flex:1; padding:4px 6px; font-size:12px; }
+  .trace-status { display:inline-block; margin-left:6px; color:var(--muted); font-size:10px; vertical-align:middle; }
+  .trace-status.armed { color:#3fb950; }   /* green dot while armed */
+  .tracing-actions { display:flex; gap:6px; margin-top:6px; }
+  .tracing-actions button { flex:1; padding:4px 6px; font-size:12px; }
+  .tracing-hint { margin:6px 0 0; font-size:11px; color:var(--muted); }
+  .tracing-count { margin:4px 0 0; font-size:11px; color:var(--muted); }
   /* The center column owns both dividers, so each delimiter line hugs the thread and the drag
-     bar sits just outside it — symmetric on the left and right. */
+    bar sits just outside it — symmetric on the left and right. */
   .center { display:flex; flex-direction:column; border-left:1px solid var(--border); border-right:1px solid var(--border); }
   .proj { margin-bottom:10px; }
   .proj.collapsed { margin-bottom:6px; }

@@ -14,6 +14,7 @@ pub mod routes;
 pub mod running_commands;
 pub mod throttle;
 pub mod tokens;
+pub mod trace;
 
 pub use app::{AppState, build_app};
 pub use registry::{HarnessFactory, HarnessRegistry};

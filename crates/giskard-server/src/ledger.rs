@@ -99,6 +99,7 @@ async fn actor(store: Arc<PersistStore>, mut rx: mpsc::Receiver<Record>) {
     }
 }
 
+#[tracing::instrument(skip(store, global, projects, dirty, rec), fields(project_id = %rec.project, op = "ledger_apply"))]
 async fn apply(
     store: &PersistStore,
     global: &mut DailyTokenLedger,

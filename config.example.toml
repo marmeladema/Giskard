@@ -105,3 +105,14 @@ api_key_env = "LITELLM_KEY"
   display_name = "GLM-4.7 (Workers AI)"
   context_window = 131072
   supports_reasoning_effort = false
+
+[tracing]
+# On-demand tracing (spec §17). When armed, completed `tracing` spans are recorded into a bounded
+# in-memory buffer and exposed as Chrome trace-event JSON at `GET /admin/trace` (viewable in
+# chrome://tracing or perfetto.dev). Capture is OFF by default to bound overhead; arm it via the
+# admin endpoint (`POST /admin/trace/arm`) or set this to "armed" to start armed at startup.
+capture = "off"
+# Maximum number of traces kept in the in-memory ring buffer (oldest evicted first).
+buffer_max_traces = 256
+# Whether the browser may submit UI spans via `POST /api/traces/ui`.
+ui_ingest_enabled = true
