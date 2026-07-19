@@ -543,9 +543,11 @@
 - **R5:** Command rows and summaries distinguish running, succeeded, failed, and
   terminated/declined/interrupted states with both a fixed symbol and subtle state color.
 - **R6:** `TerminateCommand { thread_id, process_id }` is a request to the active harness. Giskard
-  must not terminate local processes directly. For Codex agent `CommandExecution` items, the
-  Codex harness maps stop requests to `turn/interrupt { threadId, turnId }` using the native Codex
-  turn id that owns the command process; it must not use `command/exec/terminate` for these items.
+  must not terminate local processes directly. For Codex, the harness first uses process-specific
+  app-server termination when the process is controllable: `thread/backgroundTerminals/terminate`
+  for unified-exec/background-terminal process ids, then `command/exec/terminate` for explicit
+  app-server `command/exec` sessions. It must not use `turn/interrupt` for command stop; users can
+  interrupt the whole turn separately when that broader cancellation is what they want.
 - **R7:** A command marked `terminating` means "stop requested through the harness", not "process
   terminated". The browser labels this state as "stop requested" and preserves the later terminal
   command status reported by Codex. If Codex reports normal successful completion after a stop
@@ -2585,18 +2587,19 @@ events through the same event handler used for live WebSocket events.
   rows are owned by the item stream, not re-rendered from the snapshot).
   `TerminateCommand` requests are forwarded to the active harness. Giskard must not terminate
   local processes directly; Codex-owned command processes are stopped only through the Codex
-  app-server protocol. Codex agent command executions are not standalone `command/exec` sessions,
-  so the Codex harness maps terminate requests for those items to `turn/interrupt` with the native
-  Codex turn id that owns the command process. It must not use `command/exec/terminate` for agent
-  command execution items. When the harness accepts a terminate request, the matching command
-  remains in the registry with `terminating: true` until a terminal command event arrives, but the
-  browser labels this state as "stop requested" rather than "terminated" or "terminating". A
-  successful terminate request is not itself proof that the process has stopped. If Codex later
-  reports a normal successful completion, the browser preserves the successful status and annotates
-  it with "stop requested"; the server logs a warning that Codex did not terminate the process.
-  Codex's "no active command/exec for process id" response is treated as stale-state cleanup only
-  for commands already marked `after_turn`; for live commands it is surfaced through the normal
-  structured `Error` path and the command remains visible with `terminating: false`.
+  app-server protocol. The Codex harness prefers process-scoped app-server termination:
+  `thread/backgroundTerminals/terminate` for unified-exec/background-terminal process ids and
+  `command/exec/terminate` for explicit app-server `command/exec` sessions. It must not fall back
+  to `turn/interrupt` for command stop; the browser exposes turn interruption as a separate,
+  broader action. When the harness accepts a terminate request, the matching command remains in the
+  registry with `terminating: true` until a terminal command event arrives, but the browser labels
+  this state as "stop requested" rather than "terminated" or "terminating". A successful terminate
+  request is not itself proof that the process has stopped. If Codex later reports a normal
+  successful completion, the browser preserves the successful status and annotates it with "stop
+  requested"; the server logs a warning that Codex did not terminate the process. Codex's "no
+  active command/exec for process id" response is treated as stale-state cleanup only for commands
+  already marked `after_turn`; for live commands it is surfaced through the normal structured
+  `Error` path and the command remains visible with `terminating: false`.
   Harness adapters that can observe post-turn command lifecycle messages must keep draining them
   while any command is known running. When a late terminal command completion arrives for an
   already-persisted turn, the server updates `RunningTasks` and may broadcast the terminal

@@ -48,6 +48,25 @@ enum TurnContextKind {
     ManualCompaction,
 }
 
+#[derive(Clone, Copy)]
+enum ForwarderExitReason {
+    NormalTurnCompleted,
+    SyntheticCompactionCompleted,
+    AfterTurnCommandsDrained,
+    StreamEndedRecovered,
+    StreamEndedWithoutTurn,
+}
+
+fn forwarder_exit_reason_label(reason: ForwarderExitReason) -> &'static str {
+    match reason {
+        ForwarderExitReason::NormalTurnCompleted => "normal_turn_completed",
+        ForwarderExitReason::SyntheticCompactionCompleted => "synthetic_compaction_completed",
+        ForwarderExitReason::AfterTurnCommandsDrained => "after_turn_commands_drained",
+        ForwarderExitReason::StreamEndedRecovered => "stream_ended_recovered",
+        ForwarderExitReason::StreamEndedWithoutTurn => "stream_ended_without_turn",
+    }
+}
+
 fn turn_context_kind_label(kind: TurnContextKind) -> &'static str {
     match kind {
         TurnContextKind::User => "user",
@@ -883,6 +902,7 @@ async fn forward_events(
     let mut seen_notices = HashSet::new();
     let forwarder_started = Instant::now();
     let mut saw_context_compaction_marker = false;
+    let mut stream_error: Option<String> = None;
     debug!(
         %project_id,
         %thread_id,
@@ -896,7 +916,7 @@ async fn forward_events(
         "event forwarder started"
     );
 
-    loop {
+    let exit_reason = loop {
         match stream.recv().await {
             Ok(event) => {
                 let event_thread = event_thread_id(&event);
@@ -925,15 +945,17 @@ async fn forward_events(
                 if let Some(owned) = owned_turn {
                     if let Some(turn) = event_turn {
                         if turn != owned {
-                            warn!(
-                                %project_id,
-                                %thread_id,
-                                owned_turn = %owned,
-                                event_turn = %turn,
-                                event_kind = event_kind(&event),
-                                elapsed_ms = forwarder_started.elapsed().as_millis(),
-                                "dropping harness event for a different turn on the same thread"
-                            );
+                            if !owned_turn_completed {
+                                warn!(
+                                    %project_id,
+                                    %thread_id,
+                                    owned_turn = %owned,
+                                    event_turn = %turn,
+                                    event_kind = event_kind(&event),
+                                    elapsed_ms = forwarder_started.elapsed().as_millis(),
+                                    "dropping harness event for a different turn on the same thread"
+                                );
+                            }
                             continue;
                         }
                     } else if owned_turn_completed {
@@ -968,7 +990,7 @@ async fn forward_events(
                                     .has_running_for_turn(thread_id, owned)
                                     .await
                                 {
-                                    break;
+                                    break ForwarderExitReason::AfterTurnCommandsDrained;
                                 }
                             }
                         }
@@ -1194,10 +1216,17 @@ async fn forward_events(
                     if command_state_changed {
                         broadcast_running_commands(&hub, &running_commands, thread_id).await;
                     }
-                    if !running_commands.has_running_for_turn(thread_id, tid).await {
-                        break;
+                    if running_commands.has_running_for_turn(thread_id, tid).await {
+                        info!(
+                            %project_id,
+                            %thread_id,
+                            turn = %tid,
+                            elapsed_ms = forwarder_started.elapsed().as_millis(),
+                            "event forwarder monitoring after-turn running commands"
+                        );
+                        continue;
                     }
-                    continue;
+                    break ForwarderExitReason::NormalTurnCompleted;
                 }
 
                 broadcast_thread_activity(&hub, thread_id, &event, true).await;
@@ -1254,12 +1283,21 @@ async fn forward_events(
                     owned_turn_completed = true;
                     broadcast_thread_activity(&hub, thread_id, &completion_event, false).await;
                     hub.broadcast_event(thread_id, completion_event).await;
-                    if !running_commands.has_running_for_turn(thread_id, tid).await {
-                        break;
+                    if running_commands.has_running_for_turn(thread_id, tid).await {
+                        info!(
+                            %project_id,
+                            %thread_id,
+                            turn = %tid,
+                            elapsed_ms = forwarder_started.elapsed().as_millis(),
+                            "event forwarder monitoring after-turn running commands"
+                        );
+                        continue;
                     }
+                    break ForwarderExitReason::SyntheticCompactionCompleted;
                 }
             }
             Err(e) => {
+                stream_error = Some(e.to_string());
                 if ctx.kind == TurnContextKind::ManualCompaction && !owned_turn_completed {
                     let live_buffer_active = live_buffers.is_active(thread_id).await;
                     warn!(
@@ -1278,10 +1316,77 @@ async fn forward_events(
                 } else {
                     debug!(%thread_id, ?e, "event stream ended");
                 }
-                break;
+                if let Some(incomplete_turn) = turn_id.or(owned_turn) {
+                    let live_buffer_active = live_buffers.is_active(thread_id).await;
+                    let turn_gate_held =
+                        turn_gate.as_ref().is_some_and(|lease| !lease.is_released());
+                    let status = TurnStatus {
+                        kind: TurnStatusKind::Interrupted,
+                        message: Some("Harness event stream ended before turn completion".into()),
+                    };
+                    warn!(
+                        %project_id,
+                        %thread_id,
+                        turn = %incomplete_turn,
+                        context_kind = turn_context_kind_label(ctx.kind),
+                        mode = ?ctx.mode,
+                        provider = %ctx.model.provider,
+                        model = %ctx.model.model,
+                        ?owned_turn,
+                        ?turn_id,
+                        stream_error = ?stream_error,
+                        items_buffered = items.len(),
+                        diffs_buffered = diffs.len(),
+                        live_buffer_active,
+                        turn_gate_held,
+                        elapsed_ms = forwarder_started.elapsed().as_millis(),
+                        "persisting incomplete turn after event stream ended"
+                    );
+                    let completion_event = AgentEvent::TurnCompleted {
+                        thread: thread_id,
+                        turn: incomplete_turn,
+                        usage: giskard_core::token::TokenUsage::default(),
+                        status: status.clone(),
+                    };
+                    let command_state_changed =
+                        apply_running_command_event(&running_commands, &completion_event).await;
+                    if live_buffer_active {
+                        live_buffers
+                            .append(thread_id, completion_event.clone())
+                            .await;
+                    }
+                    complete_forwarded_turn(
+                        thread_id,
+                        project_id,
+                        incomplete_turn,
+                        giskard_core::token::TokenUsage::default(),
+                        status,
+                        &ctx,
+                        &mut items,
+                        &mut diffs,
+                        started_at,
+                        turn_id,
+                        &mut seen_turn_ids,
+                        &store,
+                        &hub,
+                        &ledger,
+                        &live_buffers,
+                        turn_gate.as_mut(),
+                    )
+                    .await;
+                    owned_turn_completed = true;
+                    broadcast_thread_activity(&hub, thread_id, &completion_event, false).await;
+                    hub.broadcast_event(thread_id, completion_event).await;
+                    if command_state_changed {
+                        broadcast_running_commands(&hub, &running_commands, thread_id).await;
+                    }
+                    break ForwarderExitReason::StreamEndedRecovered;
+                } else {
+                    break ForwarderExitReason::StreamEndedWithoutTurn;
+                }
             }
         }
-    }
+    };
     let turn_gate_held = turn_gate.as_ref().is_some_and(|lease| !lease.is_released());
     if turn_gate_held && !owned_turn_completed {
         warn!(
@@ -1293,6 +1398,8 @@ async fn forward_events(
             model = %ctx.model.model,
             ?owned_turn,
             ?turn_id,
+            exit_reason = forwarder_exit_reason_label(exit_reason),
+            stream_error = ?stream_error,
             items_buffered = items.len(),
             diffs_buffered = diffs.len(),
             saw_context_compaction_marker,
@@ -1308,6 +1415,8 @@ async fn forward_events(
             ?turn_id,
             owned_turn_completed,
             turn_gate_held,
+            exit_reason = forwarder_exit_reason_label(exit_reason),
+            stream_error = ?stream_error,
             elapsed_ms = forwarder_started.elapsed().as_millis(),
             "event forwarder exited"
         );
@@ -1988,6 +2097,7 @@ mod tests {
     use giskard_persist::store::ThreadFile;
     use giskard_proto::{ServerMessage, ThreadActivityKind, WireAgentEvent};
     use tokio::sync::{Mutex, broadcast, mpsc};
+    use tokio::task::JoinHandle;
 
     use super::{
         ActiveTurnOwner, ThreadTurnGate, TurnContext, TurnContextKind,
@@ -2260,6 +2370,256 @@ mod tests {
         assert_eq!(saved[0].user_input, UserInput::text("first"));
         assert_eq!(saved[1].id, second_turn);
         assert_eq!(saved[1].user_input, UserInput::text("second"));
+    }
+
+    #[tokio::test]
+    async fn completed_turn_forwarder_exits_after_after_turn_command_completion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: None,
+        };
+        store
+            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .await
+            .unwrap();
+        let now = Utc::now();
+        store
+            .save_thread(
+                project_id,
+                &ThreadFile {
+                    version: 1,
+                    id: thread_id,
+                    project_id,
+                    title: "t".into(),
+                    harness_thread_id: "th".into(),
+                    mode: Mode::Build,
+                    current_model: model.clone(),
+                    context_window: 128_000,
+                    approval_policy: ApprovalPolicy::Ask,
+                    model_efforts: Default::default(),
+                    tokens: TokenLedger::default(),
+                    created_at: now,
+                    updated_at: now,
+                    archived: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let (tx, _) = broadcast::channel(64);
+        let hub = Arc::new(Hub::new());
+        let live_buffers = Arc::new(LiveBufferStore::new());
+        let running_commands = Arc::new(RunningTaskStore::new());
+        let approvals = Arc::new(Mutex::new(Default::default()));
+        let server_requests = Arc::new(Mutex::new(Default::default()));
+        let ledger = ledger::spawn(store.clone());
+        let handle = spawn_forwarder_handle(
+            thread_id,
+            project_id,
+            AgentEventStream::new(tx.subscribe()),
+            hub,
+            live_buffers,
+            running_commands.clone(),
+            store.clone(),
+            approvals,
+            server_requests,
+            ledger,
+            model,
+            "first",
+        );
+
+        let turn = TurnId::new();
+        let command_item = ItemId::new();
+        tx.send(AgentEvent::TurnStarted {
+            thread: thread_id,
+            turn,
+        })
+        .unwrap();
+        tx.send(AgentEvent::ItemStarted {
+            thread: thread_id,
+            turn,
+            item: ItemStart {
+                id: command_item,
+                harness_item_id: "long_running_command".into(),
+                kind: ItemKind::CommandExecution,
+                command: Some(CommandExecutionStart {
+                    command: "sleep 600".into(),
+                    cwd: "/tmp/test".into(),
+                    status: Some("running".into()),
+                    process_id: Some("proc_after_turn".into()),
+                    started_at_ms: Some(1),
+                }),
+                tool: None,
+            },
+        })
+        .unwrap();
+        tx.send(AgentEvent::TurnCompleted {
+            thread: thread_id,
+            turn,
+            usage: TokenUsage::default(),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        })
+        .unwrap();
+
+        wait_for_turn_count(&store, project_id, thread_id, 1).await;
+        let tasks = running_commands.snapshot(thread_id).await;
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks[0].after_turn);
+
+        tx.send(AgentEvent::ItemCompleted {
+            thread: thread_id,
+            turn,
+            item: Item {
+                id: command_item,
+                harness_item_id: "long_running_command".into(),
+                payload: ItemPayload::CommandExecution {
+                    command: "sleep 600".into(),
+                    cwd: "/tmp/test".into(),
+                    output: "done".into(),
+                    exit_code: Some(0),
+                    status: Some("completed".into()),
+                    process_id: Some("proc_after_turn".into()),
+                    duration_ms: Some(60_000),
+                },
+                created_at: Utc::now(),
+            },
+        })
+        .unwrap();
+
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), handle)
+            .await
+            .expect("forwarder should exit after after-turn command completion")
+            .unwrap();
+
+        assert!(running_commands.snapshot(thread_id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_end_before_completion_persists_interrupted_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: None,
+        };
+        store
+            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .await
+            .unwrap();
+        let now = Utc::now();
+        store
+            .save_thread(
+                project_id,
+                &ThreadFile {
+                    version: 1,
+                    id: thread_id,
+                    project_id,
+                    title: "t".into(),
+                    harness_thread_id: "th".into(),
+                    mode: Mode::Build,
+                    current_model: model.clone(),
+                    context_window: 128_000,
+                    approval_policy: ApprovalPolicy::Ask,
+                    model_efforts: Default::default(),
+                    tokens: TokenLedger::default(),
+                    created_at: now,
+                    updated_at: now,
+                    archived: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let (tx, _) = broadcast::channel(64);
+        let hub = Arc::new(Hub::new());
+        let live_buffers = Arc::new(LiveBufferStore::new());
+        let running_commands = Arc::new(RunningTaskStore::new());
+        let approvals = Arc::new(Mutex::new(Default::default()));
+        let server_requests = Arc::new(Mutex::new(Default::default()));
+        let ledger = ledger::spawn(store.clone());
+        let handle = spawn_forwarder_handle(
+            thread_id,
+            project_id,
+            AgentEventStream::new(tx.subscribe()),
+            hub,
+            live_buffers.clone(),
+            running_commands.clone(),
+            store.clone(),
+            approvals,
+            server_requests,
+            ledger,
+            model,
+            "incomplete",
+        );
+
+        let turn = TurnId::new();
+        tx.send(AgentEvent::TurnStarted {
+            thread: thread_id,
+            turn,
+        })
+        .unwrap();
+        tx.send(AgentEvent::ItemCompleted {
+            thread: thread_id,
+            turn,
+            item: Item {
+                id: ItemId::new(),
+                harness_item_id: "agent_partial".into(),
+                payload: ItemPayload::AgentMessage {
+                    text: "partial answer".into(),
+                },
+                created_at: Utc::now(),
+            },
+        })
+        .unwrap();
+        tx.send(AgentEvent::ItemStarted {
+            thread: thread_id,
+            turn,
+            item: ItemStart {
+                id: ItemId::new(),
+                harness_item_id: "partial_command".into(),
+                kind: ItemKind::CommandExecution,
+                command: Some(CommandExecutionStart {
+                    command: "sleep 600".into(),
+                    cwd: "/tmp/test".into(),
+                    status: Some("running".into()),
+                    process_id: Some("proc_partial".into()),
+                    started_at_ms: Some(1),
+                }),
+                tool: None,
+            },
+        })
+        .unwrap();
+        drop(tx);
+
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), handle)
+            .await
+            .expect("forwarder should exit when stream closes")
+            .unwrap();
+
+        let saved = store.load_all_turns(project_id, thread_id).await.unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].id, turn);
+        assert!(matches!(saved[0].status.kind, TurnStatusKind::Interrupted));
+        assert_eq!(saved[0].items.len(), 1);
+        assert!(
+            live_buffers.snapshot(thread_id).await.is_none(),
+            "synthetic completion should clear live state"
+        );
+
+        let tasks = running_commands.snapshot(thread_id).await;
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks[0].after_turn);
     }
 
     #[tokio::test]
@@ -3031,6 +3391,37 @@ mod tests {
         model: ModelRef,
         user_input: &str,
     ) {
+        std::mem::drop(spawn_forwarder_handle(
+            thread_id,
+            project_id,
+            stream,
+            hub,
+            live_buffers,
+            running_commands,
+            store,
+            approvals,
+            server_requests,
+            ledger,
+            model,
+            user_input,
+        ));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_forwarder_handle(
+        thread_id: ThreadId,
+        project_id: ProjectId,
+        stream: AgentEventStream,
+        hub: Arc<Hub>,
+        live_buffers: Arc<LiveBufferStore>,
+        running_commands: Arc<RunningTaskStore>,
+        store: Arc<PersistStore>,
+        approvals: super::ApprovalMap,
+        server_requests: super::ServerRequestMap,
+        ledger: ledger::LedgerHandle,
+        model: ModelRef,
+        user_input: &str,
+    ) -> JoinHandle<()> {
         let ctx = TurnContext {
             user_input: UserInput::text(user_input),
             model,
@@ -3053,7 +3444,7 @@ mod tests {
                 None,
             )
             .await;
-        });
+        })
     }
 
     fn turn_events(

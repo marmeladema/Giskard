@@ -1680,10 +1680,13 @@ async fn history_limit_or_default(
     }
 }
 
-fn harness_error_means_no_active_command(error: &HarnessError) -> bool {
-    matches!(error, HarnessError::Transport(message) if message
-        .to_ascii_lowercase()
-        .contains("no active command/exec for process id"))
+fn harness_error_means_command_unmanaged(error: &HarnessError) -> bool {
+    let HarnessError::Transport(message) = error else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+    message.contains("no active command/exec for process id")
+        || message.contains("no active turn to interrupt")
 }
 
 async fn handle_ws(socket: WebSocket, state: AppState) {
@@ -2236,19 +2239,41 @@ async fn handle_client_msg(
                 )
             });
             if let Err(error) = terminate_result.and_then(|result| result) {
-                if harness_error_means_no_active_command(&error)
+                if harness_error_means_command_unmanaged(&error)
                     && existing_command
                         .as_ref()
                         .map(|cmd| cmd.after_turn)
                         .unwrap_or(false)
                 {
-                    if state
+                    let removed = state
                         .running_commands
                         .remove_by_process(thread_id, &process_id_for_state)
-                        .await
-                    {
+                        .await;
+                    if removed {
                         broadcast_running_commands(state, thread_id).await;
                     }
+                    warn!(
+                        %thread_id,
+                        process_id = %process_id_for_state,
+                        running_task_removed = removed,
+                        error = %error,
+                        "harness no longer manages after-turn command; cleared stale running-task state"
+                    );
+                    let _ = tx
+                        .send(ServerMessage::Error {
+                            error: ErrorInfo {
+                                code: "harness_command_unmanaged".into(),
+                                severity: ErrorSeverity::Warning,
+                                message: "The harness no longer manages this command.".into(),
+                                detail: Some(format!(
+                                    "{error}. The command may still be running in the harness environment."
+                                )),
+                                thread_id: Some(thread_id),
+                                action: Some("terminate_command".into()),
+                                process_id: Some(process_id_for_state),
+                            },
+                        })
+                        .await;
                     return Ok(());
                 }
 

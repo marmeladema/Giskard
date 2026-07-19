@@ -34,6 +34,7 @@ type TestWs =
 enum TerminateBehavior {
     Succeed,
     NoActiveCommand,
+    NoActiveTurn,
     TransportError,
     Unsupported,
 }
@@ -258,6 +259,9 @@ impl AgentHarness for InterruptHarness {
             TerminateBehavior::Succeed => Ok(()),
             TerminateBehavior::NoActiveCommand => Err(HarnessError::Transport(
                 "JSON-RPC error (-32600): no active command/exec for process id \"proc_1\"".into(),
+            )),
+            TerminateBehavior::NoActiveTurn => Err(HarnessError::Transport(
+                "JSON-RPC error (-32600): no active turn to interrupt".into(),
             )),
             TerminateBehavior::TransportError => {
                 Err(HarnessError::Transport("terminate failed".into()))
@@ -588,11 +592,28 @@ async fn websocket_no_active_for_live_command_surfaces_error() {
 }
 
 #[tokio::test]
-async fn websocket_no_active_for_after_turn_command_clears_stale_snapshot() {
-    let app = spawn_test_app().await;
-    app.harness
-        .set_terminate_behavior(TerminateBehavior::NoActiveCommand)
+async fn websocket_no_active_turn_for_live_command_surfaces_error() {
+    terminate_failure_preserves_snapshot(
+        TerminateBehavior::NoActiveTurn,
+        "harness_transport_error",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn websocket_no_active_command_for_after_turn_clears_stale_snapshot() {
+    no_active_for_after_turn_command_clears_stale_snapshot(TerminateBehavior::NoActiveCommand)
         .await;
+}
+
+#[tokio::test]
+async fn websocket_no_active_turn_for_after_turn_clears_stale_snapshot() {
+    no_active_for_after_turn_command_clears_stale_snapshot(TerminateBehavior::NoActiveTurn).await;
+}
+
+async fn no_active_for_after_turn_command_clears_stale_snapshot(behavior: TerminateBehavior) {
+    let app = spawn_test_app().await;
+    app.harness.set_terminate_behavior(behavior).await;
     let mut ws = app.connect_ws().await;
     let thread_id = app.thread_id;
 
@@ -623,6 +644,13 @@ async fn websocket_no_active_for_after_turn_command_clears_stale_snapshot() {
     .unwrap();
 
     wait_for_empty_running_commands(&mut ws).await;
+    let warning = wait_for_error(&mut ws, "terminate_command", "harness_command_unmanaged").await;
+    assert_eq!(warning.severity, giskard_proto::ErrorSeverity::Warning);
+    assert_eq!(warning.thread_id, Some(thread_id));
+    assert_eq!(warning.process_id.as_deref(), Some("proc_1"));
+    assert!(warning.detail.as_deref().is_some_and(|detail| {
+        detail.contains("may still be running in the harness environment")
+    }));
     assert!(
         app.state
             .running_commands
