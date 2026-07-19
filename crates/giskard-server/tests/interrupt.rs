@@ -431,9 +431,12 @@ async fn websocket_interrupt_reaches_live_harness_turn() {
     let mut ws = app.connect_ws().await;
     let thread_id = app.thread_id;
 
-    ws.send(ws_text(&ClientMessage::Subscribe { thread_id }))
-        .await
-        .unwrap();
+    ws.send(ws_text(&ClientMessage::Subscribe {
+        thread_id,
+        since: None,
+    }))
+    .await
+    .unwrap();
     ws.send(ws_text(&ClientMessage::SendInput {
         thread_id,
         text: "run for a while".into(),
@@ -473,9 +476,12 @@ async fn websocket_interrupt_timeout_surfaces_error() {
     let mut ws = app.connect_ws().await;
     let thread_id = app.thread_id;
 
-    ws.send(ws_text(&ClientMessage::Subscribe { thread_id }))
-        .await
-        .unwrap();
+    ws.send(ws_text(&ClientMessage::Subscribe {
+        thread_id,
+        since: None,
+    }))
+    .await
+    .unwrap();
     ws.send(ws_text(&ClientMessage::SendInput {
         thread_id,
         text: "sleep".into(),
@@ -499,9 +505,12 @@ async fn websocket_terminate_running_command_marks_terminating_until_terminal_ev
     let mut ws = app.connect_ws().await;
     let thread_id = app.thread_id;
 
-    ws.send(ws_text(&ClientMessage::Subscribe { thread_id }))
-        .await
-        .unwrap();
+    ws.send(ws_text(&ClientMessage::Subscribe {
+        thread_id,
+        since: None,
+    }))
+    .await
+    .unwrap();
     ws.send(ws_text(&ClientMessage::SendInput {
         thread_id,
         text: "run for a while".into(),
@@ -543,7 +552,10 @@ async fn websocket_subscribe_replays_running_command_snapshot() {
     let thread_id = app.thread_id;
 
     first
-        .send(ws_text(&ClientMessage::Subscribe { thread_id }))
+        .send(ws_text(&ClientMessage::Subscribe {
+            thread_id,
+            since: None,
+        }))
         .await
         .unwrap();
     first
@@ -559,7 +571,10 @@ async fn websocket_subscribe_replays_running_command_snapshot() {
 
     let mut second = app.connect_ws().await;
     second
-        .send(ws_text(&ClientMessage::Subscribe { thread_id }))
+        .send(ws_text(&ClientMessage::Subscribe {
+            thread_id,
+            since: None,
+        }))
         .await
         .unwrap();
     let replayed = wait_for_running_command(&mut second).await;
@@ -617,9 +632,12 @@ async fn no_active_for_after_turn_command_clears_stale_snapshot(behavior: Termin
     let mut ws = app.connect_ws().await;
     let thread_id = app.thread_id;
 
-    ws.send(ws_text(&ClientMessage::Subscribe { thread_id }))
-        .await
-        .unwrap();
+    ws.send(ws_text(&ClientMessage::Subscribe {
+        thread_id,
+        since: None,
+    }))
+    .await
+    .unwrap();
     ws.send(ws_text(&ClientMessage::SendInput {
         thread_id,
         text: "run for a while".into(),
@@ -683,9 +701,12 @@ async fn terminate_failure_preserves_snapshot(behavior: TerminateBehavior, expec
     let mut ws = app.connect_ws().await;
     let thread_id = app.thread_id;
 
-    ws.send(ws_text(&ClientMessage::Subscribe { thread_id }))
-        .await
-        .unwrap();
+    ws.send(ws_text(&ClientMessage::Subscribe {
+        thread_id,
+        since: None,
+    }))
+    .await
+    .unwrap();
     ws.send(ws_text(&ClientMessage::SendInput {
         thread_id,
         text: "run for a while".into(),

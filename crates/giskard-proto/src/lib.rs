@@ -42,6 +42,12 @@ pub use giskard_core::turn::{ApprovalPolicy, Mode, TurnStatus, TurnStatusKind};
 pub enum ClientMessage {
     Subscribe {
         thread_id: ThreadId,
+        /// Incremental resync cursor: the newest turn the client already has rendered. When present
+        /// and resolvable, the server replies with a `HistoryDelta` of just the turns after it
+        /// instead of a full `HistoryPage`, so the browser keeps its immutable completed-turn DOM
+        /// and repaints only the in-flight turn. Omitted (or unresolvable) → a full snapshot.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<TurnId>,
     },
     Unsubscribe {
         thread_id: ThreadId,
@@ -218,6 +224,13 @@ pub enum ServerMessage {
         thread_id: ThreadId,
         turns: Vec<WireTurn>,
         has_more: bool,
+    },
+    /// Incremental-resync delta: the persisted turns that completed after the client's `since`
+    /// cursor, oldest-first. The client keeps its existing transcript, repaints only the in-flight
+    /// turn, and appends these. Sent instead of `HistoryPage` when a resolvable `since` was given.
+    HistoryDelta {
+        thread_id: ThreadId,
+        turns: Vec<WireTurn>,
     },
     LiveTurnSnapshot(LiveTurnSnapshot),
     RunningTasks {

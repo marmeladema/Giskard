@@ -314,9 +314,12 @@ async fn connect_ws(addr: SocketAddr, cookie: &str) -> TestWs {
 async fn websocket_server_request_response_routes_to_harness() {
     let (_tmp, harness, addr, cookie, thread_id) = spawn_test_app().await;
     let mut ws = connect_ws(addr, &cookie).await;
-    ws.send(ws_text(&ClientMessage::Subscribe { thread_id }))
-        .await
-        .unwrap();
+    ws.send(ws_text(&ClientMessage::Subscribe {
+        thread_id,
+        since: None,
+    }))
+    .await
+    .unwrap();
     ws.send(ws_text(&ClientMessage::SendInput {
         thread_id,
         text: "ask me".into(),
@@ -348,9 +351,12 @@ async fn websocket_server_request_response_routes_to_harness() {
 async fn websocket_server_request_error_response_routes_to_harness() {
     let (_tmp, harness, addr, cookie, thread_id) = spawn_test_app().await;
     let mut ws = connect_ws(addr, &cookie).await;
-    ws.send(ws_text(&ClientMessage::Subscribe { thread_id }))
-        .await
-        .unwrap();
+    ws.send(ws_text(&ClientMessage::Subscribe {
+        thread_id,
+        since: None,
+    }))
+    .await
+    .unwrap();
     ws.send(ws_text(&ClientMessage::SendInput {
         thread_id,
         text: "ask me".into(),
@@ -381,9 +387,12 @@ async fn websocket_server_request_error_response_routes_to_harness() {
 async fn websocket_server_request_response_failure_can_be_retried() {
     let (_tmp, harness, addr, cookie, thread_id) = spawn_test_app().await;
     let mut ws = connect_ws(addr, &cookie).await;
-    ws.send(ws_text(&ClientMessage::Subscribe { thread_id }))
-        .await
-        .unwrap();
+    ws.send(ws_text(&ClientMessage::Subscribe {
+        thread_id,
+        since: None,
+    }))
+    .await
+    .unwrap();
     ws.send(ws_text(&ClientMessage::SendInput {
         thread_id,
         text: "ask me".into(),
@@ -439,9 +448,12 @@ async fn websocket_server_request_response_failure_can_be_retried() {
 async fn websocket_subscribe_replays_pending_server_request_snapshot() {
     let (_tmp, _harness, addr, cookie, thread_id) = spawn_test_app().await;
     let mut ws = connect_ws(addr, &cookie).await;
-    ws.send(ws_text(&ClientMessage::Subscribe { thread_id }))
-        .await
-        .unwrap();
+    ws.send(ws_text(&ClientMessage::Subscribe {
+        thread_id,
+        since: None,
+    }))
+    .await
+    .unwrap();
     ws.send(ws_text(&ClientMessage::SendInput {
         thread_id,
         text: "ask me".into(),
@@ -453,7 +465,10 @@ async fn websocket_subscribe_replays_pending_server_request_snapshot() {
 
     let mut reconnect = connect_ws(addr, &cookie).await;
     reconnect
-        .send(ws_text(&ClientMessage::Subscribe { thread_id }))
+        .send(ws_text(&ClientMessage::Subscribe {
+            thread_id,
+            since: None,
+        }))
         .await
         .unwrap();
 
@@ -474,9 +489,12 @@ async fn websocket_subscribe_replays_pending_server_request_snapshot() {
 async fn websocket_unknown_server_request_response_surfaces_error() {
     let (_tmp, _harness, addr, cookie, thread_id) = spawn_test_app().await;
     let mut ws = connect_ws(addr, &cookie).await;
-    ws.send(ws_text(&ClientMessage::Subscribe { thread_id }))
-        .await
-        .unwrap();
+    ws.send(ws_text(&ClientMessage::Subscribe {
+        thread_id,
+        since: None,
+    }))
+    .await
+    .unwrap();
     ws.send(ws_text(&ClientMessage::ServerRequestResponse {
         request_id: "missing".into(),
         response: ServerRequestResponse::error(-32000, "missing"),

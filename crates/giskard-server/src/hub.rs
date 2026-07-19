@@ -150,6 +150,7 @@ fn server_message_kind(msg: &ServerMessage) -> &'static str {
         ServerMessage::ThreadActivity(_) => "thread_activity",
         ServerMessage::ThreadState(_) => "thread_state",
         ServerMessage::HistoryPage { .. } => "history_page",
+        ServerMessage::HistoryDelta { .. } => "history_delta",
         ServerMessage::LiveTurnSnapshot(_) => "live_turn_snapshot",
         ServerMessage::RunningTasks { .. } => "running_tasks",
         ServerMessage::TokenUpdate { .. } => "token_update",

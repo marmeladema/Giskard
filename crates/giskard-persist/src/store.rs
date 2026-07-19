@@ -643,6 +643,26 @@ impl PersistStore {
         Ok((all[start..end].to_vec(), start > 0))
     }
 
+    /// Load the turns persisted strictly after the `after` cursor (a `TurnId`), oldest-first — the
+    /// delta an incremental reconnect needs. Returns `None` when the cursor is not found in history
+    /// (the client's cursor is stale or from another thread), signalling the caller to fall back to
+    /// a full snapshot rather than guessing.
+    pub async fn load_turns_after(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+        after: TurnId,
+    ) -> Result<Option<Vec<Turn>>, PersistError> {
+        let Some(entry) = self.current_history_cache_entry(project, thread).await? else {
+            return Ok(None);
+        };
+        let all = entry.turns.read().await;
+        match all.iter().position(|t| t.id == after) {
+            Some(index) => Ok(Some(all[index + 1..].to_vec())),
+            None => Ok(None),
+        }
+    }
+
     /// Rebuild the metadata token aggregates from the authoritative JSONL history (H3), for repair
     /// when a crash landed between the history append and the metadata update.
     pub async fn recompute_aggregates(
@@ -1147,6 +1167,39 @@ mod tests {
         // 100+200+300 input, 30 output.
         assert_eq!(tf.tokens.total.input, 600);
         assert_eq!(tf.tokens.total.output, 30);
+    }
+
+    #[tokio::test]
+    async fn load_turns_after_returns_delta_or_none_for_stale_cursor() {
+        use giskard_core::token::TokenUsage;
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+
+        let mut ids = vec![];
+        for i in 0..4 {
+            let t = make_turn(TokenUsage::new(100 * (i + 1), 10));
+            ids.push(t.id);
+            store.append_turn(pid, tid, &t).await.unwrap();
+        }
+
+        // After a middle turn → the turns strictly after it, oldest-first.
+        let after = store.load_turns_after(pid, tid, ids[1]).await.unwrap();
+        assert_eq!(
+            after.map(|turns| turns.iter().map(|t| t.id).collect::<Vec<_>>()),
+            Some(vec![ids[2], ids[3]])
+        );
+
+        // After the newest turn → an empty delta (the client is already up to date), not None.
+        let after_last = store.load_turns_after(pid, tid, ids[3]).await.unwrap();
+        assert_eq!(after_last, Some(vec![]));
+
+        // A cursor not in history → None, so the caller falls back to a full snapshot.
+        let stale = store
+            .load_turns_after(pid, tid, TurnId::new())
+            .await
+            .unwrap();
+        assert!(stale.is_none());
     }
 
     #[tokio::test]

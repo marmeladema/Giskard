@@ -643,9 +643,12 @@ async fn history_pagination_over_websocket() {
     }
 
     let subscribe = tokio_tungstenite::tungstenite::Message::Text(
-        serde_json::to_string(&ClientMessage::Subscribe { thread_id: tid })
-            .unwrap()
-            .into(),
+        serde_json::to_string(&ClientMessage::Subscribe {
+            thread_id: tid,
+            since: None,
+        })
+        .unwrap()
+        .into(),
     );
     ws.send(subscribe).await.unwrap();
 
@@ -695,6 +698,158 @@ async fn history_pagination_over_websocket() {
     assert_eq!(turns.len(), 1);
     assert_eq!(page["has_more"], false);
     assert_eq!(turns[0]["id"].as_str().unwrap(), ids[0]);
+}
+
+async fn ws_connect(
+    port: u16,
+    cookie: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let req = tokio_tungstenite::tungstenite::http::Request::builder()
+        .uri(format!("ws://127.0.0.1:{port}/api/ws"))
+        .header("host", format!("127.0.0.1:{port}"))
+        .header("cookie", cookie)
+        .header("upgrade", "websocket")
+        .header("connection", "upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .body(())
+        .unwrap();
+    tokio_tungstenite::connect_async(req).await.unwrap().0
+}
+
+/// Reconnect with a resync cursor: a resolvable `since` yields a `HistoryDelta` of just the turns
+/// after it, and a stale `since` falls back to a full `HistoryPage`.
+#[tokio::test]
+async fn resync_delta_over_websocket() {
+    let port = 19204;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let hash = password_hash("testpass");
+    // initial=2 so the stale-cursor fallback returns a bounded page we can assert on.
+    tokio::fs::write(
+        tmp.path().join("config.toml"),
+        format!(
+            "[server]\nbind=\"127.0.0.1:{port}\"\nsecure_cookies=false\n\n[auth]\npassword_hash=\"{hash}\"\nsession_days=30\n\n[history]\ninitial=2\npage=2\n"
+        ),
+    )
+    .await
+    .unwrap();
+
+    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
+    let state = AppState::new(
+        store,
+        Arc::new(DiffFactory {
+            fixture: make_fixture(),
+        }),
+        (0..32u8).collect(),
+    );
+    let app = build_app(state.clone());
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let base = format!("http://127.0.0.1:{port}");
+    let (client, cookie) = login(&base).await;
+
+    let proj_dir = tempfile::TempDir::new().unwrap();
+    let pid = ProjectId::new();
+    state
+        .store
+        .create_project(
+            pid,
+            "proj",
+            &proj_dir.path().to_string_lossy(),
+            giskard_core::model::ModelRef {
+                provider: "openai".into(),
+                model: "gpt-5.5".into(),
+                reasoning_effort: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let tid: ThreadId = {
+        let resp: serde_json::Value = client
+            .post(format!("{base}/api/projects/{pid}/threads"))
+            .header("cookie", &cookie)
+            .json(&serde_json::json!({"resume": "th_tok"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        serde_json::from_value(resp["thread_id"].clone()).unwrap()
+    };
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        let t = make_turn(&format!("turn {i}"));
+        ids.push(t.id.to_string());
+        state.store.append_turn(pid, tid, &t).await.unwrap();
+    }
+
+    async fn next_history_frame<S>(ws: &mut S) -> serde_json::Value
+    where
+        S: futures_util::Stream<
+                Item = Result<
+                    tokio_tungstenite::tungstenite::Message,
+                    tokio_tungstenite::tungstenite::Error,
+                >,
+            > + Unpin,
+    {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) =
+                tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await
+            {
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if v["type"] == "history_delta" || v["type"] == "history_page" {
+                    return v;
+                }
+            }
+        }
+        panic!("no history frame received");
+    }
+
+    // Resolvable cursor (ids[2]) → HistoryDelta with only the turns after it: ids[3], ids[4].
+    let mut ws = ws_connect(port, &cookie).await;
+    let cursor: TurnId = ids[2].parse().unwrap();
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::Subscribe {
+            thread_id: tid,
+            since: Some(cursor),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let frame = next_history_frame(&mut ws).await;
+    assert_eq!(frame["type"], "history_delta");
+    let turns = frame["turns"].as_array().unwrap();
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0]["id"].as_str().unwrap(), ids[3]);
+    assert_eq!(turns[1]["id"].as_str().unwrap(), ids[4]);
+
+    // Stale cursor (a turn id never persisted) → full HistoryPage fallback (initial=2 → last two).
+    let bogus: TurnId = make_turn("never persisted").id;
+    let mut ws2 = ws_connect(port, &cookie).await;
+    ws2.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::Subscribe {
+            thread_id: tid,
+            since: Some(bogus),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let frame = next_history_frame(&mut ws2).await;
+    assert_eq!(frame["type"], "history_page");
+    let turns = frame["turns"].as_array().unwrap();
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0]["id"].as_str().unwrap(), ids[3]);
+    assert_eq!(turns[1]["id"].as_str().unwrap(), ids[4]);
 }
 
 #[tokio::test]
@@ -783,9 +938,12 @@ async fn subscribe_corrupt_history_returns_structured_error() {
     let (mut ws, _) = tokio_tungstenite::connect_async(ws_req).await.unwrap();
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        serde_json::to_string(&ClientMessage::Subscribe { thread_id: tid })
-            .unwrap()
-            .into(),
+        serde_json::to_string(&ClientMessage::Subscribe {
+            thread_id: tid,
+            since: None,
+        })
+        .unwrap()
+        .into(),
     ))
     .await
     .unwrap();

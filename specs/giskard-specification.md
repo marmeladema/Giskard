@@ -252,10 +252,13 @@
   creation until the first message carries the selected provider/model.
 
 **Changelog (1.34 → 1.35), authoritative reconnect resync:**
-- **RX4:** A browser `Subscribe` response is an authoritative active-thread resync, not an
-  append-only delta. The client clears transient browser-rendered transcript state before replaying
-  the returned recent history and any live snapshot so failed-turn fallback bubbles, optimistic user
-  rows, and stale active-turn flags cannot duplicate or survive a reconnect.
+- **RX4:** A browser `Subscribe` response without a resync cursor is an authoritative active-thread
+  resync, not an append-only delta. The client clears transient browser-rendered transcript state
+  before replaying the returned recent history and any live snapshot so failed-turn fallback bubbles,
+  optimistic user rows, and stale active-turn flags cannot duplicate or survive a reconnect. When the
+  client can supply a `since` cursor (its newest rendered turn), it instead requests an incremental
+  `HistoryDelta` (H8) and keeps the immutable completed-turn DOM, repainting only the in-flight turn
+  — falling back to the full authoritative resync when the cursor is unresolvable.
 - **RX5:** WebSocket `error` events update persistent connection status but do not directly create
   warning notices. Warning/error notices are reserved for actionable foreground failures such as
   authorization failures, offline state, or abnormal foreground closes; sockets recently
@@ -728,6 +731,11 @@
   pagination cursor — no index file.
 - **H5:** The loader composes `[last N turns from JSONL] + [live turn from the live buffer]`; the
   in-flight turn is not in the JSONL until `TurnCompleted`.
+- **H8:** Incremental reconnect: a `Subscribe { since: TurnId }` cursor requests only the turns after
+  it, served history-first as `HistoryDelta { thread_id, turns: [WireTurn] }` (via
+  `load_turns_after`). Because persisted turns are immutable, the browser keeps its completed-turn
+  DOM and repaints only the in-flight turn. An unresolvable cursor (stale/unknown turn) falls back to
+  a full `HistoryPage` sent history-first so the client rebuilds cleanly before the live snapshot.
 - **H7:** `giskard-admin`: `compact_thread`/`dump_thread` operate on the `.jsonl`, plus
   `recompute_aggregates`; `validate` parses the JSONL line-by-line and reports the first bad line
   rather than quarantining whole histories (§5.5).
@@ -2433,7 +2441,8 @@ This guarantees a coherent experience when a future, less-capable harness is plu
   `POST /api/projects/{project_id}/threads/start` with `{ text, model_ref, mode,
   approval_policy }` and returns `{ thread_id, harness_thread_id, turn_id, warning? }`.
 
-**Client → server** (examples): `Subscribe { thread_id }`, `Unsubscribe { thread_id }`,
+**Client → server** (examples): `Subscribe { thread_id, since? }` (`since` is the incremental-resync
+cursor, H8), `Unsubscribe { thread_id }`,
 `SendInput { thread_id, text }`, `SwitchMode { thread_id, mode }`,
 `SelectModel { thread_id, model_ref }`, `SetApprovalPolicy { thread_id, policy }`,
 `Interrupt { thread_id }`, `CompactContext { thread_id }`,

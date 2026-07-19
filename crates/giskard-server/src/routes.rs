@@ -1769,7 +1769,7 @@ async fn handle_client_msg(
     msg: ClientMessage,
 ) -> Result<(), WsError> {
     match msg {
-        ClientMessage::Subscribe { thread_id } => {
+        ClientMessage::Subscribe { thread_id, since } => {
             // Attaching the harness is best-effort. If it fails — most often because the thread's
             // provider was removed from config — degrade to a read-only view: the persisted
             // history is still served and the attach failure is surfaced as a non-fatal warning,
@@ -1829,42 +1829,78 @@ async fn handle_client_msg(
                 }))
                 .await;
 
-            // Live-first: present the most recent information immediately. The in-flight turn (H5)
-            // is the newest thing in the thread and is not in the JSONL yet, so reconstruct it from
-            // the live buffer and send it — with its running tasks — *before* the persisted history
-            // page. The browser renders it at the bottom and prepends older history above it.
-            if let Some(snap) = state.live_buffers.snapshot(thread_id).await {
-                let _ = tx.send(ServerMessage::LiveTurnSnapshot(snap)).await;
-            }
+            // Two snapshot shapes, distinguished by whether the client sent a resync cursor:
+            //
+            // * Resync (`since` present): history-first ordering. Send the persisted history — a
+            //   `HistoryDelta` of the turns after the cursor when we can resolve it, or a full
+            //   `HistoryPage` when we can't (stale cursor) — *before* the live turn and tasks. The
+            //   client reconciles or rebuilds the transcript while it still owns it, then the live
+            //   turn appends on top; nothing needs mid-transcript insertion.
+            // * Fresh (`since` absent): live-first ordering. The in-flight turn (H5) isn't in the
+            //   JSONL yet, so reconstruct it from the live buffer and send it — with its tasks —
+            //   before the history page, for the fastest first paint. The browser prepends older
+            //   history above it.
+            let resync_delta = match since {
+                Some(cursor) => state
+                    .store
+                    .load_turns_after(project_id, thread_id, cursor)
+                    .await
+                    .map_err(|e| WsError::from_persist(e, "subscribe_resync", Some(thread_id)))?,
+                None => None,
+            };
 
-            let tasks = state.running_commands.snapshot(thread_id).await;
-            let _ = tx
-                .send(ServerMessage::RunningTasks { thread_id, tasks })
+            // The persisted-history message: a delta after a resolvable cursor, otherwise a full
+            // initial page (fresh open, or a stale cursor that fell back to a full rebuild).
+            let history_message = if let Some(turns) = resync_delta {
+                ServerMessage::HistoryDelta {
+                    thread_id,
+                    turns: turns.into_iter().map(Into::into).collect(),
+                }
+            } else {
+                // H4/H6: the most recent page of persisted history (not the whole thread). The
+                // initial page is deliberately small (see `HistoryConfig::initial`); the browser
+                // tops it up to fill the viewport. Older pages are fetched via `LoadHistory`.
+                let limit = history_limit_or_default(
+                    state,
+                    thread_id,
+                    "subscribe_history",
+                    |config| config.history.initial,
+                    5,
+                )
                 .await;
-
-            // H4/H6: send the most recent page of persisted history (not the whole thread). The
-            // initial page is deliberately small (see `HistoryConfig::initial`); the browser tops it
-            // up to fill the viewport. Older pages are fetched on demand via `LoadHistory`.
-            let limit = history_limit_or_default(
-                state,
-                thread_id,
-                "subscribe_history",
-                |config| config.history.initial,
-                5,
-            )
-            .await;
-            let (turns, has_more) = state
-                .store
-                .load_history(project_id, thread_id, None, limit)
-                .await
-                .map_err(|e| WsError::from_persist(e, "subscribe_history", Some(thread_id)))?;
-            let _ = tx
-                .send(ServerMessage::HistoryPage {
+                let (turns, has_more) = state
+                    .store
+                    .load_history(project_id, thread_id, None, limit)
+                    .await
+                    .map_err(|e| WsError::from_persist(e, "subscribe_history", Some(thread_id)))?;
+                ServerMessage::HistoryPage {
                     thread_id,
                     turns: turns.into_iter().map(Into::into).collect(),
                     has_more,
-                })
-                .await;
+                }
+            };
+
+            // The live turn (H5) isn't in the JSONL yet — reconstruct it from the live buffer — and
+            // its running tasks. On a fresh open (`since` absent) these go first, for the fastest
+            // first paint. On a resync (`since` present, delta or stale-cursor rebuild) the history
+            // goes first so the client reconciles/rebuilds the transcript before the live turn
+            // appends on top; that ordering needs no mid-transcript insertion.
+            let live_snapshot = state.live_buffers.snapshot(thread_id).await;
+            let tasks = state.running_commands.snapshot(thread_id).await;
+            let running_tasks = ServerMessage::RunningTasks { thread_id, tasks };
+            if since.is_some() {
+                let _ = tx.send(history_message).await;
+                if let Some(snap) = live_snapshot {
+                    let _ = tx.send(ServerMessage::LiveTurnSnapshot(snap)).await;
+                }
+                let _ = tx.send(running_tasks).await;
+            } else {
+                if let Some(snap) = live_snapshot {
+                    let _ = tx.send(ServerMessage::LiveTurnSnapshot(snap)).await;
+                }
+                let _ = tx.send(running_tasks).await;
+                let _ = tx.send(history_message).await;
+            }
         }
         ClientMessage::LoadHistory {
             thread_id,

@@ -218,9 +218,12 @@ session_days = 30
     let (mut ws, _) = tokio_tungstenite::connect_async(ws_req).await.unwrap();
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        serde_json::to_string(&ClientMessage::Subscribe { thread_id: tid })
-            .unwrap()
-            .into(),
+        serde_json::to_string(&ClientMessage::Subscribe {
+            thread_id: tid,
+            since: None,
+        })
+        .unwrap()
+        .into(),
     ))
     .await
     .unwrap();
