@@ -133,6 +133,7 @@ async fn security_headers_are_set_on_all_responses() {
             .to_str()
             .unwrap();
         assert!(csp.contains("script-src 'self'"), "CSP on {path}: {csp}");
+        assert!(csp.contains("worker-src 'self'"), "CSP on {path}: {csp}");
         assert!(
             csp.contains("frame-ancestors 'none'"),
             "CSP on {path}: {csp}"

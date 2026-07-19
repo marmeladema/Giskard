@@ -45,7 +45,7 @@ let state = {
   pickerTypeahead:"", pickerTypeaheadTimer:null, pickerSelectedRow:null,
   currentPlan:null, planExpanded:localStorage.getItem("giskard.planExpanded")==="1",
   threadActivity:new Map(), pendingApprovalFocus:null, notifiedApprovals:new Map(), approvalNotifications:new Map(), browserDiagnostics:[],
-  lastNotificationPromptNoticeAt:0,
+  lastNotificationPromptNoticeAt:0, swRegistration:null,
   collapsedProjects:new Set(loadCollapsedProjects()), pendingRemoveProject:null
 };
 const COMMAND_AUTO_COLLAPSE_LINES = 120;
@@ -82,6 +82,7 @@ $("loginForm").onsubmit = async (e) => {
 async function startApp() {
   $("login").style.display="none";
   $("app").classList.add("open");
+  initServiceWorkerNotifications();
   initNotificationSettings();
   try { state.models = (await api("GET","/api/models")).models || []; } catch { state.models=[]; }
   renderModelSelect();
@@ -138,6 +139,61 @@ function initNotificationSettings() {
 
 function notificationPermissionButtons() {
   return Array.from(document.querySelectorAll(".notify-permission-btn"));
+}
+
+// Register the notification service worker (see sw.js). Required on Chrome for Android, where
+// `new Notification()` throws — notifications must be shown via registration.showNotification() and
+// their clicks arrive as a postMessage from the worker. Best-effort: a non-secure context (plain
+// http over a LAN IP) has no service worker, and we fall back to the Notification constructor.
+function initServiceWorkerNotifications() {
+  if (!("serviceWorker" in navigator)) {
+    recordNotificationDiagnostic("sw_unsupported");
+    return;
+  }
+  navigator.serviceWorker.addEventListener("message", (event) => {
+    const data = event && event.data;
+    if (data && data.type === "giskard-notification-click") {
+      handleNotificationClick(data.notification || {});
+    }
+  });
+  navigator.serviceWorker.register("/sw.js").then((reg) => {
+    state.swRegistration = reg;
+    recordNotificationDiagnostic("sw_registered", { scope: reg && reg.scope });
+  }).catch((e) => {
+    recordNotificationDiagnostic("sw_register_failed", { error: e && e.message ? e.message : String(e) });
+  });
+}
+
+// The service-worker registration once it can show notifications, or null to fall back to the
+// Notification constructor. Waits briefly for an in-flight registration so the first notification
+// after startup isn't lost to the race.
+async function notificationRegistration() {
+  if (state.swRegistration && state.swRegistration.active) return state.swRegistration;
+  if (!("serviceWorker" in navigator)) return null;
+  try {
+    const reg = await Promise.race([
+      navigator.serviceWorker.ready,
+      new Promise((resolve) => setTimeout(() => resolve(null), 1500)),
+    ]);
+    if (reg && typeof reg.showNotification === "function") {
+      state.swRegistration = reg;
+      return reg;
+    }
+  } catch {}
+  return null;
+}
+
+// A notification was clicked — delivered by the service worker as a postMessage, or by the desktop
+// Notification's onclick. Approval notifications jump to the pending approval.
+function handleNotificationClick(data) {
+  if (data && data.threadId && data.approvalId) {
+    recordNotificationDiagnostic("approval_notification_clicked", {
+      tid: data.threadId,
+      approval_id: data.approvalId
+    });
+    closeApprovalNotification(data.threadId, data.approvalId);
+    focusApprovalTarget(data.threadId, data.approvalId);
+  }
 }
 
 async function requestNotificationPermission() {
@@ -365,7 +421,7 @@ if (clearBrowserDiagnosticsBtn) clearBrowserDiagnosticsBtn.onclick = clearBrowse
 const testNotificationBtn = $("testNotificationBtn");
 if (testNotificationBtn) testNotificationBtn.onclick = sendTestNotification;
 
-function sendTestNotification() {
+async function sendTestNotification() {
   if (!("Notification" in window)) {
     recordNotificationDiagnostic("test_notify_unsupported");
     notice("Browser notifications are unavailable.", "warning");
@@ -377,9 +433,9 @@ function sendTestNotification() {
     return;
   }
   const tag = `giskard-test-${Date.now()}`;
-  let notification;
+  let result;
   try {
-    notification = createBrowserNotification("Giskard test notification", {
+    result = await showAppNotification("Giskard test notification", {
       body: "Browser notification display test.",
       tag,
       renotify: true,
@@ -397,7 +453,7 @@ function sendTestNotification() {
     notice("Test notification failed: " + e.message, "warning");
     return;
   }
-  if (notification) recordNotificationDiagnostic("test_notify_created", { tag });
+  if (result) recordNotificationDiagnostic("test_notify_created", { tag, via: result.via });
 }
 
 /* ---------- projects & threads ---------- */
@@ -1637,7 +1693,7 @@ function handleThreadActivity(msg) {
   if (activity.kind === "approval_requested") maybeNotifyApproval(tid, activity);
 }
 
-function maybeNotifyApproval(tid, activity) {
+async function maybeNotifyApproval(tid, activity) {
   const notificationKey = approvalNotificationKey(tid, activity && activity.approval_id);
   if (!activity || activity.kind !== "approval_requested" || !notificationKey) {
     recordNotificationDiagnostic("approval_notify_skipped_invalid_call", { tid, activity });
@@ -1689,10 +1745,12 @@ function maybeNotifyApproval(tid, activity) {
   }
   const meta = threadMetaForId(tid);
   const title = meta && meta.title ? meta.title : tid.slice(0,8);
-  const notificationTag = `giskard-approval-${tid}-${activity.approval_id}-${now}`;
-  let notification;
+  // Stable per-approval tag: it dedups at the OS level and lets us close the notification by tag on
+  // the service-worker path (where we never hold a Notification object) when the approval resolves.
+  const notificationTag = approvalNotificationTag(tid, activity.approval_id);
+  let result;
   try {
-    notification = createBrowserNotification("Giskard: approval needed", {
+    result = await showAppNotification("Giskard: approval needed", {
       body: activity.summary ? `${title}: ${activity.summary}` : title,
       tag: notificationTag,
       renotify: true,
@@ -1715,31 +1773,39 @@ function maybeNotifyApproval(tid, activity) {
     console.warn("Giskard notification failed", e);
     return;
   }
-  if (!notification) return;
+  if (!result) return;
   state.notifiedApprovals.set(notificationKey, now);
-  trackApprovalNotification(notificationKey, notification);
+  // Desktop (constructor) notifications are tracked so we can close them on resolution and dispatch
+  // their click; service-worker notifications are closed by tag and click via the worker postMessage.
+  if (result.via === "constructor" && result.notification) {
+    trackApprovalNotification(notificationKey, result.notification);
+    result.notification.onclick = () => handleNotificationClick({ threadId: tid, approvalId: activity.approval_id });
+  }
   recordNotificationDiagnostic("approval_notify_created", {
     tid,
     approval_id: activity.approval_id,
     source: activity.source || "unknown",
     title,
-    tag: notificationTag
+    tag: notificationTag,
+    via: result.via
   });
-  notification.onclick = () => {
-    recordNotificationDiagnostic("approval_notification_clicked", {
-      tid,
-      approval_id: activity.approval_id,
-      source: activity.source || "unknown"
-    });
-    closeApprovalNotification(tid, activity.approval_id);
-    focusApprovalTarget(tid, activity.approval_id);
-  };
 }
 
-function createBrowserNotification(title, options, diagnosticDetail) {
-  const notification = new Notification(title, options);
+// Show an OS notification, preferring the service worker (the only path that works on Chrome for
+// Android) and falling back to the `Notification` constructor on desktop / where no worker is
+// active. Returns a descriptor: `{ via: "service_worker", tag }` (clicks arrive via postMessage,
+// closing is by tag) or `{ via: "constructor", notification }` (wire onclick / track for closing).
+// Rejects if the fallback constructor throws (e.g. on Android with no worker) so callers can log it.
+async function showAppNotification(title, options, diagnosticDetail) {
   diagnosticDetail = diagnosticDetail || {};
-  recordNotificationDiagnostic("browser_notification_created", diagnosticDetail);
+  const reg = await notificationRegistration();
+  if (reg) {
+    await reg.showNotification(title, options);
+    recordNotificationDiagnostic("browser_notification_created", { ...diagnosticDetail, via: "service_worker" });
+    return { via: "service_worker", tag: options && options.tag };
+  }
+  const notification = new Notification(title, options);
+  recordNotificationDiagnostic("browser_notification_created", { ...diagnosticDetail, via: "constructor" });
   notification.onshow = () => recordNotificationDiagnostic("browser_notification_show", diagnosticDetail);
   notification.onerror = () => recordNotificationDiagnostic("browser_notification_error", diagnosticDetail);
   notification.onclose = () => {
@@ -1751,7 +1817,7 @@ function createBrowserNotification(title, options, diagnosticDetail) {
     }
     recordNotificationDiagnostic("browser_notification_close", diagnosticDetail);
   };
-  return notification;
+  return { via: "constructor", notification };
 }
 
 function pruneNotificationDedup(now) {
@@ -1766,6 +1832,12 @@ function approvalNotificationKey(tid, approvalId) {
   const approvalKey = approvalId === undefined || approvalId === null ? "" : String(approvalId);
   if (!threadKey || !approvalKey) return "";
   return `${threadKey}:${approvalKey}`;
+}
+
+// Stable OS notification tag for an approval — used to show, dedup, and (on the service-worker
+// path) close the notification without holding a Notification object.
+function approvalNotificationTag(tid, approvalId) {
+  return `giskard-approval-${tid}-${approvalId}`;
 }
 
 function trackApprovalNotification(key, notification) {
@@ -1788,6 +1860,15 @@ function untrackApprovalNotification(key, notification) {
 function closeApprovalNotification(tid, approvalId) {
   const key = approvalNotificationKey(tid, approvalId);
   if (!key) return;
+  // Service-worker notifications aren't held as objects: fetch them back by tag and close them.
+  const reg = state.swRegistration;
+  if (reg && typeof reg.getNotifications === "function") {
+    const tag = approvalNotificationTag(tid, approvalId);
+    reg.getNotifications({ tag })
+      .then((ns) => ns.forEach((n) => { try { n.close(); } catch {} }))
+      .catch(() => {});
+  }
+  // Desktop (constructor) notifications are tracked objects.
   const notifications = state.approvalNotifications.get(key);
   if (!notifications) return;
   state.approvalNotifications.delete(key);

@@ -41,6 +41,12 @@
   hidden or the browser window is not focused, may create browser notifications when permission is
   granted. Notification clicks focus the target thread and scroll to the matching approval row when
   it is still pending. Duplicate lightweight/full approval paths are deduplicated client-side.
+  Notifications are shown through a service worker (`/sw.js`, via
+  `ServiceWorkerRegistration.showNotification()`), which is the only path that works on Chrome for
+  Android where the `Notification` constructor is illegal; the worker delivers clicks back to the
+  page by `postMessage`, and the page closes a resolved approval's notification by its stable
+  `(thread_id, request_id)` tag. Contexts without an active worker (e.g. plain-http LAN access) fall
+  back to the `Notification` constructor.
 - **BD1:** The browser exposes a tucked-away Settings → Browser diagnostics panel with a bounded
   client-side event buffer, copy/clear actions, and a test-notification action. Diagnostics include
   notification lifecycle decisions, visibility/focus state, approval routing decisions, and

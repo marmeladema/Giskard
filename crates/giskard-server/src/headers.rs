@@ -1,11 +1,12 @@
 //! Hardening response headers applied to every route.
 //!
-//! The UI is fully self-contained (its script and stylesheet are served from `/app.js` and
-//! `/app.css`, with no third-party origins), which allows a strict Content-Security-Policy:
+//! The UI is fully self-contained (its script and stylesheet are served as same-origin, content-
+//! hashed assets, with no third-party origins), which allows a strict Content-Security-Policy:
 //!
 //! - `script-src 'self'` — inline `<script>` and injected script never execute, so even a bug in
 //!   the server-side Markdown sanitizer or the client's `escapeHtml` discipline cannot escalate
 //!   to script execution;
+//! - `worker-src 'self'` — the notification service worker (`/sw.js`) loads from same origin only;
 //! - `style-src` keeps `'unsafe-inline'` because the UI sets a handful of inline `style`
 //!   attributes (a CSS-injection foothold is accepted as low severity in a single-user app);
 //! - `connect-src` lists `ws:`/`wss:` explicitly since some browsers do not extend `'self'` to
@@ -16,6 +17,7 @@ use axum::{http::HeaderValue, http::Request, middleware::Next, response::Respons
 
 const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; \
      script-src 'self'; \
+     worker-src 'self'; \
      style-src 'self' 'unsafe-inline'; \
      img-src 'self' data:; \
      connect-src 'self' ws: wss:; \
