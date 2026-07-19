@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
@@ -52,6 +52,7 @@ const CODEX_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(50);
 const WORKER_QUEUE_WARN_AFTER: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const WORKER_QUEUE_WARN_AFTER: Duration = Duration::from_millis(50);
+const THREAD_BACKGROUND_TERMINALS_TERMINATE: &str = "thread/backgroundTerminals/terminate";
 
 struct QueuedHarnessCommand {
     token: WorkerQueueToken,
@@ -61,6 +62,19 @@ struct QueuedHarnessCommand {
 struct QueuedControlCommand {
     token: WorkerQueueToken,
     command: ControlCommand,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadBackgroundTerminalsTerminateParams {
+    thread_id: String,
+    process_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadBackgroundTerminalsTerminateResponse {
+    terminated: bool,
 }
 
 enum HarnessCommand {
@@ -1338,7 +1352,7 @@ async fn handle_control_command(
                 Some(&thread),
                 Some(&process_id),
                 native_turn_id.as_deref(),
-                handle_terminate_command(client, mapper, &thread, &process_id),
+                handle_terminate_command(client, &thread, &process_id),
             )
             .await;
             let _ = response.send(result);
@@ -2137,27 +2151,72 @@ async fn handle_interrupt(
 
 async fn handle_terminate_command(
     client: &mut dyn CodexTransport,
-    mapper: &CodexMapper,
     thread: &ThreadHandle,
     process_id: &str,
 ) -> Result<(), HarnessError> {
-    let native_turn_id = mapper
-        .native_turn_for_process(thread.thread, process_id)
-        .or_else(|| mapper.active_native_turn_for_thread(thread.thread))
-        .ok_or_else(|| {
-            HarnessError::Unsupported(format!(
-                "Codex has no active turn for command process {process_id}"
-            ))
-        })?;
-    handle_interrupt_turn(
+    if process_id.parse::<i32>().is_ok() {
+        match handle_terminate_background_terminal(client, thread, process_id).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {
+                debug!(
+                    thread_id = %thread.thread,
+                    harness_thread_id = %thread.harness_thread_id,
+                    process_id,
+                    "Codex did not find a background terminal for command process"
+                );
+            }
+            Err(error) => {
+                debug!(
+                    thread_id = %thread.thread,
+                    harness_thread_id = %thread.harness_thread_id,
+                    process_id,
+                    error = %error,
+                    "Codex background-terminal termination failed; trying command/exec"
+                );
+            }
+        }
+    }
+
+    handle_terminate_command_exec(client, thread, process_id).await
+}
+
+async fn handle_terminate_background_terminal(
+    client: &mut dyn CodexTransport,
+    thread: &ThreadHandle,
+    process_id: &str,
+) -> Result<bool, HarnessError> {
+    let params = ThreadBackgroundTerminalsTerminateParams {
+        thread_id: thread.harness_thread_id.clone(),
+        process_id: process_id.to_owned(),
+    };
+    let response: ThreadBackgroundTerminalsTerminateResponse = codex_request(
         client,
-        CodexOperationContext::for_thread("terminate_command", thread)
-            .with_native_turn_id(native_turn_id)
+        CodexOperationContext::for_thread("terminate_background_terminal", thread)
             .with_process_id(process_id),
-        &thread.harness_thread_id,
-        native_turn_id,
+        THREAD_BACKGROUND_TERMINALS_TERMINATE,
+        &params,
     )
-    .await
+    .await?;
+    Ok(response.terminated)
+}
+
+async fn handle_terminate_command_exec(
+    client: &mut dyn CodexTransport,
+    thread: &ThreadHandle,
+    process_id: &str,
+) -> Result<(), HarnessError> {
+    let params = codex_codes::CommandExecTerminateParams {
+        process_id: process_id.to_owned(),
+    };
+    let _: codex_codes::CommandExecTerminateResponse = codex_request(
+        client,
+        CodexOperationContext::for_thread("terminate_command_exec", thread)
+            .with_process_id(process_id),
+        codex_codes::protocol::methods::COMMAND_EXEC_TERMINATE,
+        &params,
+    )
+    .await?;
+    Ok(())
 }
 
 async fn handle_compact_thread(
@@ -2461,6 +2520,8 @@ mod tests {
         thread_counter: usize,
         turn_counter: usize,
         hang_methods: HashSet<String>,
+        background_terminal_terminate_result: Option<bool>,
+        command_exec_terminate_error: Option<String>,
         hang_response_json: bool,
         hang_shutdown: bool,
         requests: Vec<FakeRequest>,
@@ -2515,6 +2576,14 @@ mod tests {
 
         async fn resume_method(&self, method: &'static str) {
             self.state.lock().await.hang_methods.remove(method);
+        }
+
+        async fn background_terminal_terminate_result(&self, result: bool) {
+            self.state.lock().await.background_terminal_terminate_result = Some(result);
+        }
+
+        async fn fail_command_exec_terminate(&self, message: &str) {
+            self.state.lock().await.command_exec_terminate_error = Some(message.into());
         }
 
         async fn hang_json_responses(&self) {
@@ -2599,6 +2668,17 @@ mod tests {
                     | codex_codes::protocol::methods::CONFIG_MCPSERVER_RELOAD
                     | codex_codes::protocol::methods::THREAD_DELETE
                     | codex_codes::protocol::methods::TURN_INTERRUPT => Ok(json!({})),
+                    THREAD_BACKGROUND_TERMINALS_TERMINATE => {
+                        let terminated = state.background_terminal_terminate_result.unwrap_or(true);
+                        Ok(json!({ "terminated": terminated }))
+                    }
+                    codex_codes::protocol::methods::COMMAND_EXEC_TERMINATE => {
+                        if let Some(message) = state.command_exec_terminate_error.clone() {
+                            Err(HarnessError::Transport(message))
+                        } else {
+                            Ok(json!({}))
+                        }
+                    }
                     codex_codes::protocol::methods::MCPSERVERSTATUS_LIST => Ok(json!({
                         "data": [],
                         "nextCursor": null
@@ -3118,6 +3198,100 @@ mod tests {
             )
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn codex_worker_terminates_numeric_process_with_background_terminal_api() {
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
+
+        timeout(
+            Duration::from_secs(1),
+            harness.terminate_command(&thread, "123"),
+        )
+        .await
+        .expect("terminate command should complete")
+        .unwrap();
+
+        let requests = controller.requests().await;
+        assert!(requests.iter().any(|req| {
+            req.method == THREAD_BACKGROUND_TERMINALS_TERMINATE
+                && req.params["threadId"] == thread.harness_thread_id
+                && req.params["processId"] == "123"
+        }));
+        assert!(!requests.iter().any(|req| {
+            req.method == codex_codes::protocol::methods::TURN_INTERRUPT
+                || req.method == codex_codes::protocol::methods::COMMAND_EXEC_TERMINATE
+        }));
+    }
+
+    #[tokio::test]
+    async fn codex_worker_terminates_non_numeric_process_with_command_exec_api() {
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
+
+        timeout(
+            Duration::from_secs(1),
+            harness.terminate_command(&thread, "session-a"),
+        )
+        .await
+        .expect("terminate command should complete")
+        .unwrap();
+
+        let requests = controller.requests().await;
+        assert!(requests.iter().any(|req| {
+            req.method == codex_codes::protocol::methods::COMMAND_EXEC_TERMINATE
+                && req.params["processId"] == "session-a"
+        }));
+        assert!(!requests.iter().any(|req| {
+            req.method == THREAD_BACKGROUND_TERMINALS_TERMINATE
+                || req.method == codex_codes::protocol::methods::TURN_INTERRUPT
+        }));
+    }
+
+    #[tokio::test]
+    async fn codex_worker_surfaces_process_terminate_failure_without_interrupting_turn() {
+        let (harness, controller) = spawn_fake_harness();
+        controller.background_terminal_terminate_result(false).await;
+        controller
+            .fail_command_exec_terminate("no active command/exec for process id 123")
+            .await;
+        let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
+        harness
+            .start_turn(
+                &thread,
+                UserInput::text("run command"),
+                build_turn_overrides(),
+            )
+            .await
+            .unwrap();
+
+        let err = timeout(
+            Duration::from_secs(1),
+            harness.terminate_command(&thread, "123"),
+        )
+        .await
+        .expect("terminate command should complete")
+        .expect_err("failed process termination should surface to the caller");
+        assert!(
+            matches!(err, HarnessError::Transport(message) if message.contains("no active command/exec"))
+        );
+
+        let requests = controller.requests().await;
+        assert!(requests.iter().any(|req| {
+            req.method == THREAD_BACKGROUND_TERMINALS_TERMINATE
+                && req.params["threadId"] == thread.harness_thread_id
+                && req.params["processId"] == "123"
+        }));
+        assert!(requests.iter().any(|req| {
+            req.method == codex_codes::protocol::methods::COMMAND_EXEC_TERMINATE
+                && req.params["processId"] == "123"
+        }));
+        assert!(
+            !requests
+                .iter()
+                .any(|req| req.method == codex_codes::protocol::methods::TURN_INTERRUPT)
+        );
     }
 
     #[tokio::test]
