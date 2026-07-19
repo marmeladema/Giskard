@@ -95,7 +95,10 @@ pub struct ModelRate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HistoryConfig {
-    /// Turns loaded when a thread is first opened.
+    /// Turns loaded when a thread is first opened. Kept deliberately small: a turn can contain an
+    /// arbitrary number of items, so a turn count is a poor proxy for screen height. The browser
+    /// renders the live turn first, then tops this initial page up to fill roughly two viewports
+    /// (see `HISTORY_FILL_SCREENS` in `app.js`), so most threads never fetch more than this.
     pub initial: usize,
     /// Turns loaded per "scroll up" page.
     pub page: usize,
@@ -104,7 +107,7 @@ pub struct HistoryConfig {
 impl Default for HistoryConfig {
     fn default() -> Self {
         Self {
-            initial: 50,
+            initial: 5,
             page: 50,
         }
     }

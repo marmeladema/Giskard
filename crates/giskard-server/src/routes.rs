@@ -1829,14 +1829,28 @@ async fn handle_client_msg(
                 }))
                 .await;
 
-            // H4/H6: send the most recent page of history (not the whole thread). Older pages are
-            // fetched on demand via `LoadHistory`.
+            // Live-first: present the most recent information immediately. The in-flight turn (H5)
+            // is the newest thing in the thread and is not in the JSONL yet, so reconstruct it from
+            // the live buffer and send it — with its running tasks — *before* the persisted history
+            // page. The browser renders it at the bottom and prepends older history above it.
+            if let Some(snap) = state.live_buffers.snapshot(thread_id).await {
+                let _ = tx.send(ServerMessage::LiveTurnSnapshot(snap)).await;
+            }
+
+            let tasks = state.running_commands.snapshot(thread_id).await;
+            let _ = tx
+                .send(ServerMessage::RunningTasks { thread_id, tasks })
+                .await;
+
+            // H4/H6: send the most recent page of persisted history (not the whole thread). The
+            // initial page is deliberately small (see `HistoryConfig::initial`); the browser tops it
+            // up to fill the viewport. Older pages are fetched on demand via `LoadHistory`.
             let limit = history_limit_or_default(
                 state,
                 thread_id,
                 "subscribe_history",
                 |config| config.history.initial,
-                50,
+                5,
             )
             .await;
             let (turns, has_more) = state
@@ -1850,16 +1864,6 @@ async fn handle_client_msg(
                     turns: turns.into_iter().map(Into::into).collect(),
                     has_more,
                 })
-                .await;
-
-            // H5: the in-flight turn is not in the JSONL yet — reconstruct it from the live buffer.
-            if let Some(snap) = state.live_buffers.snapshot(thread_id).await {
-                let _ = tx.send(ServerMessage::LiveTurnSnapshot(snap)).await;
-            }
-
-            let tasks = state.running_commands.snapshot(thread_id).await;
-            let _ = tx
-                .send(ServerMessage::RunningTasks { thread_id, tasks })
                 .await;
         }
         ClientMessage::LoadHistory {
