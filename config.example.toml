@@ -57,7 +57,7 @@ max_highlight_size = 10485760   # 10 MiB
 # (a turn can hold arbitrarily many items) doesn't over- or under-fetch. `page` is the "scroll up"
 # batch for loading older history (infinite scroll).
 initial = 5
-page = 50
+page = 5
 
 [harness]
 # Which agent harness backs projects. v1 ships "codex".

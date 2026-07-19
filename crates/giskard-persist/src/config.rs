@@ -100,7 +100,8 @@ pub struct HistoryConfig {
     /// renders the live turn first, then tops this initial page up to fill roughly two viewports
     /// (see `HISTORY_FILL_SCREENS` in `app.js`), so most threads never fetch more than this.
     pub initial: usize,
-    /// Turns loaded per "scroll up" page.
+    /// Turns loaded per "scroll up" page. Small for the same reason as `initial`: a turn is not a
+    /// fixed amount of content, so loading many at once can pull far more than a screen.
     pub page: usize,
 }
 
@@ -108,7 +109,7 @@ impl Default for HistoryConfig {
     fn default() -> Self {
         Self {
             initial: 5,
-            page: 50,
+            page: 5,
         }
     }
 }

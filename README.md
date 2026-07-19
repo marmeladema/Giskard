@@ -164,7 +164,7 @@ service does not silently run with an empty provider list.
 | `[plan]` | `default_dir` / `filename_template` | `docs` / `plan-{slug}-{ts}.md` | Where "Save plan to project" writes. |
 | `[tokens]` | `cost_estimation` | `false` | Show an estimated € cost from `[tokens.rates."provider/model"]`. |
 | `[viz]` | `max_highlight_size` | `10485760` (10 MiB) | Files larger than this aren't syntax-highlighted. |
-| `[history]` | `initial` / `page` | `5` / `50` | Turns fetched on open (topped up client-side to ~2 screens) / per scroll-up page. |
+| `[history]` | `initial` / `page` | `5` / `5` | Turns fetched on open (topped up client-side to ~2 screens) / per scroll-up page. |
 | `[harness]` | `kind` | `codex` | Agent harness (v1: `codex`). |
 | | `idle_shutdown_secs` | `0` (keep alive) | Terminate an idle project's harness after N seconds. |
 | `[[providers]]` | `id`, `name`, `wire_api`, `base_url?`, `model_listing`, `api_key?` / `api_key_env?`, `[[providers.models]]` | — | What the model picker offers. With `model_listing = true` + `base_url` the picker is refreshed from `GET {base_url}/models` (on load, and via the ↻ button), so `[[providers.models]]` becomes optional. Set `api_key` (inline) or `api_key_env` (env-var name) for endpoints that require auth — sent as `Authorization: Bearer …`. |
