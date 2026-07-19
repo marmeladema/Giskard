@@ -6,6 +6,14 @@ const WS_RECONNECT_MAX_MS = 8000;
 const WS_PROBLEM_NOTICE_INTERVAL_MS = 30000;
 const WS_BACKGROUND_CLOSE_GRACE_MS = 10000;
 const TRANSCRIPT_BOTTOM_STICKY_PX = 96;
+// History is paginated by turn on the server, but a turn can hold an arbitrary number of items, so a
+// turn count is a poor proxy for screen height. On open we render the live turn first, then top up
+// persisted history in small batches until the transcript holds roughly this many viewports of
+// scrollback — measuring pixels the server can't see. `clientHeight` makes this adapt to phone vs
+// desktop for free. The cap stops pathologically tiny turns from paging forever.
+const HISTORY_FILL_SCREENS = 2;
+const HISTORY_FILL_BATCH = 5;
+const HISTORY_FILL_MAX_TURNS = 200;
 const PICKER_TYPEAHEAD_RESET_MS = 1000;
 const NOTIFICATION_PROMPT_NOTICE_INTERVAL_MS = 30000;
 const BROWSER_DIAGNOSTIC_LIMIT = 120;
@@ -1139,7 +1147,7 @@ function openDraftThread(pid, defaultModel) {
   setApprovalPolicy("ask");
   setTurnActive(false);
   state.historyLoaded = false; state.oldestTurnId = null; state.hasMoreHistory = false;
-  state.loadingHistory = false; state.pendingOlder = false;
+  state.loadingHistory = false; state.pendingOlder = false; state.autoFilledTurns = 0;
   state.contextUsed = null; state.contextWindow = 0; state.tokenLedger = null;
   updateGauge(null, 0);
   state.awaitingInitialThreadState = false;
@@ -1199,7 +1207,7 @@ async function openThread(pid, tid, title, opts) {
   loadMcpServers({ announce:false });
   setTurnActive(false);
   state.historyLoaded = false; state.oldestTurnId = null; state.hasMoreHistory = false;
-  state.loadingHistory = false; state.pendingOlder = false;
+  state.loadingHistory = false; state.pendingOlder = false; state.autoFilledTurns = 0;
   state.contextUsed = null; state.contextWindow = 0; state.tokenLedger = null;
   updateGauge(null, 0);
   state.awaitingInitialThreadState = true;
@@ -1893,6 +1901,7 @@ function resetTranscriptForAuthoritativeSnapshot() {
   state.loadingHistory = false;
   state.oldestTurnId = null;
   state.hasMoreHistory = false;
+  state.autoFilledTurns = 0;
   state.interruptPending = false;
   state.compactPending = false;
   resetRenderState();
@@ -1922,33 +1931,62 @@ function setApprovalPolicy(policy) {
 // Render the most recent page of persisted history (H6), oldest-first. Older pages are available
 // via LoadHistory { before: oldestTurnId } when has_more is set (wired to the "Load older" button).
 function renderHistoryPage(msg) {
-  const older = state.pendingOlder;       // was this page requested by a scroll-up LoadHistory?
+  // `older` marks a page fetched *above* what's already shown: a scroll-up LoadHistory or an
+  // open-time autofill top-up. The first (initial) page is the only one that is not `older`.
+  const older = state.pendingOlder;
   state.pendingOlder = false;
   state.loadingHistory = false;
   state.hasMoreHistory = !!msg.has_more;
   const turns = msg.turns || [];
   if (turns.length) state.oldestTurnId = turns[0].id;   // turns are oldest-first
-  if (!older) updateGaugeFromTurns(turns);
+  state.autoFilledTurns = (state.autoFilledTurns || 0) + turns.length;
+  // The gauge tracks current context occupancy. When a live turn is active it (and the thread_state
+  // aggregates) own the gauge, so a staler value from the newest persisted turn must not clobber it.
+  if (!older && !state.activeTurn) updateGaugeFromTurns(turns);
 
+  // Every page renders into a detached container and is prepended above existing content, so the
+  // live turn (rendered first, at the bottom) and any already-loaded history stay in place.
+  const container = document.createElement("div");
+  const prev = state.renderTarget;
+  const prevTaskGroup = state.activeTaskGroup;
+  state.renderTarget = container;
+  state.activeTaskGroup = null;
+  for (const turn of turns) renderPersistedTurn(turn);
+  state.renderTarget = prev;
+  state.activeTaskGroup = prevTaskGroup;
+
+  const t = $("transcript");
+  const heightBefore = t.scrollHeight;
+  const anchor = t.firstChild;   // insert before current top-most content (or append if empty)
+  while (container.firstChild) t.insertBefore(container.firstChild, anchor);
   if (older) {
-    // Render into a detached container, then prepend to the top and preserve the scroll position
-    // so the viewport doesn't jump while older content is inserted (infinite scroll).
-    const container = document.createElement("div");
-    const prev = state.renderTarget;
-    const prevTaskGroup = state.activeTaskGroup;
-    state.renderTarget = container;
-    state.activeTaskGroup = null;
-    for (const turn of turns) renderPersistedTurn(turn);
-    state.renderTarget = prev;
-    state.activeTaskGroup = prevTaskGroup;
-
-    const t = $("transcript");
-    const heightBefore = t.scrollHeight;
-    const anchor = t.firstChild;
-    while (container.firstChild) t.insertBefore(container.firstChild, anchor);
+    // Preserve the viewport so it doesn't jump while older content is inserted (infinite scroll).
     t.scrollTop += t.scrollHeight - heightBefore;
   } else {
-    for (const turn of turns) renderPersistedTurn(turn);
+    // Initial page: reveal the newest content (the live turn, or the last persisted turn).
+    t.scrollTop = t.scrollHeight;
+  }
+
+  maybeAutoFillHistory();
+}
+
+// After each history page lands, keep topping up (oldest-first, in small batches) until the
+// transcript holds ~HISTORY_FILL_SCREENS viewports of scrollback, we run out of history, or we hit
+// the safety cap. This reuses the scroll-up LoadHistory path, so pages arrive as `older` and are
+// prepended without moving the viewport. Measuring pixels here is deliberate: only the browser
+// knows how tall rendered turns are, so the server cannot page by screen.
+function maybeAutoFillHistory() {
+  if (state.renderTarget) return;   // never while rendering into a detached container
+  const t = $("transcript");
+  if (!t || !state.threadId) return;
+  if (!state.hasMoreHistory || state.loadingHistory || !state.oldestTurnId) return;
+  if ((state.autoFilledTurns || 0) >= HISTORY_FILL_MAX_TURNS) return;
+  if (t.scrollHeight >= t.clientHeight * HISTORY_FILL_SCREENS) return;
+  state.loadingHistory = true;
+  state.pendingOlder = true;
+  if (!send({ type:"load_history", thread_id: state.threadId, before: state.oldestTurnId, limit: HISTORY_FILL_BATCH })) {
+    state.loadingHistory = false;
+    state.pendingOlder = false;
   }
 }
 
