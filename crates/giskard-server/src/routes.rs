@@ -96,6 +96,9 @@ pub fn public_routes() -> Router<AppState> {
         // hashes.
         .route(APP_JS_PATH, get(app_js))
         .route(APP_CSS_PATH, get(app_css))
+        // The service worker must live at a stable root path so it controls the whole origin and so
+        // the browser's update check can re-fetch the same URL — hence not content-hashed.
+        .route("/sw.js", get(service_worker))
         .route("/api/login", post(login))
 }
 
@@ -151,6 +154,22 @@ async fn app_css() -> impl IntoResponse {
             (axum::http::header::CACHE_CONTROL, ASSET_CACHE_CONTROL),
         ],
         include_str!("../static/app.css"),
+    )
+}
+
+/// The notification service worker. Served no-cache from the root so it controls the whole origin
+/// and the browser revalidates it on each update check (the service-worker lifecycle then rolls it
+/// over). It carries no version-specific content, so unlike the app assets it isn't content-hashed.
+async fn service_worker() -> impl IntoResponse {
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/javascript; charset=utf-8",
+            ),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ],
+        include_str!("../static/sw.js"),
     )
 }
 

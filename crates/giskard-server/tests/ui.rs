@@ -1875,7 +1875,7 @@ fn sidebar_activity_notifications_target_approval_rows() {
     assert!(body.contains("const notifiedAt = state.notifiedApprovals.get(notificationKey);"));
     assert!(body.contains("now - notifiedAt < NOTIFICATION_DEDUP_MS"));
     assert!(body.contains("state.notifiedApprovals.set(notificationKey, now);"));
-    assert!(body.contains("trackApprovalNotification(notificationKey, notification);"));
+    assert!(body.contains("trackApprovalNotification(notificationKey, result.notification);"));
     assert!(body.contains("function pruneNotificationDedup(now)"));
     assert!(body.contains("function approvalNotificationKey(tid, approvalId)"));
     assert!(body.contains("const approvalKey = approvalId === undefined || approvalId === null"));
@@ -1896,9 +1896,12 @@ fn sidebar_activity_notifications_target_approval_rows() {
     assert!(body.contains("for (const notification of notifications)"));
     assert!(body.contains("approval_notification_closed"));
     assert!(!body.contains("closeAllApprovalNotifications"));
-    assert!(body.contains(
-        "const notificationTag = `giskard-approval-${tid}-${activity.approval_id}-${now}`;"
-    ));
+    assert!(
+        body.contains(
+            "const notificationTag = approvalNotificationTag(tid, activity.approval_id);"
+        )
+    );
+    assert!(body.contains("return `giskard-approval-${tid}-${approvalId}`;"));
     assert!(body.contains("tag: notificationTag"));
     assert!(body.contains("function notifyApprovalRequest(request, tid, opts)"));
     assert!(body.contains("function handleIncomingApprovalRequest(request, tid, opts)"));
@@ -1913,7 +1916,10 @@ fn sidebar_activity_notifications_target_approval_rows() {
     assert!(body.contains("approval_notify_suppressed_visible_current_thread"));
     assert!(body.contains("approval_notify_constructor_failed"));
     assert!(body.contains("approval_notify_created"));
-    assert!(body.contains("function createBrowserNotification(title, options, diagnosticDetail)"));
+    assert!(body.contains("async function showAppNotification(title, options, diagnosticDetail)"));
+    // Prefer the service worker (works on Android); fall back to the Notification constructor.
+    assert!(body.contains("const reg = await notificationRegistration();"));
+    assert!(body.contains("await reg.showNotification(title, options);"));
     assert!(body.contains("const notification = new Notification(title, options);"));
     assert!(body.contains("browser_notification_created"));
     assert!(body.contains("browser_notification_show"));
@@ -1948,13 +1954,16 @@ fn sidebar_activity_notifications_target_approval_rows() {
     assert!(!body.contains("notifyApprovalRequest(ev.request"));
     assert!(!body.contains("notifyApprovalRequest(msg.request"));
     assert!(!body.contains("notifyApprovalRequest(snap.pending_approval"));
-    assert!(body.contains("createBrowserNotification(\"Giskard: approval needed\""));
+    assert!(body.contains("await showAppNotification(\"Giskard: approval needed\""));
     assert!(body.contains("const focused = document.hasFocus ? document.hasFocus() : true;"));
     assert!(body.contains(
         "if (document.visibilityState === \"visible\" && focused && String(tid) === String(state.threadId))"
     ));
-    assert!(body.contains("notification.onclick = () =>"));
-    assert!(body.contains("closeApprovalNotification(tid, activity.approval_id);"));
+    // Desktop notifications wire their click; service-worker clicks arrive via the worker postMessage.
+    assert!(body.contains(
+        "result.notification.onclick = () => handleNotificationClick({ threadId: tid, approvalId: activity.approval_id });"
+    ));
+    assert!(body.contains("closeApprovalNotification(data.threadId, data.approvalId);"));
     assert!(body.contains("openThread(meta.pid, tid, meta.title, { focusApprovalId:approvalId })"));
     assert!(body.contains("function approvalRowById(id)"));
     assert!(body.contains("row.scrollIntoView({ block:\"center\", behavior:\"smooth\" });"));
@@ -1972,6 +1981,78 @@ fn sidebar_activity_notifications_target_approval_rows() {
     assert!(css.contains("flex:0 0 24px"));
     assert!(css.contains("max-width:24px"));
     assert!(css.contains(".notify-permission-btn"));
+}
+
+#[test]
+fn browser_uses_service_worker_for_android_notifications() {
+    let body = app_js();
+
+    // The service worker is registered on startup, and its click messages are dispatched.
+    assert!(body.contains("initServiceWorkerNotifications();"));
+    let init = between(
+        body,
+        "function initServiceWorkerNotifications() {",
+        "async function notificationRegistration()",
+    );
+    assert!(init.contains("navigator.serviceWorker.register(\"/sw.js\")"));
+    assert!(init.contains("navigator.serviceWorker.addEventListener(\"message\""));
+    assert!(init.contains("data.type === \"giskard-notification-click\""));
+    assert!(init.contains("handleNotificationClick(data.notification || {})"));
+
+    // Readiness waits (bounded) for the worker so the first notification isn't lost to the race.
+    let ready = between(
+        body,
+        "async function notificationRegistration() {",
+        "function handleNotificationClick(data)",
+    );
+    assert!(ready.contains("navigator.serviceWorker.ready"));
+    assert!(ready.contains("typeof reg.showNotification === \"function\""));
+
+    // Resolution closes service-worker notifications by tag (no Notification object is held).
+    let close = between(
+        body,
+        "function closeApprovalNotification(tid, approvalId) {",
+        "function maybeNoticeNotificationPermission()",
+    );
+    assert!(close.contains("reg.getNotifications({ tag })"));
+
+    // The service worker handles the click where `new Notification()` can't exist (Android).
+    let sw = include_str!("../static/sw.js");
+    assert!(sw.contains("addEventListener(\"notificationclick\""));
+    assert!(sw.contains("self.clients.matchAll"));
+    assert!(sw.contains("client.postMessage({ type: \"giskard-notification-click\""));
+    assert!(sw.contains("self.skipWaiting()"));
+}
+
+#[tokio::test]
+async fn service_worker_is_served_from_root_no_cache() {
+    let port = 19302;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
+    let state = AppState::new(store, Arc::new(NoFactory), (0..32u8).collect());
+    let app = build_app(state);
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    // The worker must be reachable unauthenticated, at a stable root path, served no-cache and with
+    // a JS content type — otherwise the browser refuses to register it.
+    let resp = reqwest::get(format!("http://127.0.0.1:{port}/sw.js"))
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    assert_eq!(resp.headers().get("cache-control").unwrap(), "no-cache");
+    assert!(
+        resp.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("javascript"),
+        "service worker needs a JavaScript content type"
+    );
+    assert!(resp.text().await.unwrap().contains("notificationclick"));
 }
 
 /// The UI script, as served at `/app.js`. The page's JS is a separate same-origin asset so the
