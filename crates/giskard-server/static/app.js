@@ -25,6 +25,11 @@ let state = {
   wsReconnectTimer:null, wsReconnectAttempt:0, wsStatusDetail:"WebSocket disconnected",
   wsLastProblem:"", wsLastProblemNotice:"", wsLastProblemNoticeAt:0,
   draftThread:null, firstTurnStartingThreadId:null, inputDrafts:new Map(),
+  // Per-turn DOM identity (foundation for incremental reconnect): `currentRenderTurnId` is the turn
+  // whose rows are being stamped right now (a persisted turn being rendered, or the live turn being
+  // streamed); `newestPersistedTurnId` is the id of the newest turn known to have completed — the
+  // high-water mark a future resync will use as its "give me turns after this" cursor.
+  currentRenderTurnId:null, newestPersistedTurnId:null,
   models:[], pendingModelBeforeSelect:null, streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null,
   streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), itemKindsByItemId:new Map(),
   pendingApprovals:new Map(), answeredApprovals:new Map(), renderedApprovalStateKeys:new Set(), pendingServerRequests:new Map(),
@@ -1148,6 +1153,7 @@ function openDraftThread(pid, defaultModel) {
   setTurnActive(false);
   state.historyLoaded = false; state.oldestTurnId = null; state.hasMoreHistory = false;
   state.loadingHistory = false; state.pendingOlder = false; state.autoFilledTurns = 0;
+  state.currentRenderTurnId = null; state.newestPersistedTurnId = null;
   state.contextUsed = null; state.contextWindow = 0; state.tokenLedger = null;
   updateGauge(null, 0);
   state.awaitingInitialThreadState = false;
@@ -1208,6 +1214,7 @@ async function openThread(pid, tid, title, opts) {
   setTurnActive(false);
   state.historyLoaded = false; state.oldestTurnId = null; state.hasMoreHistory = false;
   state.loadingHistory = false; state.pendingOlder = false; state.autoFilledTurns = 0;
+  state.currentRenderTurnId = null; state.newestPersistedTurnId = null;
   state.contextUsed = null; state.contextWindow = 0; state.tokenLedger = null;
   updateGauge(null, 0);
   state.awaitingInitialThreadState = true;
@@ -1902,6 +1909,9 @@ function resetTranscriptForAuthoritativeSnapshot() {
   state.oldestTurnId = null;
   state.hasMoreHistory = false;
   state.autoFilledTurns = 0;
+  // The transcript is being rebuilt from an authoritative snapshot, so drop the in-flight stamp;
+  // the incoming history page re-establishes the persisted high-water mark.
+  state.currentRenderTurnId = null;
   state.interruptPending = false;
   state.compactPending = false;
   resetRenderState();
@@ -1939,6 +1949,9 @@ function renderHistoryPage(msg) {
   state.hasMoreHistory = !!msg.has_more;
   const turns = msg.turns || [];
   if (turns.length) state.oldestTurnId = turns[0].id;   // turns are oldest-first
+  // High-water cursor: the initial page ends at the newest persisted turn. Older pages are, by
+  // definition, further back, so they must never lower this.
+  if (!older && turns.length) state.newestPersistedTurnId = turns[turns.length - 1].id;
   state.autoFilledTurns = (state.autoFilledTurns || 0) + turns.length;
   // The gauge tracks current context occupancy. When a live turn is active it (and the thread_state
   // aggregates) own the gauge, so a staler value from the newest persisted turn must not clobber it.
@@ -1996,6 +2009,10 @@ function maybeAutoFillHistory() {
 // why the message got no agent response — the record that a transient toast used to lose.
 function renderPersistedTurn(turn) {
   breakTaskGroup();
+  // Stamp this turn's rows with its id while rendering. Save/restore so rendering an older page
+  // (prepended above) can't leave a stale id set for whatever renders next.
+  const prevRenderTurnId = state.currentRenderTurnId;
+  state.currentRenderTurnId = turn.id;
   const items = turn.items || [];
   const hasUserItem = items.some(it => ((it.payload||it).kind) === "user_message");
   const inputText = turn.user_input && turn.user_input.text;
@@ -2007,6 +2024,7 @@ function renderPersistedTurn(turn) {
   if (st && (st.kind==="failed" || st.kind==="interrupted")) {
     errorBubble(st.message || (st.kind==="interrupted" ? "Turn interrupted." : "Turn failed."));
   }
+  state.currentRenderTurnId = prevRenderTurnId;
   breakTaskGroup();
 }
 
@@ -2030,6 +2048,12 @@ function handleEvent(ev) {
       state.streamElsByItemId.clear();
       state.itemKindsByItemId.clear();
       clearPlanCard();   // a new turn starts a fresh plan
+      // The live turn id equals its eventual persisted id, so adopt it now for row stamping and
+      // upgrade any optimistic "pending" rows (the user bubble sent before the turn started).
+      state.currentRenderTurnId = ev.turn;
+      if (ev.turn) {
+        document.querySelectorAll('.msg[data-turn="pending"]').forEach(m => { m.dataset.turn = ev.turn; });
+      }
       setTurnActive(true);
       setActiveThreadActivity("progress", true, "Turn running");
       break;
@@ -2061,6 +2085,9 @@ function handleEvent(ev) {
       break;
     case "turn_completed":
       state.firstTurnStartingThreadId = null;
+      // This turn is now persisted; advance the high-water cursor and stop stamping rows to it.
+      if (ev.turn) state.newestPersistedTurnId = ev.turn;
+      state.currentRenderTurnId = null;
       updateGaugeFromUsage(ev.usage);
       state.streamEl=null;
       state.streamItemId=null;
@@ -2123,6 +2150,9 @@ function errorText(e) {
 function renderLiveTurnSnapshot(snap) {
   if (snap && snap.turn_id) {
     state.firstTurnStartingThreadId = null;
+    // Adopt the live turn id so its rows stamp correctly even if the accumulated events don't lead
+    // with a turn_started (the turn_started handler will confirm the same id).
+    state.currentRenderTurnId = snap.turn_id;
     setTurnActive(true);
     setActiveThreadActivity("progress", true, "Turn running");
   }
@@ -2768,6 +2798,12 @@ function keepTranscriptRowAnchored(el) {
 function appendBubble(cls, role) {
   const followBottom = transcriptShouldStickToBottom();
   const el = document.createElement("div"); el.className="msg "+cls;
+  // Tag every transcript row with the turn it belongs to. Persisted and live turns supply a real id
+  // via `currentRenderTurnId`; optimistic rows created before `turn_started` (the pending user
+  // bubble) are marked "pending" and upgraded to the real id when the turn actually starts. This is
+  // the sole creation site for top-level rows, so this one stamp covers messages, task-group
+  // wrappers, and command/tool bubbles; nested task-detail panels ride along inside their wrapper.
+  el.dataset.turn = state.currentRenderTurnId || "pending";
   const r = document.createElement("div"); r.className="role"; r.textContent=role;
   const body = document.createElement("div"); body.className="body";
   el.append(r, body);
