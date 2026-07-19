@@ -1,5 +1,6 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use axum::{
@@ -89,32 +90,66 @@ pub fn public_routes() -> Router<AppState> {
     Router::new()
         .route("/", get(index))
         .route("/favicon.svg", get(favicon_svg))
-        .route("/app.js", get(app_js))
-        .route("/app.css", get(app_css))
+        // Assets are served under content-hashed paths (see build.rs) so they can be cached
+        // immutably: the URL changes exactly when the bytes do, so an upgraded binary can never be
+        // shadowed by a stale browser cache. `index.html` (served no-cache) points at the current
+        // hashes.
+        .route(APP_JS_PATH, get(app_js))
+        .route(APP_CSS_PATH, get(app_css))
         .route("/api/login", post(login))
 }
+
+/// Build/version identity, stamped in by `build.rs`: a human-readable git short hash (with a
+/// `-dirty` suffix for uncommitted builds) shown in the Settings panel, and content hashes of the
+/// two assets used as cache-busting path segments.
+const GIT_HASH: &str = env!("GISKARD_GIT_HASH");
+const APP_JS_PATH: &str = concat!("/app.", env!("GISKARD_JS_HASH"), ".js");
+const APP_CSS_PATH: &str = concat!("/app.", env!("GISKARD_CSS_HASH"), ".css");
+
+/// Immutable caching is safe because the asset URL carries a content hash.
+const ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+
+/// `index.html` with its placeholders resolved once at startup: the hashed asset URLs and the build
+/// version (exposed to the browser as a `<meta>` tag, which the strict CSP allows where an inline
+/// script would be blocked).
+static INDEX_HTML: LazyLock<String> = LazyLock::new(|| {
+    include_str!("../static/index.html")
+        .replace("__APP_CSS__", APP_CSS_PATH)
+        .replace("__APP_JS__", APP_JS_PATH)
+        .replace("__GISKARD_VERSION__", GIT_HASH)
+});
 
 /// Serve the single-page desktop UI (§13). Self-contained HTML/CSS/JS (no npm); it authenticates
 /// via `/api/login` and drives the app through the same REST + WS API as any client. The script
 /// and stylesheet ship as separate same-origin assets (below) so the Content-Security-Policy can
-/// enforce a strict `script-src 'self'` with no inline execution.
-async fn index() -> axum::response::Html<&'static str> {
-    axum::response::Html(include_str!("../static/index.html"))
+/// enforce a strict `script-src 'self'` with no inline execution. Served `no-cache` so the browser
+/// always revalidates the HTML and thus always picks up the current hashed asset URLs.
+async fn index() -> impl IntoResponse {
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-cache")],
+        axum::response::Html(INDEX_HTML.as_str()),
+    )
 }
 
 async fn app_js() -> impl IntoResponse {
     (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )],
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            ),
+            (axum::http::header::CACHE_CONTROL, ASSET_CACHE_CONTROL),
+        ],
         include_str!("../static/app.js"),
     )
 }
 
 async fn app_css() -> impl IntoResponse {
     (
-        [(axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        [
+            (axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (axum::http::header::CACHE_CONTROL, ASSET_CACHE_CONTROL),
+        ],
         include_str!("../static/app.css"),
     )
 }

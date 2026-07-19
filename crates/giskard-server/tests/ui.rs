@@ -29,10 +29,29 @@ async fn index_page_is_served_and_public() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     // No cookie: the page and its same-origin assets must load without authentication. The UI's
-    // script/stylesheet are separate assets (CSP: `script-src 'self'`), and the favicon is
-    // same-origin app chrome.
-    let mut body = String::new();
-    for path in ["/", "/favicon.svg", "/app.js", "/app.css"] {
+    // script/stylesheet are separate assets (CSP: `script-src 'self'`) served under content-hashed
+    // URLs (cache-busting); the served HTML points at the current ones. The favicon is same-origin
+    // app chrome.
+    let index_html = reqwest::get(format!("http://127.0.0.1:{port}/"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let js_url = between(&index_html, "<script src=\"", "\"").to_string();
+    let css_url = between(&index_html, "<link rel=\"stylesheet\" href=\"", "\"").to_string();
+    assert!(
+        js_url.starts_with("/app.") && js_url.ends_with(".js"),
+        "script is served from a content-hashed URL: {js_url}"
+    );
+    assert!(
+        css_url.starts_with("/app.") && css_url.ends_with(".css"),
+        "stylesheet is served from a content-hashed URL: {css_url}"
+    );
+
+    let mut body = index_html.clone();
+    for path in ["/favicon.svg".to_string(), js_url, css_url] {
+        body.push('\n');
         body.push_str(
             &reqwest::get(format!("http://127.0.0.1:{port}{path}"))
                 .await
@@ -41,7 +60,6 @@ async fn index_page_is_served_and_public() {
                 .await
                 .unwrap(),
         );
-        body.push('\n');
     }
     assert!(body.contains("<title>Giskard</title>"));
     assert!(
@@ -1261,6 +1279,79 @@ async fn index_page_is_served_and_public() {
         "no external stylesheet refs"
     );
     assert!(!body.contains("cdn"), "no CDN references");
+}
+
+#[tokio::test]
+async fn version_meta_and_immutable_asset_caching() {
+    let port = 19301;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
+    let state = AppState::new(store, Arc::new(NoFactory), (0..32u8).collect());
+    let app = build_app(state);
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    // The index is served no-cache so it always revalidates and points at the current asset URLs.
+    let index_resp = reqwest::get(format!("http://127.0.0.1:{port}/"))
+        .await
+        .unwrap();
+    assert_eq!(
+        index_resp.headers().get("cache-control").unwrap(),
+        "no-cache"
+    );
+    let index_html = index_resp.text().await.unwrap();
+
+    // The running build is exposed via a CSP-safe meta tag and surfaced in the Settings panel.
+    let version = between(
+        &index_html,
+        "<meta name=\"giskard-version\" content=\"",
+        "\"",
+    )
+    .to_string();
+    assert!(
+        !version.is_empty() && version != "__GISKARD_VERSION__",
+        "the build version is stamped into the served HTML: {version:?}"
+    );
+    assert!(
+        index_html.contains("id=\"giskardVersion\""),
+        "the Settings panel has a version row"
+    );
+
+    // Asset URLs are content-hashed and served immutably, so a browser cache can't shadow an upgrade.
+    let js_url = between(&index_html, "<script src=\"", "\"").to_string();
+    let js_resp = reqwest::get(format!("http://127.0.0.1:{port}{js_url}"))
+        .await
+        .unwrap();
+    assert!(
+        js_resp
+            .headers()
+            .get("cache-control")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("immutable"),
+        "hashed assets are cached immutably"
+    );
+    assert!(
+        js_resp
+            .text()
+            .await
+            .unwrap()
+            .contains("function initVersionLabel()"),
+        "the hashed URL serves the app script"
+    );
+
+    // The old unhashed path no longer serves the asset — nothing can pin a stale /app.js.
+    let stale = reqwest::get(format!("http://127.0.0.1:{port}/app.js"))
+        .await
+        .unwrap();
+    assert!(
+        !stale.status().is_success(),
+        "the unhashed /app.js must not serve content (got {})",
+        stale.status()
+    );
 }
 
 #[test]

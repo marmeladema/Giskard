@@ -61,6 +61,7 @@
   .settings-field select { width:100%; }
   .settings-field button { width:100%; }
   .settings-field .notify-permission-btn { height:auto; min-height:32px; padding:6px 8px; text-align:left; }
+  .settings-field .settings-version { font-family:var(--mono, ui-monospace, monospace); font-size:12px; text-align:left; color:var(--muted); background:transparent; border:1px solid var(--border, #ccc); }
   .browser-diagnostics {
     margin:8px 0 0; padding:8px;
     border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--muted);

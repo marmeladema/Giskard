@@ -176,8 +176,16 @@
   (`script-src 'self'`, `frame-ancestors 'none'`), `X-Content-Type-Options: nosniff`,
   `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, COOP/CORP `same-origin`, and a
   minimal `Permissions-Policy`. The single-page UI's script and stylesheet are served as
-  separate same-origin assets (`/app.js`, `/app.css`, `/favicon.svg`) so no inline script executes
-  (§12.1, §13.1).
+  separate same-origin assets (`/favicon.svg`, plus the script/stylesheet) so no inline script
+  executes (§12.1, §13.1).
+- **SEC7 (build identity & cache-busting):** `build.rs` stamps the binary with a git short hash
+  (`-dirty` when the working tree has uncommitted changes; `unknown` without git) and SHA-256
+  content hashes of the two assets. The script/stylesheet are served under content-hashed URLs
+  (`/app.<hash>.js`, `/app.<hash>.css`) with `Cache-Control: immutable`, while `index.html` is
+  served `no-cache` and points at the current URLs — so an upgraded binary can never be shadowed by
+  a stale browser cache. The version is exposed to the browser via a CSP-safe
+  `<meta name="giskard-version">` tag and shown (click-to-copy) in the Settings panel, so it is easy
+  to confirm which build — and which assets — are live.
 - **SEC6:** `browse.roots`, when configured, also confines `POST /api/projects`: a project's
   `dir`/`workspace_root` must canonicalize into an allowed root, closing the API bypass of the
   previously picker-only confinement (§6.2, Appendix C).
