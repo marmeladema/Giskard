@@ -868,6 +868,12 @@ async fn index_page_is_served_and_public() {
             && body.contains("awaitingIncrementalResync:false"),
         "reconnect asks for an incremental delta when it has a cursor, else a full authoritative resync"
     );
+    // An in-flight turn must repaint from the live snapshot; the incremental path's dedup would drop
+    // it, so an active turn forces the full resync even when a cursor exists.
+    assert!(
+        body.contains("if (state.newestPersistedTurnId && !state.activeTurn) {"),
+        "reconnect during an active turn falls back to a full resync"
+    );
     assert!(
         body.contains("const WS_BACKGROUND_CLOSE_GRACE_MS = 10000")
             && body.contains(

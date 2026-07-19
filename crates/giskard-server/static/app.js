@@ -1414,11 +1414,14 @@ async function connectWs(opts) {
     state.wsLastProblem = "";
     setWsStatus("open", "Connected to agent.");
     markWsForegroundRecovered(ws);
-    // Incremental resync: if we already have persisted history rendered, ask only for the turns
-    // after our newest one (`since`). The server replies with a HistoryDelta and we keep the
-    // immutable completed-turn DOM, repainting only the in-flight turn. Without a cursor (nothing
-    // rendered yet) fall back to a full resync that rewrites the transcript.
-    if (state.newestPersistedTurnId) {
+    // Incremental resync keeps the immutable completed-turn DOM and only appends what finished while
+    // we were away. It is only safe when *no turn was in flight*: a live turn has to be repainted
+    // from the live snapshot, but the item/approval dedup bookkeeping for the rows we already
+    // rendered would suppress that repaint — silently dropping the in-flight turn (and any pending
+    // approval) and leaving the transcript stopped at an earlier turn. So use the incremental path
+    // only for an idle thread with a cursor; when a turn was active, fall back to a full
+    // authoritative resync, which rebuilds render state from scratch and re-renders correctly.
+    if (state.newestPersistedTurnId && !state.activeTurn) {
       state.awaitingIncrementalResync = true;
       state.awaitingThreadResync = false;
       send({ type:"subscribe", thread_id: state.threadId, since: state.newestPersistedTurnId });
