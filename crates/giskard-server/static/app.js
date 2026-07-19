@@ -39,7 +39,7 @@ let state = {
   activeTaskGroup:null, taskGroupSeq:0, taskItemSeq:0, taskGroupsById:new Map(), taskGroupsByItemId:new Map(),
   expandedTaskGroups:new Set(), manuallyToggledTaskGroups:new Set(), expandedTaskDetails:new Map(),
   linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, activeTurn:false, interruptPending:false, compactPending:false,
-  awaitingInitialThreadState:false, awaitingThreadResync:false, contextWindow:0, contextUsed:null, tokenLedger:null, approvalPolicy:"ask", currentModel:null,
+  awaitingInitialThreadState:false, awaitingThreadResync:false, awaitingIncrementalResync:false, resyncStickBottom:false, contextWindow:0, contextUsed:null, tokenLedger:null, approvalPolicy:"ask", currentModel:null,
   mcpServers:[], mcpCapabilities:{ status:false, reload:false, oauth_login:false }, mcpLoading:false, mcpError:null, expandedMcps:new Set(),
   threadReadOnly:false, readOnlyProvider:null, readOnlyMessage:null,
   pickerTypeahead:"", pickerTypeaheadTimer:null, pickerSelectedRow:null,
@@ -1219,6 +1219,7 @@ async function openThread(pid, tid, title, opts) {
   updateGauge(null, 0);
   state.awaitingInitialThreadState = true;
   state.awaitingThreadResync = false;
+  state.awaitingIncrementalResync = false; state.resyncStickBottom = false;
   resetRenderState();
   document.querySelectorAll(".thread").forEach(e => e.classList.toggle("active", e.dataset.tid===tid));
   renderAllThreadActivityIndicators();
@@ -1357,8 +1358,19 @@ async function connectWs(opts) {
     state.wsLastProblem = "";
     setWsStatus("open", "Connected to agent.");
     markWsForegroundRecovered(ws);
-    state.awaitingThreadResync = true;
-    send({ type:"subscribe", thread_id: state.threadId });
+    // Incremental resync: if we already have persisted history rendered, ask only for the turns
+    // after our newest one (`since`). The server replies with a HistoryDelta and we keep the
+    // immutable completed-turn DOM, repainting only the in-flight turn. Without a cursor (nothing
+    // rendered yet) fall back to a full resync that rewrites the transcript.
+    if (state.newestPersistedTurnId) {
+      state.awaitingIncrementalResync = true;
+      state.awaitingThreadResync = false;
+      send({ type:"subscribe", thread_id: state.threadId, since: state.newestPersistedTurnId });
+    } else {
+      state.awaitingThreadResync = true;
+      state.awaitingIncrementalResync = false;
+      send({ type:"subscribe", thread_id: state.threadId });
+    }
   };
   ws.onmessage = (m) => {
     if (state.ws !== ws) return;
@@ -1505,6 +1517,7 @@ function isThreadScopedServerMessage(msg) {
   switch (msg.type) {
     case "thread_state":
     case "history_page":
+    case "history_delta":
     case "live_turn_snapshot":
     case "running_tasks":
     case "event":
@@ -1535,8 +1548,14 @@ function handleServer(msg) {
   switch (msg.type) {
     case "thread_state": renderThreadState(msg.state); break;
     case "history_page": renderHistoryPage(msg); break;
+    case "history_delta": renderHistoryDelta(msg); break;
     case "live_turn_snapshot": renderLiveTurnSnapshot(msg); break;
-    case "running_tasks": renderRunningCommandSnapshot(msg.tasks || []); break;
+    case "running_tasks":
+      renderRunningCommandSnapshot(msg.tasks || []);
+      // Running tasks is the last message of a resync; if the user was pinned to the bottom before
+      // the in-flight turn was repainted, restore that now that everything has re-rendered.
+      if (state.resyncStickBottom) { state.resyncStickBottom = false; keepTranscriptAtBottom(true); }
+      break;
     case "event": handleEvent(msg.agent_event); break;
     case "token_update":
       if (msg.scope === "thread") renderTokens(msg.ledger);
@@ -1860,6 +1879,9 @@ function handleIncomingApprovalRequest(request, tid, opts) {
 function renderThreadState(s) {
   if (!s) return;
   const shouldResetTranscript = state.awaitingInitialThreadState || state.awaitingThreadResync;
+  // An incremental resync keeps the transcript. Remember whether the viewport was pinned to the
+  // bottom now, before the in-flight turn is repainted, so we can restore that afterwards.
+  if (state.awaitingIncrementalResync) state.resyncStickBottom = transcriptShouldStickToBottom();
   state.awaitingInitialThreadState = false;
   state.awaitingThreadResync = false;
   setMode(s.mode || "build");
@@ -1941,6 +1963,15 @@ function setApprovalPolicy(policy) {
 // Render the most recent page of persisted history (H6), oldest-first. Older pages are available
 // via LoadHistory { before: oldestTurnId } when has_more is set (wired to the "Load older" button).
 function renderHistoryPage(msg) {
+  // A full page arriving while we expected a resync delta means the server couldn't honor our
+  // cursor (stale/unknown turn) and fell back to a full snapshot. It is sent history-first, so we
+  // still own the transcript here: rebuild it from scratch, then render this as a normal initial
+  // page (the live turn appends afterwards).
+  if (state.awaitingIncrementalResync) {
+    state.awaitingIncrementalResync = false;
+    state.resyncStickBottom = false;
+    resetTranscriptForAuthoritativeSnapshot();
+  }
   // `older` marks a page fetched *above* what's already shown: a scroll-up LoadHistory or an
   // open-time autofill top-up. The first (initial) page is the only one that is not `older`.
   const older = state.pendingOlder;
@@ -1981,6 +2012,70 @@ function renderHistoryPage(msg) {
   }
 
   maybeAutoFillHistory();
+}
+
+// Incremental resync: the server sent only the turns that completed while we were disconnected
+// (history-first, before the live snapshot). Completed turns are immutable, so we keep the existing
+// transcript, repaint just the in-flight turn, and append these new turns at the bottom.
+function renderHistoryDelta(msg) {
+  state.awaitingIncrementalResync = false;
+  const turns = msg.turns || [];
+
+  // Repaint the in-flight turn: remove the rows of the turn that was still running when we
+  // disconnected (and any optimistic pre-turn rows). The live snapshot that follows re-renders its
+  // current state; a turn that completed while we were away arrives below as a delta turn instead.
+  reconcileInFlightTurn();
+
+  // Append the completed-since turns at the bottom — they are newer than everything we kept, and no
+  // live turn is in the DOM yet (it arrives next).
+  if (turns.length) {
+    const container = document.createElement("div");
+    const prev = state.renderTarget;
+    const prevTaskGroup = state.activeTaskGroup;
+    state.renderTarget = container;
+    state.activeTaskGroup = null;
+    for (const turn of turns) renderPersistedTurn(turn);
+    state.renderTarget = prev;
+    state.activeTaskGroup = prevTaskGroup;
+    const t = $("transcript");
+    while (container.firstChild) t.appendChild(container.firstChild);
+    state.newestPersistedTurnId = turns[turns.length - 1].id;   // advance the resume cursor
+    updateGaugeFromTurns(turns);   // a live snapshot, if any, overrides this next
+  }
+
+  // If the user was pinned to the bottom before the repaint, keep them there. When the turn is
+  // still running the live snapshot re-applies this after it renders; for an idle thread (no live
+  // snapshot) this is the final position.
+  if (state.resyncStickBottom) keepTranscriptAtBottom(true);
+}
+
+// Remove the in-flight turn's DOM on an incremental resync. Completed turns are immutable and stay
+// put; only the turn that was running when we disconnected can have changed, and the optimistic
+// "pending" rows (a user bubble sent but never confirmed) are transient. Matching is by the
+// per-turn `data-turn` stamp; removing a task-group wrapper takes its nested rows with it.
+function reconcileInFlightTurn() {
+  removeTurnRows("pending");
+  const liveId = state.activeTurn && state.currentRenderTurnId != null
+    ? String(state.currentRenderTurnId)
+    : null;
+  if (liveId) removeTurnRows(liveId);
+  // Drop streaming bookkeeping tied to the wiped rows so the live snapshot rebuilds cleanly; the
+  // snapshot re-activates the turn if it is still running.
+  state.currentRenderTurnId = null;
+  setTurnActive(false);
+  state.streamEl = null;
+  state.streamItemId = null;
+  state.streamElsByItemId = new Map();
+  breakTaskGroup();
+}
+function removeTurnRows(turnId) {
+  const t = $("transcript");
+  if (!t) return;
+  // Snapshot into an array first: removing a task-group wrapper also detaches its nested `.msg`
+  // children, and calling remove() on an already-detached node is a harmless no-op.
+  for (const el of Array.from(t.querySelectorAll(".msg"))) {
+    if (el.dataset.turn === turnId) el.remove();
+  }
 }
 
 // After each history page lands, keep topping up (oldest-first, in small batches) until the

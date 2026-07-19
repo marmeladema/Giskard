@@ -1678,6 +1678,7 @@ async fn wait_for_thread_activity(
                     }
                     ServerMessage::Event { thread_id, .. }
                     | ServerMessage::HistoryPage { thread_id, .. }
+                    | ServerMessage::HistoryDelta { thread_id, .. }
                     | ServerMessage::RunningTasks { thread_id, .. } => {
                         assert_eq!(
                             thread_id, active_thread,
@@ -1735,9 +1736,12 @@ async fn send_input_rejects_second_turn_before_turn_started() {
 
     for ws in [&mut first, &mut second] {
         ws.send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::to_string(&ClientMessage::Subscribe { thread_id })
-                .unwrap()
-                .into(),
+            serde_json::to_string(&ClientMessage::Subscribe {
+                thread_id,
+                since: None,
+            })
+            .unwrap()
+            .into(),
         ))
         .await
         .unwrap();
@@ -1802,9 +1806,12 @@ async fn send_input_rejects_same_thread_during_compaction() {
     let mut ws = connect_ws(port, &cookie).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        serde_json::to_string(&ClientMessage::Subscribe { thread_id })
-            .unwrap()
-            .into(),
+        serde_json::to_string(&ClientMessage::Subscribe {
+            thread_id,
+            since: None,
+        })
+        .unwrap()
+        .into(),
     ))
     .await
     .unwrap();
@@ -1850,9 +1857,12 @@ async fn compact_context_streams_and_persists_compaction_turn() {
     let mut ws = connect_ws(port, &cookie).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        serde_json::to_string(&ClientMessage::Subscribe { thread_id })
-            .unwrap()
-            .into(),
+        serde_json::to_string(&ClientMessage::Subscribe {
+            thread_id,
+            since: None,
+        })
+        .unwrap()
+        .into(),
     ))
     .await
     .unwrap();
@@ -1944,9 +1954,12 @@ async fn wire_turn_id_matches_persisted_turn_id() {
     let mut ws = connect_ws(port, &cookie).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        serde_json::to_string(&ClientMessage::Subscribe { thread_id })
-            .unwrap()
-            .into(),
+        serde_json::to_string(&ClientMessage::Subscribe {
+            thread_id,
+            since: None,
+        })
+        .unwrap()
+        .into(),
     ))
     .await
     .unwrap();
@@ -2001,9 +2014,12 @@ async fn compact_context_does_not_block_turns_on_other_threads_or_projects() {
 
     for thread_id in [compacting_thread, other_thread, other_project_thread] {
         ws.send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::to_string(&ClientMessage::Subscribe { thread_id })
-                .unwrap()
-                .into(),
+            serde_json::to_string(&ClientMessage::Subscribe {
+                thread_id,
+                since: None,
+            })
+            .unwrap()
+            .into(),
         ))
         .await
         .unwrap();
@@ -2101,6 +2117,7 @@ async fn inactive_thread_progress_sends_activity_without_full_event_subscription
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::Subscribe {
             thread_id: active_thread,
+            since: None,
         })
         .unwrap()
         .into(),
@@ -2168,6 +2185,7 @@ async fn inactive_thread_progress_sends_activity_without_full_event_subscription
                         );
                     }
                     ServerMessage::HistoryPage { thread_id, .. }
+                    | ServerMessage::HistoryDelta { thread_id, .. }
                     | ServerMessage::RunningTasks { thread_id, .. } => {
                         assert_eq!(
                             thread_id, active_thread,
@@ -2239,6 +2257,7 @@ async fn inactive_thread_requests_send_activity_and_route_responses() {
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::Subscribe {
             thread_id: active_thread,
+            since: None,
         })
         .unwrap()
         .into(),
@@ -2364,9 +2383,12 @@ async fn approval_decision_broadcasts_resolution_to_other_tabs() {
 
     for ws in [&mut first_ws, &mut second_ws] {
         ws.send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::to_string(&ClientMessage::Subscribe { thread_id })
-                .unwrap()
-                .into(),
+            serde_json::to_string(&ClientMessage::Subscribe {
+                thread_id,
+                since: None,
+            })
+            .unwrap()
+            .into(),
         ))
         .await
         .unwrap();
@@ -3127,9 +3149,12 @@ async fn subscribe_unknown_thread_returns_structured_error() {
 
     let tid = ThreadId::new();
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        serde_json::to_string(&ClientMessage::Subscribe { thread_id: tid })
-            .unwrap()
-            .into(),
+        serde_json::to_string(&ClientMessage::Subscribe {
+            thread_id: tid,
+            since: None,
+        })
+        .unwrap()
+        .into(),
     ))
     .await
     .unwrap();
@@ -3303,9 +3328,12 @@ async fn websocket_serializes_harness_error_events() {
         .expect("WS connect");
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        serde_json::to_string(&ClientMessage::Subscribe { thread_id: tid })
-            .unwrap()
-            .into(),
+        serde_json::to_string(&ClientMessage::Subscribe {
+            thread_id: tid,
+            since: None,
+        })
+        .unwrap()
+        .into(),
     ))
     .await
     .unwrap();
@@ -3452,9 +3480,12 @@ async fn subscribe_reopens_persisted_thread() {
         .expect("WS connect");
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        serde_json::to_string(&ClientMessage::Subscribe { thread_id: tid })
-            .unwrap()
-            .into(),
+        serde_json::to_string(&ClientMessage::Subscribe {
+            thread_id: tid,
+            since: None,
+        })
+        .unwrap()
+        .into(),
     ))
     .await
     .unwrap();
@@ -3589,9 +3620,12 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
         .expect("WS connect");
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        serde_json::to_string(&ClientMessage::Subscribe { thread_id: tid })
-            .unwrap()
-            .into(),
+        serde_json::to_string(&ClientMessage::Subscribe {
+            thread_id: tid,
+            since: None,
+        })
+        .unwrap()
+        .into(),
     ))
     .await
     .unwrap();
@@ -3776,9 +3810,12 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
         .expect("WS connect");
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        serde_json::to_string(&ClientMessage::Subscribe { thread_id: tid })
-            .unwrap()
-            .into(),
+        serde_json::to_string(&ClientMessage::Subscribe {
+            thread_id: tid,
+            since: None,
+        })
+        .unwrap()
+        .into(),
     ))
     .await
     .unwrap();
@@ -3929,9 +3966,12 @@ async fn failed_turn_is_persisted_with_error_message() {
         .expect("WS connect");
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        serde_json::to_string(&ClientMessage::Subscribe { thread_id: tid })
-            .unwrap()
-            .into(),
+        serde_json::to_string(&ClientMessage::Subscribe {
+            thread_id: tid,
+            since: None,
+        })
+        .unwrap()
+        .into(),
     ))
     .await
     .unwrap();
@@ -4064,9 +4104,12 @@ async fn notice_event_is_delivered_to_client() {
         .expect("WS connect");
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        serde_json::to_string(&ClientMessage::Subscribe { thread_id: tid })
-            .unwrap()
-            .into(),
+        serde_json::to_string(&ClientMessage::Subscribe {
+            thread_id: tid,
+            since: None,
+        })
+        .unwrap()
+        .into(),
     ))
     .await
     .unwrap();
@@ -4780,6 +4823,7 @@ async fn login_project_thread_message() {
     // Subscribe
     let subscribe = serde_json::to_string(&ClientMessage::Subscribe {
         thread_id: thread_id.parse().unwrap(),
+        since: None,
     })
     .unwrap();
     ws.send(tokio_tungstenite::tungstenite::Message::Text(

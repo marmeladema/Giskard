@@ -823,9 +823,12 @@ session_days = 30
         .expect("WS connect");
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        serde_json::to_string(&ClientMessage::Subscribe { thread_id })
-            .unwrap()
-            .into(),
+        serde_json::to_string(&ClientMessage::Subscribe {
+            thread_id,
+            since: None,
+        })
+        .unwrap()
+        .into(),
     ))
     .await
     .unwrap();

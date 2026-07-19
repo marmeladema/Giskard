@@ -257,9 +257,12 @@ async fn running_tool_call_surfaces_in_running_tasks_snapshot() {
         .await
         .expect("WS connect");
 
-    ws.send(ws_text(&ClientMessage::Subscribe { thread_id }))
-        .await
-        .unwrap();
+    ws.send(ws_text(&ClientMessage::Subscribe {
+        thread_id,
+        since: None,
+    }))
+    .await
+    .unwrap();
     ws.send(ws_text(&ClientMessage::SendInput {
         thread_id,
         text: "search wikipedia".into(),

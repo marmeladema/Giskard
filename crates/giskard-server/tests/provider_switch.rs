@@ -359,7 +359,14 @@ async fn cold_provider_switch_succeeds_and_binds_the_thread() {
     let mut ws = connect_ws(srv.port, &cookie).await;
 
     // The thread loads read-only under the dead provider.
-    send_msg(&mut ws, &ClientMessage::Subscribe { thread_id: srv.tid }).await;
+    send_msg(
+        &mut ws,
+        &ClientMessage::Subscribe {
+            thread_id: srv.tid,
+            since: None,
+        },
+    )
+    .await;
     next_matching(&mut ws, |v| v["code"] == "thread_read_only")
         .await
         .expect("read-only warning");
@@ -425,7 +432,14 @@ async fn unconfirmed_provider_switch_is_rejected_and_persists_nothing() {
     let cookie = login_cookie(&srv.base).await;
     let mut ws = connect_ws(srv.port, &cookie).await;
 
-    send_msg(&mut ws, &ClientMessage::Subscribe { thread_id: srv.tid }).await;
+    send_msg(
+        &mut ws,
+        &ClientMessage::Subscribe {
+            thread_id: srv.tid,
+            since: None,
+        },
+    )
+    .await;
     next_matching(&mut ws, |v| v["code"] == "thread_read_only")
         .await
         .expect("read-only warning");

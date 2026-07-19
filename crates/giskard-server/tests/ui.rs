@@ -843,9 +843,12 @@ async fn index_page_is_served_and_public() {
         "pending composer text is cached per existing thread and per project draft"
     );
     assert!(
-        body.contains("state.awaitingThreadResync = true;\n    send({ type:\"subscribe\"")
-            && body.contains("awaitingThreadResync:false"),
-        "resubscribe marks the next thread state as an authoritative resync"
+        body.contains(
+            "state.awaitingIncrementalResync = true;\n      state.awaitingThreadResync = false;\n      send({ type:\"subscribe\", thread_id: state.threadId, since: state.newestPersistedTurnId });"
+        ) && body.contains("state.awaitingThreadResync = true;\n      state.awaitingIncrementalResync = false;\n      send({ type:\"subscribe\", thread_id: state.threadId });")
+            && body.contains("awaitingThreadResync:false")
+            && body.contains("awaitingIncrementalResync:false"),
+        "reconnect asks for an incremental delta when it has a cursor, else a full authoritative resync"
     );
     assert!(
         body.contains("const WS_BACKGROUND_CLOSE_GRACE_MS = 10000")
@@ -1523,6 +1526,66 @@ fn browser_stamps_transcript_rows_with_their_turn_id() {
     );
     assert!(history.contains(
         "if (!older && turns.length) state.newestPersistedTurnId = turns[turns.length - 1].id;"
+    ));
+}
+
+#[test]
+fn browser_incremental_resync_reconciles_in_flight_turn() {
+    let body = app_js();
+
+    // Reconnect asks for a delta when it has a cursor, else a full resync.
+    let onopen = between(body, "ws.onopen = () => {", "ws.onmessage = (m) => {");
+    assert!(onopen.contains(
+        "send({ type:\"subscribe\", thread_id: state.threadId, since: state.newestPersistedTurnId });"
+    ));
+    assert!(onopen.contains("state.awaitingIncrementalResync = true;"));
+
+    // A delta keeps the transcript: repaint the in-flight turn, append new turns, advance the cursor.
+    let delta = between(
+        body,
+        "function renderHistoryDelta(msg) {",
+        "function reconcileInFlightTurn()",
+    );
+    assert_order(
+        delta,
+        "reconcileInFlightTurn();",
+        "for (const turn of turns) renderPersistedTurn(turn);",
+    );
+    assert!(delta.contains("state.newestPersistedTurnId = turns[turns.length - 1].id;"));
+    assert!(delta.contains("t.appendChild(container.firstChild)"));
+
+    // Reconcile removes only the in-flight turn's rows (by data-turn) and the optimistic pending rows.
+    let reconcile = between(
+        body,
+        "function reconcileInFlightTurn() {",
+        "function removeTurnRows(turnId)",
+    );
+    assert!(reconcile.contains("removeTurnRows(\"pending\");"));
+    assert!(reconcile.contains("state.activeTurn && state.currentRenderTurnId != null"));
+    assert!(reconcile.contains("setTurnActive(false);"));
+    let remove = between(
+        body,
+        "function removeTurnRows(turnId) {",
+        "function maybeAutoFillHistory",
+    );
+    assert!(remove.contains("if (el.dataset.turn === turnId) el.remove();"));
+
+    // Delta is dispatched, and a full page arriving mid-resync is treated as a stale-cursor rebuild.
+    assert!(body.contains("case \"history_delta\": renderHistoryDelta(msg); break;"));
+    let page = between(
+        body,
+        "function renderHistoryPage(msg) {",
+        "const older = state.pendingOlder;",
+    );
+    assert_order(
+        page,
+        "if (state.awaitingIncrementalResync) {",
+        "resetTranscriptForAuthoritativeSnapshot();",
+    );
+
+    // Running-tasks is the last resync frame; it restores bottom-stick if the user was pinned there.
+    assert!(body.contains(
+        "if (state.resyncStickBottom) { state.resyncStickBottom = false; keepTranscriptAtBottom(true); }"
     ));
 }
 

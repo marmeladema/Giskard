@@ -266,9 +266,12 @@ async fn modes_models_approvals_and_plan_dump() {
         .await
         .expect("WS connect");
 
-    ws.send(ws_text(&ClientMessage::Subscribe { thread_id: tid }))
-        .await
-        .unwrap();
+    ws.send(ws_text(&ClientMessage::Subscribe {
+        thread_id: tid,
+        since: None,
+    }))
+    .await
+    .unwrap();
 
     // --- SwitchMode -> Plan (persisted) ---
     ws.send(ws_text(&ClientMessage::SwitchMode {
