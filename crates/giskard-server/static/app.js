@@ -5579,6 +5579,25 @@ $("settingsBtn").onclick = (e) => { e.stopPropagation(); toggleSettingsMenu(); }
 $("settingsMenu").onclick = (e) => e.stopPropagation();
 $("settingsClose").onclick = closeSettingsMenu;
 
+// Show the running build (git short hash, stamped into the served HTML by the server via a
+// CSP-safe <meta> tag) so it's easy to confirm which Giskard version — and which cached assets —
+// are live. Click to copy.
+function initVersionLabel() {
+  const el = $("giskardVersion");
+  if (!el) return;
+  const meta = document.querySelector('meta[name="giskard-version"]');
+  const version = (meta && meta.content && meta.content.trim()) || "unknown";
+  el.textContent = version;
+  el.onclick = async (e) => {
+    e.stopPropagation();
+    const ok = await copyToClipboard(version);
+    const prev = el.textContent;
+    el.textContent = ok ? "Copied" : version;
+    setTimeout(() => { el.textContent = prev; }, 1200);
+  };
+}
+initVersionLabel();
+
 /* ---------- turn + model pickers (below the composer) ---------- */
 function closeModelPicker() { $("modelPickerMenu").hidden = true; }
 function closeTurnPicker() { $("turnPickerMenu").hidden = true; }

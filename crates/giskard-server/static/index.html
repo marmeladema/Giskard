@@ -3,9 +3,10 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="giskard-version" content="__GISKARD_VERSION__" />
 <title>Giskard</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
-<link rel="stylesheet" href="/app.css" />
+<link rel="stylesheet" href="__APP_CSS__" />
 </head>
 <body>
   <div id="login">
@@ -64,6 +65,11 @@
                 <button id="testNotificationBtn" type="button">Test notification</button>
               </div>
             </div>
+          </div>
+          <div class="settings-field">
+            <label for="giskardVersion">Version</label>
+            <button id="giskardVersion" class="settings-version" type="button"
+                    title="Running Giskard build (git short hash). Click to copy.">…</button>
           </div>
         </div>
       </div>
@@ -235,6 +241,6 @@
     </div>
   </div>
 
-<script src="/app.js"></script>
+<script src="__APP_JS__"></script>
 </body>
 </html>

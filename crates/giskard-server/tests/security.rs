@@ -40,6 +40,14 @@ fn session_key() -> Vec<u8> {
     (0..32u8).collect()
 }
 
+/// Pull an attribute value (up to the next `"`) that follows `start` — used to read the served,
+/// content-hashed asset URLs (`/app.<hash>.js`) out of the index HTML.
+fn attr_after(html: &str, start: &str) -> String {
+    let s = html.find(start).expect("attribute prefix present") + start.len();
+    let e = html[s..].find('"').expect("closing quote") + s;
+    html[s..e].to_string()
+}
+
 /// Start a server on an ephemeral port with the given extra config sections appended to a
 /// baseline `[server]`/`[auth]` config (password: "testpass").
 async fn start_server(extra_config: &str) -> (tempfile::TempDir, String) {
@@ -104,7 +112,19 @@ async fn security_headers_are_set_on_all_responses() {
     let (_tmp, base) = start_server("").await;
     let client = client();
 
-    for path in ["/", "/favicon.svg", "/app.js", "/app.css", "/api/projects"] {
+    // The script/stylesheet live at content-hashed URLs; read the current ones from the index.
+    let index = client
+        .get(format!("{base}/"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let js = attr_after(&index, "<script src=\"");
+    let css = attr_after(&index, "<link rel=\"stylesheet\" href=\"");
+
+    for path in ["/", "/favicon.svg", &js, &css, "/api/projects"] {
         let resp = client.get(format!("{base}{path}")).send().await.unwrap();
         let headers = resp.headers();
         let csp = headers
@@ -137,14 +157,21 @@ async fn index_page_has_no_inline_script() {
     // A strict `script-src 'self'` only protects if the page itself carries no inline code.
     assert!(!body.contains("<script>"), "index.html must not inline JS");
     assert!(!body.contains("<style>"), "index.html must not inline CSS");
-    assert!(body.contains(r#"<script src="/app.js"></script>"#));
+    // Script/stylesheet are same-origin assets under content-hashed URLs (cache-busting).
+    assert!(
+        body.contains(r#"<script src="/app."#) && body.contains(r#".js"></script>"#),
+        "script is a same-origin content-hashed asset"
+    );
+    assert!(
+        body.contains(r#"<link rel="stylesheet" href="/app."#) && body.contains(r#".css" />"#),
+        "stylesheet is a same-origin content-hashed asset"
+    );
     assert!(body.contains(r#"<link rel="icon" href="/favicon.svg" type="image/svg+xml" />"#));
     assert!(
         body.contains(
             r#"<img class="sidebar-logo" src="/favicon.svg" width="24" height="24" alt="" aria-hidden="true" />"#
         )
     );
-    assert!(body.contains(r#"<link rel="stylesheet" href="/app.css" />"#));
 }
 
 #[tokio::test]
