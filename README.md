@@ -16,6 +16,26 @@ in the build.
 
 ---
 
+## Screenshots
+
+The browser UI in its default **Professional (IDE)** theme: a sidebar of projects and durable
+threads on the left, the agent's live-streaming transcript in the center, and a composer with
+per-turn mode/model controls and context-usage tracking. The layout collapses to a single column
+with a slide-in drawer on mobile.
+
+**Desktop**
+
+<img src="docs/screenshots/ide-desktop.png" alt="Giskard IDE theme on desktop — projects sidebar, streaming transcript, and composer" width="820" />
+
+**Mobile**
+
+<img src="docs/screenshots/ide-mobile.png" alt="Giskard IDE theme on mobile — single column with the thread transcript and composer" width="300" />
+
+These are generated from the real UI (no host Node/npm needed) with `tests/e2e/screenshots.sh` — see
+[§Development](#development).
+
+---
+
 ## Prerequisites
 
 - **Rust** — edition 2024, MSRV **1.85+** (`rustup` recommended).
@@ -362,6 +382,13 @@ Codex-free build that serves the same UI/API, boots with a known password and a 
 and streams a fixed agent reply per turn via an in-process scripted harness. See
 [`tests/e2e/README.md`](tests/e2e/README.md) for details and the without-Docker workflow. The
 [E2E workflow](.github/workflows/e2e.yml) runs the same container in CI.
+
+The README screenshots are produced by the same infrastructure — regenerate them after a UI change
+with:
+
+```bash
+tests/e2e/screenshots.sh   # writes docs/screenshots/ide-{desktop,mobile}.png
+```
 
 A separate [security-audit workflow](.github/workflows/audit.yml) runs
 [`cargo-deny`](https://embarkstudios.github.io/cargo-deny/) (advisories, bans, licenses, sources,
