@@ -1160,6 +1160,22 @@ async fn index_page_is_served_and_public() {
         "UI requests server-rendered Markdown for agent text"
     );
     assert!(
+        body.contains("renderItemBodyForItem(pendingBody, item, turnId);")
+            && !body.contains("state.pendingUserEl.querySelector(\".body\").textContent = p.text;"),
+        "completed optimistic user messages must use the Markdown rendering path"
+    );
+    let append_stream = between(
+        &body,
+        "function appendStream(turnId, text, itemId, deltaType) {",
+        "function finalizeStreamedItem(item, turnId) {",
+    );
+    assert!(
+        append_stream
+            .contains("let body = key ? state.streamElsByItemId.get(key) : state.streamEl;")
+            && !append_stream.contains("state.streamElsByItemId.get(key) || state.streamEl"),
+        "identified streamed items must not share the global fallback row"
+    );
+    assert!(
         body.contains("function wireCodeCopy")
             && body.contains("wireCodeCopy(el)")
             && body.contains(".code-block-head")
@@ -1551,6 +1567,16 @@ fn browser_keeps_appended_transcript_rows_anchored_to_bottom() {
         markdown.contains("keepTranscriptRowAnchored(el);"),
         "async markdown rendering keeps newly appended rows visible"
     );
+    assert!(
+        markdown.contains("el._markdownRenderKey = cacheKey;")
+            && markdown.contains("if (el._markdownRenderKey !== cacheKey) return;")
+            && !markdown.contains("!el.isConnected"),
+        "detached history rows must render while stale responses cannot overwrite newer text"
+    );
+    assert!(
+        markdown.contains("projectId !== state.projectId || threadId !== state.threadId"),
+        "Markdown responses must remain scoped to the active project and thread"
+    );
     let linkify = between(
         body,
         "function renderLinkedText(el, text) {",
@@ -1559,6 +1585,43 @@ fn browser_keeps_appended_transcript_rows_anchored_to_bottom() {
     assert!(
         linkify.contains("keepTranscriptRowAnchored(el);"),
         "async path linkification keeps newly appended rows visible"
+    );
+}
+
+#[test]
+fn browser_applies_cached_markdown_to_detached_history_rows() {
+    let body = app_js();
+    let history = between(
+        body,
+        "function renderHistoryPage(msg) {",
+        "function renderHistoryDelta(msg) {",
+    );
+    assert_order(
+        history,
+        "const container = document.createElement(\"div\");",
+        "for (const turn of turns) renderPersistedTurn(turn);",
+    );
+    assert_order(
+        history,
+        "for (const turn of turns) renderPersistedTurn(turn);",
+        "while (container.firstChild) t.insertBefore(container.firstChild, anchor);",
+    );
+
+    let markdown = between(
+        body,
+        "function renderMarkdown(el, text) {",
+        "// Wire the server-emitted",
+    );
+    assert!(
+        markdown.contains("if (state.markdownCache.has(cacheKey)) {")
+            && markdown.contains("apply(state.markdownCache.get(cacheKey));")
+            && !markdown.contains("!el.isConnected"),
+        "a synchronous Markdown cache hit must apply before detached history is inserted"
+    );
+    assert_order(
+        markdown,
+        "el._markdownRenderKey = cacheKey;",
+        "if (!text.trim() || !projectId) return;",
     );
 }
 
@@ -1672,7 +1735,7 @@ fn browser_tracks_rendered_items_by_scoped_dom_identity() {
         "Giskard item identity invariant violated; refusing harness-only item upsert.",
         "if (!visible) {\n        markRenderedItem(item, turnId);\n        return;\n      }",
         "registerRenderedItemBody(existing, item, turnId);",
-        "registerRenderedItemBody(state.pendingUserEl.querySelector(\".body\"), item, turnId);",
+        "registerRenderedItemBody(pendingBody, item, turnId);",
         "registerRenderedItemBody(body, item, turnId);",
         "registerRenderedItemBody(mergedRow.querySelector(\".body\"), item, turnId);",
     ] {
