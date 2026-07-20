@@ -1,0 +1,59 @@
+# CodeRabbit configuration — https://docs.coderabbit.ai/reference/configuration
+#
+# Reviews follow the house conventions in AGENTS.md. Requires the CodeRabbit GitHub App to be
+# installed on the repository (https://github.com/apps/coderabbitai); this file only tunes behavior.
+language: "en-US"
+
+reviews:
+  # "chill" = balanced. Switch to "assertive" for more (nittier) feedback, or "quiet" for less.
+  profile: "chill"
+  # Keep reviews advisory: never auto-request-changes (don't let the bot gate merges — CI does that).
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+
+  auto_review:
+    enabled: true
+    drafts: false
+
+  # Don't spend review budget on generated, vendored, or binary artifacts.
+  path_filters:
+    - "!Cargo.lock"
+    - "!tests/e2e/package-lock.json"
+    - "!docs/screenshots/**"
+
+  # Natural-language rules mirroring AGENTS.md so reviews match the project's standards.
+  path_instructions:
+    - path: "crates/**/*.rs"
+      instructions: >-
+        Rust, edition 2024 (MSRV 1.85). In runtime (non-test) paths, flag `unwrap`, `expect`,
+        `panic!`, `todo!`, or `unreachable!` unless the condition is proven infallible in local
+        context; prefer typed errors, logging, or a structured browser error. Failures must be
+        visible at the right boundary: browser-action failures over HTTP/WebSocket, server/operator
+        failures via structured logs. New or changed failure modes (recovery paths, timeouts,
+        idempotent closes, dedup rules, fallbacks, lifecycle cleanup) need focused tests. Async, WS,
+        harness, persistence, approval, and cross-thread lifecycle paths need observability at their
+        boundaries — prefer structured logs with stable fields like project_id, thread_id, turn_id,
+        action, method, command_id, tool_call_id, and the underlying error source. Do not silently
+        drop, coalesce, synthesize, or recover from protocol events without logging enough context.
+    - path: "crates/giskard-harness-codex/**"
+      instructions: >-
+        Codex-specific types must stay confined to this crate. If native identifier mappings,
+        lifecycle behavior, protocol routing, process control, or restart semantics change, the
+        crate's README.md must be updated in the same change.
+    - path: "crates/giskard-persist/**"
+      instructions: >-
+        All persistence must use atomic writes (temp file + fsync + rename). IDs are ULIDs.
+    - path: "crates/giskard-server/static/**"
+      instructions: >-
+        If a change affects how the UI looks, the README screenshots (docs/screenshots/*.png) should
+        be regenerated with tests/e2e/screenshots.sh in the same change.
+    - path: "crates/**/*.rs"
+      instructions: >-
+        If config keys/defaults, giskard-admin commands, HTTP/WS endpoints, run/quick-start steps, or
+        the storage layout change, check that README.md (and config.example.toml) are updated to
+        match. The README must never contradict the spec or the code.
+
+chat:
+  auto_reply: true
