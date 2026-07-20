@@ -30,7 +30,16 @@ cargo test
 # Lint
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
+
+# Browser end-to-end tests (Playwright, in Docker — no host Node/npm needed)
+tests/e2e/run.sh
 ```
+
+Playwright tests in `tests/e2e/` drive the real UI against `giskard-server-replay` (a bin in
+`giskard-server`): a deterministic, Codex-free server with a scripted in-process harness. When you
+change the login/project/thread/settings UI or that binary's seeded state, keep those tests and the
+`SCRIPTED_REPLY` constant (mirrored in `tests/e2e/tests/helpers.ts`) in sync. See
+`tests/e2e/README.md`.
 
 ## Architecture
 Cargo workspace with 8 crates under `crates/`:

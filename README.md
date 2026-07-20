@@ -346,6 +346,23 @@ every pull request: `rustfmt` (`cargo fmt --all --check`), `clippy` (`cargo clip
 --all-targets --locked -- -D warnings`), and the full locked workspace suite (`cargo build
 --workspace --locked` + `cargo test --workspace --locked`).
 
+### Browser (Playwright) end-to-end tests
+
+[`tests/e2e/`](tests/e2e/) holds Playwright tests that drive the real web UI in a headless browser —
+login, projects/threads, live message streaming, and settings. They run entirely inside Docker, so
+no Node/npm or browsers are needed on your host:
+
+```bash
+tests/e2e/run.sh                      # build the image and run the whole suite
+tests/e2e/run.sh tests/login.spec.ts  # a single spec; extra args pass through to `playwright test`
+```
+
+The tests run against `giskard-server-replay` (a bin in `giskard-server`): a deterministic,
+Codex-free build that serves the same UI/API, boots with a known password and a pre-seeded project,
+and streams a fixed agent reply per turn via an in-process scripted harness. See
+[`tests/e2e/README.md`](tests/e2e/README.md) for details and the without-Docker workflow. The
+[E2E workflow](.github/workflows/e2e.yml) runs the same container in CI.
+
 A separate [security-audit workflow](.github/workflows/audit.yml) runs
 [`cargo-deny`](https://embarkstudios.github.io/cargo-deny/) (advisories, bans, licenses, sources,
 configured in [`deny.toml`](deny.toml)) on dependency-manifest changes, on pull requests, and on a
