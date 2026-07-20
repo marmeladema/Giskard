@@ -54,8 +54,8 @@ effect, e.g. backend-only or copy-only edits.)
 Cargo workspace with 7 crates under `crates/`:
 - `giskard-core` — pure domain types (no I/O)
 - `giskard-harness` — `AgentHarness` trait + capabilities
-- `giskard-harness-codex` — Codex CLI adapter (Phase 1)
-- `giskard-harness-replay` — deterministic replay for tests (Phase 1)
+- `giskard-harness-codex` — Codex CLI adapter
+- `giskard-harness-replay` — deterministic replay harness for tests
 - `giskard-persist` — flat-file storage + `giskard-admin` binary
 - `giskard-proto` — shared client↔server wire types
 - `giskard-server` — Axum backend + the embedded vanilla static web UI (`static/`)

@@ -1,4 +1,4 @@
-//! Phase 1 integration test: open thread, one turn, assert persisted state.
+//! Replay harness integration test: open thread, one turn, assert persisted state.
 //!
 //! Uses `ReplayHarness` with a fixture — no live LLM calls (spec §14.2).
 
