@@ -31,7 +31,7 @@ let state = {
   // high-water mark a future resync will use as its "give me turns after this" cursor.
   currentRenderTurnId:null, newestPersistedTurnId:null,
   models:[], pendingModelBeforeSelect:null, streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null,
-  streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), itemKindsByItemId:new Map(),
+  streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), renderedItemBodyByKey:new Map(), itemKindsByItemId:new Map(),
   pendingApprovals:new Map(), answeredApprovals:new Map(), renderedApprovalStateKeys:new Set(), pendingServerRequests:new Map(),
   runningCommands:new Map(), commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null,
   commandPayloadsByItemId:new Map(), endedCommandsByItemId:new Map(), expandedCommandOutputs:new Set(), manuallyToggledCommandOutputs:new Set(),
@@ -2195,7 +2195,7 @@ function renderPersistedTurn(turn) {
   if (!hasUserItem && inputText) {
     renderItemBody(bubble("user","you"), { kind:"user_message", text: inputText });
   }
-  for (const it of items) addItem(it, true);
+  for (const it of items) addItem(it, turn.id, true);
   const st = turn.status;
   if (st && (st.kind==="failed" || st.kind==="interrupted")) {
     errorBubble(st.message || (st.kind==="interrupted" ? "Turn interrupted." : "Turn failed."));
@@ -2235,7 +2235,8 @@ function handleEvent(ev) {
       break;
     case "item_started":
       if (ev.item) {
-        state.itemKindsByItemId.set(idKey(ev.item.id), ev.item.kind);
+        const key = scopedItemKey(ev.turn, ev.item.id);
+        state.itemKindsByItemId.set(key, ev.item.kind);
         if (ev.item.kind==="command_execution" && ev.item.command) {
           startRunningCommand(ev.item, ev.turn);
         } else if (ev.item.kind==="tool_call" && ev.item.tool) {
@@ -2245,18 +2246,19 @@ function handleEvent(ev) {
       break;
     case "item_delta":
       if (ev.delta && ev.delta.type==="text") {
-        const kind = state.itemKindsByItemId.get(idKey(ev.item_id));
-        if (kind==="tool_call") appendToolProgress(ev.item_id, ev.delta.text);
-        else appendStream(ev.delta.text, ev.item_id, ev.delta.type);
+        const key = scopedItemKey(ev.turn, ev.item_id);
+        const kind = state.itemKindsByItemId.get(key);
+        if (kind==="tool_call") appendToolProgress(ev.turn, ev.item_id, ev.delta.text);
+        else appendStream(ev.turn, ev.delta.text, ev.item_id, ev.delta.type);
       }
       else if (ev.delta && ev.delta.type==="command_output") {
-        if (!appendRunningCommandOutput(ev.item_id, ev.delta.chunk)) {
-          appendStream(ev.delta.chunk, ev.item_id, ev.delta.type);
+        if (!appendRunningCommandOutput(ev.turn, ev.item_id, ev.delta.chunk)) {
+          appendStream(ev.turn, ev.delta.chunk, ev.item_id, ev.delta.type);
         }
       }
       break;
     case "item_completed":
-      if (!finalizeStreamedItem(ev.item)) addItem(ev.item);
+      if (!finalizeStreamedItem(ev.item, ev.turn)) addItem(ev.item, ev.turn);
       if (isContextCompactionItem(ev.item)) finishCompactPending();
       break;
     case "turn_completed":
@@ -3274,7 +3276,7 @@ function removeTaskGroupItem(itemId) {
   return true;
 }
 function startRunningCommand(item, turnId) {
-  const key = idKey(item.id); if (!key) return;
+  const key = scopedItemKey(turnId, item.id); if (!key) return;
   const command = item.command || {};
   const existing = state.runningCommands.get(key);
   const cmd = commandFromParts({
@@ -3323,7 +3325,7 @@ function taskTitleText(cmd) {
 }
 function commandFromItem(item, p, existing) {
   return commandFromParts({
-    id:idKey(item && item.id),
+    id:existing ? existing.id : idKey(item && item.id),
     turnId:existing ? existing.turnId : "",
     harnessItemId:(item && item.harness_item_id) || (existing && existing.harnessItemId) || "",
     command:p.command || "",
@@ -3591,8 +3593,8 @@ function updateRunningCommandDurations() {
   }
   renderRunningCommands();
 }
-function appendRunningCommandOutput(itemId, chunk) {
-  const key = idKey(itemId);
+function appendRunningCommandOutput(turnId, itemId, chunk) {
+  const key = scopedItemKey(turnId, itemId);
   const cmd = state.runningCommands.get(key);
   if (!cmd) return false;
   cmd.output = (cmd.output || "") + (chunk || "");
@@ -3611,7 +3613,21 @@ function detachRunningCommands() {
   renderRunningCommands();
 }
 function finishRunningCommand(item) {
-  const key = idKey(item && item.id);
+  // finishRunningCommand is called from addItem/finalizeStreamedItem after the turn id has
+  // been stamped on the row; recover the turn from the rendered command body so repeated
+  // item ids across turns still resolve to the right command entry.
+  let turnId = state.currentRenderTurnId;
+  if (!turnId && item && item.id) {
+    const bare = idKey(item.id);
+    for (const [k, v] of state.commandBodyElsByItemId) {
+      if (k.endsWith(":" + bare) || k === bare) {
+        const idx = k.indexOf(":");
+        if (idx !== -1) turnId = k.slice(0, idx);
+        break;
+      }
+    }
+  }
+  const key = scopedItemKey(turnId, item && item.id);
   if (!key) return;
   const p = item && item.payload;
   if (p && p.kind==="command_execution" && commandIsRunningStatus(p.status)) {
@@ -3633,7 +3649,7 @@ function finishRunningCommand(item) {
 function renderRunningCommandSnapshot(commands) {
   const seen = new Set();
   for (const info of commands) {
-    const key = idKey(info.item_id);
+    const key = scopedItemKey(info.turn_id, info.item_id);
     if (!key) continue;
     seen.add(key);
     const existing = state.runningCommands.get(key);
@@ -3916,7 +3932,7 @@ function resetTerminatingToolTasks() {
   renderRunningCommands();
 }
 function startToolCall(item, turnId) {
-  const key = idKey(item.id); if (!key) return;
+  const key = scopedItemKey(turnId, item.id); if (!key) return;
   const tool = item.tool || {};
   let body = state.streamElsByItemId.get(key);
   if (!body) body = taskBubble(key, "tool_call", "tool running-tool state-running", "tool");
@@ -3935,17 +3951,15 @@ function startToolCall(item, turnId) {
     error:null
   });
 }
-function appendToolProgress(itemId, text) {
-  const key = idKey(itemId);
-  let body = key ? state.streamElsByItemId.get(key) : null;
+function appendToolProgress(turnId, itemId, text) {
+  const key = scopedItemKey(turnId, itemId);
+  let body = state.streamElsByItemId.get(key);
   if (!body) {
     body = taskBubble(key, "tool_call", "tool running-tool state-running", "tool");
-    if (key) {
-      state.streamElsByItemId.set(key, body);
-      state.toolBodyElsByItemId.set(key, body);
-      state.commandMsgElsByItemId.set(key, body.parentElement);
-      body.parentElement.dataset.toolItemId = key;
-    }
+    state.streamElsByItemId.set(key, body);
+    state.toolBodyElsByItemId.set(key, body);
+    state.commandMsgElsByItemId.set(key, body.parentElement);
+    body.parentElement.dataset.toolItemId = key;
     renderItemBody(body, {
       kind:"tool_call",
       name:"tool",
@@ -3957,16 +3971,14 @@ function appendToolProgress(itemId, text) {
     });
   }
   const chunk = String(text || "");
-  if (key) {
-    const payload = state.toolPayloadsByItemId.get(key);
-    if (payload) {
-      const current = typeof payload.output === "string" ? payload.output : "";
-      payload.output = current ? current + "\n" + chunk : chunk;
-      state.toolPayloadsByItemId.set(key, payload);
-      renderItemBody(body, payload);
-      $("transcript").scrollTop = $("transcript").scrollHeight;
-      return;
-    }
+  const payload = state.toolPayloadsByItemId.get(key);
+  if (payload) {
+    const current = typeof payload.output === "string" ? payload.output : "";
+    payload.output = current ? current + "\n" + chunk : chunk;
+    state.toolPayloadsByItemId.set(key, payload);
+    renderItemBody(body, payload);
+    $("transcript").scrollTop = $("transcript").scrollHeight;
+    return;
   }
   let progress = body.querySelector(".tool-progress");
   if (!progress) {
@@ -3977,13 +3989,13 @@ function appendToolProgress(itemId, text) {
   progress.textContent += (progress.textContent ? "\n" : "") + chunk;
   $("transcript").scrollTop = $("transcript").scrollHeight;
 }
-function appendStream(text, itemId, deltaType) {
-  const key = idKey(itemId);
-  if (key && state.renderedItemIds.has(key)) return;
-  let body = key ? state.streamElsByItemId.get(key) : state.streamEl;
+function appendStream(turnId, text, itemId, deltaType) {
+  const key = scopedItemKey(turnId, itemId);
+  if (state.renderedItemIds.has(scopedItemKey(turnId, itemId))) return;
+  let body = state.streamElsByItemId.get(key) || state.streamEl;
   if (!body) {
-    const kind = key ? state.itemKindsByItemId.get(key) : null;
-    if (key && (isTaskPayloadKind(kind) || deltaType==="command_output")) {
+    const kind = state.itemKindsByItemId.get(key);
+    if (isTaskPayloadKind(kind) || deltaType==="command_output") {
       const taskKind = kind==="tool_call" ? "tool_call" : "command_execution";
       body = taskBubble(key, taskKind, classForStream(taskKind, deltaType), roleForStream(taskKind, deltaType));
       if (taskKind==="command_execution") {
@@ -3998,11 +4010,11 @@ function appendStream(text, itemId, deltaType) {
     } else {
       body = bubble(classForStream(kind, deltaType), roleForStream(kind, deltaType));
     }
-    if (key) state.streamElsByItemId.set(key, body);
+    state.streamElsByItemId.set(key, body);
   }
   state.streamEl = body;
-  state.streamItemId = key || null;
-  const kind = key ? state.itemKindsByItemId.get(key) : null;
+  state.streamItemId = key;
+  const kind = state.itemKindsByItemId.get(key);
   if (deltaType==="command_output" || kind==="command_execution") {
     let out = body.querySelector("pre.out");
     if (!out) {
@@ -4016,16 +4028,18 @@ function appendStream(text, itemId, deltaType) {
   }
   $("transcript").scrollTop = $("transcript").scrollHeight;
 }
-function finalizeStreamedItem(item) {
+function finalizeStreamedItem(item, turnId) {
   if (!item || !item.payload) return false;
-  const key = idKey(item.id);
-  const body = (key && (state.streamElsByItemId.get(key) || state.commandBodyElsByItemId.get(key) || state.toolBodyElsByItemId.get(key))) ||
+  const key = scopedItemKey(turnId, item.id);
+  const body = state.streamElsByItemId.get(key) ||
+    state.commandBodyElsByItemId.get(key) ||
+    state.toolBodyElsByItemId.get(key) ||
     (state.streamItemId===key ? state.streamEl : null);
   if (!hasVisiblePayload(item.payload)) {
     if (body && !body.textContent.trim()) {
-      if (key && !removeTaskGroupItem(key)) body.parentElement.remove();
+      if (!removeTaskGroupItem(key)) body.parentElement.remove();
     }
-    markRenderedItem(item);
+    markRenderedItem(item, turnId);
     if (state.streamEl === body) {
       state.streamEl = null;
       state.streamItemId = null;
@@ -4033,19 +4047,20 @@ function finalizeStreamedItem(item) {
     return true;
   }
   if (!body) return false;
-  if (item.payload.kind==="command_execution" && key) {
+  if (item.payload.kind==="command_execution") {
     state.commandBodyElsByItemId.set(key, body);
     state.commandMsgElsByItemId.set(key, body.parentElement);
     body.parentElement.dataset.commandItemId = key;
   }
-  if (item.payload.kind==="tool_call" && key) {
+  if (item.payload.kind==="tool_call") {
     state.toolBodyElsByItemId.set(key, body);
     state.commandMsgElsByItemId.set(key, body.parentElement);
     body.parentElement.dataset.toolItemId = key;
   }
+  state.renderedItemBodyByKey.set(key, body);
   renderItemBody(body, item.payload);
   if (item.payload.kind==="command_execution") finishRunningCommand(item);
-  markRenderedItem(item);
+  markRenderedItem(item, turnId);
   if (state.streamEl === body) {
     state.streamEl = null;
     state.streamItemId = null;
@@ -4053,7 +4068,7 @@ function finalizeStreamedItem(item) {
   $("transcript").scrollTop = $("transcript").scrollHeight;
   return true;
 }
-function addItem(item, fromHistory) {
+function addItem(item, turnId, fromHistory) {
   const p = item && item.payload ? item.payload : item;
   if (!p) return;
   // Plan updates are shown in the pinned plan card above the composer, not as transcript rows. Live
@@ -4063,9 +4078,18 @@ function addItem(item, fromHistory) {
     if (!fromHistory) updatePlanCard(item);
     return;
   }
-  if (isRenderedItem(item)) return;
+  const key = scopedItemKey(turnId, item && item.id);
+  if (isRenderedItem(item, turnId)) {
+    // Upsert: a repeated item id within the same turn refreshes the existing row.
+    const existing = state.renderedItemBodyByKey.get(key);
+    if (existing) {
+      renderItemBody(existing, p);
+      if (p.kind==="command_execution") finishRunningCommand(item);
+    }
+    return;
+  }
   if (!hasVisiblePayload(p)) {
-    markRenderedItem(item);
+    markRenderedItem(item, turnId);
     return;
   }
   if (p.kind==="user_message") {
@@ -4074,38 +4098,36 @@ function addItem(item, fromHistory) {
       state.pendingUserEl.querySelector(".body").textContent = p.text;
       state.pendingUserEl = null;
       state.pendingUserText = null;
-      markRenderedItem(item);
+      markRenderedItem(item, turnId);
       return;
     }
-    renderItemBody(bubble("user","you"), p);
+    const body = bubble("user","you");
+    state.renderedItemBodyByKey.set(key, body);
+    renderItemBody(body, p);
   }
   else {
     if (p.kind==="file_change" && mergeFileChangeWithPrevious(p)) {
-      markRenderedItem(item);
+      markRenderedItem(item, turnId);
       return;
     }
-    const key = idKey(item && item.id);
     const body = isTaskPayloadKind(p.kind)
       ? taskBubble(key, p.kind, classForPayload(p), roleForPayload(p))
       : bubble(classForPayload(p), roleForPayload(p));
     if (p.kind==="command_execution") {
-      if (key) {
-        state.commandBodyElsByItemId.set(key, body);
-        state.commandMsgElsByItemId.set(key, body.parentElement);
-        body.parentElement.dataset.commandItemId = key;
-      }
+      state.commandBodyElsByItemId.set(key, body);
+      state.commandMsgElsByItemId.set(key, body.parentElement);
+      body.parentElement.dataset.commandItemId = key;
     }
     if (p.kind==="tool_call") {
-      if (key) {
-        state.toolBodyElsByItemId.set(key, body);
-        state.commandMsgElsByItemId.set(key, body.parentElement);
-        body.parentElement.dataset.toolItemId = key;
-      }
+      state.toolBodyElsByItemId.set(key, body);
+      state.commandMsgElsByItemId.set(key, body.parentElement);
+      body.parentElement.dataset.toolItemId = key;
     }
+    state.renderedItemBodyByKey.set(key, body);
     renderItemBody(body, p);
   }
   if (p.kind==="command_execution") finishRunningCommand(item);
-  markRenderedItem(item);
+  markRenderedItem(item, turnId);
 }
 function resetRenderState() {
   clearPlanCard();   // dropping/switching threads clears any pinned plan
@@ -4114,6 +4136,7 @@ function resetRenderState() {
   state.streamElsByItemId = new Map();
   state.renderedItemIds = new Set();
   state.renderedHarnessItemIds = new Set();
+  state.renderedItemBodyByKey = new Map();
   state.itemKindsByItemId = new Map();
   state.pendingApprovals = new Map();
   state.renderedApprovalStateKeys = new Set();
@@ -4144,20 +4167,33 @@ function resetRenderState() {
 function idKey(id) {
   return id === undefined || id === null ? "" : String(id);
 }
-function isRenderedItem(item) {
+function scopedItemKey(turnId, itemId) {
+  return `${idKey(turnId)}:${idKey(itemId)}`;
+}
+function scopedHarnessKey(turnId, harnessItemId) {
+  return `${idKey(turnId)}:${idKey(harnessItemId)}`;
+}
+
+function isRenderedItem(item, turnId) {
   const itemId = idKey(item && item.id);
   const harnessItemId = item && item.harness_item_id;
-  return (itemId && state.renderedItemIds.has(itemId)) ||
-    (harnessItemId && state.renderedHarnessItemIds.has(harnessItemId));
+  const turn = idKey(turnId);
+  if (!turn) return false;
+  return (itemId && state.renderedItemIds.has(scopedItemKey(turn, itemId))) ||
+    (harnessItemId && state.renderedHarnessItemIds.has(scopedHarnessKey(turn, harnessItemId)));
 }
-function markRenderedItem(item) {
+function markRenderedItem(item, turnId) {
   const itemId = idKey(item && item.id);
-  if (itemId) {
-    state.renderedItemIds.add(itemId);
-    state.streamElsByItemId.delete(itemId);
-    state.itemKindsByItemId.delete(itemId);
+  const turn = idKey(turnId);
+  if (itemId && turn) {
+    state.renderedItemIds.add(scopedItemKey(turn, itemId));
+    const key = scopedItemKey(turn, itemId);
+    state.streamElsByItemId.delete(key);
+    state.itemKindsByItemId.delete(key);
   }
-  if (item && item.harness_item_id) state.renderedHarnessItemIds.add(item.harness_item_id);
+  if (item && item.harness_item_id && turn) {
+    state.renderedHarnessItemIds.add(scopedHarnessKey(turn, item.harness_item_id));
+  }
 }
 function hasVisiblePayload(p) {
   if (!p || !p.kind) return false;

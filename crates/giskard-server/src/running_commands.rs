@@ -5,17 +5,18 @@ use chrono::Utc;
 use tokio::sync::Mutex;
 
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ItemId, ThreadId};
+use giskard_core::ids::{ItemId, ThreadId, TurnId};
 use giskard_core::item::{ItemDelta, ItemPayload, command_status_is_running};
 use giskard_proto::{RunningTask, TaskKind};
 
 const MAX_OUTPUT_TAIL: usize = 8_000;
 
+type TaskKey = (TurnId, ItemId);
+
 #[derive(Default)]
 pub struct RunningTaskStore {
-    tasks: Mutex<HashMap<ThreadId, HashMap<ItemId, RunningTask>>>,
+    tasks: Mutex<HashMap<ThreadId, HashMap<TaskKey, RunningTask>>>,
 }
-
 impl RunningTaskStore {
     pub fn new() -> Self {
         Self::default()
@@ -74,13 +75,17 @@ impl RunningTaskStore {
                     return false;
                 };
                 let mut tasks = self.tasks.lock().await;
-                tasks.entry(*thread).or_default().insert(item.id, task);
+                tasks
+                    .entry(*thread)
+                    .or_default()
+                    .insert((*turn, item.id), task);
                 true
             }
             // Command output arrives as `CommandOutput`, tool progress as `Text`. Either appends to
             // the tracked task for its item id (untracked item ids — e.g. agent text — are ignored).
             AgentEvent::ItemDelta {
                 thread,
+                turn,
                 item_id,
                 delta: ItemDelta::CommandOutput { chunk } | ItemDelta::Text { text: chunk },
                 ..
@@ -88,7 +93,7 @@ impl RunningTaskStore {
                 let mut tasks = self.tasks.lock().await;
                 let Some(task) = tasks
                     .get_mut(thread)
-                    .and_then(|thread_tasks| thread_tasks.get_mut(item_id))
+                    .and_then(|thread_tasks| thread_tasks.get_mut(&(*turn, *item_id)))
                 else {
                     return false;
                 };
@@ -135,30 +140,31 @@ impl RunningTaskStore {
 
                 let mut tasks = self.tasks.lock().await;
                 let thread_tasks = tasks.entry(*thread).or_default();
+                let key = (*turn, item.id);
                 let Some(status) = completed.status.as_deref() else {
-                    return thread_tasks.remove(&item.id).is_some();
+                    return thread_tasks.remove(&key).is_some();
                 };
 
                 if !command_status_is_running(status) {
-                    return thread_tasks.remove(&item.id).is_some();
+                    return thread_tasks.remove(&key).is_some();
                 }
 
                 let mut output = completed.output;
                 truncate_output_tail(&mut output);
                 let after_turn = thread_tasks
-                    .get(&item.id)
+                    .get(&key)
                     .map(|task| task.after_turn)
                     .unwrap_or(false);
                 let started_at_ms = thread_tasks
-                    .get(&item.id)
+                    .get(&key)
                     .map(|task| task.started_at_ms)
                     .unwrap_or_else(now_ms);
                 let terminating = thread_tasks
-                    .get(&item.id)
+                    .get(&key)
                     .map(|task| task.terminating)
                     .unwrap_or(false);
                 thread_tasks.insert(
-                    item.id,
+                    key,
                     RunningTask {
                         kind: completed.kind,
                         thread_id: *thread,
@@ -246,11 +252,16 @@ impl RunningTaskStore {
         })
     }
 
-    pub async fn get_by_item(&self, thread_id: ThreadId, item_id: ItemId) -> Option<RunningTask> {
+    pub async fn get_by_item(
+        &self,
+        thread_id: ThreadId,
+        turn_id: TurnId,
+        item_id: ItemId,
+    ) -> Option<RunningTask> {
         let commands = self.tasks.lock().await;
         commands
             .get(&thread_id)
-            .and_then(|thread_commands| thread_commands.get(&item_id))
+            .and_then(|thread_commands| thread_commands.get(&(turn_id, item_id)))
             .cloned()
     }
 
@@ -749,6 +760,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn running_tasks_with_same_item_id_in_different_turns_are_tracked_separately() {
+        let store = RunningTaskStore::new();
+        let thread = ThreadId::new();
+        let first_turn = TurnId::new();
+        let second_turn = TurnId::new();
+        let shared_item_id = ItemId::new();
+
+        // First turn starts a long-running command with the shared item id.
+        store
+            .apply_event(&AgentEvent::ItemStarted {
+                thread,
+                turn: first_turn,
+                item: ItemStart {
+                    id: shared_item_id,
+                    harness_item_id: "cmd".into(),
+                    kind: ItemKind::CommandExecution,
+                    command: Some(CommandExecutionStart {
+                        command: "sleep 1".into(),
+                        cwd: "/tmp".into(),
+                        status: Some("in_progress".into()),
+                        process_id: Some("proc_1".into()),
+                        started_at_ms: Some(1),
+                    }),
+                    tool: None,
+                },
+            })
+            .await;
+
+        // Second turn starts another command with the same item id.
+        store
+            .apply_event(&AgentEvent::ItemStarted {
+                thread,
+                turn: second_turn,
+                item: ItemStart {
+                    id: shared_item_id,
+                    harness_item_id: "cmd".into(),
+                    kind: ItemKind::CommandExecution,
+                    command: Some(CommandExecutionStart {
+                        command: "sleep 2".into(),
+                        cwd: "/tmp".into(),
+                        status: Some("in_progress".into()),
+                        process_id: Some("proc_2".into()),
+                        started_at_ms: Some(2),
+                    }),
+                    tool: None,
+                },
+            })
+            .await;
+
+        let tasks = store.snapshot(thread).await;
+        assert_eq!(
+            tasks.len(),
+            2,
+            "same item id in different turns must create separate running tasks"
+        );
+        assert!(
+            tasks
+                .iter()
+                .any(|t| t.turn_id == first_turn && t.process_id.as_deref() == Some("proc_1"))
+        );
+        assert!(
+            tasks
+                .iter()
+                .any(|t| t.turn_id == second_turn && t.process_id.as_deref() == Some("proc_2"))
+        );
+    }
+
+    #[tokio::test]
     async fn terminal_failed_and_declined_items_remove_commands() {
         for status in ["failed", "declined"] {
             let store = RunningTaskStore::new();
@@ -903,11 +982,16 @@ mod tests {
             .await;
 
         let command = store
-            .get_by_item(thread, item_id)
+            .get_by_item(thread, turn, item_id)
             .await
             .expect("running command should be indexed by item id");
         assert_eq!(command.process_id.as_deref(), Some("proc_1"));
-        assert!(store.get_by_item(thread, ItemId::new()).await.is_none());
+        assert!(
+            store
+                .get_by_item(thread, TurnId::new(), ItemId::new())
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]

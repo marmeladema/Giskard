@@ -1232,11 +1232,11 @@ async fn index_page_is_served_and_public() {
         "UI tracks item kinds for streamed deltas"
     );
     assert!(
-        body.contains("addItem(ev.item)"),
+        body.contains("addItem(ev.item, ev.turn)"),
         "UI renders completed events with full item metadata"
     );
     assert!(
-        body.contains("addItem(it, true)"),
+        body.contains("addItem(it, turn.id, true)"),
         "UI replays persisted history with full item metadata"
     );
     assert!(
@@ -1588,7 +1588,7 @@ fn browser_stamps_transcript_rows_with_their_turn_id() {
     );
     assert_order(
         persisted,
-        "for (const it of items) addItem(it, true);",
+        "for (const it of items) addItem(it, turn.id, true);",
         "state.currentRenderTurnId = prevRenderTurnId;",
     );
 
