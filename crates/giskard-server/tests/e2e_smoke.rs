@@ -1028,6 +1028,73 @@ fn make_fixture() -> ReplayFixture {
     ])
 }
 
+fn reused_item_id_across_turns_fixture(
+    thread: ThreadId,
+    old_turn: TurnId,
+    new_turn: TurnId,
+    item_id: ItemId,
+) -> ReplayFixture {
+    let now = chrono::Utc::now();
+    let shared_harness = "shared_agent".to_string();
+
+    ReplayFixture::from_events(vec![
+        AgentEvent::ThreadOpened {
+            thread,
+            harness_thread_id: "th_reuse".into(),
+        },
+        AgentEvent::TurnStarted {
+            thread,
+            turn: old_turn,
+        },
+        AgentEvent::ItemCompleted {
+            thread,
+            turn: old_turn,
+            item: Item {
+                id: item_id,
+                harness_item_id: shared_harness.clone(),
+                payload: ItemPayload::AgentMessage {
+                    text: "old answer".into(),
+                },
+                created_at: now,
+            },
+        },
+        AgentEvent::TurnCompleted {
+            thread,
+            turn: old_turn,
+            usage: TokenUsage::new(10, 10),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        },
+        AgentEvent::TurnStarted {
+            thread,
+            turn: new_turn,
+        },
+        AgentEvent::ItemCompleted {
+            thread,
+            turn: new_turn,
+            item: Item {
+                id: item_id,
+                harness_item_id: shared_harness.clone(),
+                payload: ItemPayload::AgentMessage {
+                    text: "new answer".into(),
+                },
+                created_at: now,
+            },
+        },
+        AgentEvent::TurnCompleted {
+            thread,
+            turn: new_turn,
+            usage: TokenUsage::new(20, 20),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        },
+    ])
+}
+
 fn duplicate_history_fixture(
     thread: ThreadId,
     old_turn: TurnId,
@@ -3885,6 +3952,215 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
 /// A turn that fails without producing agent output must still be persisted as a `Failed` turn
 /// carrying the user's input and the real error message, so history explains why the message got
 /// no response (rather than the error only flashing by as a transient toast).
+#[tokio::test]
+async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
+    let tid = ThreadId::new();
+    let old_turn = TurnId::new();
+    let new_turn = TurnId::new();
+    let shared_item_id = ItemId::new();
+    let fixture = reused_item_id_across_turns_fixture(tid, old_turn, new_turn, shared_item_id);
+    let (_tmp, state, port) =
+        start_server_with_fixture_and_extra_config_on_available_port(fixture, "").await;
+    let base = format!("http://127.0.0.1:{port}");
+    let ws_base = format!("ws://127.0.0.1:{port}");
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let resp = client
+        .post(format!("{base}/api/login"))
+        .json(&serde_json::json!({"password": "testpass"}))
+        .send()
+        .await
+        .unwrap();
+    let cookie = resp
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let model = ModelRef {
+        provider: "openai".into(),
+        model: "gpt-5.5".into(),
+        reasoning_effort: None,
+    };
+
+    let resp = client
+        .post(format!("{base}/api/projects"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({
+            "name": "test-project",
+            "dir": "/tmp/test",
+            "default_model": model,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let project_id = resp.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pid: ProjectId = project_id.parse().unwrap();
+
+    let now = chrono::Utc::now();
+    state
+        .store
+        .save_thread(
+            pid,
+            &giskard_persist::store::ThreadFile {
+                version: 1,
+                id: tid,
+                project_id: pid,
+                title: "Saved thread".into(),
+                harness_thread_id: "th_reuse".into(),
+                mode: Mode::Build,
+                current_model: model.clone(),
+                context_window: 128_000,
+                approval_policy: ApprovalPolicy::Ask,
+                model_efforts: Default::default(),
+                tokens: Default::default(),
+                created_at: now,
+                updated_at: now,
+                archived: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    // Persist the first turn up-front so the replayed old-turn events are marked as seen
+    // and the forwarder does not exit early after handling them.
+    state
+        .store
+        .append_turn(
+            pid,
+            tid,
+            &giskard_core::turn::Turn {
+                id: old_turn,
+                user_input: UserInput::text("old input"),
+                items: vec![Item {
+                    id: shared_item_id,
+                    harness_item_id: "shared_agent".into(),
+                    payload: ItemPayload::AgentMessage {
+                        text: "old answer".into(),
+                    },
+                    created_at: now,
+                }],
+                model: model.clone(),
+                mode: Mode::Build,
+                status: TurnStatus {
+                    kind: TurnStatusKind::Completed,
+                    message: None,
+                },
+                usage: TokenUsage::new(10, 10),
+                diffs: vec![],
+                started_at: now,
+                completed_at: Some(now),
+            },
+        )
+        .await
+        .unwrap();
+
+    let resp = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"thread_id": tid, "resume": null}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    use tokio_tungstenite::tungstenite::http::Request;
+    let ws_request = Request::builder()
+        .uri(format!("{ws_base}/api/ws"))
+        .header("host", format!("127.0.0.1:{port}"))
+        .header("cookie", &cookie)
+        .header("upgrade", "websocket")
+        .header("connection", "upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .body(())
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request)
+        .await
+        .expect("WS connect");
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::Subscribe {
+            thread_id: tid,
+            since: None,
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SendInput {
+            thread_id: tid,
+            text: "new input".into(),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    // Wait until the replayed new turn completes.
+    let mut saw_new_turn_complete = false;
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline && !saw_new_turn_complete {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
+                let server_msg: ServerMessage = serde_json::from_str(&t).unwrap();
+                if let ServerMessage::Event { agent_event, .. } = server_msg {
+                    if let WireAgentEvent::TurnCompleted { turn, .. } = agent_event {
+                        if turn == new_turn {
+                            saw_new_turn_complete = true;
+                        }
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => break,
+        }
+    }
+    assert!(saw_new_turn_complete, "new replayed turn should complete");
+
+    let saved = state.store.load_all_turns(pid, tid).await.unwrap();
+    assert_eq!(saved.len(), 2);
+    assert_eq!(saved[0].id, old_turn);
+    assert_eq!(saved[1].id, new_turn);
+    assert_eq!(saved[0].items.len(), 1);
+    assert_eq!(saved[1].items.len(), 1);
+    assert_eq!(
+        saved[0].items[0].id, saved[1].items[0].id,
+        "fixture deliberately reuses item id"
+    );
+    assert!(
+        matches!(
+            &saved[0].items[0].payload,
+            ItemPayload::AgentMessage { text } if text == "old answer"
+        ),
+        "old turn keeps its own payload"
+    );
+    assert!(
+        matches!(
+            &saved[1].items[0].payload,
+            ItemPayload::AgentMessage { text } if text == "new answer"
+        ),
+        "new turn keeps its own payload"
+    );
+}
+
 #[tokio::test]
 async fn failed_turn_is_persisted_with_error_message() {
     let tid = ThreadId::new();

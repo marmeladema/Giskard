@@ -10,7 +10,7 @@ use tracing::{debug, error, info, warn};
 use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
+use giskard_core::ids::{ApprovalId, ProjectId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{Item, ItemPayload, command_status_is_running, normalized_command_status};
 use giskard_core::mcp::{McpOauthStart, McpServerStatus};
 use giskard_core::model::ModelRef;
@@ -897,9 +897,8 @@ async fn forward_events(
     let mut items: Vec<Item> = Vec::new();
     let mut diffs: Vec<giskard_core::FileDiff> = Vec::new();
     let mut seen_turn_ids = persisted_turn_ids(&store, project_id, thread_id).await;
-    let mut seen_harness_item_ids = persisted_harness_item_ids(&store, project_id, thread_id).await;
-    let mut duplicate_item_ids = HashSet::new();
     let mut seen_notices = HashSet::new();
+    let mut current_turn_item_indexes: HashMap<String, usize> = HashMap::new();
     let forwarder_started = Instant::now();
     let mut saw_context_compaction_marker = false;
     let mut stream_error: Option<String> = None;
@@ -912,7 +911,6 @@ async fn forward_events(
         model = %ctx.model.model,
         turn_gate_held = turn_gate.as_ref().is_some_and(|lease| !lease.is_released()),
         persisted_turn_count = seen_turn_ids.len(),
-        persisted_harness_item_count = seen_harness_item_ids.len(),
         "event forwarder started"
     );
 
@@ -1058,23 +1056,6 @@ async fn forward_events(
                     continue;
                 }
 
-                if should_skip_duplicate_item(
-                    &event,
-                    &mut seen_harness_item_ids,
-                    &mut duplicate_item_ids,
-                ) {
-                    debug!(
-                        %project_id,
-                        %thread_id,
-                        event_kind = event_kind(&event),
-                        event_turn_id = ?event_turn_id(&event),
-                        item_id = ?event_item_id(&event),
-                        harness_item_id = ?event_harness_item_id(&event),
-                        "skipping duplicate harness item event"
-                    );
-                    continue;
-                }
-
                 let command_state_changed =
                     apply_running_command_event(&running_commands, &event).await;
 
@@ -1082,6 +1063,12 @@ async fn forward_events(
                     AgentEvent::TurnStarted { turn, .. } => {
                         turn_id = Some(*turn);
                         started_at = Utc::now();
+                        current_turn_item_indexes.clear();
+                        for (idx, item) in items.iter().enumerate() {
+                            if !item.harness_item_id.is_empty() {
+                                current_turn_item_indexes.insert(item.harness_item_id.clone(), idx);
+                            }
+                        }
                         if let Some(turn_gate) = turn_gate.as_mut() {
                             turn_gate.acknowledge_turn(*turn);
                         }
@@ -1111,7 +1098,7 @@ async fn forward_events(
                                 "context compaction marker received"
                             );
                         }
-                        items.push(item.clone());
+                        upsert_current_turn_item(&mut items, &mut current_turn_item_indexes, item);
                     }
                     AgentEvent::DiffUpdated { diff, .. } => {
                         let existing = diffs.iter_mut().find(|d| d.path == diff.path);
@@ -1691,27 +1678,6 @@ fn thread_activity_from_event(
     Some(activity)
 }
 
-fn event_item_id(event: &AgentEvent) -> Option<ItemId> {
-    match event {
-        AgentEvent::ItemStarted { item, .. } => Some(item.id),
-        AgentEvent::ItemDelta { item_id, .. } => Some(*item_id),
-        AgentEvent::ItemCompleted { item, .. } => Some(item.id),
-        _ => None,
-    }
-}
-
-fn event_harness_item_id(event: &AgentEvent) -> Option<&str> {
-    match event {
-        AgentEvent::ItemStarted { item, .. } if !item.harness_item_id.is_empty() => {
-            Some(item.harness_item_id.as_str())
-        }
-        AgentEvent::ItemCompleted { item, .. } if !item.harness_item_id.is_empty() => {
-            Some(item.harness_item_id.as_str())
-        }
-        _ => None,
-    }
-}
-
 async fn apply_running_command_event(
     running_commands: &RunningTaskStore,
     event: &AgentEvent,
@@ -1761,7 +1727,7 @@ async fn terminating_command_before_terminal_completion(
     running_commands: &RunningTaskStore,
     event: &AgentEvent,
 ) -> Option<RunningTask> {
-    let AgentEvent::ItemCompleted { thread, item, .. } = event else {
+    let AgentEvent::ItemCompleted { thread, turn, item } = event else {
         return None;
     };
     let ItemPayload::CommandExecution { status, .. } = &item.payload else {
@@ -1775,7 +1741,9 @@ async fn terminating_command_before_terminal_completion(
         return None;
     }
 
-    let command = running_commands.get_by_item(*thread, item.id).await?;
+    let command = running_commands
+        .get_by_item(*thread, *turn, item.id)
+        .await?;
     command.terminating.then_some(command)
 }
 
@@ -1846,32 +1814,26 @@ fn command_completion_is_normal_success(status: &str, exit_code: Option<i32>) ->
     ) && exit_code == Some(0)
 }
 
-fn should_skip_duplicate_item(
-    event: &AgentEvent,
-    seen_harness_item_ids: &mut HashSet<String>,
-    duplicate_item_ids: &mut HashSet<ItemId>,
-) -> bool {
-    match event {
-        AgentEvent::ItemStarted { item, .. } => {
-            if !item.harness_item_id.is_empty()
-                && seen_harness_item_ids.contains(&item.harness_item_id)
-            {
-                duplicate_item_ids.insert(item.id);
-                return true;
-            }
-            false
-        }
-        AgentEvent::ItemDelta { item_id, .. } => duplicate_item_ids.contains(item_id),
-        AgentEvent::ItemCompleted { item, .. } => {
-            if duplicate_item_ids.remove(&item.id) {
-                return true;
-            }
-            if item.harness_item_id.is_empty() {
-                return false;
-            }
-            !seen_harness_item_ids.insert(item.harness_item_id.clone())
-        }
-        _ => false,
+/// Upsert an `ItemCompleted` into the current turn's item buffer. If the same
+/// `harness_item_id` has already completed in this turn, replace the earlier
+/// buffered item with the latest one; otherwise append. Items with empty
+/// harness ids always append. This keeps the persisted turn coherent when a
+/// harness legitimately reuses an item id across turn boundaries.
+fn upsert_current_turn_item(
+    items: &mut Vec<Item>,
+    indexes: &mut HashMap<String, usize>,
+    item: &Item,
+) {
+    if item.harness_item_id.is_empty() {
+        items.push(item.clone());
+        return;
+    }
+    if let Some(&idx) = indexes.get(&item.harness_item_id) {
+        items[idx] = item.clone();
+    } else {
+        let idx = items.len();
+        items.push(item.clone());
+        indexes.insert(item.harness_item_id.clone(), idx);
     }
 }
 
@@ -1888,35 +1850,6 @@ async fn persisted_turn_ids(
                 %thread_id,
                 %error,
                 "failed to load persisted turn ids; duplicate-turn detection starts empty"
-            );
-            HashSet::new()
-        }
-    }
-}
-
-async fn persisted_harness_item_ids(
-    store: &PersistStore,
-    project_id: ProjectId,
-    thread_id: ThreadId,
-) -> HashSet<String> {
-    match store.load_all_turns(project_id, thread_id).await {
-        Ok(turns) => turns
-            .into_iter()
-            .flat_map(|turn| turn.items)
-            .filter_map(|item| {
-                if item.harness_item_id.is_empty() {
-                    None
-                } else {
-                    Some(item.harness_item_id)
-                }
-            })
-            .collect(),
-        Err(error) => {
-            warn!(
-                %project_id,
-                %thread_id,
-                %error,
-                "failed to load persisted harness item ids; duplicate-item detection starts empty"
             );
             HashSet::new()
         }
@@ -3489,6 +3422,538 @@ mod tests {
                 },
             },
         ]
+    }
+
+    #[tokio::test]
+    async fn forwarder_upserts_repeated_harness_item_ids_within_turn_and_allows_reuse_across_turns()
+    {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: None,
+        };
+        store
+            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .await
+            .unwrap();
+        let now = Utc::now();
+        store
+            .save_thread(
+                project_id,
+                &ThreadFile {
+                    version: 1,
+                    id: thread_id,
+                    project_id,
+                    title: "t".into(),
+                    harness_thread_id: "th".into(),
+                    mode: Mode::Build,
+                    current_model: model.clone(),
+                    context_window: 128_000,
+                    approval_policy: ApprovalPolicy::Ask,
+                    model_efforts: Default::default(),
+                    tokens: TokenLedger::default(),
+                    created_at: now,
+                    updated_at: now,
+                    archived: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let first_turn = TurnId::new();
+        let reused_harness = "agent_reply".to_string();
+        let first_item_id = ItemId::new();
+        let second_item_id = ItemId::new();
+
+        store
+            .append_turn(
+                project_id,
+                thread_id,
+                &Turn {
+                    id: first_turn,
+                    user_input: UserInput::text("first"),
+                    items: vec![Item {
+                        id: first_item_id,
+                        harness_item_id: reused_harness.clone(),
+                        payload: ItemPayload::AgentMessage {
+                            text: "first answer".into(),
+                        },
+                        created_at: now,
+                    }],
+                    model: model.clone(),
+                    mode: Mode::Build,
+                    status: TurnStatus {
+                        kind: TurnStatusKind::Completed,
+                        message: None,
+                    },
+                    usage: TokenUsage::new(1, 1),
+                    diffs: vec![],
+                    started_at: now,
+                    completed_at: Some(now),
+                },
+            )
+            .await
+            .unwrap();
+
+        let (tx, _) = broadcast::channel(64);
+        let hub = Arc::new(Hub::new());
+        let live_buffers = Arc::new(LiveBufferStore::new());
+        let running_commands = Arc::new(RunningTaskStore::new());
+        let approvals = Arc::new(Mutex::new(Default::default()));
+        let server_requests = Arc::new(Mutex::new(Default::default()));
+        let ledger = ledger::spawn(store.clone());
+
+        spawn_forwarder(
+            thread_id,
+            project_id,
+            AgentEventStream::new(tx.subscribe()),
+            hub,
+            live_buffers,
+            running_commands,
+            store.clone(),
+            approvals,
+            server_requests,
+            ledger,
+            model,
+            "second",
+        );
+
+        let second_turn = TurnId::new();
+        tx.send(AgentEvent::TurnStarted {
+            thread: thread_id,
+            turn: second_turn,
+        })
+        .unwrap();
+        // Two ItemCompleted events for the same harness id within the new turn: this should
+        // upsert to a single persisted item carrying the latest payload, while the earlier
+        // persisted turn keeps its own distinct item.
+        tx.send(AgentEvent::ItemCompleted {
+            thread: thread_id,
+            turn: second_turn,
+            item: Item {
+                id: second_item_id,
+                harness_item_id: reused_harness.clone(),
+                payload: ItemPayload::AgentMessage {
+                    text: "first version in second turn".into(),
+                },
+                created_at: now,
+            },
+        })
+        .unwrap();
+        tx.send(AgentEvent::ItemCompleted {
+            thread: thread_id,
+            turn: second_turn,
+            item: Item {
+                id: second_item_id,
+                harness_item_id: reused_harness.clone(),
+                payload: ItemPayload::AgentMessage {
+                    text: "second version in second turn".into(),
+                },
+                created_at: now,
+            },
+        })
+        .unwrap();
+        tx.send(AgentEvent::TurnCompleted {
+            thread: thread_id,
+            turn: second_turn,
+            usage: TokenUsage::new(2, 2),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        })
+        .unwrap();
+
+        wait_for_turn_count(&store, project_id, thread_id, 2).await;
+        let saved = store.load_all_turns(project_id, thread_id).await.unwrap();
+        assert_eq!(saved.len(), 2);
+        assert_eq!(saved[0].id, first_turn);
+        assert_eq!(saved[1].id, second_turn);
+        assert_eq!(saved[0].items.len(), 1);
+        assert_eq!(
+            saved[1].items.len(),
+            1,
+            "repeated harness id in same turn should upsert to one item"
+        );
+        assert_eq!(saved[1].items[0].id, second_item_id);
+        assert!(
+            matches!(
+                &saved[1].items[0].payload,
+                ItemPayload::AgentMessage { text } if text == "second version in second turn"
+            ),
+            "upsert should keep the latest occurrence within the turn"
+        );
+        assert!(
+            saved[0].items[0].id == first_item_id,
+            "earlier turn item must remain untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarder_forwards_item_started_and_delta_for_harness_id_reused_across_turns() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: None,
+        };
+        store
+            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .await
+            .unwrap();
+        let now = Utc::now();
+        store
+            .save_thread(
+                project_id,
+                &ThreadFile {
+                    version: 1,
+                    id: thread_id,
+                    project_id,
+                    title: "t".into(),
+                    harness_thread_id: "th".into(),
+                    mode: Mode::Build,
+                    current_model: model.clone(),
+                    context_window: 128_000,
+                    approval_policy: ApprovalPolicy::Ask,
+                    model_efforts: Default::default(),
+                    tokens: TokenLedger::default(),
+                    created_at: now,
+                    updated_at: now,
+                    archived: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let first_turn = TurnId::new();
+        let reused_harness = "agent_stream".to_string();
+        let first_item_id = ItemId::new();
+
+        store
+            .append_turn(
+                project_id,
+                thread_id,
+                &Turn {
+                    id: first_turn,
+                    user_input: UserInput::text("first"),
+                    items: vec![Item {
+                        id: first_item_id,
+                        harness_item_id: reused_harness.clone(),
+                        payload: ItemPayload::AgentMessage {
+                            text: "first answer".into(),
+                        },
+                        created_at: now,
+                    }],
+                    model: model.clone(),
+                    mode: Mode::Build,
+                    status: TurnStatus {
+                        kind: TurnStatusKind::Completed,
+                        message: None,
+                    },
+                    usage: TokenUsage::new(1, 1),
+                    diffs: vec![],
+                    started_at: now,
+                    completed_at: Some(now),
+                },
+            )
+            .await
+            .unwrap();
+
+        let (tx, _) = broadcast::channel(64);
+        let hub = Arc::new(Hub::new());
+        let (client_tx, mut client_rx) = mpsc::channel(64);
+        hub.subscribe(thread_id, 1, client_tx).await;
+        let live_buffers = Arc::new(LiveBufferStore::new());
+        let running_commands = Arc::new(RunningTaskStore::new());
+        let approvals = Arc::new(Mutex::new(Default::default()));
+        let server_requests = Arc::new(Mutex::new(Default::default()));
+        let ledger = ledger::spawn(store.clone());
+
+        spawn_forwarder(
+            thread_id,
+            project_id,
+            AgentEventStream::new(tx.subscribe()),
+            hub,
+            live_buffers,
+            running_commands,
+            store.clone(),
+            approvals,
+            server_requests,
+            ledger,
+            model,
+            "second",
+        );
+
+        let second_turn = TurnId::new();
+        let second_item_id = ItemId::new();
+        tx.send(AgentEvent::TurnStarted {
+            thread: thread_id,
+            turn: second_turn,
+        })
+        .unwrap();
+        tx.send(AgentEvent::ItemStarted {
+            thread: thread_id,
+            turn: second_turn,
+            item: ItemStart {
+                id: second_item_id,
+                harness_item_id: reused_harness.clone(),
+                kind: ItemKind::AgentMessage,
+                command: None,
+                tool: None,
+            },
+        })
+        .unwrap();
+        tx.send(AgentEvent::ItemDelta {
+            thread: thread_id,
+            turn: second_turn,
+            item_id: second_item_id,
+            delta: giskard_core::item::ItemDelta::Text {
+                text: "streaming".into(),
+            },
+        })
+        .unwrap();
+        tx.send(AgentEvent::ItemCompleted {
+            thread: thread_id,
+            turn: second_turn,
+            item: Item {
+                id: second_item_id,
+                harness_item_id: reused_harness.clone(),
+                payload: ItemPayload::AgentMessage {
+                    text: "second answer".into(),
+                },
+                created_at: now,
+            },
+        })
+        .unwrap();
+        tx.send(AgentEvent::TurnCompleted {
+            thread: thread_id,
+            turn: second_turn,
+            usage: TokenUsage::new(2, 2),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        })
+        .unwrap();
+
+        wait_for_turn_count(&store, project_id, thread_id, 2).await;
+
+        // Collect broadcast events for the new turn and ensure the reused harness id did not
+        // cause ItemStarted/ItemDelta/ItemCompleted to be suppressed.
+        let mut saw_started = false;
+        let mut saw_delta = false;
+        let mut saw_completed = false;
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(tokio::time::Duration::from_millis(100), client_rx.recv())
+                .await
+            {
+                Ok(Some(ServerMessage::Event { agent_event, .. })) => match agent_event {
+                    WireAgentEvent::ItemStarted { item, .. }
+                        if item.harness_item_id == reused_harness =>
+                    {
+                        saw_started = true;
+                    }
+                    WireAgentEvent::ItemDelta { item_id, .. } if item_id == second_item_id => {
+                        saw_delta = true;
+                    }
+                    WireAgentEvent::ItemCompleted { item, .. }
+                        if item.harness_item_id == reused_harness =>
+                    {
+                        saw_completed = true;
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+
+        assert!(
+            saw_started,
+            "ItemStarted for reused harness id must be forwarded"
+        );
+        assert!(
+            saw_delta,
+            "ItemDelta for reused harness id must be forwarded"
+        );
+        assert!(
+            saw_completed,
+            "ItemCompleted for reused harness id must be forwarded"
+        );
+
+        let saved = store.load_all_turns(project_id, thread_id).await.unwrap();
+        assert_eq!(saved[1].items.len(), 1);
+        assert_eq!(saved[1].items[0].id, second_item_id);
+        assert!(
+            saved[0].items[0].id == first_item_id,
+            "earlier turn item must remain untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarder_upserts_item_deltas_for_repeated_item_id_within_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: None,
+        };
+        store
+            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .await
+            .unwrap();
+        let now = Utc::now();
+        store
+            .save_thread(
+                project_id,
+                &ThreadFile {
+                    version: 1,
+                    id: thread_id,
+                    project_id,
+                    title: "t".into(),
+                    harness_thread_id: "th".into(),
+                    mode: Mode::Build,
+                    current_model: model.clone(),
+                    context_window: 128_000,
+                    approval_policy: ApprovalPolicy::Ask,
+                    model_efforts: Default::default(),
+                    tokens: TokenLedger::default(),
+                    created_at: now,
+                    updated_at: now,
+                    archived: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let (tx, _) = broadcast::channel(64);
+        let hub = Arc::new(Hub::new());
+        let (client_tx, mut client_rx) = mpsc::channel(64);
+        hub.subscribe(thread_id, 1, client_tx).await;
+        let live_buffers = Arc::new(LiveBufferStore::new());
+        let running_commands = Arc::new(RunningTaskStore::new());
+        let approvals = Arc::new(Mutex::new(Default::default()));
+        let server_requests = Arc::new(Mutex::new(Default::default()));
+        let ledger = ledger::spawn(store.clone());
+
+        spawn_forwarder(
+            thread_id,
+            project_id,
+            AgentEventStream::new(tx.subscribe()),
+            hub,
+            live_buffers.clone(),
+            running_commands,
+            store.clone(),
+            approvals,
+            server_requests,
+            ledger,
+            model,
+            "delta-upsert",
+        );
+
+        let turn = TurnId::new();
+        let item_id = ItemId::new();
+        let harness = "agent_text";
+        tx.send(AgentEvent::TurnStarted {
+            thread: thread_id,
+            turn,
+        })
+        .unwrap();
+        tx.send(AgentEvent::ItemStarted {
+            thread: thread_id,
+            turn,
+            item: ItemStart {
+                id: item_id,
+                harness_item_id: harness.into(),
+                kind: ItemKind::AgentMessage,
+                command: None,
+                tool: None,
+            },
+        })
+        .unwrap();
+        tx.send(AgentEvent::ItemDelta {
+            thread: thread_id,
+            turn,
+            item_id,
+            delta: giskard_core::item::ItemDelta::Text {
+                text: "first".into(),
+            },
+        })
+        .unwrap();
+        tx.send(AgentEvent::ItemDelta {
+            thread: thread_id,
+            turn,
+            item_id,
+            delta: giskard_core::item::ItemDelta::Text {
+                text: " second".into(),
+            },
+        })
+        .unwrap();
+        tx.send(AgentEvent::ItemCompleted {
+            thread: thread_id,
+            turn,
+            item: Item {
+                id: item_id,
+                harness_item_id: harness.into(),
+                payload: ItemPayload::AgentMessage {
+                    text: "final".into(),
+                },
+                created_at: now,
+            },
+        })
+        .unwrap();
+        tx.send(AgentEvent::TurnCompleted {
+            thread: thread_id,
+            turn,
+            usage: TokenUsage::new(3, 3),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        })
+        .unwrap();
+
+        wait_for_turn_count(&store, project_id, thread_id, 1).await;
+
+        // Collect broadcast events before querying persistence; the live buffer may already have
+        // been cleared by the time the persisted turn is visible.
+        let mut delta_texts = Vec::new();
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(tokio::time::Duration::from_millis(100), client_rx.recv())
+                .await
+            {
+                Ok(Some(ServerMessage::Event { agent_event, .. })) => {
+                    if let WireAgentEvent::ItemDelta { delta, .. } = agent_event {
+                        if let giskard_proto::ItemDelta::Text { text } = delta {
+                            delta_texts.push(text);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            delta_texts.len(),
+            2,
+            "both deltas for the same item id must be forwarded"
+        );
+        assert_eq!(delta_texts.concat(), "first second");
+
+        let saved = store.load_all_turns(project_id, thread_id).await.unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].items.len(), 1);
+        assert_eq!(saved[0].items[0].id, item_id);
     }
 
     async fn wait_for_turn_count(
