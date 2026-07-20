@@ -141,6 +141,9 @@ enum ControlCommand {
         name: String,
         response: oneshot::Sender<Result<McpOauthStart, HarnessError>>,
     },
+    ListModels {
+        response: oneshot::Sender<Result<Vec<ModelDescriptor>, HarnessError>>,
+    },
     Shutdown {
         response: oneshot::Sender<Result<(), HarnessError>>,
     },
@@ -622,7 +625,7 @@ impl CodexHarness {
                 reasoning_effort: true,
                 structured_diffs: true,
                 resumable_threads: true,
-                model_listing: false,
+                model_listing: true,
                 token_usage: true,
                 mcp_status: true,
                 mcp_reload: true,
@@ -710,7 +713,11 @@ impl AgentHarness for CodexHarness {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelDescriptor>, HarnessError> {
-        Ok(vec![])
+        let (tx, rx) = oneshot::channel();
+        self.enqueue_control("list_models", ControlCommand::ListModels { response: tx })
+            .await?;
+        rx.await
+            .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
 
     async fn list_mcp_servers(&self) -> Result<Vec<McpServerStatus>, HarnessError> {
@@ -1470,6 +1477,13 @@ async fn handle_control_command(
                 handle_start_mcp_oauth_login(client, &name),
             )
             .await;
+            let _ = response.send(result);
+            StreamOutcome::TurnEnded
+        }
+        Some(ControlCommand::ListModels { response }) => {
+            let result =
+                timeout_codex_control("list_models", None, None, None, handle_list_models(client))
+                    .await;
             let _ = response.send(result);
             StreamOutcome::TurnEnded
         }
@@ -2320,6 +2334,70 @@ async fn handle_list_mcp_servers(
     Ok(out)
 }
 
+/// List the models Codex advertises over the app-server `model/list` RPC, mapped to Giskard
+/// [`ModelDescriptor`]s so the picker can show Codex's friendly `display_name` instead of raw
+/// model ids.
+///
+/// The `model/list` catalog is provider-agnostic — each entry carries only a model slug, no
+/// provider — so the returned descriptors leave `provider` empty; matching a descriptor to a
+/// Giskard `(provider, model)` pair is by model id and is the caller's responsibility. Codex also
+/// omits the context window from this RPC, so descriptors use the conservative default; these
+/// entries are a source of names/reasoning-effort support only, not gauge sizing.
+async fn handle_list_models(
+    client: &mut dyn CodexTransport,
+) -> Result<Vec<ModelDescriptor>, HarnessError> {
+    let mut out = Vec::new();
+    let mut cursor = None;
+
+    loop {
+        let params = codex_codes::ModelListParams {
+            cursor: cursor.clone(),
+            // Default (false): only models Codex shows in its own picker.
+            include_hidden: None,
+            limit: None,
+        };
+        let page: codex_codes::ModelListResponse = codex_request(
+            client,
+            CodexOperationContext::new("list_models"),
+            codex_codes::protocol::methods::MODEL_LIST,
+            &params,
+        )
+        .await?;
+
+        out.extend(page.data.into_iter().filter(|m| !m.hidden).map(map_model));
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    Ok(out)
+}
+
+/// Map a Codex `model/list` entry to a Giskard [`ModelDescriptor`]. See [`handle_list_models`] for
+/// why `provider` is empty and the context window is conservative.
+fn map_model(model: codex_codes::Model) -> ModelDescriptor {
+    // `model` is the wire slug used in a ModelRef; `id` is the preset id. Prefer the slug, but fall
+    // back to the id if an older/edge payload leaves it empty.
+    let id = if model.model.is_empty() {
+        model.id
+    } else {
+        model.model
+    };
+    let display_name = if model.display_name.is_empty() {
+        None
+    } else {
+        Some(model.display_name)
+    };
+    ModelDescriptor {
+        provider: String::new(),
+        model: id,
+        context_window: ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
+        supports_reasoning_effort: !model.supported_reasoning_efforts.is_empty(),
+        display_name,
+    }
+}
+
 async fn handle_reload_mcp_servers(client: &mut dyn CodexTransport) -> Result<(), HarnessError> {
     let _: codex_codes::McpServerRefreshResponse = codex_request(
         client,
@@ -2684,6 +2762,44 @@ mod tests {
                     }
                     codex_codes::protocol::methods::MCPSERVERSTATUS_LIST => Ok(json!({
                         "data": [],
+                        "nextCursor": null
+                    })),
+                    codex_codes::protocol::methods::MODEL_LIST => Ok(json!({
+                        "data": [
+                            {
+                                "id": "gpt-5.5",
+                                "model": "gpt-5.5",
+                                "displayName": "GPT-5.5",
+                                "description": "Flagship model",
+                                "hidden": false,
+                                "supportedReasoningEfforts": [
+                                    { "reasoningEffort": "medium", "description": "" },
+                                    { "reasoningEffort": "high", "description": "" }
+                                ],
+                                "defaultReasoningEffort": "medium",
+                                "isDefault": true
+                            },
+                            {
+                                "id": "gpt-5.5-mini",
+                                "model": "gpt-5.5-mini",
+                                "displayName": "GPT-5.5 mini",
+                                "description": "",
+                                "hidden": false,
+                                "supportedReasoningEfforts": [],
+                                "defaultReasoningEffort": "medium",
+                                "isDefault": false
+                            },
+                            {
+                                "id": "internal-secret",
+                                "model": "internal-secret",
+                                "displayName": "Internal",
+                                "description": "",
+                                "hidden": true,
+                                "supportedReasoningEfforts": [],
+                                "defaultReasoningEffort": "medium",
+                                "isDefault": false
+                            }
+                        ],
                         "nextCursor": null
                     })),
                     codex_codes::protocol::methods::MCPSERVER_OAUTH_LOGIN => Ok(json!({
@@ -3250,6 +3366,55 @@ mod tests {
             req.method == THREAD_BACKGROUND_TERMINALS_TERMINATE
                 || req.method == codex_codes::protocol::methods::TURN_INTERRUPT
         }));
+    }
+
+    #[tokio::test]
+    async fn codex_list_models_maps_model_list_rpc_to_descriptors() {
+        let (harness, controller) = spawn_fake_harness();
+
+        assert!(
+            harness.capabilities().model_listing,
+            "Codex harness should advertise model listing"
+        );
+
+        let models = timeout(Duration::from_secs(1), harness.list_models())
+            .await
+            .expect("list_models should complete")
+            .unwrap();
+
+        // The hidden Codex model is filtered out; only picker-visible models remain.
+        assert_eq!(models.len(), 2);
+
+        let flagship = &models[0];
+        assert_eq!(flagship.model, "gpt-5.5");
+        assert_eq!(flagship.display_name.as_deref(), Some("GPT-5.5"));
+        assert!(
+            flagship.supports_reasoning_effort,
+            "gpt-5.5 advertises reasoning efforts"
+        );
+        // model/list carries no provider and no context window.
+        assert_eq!(flagship.provider, "");
+        assert_eq!(
+            flagship.context_window,
+            ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW
+        );
+
+        let mini = &models[1];
+        assert_eq!(mini.model, "gpt-5.5-mini");
+        assert_eq!(mini.display_name.as_deref(), Some("GPT-5.5 mini"));
+        assert!(
+            !mini.supports_reasoning_effort,
+            "mini advertises no reasoning efforts"
+        );
+
+        assert!(
+            controller
+                .requests()
+                .await
+                .iter()
+                .any(|req| req.method == codex_codes::protocol::methods::MODEL_LIST),
+            "list_models should issue a model/list request"
+        );
     }
 
     #[tokio::test]
