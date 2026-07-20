@@ -1,4 +1,4 @@
-//! Phase 3 integration tests (modes, models, approvals, plan dump), replay-driven.
+//! Per-turn control integration tests: modes, model selection, approval policy, and plan dump.
 
 use std::sync::Arc;
 
