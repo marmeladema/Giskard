@@ -2,27 +2,12 @@
 
 [![CI](https://github.com/marmeladema/Giskard/actions/workflows/ci.yml/badge.svg)](https://github.com/marmeladema/Giskard/actions/workflows/ci.yml)
 
-A **local-first, single-user web UI** on top of agentic coding CLIs. Giskard runs on your machine,
-manages projects and durable conversation threads, streams the agent's work to a browser in real
-time, visualizes file diffs and referenced source, and tracks token usage.
+**Giskard is a self-hosted web UI for agentic coding CLIs.** It runs on your own machine — no cloud,
+no account — managing projects and durable conversation threads, streaming the agent's work to your
+browser in real time, and visualizing file diffs, referenced source, and token usage.
 
-The first — and currently the **only** — supported agent harness is OpenAI's **Codex CLI**, spoken
-over its `app-server` JSON-RPC protocol. **A working, authenticated Codex CLI is required today**
-(see [Prerequisites](#prerequisites)); without it, projects can be created but turns fail. The
-harness is a deliberately replaceable component, though — it lives behind a neutral `AgentHarness`
-trait — so other agent CLIs such as **Claude Code** could be added without touching the rest of the
-app. That work just hasn't happened yet. _(Anthropic, if you're reading this: a generous pile of
-Claude credits would move Claude Code support up the roadmap considerably_ 😁_.)_
-
-Built entirely in **Rust** (Axum backend + a hand-authored vanilla HTML/CSS/JS frontend). No
-npm/Node/JS toolchain in the build.
-
-The server is a **single self-contained binary**: the entire web UI (HTML, CSS, JS, favicon) is
-compiled into `giskard-server`, so there are no separate frontend assets to build, bundle, or serve.
-Drop the binary on a machine, point it at a data directory, and run it — no runtime, no Node, no
-static-file hosting, no reverse proxy required. That makes it trivial to deploy and run anywhere: run
-it from a checkout, `cargo install` it, or copy a compiled binary to the target host. (A second small
-binary, `giskard-admin`, handles password and data management — see below.)
+It ships as a **single self-contained Rust binary**: the whole UI is compiled in, with no npm/Node
+and no separate assets to build or serve. Drop it on a machine, point it at a data directory, and run.
 
 > The authoritative design document is [`specs/giskard-specification.md`](specs/giskard-specification.md).
 > This README is the practical setup/usage guide and must be kept in sync with the code (see
@@ -47,6 +32,20 @@ with a slide-in drawer on mobile.
 
 These are generated from the real UI (no host Node/npm needed) with `tests/e2e/screenshots.sh` — see
 [§Development](#development).
+
+---
+
+## Supported harnesses
+
+The agent harness is a replaceable component behind a neutral `AgentHarness` trait:
+
+- **[Codex CLI](https://github.com/openai/codex) — supported, and required today.** Giskard drives
+  Codex over its `app-server` JSON-RPC protocol. A working, authenticated Codex CLI must be installed
+  on the machine (see [Prerequisites](#prerequisites)); without it you can create projects, but turns
+  fail.
+- **Claude Code — not yet supported.** The trait makes it addable without touching the rest of the
+  app; it just hasn't been built yet. _(Anthropic, if you're reading this: a generous pile of Claude
+  credits would move this up the roadmap_ 😁_.)_
 
 ---
 
