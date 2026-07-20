@@ -4077,11 +4077,13 @@ function appendToolProgress(turnId, itemId, text) {
 }
 function appendStream(turnId, text, itemId, deltaType) {
   const key = scopedItemKey(turnId, itemId);
-  if (state.renderedItemIds.has(scopedItemKey(turnId, itemId))) return;
-  let body = state.streamElsByItemId.get(key) || state.streamEl;
+  if (key && state.renderedItemIds.has(key)) return;
+  // Identified items always own distinct rows. The global stream fallback exists only for legacy
+  // deltas without an item identity; using it for a new key can merge interleaved items.
+  let body = key ? state.streamElsByItemId.get(key) : state.streamEl;
   if (!body) {
-    const kind = state.itemKindsByItemId.get(key);
-    if (isTaskPayloadKind(kind) || deltaType==="command_output") {
+    const kind = key ? state.itemKindsByItemId.get(key) : null;
+    if (key && (isTaskPayloadKind(kind) || deltaType==="command_output")) {
       const taskKind = kind==="tool_call" ? "tool_call" : "command_execution";
       body = taskBubble(key, taskKind, classForStream(taskKind, deltaType), roleForStream(taskKind, deltaType));
       if (taskKind==="command_execution") {
@@ -4096,12 +4098,12 @@ function appendStream(turnId, text, itemId, deltaType) {
     } else {
       body = bubble(classForStream(kind, deltaType), roleForStream(kind, deltaType));
     }
-    state.streamElsByItemId.set(key, body);
+    if (key) state.streamElsByItemId.set(key, body);
   }
-  registerRenderedItemBody(body, { id:itemId }, turnId);
+  if (key) registerRenderedItemBody(body, { id:itemId }, turnId);
   state.streamEl = body;
-  state.streamItemId = key;
-  const kind = state.itemKindsByItemId.get(key);
+  state.streamItemId = key || null;
+  const kind = key ? state.itemKindsByItemId.get(key) : null;
   if (deltaType==="command_output" || kind==="command_execution") {
     let out = body.querySelector("pre.out");
     if (!out) {
@@ -4216,8 +4218,9 @@ function addItem(item, turnId, fromHistory) {
     }
     if (state.pendingUserEl && p.text===state.pendingUserText) {
       state.pendingUserEl.classList.remove("pending");
-      state.pendingUserEl.querySelector(".body").textContent = p.text;
-      registerRenderedItemBody(state.pendingUserEl.querySelector(".body"), item, turnId);
+      const pendingBody = state.pendingUserEl.querySelector(".body");
+      renderItemBodyForItem(pendingBody, item, turnId);
+      registerRenderedItemBody(pendingBody, item, turnId);
       state.pendingUserEl = null;
       state.pendingUserText = null;
       markRenderedItem(item, turnId);
@@ -4492,12 +4495,15 @@ function renderMarkdown(el, text) {
   text = String(text || "");
   el.classList.remove("md");
   el.textContent = text;
-  if (!text.trim() || !state.projectId) return;
-
   const projectId = state.projectId;
-  const cacheKey = projectId + "\n" + text;
+  const threadId = state.threadId;
+  const cacheKey = (projectId || "") + "\n" + text;
+  el._markdownRenderKey = cacheKey;
+  if (!text.trim() || !projectId) return;
+
   const apply = (html) => {
-    if (!el.isConnected || projectId !== state.projectId) return;
+    if (el._markdownRenderKey !== cacheKey) return;
+    if (projectId !== state.projectId || threadId !== state.threadId) return;
     if (typeof html !== "string") return;
     el.innerHTML = html;
     el.classList.add("md");

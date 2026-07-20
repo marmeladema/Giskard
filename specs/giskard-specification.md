@@ -8,7 +8,16 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.51
+**Version:** 1.52
+
+**Changelog (1.51 → 1.52), reliable Markdown finalization:**
+- **M4:** completed agent, reasoning, and user messages use the Markdown renderer whether their
+  rows are live, optimistic, or being built in a detached history/resync container. Detachment
+  alone must not discard a valid render result.
+- **M5:** asynchronous Markdown results are scoped to the active project/thread and the latest
+  render request for that body, so stale responses cannot overwrite newer item content.
+- **E6:** identified streamed items retain separate turn-scoped rows even when their deltas are
+  interleaved; the legacy unscoped stream fallback is only for deltas without an item identity.
 
 **Changelog (1.50 → 1.51), item identity and upsert invariants:**
 - **B2/E6:** `ItemId` is the authoritative item lifecycle identity. Native item IDs are secondary
@@ -547,6 +556,10 @@
 - **M3:** The renderer is the trust boundary. It escapes all text, never passes through raw HTML in
   the source (it is escaped to inert text), and only emits `href`s with an `http`/`https`/`mailto`
   scheme; images are not fetched (alt text is shown). Output is safe to inject as trusted HTML.
+- **M4/M5:** Finalized message rows invoke the same renderer for live, optimistic, history, and
+  resync paths. A row may be rendered while detached before insertion into the transcript. Each
+  asynchronous result applies only if its project/thread scope and per-body request identity still
+  match, preventing both dropped detached renders and stale-response overwrites.
 
 **Changelog (1.11 → 1.12), live-turn interruption and running commands:**
 - **I1:** The browser exposes a Stop control while a turn is live and sends
@@ -2527,7 +2540,8 @@ decisions for a removed request id remain protocol errors.
 **Client rendering invariant (E6):** `ItemDelta { item_id }` and the later `ItemCompleted`
 for the same `Item.id` are one lifecycle. The UI must finalize or replace the streamed body in
 place when the completed item arrives. Scoped Giskard `(TurnId, ItemId)` is authoritative for
-rendered-item identity. Scoped `harness_item_id` is a secondary consistency and replay-correlation
+rendered-item identity. Deltas for distinct identified items must retain distinct rows even when
+they are interleaved. Scoped `harness_item_id` is a secondary consistency and replay-correlation
 key; it must never re-key or merge rows with different Giskard identities. Consecutive file-change
 items may share one visual row only within the same turn. The row retains one contribution per
 scoped item identity, so updating one item replaces only its contribution and preserves the other
