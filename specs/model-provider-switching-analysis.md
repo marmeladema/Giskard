@@ -2,7 +2,7 @@
 
 This note documents the provider-switching problem seen while using Giskard with Codex
 app-server and LiteLLM-backed models, plus the Codex source analysis performed on
-2026-07-12 against `/home/elie/Sources/codex`.
+2026-07-12 against `/home/user/Sources/codex`.
 
 It is an analysis note, not an authoritative product spec. Once the implementation direction is
 chosen, fold the final contract into `specs/giskard-specification.md`.
@@ -29,13 +29,13 @@ wrong provider path, yielding provider-side `model_not_found` errors.
 From the app-server v2 protocol types in the Codex checkout:
 
 - `ThreadStartParams` includes `modelProvider`:
-  `/home/elie/Sources/codex/codex-rs/app-server-protocol/src/protocol/v2/thread.rs:56`
+  `/home/user/Sources/codex/codex-rs/app-server-protocol/src/protocol/v2/thread.rs:56`
   and `:60`.
 - `ThreadResumeParams` includes `modelProvider`:
-  `/home/elie/Sources/codex/codex-rs/app-server-protocol/src/protocol/v2/thread.rs:324`
+  `/home/user/Sources/codex/codex-rs/app-server-protocol/src/protocol/v2/thread.rs:324`
   and `:350`.
 - `TurnStartParams` does not include `modelProvider`:
-  `/home/elie/Sources/codex/codex-rs/app-server-protocol/src/protocol/v2/turn.rs:68`.
+  `/home/user/Sources/codex/codex-rs/app-server-protocol/src/protocol/v2/turn.rs:68`.
 
 Giskard's current Codex adapter already sends `modelProvider` on `thread/resume`:
 
@@ -48,11 +48,11 @@ per-turn override.
 
 The relevant Codex source is under:
 
-- `/home/elie/Sources/codex/codex-rs/app-server/src/request_processors/thread_processor.rs`
-- `/home/elie/Sources/codex/codex-rs/app-server/src/request_processors/thread_lifecycle.rs`
-- `/home/elie/Sources/codex/codex-rs/app-server/src/request_processors/thread_processor_tests.rs`
-- `/home/elie/Sources/codex/codex-rs/core/src/thread_manager.rs`
-- `/home/elie/Sources/codex/codex-rs/app-server/README.md`
+- `/home/user/Sources/codex/codex-rs/app-server/src/request_processors/thread_processor.rs`
+- `/home/user/Sources/codex/codex-rs/app-server/src/request_processors/thread_lifecycle.rs`
+- `/home/user/Sources/codex/codex-rs/app-server/src/request_processors/thread_processor_tests.rs`
+- `/home/user/Sources/codex/codex-rs/core/src/thread_manager.rs`
+- `/home/user/Sources/codex/codex-rs/app-server/README.md`
 
 ### Cold Resume Can Apply Provider Overrides
 

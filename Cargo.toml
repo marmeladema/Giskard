@@ -7,7 +7,6 @@ members = [
     "crates/giskard-harness-replay",
     "crates/giskard-persist",
     "crates/giskard-server",
-    "crates/giskard-ui",
     "crates/giskard-proto",
 ]
 default-members = [
@@ -31,7 +30,6 @@ giskard-harness-replay = { path = "crates/giskard-harness-replay" }
 giskard-persist = { path = "crates/giskard-persist" }
 giskard-proto = { path = "crates/giskard-proto" }
 giskard-server = { path = "crates/giskard-server" }
-giskard-ui = { path = "crates/giskard-ui" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -574,11 +574,11 @@ mod tests {
     fn approval_kind_path_becomes_string() {
         let core = ApprovalKind::CommandExecution {
             command: "ls".into(),
-            cwd: PathBuf::from("/home/elie/dev"),
+            cwd: PathBuf::from("/home/user/dev"),
         };
         let wire: WireApprovalKind = core.into();
         let json = serde_json::to_value(&wire).unwrap();
-        assert_eq!(json["cwd"], "/home/elie/dev");
+        assert_eq!(json["cwd"], "/home/user/dev");
         assert_eq!(json["kind"], "command_execution");
     }
 
@@ -597,7 +597,7 @@ mod tests {
                 },
                 ApprovalMetadata::Path {
                     label: "Write".into(),
-                    path: PathBuf::from("/home/elie/dev/src/lib.rs"),
+                    path: PathBuf::from("/home/user/dev/src/lib.rs"),
                     source_link: true,
                 },
                 ApprovalMetadata::Host {
@@ -609,7 +609,7 @@ mod tests {
                 },
                 ApprovalMetadata::Path {
                     label: "Grant root".into(),
-                    path: PathBuf::from("/home/elie/dev"),
+                    path: PathBuf::from("/home/user/dev"),
                     source_link: false,
                 },
             ],
@@ -621,7 +621,7 @@ mod tests {
         assert_eq!(json["metadata"][0]["label"], "Environment");
         assert_eq!(json["metadata"][0]["value"], "env_1");
         assert_eq!(json["metadata"][1]["kind"], "path");
-        assert_eq!(json["metadata"][1]["path"], "/home/elie/dev/src/lib.rs");
+        assert_eq!(json["metadata"][1]["path"], "/home/user/dev/src/lib.rs");
         assert_eq!(json["metadata"][1]["source_link"], true);
         assert_eq!(json["metadata"][2]["kind"], "host");
         assert_eq!(json["metadata"][2]["host"], "api.example.com");
@@ -629,7 +629,7 @@ mod tests {
         assert_eq!(json["metadata"][2]["port"], 443);
         assert_eq!(json["metadata"][2]["target"], "https://api.example.com/v1");
         assert_eq!(json["metadata"][3]["kind"], "path");
-        assert_eq!(json["metadata"][3]["path"], "/home/elie/dev");
+        assert_eq!(json["metadata"][3]["path"], "/home/user/dev");
         assert!(
             !json["metadata"][3]
                 .as_object()
