@@ -2140,14 +2140,104 @@ function reconcileInFlightTurn() {
     ? String(state.currentRenderTurnId)
     : null;
   if (liveId) removeTurnRows(liveId);
-  // Drop streaming bookkeeping tied to the wiped rows so the live snapshot rebuilds cleanly; the
-  // snapshot re-activates the turn if it is still running.
+  // The in-flight turn's rows are gone. Rebuild render bookkeeping from the rows that survived
+  // (the DOM is the source of truth) so the live snapshot creates fresh rows for the removed turn
+  // instead of deduping against stale maps or updating detached bodies.
+  rebuildRenderTrackingFromDom();
+  state.pendingUserEl = null;
+  state.pendingUserText = null;
   state.currentRenderTurnId = null;
   setTurnActive(false);
   state.streamEl = null;
   state.streamItemId = null;
-  state.streamElsByItemId = new Map();
   breakTaskGroup();
+}
+function rebuildRenderTrackingFromDom() {
+  const t = $("transcript");
+  const attached = (el) => !!(el && t && t.contains(el));
+  const renderedItems = new Set();
+  const renderedHarnessItems = new Set();
+  const renderedBodies = new Map();
+
+  if (t) {
+    for (const row of t.querySelectorAll(".msg")) {
+      const turn = row.dataset.turn || "";
+      const body = row.querySelector(".body");
+      for (const itemId of identityTokens(row.dataset.item)) {
+        const key = scopedItemKey(turn, itemId);
+        if (!key) continue;
+        renderedItems.add(key);
+        if (body) renderedBodies.set(key, body);
+      }
+      for (const harnessItemId of identityTokens(row.dataset.harnessItem)) {
+        const key = scopedHarnessKey(turn, harnessItemId);
+        if (!key) continue;
+        renderedHarnessItems.add(key);
+        if (body) renderedBodies.set(key, body);
+      }
+    }
+  }
+
+  state.renderedItemIds = renderedItems;
+  state.renderedHarnessItemIds = renderedHarnessItems;
+  state.renderedItemBodyByKey = renderedBodies;
+  state.streamElsByItemId = new Map();
+  state.itemKindsByItemId = new Map();
+
+  for (const m of [state.commandBodyElsByItemId, state.commandMsgElsByItemId, state.toolBodyElsByItemId]) {
+    for (const [key, el] of Array.from(m)) if (!attached(el)) m.delete(key);
+  }
+
+  const liveTaskIds = new Set(state.commandMsgElsByItemId.keys());
+  for (const m of [
+    state.commandPayloadsByItemId,
+    state.endedCommandsByItemId,
+    state.runningCommands,
+    state.toolPayloadsByItemId,
+    state.taskGroupsByItemId
+  ]) {
+    for (const key of Array.from(m.keys())) if (!liveTaskIds.has(key)) m.delete(key);
+  }
+  pruneKeySet(state.commandStopRequestedByItemId, liveTaskIds);
+  pruneKeySet(state.expandedCommandOutputs, liveTaskIds);
+  pruneKeySet(state.manuallyToggledCommandOutputs, liveTaskIds);
+  pruneKeySet(state.expandedToolOutputs, liveTaskIds);
+  pruneKeySet(state.manuallyToggledToolOutputs, liveTaskIds);
+
+  for (const [groupId, group] of Array.from(state.taskGroupsById)) {
+    if (!attached(group && group.el)) {
+      state.taskGroupsById.delete(groupId);
+      state.expandedTaskGroups.delete(groupId);
+      state.manuallyToggledTaskGroups.delete(groupId);
+      state.expandedTaskDetails.delete(groupId);
+      continue;
+    }
+    group.itemOrder = group.itemOrder.filter(id => liveTaskIds.has(id));
+    for (const key of Array.from(group.items.keys())) {
+      if (!liveTaskIds.has(key)) group.items.delete(key);
+    }
+    const detailIds = expandedTaskDetailIds(groupId);
+    pruneKeySet(detailIds, liveTaskIds);
+    syncTaskGroupState(group);
+  }
+  if (state.selectedCommandId && !liveTaskIds.has(state.selectedCommandId)) {
+    state.selectedCommandId = null;
+  }
+
+  for (const [id, entry] of Array.from(state.pendingApprovals)) {
+    if (!attached(entry && entry.msg)) state.pendingApprovals.delete(id);
+  }
+  for (const [id, entry] of Array.from(state.pendingServerRequests)) {
+    if (!attached(entry && entry.msg)) state.pendingServerRequests.delete(id);
+  }
+  const approvalKeys = new Set();
+  if (t) {
+    for (const row of t.querySelectorAll("[data-approval-state-key]")) {
+      if (row.dataset.approvalStateKey) approvalKeys.add(row.dataset.approvalStateKey);
+    }
+  }
+  state.renderedApprovalStateKeys = approvalKeys;
+  renderRunningCommands();
 }
 function removeTurnRows(turnId) {
   const t = $("transcript");
@@ -3113,13 +3203,7 @@ function taskBubble(itemId, kind, cls, role) {
   const status = document.createElement("span");
   status.className = "task-group-item-status";
   row.append(symbol, title, status);
-  row.onclick = (e) => { e.stopPropagation(); selectTaskGroupItem(group.id, key); };
-  row.onkeydown = (e) => {
-    if (e.key === "Enter" || e.key === " ") {
-      e.preventDefault();
-      selectTaskGroupItem(group.id, key);
-    }
-  };
+  wireTaskGroupItemRow(row, group.id, key);
 
   const msg = document.createElement("div");
   msg.className = "msg " + cls;
@@ -3141,6 +3225,16 @@ function taskBubble(itemId, kind, cls, role) {
   group.list.append(entry);
   syncTaskGroupItem(key);
   return body;
+}
+function wireTaskGroupItemRow(row, groupId, itemId) {
+  const key = idKey(itemId);
+  row.onclick = (e) => { e.stopPropagation(); selectTaskGroupItem(groupId, key); };
+  row.onkeydown = (e) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      selectTaskGroupItem(groupId, key);
+    }
+  };
 }
 function selectTaskGroupItem(groupId, itemId) {
   const key = idKey(itemId);
@@ -3298,6 +3392,7 @@ function startRunningCommand(item, turnId) {
   state.streamElsByItemId.set(key, body);
   state.commandBodyElsByItemId.set(key, body);
   state.commandMsgElsByItemId.set(key, body.parentElement);
+  registerRenderedItemBody(body, item, turnId);
   renderCommandBody(body, cmd);
   renderRunningCommands();
 }
@@ -3323,10 +3418,10 @@ function taskTitleText(cmd) {
   if (cmd.kind === "tool") return (cmd.server ? cmd.server + ":" : "") + (cmd.command || "tool");
   return "$ " + (cmd.command || "(command)");
 }
-function commandFromItem(item, p, existing) {
+function commandFromItem(item, p, turnId, key, existing) {
   return commandFromParts({
-    id:existing ? existing.id : idKey(item && item.id),
-    turnId:existing ? existing.turnId : "",
+    id:existing ? existing.id : key,
+    turnId:existing ? existing.turnId : idKey(turnId),
     harnessItemId:(item && item.harness_item_id) || (existing && existing.harnessItemId) || "",
     command:p.command || "",
     cwd:p.cwd || "",
@@ -3612,26 +3707,12 @@ function detachRunningCommands() {
   }
   renderRunningCommands();
 }
-function finishRunningCommand(item) {
-  // finishRunningCommand is called from addItem/finalizeStreamedItem after the turn id has
-  // been stamped on the row; recover the turn from the rendered command body so repeated
-  // item ids across turns still resolve to the right command entry.
-  let turnId = state.currentRenderTurnId;
-  if (!turnId && item && item.id) {
-    const bare = idKey(item.id);
-    for (const [k, v] of state.commandBodyElsByItemId) {
-      if (k.endsWith(":" + bare) || k === bare) {
-        const idx = k.indexOf(":");
-        if (idx !== -1) turnId = k.slice(0, idx);
-        break;
-      }
-    }
-  }
+function finishRunningCommand(item, turnId) {
   const key = scopedItemKey(turnId, item && item.id);
   if (!key) return;
   const p = item && item.payload;
   if (p && p.kind==="command_execution" && commandIsRunningStatus(p.status)) {
-    const cmd = commandFromItem(item, p, state.runningCommands.get(key));
+    const cmd = commandFromItem(item, p, turnId, key, state.runningCommands.get(key));
     state.runningCommands.set(key, cmd);
     state.endedCommandsByItemId.delete(key);
     let body = commandBodyFor(key);
@@ -3651,6 +3732,7 @@ function renderRunningCommandSnapshot(commands) {
   for (const info of commands) {
     const key = scopedItemKey(info.turn_id, info.item_id);
     if (!key) continue;
+    const snapshotItem = { id:info.item_id, harness_item_id:info.harness_item_id || "" };
     seen.add(key);
     const existing = state.runningCommands.get(key);
     const cmd = commandFromParts({
@@ -3690,12 +3772,14 @@ function renderRunningCommandSnapshot(commands) {
           error:null
         });
       }
+      registerRenderedItemBody(toolBody, snapshotItem, info.turn_id);
       state.commandMsgElsByItemId.set(key, toolBody.parentElement);
     } else {
       let body = commandBodyFor(key);
       if (!body) body = taskBubble(key, "command_execution", "cmd running-command", "command");
       state.commandBodyElsByItemId.set(key, body);
       state.commandMsgElsByItemId.set(key, body.parentElement);
+      registerRenderedItemBody(body, snapshotItem, info.turn_id);
       renderCommandBody(body, cmd);
     }
   }
@@ -3941,6 +4025,7 @@ function startToolCall(item, turnId) {
   state.commandMsgElsByItemId.set(key, body.parentElement);
   body.parentElement.dataset.toolItemId = key;
   body.parentElement.dataset.toolStartedAtMs = String(normalizeTimestampMs(tool.started_at_ms, Date.now()));
+  registerRenderedItemBody(body, item, turnId);
   renderItemBody(body, {
     kind:"tool_call",
     name:tool.name || "tool",
@@ -3970,6 +4055,7 @@ function appendToolProgress(turnId, itemId, text) {
       error:null
     });
   }
+  registerRenderedItemBody(body, { id:itemId }, turnId);
   const chunk = String(text || "");
   const payload = state.toolPayloadsByItemId.get(key);
   if (payload) {
@@ -4012,6 +4098,7 @@ function appendStream(turnId, text, itemId, deltaType) {
     }
     state.streamElsByItemId.set(key, body);
   }
+  registerRenderedItemBody(body, { id:itemId }, turnId);
   state.streamEl = body;
   state.streamItemId = key;
   const kind = state.itemKindsByItemId.get(key);
@@ -4034,6 +4121,7 @@ function finalizeStreamedItem(item, turnId) {
   const body = state.streamElsByItemId.get(key) ||
     state.commandBodyElsByItemId.get(key) ||
     state.toolBodyElsByItemId.get(key) ||
+    renderedItemBody(item, turnId) ||
     (state.streamItemId===key ? state.streamEl : null);
   if (!hasVisiblePayload(item.payload)) {
     if (body && !body.textContent.trim()) {
@@ -4057,9 +4145,9 @@ function finalizeStreamedItem(item, turnId) {
     state.commandMsgElsByItemId.set(key, body.parentElement);
     body.parentElement.dataset.toolItemId = key;
   }
-  state.renderedItemBodyByKey.set(key, body);
-  renderItemBody(body, item.payload);
-  if (item.payload.kind==="command_execution") finishRunningCommand(item);
+  renderItemBodyForItem(body, item, turnId);
+  registerRenderedItemBody(body, item, turnId);
+  if (item.payload.kind==="command_execution") finishRunningCommand(item, turnId);
   markRenderedItem(item, turnId);
   if (state.streamEl === body) {
     state.streamEl = null;
@@ -4079,36 +4167,74 @@ function addItem(item, turnId, fromHistory) {
     return;
   }
   const key = scopedItemKey(turnId, item && item.id);
+  const visible = hasVisiblePayload(p);
   if (isRenderedItem(item, turnId)) {
     // Upsert: a repeated item id within the same turn refreshes the existing row.
-    const existing = state.renderedItemBodyByKey.get(key);
-    if (existing) {
-      renderItemBody(existing, p);
-      if (p.kind==="command_execution") finishRunningCommand(item);
+    const existing = renderedItemBody(item, turnId);
+    const harnessExisting = renderedHarnessItemBody(item, turnId);
+    if (existing && harnessExisting && existing!==harnessExisting) {
+      console.error("Giskard item identity invariant violated; refusing conflicting item upsert.", {
+        turnId:idKey(turnId),
+        itemId:idKey(item && item.id),
+        harnessItemId:idKey(item && item.harness_item_id)
+      });
+      return;
     }
-    return;
-  }
-  if (!hasVisiblePayload(p)) {
+    if (!existing && harnessExisting) {
+      console.error("Giskard item identity invariant violated; refusing harness-only item upsert.", {
+        turnId:idKey(turnId),
+        itemId:idKey(item && item.id),
+        harnessItemId:idKey(item && item.harness_item_id)
+      });
+      return;
+    }
+    if (existing) {
+      if (!visible) {
+        markRenderedItem(item, turnId);
+        return;
+      }
+      registerRenderedItemBody(existing, item, turnId);
+      renderItemBodyForItem(existing, item, turnId);
+      if (p.kind==="command_execution") finishRunningCommand(item, turnId);
+      markRenderedItem(item, turnId);
+      return;
+    }
+    if (!visible) {
+      markRenderedItem(item, turnId);
+      return;
+    }
+    // A previous invisible item can mark this identity rendered without creating a body. Let the
+    // now-visible upsert fall through and create its first transcript row.
+  } else if (!visible) {
     markRenderedItem(item, turnId);
     return;
   }
   if (p.kind==="user_message") {
+    if (state.pendingUserEl && !state.pendingUserEl.isConnected) {
+      state.pendingUserEl = null;
+      state.pendingUserText = null;
+    }
     if (state.pendingUserEl && p.text===state.pendingUserText) {
       state.pendingUserEl.classList.remove("pending");
       state.pendingUserEl.querySelector(".body").textContent = p.text;
+      registerRenderedItemBody(state.pendingUserEl.querySelector(".body"), item, turnId);
       state.pendingUserEl = null;
       state.pendingUserText = null;
       markRenderedItem(item, turnId);
       return;
     }
     const body = bubble("user","you");
-    state.renderedItemBodyByKey.set(key, body);
     renderItemBody(body, p);
+    registerRenderedItemBody(body, item, turnId);
   }
   else {
-    if (p.kind==="file_change" && mergeFileChangeWithPrevious(p)) {
-      markRenderedItem(item, turnId);
-      return;
+    if (p.kind==="file_change") {
+      const mergedRow = mergeFileChangeWithPrevious(p, item, turnId);
+      if (mergedRow) {
+        registerRenderedItemBody(mergedRow.querySelector(".body"), item, turnId);
+        markRenderedItem(item, turnId);
+        return;
+      }
     }
     const body = isTaskPayloadKind(p.kind)
       ? taskBubble(key, p.kind, classForPayload(p), roleForPayload(p))
@@ -4123,10 +4249,10 @@ function addItem(item, turnId, fromHistory) {
       state.commandMsgElsByItemId.set(key, body.parentElement);
       body.parentElement.dataset.toolItemId = key;
     }
-    state.renderedItemBodyByKey.set(key, body);
-    renderItemBody(body, p);
+    renderItemBodyForItem(body, item, turnId);
+    registerRenderedItemBody(body, item, turnId);
   }
-  if (p.kind==="command_execution") finishRunningCommand(item);
+  if (p.kind==="command_execution") finishRunningCommand(item, turnId);
   markRenderedItem(item, turnId);
 }
 function resetRenderState() {
@@ -4168,31 +4294,69 @@ function idKey(id) {
   return id === undefined || id === null ? "" : String(id);
 }
 function scopedItemKey(turnId, itemId) {
-  return `${idKey(turnId)}:${idKey(itemId)}`;
+  const turn = idKey(turnId);
+  const item = idKey(itemId);
+  return turn && item ? `${turn}:${item}` : "";
 }
 function scopedHarnessKey(turnId, harnessItemId) {
-  return `${idKey(turnId)}:${idKey(harnessItemId)}`;
-}
-
-function isRenderedItem(item, turnId) {
-  const itemId = idKey(item && item.id);
-  const harnessItemId = item && item.harness_item_id;
   const turn = idKey(turnId);
-  if (!turn) return false;
-  return (itemId && state.renderedItemIds.has(scopedItemKey(turn, itemId))) ||
-    (harnessItemId && state.renderedHarnessItemIds.has(scopedHarnessKey(turn, harnessItemId)));
+  const harness = idKey(harnessItemId);
+  return turn && harness ? `${turn}:${harness}` : "";
+}
+function identityTokens(value) {
+  return String(value || "").split(" ").filter(Boolean);
+}
+function addIdentityToken(existing, token) {
+  const value = idKey(token);
+  if (!value) return existing || "";
+  const tokens = new Set(identityTokens(existing));
+  tokens.add(value);
+  return Array.from(tokens).join(" ");
+}
+function pruneKeySet(set, allowed) {
+  for (const key of Array.from(set)) if (!allowed.has(key)) set.delete(key);
+}
+function itemIdentityKeys(item, turnId) {
+  return {
+    itemKey: scopedItemKey(turnId, item && item.id),
+    harnessKey: scopedHarnessKey(turnId, item && item.harness_item_id)
+  };
+}
+function renderedItemBody(item, turnId) {
+  const keys = itemIdentityKeys(item, turnId);
+  return (keys.itemKey && state.renderedItemBodyByKey.get(keys.itemKey)) || null;
+}
+function renderedHarnessItemBody(item, turnId) {
+  const keys = itemIdentityKeys(item, turnId);
+  return (keys.harnessKey && state.renderedItemBodyByKey.get(keys.harnessKey)) || null;
+}
+function registerRenderedItemBody(body, item, turnId) {
+  if (!body || !item) return;
+  const row = body.parentElement;
+  if (!row) return;
+  if (turnId) row.dataset.turn = idKey(turnId);
+  const keys = itemIdentityKeys(item, turnId);
+  if (item && item.id) row.dataset.item = addIdentityToken(row.dataset.item, item.id);
+  if (item && item.harness_item_id) {
+    row.dataset.harnessItem = addIdentityToken(row.dataset.harnessItem, item.harness_item_id);
+  }
+  if (keys.itemKey) state.renderedItemBodyByKey.set(keys.itemKey, body);
+  if (keys.harnessKey) state.renderedItemBodyByKey.set(keys.harnessKey, body);
+}
+function isRenderedItem(item, turnId) {
+  const keys = itemIdentityKeys(item, turnId);
+  return (keys.itemKey && state.renderedItemIds.has(keys.itemKey)) ||
+    (keys.harnessKey && state.renderedHarnessItemIds.has(keys.harnessKey));
 }
 function markRenderedItem(item, turnId) {
-  const itemId = idKey(item && item.id);
-  const turn = idKey(turnId);
-  if (itemId && turn) {
-    state.renderedItemIds.add(scopedItemKey(turn, itemId));
-    const key = scopedItemKey(turn, itemId);
-    state.streamElsByItemId.delete(key);
-    state.itemKindsByItemId.delete(key);
+  const keys = itemIdentityKeys(item, turnId);
+  if (keys.itemKey) {
+    state.renderedItemIds.add(keys.itemKey);
+    state.streamElsByItemId.delete(keys.itemKey);
+    state.itemKindsByItemId.delete(keys.itemKey);
   }
-  if (item && item.harness_item_id && turn) {
-    state.renderedHarnessItemIds.add(scopedHarnessKey(turn, item.harness_item_id));
+  if (keys.harnessKey) {
+    state.renderedHarnessItemIds.add(keys.harnessKey);
   }
 }
 function hasVisiblePayload(p) {
@@ -4271,6 +4435,14 @@ function renderItemBody(body, p) {
   }
   const taskItemId = msg.dataset.commandItemId || msg.dataset.toolItemId || "";
   if (taskItemId) syncTaskGroupItem(taskItemId);
+}
+function renderItemBodyForItem(body, item, turnId) {
+  const p = item && item.payload ? item.payload : item;
+  if (p && p.kind==="file_change") {
+    renderFileChangeContribution(body, p, item, turnId);
+    return;
+  }
+  renderItemBody(body, p);
 }
 function normalizeCommandDuration(durationMs, startedAtMs) {
   const provided = Number(durationMs);
@@ -4516,7 +4688,27 @@ function mergeFileChangePayload(existing, next) {
     changes:current.changes.concat(incoming.changes)
   };
 }
-function mergeFileChangeWithPrevious(p) {
+function fileChangeContributionKey(item, turnId) {
+  const keys = itemIdentityKeys(item, turnId);
+  return keys.itemKey;
+}
+function renderFileChangeContribution(body, p, item, turnId) {
+  const row = body && body.parentElement;
+  const key = fileChangeContributionKey(item, turnId);
+  if (!row || !key) {
+    renderFileChange(body, p);
+    return;
+  }
+  if (!row._fileChangePayloadsByItemKey) row._fileChangePayloadsByItemKey = new Map();
+  row._fileChangePayloadsByItemKey.set(key, normalizedFileChangePayload(p));
+  const contributions = Array.from(row._fileChangePayloadsByItemKey.values());
+  const merged = contributions.reduce((current, next) => (
+    current ? mergeFileChangePayload(current, next) : next
+  ), null);
+  renderFileChange(body, merged || p);
+}
+function mergeFileChangeWithPrevious(p, item, turnId) {
+  if (!fileChangeContributionKey(item, turnId)) return null;
   breakTaskGroup();
   const target = renderTarget();
   const prev = target && target.lastElementChild;
@@ -4524,14 +4716,14 @@ function mergeFileChangeWithPrevious(p) {
     !prev ||
     !prev.classList ||
     !prev.classList.contains("file") ||
+    prev.dataset.turn!==idKey(turnId) ||
     !prev._fileChangePayload
-  ) return false;
+  ) return null;
   const body = prev.querySelector(".body");
-  if (!body) return false;
-  const merged = mergeFileChangePayload(prev._fileChangePayload, p);
-  renderItemBody(body, merged);
+  if (!body) return null;
+  renderFileChangeContribution(body, p, item, turnId);
   keepTranscriptRowAnchored(prev);
-  return true;
+  return prev;
 }
 function renderFileChange(body, p) {
   const normalized = normalizedFileChangePayload(p);

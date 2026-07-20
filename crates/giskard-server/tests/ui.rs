@@ -622,10 +622,12 @@ async fn index_page_is_served_and_public() {
         "the task group header expands all details and collapses them when all are open"
     );
     assert!(
-        body.contains(
-            "row.onclick = (e) => { e.stopPropagation(); selectTaskGroupItem(group.id, key); }"
-        ) && !body.contains("selectCommand(key);"),
-        "in-thread task summary clicks toggle inline details without scrolling the transcript"
+        body.contains("wireTaskGroupItemRow(row, group.id, key)")
+            && body.contains("function wireTaskGroupItemRow(row, groupId, itemId)")
+            && body.contains("selectTaskGroupItem(groupId, key);")
+            && !body.contains("selectCommand(key);"),
+        "in-thread task summary clicks toggle inline details without scrolling the transcript, \
+         including after item-id migration"
     );
     assert!(
         body.contains(".task-group-body { white-space:normal; font-size:12px; }")
@@ -1621,6 +1623,120 @@ fn browser_stamps_transcript_rows_with_their_turn_id() {
 }
 
 #[test]
+fn browser_tracks_rendered_items_by_scoped_dom_identity() {
+    let body = app_js();
+
+    let scoped_item = between(
+        body,
+        "function scopedItemKey(turnId, itemId) {",
+        "function scopedHarnessKey(turnId, harnessItemId) {",
+    );
+    assert!(scoped_item.contains("return turn && item ? `${turn}:${item}` : \"\";"));
+    let scoped_harness = between(
+        body,
+        "function scopedHarnessKey(turnId, harnessItemId) {",
+        "function identityTokens(value) {",
+    );
+    assert!(scoped_harness.contains("return turn && harness ? `${turn}:${harness}` : \"\";"));
+
+    let register = between(
+        body,
+        "function registerRenderedItemBody(body, item, turnId) {",
+        "function isRenderedItem(item, turnId) {",
+    );
+    for expected in [
+        "if (turnId) row.dataset.turn = idKey(turnId);",
+        "row.dataset.item = addIdentityToken(row.dataset.item, item.id);",
+        "row.dataset.harnessItem = addIdentityToken(row.dataset.harnessItem, item.harness_item_id);",
+        "if (keys.itemKey) state.renderedItemBodyByKey.set(keys.itemKey, body);",
+        "if (keys.harnessKey) state.renderedItemBodyByKey.set(keys.harnessKey, body);",
+    ] {
+        assert!(
+            register.contains(expected),
+            "rendered item body registration is missing `{expected}`"
+        );
+    }
+
+    let add_item = between(
+        body,
+        "function addItem(item, turnId, fromHistory) {",
+        "function resetRenderState()",
+    );
+    for expected in [
+        "const visible = hasVisiblePayload(p);",
+        "const existing = renderedItemBody(item, turnId);",
+        "const harnessExisting = renderedHarnessItemBody(item, turnId);",
+        "if (existing && harnessExisting && existing!==harnessExisting) {",
+        "Giskard item identity invariant violated; refusing conflicting item upsert.",
+        "if (!existing && harnessExisting) {",
+        "Giskard item identity invariant violated; refusing harness-only item upsert.",
+        "if (!visible) {\n        markRenderedItem(item, turnId);\n        return;\n      }",
+        "registerRenderedItemBody(existing, item, turnId);",
+        "registerRenderedItemBody(state.pendingUserEl.querySelector(\".body\"), item, turnId);",
+        "registerRenderedItemBody(body, item, turnId);",
+        "registerRenderedItemBody(mergedRow.querySelector(\".body\"), item, turnId);",
+    ] {
+        assert!(
+            add_item.contains(expected),
+            "addItem must register scoped DOM identity: `{expected}`"
+        );
+    }
+    assert_order(
+        add_item,
+        "registerRenderedItemBody(existing, item, turnId);",
+        "renderItemBodyForItem(existing, item, turnId);",
+    );
+    assert!(
+        add_item.contains("now-visible upsert fall through")
+            && add_item.contains("if (state.pendingUserEl && !state.pendingUserEl.isConnected)"),
+        "visible upserts without a body render normally, and detached pending rows are ignored"
+    );
+    assert!(
+        !add_item.contains("state.renderedItemBodyByKey.set(key, body)"),
+        "new and upserted rows must not rely on item-id-only body lookup"
+    );
+
+    assert!(!body.contains("function moveTaskStateKey("));
+    assert!(!body.contains("function moveTaskGroupItem("));
+    assert!(!body.contains("function taskKeyForBody("));
+
+    let merge = between(
+        body,
+        "function fileChangeContributionKey(item, turnId) {",
+        "function renderFileChange(body, p)",
+    );
+    for expected in [
+        "return keys.itemKey;",
+        "if (!row._fileChangePayloadsByItemKey) row._fileChangePayloadsByItemKey = new Map();",
+        "row._fileChangePayloadsByItemKey.set(key, normalizedFileChangePayload(p));",
+        "const contributions = Array.from(row._fileChangePayloadsByItemKey.values());",
+        "if (!fileChangeContributionKey(item, turnId)) return null;",
+        "prev.dataset.turn!==idKey(turnId)",
+        "renderFileChangeContribution(body, p, item, turnId);",
+        "return prev;",
+    ] {
+        assert!(
+            merge.contains(expected),
+            "file-change upsert must preserve merged item contributions: `{expected}`"
+        );
+    }
+    assert!(
+        add_item.contains("mergeFileChangeWithPrevious(p, item, turnId)"),
+        "merged file changes must retain the incoming scoped item identity"
+    );
+
+    let finalize = between(
+        body,
+        "function finalizeStreamedItem(item, turnId) {",
+        "function addItem(item, turnId, fromHistory)",
+    );
+    assert!(
+        finalize.contains("renderItemBodyForItem(body, item, turnId);"),
+        "stream completion must use contribution-aware file-change rendering"
+    );
+}
+
+#[test]
 fn browser_incremental_resync_reconciles_in_flight_turn() {
     let body = app_js();
 
@@ -1653,6 +1769,13 @@ fn browser_incremental_resync_reconciles_in_flight_turn() {
     );
     assert!(reconcile.contains("removeTurnRows(\"pending\");"));
     assert!(reconcile.contains("state.activeTurn && state.currentRenderTurnId != null"));
+    assert_order(
+        reconcile,
+        "if (liveId) removeTurnRows(liveId);",
+        "rebuildRenderTrackingFromDom();",
+    );
+    assert!(reconcile.contains("state.pendingUserEl = null;"));
+    assert!(reconcile.contains("state.pendingUserText = null;"));
     assert!(reconcile.contains("setTurnActive(false);"));
     let remove = between(
         body,
@@ -1660,6 +1783,52 @@ fn browser_incremental_resync_reconciles_in_flight_turn() {
         "function maybeAutoFillHistory",
     );
     assert!(remove.contains("if (el.dataset.turn === turnId) el.remove();"));
+
+    // Rebuild uses the surviving DOM as source of truth so removed live rows cannot leave stale
+    // de-dupe sets or body maps pointing at detached elements.
+    assert!(body.contains("rebuildRenderTrackingFromDom();"));
+    let rebuild = between(
+        body,
+        "function rebuildRenderTrackingFromDom() {",
+        "function removeTurnRows(turnId)",
+    );
+    for expected in [
+        "const renderedBodies = new Map();",
+        "for (const row of t.querySelectorAll(\".msg\"))",
+        "const turn = row.dataset.turn || \"\";",
+        "for (const itemId of identityTokens(row.dataset.item))",
+        "const key = scopedItemKey(turn, itemId);",
+        "for (const harnessItemId of identityTokens(row.dataset.harnessItem))",
+        "const key = scopedHarnessKey(turn, harnessItemId);",
+        "state.renderedItemIds = renderedItems;",
+        "state.renderedHarnessItemIds = renderedHarnessItems;",
+        "state.renderedItemBodyByKey = renderedBodies;",
+        "state.streamElsByItemId = new Map();",
+        "state.itemKindsByItemId = new Map();",
+    ] {
+        assert!(
+            rebuild.contains(expected),
+            "incremental resync rebuild is missing `{expected}`"
+        );
+    }
+    for expected in [
+        "state.commandPayloadsByItemId",
+        "state.endedCommandsByItemId",
+        "state.runningCommands",
+        "state.toolPayloadsByItemId",
+        "state.taskGroupsByItemId",
+        "pruneKeySet(state.commandStopRequestedByItemId, liveTaskIds);",
+        "pruneKeySet(state.expandedCommandOutputs, liveTaskIds);",
+        "pruneKeySet(state.expandedToolOutputs, liveTaskIds);",
+        "state.pendingApprovals.delete(id)",
+        "state.pendingServerRequests.delete(id)",
+        "state.renderedApprovalStateKeys = approvalKeys;",
+    ] {
+        assert!(
+            rebuild.contains(expected),
+            "incremental resync cleanup is missing `{expected}`"
+        );
+    }
 
     // Delta is dispatched, and a full page arriving mid-resync is treated as a stale-cursor rebuild.
     assert!(body.contains("case \"history_delta\": renderHistoryDelta(msg); break;"));
@@ -1678,6 +1847,85 @@ fn browser_incremental_resync_reconciles_in_flight_turn() {
     assert!(body.contains(
         "if (state.resyncStickBottom) { state.resyncStickBottom = false; keepTranscriptAtBottom(true); }"
     ));
+}
+
+#[test]
+fn browser_scopes_running_command_completion_identity_to_turn() {
+    let body = app_js();
+
+    let command_from_item = between(
+        body,
+        "function commandFromItem(item, p, turnId, key, existing) {",
+        "function commandBodyFor(id) {",
+    );
+    assert!(command_from_item.contains("id:existing ? existing.id : key,"));
+    assert!(command_from_item.contains("turnId:existing ? existing.turnId : idKey(turnId),"));
+    assert!(
+        !command_from_item.contains("idKey(item && item.id)"),
+        "completed commands must not fall back to a bare item id"
+    );
+
+    let finish = between(
+        body,
+        "function finishRunningCommand(item, turnId) {",
+        "function renderRunningCommandSnapshot(commands) {",
+    );
+    for expected in [
+        "const key = scopedItemKey(turnId, item && item.id);",
+        "if (!key) return;",
+        "commandFromItem(item, p, turnId, key, state.runningCommands.get(key))",
+    ] {
+        assert!(
+            finish.contains(expected),
+            "finishRunningCommand must use scoped command identity: `{expected}`"
+        );
+    }
+
+    let finalize = between(
+        body,
+        "function finalizeStreamedItem(item, turnId) {",
+        "function addItem(item, turnId, fromHistory)",
+    );
+    assert!(finalize.contains("finishRunningCommand(item, turnId);"));
+    let add_item = between(
+        body,
+        "function addItem(item, turnId, fromHistory) {",
+        "function resetRenderState()",
+    );
+    assert!(add_item.contains("finishRunningCommand(item, turnId);"));
+    assert!(
+        !add_item.contains("finishRunningCommand(item);"),
+        "addItem must pass the owning turn into command completion"
+    );
+
+    let snapshot = between(
+        body,
+        "function renderRunningCommandSnapshot(commands) {",
+        "function renderEndedCommandBody(body, cmd, status, opts)",
+    );
+    for expected in [
+        "const key = scopedItemKey(info.turn_id, info.item_id);",
+        "const snapshotItem = { id:info.item_id, harness_item_id:info.harness_item_id || \"\" };",
+        "const existing = state.runningCommands.get(key);",
+        "let body = commandBodyFor(key);",
+        "registerRenderedItemBody(toolBody, snapshotItem, info.turn_id);",
+        "registerRenderedItemBody(body, snapshotItem, info.turn_id);",
+    ] {
+        assert!(
+            snapshot.contains(expected),
+            "running task snapshots must keep scoped DOM identity: `{expected}`"
+        );
+    }
+
+    let start = between(
+        body,
+        "function startRunningCommand(item, turnId) {",
+        "function commandFromParts(parts) {",
+    );
+    assert!(start.contains("const key = scopedItemKey(turnId, item.id);"));
+    assert!(start.contains("const existing = state.runningCommands.get(key);"));
+    assert!(start.contains("let body = commandBodyFor(key);"));
+    assert!(start.contains("registerRenderedItemBody(body, item, turnId);"));
 }
 
 #[test]

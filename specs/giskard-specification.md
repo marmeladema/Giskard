@@ -8,7 +8,15 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.50
+**Version:** 1.51
+
+**Changelog (1.50 → 1.51), item identity and upsert invariants:**
+- **B2/E6:** `ItemId` is the authoritative item lifecycle identity. Native item IDs are secondary
+  adapter correlation keys and must never re-key or merge distinct Giskard items.
+- **B2/P1:** repeated finalized values for one `(TurnId, ItemId)` replace the prior buffered value,
+  including items with no native ID.
+- **E6:** visually merged file-change rows remain turn-scoped and retain independent per-item
+  contributions when one item is updated.
 
 **Changelog (1.49 → 1.50), ImageView activity previews:**
 - **IV1:** Codex `ImageView` activity rows render a bounded inline raster image preview in the
@@ -560,19 +568,18 @@
 - **R5:** Command rows and summaries distinguish running, succeeded, failed, and
   terminated/declined/interrupted states with both a fixed symbol and subtle state color.
 - **R6:** `TerminateCommand { thread_id, process_id }` is a request to the active harness. Giskard
-  must not terminate local processes directly. For Codex, the harness first uses process-specific
-  app-server termination when the process is controllable: `thread/backgroundTerminals/terminate`
-  for unified-exec/background-terminal process ids, then `command/exec/terminate` for explicit
-  app-server `command/exec` sessions. It must not use `turn/interrupt` for command stop; users can
-  interrupt the whole turn separately when that broader cancellation is what they want.
+  must not terminate local processes directly. The adapter uses the process-specific control
+  operation appropriate to its harness and must not substitute turn interruption for command stop;
+  users can interrupt the whole turn separately when that broader cancellation is what they want.
 - **R7:** A command marked `terminating` means "stop requested through the harness", not "process
   terminated". The browser labels this state as "stop requested" and preserves the later terminal
-  command status reported by Codex. If Codex reports normal successful completion after a stop
-  request, the command row shows the successful completion annotated with "stop requested" and the
-  server logs a structured warning.
+  command status reported by the harness. If the harness reports normal successful completion after
+  a stop request, the command row shows the successful completion annotated with "stop requested"
+  and the server logs a structured warning.
 - **R8:** Stop-request failures are surfaced through the normal structured `Error` path and the
-  command remains visible with `terminating: false`. Codex's "no active command/exec for process
-  id" response is treated as stale-state cleanup only for commands already marked `after_turn`.
+  command remains visible with `terminating: false`. An adapter may classify a harness-specific
+  not-found response as stale-state cleanup only for commands already marked `after_turn`; that
+  classification must be documented by the adapter.
 
 **Changelog (1.10 → 1.11), source target positioning:**
 - **L7:** Opening a source link with a target line centers that line in the code overlay viewport
@@ -1207,10 +1214,19 @@ pub enum AgentEvent {
 
 `ItemStart`/`Item` cover: user message, agent message (with streaming text deltas), reasoning
 note, command execution (with output deltas), file change, and MCP/tool calls. `ItemDelta` carries
-incremental text or command output, keyed by the Giskard-owned `ItemId` (the `CodexHarness`
-translates the harness-native item id to the owned `ItemId` via the map established at `ItemStarted`;
-§4.7). Codex notifications that carry an item id but no visible payload may still seed the
-native-item registry without emitting a transcript row, so later deltas/completions stay correlated.
+incremental text or command output, keyed by the Giskard-owned `ItemId`.
+
+Every adapter translates its harness-native identifiers into Giskard-owned ids. For one logical
+item lifecycle, `ItemStarted`, every `ItemDelta`, and `ItemCompleted` MUST carry the same `ItemId`.
+Distinct logical items MUST NOT alias even when the harness reuses a native identifier across turns,
+threads, sessions, or resumes. Native identifiers are opaque protocol details: each adapter defines
+and documents the native key scope needed to satisfy these invariants.
+
+Within one turn, the server treats `(TurnId, ItemId)` as the authoritative finalized-item key.
+Receiving another `ItemCompleted` for that key replaces the previously buffered value rather than
+appending a duplicate, including when `harness_item_id` is empty. A non-empty native item ID is a
+secondary consistency key: it may detect an adapter identity violation, but it MUST NOT re-key one
+Giskard item onto another.
 
 > **Note (B5):** the `ItemStarted` above is an `AgentEvent` **variant**; the payload struct it carries
 > is named `ItemStart` (§4.5), not `ItemStarted`, to avoid the name collision.
@@ -1221,6 +1237,13 @@ These types are referenced by the trait (§4.3) and event model (§4.4). The sha
 **normative sketches**: field names and variants are the contract; the implementer may add
 fields but must not rename or drop the ones shown, so that persistence (§5), the wire protocol
 (`giskard-proto`), and the UI agree. All live in `giskard-core`.
+
+`ProjectId`, `ThreadId`, `TurnId`, and `ItemId` are Giskard-owned identities. Each is minted once
+for one logical entity, remains stable across persistence and replay, and must not alias another
+entity even when a harness reuses or changes its native identifier. Harness-native identifiers are
+stored separately and are never substituted for these owned IDs. `ApprovalId` and
+`ServerRequestId` are short-lived routing identities for pending browser actions rather than
+durable transcript identities.
 
 ```rust
 // ---- IDs (ULID-backed newtypes) ----
@@ -1279,7 +1302,7 @@ pub struct Turn {
 // ---- Items ----
 pub struct ItemStart {                // B5: renamed from `ItemStarted` (collides with the event variant)
     pub id: ItemId,                   // Giskard-owned (B2)
-    pub harness_item_id: String,      // native id, used to correlate deltas/completion
+    pub harness_item_id: String,      // secondary native correlation id; never authoritative
     pub kind: ItemKind,               // discriminant; payload fills in on completion
     pub command: Option<CommandExecutionStart>, // present for command items when known
     pub tool: Option<ToolCallStart>,   // present for tool-call items when known
@@ -1527,22 +1550,10 @@ maps to Codex's approval configuration (§9).
 - **Crash handling:** if the child exits unexpectedly, the server marks the project's active
   threads as "disconnected", surfaces an `Error` event to the UI, and offers a "reconnect"
   action that respawns and resumes.
-- **Native-thread-id registry (B4).** `AgentEvent` is tagged by the Giskard `ThreadId` (a ULID),
-  but Codex notifications arrive tagged with the **native** `threadId` string. `CodexHarness` MUST
-  maintain an explicit `harness_thread_id → ThreadId` map:
-  - populated at `open_thread` (both fresh `thread/start` and `thread/resume`), and
-  - consulted when mapping every inbound notification/request to route it to the correct owned
-    `ThreadId` (falling back to the handle in scope when a message omits the id).
-
-  This matters especially on **resume**: the native id is re-established (possibly different from the
-  previous run), and the map re-binds it to the same durable `ThreadId` so history stays continuous.
-  The mapper similarly keeps `harness_item_id → ItemId` (B2) and `harness_turn_id → TurnId` maps.
-  Turn id mapping is established as soon as `turn/start` returns its native `turn.id`, then reused
-  by `TurnStarted`, streamed deltas, and completions so the returned `TurnId` and subsequent events
-  resolve to the same owned id rather than minting a fresh id per message. Server requests use the
-  JSON-RPC request id for response routing, but any Codex thread/turn ids carried by first-class
-  params, MCP elicitation `_meta`, or unknown raw params must still pass through the native-id map
-  before the request is shown or persisted.
+- **Native identifier mapping.** The adapter translates native thread, turn, item, and request
+  identifiers as required by the Giskard-owned identity and lifecycle rules in §4.4–§4.5. Native
+  process handles remain separate control identifiers. The Codex-specific key scopes and routing
+  behavior are documented in `crates/giskard-harness-codex/README.md`.
 - **Resume-failure fallback (C5).** `thread/resume {threadId}` can fail even though Giskard has the
   stored native id — Codex's own thread store may have been purged or rotated. On a resume-by-id
   failure the harness MUST **not** hard-error the thread: it starts a **fresh** native thread
@@ -2515,9 +2526,12 @@ decisions for a removed request id remain protocol errors.
 
 **Client rendering invariant (E6):** `ItemDelta { item_id }` and the later `ItemCompleted`
 for the same `Item.id` are one lifecycle. The UI must finalize or replace the streamed body in
-place when the completed item arrives, and must de-duplicate rendered items by both Giskard
-`ItemId` and harness-native `harness_item_id` when replaying persisted state or receiving live
-events.
+place when the completed item arrives. Scoped Giskard `(TurnId, ItemId)` is authoritative for
+rendered-item identity. Scoped `harness_item_id` is a secondary consistency and replay-correlation
+key; it must never re-key or merge rows with different Giskard identities. Consecutive file-change
+items may share one visual row only within the same turn. The row retains one contribution per
+scoped item identity, so updating one item replaces only its contribution and preserves the other
+merged file changes.
 
 **Client thread isolation invariant (WS1/WS2):** before rendering or mutating local thread state,
 the browser must verify that every thread-scoped server message belongs to the active thread.
@@ -2609,18 +2623,15 @@ events through the same event handler used for live WebSocket events.
   `Tasks` menu and maps `item_id` back to the transcript row for select/scroll (tool transcript
   rows are owned by the item stream, not re-rendered from the snapshot).
   `TerminateCommand` requests are forwarded to the active harness. Giskard must not terminate
-  local processes directly; Codex-owned command processes are stopped only through the Codex
-  app-server protocol. The Codex harness prefers process-scoped app-server termination:
-  `thread/backgroundTerminals/terminate` for unified-exec/background-terminal process ids and
-  `command/exec/terminate` for explicit app-server `command/exec` sessions. It must not fall back
-  to `turn/interrupt` for command stop; the browser exposes turn interruption as a separate,
-  broader action. When the harness accepts a terminate request, the matching command remains in the
-  registry with `terminating: true` until a terminal command event arrives, but the browser labels
-  this state as "stop requested" rather than "terminated" or "terminating". A successful terminate
-  request is not itself proof that the process has stopped. If Codex later reports a normal
-  successful completion, the browser preserves the successful status and annotates it with "stop
-  requested"; the server logs a warning that Codex did not terminate the process. Codex's "no
-  active command/exec for process id" response is treated as stale-state cleanup only for commands
+  local processes directly; the adapter uses the harness's process-specific control operation. It
+  must not fall back to turn interruption for command stop; the browser exposes turn interruption
+  as a separate, broader action. When the harness accepts a terminate request, the matching command
+  remains in the registry with `terminating: true` until a terminal command event arrives, but the
+  browser labels this state as "stop requested" rather than "terminated" or "terminating". A
+  successful terminate request is not itself proof that the process has stopped. If the harness
+  later reports a normal successful completion, the browser preserves the successful status,
+  annotates it with "stop requested", and logs that the harness did not terminate the process. A
+  harness-specific not-found response may be treated as stale-state cleanup only for commands
   already marked `after_turn`; for live commands it is surfaced through the normal structured
   `Error` path and the command remains visible with `terminating: false`.
   Harness adapters that can observe post-turn command lifecycle messages must keep draining them
