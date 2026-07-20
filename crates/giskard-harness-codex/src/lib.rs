@@ -3,6 +3,9 @@
 //! Wraps `codex-codes::AsyncClient` and implements the `AgentHarness` trait.
 //! All Codex-specific types are confined to this crate and mapped to
 //! `giskard-core` types at the boundary.
+//!
+//! See the crate README for Codex-native identifier scopes, item and process
+//! lifecycles, background-command ownership, and termination routing.
 
 mod mapping;
 

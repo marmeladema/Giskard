@@ -10,7 +10,7 @@ use tracing::{debug, error, info, warn};
 use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ApprovalId, ProjectId, ServerRequestId, ThreadId, TurnId};
+use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{Item, ItemPayload, command_status_is_running, normalized_command_status};
 use giskard_core::mcp::{McpOauthStart, McpServerStatus};
 use giskard_core::model::ModelRef;
@@ -894,11 +894,11 @@ async fn forward_events(
     let mut owned_turn: Option<TurnId> = None;
     let mut owned_turn_completed = false;
     let mut started_at = Utc::now();
-    let mut items: Vec<Item> = Vec::new();
+    let mut current_turn_items = CurrentTurnItems::default();
     let mut diffs: Vec<giskard_core::FileDiff> = Vec::new();
     let mut seen_turn_ids = persisted_turn_ids(&store, project_id, thread_id).await;
     let mut seen_notices = HashSet::new();
-    let mut current_turn_item_indexes: HashMap<String, usize> = HashMap::new();
+    let mut item_ids_by_harness: HashMap<(TurnId, String), ItemId> = HashMap::new();
     let forwarder_started = Instant::now();
     let mut saw_context_compaction_marker = false;
     let mut stream_error: Option<String> = None;
@@ -935,6 +935,22 @@ async fn forward_events(
                         %thread_id,
                         event_turn_id = ?event_turn_id(&event),
                         "skipping duplicate harness notice"
+                    );
+                    continue;
+                }
+
+                if let Some((event_turn, harness_item_id, existing_item_id, conflicting_item_id)) =
+                    track_item_identity(&mut item_ids_by_harness, &event)
+                {
+                    error!(
+                        %project_id,
+                        %thread_id,
+                        turn_id = %event_turn,
+                        event_kind = event_kind(&event),
+                        harness_item_id,
+                        existing_item_id = %existing_item_id,
+                        conflicting_item_id = %conflicting_item_id,
+                        "dropping harness event because a native item id remapped to a different Giskard item id"
                     );
                     continue;
                 }
@@ -1063,12 +1079,7 @@ async fn forward_events(
                     AgentEvent::TurnStarted { turn, .. } => {
                         turn_id = Some(*turn);
                         started_at = Utc::now();
-                        current_turn_item_indexes.clear();
-                        for (idx, item) in items.iter().enumerate() {
-                            if !item.harness_item_id.is_empty() {
-                                current_turn_item_indexes.insert(item.harness_item_id.clone(), idx);
-                            }
-                        }
+                        current_turn_items.rebuild_indexes();
                         if let Some(turn_gate) = turn_gate.as_mut() {
                             turn_gate.acknowledge_turn(*turn);
                         }
@@ -1093,12 +1104,21 @@ async fn forward_events(
                                 %turn,
                                 turn_started_seen = turn_id.is_some(),
                                 will_synthesize_completion = turn_id.is_none(),
-                                items_buffered_after = items.len() + 1,
+                                items_buffered_after = current_turn_items.len() + 1,
                                 elapsed_ms = forwarder_started.elapsed().as_millis(),
                                 "context compaction marker received"
                             );
                         }
-                        upsert_current_turn_item(&mut items, &mut current_turn_item_indexes, item);
+                        if !owned_turn_completed && current_turn_items.upsert(item) {
+                            error!(
+                                %project_id,
+                                %thread_id,
+                                %turn,
+                                item_id = %item.id,
+                                harness_item_id = %item.harness_item_id,
+                                "recovered stale current-turn item index"
+                            );
+                        }
                     }
                     AgentEvent::DiffUpdated { diff, .. } => {
                         let existing = diffs.iter_mut().find(|d| d.path == diff.path);
@@ -1161,7 +1181,7 @@ async fn forward_events(
                         started_turn = ?turn_id,
                         status = ?status.kind,
                         context_kind = turn_context_kind_label(ctx.kind),
-                        items_buffered = items.len(),
+                        items_buffered = current_turn_items.len(),
                         diffs_buffered = diffs.len(),
                         elapsed_ms = forwarder_started.elapsed().as_millis(),
                         "turn completion event received"
@@ -1172,7 +1192,7 @@ async fn forward_events(
                             %thread_id,
                             turn = %completed_turn,
                             status = ?status.kind,
-                            items_buffered = items.len(),
+                            items_buffered = current_turn_items.len(),
                             saw_context_compaction_marker,
                             elapsed_ms = forwarder_started.elapsed().as_millis(),
                             "context compaction turn completed"
@@ -1185,7 +1205,7 @@ async fn forward_events(
                         usage,
                         status.clone(),
                         &ctx,
-                        &mut items,
+                        &mut current_turn_items,
                         &mut diffs,
                         started_at,
                         turn_id,
@@ -1229,7 +1249,7 @@ async fn forward_events(
                         %thread_id,
                         turn = %completed_turn,
                         turn_started_seen = turn_id.is_some(),
-                        items_buffered = items.len(),
+                        items_buffered = current_turn_items.len(),
                         elapsed_ms = forwarder_started.elapsed().as_millis(),
                         "context compaction completed from marker without turn completion"
                     );
@@ -1255,7 +1275,7 @@ async fn forward_events(
                         giskard_core::token::TokenUsage::default(),
                         status,
                         &ctx,
-                        &mut items,
+                        &mut current_turn_items,
                         &mut diffs,
                         started_at,
                         turn_id,
@@ -1294,7 +1314,7 @@ async fn forward_events(
                         ?owned_turn,
                         ?turn_id,
                         saw_context_compaction_marker,
-                        items_buffered = items.len(),
+                        items_buffered = current_turn_items.len(),
                         live_buffer_active,
                         turn_gate_held = turn_gate.is_some(),
                         elapsed_ms = forwarder_started.elapsed().as_millis(),
@@ -1322,7 +1342,7 @@ async fn forward_events(
                         ?owned_turn,
                         ?turn_id,
                         stream_error = ?stream_error,
-                        items_buffered = items.len(),
+                        items_buffered = current_turn_items.len(),
                         diffs_buffered = diffs.len(),
                         live_buffer_active,
                         turn_gate_held,
@@ -1349,7 +1369,7 @@ async fn forward_events(
                         giskard_core::token::TokenUsage::default(),
                         status,
                         &ctx,
-                        &mut items,
+                        &mut current_turn_items,
                         &mut diffs,
                         started_at,
                         turn_id,
@@ -1387,7 +1407,7 @@ async fn forward_events(
             ?turn_id,
             exit_reason = forwarder_exit_reason_label(exit_reason),
             stream_error = ?stream_error,
-            items_buffered = items.len(),
+            items_buffered = current_turn_items.len(),
             diffs_buffered = diffs.len(),
             saw_context_compaction_marker,
             elapsed_ms = forwarder_started.elapsed().as_millis(),
@@ -1418,7 +1438,7 @@ async fn complete_forwarded_turn(
     usage: giskard_core::token::TokenUsage,
     status: TurnStatus,
     ctx: &TurnContext,
-    items: &mut Vec<Item>,
+    current_turn_items: &mut CurrentTurnItems,
     diffs: &mut Vec<giskard_core::FileDiff>,
     started_at: chrono::DateTime<Utc>,
     turn_id: Option<TurnId>,
@@ -1431,9 +1451,9 @@ async fn complete_forwarded_turn(
 ) -> TurnId {
     let tid = turn_id.unwrap_or(completed_turn);
     seen_turn_ids.insert(tid);
-    let item_count = items.len();
+    let item_count = current_turn_items.len();
     let diff_count = diffs.len();
-    let has_context_compaction_marker = items.iter().any(is_context_compaction_item);
+    let has_context_compaction_marker = current_turn_items.iter().any(is_context_compaction_item);
     if ctx.kind == TurnContextKind::ManualCompaction {
         info!(
             %project_id,
@@ -1450,7 +1470,7 @@ async fn complete_forwarded_turn(
     let turn = Turn {
         id: tid,
         user_input: ctx.user_input.clone(),
-        items: std::mem::take(items),
+        items: current_turn_items.take(),
         model: ctx.model.clone(),
         mode: ctx.mode,
         status: status.clone(),
@@ -1529,6 +1549,36 @@ fn event_turn_id(event: &AgentEvent) -> Option<TurnId> {
         | AgentEvent::Notice {
             turn: Some(turn), ..
         } => Some(*turn),
+    }
+}
+
+fn event_item_identity(event: &AgentEvent) -> Option<(TurnId, &str, ItemId)> {
+    match event {
+        AgentEvent::ItemStarted { turn, item, .. } if !item.harness_item_id.is_empty() => {
+            Some((*turn, item.harness_item_id.as_str(), item.id))
+        }
+        AgentEvent::ItemCompleted { turn, item, .. } if !item.harness_item_id.is_empty() => {
+            Some((*turn, item.harness_item_id.as_str(), item.id))
+        }
+        _ => None,
+    }
+}
+
+fn track_item_identity(
+    item_ids_by_harness: &mut HashMap<(TurnId, String), ItemId>,
+    event: &AgentEvent,
+) -> Option<(TurnId, String, ItemId, ItemId)> {
+    let (turn, harness_item_id, item_id) = event_item_identity(event)?;
+    let identity_key = (turn, harness_item_id.to_owned());
+    match item_ids_by_harness.get(&identity_key) {
+        Some(existing_item_id) if *existing_item_id != item_id => {
+            Some((turn, harness_item_id.to_owned(), *existing_item_id, item_id))
+        }
+        Some(_) => None,
+        None => {
+            item_ids_by_harness.insert(identity_key, item_id);
+            None
+        }
     }
 }
 
@@ -1814,26 +1864,64 @@ fn command_completion_is_normal_success(status: &str, exit_code: Option<i32>) ->
     ) && exit_code == Some(0)
 }
 
-/// Upsert an `ItemCompleted` into the current turn's item buffer. If the same
-/// `harness_item_id` has already completed in this turn, replace the earlier
-/// buffered item with the latest one; otherwise append. Items with empty
-/// harness ids always append. This keeps the persisted turn coherent when a
-/// harness legitimately reuses an item id across turn boundaries.
-fn upsert_current_turn_item(
-    items: &mut Vec<Item>,
-    indexes: &mut HashMap<String, usize>,
-    item: &Item,
-) {
-    if item.harness_item_id.is_empty() {
-        items.push(item.clone());
-        return;
+/// Owns the current turn's completed items and their authoritative `ItemId` index.
+/// Keeping both in one type ensures draining a completed turn cannot leave indexes pointing into
+/// the previous vector. Native item ids are validated separately and are never used to re-key an
+/// item whose Giskard identity is already known.
+#[derive(Default)]
+struct CurrentTurnItems {
+    items: Vec<Item>,
+    indexes: HashMap<ItemId, usize>,
+}
+
+impl CurrentTurnItems {
+    fn len(&self) -> usize {
+        self.items.len()
     }
-    if let Some(&idx) = indexes.get(&item.harness_item_id) {
-        items[idx] = item.clone();
-    } else {
-        let idx = items.len();
-        items.push(item.clone());
-        indexes.insert(item.harness_item_id.clone(), idx);
+
+    fn iter(&self) -> impl Iterator<Item = &Item> {
+        self.items.iter()
+    }
+
+    fn rebuild_indexes(&mut self) {
+        self.indexes.clear();
+        for (idx, item) in self.items.iter().enumerate() {
+            self.indexes.insert(item.id, idx);
+        }
+    }
+
+    /// Returns true when an inconsistent stale index was detected and repaired.
+    fn upsert(&mut self, item: &Item) -> bool {
+        if let Some(&idx) = self.indexes.get(&item.id) {
+            if let Some(existing) = self
+                .items
+                .get_mut(idx)
+                .filter(|existing| existing.id == item.id)
+            {
+                *existing = item.clone();
+                return false;
+            }
+            self.rebuild_indexes();
+            if let Some(&repaired_idx) = self.indexes.get(&item.id) {
+                self.items[repaired_idx] = item.clone();
+                return true;
+            }
+            self.append_indexed(item);
+            return true;
+        }
+        self.append_indexed(item);
+        false
+    }
+
+    fn append_indexed(&mut self, item: &Item) {
+        let idx = self.items.len();
+        self.items.push(item.clone());
+        self.indexes.insert(item.id, idx);
+    }
+
+    fn take(&mut self) -> Vec<Item> {
+        self.indexes.clear();
+        std::mem::take(&mut self.items)
     }
 }
 
@@ -2033,9 +2121,9 @@ mod tests {
     use tokio::task::JoinHandle;
 
     use super::{
-        ActiveTurnOwner, ThreadTurnGate, TurnContext, TurnContextKind,
+        ActiveTurnOwner, CurrentTurnItems, ThreadTurnGate, TurnContext, TurnContextKind,
         command_completion_is_normal_success, command_status_is_running, forward_events,
-        thread_activity_from_event,
+        thread_activity_from_event, track_item_identity,
     };
     use crate::hub::Hub;
     use crate::ledger;
@@ -2057,6 +2145,114 @@ mod tests {
     }
 
     #[test]
+    fn current_turn_items_take_clears_indexes_for_reused_item_id() {
+        let item_id = ItemId::new();
+        let mut buffer = CurrentTurnItems::default();
+        let first = Item {
+            id: item_id,
+            harness_item_id: "native_first".into(),
+            payload: ItemPayload::AgentMessage {
+                text: "first".into(),
+            },
+            created_at: Utc::now(),
+        };
+        assert!(!buffer.upsert(&first));
+        assert_eq!(buffer.take(), vec![first]);
+        assert!(buffer.indexes.is_empty());
+
+        let second = Item {
+            id: item_id,
+            harness_item_id: "native_second".into(),
+            payload: ItemPayload::AgentMessage {
+                text: "second".into(),
+            },
+            created_at: Utc::now(),
+        };
+        assert!(!buffer.upsert(&second));
+        assert_eq!(buffer.take(), vec![second]);
+    }
+
+    #[test]
+    fn current_turn_items_repairs_stale_index_without_panicking() {
+        let mut buffer = CurrentTurnItems::default();
+        let item_id = ItemId::new();
+        buffer.indexes.insert(item_id, 7);
+        let item = Item {
+            id: item_id,
+            harness_item_id: "stale_item".into(),
+            payload: ItemPayload::AgentMessage {
+                text: "recovered".into(),
+            },
+            created_at: Utc::now(),
+        };
+
+        assert!(buffer.upsert(&item));
+        assert_eq!(buffer.items, vec![item]);
+        assert_eq!(buffer.indexes.get(&item_id), Some(&0));
+    }
+
+    #[test]
+    fn current_turn_items_repairs_in_range_stale_index() {
+        let first_id = ItemId::new();
+        let second_id = ItemId::new();
+        let first = Item {
+            id: first_id,
+            harness_item_id: "first".into(),
+            payload: ItemPayload::AgentMessage {
+                text: "first".into(),
+            },
+            created_at: Utc::now(),
+        };
+        let second = Item {
+            id: second_id,
+            harness_item_id: "second".into(),
+            payload: ItemPayload::AgentMessage {
+                text: "second".into(),
+            },
+            created_at: Utc::now(),
+        };
+        let replacement = Item {
+            payload: ItemPayload::AgentMessage {
+                text: "updated second".into(),
+            },
+            ..second.clone()
+        };
+        let mut buffer = CurrentTurnItems::default();
+        assert!(!buffer.upsert(&first));
+        assert!(!buffer.upsert(&second));
+        buffer.indexes.insert(second_id, 0);
+
+        assert!(buffer.upsert(&replacement));
+        assert_eq!(buffer.items, vec![first, replacement]);
+        assert_eq!(buffer.indexes.get(&first_id), Some(&0));
+        assert_eq!(buffer.indexes.get(&second_id), Some(&1));
+    }
+
+    #[test]
+    fn current_turn_items_upserts_empty_native_id_by_item_id() {
+        let item_id = ItemId::new();
+        let mut buffer = CurrentTurnItems::default();
+        let first = Item {
+            id: item_id,
+            harness_item_id: String::new(),
+            payload: ItemPayload::AgentMessage {
+                text: "partial".into(),
+            },
+            created_at: Utc::now(),
+        };
+        let completed = Item {
+            payload: ItemPayload::AgentMessage {
+                text: "complete".into(),
+            },
+            ..first.clone()
+        };
+
+        assert!(!buffer.upsert(&first));
+        assert!(!buffer.upsert(&completed));
+        assert_eq!(buffer.items, vec![completed]);
+    }
+
+    #[test]
     fn command_status_running_accepts_codex_variants() {
         assert!(command_status_is_running("in_progress"));
         assert!(command_status_is_running("in-progress"));
@@ -2064,6 +2260,59 @@ mod tests {
 
         assert!(!command_status_is_running("completed"));
         assert!(!command_status_is_running("interrupted"));
+    }
+
+    #[test]
+    fn item_identity_tracking_rejects_native_id_remapping_within_a_turn() {
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let original_item = ItemId::new();
+        let conflicting_item = ItemId::new();
+        let mut identities = Default::default();
+
+        let started = AgentEvent::ItemStarted {
+            thread,
+            turn,
+            item: ItemStart {
+                id: original_item,
+                harness_item_id: "cmd_1".into(),
+                kind: ItemKind::CommandExecution,
+                command: None,
+                tool: None,
+            },
+        };
+        assert!(track_item_identity(&mut identities, &started).is_none());
+
+        let repeated = AgentEvent::ItemCompleted {
+            thread,
+            turn,
+            item: Item {
+                id: original_item,
+                harness_item_id: "cmd_1".into(),
+                payload: ItemPayload::AgentMessage {
+                    text: "same identity".into(),
+                },
+                created_at: Utc::now(),
+            },
+        };
+        assert!(track_item_identity(&mut identities, &repeated).is_none());
+
+        let conflicting = AgentEvent::ItemCompleted {
+            thread,
+            turn,
+            item: Item {
+                id: conflicting_item,
+                harness_item_id: "cmd_1".into(),
+                payload: ItemPayload::AgentMessage {
+                    text: "different identity".into(),
+                },
+                created_at: Utc::now(),
+            },
+        };
+        assert_eq!(
+            track_item_identity(&mut identities, &conflicting),
+            Some((turn, "cmd_1".into(), original_item, conflicting_item))
+        );
     }
 
     #[test]
@@ -2388,6 +2637,25 @@ mod tests {
                     started_at_ms: Some(1),
                 }),
                 tool: None,
+            },
+        })
+        .unwrap();
+        tx.send(AgentEvent::ItemCompleted {
+            thread: thread_id,
+            turn,
+            item: Item {
+                id: command_item,
+                harness_item_id: "long_running_command".into(),
+                payload: ItemPayload::CommandExecution {
+                    command: "sleep 600".into(),
+                    cwd: "/tmp/test".into(),
+                    output: "still running".into(),
+                    exit_code: None,
+                    status: Some("running".into()),
+                    process_id: Some("proc_after_turn".into()),
+                    duration_ms: None,
+                },
+                created_at: Utc::now(),
             },
         })
         .unwrap();
@@ -3425,8 +3693,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forwarder_upserts_repeated_harness_item_ids_within_turn_and_allows_reuse_across_turns()
-    {
+    async fn forwarder_upserts_items_and_drops_conflicting_native_identity() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
         let project_id = ProjectId::new();
@@ -3468,6 +3735,7 @@ mod tests {
         let reused_harness = "agent_reply".to_string();
         let first_item_id = ItemId::new();
         let second_item_id = ItemId::new();
+        let conflicting_item_id = ItemId::new();
 
         store
             .append_turn(
@@ -3501,6 +3769,8 @@ mod tests {
 
         let (tx, _) = broadcast::channel(64);
         let hub = Arc::new(Hub::new());
+        let (client_tx, mut client_rx) = mpsc::channel(64);
+        hub.subscribe(thread_id, 1, client_tx).await;
         let live_buffers = Arc::new(LiveBufferStore::new());
         let running_commands = Arc::new(RunningTaskStore::new());
         let approvals = Arc::new(Mutex::new(Default::default()));
@@ -3557,6 +3827,19 @@ mod tests {
             },
         })
         .unwrap();
+        tx.send(AgentEvent::ItemCompleted {
+            thread: thread_id,
+            turn: second_turn,
+            item: Item {
+                id: conflicting_item_id,
+                harness_item_id: reused_harness.clone(),
+                payload: ItemPayload::AgentMessage {
+                    text: "conflicting identity".into(),
+                },
+                created_at: now,
+            },
+        })
+        .unwrap();
         tx.send(AgentEvent::TurnCompleted {
             thread: thread_id,
             turn: second_turn,
@@ -3591,6 +3874,18 @@ mod tests {
             saved[0].items[0].id == first_item_id,
             "earlier turn item must remain untouched"
         );
+        while let Ok(message) = client_rx.try_recv() {
+            if let ServerMessage::Event {
+                agent_event: WireAgentEvent::ItemCompleted { item, .. },
+                ..
+            } = message
+            {
+                assert_ne!(
+                    item.id, conflicting_item_id,
+                    "conflicting native identity must not be broadcast"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -3752,10 +4047,11 @@ mod tests {
         let mut saw_completed = false;
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
         while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(tokio::time::Duration::from_millis(100), client_rx.recv())
-                .await
+            if let Ok(Some(ServerMessage::Event { agent_event, .. })) =
+                tokio::time::timeout(tokio::time::Duration::from_millis(100), client_rx.recv())
+                    .await
             {
-                Ok(Some(ServerMessage::Event { agent_event, .. })) => match agent_event {
+                match agent_event {
                     WireAgentEvent::ItemStarted { item, .. }
                         if item.harness_item_id == reused_harness =>
                     {
@@ -3770,8 +4066,7 @@ mod tests {
                         saw_completed = true;
                     }
                     _ => {}
-                },
-                _ => {}
+                }
             }
         }
 
@@ -3930,17 +4225,17 @@ mod tests {
         let mut delta_texts = Vec::new();
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
         while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(tokio::time::Duration::from_millis(100), client_rx.recv())
+            if let Ok(Some(ServerMessage::Event {
+                agent_event:
+                    WireAgentEvent::ItemDelta {
+                        delta: giskard_proto::ItemDelta::Text { text },
+                        ..
+                    },
+                ..
+            })) = tokio::time::timeout(tokio::time::Duration::from_millis(100), client_rx.recv())
                 .await
             {
-                Ok(Some(ServerMessage::Event { agent_event, .. })) => {
-                    if let WireAgentEvent::ItemDelta { delta, .. } = agent_event {
-                        if let giskard_proto::ItemDelta::Text { text } = delta {
-                            delta_texts.push(text);
-                        }
-                    }
-                }
-                _ => {}
+                delta_texts.push(text);
             }
         }
         assert_eq!(

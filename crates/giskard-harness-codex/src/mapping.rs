@@ -47,24 +47,26 @@ const MCP_TOOL_APPROVAL_LABEL_ACCEPT: &str = "Allow";
 const MCP_TOOL_APPROVAL_LABEL_ACCEPT_FOR_SESSION: &str = "Allow for this session";
 const MCP_TOOL_APPROVAL_LABEL_CANCEL: &str = "Cancel";
 
+type NativeItemKey = (ThreadId, TurnId, String);
+type NativeTurnKey = (ThreadId, String);
+
 /// Maps Codex app-server messages onto `giskard-core` events, owning the id-translation registries
-/// (spec §4.7): native `threadId → ThreadId` (B4), native `turnId → TurnId`, and native
-/// `itemId → ItemId` (B2). The Giskard-owned ids are minted once and reused for every subsequent
-/// response, delta, or completion carrying the same native id, so events for one turn/item stay
-/// correlated.
+/// (spec §4.7): native `threadId → ThreadId` (B4),
+/// `(ThreadId, native turnId) → TurnId`, and
+/// `(ThreadId, TurnId, native itemId) → ItemId` (B2). The Giskard-owned item id is minted once and
+/// reused for every subsequent response, delta, or completion in that turn's item lifecycle.
 pub struct CodexMapper {
     workspace_root: PathBuf,
     thread_ids: HashMap<String, ThreadId>,
-    turn_ids: HashMap<String, TurnId>,
-    item_ids: HashMap<String, ItemId>,
-    /// Latest per-turn token usage, keyed by native turn id. Codex reports usage via a separate
-    /// `thread/tokenUsage/updated` notification (not on `turn/completed`), so we cache the most
-    /// recent value per turn and attach it when the turn completes (spec §10.1).
-    turn_usage: HashMap<String, TokenUsage>,
+    turn_ids: HashMap<NativeTurnKey, TurnId>,
+    item_ids: HashMap<NativeItemKey, ItemId>,
+    /// Latest per-turn token usage, keyed by owning thread and native turn id. Codex reports usage
+    /// via a separate `thread/tokenUsage/updated` notification (not on `turn/completed`), so we
+    /// cache the most recent value per turn and attach it when the turn completes (spec §10.1).
+    turn_usage: HashMap<NativeTurnKey, TokenUsage>,
     active_turns: HashMap<ThreadId, String>,
-    running_command_turns: HashMap<String, (ThreadId, String)>,
-    running_commands: HashSet<String>,
-    running_command_threads: HashMap<String, ThreadId>,
+    running_command_turns: HashMap<(ThreadId, String), String>,
+    running_commands: HashSet<NativeItemKey>,
     pending_approval_responses: HashMap<ApprovalId, PendingApprovalResponse>,
     pending_server_requests: HashMap<ServerRequestId, PendingServerRequest>,
 }
@@ -80,7 +82,6 @@ impl CodexMapper {
             active_turns: HashMap::new(),
             running_command_turns: HashMap::new(),
             running_commands: HashSet::new(),
-            running_command_threads: HashMap::new(),
             pending_approval_responses: HashMap::new(),
             pending_server_requests: HashMap::new(),
         }
@@ -91,7 +92,10 @@ impl CodexMapper {
     }
 
     pub fn running_command_fallback_thread(&self) -> Option<ThreadId> {
-        self.running_command_threads.values().next().copied()
+        self.running_commands
+            .iter()
+            .next()
+            .map(|(thread, _, _)| *thread)
     }
 
     pub fn active_native_turn_for_thread(&self, thread: ThreadId) -> Option<&str> {
@@ -117,12 +121,12 @@ impl CodexMapper {
             return None;
         }
         self.active_turns.insert(thread, native_turn_id.to_string());
-        Some(self.resolve_turn(native_turn_id))
+        Some(self.resolve_turn(thread, native_turn_id))
     }
 
     fn active_turn_for_thread(&mut self, thread: ThreadId) -> Option<TurnId> {
         let native = self.active_turns.get(&thread).cloned()?;
-        Some(self.resolve_turn(&native))
+        Some(self.resolve_turn(thread, &native))
     }
 
     fn explicit_or_active_turn(
@@ -135,9 +139,8 @@ impl CodexMapper {
 
     pub fn native_turn_for_process(&self, thread: ThreadId, process_id: &str) -> Option<&str> {
         self.running_command_turns
-            .get(process_id)
-            .filter(|(owner_thread, _)| *owner_thread == thread)
-            .map(|(_, turn_id)| turn_id.as_str())
+            .get(&(thread, process_id.to_owned()))
+            .map(String::as_str)
     }
 
     /// B4: bind a native thread id to its owned `ThreadId`. Called at `open_thread` for both fresh
@@ -169,20 +172,26 @@ impl CodexMapper {
         None
     }
 
-    /// Resolve (get-or-mint) the owned `TurnId` for a native turn id.
-    fn resolve_turn(&mut self, native: &str) -> TurnId {
+    /// Resolve (get-or-mint) the owned `TurnId` for a native turn id in one Giskard thread.
+    fn resolve_turn(&mut self, thread: ThreadId, native: &str) -> TurnId {
         if native.is_empty() {
             return TurnId::new();
         }
-        *self.turn_ids.entry(native.to_string()).or_default()
+        *self
+            .turn_ids
+            .entry((thread, native.to_string()))
+            .or_default()
     }
 
-    /// Resolve (get-or-mint) the owned `ItemId` for a native item id (B2).
-    fn resolve_item(&mut self, native: &str) -> ItemId {
+    /// Resolve the owned `ItemId` for one native item lifecycle (B2).
+    fn resolve_item(&mut self, thread: ThreadId, turn: TurnId, native: &str) -> ItemId {
         if native.is_empty() {
             return ItemId::new();
         }
-        *self.item_ids.entry(native.to_string()).or_default()
+        *self
+            .item_ids
+            .entry((thread, turn, native.to_owned()))
+            .or_default()
     }
 
     pub fn map_notification(
@@ -196,7 +205,7 @@ impl CodexMapper {
                 self.active_turns.insert(thread, turn.id.clone());
                 Some(AgentEvent::TurnStarted {
                     thread,
-                    turn: self.resolve_turn(&turn.id),
+                    turn: self.resolve_turn(thread, &turn.id),
                 })
             }
 
@@ -212,11 +221,14 @@ impl CodexMapper {
                 }
                 // Attach the usage cached from the last `thread/tokenUsage/updated` for this turn
                 // (spec §10.1). Defaults to zero if Codex sent no usage update for the turn.
-                let usage = self.turn_usage.remove(&turn.id).unwrap_or_default();
+                let usage = self
+                    .turn_usage
+                    .remove(&(thread, turn.id.clone()))
+                    .unwrap_or_default();
                 let status = map_turn_status(&turn.status);
                 Some(AgentEvent::TurnCompleted {
                     thread,
-                    turn: self.resolve_turn(&turn.id),
+                    turn: self.resolve_turn(thread, &turn.id),
                     usage,
                     status,
                 })
@@ -225,10 +237,12 @@ impl CodexMapper {
             Notification::ThreadTokenUsageUpdated(n) => {
                 // Cache the last-turn usage breakdown; emit no Giskard event for the intermediate
                 // update (the usage is surfaced on `TurnCompleted`).
-                self.resolve_thread(&n.thread_id, fallback_thread)?;
+                let thread = self.resolve_thread(&n.thread_id, fallback_thread)?;
                 if !n.turn_id.is_empty() {
-                    self.turn_usage
-                        .insert(n.turn_id.clone(), breakdown_to_usage(&n.token_usage.last));
+                    self.turn_usage.insert(
+                        (thread, n.turn_id.clone()),
+                        breakdown_to_usage(&n.token_usage.last),
+                    );
                 }
                 None
             }
@@ -241,11 +255,11 @@ impl CodexMapper {
                 ..
             }) => {
                 let thread = self.resolve_thread(thread_id, fallback_thread)?;
-                let turn = self.resolve_turn(turn_id);
+                let turn = self.resolve_turn(thread, turn_id);
                 let (harness_item_id, kind, command, tool) =
                     map_thread_item_start(item, *started_at_ms);
-                let id = self.resolve_item(&harness_item_id);
-                self.track_command_start(&harness_item_id, command.as_ref(), thread, turn_id);
+                let id = self.resolve_item(thread, turn, &harness_item_id);
+                self.track_command_start(&harness_item_id, command.as_ref(), thread, turn, turn_id);
                 Some(AgentEvent::ItemStarted {
                     thread,
                     turn,
@@ -266,12 +280,12 @@ impl CodexMapper {
                 turn_id,
             }) => {
                 let thread = self.resolve_thread(thread_id, fallback_thread)?;
-                let turn = self.resolve_turn(turn_id);
+                let turn = self.resolve_turn(thread, turn_id);
                 let harness_item_id = thread_item_id(item);
-                let id = self.resolve_item(&harness_item_id);
+                let id = self.resolve_item(thread, turn, &harness_item_id);
                 let giskard_item =
                     map_thread_item_complete(item, id, harness_item_id, *completed_at_ms);
-                self.track_completed_item(&giskard_item, thread);
+                self.track_completed_item(&giskard_item, thread, turn, turn_id);
                 Some(AgentEvent::ItemCompleted {
                     thread,
                     turn,
@@ -294,11 +308,11 @@ impl CodexMapper {
                 ..
             }) => {
                 let thread = self.resolve_thread(thread_id, fallback_thread)?;
-                let turn = self.resolve_turn(turn_id);
+                let turn = self.resolve_turn(thread, turn_id);
                 Some(AgentEvent::ItemDelta {
                     thread,
                     turn,
-                    item_id: self.resolve_item(item_id),
+                    item_id: self.resolve_item(thread, turn, item_id),
                     delta: ItemDelta::CommandOutput {
                         chunk: delta.clone(),
                     },
@@ -351,9 +365,9 @@ impl CodexMapper {
             ),
 
             Notification::ReasoningSummaryPartAdded(n) => {
-                self.resolve_thread(&n.thread_id, fallback_thread)?;
-                self.resolve_turn(&n.turn_id);
-                self.resolve_item(&n.item_id);
+                let thread = self.resolve_thread(&n.thread_id, fallback_thread)?;
+                let turn = self.resolve_turn(thread, &n.turn_id);
+                self.resolve_item(thread, turn, &n.item_id);
                 None
             }
 
@@ -364,7 +378,7 @@ impl CodexMapper {
                 ..
             }) => {
                 let thread = self.resolve_thread(thread_id, fallback_thread)?;
-                let turn = self.resolve_turn(turn_id);
+                let turn = self.resolve_turn(thread, turn_id);
                 Some(AgentEvent::DiffUpdated {
                     thread,
                     turn,
@@ -381,7 +395,7 @@ impl CodexMapper {
 
             Notification::Error(n) => {
                 let thread = self.resolve_thread(&n.thread_id, fallback_thread)?;
-                let turn = (!n.turn_id.is_empty()).then(|| self.resolve_turn(&n.turn_id));
+                let turn = (!n.turn_id.is_empty()).then(|| self.resolve_turn(thread, &n.turn_id));
                 Some(AgentEvent::Error {
                     thread,
                     turn,
@@ -394,7 +408,7 @@ impl CodexMapper {
 
             Notification::TurnPlanUpdated(n) => {
                 let thread = self.resolve_thread(&n.thread_id, fallback_thread)?;
-                let turn = self.resolve_turn(&n.turn_id);
+                let turn = self.resolve_turn(thread, &n.turn_id);
                 let mut lines = Vec::new();
                 if let Some(explanation) = &n.explanation {
                     if !explanation.trim().is_empty() {
@@ -416,7 +430,7 @@ impl CodexMapper {
 
             Notification::ModelRerouted(n) => {
                 let thread = self.resolve_thread(&n.thread_id, fallback_thread)?;
-                let turn = self.resolve_turn(&n.turn_id);
+                let turn = self.resolve_turn(thread, &n.turn_id);
                 Some(self.activity_event(
                     thread,
                     turn,
@@ -446,12 +460,16 @@ impl CodexMapper {
 
             Notification::ContextCompacted(n) => {
                 let thread = self.resolve_thread(&n.thread_id, fallback_thread)?;
-                let turn = self.resolve_turn(&n.turn_id);
+                let turn = self.resolve_turn(thread, &n.turn_id);
                 Some(AgentEvent::ItemCompleted {
                     thread,
                     turn,
                     item: Item {
-                        id: self.resolve_item(&format!("context_compacted:{}", n.turn_id)),
+                        id: self.resolve_item(
+                            thread,
+                            turn,
+                            &format!("context_compacted:{}", n.turn_id),
+                        ),
                         harness_item_id: format!("context_compacted:{}", n.turn_id),
                         payload: ItemPayload::Activity {
                             title: "Context compacted".into(),
@@ -522,6 +540,7 @@ impl CodexMapper {
         harness_item_id: &str,
         command: Option<&CommandExecutionStart>,
         thread: ThreadId,
+        turn: TurnId,
         native_turn_id: &str,
     ) {
         let Some(command) = command else {
@@ -533,9 +552,8 @@ impl CodexMapper {
             .map(command_status_is_running)
             .unwrap_or(true)
         {
-            self.running_commands.insert(harness_item_id.to_owned());
-            self.running_command_threads
-                .insert(harness_item_id.to_owned(), thread);
+            self.running_commands
+                .insert((thread, turn, harness_item_id.to_owned()));
             if let Some(process_id) = &command.process_id {
                 let turn_id = if native_turn_id.is_empty() {
                     self.active_turns.get(&thread).cloned().unwrap_or_default()
@@ -544,13 +562,19 @@ impl CodexMapper {
                 };
                 if !turn_id.is_empty() {
                     self.running_command_turns
-                        .insert(process_id.clone(), (thread, turn_id));
+                        .insert((thread, process_id.clone()), turn_id);
                 }
             }
         }
     }
 
-    fn track_completed_item(&mut self, item: &Item, thread: ThreadId) {
+    fn track_completed_item(
+        &mut self,
+        item: &Item,
+        thread: ThreadId,
+        turn: TurnId,
+        native_turn_id: &str,
+    ) {
         let ItemPayload::CommandExecution {
             status, process_id, ..
         } = &item.payload
@@ -562,14 +586,20 @@ impl CodexMapper {
             .map(command_status_is_running)
             .unwrap_or(false)
         {
-            self.running_commands.insert(item.harness_item_id.clone());
-            self.running_command_threads
-                .insert(item.harness_item_id.clone(), thread);
+            self.running_commands
+                .insert((thread, turn, item.harness_item_id.clone()));
+            if let Some(process_id) = process_id
+                && !native_turn_id.is_empty()
+            {
+                self.running_command_turns
+                    .insert((thread, process_id.clone()), native_turn_id.to_owned());
+            }
         } else {
-            self.running_commands.remove(&item.harness_item_id);
-            self.running_command_threads.remove(&item.harness_item_id);
+            self.running_commands
+                .remove(&(thread, turn, item.harness_item_id.clone()));
             if let Some(process_id) = process_id {
-                self.running_command_turns.remove(process_id);
+                self.running_command_turns
+                    .remove(&(thread, process_id.clone()));
             }
         }
     }
@@ -586,11 +616,11 @@ impl CodexMapper {
             return None;
         }
         let thread = self.resolve_thread(thread_id, fallback_thread)?;
-        let turn = self.resolve_turn(turn_id);
+        let turn = self.resolve_turn(thread, turn_id);
         Some(AgentEvent::ItemDelta {
             thread,
             turn,
-            item_id: self.resolve_item(item_id),
+            item_id: self.resolve_item(thread, turn, item_id),
             delta: ItemDelta::Text {
                 text: text.to_owned(),
             },
@@ -606,7 +636,7 @@ impl CodexMapper {
         detail: impl Into<String>,
         metadata: &T,
     ) -> AgentEvent {
-        let id = self.resolve_item(&harness_item_id);
+        let id = self.resolve_item(thread, turn, &harness_item_id);
         let detail = detail.into();
         AgentEvent::ItemCompleted {
             thread,
@@ -635,7 +665,7 @@ impl CodexMapper {
         match request {
             CodexServerRequest::CmdExecApproval(params) => {
                 let thread = self.resolve_thread(&params.thread_id, fallback_thread)?;
-                let turn = self.resolve_turn(&params.turn_id);
+                let turn = self.resolve_turn(thread, &params.turn_id);
                 let approval_id = ApprovalId(req_id);
                 self.pending_approval_responses.insert(
                     approval_id.clone(),
@@ -672,7 +702,7 @@ impl CodexMapper {
             }
             CodexServerRequest::FileChangeApproval(params) => {
                 let thread = self.resolve_thread(&params.thread_id, fallback_thread)?;
-                let turn = self.resolve_turn(&params.turn_id);
+                let turn = self.resolve_turn(thread, &params.turn_id);
                 let approval_id = ApprovalId(req_id);
                 self.pending_approval_responses.insert(
                     approval_id.clone(),
@@ -709,7 +739,7 @@ impl CodexMapper {
             }
             CodexServerRequest::PermissionsRequestApproval(params) => {
                 let thread = self.resolve_thread(&params.thread_id, fallback_thread)?;
-                let turn = self.resolve_turn(&params.turn_id);
+                let turn = self.resolve_turn(thread, &params.turn_id);
                 let permissions = serde_json::to_value(&params.permissions).unwrap_or_default();
                 let approval_id = ApprovalId(req_id);
                 self.pending_approval_responses.insert(
@@ -1078,12 +1108,14 @@ impl CodexMapper {
         match request {
             CodexServerRequest::ToolRequestUserInput(params) => {
                 let thread = self.resolve_thread(&params.thread_id, fallback_thread)?;
-                let turn = (!params.turn_id.is_empty()).then(|| self.resolve_turn(&params.turn_id));
+                let turn = (!params.turn_id.is_empty())
+                    .then(|| self.resolve_turn(thread, &params.turn_id));
                 Some((thread, turn))
             }
             CodexServerRequest::ItemToolCall(params) => {
                 let thread = self.resolve_thread(&params.thread_id, fallback_thread)?;
-                let turn = (!params.turn_id.is_empty()).then(|| self.resolve_turn(&params.turn_id));
+                let turn = (!params.turn_id.is_empty())
+                    .then(|| self.resolve_turn(thread, &params.turn_id));
                 Some((thread, turn))
             }
             CodexServerRequest::McpServerElicitationRequest(params) => {
@@ -1111,7 +1143,7 @@ impl CodexMapper {
         let turn = string_field(meta, "turnId")
             .or_else(|| string_field(meta, "turn_id"))
             .filter(|native| !native.is_empty())
-            .map(|native| self.resolve_turn(native));
+            .map(|native| self.resolve_turn(thread, native));
         Some((thread, turn))
     }
 
@@ -2607,10 +2639,14 @@ mod tests {
     }
 
     fn completed_item(item: Value) -> Notification {
+        completed_item_in_turn(item, "t1")
+    }
+
+    fn completed_item_in_turn(item: Value, turn_id: &str) -> Notification {
         Notification::ItemCompleted(
             serde_json::from_value(serde_json::json!({
                 "threadId": "th1",
-                "turnId": "t1",
+                "turnId": turn_id,
                 "completedAtMs": 1000,
                 "item": item,
             }))
@@ -2790,6 +2826,83 @@ mod tests {
             }
             other => panic!("expected TurnCompleted, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn token_usage_is_scoped_by_thread_when_native_turn_ids_repeat() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let first_thread = ThreadId::new();
+        let second_thread = ThreadId::new();
+        mapper.register_thread("th1".into(), first_thread);
+        mapper.register_thread("th2".into(), second_thread);
+        let usage_notification = |thread_id: &str, input_tokens: u64| {
+            Notification::ThreadTokenUsageUpdated(
+                serde_json::from_value(serde_json::json!({
+                    "threadId": thread_id,
+                    "turnId": "reused_turn",
+                    "tokenUsage": {
+                        "last": {
+                            "cachedInputTokens": 0,
+                            "inputTokens": input_tokens,
+                            "outputTokens": 1,
+                            "reasoningOutputTokens": 0,
+                            "totalTokens": input_tokens + 1
+                        },
+                        "total": {
+                            "cachedInputTokens": 0,
+                            "inputTokens": input_tokens,
+                            "outputTokens": 1,
+                            "reasoningOutputTokens": 0,
+                            "totalTokens": input_tokens + 1
+                        }
+                    }
+                }))
+                .expect("usage update should deserialize"),
+            )
+        };
+        let completed = |thread_id: &str| {
+            Notification::TurnCompleted(
+                serde_json::from_value(serde_json::json!({
+                    "threadId": thread_id,
+                    "turn": { "id": "reused_turn", "status": "completed" }
+                }))
+                .expect("turn completion should deserialize"),
+            )
+        };
+
+        assert!(
+            mapper
+                .map_notification(&usage_notification("th1", 10), first_thread)
+                .is_none()
+        );
+        assert!(
+            mapper
+                .map_notification(&usage_notification("th2", 20), second_thread)
+                .is_none()
+        );
+        let usage = |event| match event {
+            AgentEvent::TurnCompleted { usage, .. } => usage,
+            other => panic!("expected turn completion, got {other:?}"),
+        };
+
+        assert_eq!(
+            usage(
+                mapper
+                    .map_notification(&completed("th1"), first_thread)
+                    .expect("first turn should complete")
+            )
+            .input,
+            10
+        );
+        assert_eq!(
+            usage(
+                mapper
+                    .map_notification(&completed("th2"), second_thread)
+                    .expect("second turn should complete")
+            )
+            .input,
+            20
+        );
     }
 
     #[test]
@@ -3710,7 +3823,7 @@ mod tests {
         {
             AgentEvent::ServerRequestReceived { thread, turn, .. } => {
                 assert_eq!(thread, scoped_thread);
-                assert_eq!(turn, Some(mapper.resolve_turn("turn1")));
+                assert_eq!(turn, Some(mapper.resolve_turn(scoped_thread, "turn1")));
             }
             other => panic!("expected scoped MCP request, got {other:?}"),
         }
@@ -3741,7 +3854,7 @@ mod tests {
                 request,
             } => {
                 assert_eq!(thread, scoped_thread);
-                assert_eq!(turn, Some(mapper.resolve_turn("turn1")));
+                assert_eq!(turn, Some(mapper.resolve_turn(scoped_thread, "turn1")));
                 assert_eq!(request.params["answer"], 42);
             }
             other => panic!("expected scoped unknown request, got {other:?}"),
@@ -3891,6 +4004,7 @@ mod tests {
     #[test]
     fn command_item_preserves_running_metadata() {
         let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let thread = ThreadId::new();
         let start = started_item(serde_json::json!({
             "type": "commandExecution",
             "id": "cmd1",
@@ -3901,8 +4015,9 @@ mod tests {
             "processId": "proc_1"
         }));
 
-        match mapper.map_notification(&start, ThreadId::new()).unwrap() {
+        let started_item_id = match mapper.map_notification(&start, thread).unwrap() {
             AgentEvent::ItemStarted { item, .. } => {
+                let item_id = item.id;
                 assert_eq!(item.kind, ItemKind::CommandExecution);
                 let command = item.command.expect("command metadata");
                 assert_eq!(command.command, "sleep 60");
@@ -3910,9 +4025,10 @@ mod tests {
                 assert_eq!(command.status.as_deref(), Some("in_progress"));
                 assert_eq!(command.process_id.as_deref(), Some("proc_1"));
                 assert_eq!(command.started_at_ms, Some(500));
+                item_id
             }
             other => panic!("expected command item start, got {other:?}"),
-        }
+        };
         assert!(mapper.has_running_commands());
 
         let completed = completed_item(serde_json::json!({
@@ -3928,31 +4044,185 @@ mod tests {
             "durationMs": 60000
         }));
 
-        match mapper
-            .map_notification(&completed, ThreadId::new())
-            .unwrap()
-        {
-            AgentEvent::ItemCompleted { item, .. } => match item.payload {
-                ItemPayload::CommandExecution {
-                    command,
-                    cwd,
-                    status,
-                    process_id,
-                    exit_code,
-                    duration_ms,
-                    ..
-                } => {
-                    assert_eq!(command, "sleep 60");
-                    assert_eq!(cwd, PathBuf::from("/tmp/project"));
-                    assert_eq!(status.as_deref(), Some("failed"));
-                    assert_eq!(process_id.as_deref(), Some("proc_1"));
-                    assert_eq!(exit_code, Some(130));
-                    assert_eq!(duration_ms, Some(60000));
+        match mapper.map_notification(&completed, thread).unwrap() {
+            AgentEvent::ItemCompleted { item, .. } => {
+                assert_eq!(item.id, started_item_id);
+                match item.payload {
+                    ItemPayload::CommandExecution {
+                        command,
+                        cwd,
+                        status,
+                        process_id,
+                        exit_code,
+                        duration_ms,
+                        ..
+                    } => {
+                        assert_eq!(command, "sleep 60");
+                        assert_eq!(cwd, PathBuf::from("/tmp/project"));
+                        assert_eq!(status.as_deref(), Some("failed"));
+                        assert_eq!(process_id.as_deref(), Some("proc_1"));
+                        assert_eq!(exit_code, Some(130));
+                        assert_eq!(duration_ms, Some(60000));
+                    }
+                    other => panic!("expected command execution, got {other:?}"),
                 }
-                other => panic!("expected command execution, got {other:?}"),
-            },
+            }
             other => panic!("expected command item completion, got {other:?}"),
         }
+        assert!(!mapper.has_running_commands());
+    }
+
+    #[test]
+    fn native_item_ids_are_scoped_to_their_turn() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let thread = ThreadId::new();
+        let item = serde_json::json!({
+            "type": "agentMessage",
+            "id": "reused_item",
+            "text": "hello"
+        });
+
+        let first = mapper
+            .map_notification(&started_item_in_turn(item.clone(), "t1"), thread)
+            .expect("first item should map");
+        let repeated = mapper
+            .map_notification(&started_item_in_turn(item.clone(), "t1"), thread)
+            .expect("repeated item should map");
+        let second_turn = mapper
+            .map_notification(&started_item_in_turn(item, "t2"), thread)
+            .expect("second-turn item should map");
+
+        let item_id = |event| match event {
+            AgentEvent::ItemStarted { item, .. } => item.id,
+            other => panic!("expected item start, got {other:?}"),
+        };
+        let first_id = item_id(first);
+        assert_eq!(item_id(repeated), first_id);
+        assert_ne!(item_id(second_turn), first_id);
+    }
+
+    #[test]
+    fn native_item_ids_are_scoped_to_their_thread() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let first_thread = ThreadId::new();
+        let second_thread = ThreadId::new();
+        mapper.register_thread("th1".into(), first_thread);
+        mapper.register_thread("th2".into(), second_thread);
+        let item = serde_json::json!({
+            "type": "agentMessage",
+            "id": "copied_item",
+            "text": "hello"
+        });
+        let notification = |thread_id: &str| {
+            Notification::ItemStarted(
+                serde_json::from_value(serde_json::json!({
+                    "threadId": thread_id,
+                    "turnId": "copied_turn",
+                    "startedAtMs": 500,
+                    "item": item.clone(),
+                }))
+                .expect("item start should deserialize"),
+            )
+        };
+
+        let first = mapper
+            .map_notification(&notification("th1"), first_thread)
+            .expect("first-thread item should map");
+        let second = mapper
+            .map_notification(&notification("th2"), second_thread)
+            .expect("second-thread item should map");
+        let item_id = |event| match event {
+            AgentEvent::ItemStarted { item, .. } => item.id,
+            other => panic!("expected item start, got {other:?}"),
+        };
+
+        assert_ne!(item_id(first), item_id(second));
+    }
+
+    #[test]
+    fn native_turn_ids_are_scoped_to_their_thread() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let first_thread = ThreadId::new();
+        let second_thread = ThreadId::new();
+        mapper.register_thread("th1".into(), first_thread);
+        mapper.register_thread("th2".into(), second_thread);
+        let notification = |thread_id: &str| {
+            Notification::TurnStarted(
+                serde_json::from_value(serde_json::json!({
+                    "threadId": thread_id,
+                    "turn": { "id": "copied_turn", "status": "inProgress" }
+                }))
+                .expect("turn start should deserialize"),
+            )
+        };
+
+        let first = mapper
+            .map_notification(&notification("th1"), first_thread)
+            .expect("first-thread turn should map");
+        let second = mapper
+            .map_notification(&notification("th2"), second_thread)
+            .expect("second-thread turn should map");
+        let turn_id = |event| match event {
+            AgentEvent::TurnStarted { turn, .. } => turn,
+            other => panic!("expected turn start, got {other:?}"),
+        };
+
+        assert_ne!(turn_id(first), turn_id(second));
+    }
+
+    #[test]
+    fn running_commands_with_reused_item_ids_remain_independent() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let thread = ThreadId::new();
+        let running_command = |process_id: &str| {
+            serde_json::json!({
+                "type": "commandExecution",
+                "id": "reused_command",
+                "command": "sleep 60",
+                "cwd": "/tmp/project",
+                "commandActions": [],
+                "status": "inProgress",
+                "processId": process_id
+            })
+        };
+        let completed_command = |process_id: &str| {
+            serde_json::json!({
+                "type": "commandExecution",
+                "id": "reused_command",
+                "command": "sleep 60",
+                "cwd": "/tmp/project",
+                "commandActions": [],
+                "aggregatedOutput": "",
+                "status": "completed",
+                "exitCode": 0,
+                "processId": process_id,
+                "durationMs": 1000
+            })
+        };
+
+        mapper.map_notification(
+            &started_item_in_turn(running_command("proc_1"), "t1"),
+            thread,
+        );
+        mapper.map_notification(
+            &started_item_in_turn(running_command("proc_2"), "t2"),
+            thread,
+        );
+        assert_eq!(mapper.native_turn_for_process(thread, "proc_1"), Some("t1"));
+        assert_eq!(mapper.native_turn_for_process(thread, "proc_2"), Some("t2"));
+
+        mapper.map_notification(
+            &completed_item_in_turn(completed_command("proc_1"), "t1"),
+            thread,
+        );
+        assert!(mapper.has_running_commands());
+        assert_eq!(mapper.native_turn_for_process(thread, "proc_1"), None);
+        assert_eq!(mapper.native_turn_for_process(thread, "proc_2"), Some("t2"));
+
+        mapper.map_notification(
+            &completed_item_in_turn(completed_command("proc_2"), "t2"),
+            thread,
+        );
         assert!(!mapper.has_running_commands());
     }
 
@@ -4347,11 +4617,15 @@ mod tests {
             .unwrap(),
         );
 
-        assert!(!mapper.item_ids.contains_key("reasoning1"));
+        assert!(mapper.item_ids.is_empty());
         assert!(mapper.map_notification(&part, fallback).is_none());
+        let turn = *mapper
+            .turn_ids
+            .get(&(fallback, "t1".into()))
+            .expect("summary part should bind native turn id");
         let expected_item = *mapper
             .item_ids
-            .get("reasoning1")
+            .get(&(fallback, turn, "reasoning1".into()))
             .expect("summary part should bind native item id");
 
         let delta = Notification::ReasoningDelta(
@@ -4407,7 +4681,7 @@ mod tests {
                 error: giskard_core::error::HarnessError::Protocol(msg),
                 ..
             } => {
-                assert_eq!(turn, mapper.resolve_turn("t1"));
+                assert_eq!(turn, mapper.resolve_turn(fallback, "t1"));
                 assert_eq!(
                     msg,
                     "unauthorized: No API key configured for provider openai"

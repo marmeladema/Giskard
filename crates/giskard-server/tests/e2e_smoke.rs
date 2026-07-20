@@ -4121,11 +4121,13 @@ async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
         match tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
                 let server_msg: ServerMessage = serde_json::from_str(&t).unwrap();
-                if let ServerMessage::Event { agent_event, .. } = server_msg {
-                    if let WireAgentEvent::TurnCompleted { turn, .. } = agent_event {
-                        if turn == new_turn {
-                            saw_new_turn_complete = true;
-                        }
+                if let ServerMessage::Event {
+                    agent_event: WireAgentEvent::TurnCompleted { turn, .. },
+                    ..
+                } = server_msg
+                {
+                    if turn == new_turn {
+                        saw_new_turn_complete = true;
                     }
                 }
             }
