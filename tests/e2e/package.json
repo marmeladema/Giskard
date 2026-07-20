@@ -1,0 +1,12 @@
+{
+  "name": "giskard-e2e",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Playwright end-to-end tests for the Giskard web UI, driven against a deterministic Codex-free replay server.",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.56.0"
+  }
+}

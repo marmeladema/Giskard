@@ -1,0 +1,6 @@
+# This file is only consulted when the build context is tests/e2e/. The real build uses the repo
+# root as context (see Dockerfile header), so the root .dockerignore governs there. Kept in sync as
+# a courtesy for anyone building from this directory.
+node_modules
+test-results
+playwright-report

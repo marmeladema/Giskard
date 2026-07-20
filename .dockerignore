@@ -1,0 +1,7 @@
+# Keep the Docker build context small and reproducible. The e2e image (tests/e2e/Dockerfile) builds
+# from the repository root, so these are excluded from every build:
+target
+.git
+**/node_modules
+tests/e2e/test-results
+tests/e2e/playwright-report

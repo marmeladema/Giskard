@@ -1,0 +1,78 @@
+# End-to-end (Playwright) tests
+
+Browser tests that drive Giskard's real web UI — login, projects/threads, live message streaming,
+and settings — through a headless Chromium.
+
+Everything runs **inside Docker**, so you don't need Node, npm, or the Playwright browsers on your
+host. The one thing you do need is Docker.
+
+## What's under test
+
+The tests run against **`giskard-server-replay`**, a deterministic, Codex-free build of the server
+(`crates/giskard-server/src/bin/giskard-server-replay.rs`). It serves the exact same UI and
+REST/WebSocket API as the real `giskard-server`, but:
+
+- uses an in-process **scripted harness** that streams a fixed agent reply on every turn (no LLM, no
+  network), so the transcript is fully deterministic;
+- boots with a **known password** (`giskard` by default) and one pre-seeded **"Demo"** project, so
+  the tests can log in and drive a thread with zero host-side setup.
+
+This keeps the suite hermetic: the production server needs a real, authenticated Codex CLI, which
+can't run unattended in CI.
+
+## Run it
+
+```bash
+# From anywhere in the repo. Builds the image, runs the whole suite.
+tests/e2e/run.sh
+
+# Run a single spec, or pass any `playwright test` flags:
+tests/e2e/run.sh tests/login.spec.ts
+tests/e2e/run.sh --reporter=line
+```
+
+The HTML report lands in `tests/e2e/playwright-report/` on your host.
+
+## Run it without Docker (optional, for UI development)
+
+If you already have Node and the matching Playwright browsers, you can iterate faster by pointing
+Playwright at a locally built server binary:
+
+```bash
+cargo build -p giskard-server --bin giskard-server-replay
+
+cd tests/e2e
+npm ci
+npx playwright install chromium   # only if you don't already have the pinned browser
+GISKARD_SERVER_BIN=../../target/debug/giskard-server-replay npx playwright test
+```
+
+Playwright starts and stops the server itself (see `webServer` in `playwright.config.ts`).
+
+## CI
+
+`.github/workflows/e2e.yml` builds the same image and runs the same command on every push to `main`
+and every pull request, uploading the HTML report as a build artifact.
+
+## Configuration
+
+All knobs are environment variables with sensible defaults (see `playwright.config.ts`):
+
+| Variable                   | Default                 | Purpose                                           |
+| -------------------------- | ----------------------- | ------------------------------------------------- |
+| `GISKARD_SERVER_BIN`       | `giskard-server-replay` | Path/command for the replay server binary.        |
+| `GISKARD_HOST`             | `127.0.0.1`             | Host the server binds to and tests connect to.    |
+| `GISKARD_PORT`             | `8787`                  | Port for the same.                                |
+| `GISKARD_BASE_URL`         | `http://<host>:<port>`  | Full base URL (overrides host/port if set).       |
+| `GISKARD_REPLAY_PASSWORD`  | `giskard`               | App password the server accepts and tests submit. |
+
+## Keeping versions in sync
+
+The Playwright npm package and its browsers must match the Docker base image. When bumping
+Playwright, change **both**:
+
+- `@playwright/test` in `tests/e2e/package.json`, and
+- the `mcr.microsoft.com/playwright:vX.Y.Z-jammy` tag in `tests/e2e/Dockerfile`.
+
+The scripted reply asserted by `tests/thread.spec.ts` is defined once in the replay binary
+(`SCRIPTED_REPLY`) and mirrored in `tests/helpers.ts`; keep the two in step.
