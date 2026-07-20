@@ -1661,6 +1661,29 @@ fn browser_incremental_resync_reconciles_in_flight_turn() {
     );
     assert!(remove.contains("if (el.dataset.turn === turnId) el.remove();"));
 
+    // Rows carry a composite (turn, item) identity so a resync can rebuild bookkeeping from the DOM.
+    assert!(
+        body.contains("function stampItemIdentity(el, item)")
+            && body.contains("el.dataset.item = addIdentityToken(el.dataset.item, id)")
+            && body.contains("el.dataset.harnessItem = addIdentityToken(el.dataset.harnessItem, item.harness_item_id)"),
+        "item rows are stamped with their item and harness ids"
+    );
+    // Reconcile rebuilds render tracking from the surviving rows (so the in-flight turn re-renders
+    // instead of being suppressed by dedup), rather than leaving the dedup sets stale.
+    assert!(body.contains("rebuildRenderTrackingFromDom();"));
+    let rebuild = between(
+        body,
+        "function rebuildRenderTrackingFromDom() {",
+        "function removeTurnRows(turnId)",
+    );
+    assert!(rebuild.contains("state.renderedItemIds = items;"));
+    assert!(rebuild.contains("state.renderedHarnessItemIds = harness;"));
+    assert!(
+        rebuild.contains("if (!attached(el)) m.delete(k);"),
+        "element-keyed maps drop entries whose element left the DOM"
+    );
+    assert!(rebuild.contains("state.renderedApprovalStateKeys = keys;"));
+
     // Delta is dispatched, and a full page arriving mid-resync is treated as a stale-cursor rebuild.
     assert!(body.contains("case \"history_delta\": renderHistoryDelta(msg); break;"));
     let page = between(

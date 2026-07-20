@@ -2140,14 +2140,62 @@ function reconcileInFlightTurn() {
     ? String(state.currentRenderTurnId)
     : null;
   if (liveId) removeTurnRows(liveId);
-  // Drop streaming bookkeeping tied to the wiped rows so the live snapshot rebuilds cleanly; the
-  // snapshot re-activates the turn if it is still running.
+  // The in-flight turn's rows are gone. Rebuild the per-item render bookkeeping from the rows that
+  // survive (the DOM is the source of truth) so the live snapshot re-renders that turn's items — the
+  // dedup would otherwise skip them — and no stale map points at a detached element. Kept turns keep
+  // their identity and interactivity because their rows (and stamps) are untouched.
+  rebuildRenderTrackingFromDom();
   state.currentRenderTurnId = null;
   setTurnActive(false);
   state.streamEl = null;
   state.streamItemId = null;
-  state.streamElsByItemId = new Map();
   breakTaskGroup();
+}
+
+// Recompute item/approval render bookkeeping from the transcript after rows were removed. Item rows
+// carry a composite identity (`data-turn` + `data-item`/`data-harness-item`); approvals carry
+// `data-approval-*`. Anything not backed by a surviving row is dropped, so re-rendering the removed
+// turn creates fresh rows rather than skipping (dedup) or writing into detached ones.
+function rebuildRenderTrackingFromDom() {
+  const t = $("transcript");
+  const attached = (el) => !!(el && t && t.contains(el));
+  const items = new Set();
+  const harness = new Set();
+  if (t) {
+    for (const el of t.querySelectorAll("[data-item]")) {
+      for (const id of el.dataset.item.split(" ")) if (id) items.add(id);
+    }
+    for (const el of t.querySelectorAll("[data-harness-item]")) {
+      for (const h of el.dataset.harnessItem.split(" ")) if (h) harness.add(h);
+    }
+  }
+  state.renderedItemIds = items;
+  state.renderedHarnessItemIds = harness;
+  state.streamElsByItemId = new Map();
+  state.itemKindsByItemId = new Map();
+  // Element-keyed maps: drop entries whose element left the DOM so a re-render builds fresh rows.
+  for (const m of [state.commandBodyElsByItemId, state.commandMsgElsByItemId, state.toolBodyElsByItemId]) {
+    for (const [k, el] of Array.from(m)) if (!attached(el)) m.delete(k);
+  }
+  // Command/tool state keyed by item id: keep only ids that still have a rendered row.
+  const live = new Set(state.commandMsgElsByItemId.keys());
+  for (const m of [state.commandPayloadsByItemId, state.endedCommandsByItemId, state.runningCommands,
+                   state.toolPayloadsByItemId, state.taskGroupsByItemId]) {
+    for (const k of Array.from(m.keys())) if (!live.has(k)) m.delete(k);
+  }
+  for (const [k, g] of Array.from(state.taskGroupsById)) if (!attached(g && g.el)) state.taskGroupsById.delete(k);
+  // Approvals: drop cards that are gone, then rebuild the state-key set from the survivors.
+  for (const [id, entry] of Array.from(state.pendingApprovals)) {
+    if (!attached(entry && entry.msg)) state.pendingApprovals.delete(id);
+  }
+  const keys = new Set();
+  if (t) {
+    for (const el of t.querySelectorAll("[data-approval-state-key]")) {
+      if (el.dataset.approvalStateKey) keys.add(el.dataset.approvalStateKey);
+    }
+  }
+  state.renderedApprovalStateKeys = keys;
+  renderRunningCommands();
 }
 function removeTurnRows(turnId) {
   const t = $("transcript");
@@ -4044,6 +4092,7 @@ function finalizeStreamedItem(item) {
     body.parentElement.dataset.toolItemId = key;
   }
   renderItemBody(body, item.payload);
+  stampItemIdentity(body.parentElement, item);
   if (item.payload.kind==="command_execution") finishRunningCommand(item);
   markRenderedItem(item);
   if (state.streamEl === body) {
@@ -4072,17 +4121,24 @@ function addItem(item, fromHistory) {
     if (state.pendingUserEl && p.text===state.pendingUserText) {
       state.pendingUserEl.classList.remove("pending");
       state.pendingUserEl.querySelector(".body").textContent = p.text;
+      stampItemIdentity(state.pendingUserEl, item);
       state.pendingUserEl = null;
       state.pendingUserText = null;
       markRenderedItem(item);
       return;
     }
-    renderItemBody(bubble("user","you"), p);
+    const userBody = bubble("user","you");
+    renderItemBody(userBody, p);
+    stampItemIdentity(userBody.parentElement, item);
   }
   else {
-    if (p.kind==="file_change" && mergeFileChangeWithPrevious(p)) {
-      markRenderedItem(item);
-      return;
+    if (p.kind==="file_change") {
+      const mergedRow = mergeFileChangeWithPrevious(p);
+      if (mergedRow) {
+        stampItemIdentity(mergedRow, item);   // a merged row stands for several items
+        markRenderedItem(item);
+        return;
+      }
     }
     const key = idKey(item && item.id);
     const body = isTaskPayloadKind(p.kind)
@@ -4103,6 +4159,7 @@ function addItem(item, fromHistory) {
       }
     }
     renderItemBody(body, p);
+    stampItemIdentity(body.parentElement, item);
   }
   if (p.kind==="command_execution") finishRunningCommand(item);
   markRenderedItem(item);
@@ -4158,6 +4215,21 @@ function markRenderedItem(item) {
     state.itemKindsByItemId.delete(itemId);
   }
   if (item && item.harness_item_id) state.renderedHarnessItemIds.add(item.harness_item_id);
+}
+// Composite (turn, item) DOM identity. `data-turn` is already stamped per row (per-turn identity);
+// stamp the item's id(s) too so an incremental resync can rebuild render bookkeeping straight from
+// the DOM — scoping every item to its turn, so a later turn reusing an id can't mangle an earlier
+// one. A merged file-change row stands for several items, so ids accumulate space-separated.
+function stampItemIdentity(el, item) {
+  if (!el || !item) return;
+  const id = idKey(item.id);
+  if (id) el.dataset.item = addIdentityToken(el.dataset.item, id);
+  if (item.harness_item_id) el.dataset.harnessItem = addIdentityToken(el.dataset.harnessItem, item.harness_item_id);
+}
+function addIdentityToken(existing, token) {
+  const set = new Set((existing || "").split(" ").filter(Boolean));
+  set.add(token);
+  return Array.from(set).join(" ");
 }
 function hasVisiblePayload(p) {
   if (!p || !p.kind) return false;
@@ -4480,6 +4552,8 @@ function mergeFileChangePayload(existing, next) {
     changes:current.changes.concat(incoming.changes)
   };
 }
+// Returns the row a consecutive file-change was merged into (so the caller can add the merged item
+// to that row's composite identity), or null when there's no adjacent file-change row to merge with.
 function mergeFileChangeWithPrevious(p) {
   breakTaskGroup();
   const target = renderTarget();
@@ -4489,13 +4563,13 @@ function mergeFileChangeWithPrevious(p) {
     !prev.classList ||
     !prev.classList.contains("file") ||
     !prev._fileChangePayload
-  ) return false;
+  ) return null;
   const body = prev.querySelector(".body");
-  if (!body) return false;
+  if (!body) return null;
   const merged = mergeFileChangePayload(prev._fileChangePayload, p);
   renderItemBody(body, merged);
   keepTranscriptRowAnchored(prev);
-  return true;
+  return prev;
 }
 function renderFileChange(body, p) {
   const normalized = normalizedFileChangePayload(p);
