@@ -41,6 +41,13 @@ change the login/project/thread/settings UI or that binary's seeded state, keep 
 `SCRIPTED_REPLY` constant (mirrored in `tests/e2e/tests/helpers.ts`) in sync. See
 `tests/e2e/README.md`.
 
+The README's UI screenshots (`docs/screenshots/ide-{desktop,mobile}.png`) are generated from the
+same server. Whenever you change the frontend in a way that affects how it looks — anything under
+`crates/giskard-server/static/` (`index.html`, `app.css`, `app.js`), the appearance themes, or the
+layout — regenerate them with `tests/e2e/screenshots.sh` and commit the updated PNGs in the same
+change, so the README never shows a stale UI. (No regeneration needed for changes with no visible
+effect, e.g. backend-only or copy-only edits.)
+
 ## Architecture
 Cargo workspace with 8 crates under `crates/`:
 - `giskard-core` — pure domain types (no I/O)
