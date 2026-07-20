@@ -1293,16 +1293,9 @@ pub fn map_approval_policy(policy: ApprovalPolicy) -> codex_codes::AskForApprova
 }
 
 pub fn map_effort(effort: giskard_core::model::Effort) -> codex_codes::ReasoningEffort {
-    use giskard_core::model::Effort;
-    // Matches Codex `ModelReasoningEffort` (minimal | low | medium | high | xhigh), S4.
-    let s = match effort {
-        Effort::Minimal => "minimal",
-        Effort::Low => "low",
-        Effort::Medium => "medium",
-        Effort::High => "high",
-        Effort::XHigh => "xhigh",
-    };
-    codex_codes::ReasoningEffort(s.into())
+    // Reasoning efforts are model-defined strings on both sides, so this is a straight pass-through:
+    // whatever a model advertised (via `model/list`) and the user selected goes back to Codex as-is.
+    codex_codes::ReasoningEffort(effort.0)
 }
 
 fn map_permissions_approval_decision(
@@ -2621,6 +2614,15 @@ fn parse_hunk_header(line: &str) -> Option<(u32, u32, u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_effort_passes_arbitrary_strings_through() {
+        use giskard_core::model::Effort;
+        // A common level and a model-defined one the old closed enum could not represent both go to
+        // Codex unchanged.
+        assert_eq!(map_effort(Effort::new("high")).0, "high");
+        assert_eq!(map_effort(Effort::new("ultra")).0, "ultra");
+    }
 
     fn approval_result_value(response: ApprovalResponse) -> Value {
         match response {

@@ -30,7 +30,7 @@ let state = {
   // streamed); `newestPersistedTurnId` is the id of the newest turn known to have completed — the
   // high-water mark a future resync will use as its "give me turns after this" cursor.
   currentRenderTurnId:null, newestPersistedTurnId:null,
-  models:[], pendingModelBeforeSelect:null, streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null,
+  models:[], modelsProject:null, pendingModelBeforeSelect:null, streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null,
   streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), renderedItemBodyByKey:new Map(), itemKindsByItemId:new Map(),
   pendingApprovals:new Map(), answeredApprovals:new Map(), renderedApprovalStateKeys:new Set(), pendingServerRequests:new Map(),
   runningCommands:new Map(), commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null,
@@ -90,8 +90,10 @@ async function startApp() {
   refreshModels();   // background: merge in any provider /v1/models discovery (§8.3)
 }
 
-// Re-pull the model list, merging each `model_listing` provider's /v1/models over the static list,
-// then re-render the pickers. Best-effort; on failure the current list stays.
+// The global (no-project) model list: configured models merged with each `model_listing`
+// provider's /v1/models discovery. Used for the startup baseline and the new-project modal. Once a
+// project is open its per-project list (with harness names) is authoritative, so this does not
+// clobber it. Best-effort; on failure the current list stays.
 let _refreshingModels = false;
 async function refreshModels(opts) {
   opts = opts || {};
@@ -101,8 +103,7 @@ async function refreshModels(opts) {
   try {
     const res = await api("POST","/api/models/refresh");
     if (res && Array.isArray(res.models)) {
-      state.models = res.models;
-      renderModelSelect();
+      if (!state.projectId) { state.models = res.models; renderModelSelect(); }
       populateModalModels();
     }
     // Surface per-provider discovery failures (e.g. a 401 from a misconfigured api_key) so they
@@ -117,7 +118,52 @@ async function refreshModels(opts) {
     if (btn) btn.disabled = false;
   }
 }
-$("refreshModels").onclick = () => refreshModels();
+
+// The per-project model list is authoritative when a project is open: configured models + each
+// provider's /v1/models discovery + the project harness's (Codex) friendly names, all resolved
+// server-side. Loaded once per project (not per thread switch — the list is the same across a
+// project's threads) unless opts.force is set (the "Reload models" button). opts.announce surfaces
+// discovery warnings. Best-effort; on failure the current list stays. Guards against a stale
+// project's response landing after a project switch.
+let _loadingProjectModels = false;
+let _pendingProjectModelLoad = null;
+async function loadProjectModels(pid, opts) {
+  opts = opts || {};
+  if (!pid) return;
+  // A load is in flight: remember the latest requested project instead of dropping it, so switching
+  // A→B while A is loading still fetches B's authoritative list once A settles.
+  if (_loadingProjectModels) { _pendingProjectModelLoad = { pid, opts }; return; }
+  if (!opts.force && pid === state.modelsProject) return;   // already loaded for this project
+  _loadingProjectModels = true;
+  const btn = $("refreshModels"); if (btn) btn.disabled = true;
+  try {
+    const res = await api("GET", `/api/projects/${pid}/models`);
+    if (res && Array.isArray(res.models) && pid === state.projectId) {
+      state.models = res.models;
+      state.modelsProject = pid;
+      renderModelSelect();
+      populateModalModels();
+      updateModelButton();
+    }
+    // Only surface warnings/errors while `pid` is still the active project — a switch mid-request
+    // must not misattribute the previous project's discovery failures to the new one.
+    if (opts.announce && res && Array.isArray(res.warnings) && pid === state.projectId) {
+      for (const w of res.warnings) notice(`Model discovery — ${w.provider}: ${w.message}`, "warning");
+    }
+  } catch (e) {
+    if (opts.announce && pid === state.projectId) notice("Could not reload models: "+e.message, "warning");
+  } finally {
+    _loadingProjectModels = false;
+    if (btn) btn.disabled = false;
+    const pending = _pendingProjectModelLoad;
+    _pendingProjectModelLoad = null;
+    if (pending && pending.pid === state.projectId) {
+      void loadProjectModels(pending.pid, pending.opts);
+    }
+  }
+}
+// Reload re-runs discovery and re-pulls this project's harness names for the current project.
+$("refreshModels").onclick = () => loadProjectModels(state.projectId, { force:true, announce:true });
 
 function initNotificationSettings() {
   const buttons = notificationPermissionButtons();
@@ -1204,6 +1250,7 @@ function openDraftThread(pid, defaultModel) {
   $("mcpMenu").hidden = true;
   $("usageMenu").hidden = true;
   renderMcpButton();
+  loadProjectModels(pid);   // load this project's model list (config + discovery + Codex names)
   setMode("build");
   setApprovalPolicy("ask");
   setTurnActive(false);
@@ -1267,6 +1314,7 @@ async function openThread(pid, tid, title, opts) {
   $("usageMenu").hidden = true;
   renderMcpButton();
   loadMcpServers({ announce:false });
+  loadProjectModels(pid);   // load this project's model list (config + discovery + Codex names)
   setTurnActive(false);
   state.historyLoaded = false; state.oldestTurnId = null; state.hasMoreHistory = false;
   state.loadingHistory = false; state.pendingOlder = false; state.autoFilledTurns = 0;

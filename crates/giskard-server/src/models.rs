@@ -22,6 +22,7 @@ fn from_config(config: &Config, provider: &str, model: &str) -> Option<ModelDesc
         model: model.to_string(),
         context_window: m.context_window,
         supports_reasoning_effort: m.supports_reasoning_effort,
+        reasoning_efforts: Vec::new(),
         display_name: m.display_name.clone(),
     })
 }
@@ -77,11 +78,52 @@ pub fn list_descriptors(config: &Config) -> Vec<ModelDescriptor> {
                 model: m.id.clone(),
                 context_window: m.context_window,
                 supports_reasoning_effort: m.supports_reasoning_effort,
+                reasoning_efforts: Vec::new(),
                 display_name: m.display_name.clone(),
             });
         }
     }
     out
+}
+
+/// Overlay a harness model catalog's metadata onto a descriptor list, keyed by model id
+/// (provider-independent — Codex's `model/list` carries no provider):
+///
+/// - **Display names** fill a descriptor whose `display_name` is unset, so an explicit
+///   `[[providers.models]] display_name` always wins.
+/// - **Reasoning efforts** (the exact levels a model advertises) are applied only to models the
+///   config did **not** explicitly declare. A `[[providers.models]]` entry keeps its configured
+///   effort setting; for discovery-only / built-in models the catalog is the source of truth.
+///
+/// The harness never supplies context window (Codex's `model/list` omits it).
+pub fn apply_harness_metadata(
+    mut base: Vec<ModelDescriptor>,
+    harness_models: &[ModelDescriptor],
+    config: &Config,
+) -> Vec<ModelDescriptor> {
+    use std::collections::{HashMap, HashSet};
+    let by_id: HashMap<&str, &ModelDescriptor> = harness_models
+        .iter()
+        .map(|m| (m.model.as_str(), m))
+        .collect();
+    let declared: HashSet<&str> = config
+        .providers
+        .iter()
+        .flat_map(|p| p.models.iter().map(|m| m.id.as_str()))
+        .collect();
+    for d in &mut base {
+        let Some(h) = by_id.get(d.model.as_str()) else {
+            continue;
+        };
+        if d.display_name.is_none() {
+            d.display_name = h.display_name.clone();
+        }
+        if !declared.contains(d.model.as_str()) && !h.reasoning_efforts.is_empty() {
+            d.supports_reasoning_effort = true;
+            d.reasoning_efforts = h.reasoning_efforts.clone();
+        }
+    }
+    base
 }
 
 // ---- Dynamic /v1/models refresh (spec §8.3) ----
@@ -294,6 +336,167 @@ model_listing = true
     }
 
     #[test]
+    fn harness_metadata_fills_names_and_efforts_by_model_id() {
+        // config declares `@cf/z-ai/glm-4.7` (no efforts); `gpt-5.5` is not declared (discovered).
+        let config = config_with_glm();
+        let base = vec![
+            ModelDescriptor {
+                provider: "openai".into(),
+                model: "gpt-5.5".into(),
+                context_window: 262_144,
+                supports_reasoning_effort: false,
+                reasoning_efforts: Vec::new(),
+                display_name: None,
+            },
+            ModelDescriptor {
+                provider: "cloudflare-litellm".into(),
+                model: "@cf/z-ai/glm-4.7".into(),
+                context_window: 131_072,
+                supports_reasoning_effort: false,
+                reasoning_efforts: Vec::new(),
+                display_name: Some("GLM-4.7".into()),
+            },
+        ];
+        // Harness catalog is provider-agnostic (empty provider), keyed by model id.
+        let harness = vec![
+            ModelDescriptor {
+                provider: String::new(),
+                model: "gpt-5.5".into(),
+                context_window: ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
+                supports_reasoning_effort: true,
+                reasoning_efforts: vec!["low".into(), "high".into()],
+                display_name: Some("GPT-5.5".into()),
+            },
+            ModelDescriptor {
+                provider: String::new(),
+                model: "@cf/z-ai/glm-4.7".into(),
+                context_window: ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
+                supports_reasoning_effort: true,
+                reasoning_efforts: vec!["medium".into()],
+                display_name: Some("GLM 4.7".into()),
+            },
+        ];
+
+        let merged = apply_harness_metadata(base, &harness, &config);
+
+        // Not config-declared: name filled and the catalog's exact efforts applied.
+        let gpt = merged.iter().find(|d| d.model == "gpt-5.5").unwrap();
+        assert_eq!(gpt.display_name.as_deref(), Some("GPT-5.5"));
+        assert!(gpt.supports_reasoning_effort);
+        assert_eq!(gpt.reasoning_efforts, vec!["low", "high"]);
+        // Names only: the harness never changes context window.
+        assert_eq!(gpt.context_window, 262_144);
+
+        // Config-declared: display_name already set stays (config wins), and its configured effort
+        // setting is preserved — the catalog does not override a declared model's efforts.
+        let glm = merged
+            .iter()
+            .find(|d| d.model == "@cf/z-ai/glm-4.7")
+            .unwrap();
+        assert_eq!(glm.display_name.as_deref(), Some("GLM-4.7"));
+        assert!(!glm.supports_reasoning_effort);
+        assert!(glm.reasoning_efforts.is_empty());
+    }
+
+    #[test]
+    fn harness_metadata_precedence_matrix() {
+        // config declares two models: one with a name, one without. Both have efforts off.
+        let config: Config = toml::from_str(
+            r#"
+[[providers]]
+id = "p"
+name = "P"
+wire_api = "responses"
+  [[providers.models]]
+  id = "declared-named"
+  display_name = "Config Name"
+  context_window = 1000
+  supports_reasoning_effort = false
+  [[providers.models]]
+  id = "declared-noname"
+  context_window = 1000
+  supports_reasoning_effort = false
+"#,
+        )
+        .unwrap();
+
+        // Base descriptor with the given name/effort-support (no effort list, like config/discovery).
+        let base_desc = |model: &str, name: Option<&str>, supports: bool| ModelDescriptor {
+            provider: "p".into(),
+            model: model.into(),
+            context_window: 1000,
+            supports_reasoning_effort: supports,
+            reasoning_efforts: Vec::new(),
+            display_name: name.map(str::to_string),
+        };
+        // Harness catalog entry (empty provider) with a name and effort list.
+        let cat = |model: &str, name: &str, efforts: &[&str]| ModelDescriptor {
+            provider: String::new(),
+            model: model.into(),
+            context_window: ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
+            supports_reasoning_effort: !efforts.is_empty(),
+            reasoning_efforts: efforts.iter().map(|e| (*e).to_string()).collect(),
+            display_name: Some(name.into()),
+        };
+
+        let base = vec![
+            base_desc("declared-named", Some("Config Name"), false),
+            base_desc("declared-noname", None, false),
+            base_desc("discovered-named", Some("Already Named"), false),
+            base_desc("discovered-unnamed", None, false),
+            base_desc("discovered-no-catalog-efforts", None, false),
+            base_desc("unknown-to-harness", None, false),
+        ];
+        let harness = vec![
+            cat("declared-named", "Catalog Name", &["low", "high"]),
+            cat("declared-noname", "Catalog NoName", &["low"]),
+            cat("discovered-named", "Catalog Named", &["medium"]),
+            cat("discovered-unnamed", "Catalog Unnamed", &["high", "xhigh"]),
+            cat("discovered-no-catalog-efforts", "Catalog NoEfforts", &[]),
+            // no entry for "unknown-to-harness"
+        ];
+
+        let merged = apply_harness_metadata(base, &harness, &config);
+        let get = |m: &str| merged.iter().find(|d| d.model == m).cloned().unwrap();
+
+        // Declared + config name: name kept; efforts NOT overlaid (config wins for declared models).
+        let d = get("declared-named");
+        assert_eq!(d.display_name.as_deref(), Some("Config Name"));
+        assert!(!d.supports_reasoning_effort);
+        assert!(d.reasoning_efforts.is_empty());
+
+        // Declared + no config name: name fills from catalog; efforts still NOT overlaid (declared).
+        let d = get("declared-noname");
+        assert_eq!(d.display_name.as_deref(), Some("Catalog NoName"));
+        assert!(!d.supports_reasoning_effort);
+        assert!(d.reasoning_efforts.is_empty());
+
+        // Not declared + already named: name preserved (not overridden); efforts applied.
+        let d = get("discovered-named");
+        assert_eq!(d.display_name.as_deref(), Some("Already Named"));
+        assert!(d.supports_reasoning_effort);
+        assert_eq!(d.reasoning_efforts, vec!["medium"]);
+
+        // Not declared + unnamed: name fills and the exact catalog efforts apply (flips support on).
+        let d = get("discovered-unnamed");
+        assert_eq!(d.display_name.as_deref(), Some("Catalog Unnamed"));
+        assert!(d.supports_reasoning_effort);
+        assert_eq!(d.reasoning_efforts, vec!["high", "xhigh"]);
+
+        // Not declared, but the catalog lists no efforts for it: support stays off, list stays empty.
+        let d = get("discovered-no-catalog-efforts");
+        assert_eq!(d.display_name.as_deref(), Some("Catalog NoEfforts"));
+        assert!(!d.supports_reasoning_effort);
+        assert!(d.reasoning_efforts.is_empty());
+
+        // In the list but unknown to the harness: left entirely unchanged.
+        let d = get("unknown-to-harness");
+        assert_eq!(d.display_name, None);
+        assert!(!d.supports_reasoning_effort);
+        assert!(d.reasoning_efforts.is_empty());
+    }
+
+    #[test]
     fn normalizes_stale_provider_when_model_has_one_configured_provider() {
         let config = config_with_glm();
         let normalized = normalize_model_ref(
@@ -301,7 +504,7 @@ model_listing = true
             &ModelRef {
                 provider: "openai".into(),
                 model: "@cf/z-ai/glm-4.7".into(),
-                reasoning_effort: Some(giskard_core::model::Effort::High),
+                reasoning_effort: Some(giskard_core::model::Effort::new("high")),
             },
         );
         assert_eq!(normalized.provider, "cloudflare-litellm");

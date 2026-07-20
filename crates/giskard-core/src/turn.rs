@@ -127,7 +127,7 @@ mod tests {
             model: Some(ModelRef {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
-                reasoning_effort: Some(Effort::High),
+                reasoning_effort: Some(Effort::new("high")),
             }),
             mode: Mode::Build,
             approval_policy: ApprovalPolicy::Ask,

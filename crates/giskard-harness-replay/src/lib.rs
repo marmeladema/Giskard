@@ -84,6 +84,12 @@ pub struct ReplayHarness {
     capabilities: HarnessCapabilities,
     threads: Mutex<Vec<(ThreadId, ThreadState)>>,
     fixtures: Mutex<HashMap<String, PreloadedFixture>>,
+    /// Catalog returned by `list_models` (empty unless set via [`ReplayHarness::with_models`]),
+    /// standing in for a real harness's model catalog (e.g. Codex `model/list`).
+    models: Vec<ModelDescriptor>,
+    /// When set, `list_models` fails with this message instead of returning `models` — used to
+    /// exercise the server's best-effort degradation when a harness catalog query errors.
+    models_error: Option<String>,
     shutdown_called: AtomicBool,
 }
 
@@ -111,8 +117,26 @@ impl ReplayHarness {
             },
             threads: Mutex::new(Vec::new()),
             fixtures: Mutex::new(fixtures),
+            models: Vec::new(),
+            models_error: None,
             shutdown_called: AtomicBool::new(false),
         }
+    }
+
+    /// Advertise a model catalog: sets the list returned by `list_models` and turns on the
+    /// `model_listing` capability, so the server's per-project model overlay runs against it.
+    pub fn with_models(mut self, models: Vec<ModelDescriptor>) -> Self {
+        self.capabilities.model_listing = true;
+        self.models = models;
+        self
+    }
+
+    /// Advertise `model_listing` but make `list_models` fail, to exercise the server's best-effort
+    /// degradation (the picker should still get the config + discovery list).
+    pub fn with_failing_models(mut self, message: impl Into<String>) -> Self {
+        self.capabilities.model_listing = true;
+        self.models_error = Some(message.into());
+        self
     }
 
     /// Load a fixture and create a harness pre-loaded with those events
@@ -155,7 +179,10 @@ impl AgentHarness for ReplayHarness {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelDescriptor>, HarnessError> {
-        Ok(vec![])
+        match &self.models_error {
+            Some(message) => Err(HarnessError::Transport(message.clone())),
+            None => Ok(self.models.clone()),
+        }
     }
 
     async fn list_mcp_servers(&self) -> Result<Vec<McpServerStatus>, HarnessError> {

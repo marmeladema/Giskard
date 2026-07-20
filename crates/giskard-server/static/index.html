@@ -45,10 +45,6 @@
             </select>
           </div>
           <div class="settings-field">
-            <label for="refreshModels">Models</label>
-            <button id="refreshModels" type="button" title="Refresh the model list from the provider's /v1/models endpoint">↻ Reload models</button>
-          </div>
-          <div class="settings-field">
             <label for="notifyBtn">Notifications</label>
             <button id="notifyBtn" class="notify-permission-btn" type="button"
                     title="Enable browser notifications for approval requests">Enable approval notifications</button>
@@ -163,6 +159,10 @@
               <span>Effort</span>
               <select id="effortSel" aria-label="Reasoning effort"></select>
             </label>
+            <div class="mp-field mp-reload">
+              <button id="refreshModels" type="button"
+                      title="Reload this project's models, including any provider /v1/models discovery">↻ Reload models</button>
+            </div>
           </div>
         </div>
       </div>
