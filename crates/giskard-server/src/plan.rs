@@ -164,15 +164,15 @@ mod tests {
 
     #[test]
     fn safe_path_confines_to_root() {
-        let root = Path::new("/home/elie/dev/proj");
+        let root = Path::new("/home/user/dev/proj");
         assert_eq!(
             safe_plan_path(root, "docs/plan.md"),
-            Some(PathBuf::from("/home/elie/dev/proj/docs/plan.md"))
+            Some(PathBuf::from("/home/user/dev/proj/docs/plan.md"))
         );
         // absolute-looking is treated as workspace-relative
         assert_eq!(
             safe_plan_path(root, "/docs/plan.md"),
-            Some(PathBuf::from("/home/elie/dev/proj/docs/plan.md"))
+            Some(PathBuf::from("/home/user/dev/proj/docs/plan.md"))
         );
         // escapes are rejected
         assert!(safe_plan_path(root, "../evil.md").is_none());

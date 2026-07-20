@@ -218,7 +218,7 @@ password_hash = "$argon2id$v=19$m=…"
 session_days = 30
 
 [browse]
-roots = ["/home/elie/dev"]
+roots = ["/home/user/dev"]
 
 [plan]
 default_dir = "docs"
@@ -264,7 +264,7 @@ idle_shutdown_secs = 0
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.server.bind, "127.0.0.1:8787");
-        assert_eq!(config.browse.roots, vec!["/home/elie/dev"]);
+        assert_eq!(config.browse.roots, vec!["/home/user/dev"]);
         assert_eq!(config.providers.len(), 2);
         assert_eq!(config.providers[0].models.len(), 2);
         assert_eq!(config.providers[0].models[0].context_window, 262144);

@@ -3,12 +3,25 @@
 > A local-first, single-user web application that provides a modern browser UI on top of
 > agentic coding CLIs. The first supported agent harness is OpenAI's **Codex CLI** (via its
 > `app-server` JSON-RPC protocol), but the application is designed so the harness is a
-> replaceable component. Built entirely in Rust (Dioxus fullstack + Axum), with **no npm,
-> Node, or JavaScript toolchain** anywhere in the build.
+> replaceable component. Built entirely in Rust (Axum backend + a hand-authored vanilla
+> HTML/CSS/JS UI embedded in the server binary), with **no npm, Node, or JavaScript toolchain**
+> anywhere in the build.
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
 **Version:** 1.52
+
+> **Amendment — frontend approach (supersedes the Dioxus/WASM design below).**
+> This document was written targeting a **Dioxus fullstack / WebAssembly** frontend (`giskard-ui`),
+> and many sections (notably §3.5, §13.1, and the crate map in §3.2) still describe it that way.
+> That approach was **not adopted and is no longer a goal.** The shipped and supported UI is a
+> single hand-authored **vanilla HTML/CSS/JavaScript** page, served as same-origin static assets
+> that are `include_str!`-embedded into the `giskard-server` binary (`crates/giskard-server/static/`:
+> `index.html`, `app.css`, `app.js`, `sw.js`, `favicon.svg`). It requires no npm/Node and no WASM
+> build. The `giskard-ui` crate has been **removed** from the workspace. This vanilla static UI is
+> the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
+> below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
+> and all backend design remain authoritative.
 
 **Changelog (1.51 → 1.52), reliable Markdown finalization:**
 - **M4:** completed agent, reasoning, and user messages use the Markdown renderer whether their
@@ -1632,7 +1645,7 @@ All defined in `giskard-core`, serialized by `giskard-persist`. Illustrative sha
 {
   "version": 1,
   "projects": [
-    { "id": "01J…", "name": "ostinato-radio", "dir": "/home/elie/dev/ostinato-radio",
+    { "id": "01J…", "name": "ostinato-radio", "dir": "/home/user/dev/ostinato-radio",
       "created_at": "2026-07-06T10:00:00Z", "order": 0 }
   ]
 }
@@ -1644,7 +1657,7 @@ All defined in `giskard-core`, serialized by `giskard-persist`. Illustrative sha
   "version": 1,
   "id": "01J…",
   "name": "ostinato-radio",
-  "dir": "/home/elie/dev/ostinato-radio",
+  "dir": "/home/user/dev/ostinato-radio",
   "harness": "codex",
   "workspace_root": null,               // null ⇒ defaults to `dir`
   "default_model": { "provider": "openai", "model": "gpt-5.5", "reasoning_effort": "high" },
@@ -2847,7 +2860,7 @@ supports, including `collaborationMode` and `item/tool/requestUserInput`.
                    "delta": { "text": "I'll start by reading auth.rs…" } } }
 { "type": "ApprovalRequest", "thread_id": "01J…",
   "request": { "id": "ap_7", "kind": "command_execution",
-               "command": "cargo test", "cwd": "/home/elie/dev/x",
+               "command": "cargo test", "cwd": "/home/user/dev/x",
                "decisions": ["accept","accept_for_session","decline","cancel"] } }
 { "type": "Event", "thread_id": "01J…",
   "agent_event": { "kind": "TurnCompleted",
@@ -2874,7 +2887,7 @@ session_days = 30
 [browse]
 # empty/unset ⇒ entire filesystem browsable.
 # set to confine the file picker to these subtrees:
-roots = []                     # e.g. ["/home/elie/dev"]
+roots = []                     # e.g. ["/home/user/dev"]
 
 [plan]
 default_dir = "docs"           # where "Save plan to project" writes

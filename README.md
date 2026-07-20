@@ -4,11 +4,25 @@
 
 A **local-first, single-user web UI** on top of agentic coding CLIs. Giskard runs on your machine,
 manages projects and durable conversation threads, streams the agent's work to a browser in real
-time, visualizes file diffs and referenced source, and tracks token usage. The first (and current)
-agent harness is OpenAI's **Codex CLI**, spoken over its `app-server` JSON-RPC protocol.
+time, visualizes file diffs and referenced source, and tracks token usage.
 
-Built entirely in **Rust** (Axum backend + a self-contained web frontend). No npm/Node/JS toolchain
-in the build.
+The first — and currently the **only** — supported agent harness is OpenAI's **Codex CLI**, spoken
+over its `app-server` JSON-RPC protocol. **A working, authenticated Codex CLI is required today**
+(see [Prerequisites](#prerequisites)); without it, projects can be created but turns fail. The
+harness is a deliberately replaceable component, though — it lives behind a neutral `AgentHarness`
+trait — so other agent CLIs such as **Claude Code** could be added without touching the rest of the
+app. That work just hasn't happened yet. _(Anthropic, if you're reading this: a generous pile of
+Claude credits would move Claude Code support up the roadmap considerably_ 😁_.)_
+
+Built entirely in **Rust** (Axum backend + a hand-authored vanilla HTML/CSS/JS frontend). No
+npm/Node/JS toolchain in the build.
+
+The server is a **single self-contained binary**: the entire web UI (HTML, CSS, JS, favicon) is
+compiled into `giskard-server`, so there are no separate frontend assets to build, bundle, or serve.
+Drop the binary on a machine, point it at a data directory, and run it — no runtime, no Node, no
+static-file hosting, no reverse proxy required. That makes it trivial to deploy and run anywhere: run
+it from a checkout, `cargo install` it, or copy a compiled binary to the target host. (A second small
+binary, `giskard-admin`, handles password and data management — see below.)
 
 > The authoritative design document is [`specs/giskard-specification.md`](specs/giskard-specification.md).
 > This README is the practical setup/usage guide and must be kept in sync with the code (see
@@ -337,14 +351,13 @@ Cargo workspace under `crates/`:
 | `giskard-persist` | Flat-file storage + the `giskard-admin` binary. |
 | `giskard-proto` | Shared client↔server wire types (path-mirrored `Wire*` types). |
 | `giskard-server` | Axum backend: auth, WS hub, services, syntax highlighting, and the web UI. |
-| `giskard-ui` | Frontend crate (see note below). |
 
-**Frontend note:** the desktop UI is currently a single self-contained page (HTML/CSS/vanilla JS,
-no npm) served by `giskard-server` at `/`, with its stylesheet and script as separate same-origin
-assets (`/app.css`, `/app.js`) so the Content-Security-Policy can forbid inline script. The
-favicon is served as a same-origin SVG at `/favicon.svg`. The spec targets a Dioxus/WASM frontend
-(`giskard-ui`); because the wire contract (`giskard-proto`) is stable, that port can happen
-without server changes.
+**Frontend note:** the UI is a single self-contained page (hand-authored HTML/CSS/vanilla JS, no
+npm/Node) served by `giskard-server` at `/`, with its stylesheet and script as separate same-origin
+assets (`/app.css`, `/app.js`) so the Content-Security-Policy can forbid inline script. The favicon
+is served as a same-origin SVG at `/favicon.svg`. This vanilla static UI is the supported frontend
+for the foreseeable future — an earlier plan for a Dioxus/WASM client was dropped, and the crate that
+would have held it (`giskard-ui`) has been removed.
 
 ---
 

@@ -2,7 +2,9 @@
 
 ## Project
 Giskard: a local-first, single-user web UI for agentic coding CLIs (Codex CLI first).
-Built in Rust (Dioxus fullstack + Axum). No npm/Node/JS toolchain.
+Built in Rust (Axum backend + a hand-authored vanilla HTML/CSS/JS UI embedded in the
+`giskard-server` binary). No npm/Node/JS toolchain. The vanilla static UI is the supported frontend
+for the foreseeable future; an earlier Dioxus/WASM plan was dropped.
 
 ## Specification
 `specs/giskard-specification.md` is the authoritative spec. Read it before making changes.
@@ -21,7 +23,7 @@ identifier mappings, lifecycle behavior, protocol routing, process control, and 
 ## Build & Test
 
 ```bash
-# Build all native crates (Phase 0 — no WASM needed yet)
+# Build all crates
 cargo build
 
 # Run all tests
@@ -49,15 +51,14 @@ change, so the README never shows a stale UI. (No regeneration needed for change
 effect, e.g. backend-only or copy-only edits.)
 
 ## Architecture
-Cargo workspace with 8 crates under `crates/`:
+Cargo workspace with 7 crates under `crates/`:
 - `giskard-core` — pure domain types (no I/O)
 - `giskard-harness` — `AgentHarness` trait + capabilities
 - `giskard-harness-codex` — Codex CLI adapter (Phase 1)
 - `giskard-harness-replay` — deterministic replay for tests (Phase 1)
 - `giskard-persist` — flat-file storage + `giskard-admin` binary
 - `giskard-proto` — shared client↔server wire types
-- `giskard-server` — Axum backend (Phase 2)
-- `giskard-ui` — Dioxus WASM frontend (Phase 2)
+- `giskard-server` — Axum backend + the embedded vanilla static web UI (`static/`)
 
 ## Conventions
 - Edition 2024, MSRV 1.85.
