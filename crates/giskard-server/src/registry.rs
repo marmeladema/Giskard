@@ -13,7 +13,7 @@ use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{Item, ItemPayload, command_status_is_running, normalized_command_status};
 use giskard_core::mcp::{McpOauthStart, McpServerStatus};
-use giskard_core::model::ModelRef;
+use giskard_core::model::{ModelDescriptor, ModelRef};
 use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::turn::{Mode, Turn, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
@@ -771,6 +771,16 @@ impl HarnessRegistry {
     ) -> Result<Vec<McpServerStatus>, HarnessError> {
         let harness = self.get_or_create_harness(config.id, config).await?;
         harness.list_mcp_servers().await
+    }
+
+    /// List the models the project's harness advertises (e.g. Codex's `model/list` catalog). Used to
+    /// overlay friendly display names onto the configured model list.
+    pub async fn list_models(
+        &self,
+        config: &ProjectConfig,
+    ) -> Result<Vec<ModelDescriptor>, HarnessError> {
+        let harness = self.get_or_create_harness(config.id, config).await?;
+        harness.list_models().await
     }
 
     pub async fn capabilities(

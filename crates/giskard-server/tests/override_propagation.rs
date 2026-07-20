@@ -261,7 +261,7 @@ async fn send_input_snapshot_carries_model_effort_and_thread_policy() {
         model_ref: ModelRef {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
-            reasoning_effort: Some(Effort::High),
+            reasoning_effort: Some(Effort::new("high")),
         },
     }))
     .await
@@ -287,7 +287,7 @@ async fn send_input_snapshot_carries_model_effort_and_thread_policy() {
         Some(ModelRef {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
-            reasoning_effort: Some(Effort::High),
+            reasoning_effort: Some(Effort::new("high")),
         }),
         "fix #1: current model + effort must reach the harness"
     );

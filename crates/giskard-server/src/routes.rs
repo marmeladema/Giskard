@@ -20,9 +20,10 @@ use tracing::{debug, error, info, warn};
 use futures::{SinkExt, StreamExt};
 use giskard_core::error::{HarnessError, PersistError};
 use giskard_core::ids::{ProjectId, ThreadId};
-use giskard_core::model::ModelRef;
+use giskard_core::model::{ModelDescriptor, ModelRef};
 use giskard_core::turn::{ApprovalPolicy, Mode, TurnOverrides};
 use giskard_core::user_input::UserInput;
+use giskard_persist::Config;
 use giskard_persist::store::{ProjectConfig, ThreadFile};
 use giskard_proto::*;
 use tokio::sync::mpsc;
@@ -72,6 +73,7 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
         .route("/api/browse/mkdir", post(browse_mkdir))
         .route("/api/models", get(list_models))
         .route("/api/models/refresh", post(refresh_models))
+        .route("/api/projects/{id}/models", get(project_list_models))
         .route("/api/projects/{id}/mcp", get(list_mcp_servers))
         .route("/api/projects/{id}/mcp/reload", post(reload_mcp_servers))
         .route(
@@ -1385,6 +1387,64 @@ async fn refresh_models(
     Ok(Json(ListModelsResponse { models, warnings }))
 }
 
+/// `GET /api/projects/{id}/models` — the model picker list for a project: every configured model
+/// merged with each `model_listing` provider's `/v1/models` discovery, and the project harness's
+/// friendly `display_name` overlaid by model id where the config left one unset (spec §8.3). For a
+/// Codex project this surfaces Codex's `model/list` names instead of raw ids. Per-provider discovery
+/// failures come back as `warnings`; the harness name overlay is best-effort (a harness that can't
+/// list models just yields the discovered list with config/raw names).
+async fn project_list_models(
+    State(state): State<AppState>,
+    AxumPath(project_id): AxumPath<ProjectId>,
+) -> Result<Json<ListModelsResponse>, ApiError> {
+    let project_config = state
+        .store
+        .load_project(project_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let config = state.store.load_config().await?;
+    let (base, warnings) = crate::models::refresh_models(&config).await;
+    let models = overlay_harness_metadata(&state, &project_config, &config, base).await;
+    Ok(Json(ListModelsResponse { models, warnings }))
+}
+
+/// Overlay the project harness's model metadata (friendly names + advertised reasoning efforts) onto
+/// `base` when the harness supports model listing. Best-effort: capability or listing failures are
+/// logged and leave `base` unchanged, so a non-Codex harness (or a Codex process that can't answer)
+/// just yields config/discovered metadata.
+async fn overlay_harness_metadata(
+    state: &AppState,
+    project_config: &ProjectConfig,
+    config: &Config,
+    base: Vec<ModelDescriptor>,
+) -> Vec<ModelDescriptor> {
+    match state.registry.capabilities(project_config).await {
+        Ok(caps) if !caps.model_listing => return base,
+        Ok(_) => {}
+        Err(e) => {
+            warn!(
+                project_id = %project_config.id,
+                harness = %project_config.harness,
+                error = %e,
+                "cannot read harness capabilities; serving models without harness metadata"
+            );
+            return base;
+        }
+    }
+    match state.registry.list_models(project_config).await {
+        Ok(harness_models) => crate::models::apply_harness_metadata(base, &harness_models, config),
+        Err(e) => {
+            warn!(
+                project_id = %project_config.id,
+                harness = %project_config.harness,
+                error = %e,
+                "harness model listing failed; serving models without harness metadata"
+            );
+            base
+        }
+    }
+}
+
 async fn list_mcp_servers(
     State(state): State<AppState>,
     AxumPath(project_id): AxumPath<ProjectId>,
@@ -2130,7 +2190,7 @@ async fn handle_client_msg(
                 .update_thread(project_id, thread_id, move |tf| {
                     let old = crate::models::resolve_descriptor(&config, &tf.current_model);
                     if old.supports_reasoning_effort {
-                        if let Some(effort) = tf.current_model.reasoning_effort {
+                        if let Some(effort) = tf.current_model.reasoning_effort.clone() {
                             tf.model_efforts.insert(tf.current_model.key(), effort);
                         }
                     }
@@ -2144,7 +2204,7 @@ async fn handle_client_msg(
                             tf.model_efforts.remove(&new_model.key());
                         } else if new_model.reasoning_effort.is_none() {
                             new_model.reasoning_effort =
-                                tf.model_efforts.get(&new_model.key()).copied();
+                                tf.model_efforts.get(&new_model.key()).cloned();
                         }
                     } else {
                         new_model.reasoning_effort = None;

@@ -1724,7 +1724,7 @@ fn effective_model(
     Some(giskard_core::model::ModelRef {
         provider: model_provider.to_string(),
         model: model.to_string(),
-        reasoning_effort: requested.reasoning_effort,
+        reasoning_effort: requested.reasoning_effort.clone(),
     })
 }
 
@@ -1810,7 +1810,7 @@ fn build_turn_start_params(
     let effort = overrides
         .model
         .as_ref()
-        .and_then(|m| m.reasoning_effort)
+        .and_then(|m| m.reasoning_effort.clone())
         .map(mapping::map_effort);
 
     let mut params = serde_json::json!({
@@ -2389,11 +2389,19 @@ fn map_model(model: codex_codes::Model) -> ModelDescriptor {
     } else {
         Some(model.display_name)
     };
+    // The exact reasoning-effort levels this model advertises (Codex `ReasoningEffort` is a bare
+    // string), preserved verbatim so the picker offers precisely what the catalog defines.
+    let reasoning_efforts: Vec<String> = model
+        .supported_reasoning_efforts
+        .into_iter()
+        .map(|option| option.reasoning_effort.0)
+        .collect();
     ModelDescriptor {
         provider: String::new(),
         model: id,
         context_window: ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
-        supports_reasoning_effort: !model.supported_reasoning_efforts.is_empty(),
+        supports_reasoning_effort: !reasoning_efforts.is_empty(),
+        reasoning_efforts,
         display_name,
     }
 }
@@ -2603,6 +2611,7 @@ mod tests {
         hang_methods: HashSet<String>,
         background_terminal_terminate_result: Option<bool>,
         command_exec_terminate_error: Option<String>,
+        model_list_error: Option<String>,
         hang_response_json: bool,
         hang_shutdown: bool,
         requests: Vec<FakeRequest>,
@@ -2665,6 +2674,10 @@ mod tests {
 
         async fn fail_command_exec_terminate(&self, message: &str) {
             self.state.lock().await.command_exec_terminate_error = Some(message.into());
+        }
+
+        async fn fail_model_list(&self, message: &str) {
+            self.state.lock().await.model_list_error = Some(message.into());
         }
 
         async fn hang_json_responses(&self) {
@@ -2764,6 +2777,13 @@ mod tests {
                         "data": [],
                         "nextCursor": null
                     })),
+                    codex_codes::protocol::methods::MODEL_LIST
+                        if state.model_list_error.is_some() =>
+                    {
+                        Err(HarnessError::Transport(
+                            state.model_list_error.clone().unwrap(),
+                        ))
+                    }
                     codex_codes::protocol::methods::MODEL_LIST => Ok(json!({
                         "data": [
                             {
@@ -3392,6 +3412,8 @@ mod tests {
             flagship.supports_reasoning_effort,
             "gpt-5.5 advertises reasoning efforts"
         );
+        // The exact effort levels from the catalog are preserved for the picker.
+        assert_eq!(flagship.reasoning_efforts, vec!["medium", "high"]);
         // model/list carries no provider and no context window.
         assert_eq!(flagship.provider, "");
         assert_eq!(
@@ -3415,6 +3437,26 @@ mod tests {
                 .any(|req| req.method == codex_codes::protocol::methods::MODEL_LIST),
             "list_models should issue a model/list request"
         );
+    }
+
+    #[tokio::test]
+    async fn codex_list_models_surfaces_transport_failure() {
+        let (harness, controller) = spawn_fake_harness();
+        controller.fail_model_list("model/list exploded").await;
+
+        let result = timeout(Duration::from_secs(1), harness.list_models())
+            .await
+            .expect("list_models should complete");
+
+        match result {
+            Err(HarnessError::Transport(message)) => {
+                assert!(
+                    message.contains("model/list exploded"),
+                    "unexpected error message: {message}"
+                );
+            }
+            other => panic!("expected a transport error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -3995,7 +4037,7 @@ mod tests {
         let params = build_turn_start_params(
             &test_thread(),
             &UserInput::text("make a plan"),
-            &turn_overrides(Mode::Plan, Some(Effort::Medium)),
+            &turn_overrides(Mode::Plan, Some(Effort::new("medium"))),
         )
         .unwrap();
 

@@ -395,6 +395,8 @@
   .mp-field[hidden] { display:none; }   /* the grid display above would otherwise defeat [hidden] */
   .mp-field > label, .mp-field > span { color:var(--muted); font-size:11px; }
   .mp-field select { width:100%; }
+  .mp-reload { grid-column:1 / -1; }   /* the reload button gets its own full-width row */
+  .mp-reload button { width:100%; }
   .composer textarea:disabled { opacity:.65; cursor:not-allowed; }
   button:disabled { opacity:.55; cursor:not-allowed; }
 

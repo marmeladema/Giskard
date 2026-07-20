@@ -210,6 +210,33 @@ terminate the same unified-exec process. Tracking the process backend explicitly
 or reconciling against `thread/backgroundTerminals/list` would remove this
 heuristic.
 
+## Model catalog (`model/list`)
+
+The adapter advertises the `model_listing` capability and implements
+`list_models` against the app-server `model/list` RPC. Like the MCP-status
+listing, the request runs as a control command on the worker queue
+(`handle_list_models`), paginating with the response cursor until exhausted.
+
+Each returned model is mapped to a Giskard `ModelDescriptor` (`map_model`):
+
+- **Display name** — Codex's friendly `display_name` is carried through, so the
+  picker can show it instead of the raw slug.
+- **Reasoning efforts** — the model's `supported_reasoning_efforts` are preserved
+  verbatim (Codex `ReasoningEffort` is a bare string), and
+  `supports_reasoning_effort` is set when that list is non-empty.
+- **Hidden models** are filtered out (only picker-visible entries are returned).
+- **Empty provider** — the `model/list` catalog is provider-agnostic (a bare
+  model slug, no provider), so descriptors leave `provider` empty; matching a
+  catalog entry to a Giskard `(provider, model)` pair is by model id and is the
+  caller's responsibility.
+- **Conservative context window** — `model/list` omits the context window, so
+  descriptors use the conservative default; the catalog is a source of names and
+  reasoning-effort levels only, not gauge sizing.
+
+The server overlays this metadata onto the configured/discovered model list by
+model id (see `giskard-server` §8.3): config names win, and reasoning efforts
+fill in for models the config did not explicitly declare.
+
 ## Restart and unload behavior
 
 Unified-exec process entries are in memory and belong to the loaded Codex thread

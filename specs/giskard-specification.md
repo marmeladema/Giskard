@@ -700,6 +700,8 @@
 - **S3:** Renamed `HarnessError::Timed` → `HarnessError::Timeout` (§4.5).
 - **S4:** Aligned `Effort` to the pinned Codex `ModelReasoningEffort`
   (`minimal | low | medium | high | xhigh`) instead of hardcoding three values (§4.5, §8.5).
+  Since generalized: `Effort` is now a transparent string newtype (Codex's `ReasoningEffort` is
+  itself a bare string), so model-defined efforts round-trip without a fixed set (§8.5).
 - **S5:** Documented that project ordering defaults to ULID creation order; the `projects.json`
   `order` field is reserved for a future manual/drag reorder and is not yet surfaced by the UI (§5.3).
 
@@ -1096,7 +1098,8 @@ pub struct HarnessCapabilities {
     pub structured_diffs: bool,
     /// Durable thread resume across process/app restarts.
     pub resumable_threads: bool,
-    /// A queryable model list (e.g. GET /v1/models via the provider).
+    /// The harness can list its own model catalog (e.g. Codex's app-server `model/list`),
+    /// used to overlay friendly display names onto the configured list (§8.3).
     pub model_listing: bool,
     /// Token usage reported on turn completion.
     pub token_usage: bool,
@@ -1111,9 +1114,11 @@ pub struct HarnessCapabilities {
 }
 ```
 
-Codex advertises all Codex-backed capabilities as `true`, except harness-owned model listing
-(`model_listing`) because Giskard currently resolves provider models through its config/provider
-metadata (§8.3). A future Claude Code adapter would likely set `live_approvals`,
+Codex advertises all Codex-backed capabilities as `true`, including `model_listing`: the adapter
+maps the app-server `model/list` RPC and Giskard overlays that metadata — friendly display names and
+each model's advertised reasoning efforts — onto its config/provider model list, by model id (§8.3).
+Context window still comes from Giskard's config/provider metadata (`model/list` omits it). A future
+Claude Code adapter would likely set `live_approvals`,
 `structured_diffs`, `mcp_status`, and possibly `plan_build_modes` to `false` or a degraded form,
 and the UI reacts accordingly (§13.5).
 
@@ -1495,17 +1500,18 @@ pub struct ModelRef {
     pub model: String,
     pub reasoning_effort: Option<Effort>,
 }
-// S4: mirrors the pinned Codex `ModelReasoningEffort` (verified against codex-codes 0.143.0:
-// minimal | low | medium | high | xhigh). Do not hardcode a smaller set; a future harness with a
-// different vocabulary should map onto (or extend) this enum at its boundary, and the effort
-// selector is only shown when the chosen model advertises `supports_reasoning_effort` (§8.5).
-pub enum Effort { Minimal, Low, Medium, High, XHigh }
+// Reasoning efforts are model-defined (Codex's `ReasoningEffort` is a bare string), so this is a
+// transparent string newtype, not a closed set: Giskard passes the value through to the harness and
+// never branches on it. Common values are minimal | low | medium | high | xhigh; the effort selector
+// is only shown when the chosen model advertises `supports_reasoning_effort` (§8.5).
+pub struct Effort(pub String);
 
 pub struct ModelDescriptor {
     pub provider: String,
     pub model: String,
     pub context_window: u32,                 // drives the context gauge (§10.3)
     pub supports_reasoning_effort: bool,     // drives effort-selector visibility (§8.5)
+    pub reasoning_efforts: Vec<String>,      // exact effort levels the model advertises (§8.3, §8.5)
     pub display_name: Option<String>,
 }
 
@@ -2027,7 +2033,8 @@ LiteLLM gateway fronting Cloudflare Workers AI.
 - Each model entry resolves to a `ModelDescriptor { provider, model, context_window,
   supports_reasoning_effort, display_name }`. `context_window` drives the thread context gauge
   (§10.3); `supports_reasoning_effort` drives whether the effort selector is shown (§8.5).
-- **Metadata source precedence** (first hit wins):
+- **Metadata source precedence** (first hit wins) for `context_window` and
+  `supports_reasoning_effort`:
   1. the typed `[[providers.models]]` entry in config;
   2. the `/v1/models` response, **if** it includes the field (many OpenAI-compatible
      endpoints, including LiteLLM, return `context_window`/`max_input_tokens` and capability
@@ -2036,6 +2043,29 @@ LiteLLM gateway fronting Cloudflare Workers AI.
   4. a **conservative fallback** (`context_window = 128000`, `supports_reasoning_effort =
      false`) with a UI warning badge ("context size unknown — using default"), so an unknown
      model is still usable and the gauge still renders.
+
+  `display_name` follows the same config-first order, plus per-project harness metadata as below.
+- **Per-project model list + harness metadata.** When a project is open, the picker list is served
+  **per project** by `GET /api/projects/{id}/models`: the configured models, merged with each
+  `model_listing` provider's `/v1/models` discovery, with the project harness's metadata overlaid on
+  top. A harness may advertise its own model catalog — the Codex adapter maps the app-server
+  `model/list` RPC (behind the `model_listing` capability). Two things are overlaid, keyed by
+  **model id and independent of provider** (the Codex catalog carries no provider; the same model id
+  denotes the same model even if two providers route it differently — routing stays keyed by
+  `(provider, model)` per §8.1):
+  - **`display_name`** — applied when the config left one unset, so an explicit config name wins.
+  - **`reasoning_efforts`** — the exact effort levels the model advertises, used to populate the
+    effort selector (§8.5). Applied only to models the config did **not** explicitly declare; a
+    `[[providers.models]]` entry keeps its configured `supports_reasoning_effort`. Efforts are
+    model-defined strings (see `Effort` in §8.5), so whatever the catalog lists is offered verbatim.
+
+  The harness never supplies `context_window` (Codex's `model/list` omits it). Per-provider
+  discovery failures come back as `warnings`; the overlay is best-effort, so a non-Codex harness (or
+  a Codex process that can't answer) just yields the config + discovery list with config/raw
+  metadata. The list is loaded once per project (not per thread) and re-fetched by the picker's
+  "Reload models" action. The global `/api/models` route is the no-project baseline (config +
+  discovery, no harness metadata) for the startup list and the
+  new-project dialog.
 - **Stale-provider normalization (E5).** When a persisted/project `ModelRef` names a provider
   that is no longer configured, but its `model` id appears under exactly one configured provider,
   the server rewrites the provider to that configured provider before opening/resuming or starting
@@ -2066,11 +2096,16 @@ LiteLLM gateway fronting Cloudflare Workers AI.
 
 ### 8.5 Reasoning effort
 
-- Effort (`minimal | low | medium | high | xhigh`, matching the pinned Codex `ModelReasoningEffort`,
-  S4) is selectable **only when the chosen model supports it** (`supports_reasoning_effort`);
+- Reasoning efforts are **model-defined**, not a fixed set. The `Effort` type is a transparent
+  string newtype (Codex's own `ReasoningEffort` is likewise a bare string); Giskard never branches on
+  the value, it just carries the user's selection to the harness. Common values are
+  `minimal | low | medium | high | xhigh`, but a model may advertise any string (e.g. `max`), and it
+  round-trips unchanged.
+- Effort is selectable **only when the chosen model supports it** (`supports_reasoning_effort`);
   otherwise the selector is hidden and no effort param is sent (avoids sending unsupported
-  parameters). If a model descriptor supplies a concrete effort list, the browser uses it;
-  otherwise the Codex-compatible set above is offered for reasoning models.
+  parameters). When a model descriptor supplies a concrete effort list (`reasoning_efforts` — e.g.
+  from Codex's `model/list`, §8.3), the browser offers exactly those; otherwise the common set above
+  is offered for reasoning models.
 
 ---
 
