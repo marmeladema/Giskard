@@ -383,11 +383,13 @@ pub struct BrowseResponse {
     pub entries: Vec<DirEntry>,
 }
 
-/// A per-provider failure encountered while refreshing the model list from `/v1/models` (§8.3),
-/// surfaced so the user sees e.g. a 401 instead of silently getting no models.
+/// A non-fatal failure from one source participating in model-list composition (§8.3).
+///
+/// `source` identifies either a configured provider (`provider:<id>`) or the project harness
+/// (`harness:<kind>`), so the browser can report degraded discovery without conflating the two.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderListingWarning {
-    pub provider: String,
+pub struct ModelListingWarning {
+    pub source: String,
     pub message: String,
 }
 
@@ -395,9 +397,9 @@ pub struct ProviderListingWarning {
 #[derive(Debug, Clone, Serialize)]
 pub struct ListModelsResponse {
     pub models: Vec<ModelDescriptor>,
-    /// Non-fatal per-provider discovery failures from a refresh (empty for the static listing).
+    /// Non-fatal provider or harness listing failures (empty for the static listing).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub warnings: Vec<ProviderListingWarning>,
+    pub warnings: Vec<ModelListingWarning>,
 }
 
 #[derive(Debug, Clone, Serialize)]

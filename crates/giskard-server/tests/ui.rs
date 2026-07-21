@@ -1299,6 +1299,131 @@ async fn index_page_is_served_and_public() {
     assert!(!body.contains("cdn"), "no CDN references");
 }
 
+#[test]
+fn browser_isolates_global_and_project_model_catalogs() {
+    let body = app_js();
+
+    let start_app = between(
+        body,
+        "async function startApp() {",
+        "// The global (no-project)",
+    );
+    assert!(
+        start_app
+            .contains("state.globalModels = (await api(\"GET\",\"/api/models\")).models || []")
+            && !start_app.contains("state.models = (await api(\"GET\",\"/api/models\""),
+        "startup keeps the no-project catalog separate from the active project catalog"
+    );
+
+    let modal_models = between(
+        body,
+        "function populateModalModels() {",
+        "function openProjectModal() {",
+    );
+    assert!(
+        modal_models.contains("for (const m of state.globalModels)")
+            && modal_models.contains("if (!state.globalModels.length)")
+            && !modal_models.contains("state.models"),
+        "the new-project modal only exposes the global model catalog"
+    );
+
+    let prepare_catalog = between(
+        body,
+        "function prepareProjectModelCatalog(pid) {",
+        "async function loadProjectModels(pid, opts) {",
+    );
+    assert_order(
+        prepare_catalog,
+        "state.models = [];",
+        "renderModelSelect();",
+    );
+    assert!(
+        prepare_catalog.contains("if (state.modelsProject === pid) return;")
+            && prepare_catalog.contains("state.modelsProject = null;")
+            && prepare_catalog.contains("updateComposerControls();"),
+        "switching projects invalidates and disables the previous project catalog immediately"
+    );
+
+    let load_catalog = between(
+        body,
+        "async function loadProjectModels(pid, opts) {",
+        "// Reload re-runs discovery",
+    );
+    assert!(
+        load_catalog.contains("pid === state.projectId")
+            && load_catalog.contains("state.models = res.models;")
+            && load_catalog.contains("state.modelsProject = pid;")
+            && !load_catalog.contains("populateModalModels();"),
+        "project responses stay scoped to the active project and cannot replace modal options"
+    );
+
+    let open_draft = between(
+        body,
+        "function openDraftThread(pid, defaultModel) {",
+        "/* ---------- thread view + websocket ---------- */",
+    );
+    assert_order(
+        open_draft,
+        "state.currentModel = normalizeDraftModel(defaultModel);",
+        "prepareProjectModelCatalog(pid);",
+    );
+    assert_order(
+        open_draft,
+        "prepareProjectModelCatalog(pid);",
+        "loadProjectModels(pid);",
+    );
+
+    let open_thread = between(
+        body,
+        "async function openThread(pid, tid, title, opts) {",
+        "function clearWsReconnectTimer()",
+    );
+    assert_order(
+        open_thread,
+        "state.currentModel = null;",
+        "prepareProjectModelCatalog(pid);",
+    );
+    assert_order(
+        open_thread,
+        "prepareProjectModelCatalog(pid);",
+        "loadProjectModels(pid);",
+    );
+
+    let composer_controls = between(
+        body,
+        "function updateComposerControls() {",
+        "function setTurnActive(active) {",
+    );
+    assert!(
+        composer_controls.contains("const modelCatalogReady = projectModelCatalogReady();")
+            && composer_controls.matches("!modelCatalogReady").count() == 3,
+        "model, picker, and effort controls remain disabled until the active catalog is ready"
+    );
+
+    let render_models = between(
+        body,
+        "function renderModelSelect() {",
+        "function modelOptionLabel(m) {",
+    );
+    assert!(
+        render_models.contains("o.value = modelKey(state.currentModel);")
+            && render_models.contains("o.textContent = modelOptionLabel(state.currentModel);")
+            && render_models.contains("(loading models...)"),
+        "catalog invalidation preserves the current model display while hiding old options"
+    );
+
+    let thread_state = between(
+        body,
+        "function renderThreadState(s) {",
+        "function resetTranscriptForAuthoritativeSnapshot()",
+    );
+    assert!(
+        thread_state.contains("if (projectModelCatalogReady()) syncModelControls();")
+            && thread_state.contains("else renderModelSelect();"),
+        "a current model received before the catalog replaces the generic loading placeholder"
+    );
+}
+
 #[tokio::test]
 async fn version_meta_and_immutable_asset_caching() {
     let port = 19301;

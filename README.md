@@ -207,8 +207,11 @@ reads `~/.codex/config.toml` for real provider/auth, so any model you select mus
 actually reach.
 
 Models with `supports_reasoning_effort = true` expose a thread-header **Effort** selector next to
-the model picker. Choose `Model default` to omit the effort parameter, or select a concrete Codex
-effort (`Minimal` through `Extra High`) for subsequent turns in that thread.
+the model picker. Choose `Default` to omit the effort parameter, or select one of the exact effort
+levels advertised by the project harness. Effort values are model-defined strings; familiar models
+commonly offer `minimal`, `low`, `medium`, `high`, or `xhigh`, while other values are passed through
+unchanged. Reloading the picker refreshes provider discovery and harness metadata; non-fatal
+failures are shown as warnings while the usable portion of the model list remains available.
 
 ---
 
@@ -316,7 +319,7 @@ WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticke
 /api/projects/{id}/threads`, `POST /api/projects/{id}/threads/start`, `DELETE
 /api/projects/{id}/threads/{thread_id}`, `PATCH /api/projects/{id}/threads/{thread_id}/title`,
 `POST /api/projects/{id}/threads/{thread_id}/archive`, `GET /api/models`, `POST
-/api/models/refresh`,
+/api/models/refresh`, `GET /api/projects/{id}/models`,
 `GET /api/tokens`, `GET /api/projects/{id}/tokens`,
 `GET /api/projects/{id}/highlight|raw|image`, `POST
 /api/projects/{id}/linkify`, `POST /api/projects/{id}/render`, `GET /api/browse`, `POST

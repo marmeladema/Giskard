@@ -2389,13 +2389,18 @@ fn map_model(model: codex_codes::Model) -> ModelDescriptor {
     } else {
         Some(model.display_name)
     };
-    // The exact reasoning-effort levels this model advertises (Codex `ReasoningEffort` is a bare
-    // string), preserved verbatim so the picker offers precisely what the catalog defines.
-    let reasoning_efforts: Vec<String> = model
+    // Codex separates the default effort from selectable alternatives. Its TUI treats a non-`none`
+    // default as the sole valid choice when the alternatives list is empty, so normalize that case
+    // here instead of incorrectly classifying a default-only reasoning model as non-reasoning.
+    let default_reasoning_effort = model.default_reasoning_effort.0;
+    let mut reasoning_efforts: Vec<String> = model
         .supported_reasoning_efforts
         .into_iter()
         .map(|option| option.reasoning_effort.0)
         .collect();
+    if reasoning_efforts.is_empty() && default_reasoning_effort != "none" {
+        reasoning_efforts.push(default_reasoning_effort);
+    }
     ModelDescriptor {
         provider: String::new(),
         model: id,
@@ -3425,9 +3430,10 @@ mod tests {
         assert_eq!(mini.model, "gpt-5.5-mini");
         assert_eq!(mini.display_name.as_deref(), Some("GPT-5.5 mini"));
         assert!(
-            !mini.supports_reasoning_effort,
-            "mini advertises no reasoning efforts"
+            mini.supports_reasoning_effort,
+            "a non-none default is the sole effort when alternatives are empty"
         );
+        assert_eq!(mini.reasoning_efforts, vec!["medium"]);
 
         assert!(
             controller
