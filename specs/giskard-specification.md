@@ -9,7 +9,7 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.53
+**Version:** 1.54
 
 > **Amendment — frontend approach (supersedes the Dioxus/WASM design below).**
 > This document was written targeting a **Dioxus fullstack / WebAssembly** frontend (`giskard-ui`),
@@ -22,6 +22,18 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.53 → 1.54), authoritative context-window metadata:**
+- **C4:** Giskard has no model-name defaults table. Initial context capacity comes from exact
+  config, provider-advertised `context_window` / `max_input_tokens`, or the conservative fallback.
+- **C8:** harnesses may emit `ContextWindowUpdated` for a turn. The server persists the effective
+  value for the event's exact `(provider, model)`, updates the active gauge only while that model is
+  selected, and restores it after reloads and model switches without replacing it during turn
+  completion.
+- **C9:** the Codex adapter maps
+  `thread/tokenUsage/updated.tokenUsage.modelContextWindow`, rejects invalid values with a warning,
+  and suppresses consecutive unchanged reports within a turn. Resume-time historical usage replay
+  is not treated as a new runtime observation.
 
 **Changelog (1.52 → 1.53), project model-catalog consistency:**
 - **M8:** the server caches the composed model descriptors per project and uses that same catalog
@@ -701,9 +713,9 @@
 - **C3:** The per-model token breakdown is stored as a **nested object** (`by_model[provider][model]`),
   not an interpolated `"provider/model"` string key, because provider/model ids can contain slashes
   (e.g. `@cf/z-ai/glm-4.7`) and would be ambiguous to re-split (§5.3, §10.2).
-- **C4:** Thread `context_window` is a **cache**, not a source of truth: it is derived from the current
-  model's descriptor and recomputed from `current_model` on load, so a corrected config value is
-  honored (§5.3, §8.4, §10.3).
+- **C4:** Thread `context_window` is a **cache**, not a source of truth. This original descriptor-only
+  rule is superseded by 1.54/C8: harness-reported runtime values are retained per model and take
+  precedence over initial descriptor metadata (§5.3, §8.4, §10.3).
 - **C5:** Defined the resume-failure policy: if resume-by-id fails (Codex thread store purged/rotated),
   start a fresh native thread, keep the Giskard-side history, and warn the user that agent context was
   lost (§4.7, §7.1).
@@ -1234,6 +1246,12 @@ browser tabs).
 pub enum AgentEvent {
     ThreadOpened { thread: ThreadId, harness_thread_id: String },
     TurnStarted  { thread: ThreadId, turn: TurnId },
+    ContextWindowUpdated {
+        thread: ThreadId,
+        turn: TurnId,
+        model: ModelRef,
+        context_window: u32,
+    },
 
     ItemStarted   { thread: ThreadId, turn: TurnId, item: ItemStart },
     ItemDelta     { thread: ThreadId, turn: TurnId, item_id: ItemId, delta: ItemDelta },
@@ -1304,6 +1322,7 @@ pub struct ThreadHandle {
     pub thread: ThreadId,
     pub harness_thread_id: String,    // native id used for resume
     pub warning: Option<HarnessNotice>, // non-fatal attach/open warning to surface to the user
+    pub resumed_model: Option<ModelRef>, // effective model reported by the native open/resume
 }
 
 pub struct HarnessNotice {
@@ -1695,9 +1714,12 @@ All defined in `giskard-core`, serialized by `giskard-persist`. Illustrative sha
   "harness_thread_id": "th_abc123",     // native id used for resume
   "mode": "build",                       // "plan" | "build"
   "current_model": { "provider": "openai", "model": "gpt-5.5", "reasoning_effort": "high" },
-  "context_window": 262144,              // CACHE ONLY (C4): derived from current_model's descriptor;
-                                         //   recomputed from current_model on load — not a source of
-                                         //   truth. May be omitted; a corrected config value wins.
+  "context_window": 258400,              // CACHE ONLY (C4): effective window for current_model;
+                                         //   starts from descriptor metadata and is replaced by a
+                                         //   harness-reported runtime value when available.
+  "model_context_windows": {             // C8: harness-reported effective windows retained by
+    "openai": { "gpt-5.5": 258400 }      //   exact provider/model for reloads and model switches.
+  },
   "approval_policy": "ask",              // "ask" | "auto" | "read_only" (§9)
   "archived": false,                     // hidden from the active thread group when true
   "model_efforts": {                     // C7: per-model effort retention. Maps "provider/model"
@@ -1720,9 +1742,9 @@ All defined in `giskard-core`, serialized by `giskard-persist`. Illustrative sha
 
 > The thread `tokens` object carries both the aggregate (`total`) **and** the per-model
 > breakdown (`by_model`), matching §10.2. A thread accumulates a distinct `by_model[provider][model]`
-> entry whenever its model changes mid-thread (§8.4). `context_window` is a cache (C4): on load the
-> server resolves the current model's descriptor and recomputes it, so it never goes stale relative
-> to config.
+> entry whenever its model changes mid-thread (§8.4). `context_window` is a cache (C4): catalog or
+> config metadata supplies its initial value, while `model_context_windows` retains authoritative
+> effective values reported by the harness for exact provider/model pairs.
 
 ```jsonc
 // projects/<id>/tokens.json  and  tokens-global.json
@@ -1876,7 +1898,9 @@ Flow: user clicks "New project" → names it → picks a directory via the file 
   `harness_thread_id` (Codex `thread/resume`) rehydrates the native session; Giskard already
   holds the display history from disk. If resume-by-id fails (Codex store purged/rotated), the
   harness falls back to a fresh native thread and warns that agent context was lost, keeping the
-  Giskard history intact (C5, §4.7).
+  Giskard history intact (C5, §4.7). The initial gauge uses the latest persisted runtime window for
+  the selected model, then provider/config metadata, then the conservative fallback. A later turn
+  replaces that value when the harness reports its effective window.
 - **Interrupt:** user can interrupt an in-flight turn (`turn/interrupt`). The UI exposes this as a
   live-turn Stop control; sending another user message while a turn is still live is a separate
   queueing policy and is not implied by interrupt support.
@@ -2053,10 +2077,11 @@ LiteLLM gateway fronting Cloudflare Workers AI.
   2. the `/v1/models` response, **if** it includes the field (many OpenAI-compatible
      endpoints, including LiteLLM, return `context_window`/`max_input_tokens` and capability
      hints — use them when present);
-  3. a built-in **defaults table** in `giskard-core` keyed by well-known model ids;
-  4. a **conservative fallback** (`context_window = 128000`, `supports_reasoning_effort =
-     false`) with a UI warning badge ("context size unknown — using default"), so an unknown
-     model is still usable and the gauge still renders.
+  3. a **conservative fallback** (`context_window = 128000`, `supports_reasoning_effort =
+     false`), so an unknown model is still usable until provider or runtime metadata is available.
+
+  Giskard must not maintain a model-name defaults table. Model metadata changes independently of
+  Giskard releases and must come from configuration, provider discovery, or the active harness.
 
   `display_name` follows the same config-first order, plus per-project harness metadata as below.
 - **Per-project model list + harness metadata.** When a project is open, the picker list is served
@@ -2083,8 +2108,9 @@ LiteLLM gateway fronting Cloudflare Workers AI.
   Giskard `reasoning_efforts` list. Only an empty alternatives list paired with a `none` default maps
   to no reasoning-effort support.
 
-  The harness never supplies `context_window` (Codex's `model/list` omits it). Per-provider
-  provider or harness listing failures come back as structured `warnings` whose `source` identifies
+  Codex's `model/list` does not supply `context_window`; Codex reports its effective runtime window
+  separately through `thread/tokenUsage/updated` (§10.3). Per-provider provider or harness listing
+  failures come back as structured `warnings` whose `source` identifies
   `provider:<id>` or `harness:<kind>`. The overlay is best-effort, so failures preserve the usable
   config + discovery list while remaining visible to the user. The composed list is cached per
   project and is the descriptor source for both picker display and model mutations; the picker and
@@ -2104,10 +2130,10 @@ LiteLLM gateway fronting Cloudflare Workers AI.
 - Supported and expected. Selecting a different model updates the thread's `current_model`;
   it takes effect on the **next turn** (Codex accepts model per `turn/start`). This satisfies
   "change model during a thread".
-- When the model changes, the thread's cached `context_window` (C4) is updated from the new
-  model's descriptor and the context gauge (§10.3) recomputes. Because the value is a cache derived
-  from `current_model`, it is also recomputed on load, so a corrected config `context_window` takes
-  effect without a migration.
+- When the model changes, the thread's cached `context_window` (C4) uses a retained harness-reported
+  value for the exact `(provider, model)` when available, otherwise the new model descriptor. The
+  context gauge (§10.3) recomputes immediately. Turn completion must not replace an authoritative
+  runtime value with descriptor or fallback metadata.
 - On project/thread load, open/resume, `SendInput`, and `SelectModel`, the server applies
   stale-provider normalization (E5) before computing the context window or passing the model to the
   harness. This allows a project saved with an old provider id to recover when the configured
@@ -2274,9 +2300,10 @@ and monthly figures are derived on read by summing `by_day` buckets (single sour
 ### 10.3 Context-window gauge (per thread)
 
 Within a thread, show the thread's current context footprint **relative to the active
-model's context window** (e.g. 15.4k / 262k, or / 1M). The denominator is
-`ModelDescriptor.context_window` for the current model and **recomputes when the model
-changes** (§8.4). This is a usage-vs-capacity indicator to warn before hitting context limits.
+model's context window** (e.g. 15.4k / 258.4k, or / 1M). The denominator starts from
+`ModelDescriptor.context_window` and is replaced by a valid harness-reported effective window for
+the current `(provider, model)`. It **recomputes when the model changes** (§8.4). This is a
+usage-vs-capacity indicator to warn before hitting context limits.
 The gauge is rendered as a header button; activating it opens a compact card with the same current
 context footprint plus cumulative thread token totals from §10.2 and a manual `Compact context`
 action routed through `HarnessCapabilities.context_compaction`. Unsupported harnesses return a
@@ -2287,17 +2314,19 @@ running. Giskard does not need to warn near the limit because Codex may compact 
 > **Codex source field.** "Tokens used in the thread" for the gauge should reflect the current
 > conversation's *context occupancy*, which is not the same as cumulative billed tokens
 > (cumulative usage keeps growing across turns; context occupancy reflects what's currently in
-> the window after any compaction). Codex reports usage on `turn/completed`; the token-usage
-> payload distinguishes cumulative totals from the last turn's usage and typically exposes an
-> input-tokens / context-used figure per turn. **Candidate fields to use (in order):**
+> the window after any compaction). Codex reports usage through `thread/tokenUsage/updated`; the
+> payload distinguishes cumulative totals from the last turn's usage and exposes an effective
+> `modelContextWindow` denominator. The Codex adapter emits `ContextWindowUpdated` whenever the
+> value changes within a turn, tagged with that turn's exact model, and the server persists it by
+> `(provider, model)`. For the numerator,
+> use an input-tokens / context-used figure per turn. **Candidate fields to use (in order):**
 > (1) an explicit context/window-used field on the turn's usage object if present in the
 > pinned schema; (2) otherwise the **last turn's input tokens** (the input side reflects the
 > context sent to the model, which is the best available proxy for occupancy); (3) fall back
 > to cumulative `total` only if neither is available. The implementer must inspect the pinned
-> `codex app-server generate-json-schema` output for the exact field name on the
-> `turn/completed` usage object, pick per the order above, and record the choice in a code
-> comment + the README. Whichever is chosen, the gauge denominator is the active model's
-> `context_window` (§8.3).
+> `codex app-server generate-json-schema` output for the exact fields on
+> `thread/tokenUsage/updated.tokenUsage`, pick per the order above, and record the choice in a code
+> comment + the README.
 
 ### 10.4 Optional cost estimation
 

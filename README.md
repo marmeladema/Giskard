@@ -204,7 +204,10 @@ service does not silently run with an empty provider list.
 
 Provider config governs the **picker** and optional `/v1/models` discovery only — Codex itself
 reads `~/.codex/config.toml` for real provider/auth, so any model you select must be one Codex can
-actually reach.
+actually reach. Giskard has no model-name defaults table. Initial context-window metadata comes
+from an explicit `[[providers.models]]` entry or a model object's `context_window` /
+`max_input_tokens` field in the provider's `/models` response; otherwise the picker starts with the
+conservative 128k fallback.
 
 Models with `supports_reasoning_effort = true` expose a thread-header **Effort** selector next to
 the model picker. Choose `Default` to omit the effort parameter, or select one of the exact effort
@@ -212,6 +215,12 @@ levels advertised by the project harness. Effort values are model-defined string
 commonly offer `minimal`, `low`, `medium`, `high`, or `xhigh`, while other values are passed through
 unchanged. Reloading the picker refreshes provider discovery and harness metadata; non-fatal
 failures are shown as warnings while the usable portion of the model list remains available.
+
+When a harness reports the effective context window used for a turn, that runtime value replaces
+the initial descriptor value and is retained per `(provider, model)` across reloads and model
+switches. Codex supplies this through
+`thread/tokenUsage/updated.tokenUsage.modelContextWindow`; its value may be lower than a model's
+raw advertised maximum because Codex reserves context headroom.
 
 ---
 

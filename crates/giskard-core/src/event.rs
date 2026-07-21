@@ -5,6 +5,7 @@ use crate::diff::FileDiff;
 use crate::error::HarnessError;
 use crate::ids::{ItemId, ServerRequestId, ThreadId, TurnId};
 use crate::item::{Item, ItemDelta, ItemStart};
+use crate::model::ModelRef;
 use crate::server_request::ServerRequest;
 use crate::token::TokenUsage;
 use crate::turn::TurnStatus;
@@ -22,6 +23,17 @@ pub enum AgentEvent {
     TurnStarted {
         thread: ThreadId,
         turn: TurnId,
+    },
+    /// The effective context window reported by the harness for this turn's model.
+    ///
+    /// This is runtime metadata rather than token usage: harnesses may reserve part of a model's
+    /// raw context capacity for prompts, tools, or output. The server persists the effective value
+    /// against the included turn model and updates the gauge only while that model is selected.
+    ContextWindowUpdated {
+        thread: ThreadId,
+        turn: TurnId,
+        model: ModelRef,
+        context_window: u32,
     },
     ItemStarted {
         thread: ThreadId,
@@ -116,6 +128,32 @@ mod tests {
             }
             _ => panic!("variant mismatch"),
         }
+    }
+
+    #[test]
+    fn context_window_update_serde_roundtrip() {
+        let event = AgentEvent::ContextWindowUpdated {
+            thread: ThreadId::new(),
+            turn: TurnId::new(),
+            model: ModelRef {
+                provider: "openai".into(),
+                model: "gpt-5.6-sol".into(),
+                reasoning_effort: None,
+            },
+            context_window: 258_400,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["kind"], "context_window_updated");
+        assert_eq!(json["model"]["model"], "gpt-5.6-sol");
+        assert_eq!(json["context_window"], 258_400);
+        let decoded: AgentEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            decoded,
+            AgentEvent::ContextWindowUpdated {
+                context_window: 258_400,
+                ..
+            }
+        ));
     }
 
     #[test]

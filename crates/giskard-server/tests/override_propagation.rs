@@ -167,7 +167,24 @@ async fn send_input_snapshot_carries_model_effort_and_thread_policy() {
     tokio::fs::write(
         tmp.path().join("config.toml"),
         format!(
-            "[server]\nbind = \"127.0.0.1:{port}\"\nsecure_cookies = false\n\n[auth]\npassword_hash = \"{hash}\"\nsession_days = 30\n"
+            r#"
+[server]
+bind = "127.0.0.1:{port}"
+secure_cookies = false
+
+[auth]
+password_hash = "{hash}"
+session_days = 30
+
+[[providers]]
+id = "openai"
+name = "OpenAI"
+wire_api = "responses"
+  [[providers.models]]
+  id = "gpt-5.5"
+  context_window = 258400
+  supports_reasoning_effort = true
+"#
         ),
     )
     .await
@@ -255,7 +272,7 @@ async fn send_input_snapshot_carries_model_effort_and_thread_policy() {
         .await
         .expect("WS connect");
 
-    // Select a reasoning model with High effort (gpt-5.5 supports effort via the defaults table).
+    // Select a reasoning model with High effort (gpt-5.5 is declared in this test's config).
     ws.send(ws_text(&ClientMessage::SelectModel {
         thread_id,
         model_ref: ModelRef {

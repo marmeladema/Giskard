@@ -483,25 +483,20 @@ async fn open_thread(
     );
 
     if let Some(thread_id) = req.thread_id {
-        let thread_file = state
+        if state
             .store
             .load_thread(project_id, thread_id)
             .await?
-            .ok_or(ApiError::NotFound)?;
-        let current_model =
-            crate::models::normalize_model_ref(&app_config, &thread_file.current_model);
-        let model_changed = current_model != thread_file.current_model;
-        if model_changed {
-            state
-                .store
-                .update_thread(project_id, thread_id, |tf| {
-                    tf.current_model = current_model.clone();
-                    tf.context_window =
-                        crate::models::context_window_for(&app_config, &current_model);
-                    tf.updated_at = Utc::now();
-                })
-                .await?;
+            .is_none()
+        {
+            return Err(ApiError::NotFound);
         }
+        let catalog = project_model_catalog(&state, &project_config, &app_config).await;
+        let thread_file =
+            normalize_persisted_thread_model(&state, project_id, thread_id, &app_config, &catalog)
+                .await?
+                .ok_or(ApiError::NotFound)?;
+        let current_model = thread_file.current_model.clone();
         if let Some(handle) = state.registry.get_thread_handle(thread_id).await {
             return Ok(Json(OpenThreadResponse {
                 thread_id: handle.thread,
@@ -608,6 +603,14 @@ async fn open_thread(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
+    let current_model = handle
+        .resumed_model
+        .clone()
+        .unwrap_or_else(|| project_config.default_model.clone());
+    let catalog = project_model_catalog(&state, &project_config, &app_config).await;
+    let descriptor =
+        crate::models::resolve_catalog_descriptor(&catalog, &app_config, &current_model);
+    let context_window = descriptor.context_window;
     let now = Utc::now();
     let thread_file = ThreadFile {
         version: 1,
@@ -616,11 +619,9 @@ async fn open_thread(
         title: "New thread".into(),
         harness_thread_id: handle.harness_thread_id.clone(),
         mode: Mode::Build,
-        current_model: project_config.default_model.clone(),
-        context_window: crate::models::context_window_for(
-            &app_config,
-            &project_config.default_model,
-        ),
+        current_model,
+        context_window,
+        model_context_windows: std::collections::HashMap::new(),
         approval_policy: ApprovalPolicy::Ask,
         model_efforts: std::collections::HashMap::new(),
         tokens: giskard_core::token::TokenLedger::default(),
@@ -730,6 +731,7 @@ async fn start_thread_with_message(
         mode: req.mode,
         current_model: model_ref.clone(),
         context_window: model_descriptor.context_window,
+        model_context_windows: std::collections::HashMap::new(),
         approval_policy: req.approval_policy,
         model_efforts: std::collections::HashMap::new(),
         tokens: giskard_core::token::TokenLedger::default(),
@@ -1431,6 +1433,36 @@ async fn project_model_catalog(
         .0
 }
 
+/// Normalize a persisted thread's selected model and repair its context-window cache while holding
+/// the store's per-thread lock. The returned snapshot is the only model state callers should pass
+/// to a harness; deriving it before `update_thread` could overwrite a concurrent model selection.
+async fn normalize_persisted_thread_model(
+    state: &AppState,
+    project_id: ProjectId,
+    thread_id: ThreadId,
+    config: &Config,
+    catalog: &[ModelDescriptor],
+) -> Result<Option<ThreadFile>, PersistError> {
+    state
+        .store
+        .update_thread(project_id, thread_id, |thread| {
+            let current_model = crate::models::normalize_model_ref(config, &thread.current_model);
+            let descriptor =
+                crate::models::resolve_catalog_descriptor(catalog, config, &current_model);
+            let context_window = crate::models::context_window_with_runtime(
+                &current_model,
+                &descriptor,
+                &thread.model_context_windows,
+            );
+            if current_model != thread.current_model || context_window != thread.context_window {
+                thread.current_model = current_model;
+                thread.context_window = context_window;
+                thread.updated_at = Utc::now();
+            }
+        })
+        .await
+}
+
 async fn refresh_project_model_catalog(
     state: &AppState,
     project_config: &ProjectConfig,
@@ -2110,17 +2142,38 @@ async fn handle_client_msg(
                 .load_config()
                 .await
                 .map_err(|e| WsError::from_persist(e, "send_input", Some(thread_id)))?;
+            let project_config = state
+                .store
+                .load_project(project_id)
+                .await
+                .map_err(|e| WsError::from_persist(e, "send_input", Some(thread_id)))?
+                .ok_or_else(|| {
+                    WsError::new(
+                        "project_not_found",
+                        ErrorSeverity::Error,
+                        "Project not found.",
+                    )
+                    .thread(thread_id)
+                    .action("send_input")
+                })?;
+            let catalog = project_model_catalog(state, &project_config, &app_config).await;
             // RMW under the per-thread lock: bump activity and read back the resolved state.
             let tf = state
                 .store
                 .update_thread(project_id, thread_id, |tf| {
                     let normalized =
                         crate::models::normalize_model_ref(&app_config, &tf.current_model);
-                    if normalized != tf.current_model {
-                        tf.current_model = normalized;
-                        tf.context_window =
-                            crate::models::context_window_for(&app_config, &tf.current_model);
-                    }
+                    let descriptor = crate::models::resolve_catalog_descriptor(
+                        &catalog,
+                        &app_config,
+                        &normalized,
+                    );
+                    tf.context_window = crate::models::context_window_with_runtime(
+                        &normalized,
+                        &descriptor,
+                        &tf.model_context_windows,
+                    );
+                    tf.current_model = normalized;
                     tf.updated_at = chrono::Utc::now();
                 })
                 .await
@@ -2286,7 +2339,11 @@ async fn handle_client_msg(
                         new_model.reasoning_effort = None;
                     }
 
-                    tf.context_window = new_descriptor.context_window;
+                    tf.context_window = crate::models::context_window_with_runtime(
+                        &new_model,
+                        &new_descriptor,
+                        &tf.model_context_windows,
+                    );
                     tf.current_model = new_model;
                     tf.updated_at = chrono::Utc::now();
                 })
@@ -2557,7 +2614,7 @@ async fn ensure_thread_open(
         });
     }
 
-    let Some((project_config, thread_file)) =
+    let Some((project_config, _thread_file)) =
         find_persisted_thread(state, thread_id, action).await?
     else {
         return Err(WsError::new(
@@ -2578,18 +2635,26 @@ async fn ensure_thread_open(
         .load_config()
         .await
         .map_err(|e| WsError::from_persist(e, action, Some(thread_id)))?;
-    let current_model = crate::models::normalize_model_ref(&app_config, &thread_file.current_model);
-    if current_model != thread_file.current_model {
-        state
-            .store
-            .update_thread(project_config.id, thread_id, |tf| {
-                tf.current_model = current_model.clone();
-                tf.context_window = crate::models::context_window_for(&app_config, &current_model);
-                tf.updated_at = Utc::now();
-            })
-            .await
-            .map_err(|e| WsError::from_persist(e, action, Some(thread_id)))?;
-    }
+    let catalog = project_model_catalog(state, &project_config, &app_config).await;
+    let thread_file = normalize_persisted_thread_model(
+        state,
+        project_config.id,
+        thread_id,
+        &app_config,
+        &catalog,
+    )
+    .await
+    .map_err(|e| WsError::from_persist(e, action, Some(thread_id)))?
+    .ok_or_else(|| {
+        WsError::new(
+            "thread_not_found",
+            ErrorSeverity::Error,
+            "Thread not found.",
+        )
+        .thread(thread_id)
+        .action(action)
+    })?;
+    let current_model = thread_file.current_model.clone();
     debug!(
         project_id = %project_config.id,
         %thread_id,

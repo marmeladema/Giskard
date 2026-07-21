@@ -144,6 +144,17 @@ session_days = 30
 [plan]
 default_dir = "docs"
 filename_template = "plan-{{slug}}-{{ts}}.md"
+
+[[providers]]
+id = "cloudflare-litellm"
+name = "Cloudflare LiteLLM"
+wire_api = "responses"
+model_listing = false
+  [[providers.models]]
+  id = "@cf/z-ai/glm-4.7"
+  display_name = "GLM-4.7"
+  context_window = 131072
+  supports_reasoning_effort = false
 "#
     );
     tokio::fs::write(tmp.path().join("config.toml"), config_toml)
@@ -283,7 +294,7 @@ async fn modes_models_approvals_and_plan_dump() {
     let tf = poll_thread(&state, pid, tid, |tf| tf.mode == Mode::Plan).await;
     assert_eq!(tf.mode, Mode::Plan, "mode switch should persist");
 
-    // --- SelectModel -> glm (context window recomputed from defaults table) ---
+    // --- SelectModel -> glm (context window loaded from the configured descriptor) ---
     ws.send(ws_text(&ClientMessage::SelectModel {
         thread_id: tid,
         model_ref: ModelRef {

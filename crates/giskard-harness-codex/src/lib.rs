@@ -1040,7 +1040,8 @@ async fn background_task<C>(
 
                 match queued.command {
                     HarnessCommand::OpenThread { opts, response } => {
-                        let result = handle_open_thread(&mut client, &mut mapper, &opts, &senders).await;
+                        let result =
+                            handle_open_thread(&mut client, &mut mapper, &opts, &senders).await;
                         let _ = response.send(result);
                     }
                     HarnessCommand::StartTurn {
@@ -1600,6 +1601,7 @@ fn compaction_event_name(event: &AgentEvent) -> Option<&'static str> {
 fn agent_event_turn(event: &AgentEvent) -> Option<TurnId> {
     match event {
         AgentEvent::TurnStarted { turn, .. }
+        | AgentEvent::ContextWindowUpdated { turn, .. }
         | AgentEvent::ItemStarted { turn, .. }
         | AgentEvent::ItemDelta { turn, .. }
         | AgentEvent::ItemCompleted { turn, .. }
@@ -1792,11 +1794,14 @@ async fn handle_start_turn(
     )
     .await?;
 
-    mapper
-        .register_active_turn(thread.thread, &resp.turn.id)
-        .ok_or_else(|| {
-            HarnessError::Protocol("turn/start response did not include a turn id".into())
-        })
+    let turn = if let Some(model) = overrides.model.clone() {
+        mapper.register_active_turn_with_model(thread.thread, &resp.turn.id, model)
+    } else {
+        mapper.register_active_turn(thread.thread, &resp.turn.id)
+    };
+    turn.ok_or_else(|| {
+        HarnessError::Protocol("turn/start response did not include a turn id".into())
+    })
 }
 
 fn build_turn_start_params(
@@ -1899,6 +1904,7 @@ fn event_thread(event: &AgentEvent) -> ThreadId {
     match event {
         AgentEvent::ThreadOpened { thread, .. }
         | AgentEvent::TurnStarted { thread, .. }
+        | AgentEvent::ContextWindowUpdated { thread, .. }
         | AgentEvent::ItemStarted { thread, .. }
         | AgentEvent::ItemDelta { thread, .. }
         | AgentEvent::ItemCompleted { thread, .. }
