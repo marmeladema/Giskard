@@ -34,6 +34,7 @@ fn test_thread(
         mode,
         current_model: test_model(),
         context_window: 262_144,
+        model_context_windows: Default::default(),
         approval_policy: ApprovalPolicy::Ask,
         model_efforts: HashMap::new(),
         tokens: TokenLedger::default(),

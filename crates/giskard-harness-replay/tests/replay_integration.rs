@@ -318,6 +318,7 @@ async fn replay_persisted_state_roundtrip() {
             reasoning_effort: None,
         },
         context_window: 262_144,
+        model_context_windows: Default::default(),
         approval_policy: ApprovalPolicy::Ask,
         model_efforts: std::collections::HashMap::new(),
         tokens: giskard_core::token::TokenLedger {

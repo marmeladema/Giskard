@@ -2393,6 +2393,14 @@ function handleEvent(ev) {
       setTurnActive(true);
       setActiveThreadActivity("progress", true, "Turn running");
       break;
+    case "context_window_updated":
+      if (ev.model && state.currentModel &&
+          ev.model.provider === state.currentModel.provider &&
+          ev.model.model === state.currentModel.model &&
+          Number.isFinite(ev.context_window) && ev.context_window > 0) {
+        updateGauge(state.contextUsed, ev.context_window);
+      }
+      break;
     case "item_started":
       if (ev.item) {
         const key = scopedItemKey(ev.turn, ev.item.id);

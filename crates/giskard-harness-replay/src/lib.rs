@@ -370,6 +370,7 @@ fn remap_event_thread(event: &mut AgentEvent, thread_id: ThreadId) {
     match event {
         AgentEvent::ThreadOpened { thread, .. }
         | AgentEvent::TurnStarted { thread, .. }
+        | AgentEvent::ContextWindowUpdated { thread, .. }
         | AgentEvent::ItemStarted { thread, .. }
         | AgentEvent::ItemDelta { thread, .. }
         | AgentEvent::ItemCompleted { thread, .. }
@@ -599,6 +600,7 @@ mod tests {
         match event {
             AgentEvent::ThreadOpened { thread, .. }
             | AgentEvent::TurnStarted { thread, .. }
+            | AgentEvent::ContextWindowUpdated { thread, .. }
             | AgentEvent::ItemStarted { thread, .. }
             | AgentEvent::ItemDelta { thread, .. }
             | AgentEvent::ItemCompleted { thread, .. }

@@ -89,6 +89,7 @@ fn seeded_thread(project_id: ProjectId, thread_id: ThreadId) -> ThreadFile {
         mode: Mode::Build,
         current_model: orphaned_model(),
         context_window: 131_072,
+        model_context_windows: Default::default(),
         approval_policy: ApprovalPolicy::Ask,
         model_efforts: HashMap::new(),
         tokens: TokenLedger::default(),

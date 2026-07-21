@@ -26,7 +26,7 @@ pub use mcp::{
     McpAuthStatus, McpOauthStart, McpResource, McpResourceTemplate, McpServerInfo, McpServerStatus,
     McpTool,
 };
-pub use model::{Effort, ModelDescriptor, ModelRef, default_descriptor};
+pub use model::{Effort, ModelDescriptor, ModelRef};
 pub use server_request::{ServerRequest, ServerRequestResponse};
 pub use token::{ByModel, DailyTokenLedger, TokenLedger, TokenUsage};
 pub use turn::{ApprovalPolicy, Mode, Turn, TurnOverrides, TurnStatus, TurnStatusKind};

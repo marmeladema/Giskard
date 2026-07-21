@@ -240,6 +240,26 @@ The server overlays this metadata onto the configured/discovered model list by
 model id (see `giskard-server` §8.3): config names win, and reasoning efforts
 fill in for models the config did not explicitly declare.
 
+## Runtime context window
+
+Codex includes the effective context capacity in
+`thread/tokenUsage/updated.tokenUsage.modelContextWindow`. This is the window Codex
+actually applies after reserving any model-specific headroom, so it is authoritative
+for the thread gauge even when it differs from a provider's raw advertised maximum.
+
+The adapter emits `AgentEvent::ContextWindowUpdated` whenever the valid reported
+value changes and suppresses consecutive unchanged repeats. Each event carries the
+model selected for that turn, which the adapter records when `turn/start` is
+acknowledged. Non-positive values and values outside Giskard's `u32` range are logged
+and ignored without dropping the notification's token usage. The server persists
+accepted values per `(provider, model)` so they survive reloads and model switches.
+
+Existing threads initialize the gauge from Giskard's latest persisted runtime value
+for the selected model. If none has been observed, they use provider/config metadata
+or the conservative fallback. Codex may replay historical token usage after
+`thread/resume`; that replay is not a new turn observation and is not folded into
+Giskard's ledgers or context-window metadata.
+
 ## Restart and unload behavior
 
 Unified-exec process entries are in memory and belong to the loaded Codex thread

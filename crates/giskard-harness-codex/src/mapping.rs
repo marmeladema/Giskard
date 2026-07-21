@@ -16,6 +16,7 @@ use giskard_core::item::{
     CommandExecutionStart, FileChangeEntry, FileChangeKind, Item, ItemDelta, ItemKind, ItemPayload,
     ItemStart, ToolCallStart, command_status_is_running, normalized_command_status,
 };
+use giskard_core::model::ModelRef;
 use giskard_core::server_request::ServerRequest as GiskardServerRequest;
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{ApprovalPolicy, Mode, TurnStatus, TurnStatusKind};
@@ -64,6 +65,17 @@ pub struct CodexMapper {
     /// via a separate `thread/tokenUsage/updated` notification (not on `turn/completed`), so we
     /// cache the most recent value per turn and attach it when the turn completes (spec §10.1).
     turn_usage: HashMap<NativeTurnKey, TokenUsage>,
+    /// Last effective context window emitted for each turn. Codex repeats the same window on every
+    /// token-usage notification, so this suppresses redundant persistence and browser updates.
+    turn_context_windows: HashMap<NativeTurnKey, u32>,
+    /// Model selected for each acknowledged native turn. Context-window notifications do not carry
+    /// a model id, so the value must be bound when `turn/start` returns.
+    turn_models: HashMap<NativeTurnKey, ModelRef>,
+    /// Turns whose context window could not be attributed to a model, deduplicating warnings.
+    missing_context_model_turns: HashSet<NativeTurnKey>,
+    /// Turns for which an invalid context window was already logged. A later valid value is still
+    /// accepted, but repeated malformed usage notifications do not flood service logs.
+    invalid_context_window_turns: HashSet<NativeTurnKey>,
     active_turns: HashMap<ThreadId, String>,
     running_command_turns: HashMap<(ThreadId, String), String>,
     running_commands: HashSet<NativeItemKey>,
@@ -79,6 +91,10 @@ impl CodexMapper {
             turn_ids: HashMap::new(),
             item_ids: HashMap::new(),
             turn_usage: HashMap::new(),
+            turn_context_windows: HashMap::new(),
+            turn_models: HashMap::new(),
+            missing_context_model_turns: HashSet::new(),
+            invalid_context_window_turns: HashSet::new(),
             active_turns: HashMap::new(),
             running_command_turns: HashMap::new(),
             running_commands: HashSet::new(),
@@ -104,6 +120,14 @@ impl CodexMapper {
 
     pub fn clear_active_turn(&mut self, thread: ThreadId) {
         self.active_turns.remove(&thread);
+        self.turn_usage.retain(|(owner, _), _| *owner != thread);
+        self.turn_context_windows
+            .retain(|(owner, _), _| *owner != thread);
+        self.turn_models.retain(|(owner, _), _| *owner != thread);
+        self.missing_context_model_turns
+            .retain(|(owner, _)| *owner != thread);
+        self.invalid_context_window_turns
+            .retain(|(owner, _)| *owner != thread);
     }
 
     /// Register the native turn id returned by `turn/start` before notifications start streaming.
@@ -122,6 +146,20 @@ impl CodexMapper {
         }
         self.active_turns.insert(thread, native_turn_id.to_string());
         Some(self.resolve_turn(thread, native_turn_id))
+    }
+
+    pub fn register_active_turn_with_model(
+        &mut self,
+        thread: ThreadId,
+        native_turn_id: &str,
+        model: ModelRef,
+    ) -> Option<TurnId> {
+        let native_turn_id = native_turn_id.trim();
+        let turn = self.register_active_turn(thread, native_turn_id)?;
+        let key = (thread, native_turn_id.to_string());
+        self.turn_models.insert(key.clone(), model);
+        self.missing_context_model_turns.remove(&key);
+        Some(turn)
     }
 
     fn active_turn_for_thread(&mut self, thread: ThreadId) -> Option<TurnId> {
@@ -225,6 +263,12 @@ impl CodexMapper {
                     .turn_usage
                     .remove(&(thread, turn.id.clone()))
                     .unwrap_or_default();
+                self.turn_context_windows.remove(&(thread, turn.id.clone()));
+                self.turn_models.remove(&(thread, turn.id.clone()));
+                self.missing_context_model_turns
+                    .remove(&(thread, turn.id.clone()));
+                self.invalid_context_window_turns
+                    .remove(&(thread, turn.id.clone()));
                 let status = map_turn_status(&turn.status);
                 Some(AgentEvent::TurnCompleted {
                     thread,
@@ -235,16 +279,58 @@ impl CodexMapper {
             }
 
             Notification::ThreadTokenUsageUpdated(n) => {
-                // Cache the last-turn usage breakdown; emit no Giskard event for the intermediate
-                // update (the usage is surfaced on `TurnCompleted`).
                 let thread = self.resolve_thread(&n.thread_id, fallback_thread)?;
-                if !n.turn_id.is_empty() {
-                    self.turn_usage.insert(
-                        (thread, n.turn_id.clone()),
-                        breakdown_to_usage(&n.token_usage.last),
-                    );
+                if n.turn_id.is_empty() {
+                    return None;
                 }
-                None
+                let key = (thread, n.turn_id.clone());
+                self.turn_usage
+                    .insert(key.clone(), breakdown_to_usage(&n.token_usage.last));
+
+                let native_context_window = n.token_usage.model_context_window?;
+                let Ok(context_window) = u32::try_from(native_context_window) else {
+                    if self.invalid_context_window_turns.insert(key) {
+                        warn!(
+                            native_thread_id = %n.thread_id,
+                            native_turn_id = %n.turn_id,
+                            native_context_window,
+                            "ignoring invalid Codex model context window"
+                        );
+                    }
+                    return None;
+                };
+                if context_window == 0 {
+                    if self.invalid_context_window_turns.insert(key) {
+                        warn!(
+                            native_thread_id = %n.thread_id,
+                            native_turn_id = %n.turn_id,
+                            "ignoring zero Codex model context window"
+                        );
+                    }
+                    return None;
+                }
+                self.invalid_context_window_turns.remove(&key);
+                if self.turn_context_windows.get(&key) == Some(&context_window) {
+                    return None;
+                }
+                let Some(model) = self.turn_models.get(&key).cloned() else {
+                    if self.missing_context_model_turns.insert(key) {
+                        warn!(
+                            native_thread_id = %n.thread_id,
+                            native_turn_id = %n.turn_id,
+                            context_window,
+                            "ignoring Codex model context window without a registered turn model"
+                        );
+                    }
+                    return None;
+                };
+                self.turn_context_windows.insert(key, context_window);
+                Some(AgentEvent::ContextWindowUpdated {
+                    thread,
+                    turn: self.resolve_turn(thread, &n.turn_id),
+                    model,
+                    context_window,
+                })
             }
 
             Notification::ItemStarted(ItemStartedNotification {
@@ -2787,11 +2873,17 @@ mod tests {
     }
 
     /// Usage from a `thread/tokenUsage/updated` notification is cached per turn and surfaced on the
-    /// matching `TurnCompleted` (spec §10.1) — regression guard for the previous zero stub.
+    /// matching `TurnCompleted`; its effective context window is emitted once when first observed.
     #[test]
     fn token_usage_attached_on_turn_completed() {
         let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
         let fallback = ThreadId::new();
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.6-sol".into(),
+            reasoning_effort: None,
+        };
+        mapper.register_active_turn_with_model(fallback, "t1", model.clone());
 
         let usage_notif = Notification::ThreadTokenUsageUpdated(
             serde_json::from_value(serde_json::json!({
@@ -2805,12 +2897,27 @@ mod tests {
                     "total": {
                         "cachedInputTokens": 10, "inputTokens": 100,
                         "outputTokens": 40, "reasoningOutputTokens": 5, "totalTokens": 140
-                    }
+                    },
+                    "modelContextWindow": 258400
                 }
             }))
             .unwrap(),
         );
-        // The intermediate update emits no Giskard event.
+        match mapper.map_notification(&usage_notif, fallback).unwrap() {
+            AgentEvent::ContextWindowUpdated {
+                thread,
+                turn,
+                model: reported_model,
+                context_window,
+            } => {
+                assert_eq!(thread, fallback);
+                assert_eq!(turn, mapper.resolve_turn(fallback, "t1"));
+                assert_eq!(reported_model, model);
+                assert_eq!(context_window, 258_400);
+            }
+            other => panic!("expected ContextWindowUpdated, got {other:?}"),
+        }
+        // Codex repeats the same context window with every usage update; emit it only once per turn.
         assert!(mapper.map_notification(&usage_notif, fallback).is_none());
 
         let completed = Notification::TurnCompleted(
@@ -2826,6 +2933,43 @@ mod tests {
                 assert_eq!(usage.output, 40);
                 assert_eq!(usage.total, 140);
             }
+            other => panic!("expected TurnCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_context_window_does_not_hide_token_usage() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let fallback = ThreadId::new();
+        let usage_notif = Notification::ThreadTokenUsageUpdated(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "th1",
+                "turnId": "t1",
+                "tokenUsage": {
+                    "last": {
+                        "cachedInputTokens": 0, "inputTokens": 12,
+                        "outputTokens": 3, "reasoningOutputTokens": 0, "totalTokens": 15
+                    },
+                    "total": {
+                        "cachedInputTokens": 0, "inputTokens": 12,
+                        "outputTokens": 3, "reasoningOutputTokens": 0, "totalTokens": 15
+                    },
+                    "modelContextWindow": -1
+                }
+            }))
+            .unwrap(),
+        );
+        assert!(mapper.map_notification(&usage_notif, fallback).is_none());
+
+        let completed = Notification::TurnCompleted(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "th1",
+                "turn": { "id": "t1", "status": "completed" }
+            }))
+            .unwrap(),
+        );
+        match mapper.map_notification(&completed, fallback).unwrap() {
+            AgentEvent::TurnCompleted { usage, .. } => assert_eq!(usage.total, 15),
             other => panic!("expected TurnCompleted, got {other:?}"),
         }
     }

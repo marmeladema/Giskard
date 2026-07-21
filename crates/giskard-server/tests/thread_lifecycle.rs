@@ -166,6 +166,7 @@ async fn thread_lifecycle_native_failure_preserves_local_thread() {
                     reasoning_effort: None,
                 },
                 context_window: 262_144,
+                model_context_windows: Default::default(),
                 approval_policy: ApprovalPolicy::Ask,
                 model_efforts: Default::default(),
                 tokens: Default::default(),

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use axum::{Router, response::Json as AxumJson, routing::get};
 use chrono::Utc;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ItemId, ThreadId, TurnId};
+use giskard_core::ids::{ItemId, ProjectId, ThreadId, TurnId};
 use giskard_core::item::{Item, ItemKind, ItemPayload, ItemStart};
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnStatus, TurnStatusKind};
@@ -115,7 +115,11 @@ async fn dynamic_model_refresh_merges_provider_listing() {
         "/models",
         get(|| async {
             AxumJson(serde_json::json!({
-                "data": [ { "id": "dyn-model-1" }, { "id": "gpt-5.5" } ]
+                "data": [
+                    { "id": "dyn-model-1", "context_window": 258400 },
+                    { "id": "gpt-5.5", "context_window": 0, "max_input_tokens": 272000 },
+                    { "id": "bad-metadata", "context_window": -1 }
+                ]
             }))
         }),
     );
@@ -157,7 +161,7 @@ model_listing = true
 
     let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
     let state = AppState::new(
-        store,
+        store.clone(),
         Arc::new(DiffFactory {
             fixture: make_fixture(),
         }),
@@ -201,6 +205,67 @@ model_listing = true
         1,
         "no duplicate ids: {ids:?}"
     );
+    let context_window = |model: &str| {
+        models
+            .iter()
+            .find(|entry| entry["model"] == model)
+            .and_then(|entry| entry["context_window"].as_u64())
+    };
+    assert_eq!(context_window("dyn-model-1"), Some(258_400));
+    assert_eq!(context_window("gpt-5.5"), Some(272_000));
+    assert_eq!(context_window("bad-metadata"), Some(128_000));
+    assert_eq!(refreshed["warnings"].as_array().unwrap().len(), 1);
+    assert!(
+        refreshed["warnings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid context capacity metadata")
+    );
+
+    let project_response = client
+        .post(format!("{base}/api/projects"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({
+            "name": "dynamic-resume",
+            "dir": "/tmp",
+            "default_model": {
+                "provider": "mock",
+                "model": "dyn-model-1",
+                "reasoning_effort": null
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(project_response.status(), reqwest::StatusCode::OK);
+    let project_id: ProjectId = project_response.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let resume_response = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"resume": "native-dynamic-model"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resume_response.status(), reqwest::StatusCode::OK);
+    let thread_id: ThreadId =
+        resume_response.json::<serde_json::Value>().await.unwrap()["thread_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+    let imported = store
+        .load_thread(project_id, thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(imported.current_model.provider, "mock");
+    assert_eq!(imported.current_model.model, "dyn-model-1");
+    assert_eq!(imported.context_window, 258_400);
 }
 
 /// A provider's `api_key` is sent as `Authorization: Bearer …` on the `/models` discovery request,

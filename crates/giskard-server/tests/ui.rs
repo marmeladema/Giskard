@@ -2497,6 +2497,15 @@ fn app_js() -> &'static str {
     include_str!("../static/app.js")
 }
 
+#[test]
+fn browser_applies_harness_context_window_updates_to_the_gauge() {
+    let source = app_js();
+    assert!(source.contains("case \"context_window_updated\":"));
+    assert!(source.contains("ev.model.provider === state.currentModel.provider"));
+    assert!(source.contains("ev.model.model === state.currentModel.model"));
+    assert!(source.contains("updateGauge(state.contextUsed, ev.context_window);"));
+}
+
 fn between<'a>(haystack: &'a str, start: &str, end: &str) -> &'a str {
     let start_index = haystack
         .find(start)

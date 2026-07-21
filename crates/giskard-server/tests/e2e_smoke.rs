@@ -3519,6 +3519,10 @@ async fn subscribe_reopens_persisted_thread() {
                 mode: Mode::Build,
                 current_model: model.clone(),
                 context_window: 128_000,
+                model_context_windows: HashMap::from([(
+                    "openai".into(),
+                    HashMap::from([("gpt-5.5".into(), 258_400)]),
+                )]),
                 approval_policy: ApprovalPolicy::Ask,
                 model_efforts: Default::default(),
                 tokens: Default::default(),
@@ -3565,6 +3569,7 @@ async fn subscribe_reopens_persisted_thread() {
                 let server_msg: ServerMessage = serde_json::from_str(&t).unwrap();
                 if let ServerMessage::ThreadState(state) = server_msg {
                     assert_eq!(state.thread_id, tid);
+                    assert_eq!(state.state["context_window"], 258_400);
                     got_thread_state = true;
                     break;
                 }
@@ -3575,6 +3580,8 @@ async fn subscribe_reopens_persisted_thread() {
     }
 
     assert!(got_thread_state, "subscribe should return ThreadState");
+    let persisted = state.store.load_thread(pid, tid).await.unwrap().unwrap();
+    assert_eq!(persisted.context_window, 258_400);
     assert_eq!(state.registry.get_project_for_thread(tid).await, Some(pid));
 }
 
@@ -3647,6 +3654,7 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
                 mode: Mode::Build,
                 current_model: model.clone(),
                 context_window: 128_000,
+                model_context_windows: Default::default(),
                 approval_policy: ApprovalPolicy::Ask,
                 model_efforts: Default::default(),
                 tokens: Default::default(),
@@ -3800,6 +3808,7 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
                 mode: Mode::Build,
                 current_model: model.clone(),
                 context_window: 128_000,
+                model_context_windows: Default::default(),
                 approval_policy: ApprovalPolicy::Ask,
                 model_efforts: Default::default(),
                 tokens: Default::default(),
@@ -4024,6 +4033,7 @@ async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
                 mode: Mode::Build,
                 current_model: model.clone(),
                 context_window: 128_000,
+                model_context_windows: Default::default(),
                 approval_policy: ApprovalPolicy::Ask,
                 model_efforts: Default::default(),
                 tokens: Default::default(),
@@ -4515,6 +4525,7 @@ wire_api = "responses"
                     reasoning_effort: None,
                 },
                 context_window: 128_000,
+                model_context_windows: Default::default(),
                 approval_policy: ApprovalPolicy::Ask,
                 model_efforts: Default::default(),
                 tokens: Default::default(),
@@ -4538,6 +4549,25 @@ wire_api = "responses"
     let saved_thread = state.store.load_thread(pid, tid).await.unwrap().unwrap();
     assert_eq!(saved_thread.current_model.provider, "proxy");
     assert_eq!(saved_thread.context_window, 262_144);
+
+    state
+        .store
+        .update_thread(pid, tid, |thread| thread.context_window = 64_000)
+        .await
+        .unwrap();
+    let resp = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"thread_id": tid, "resume": null}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let saved_thread = state.store.load_thread(pid, tid).await.unwrap().unwrap();
+    assert_eq!(
+        saved_thread.context_window, 262_144,
+        "opening an unchanged model should repair stale descriptor metadata"
+    );
 }
 
 #[tokio::test]
@@ -4595,6 +4625,7 @@ wire_api = "responses"
                 mode: Mode::Build,
                 current_model: stale_model.clone(),
                 context_window: 128_000,
+                model_context_windows: Default::default(),
                 approval_policy: ApprovalPolicy::Ask,
                 model_efforts: Default::default(),
                 tokens: Default::default(),

@@ -65,11 +65,14 @@ pub struct ThreadFile {
     pub harness_thread_id: String,
     pub mode: Mode,
     pub current_model: ModelRef,
-    /// Cache only (C4): derived from `current_model`'s descriptor and recomputed on load — not a
-    /// source of truth. `#[serde(default)]` so older files (or a deliberately omitted value) load;
-    /// callers should recompute it from `current_model` against the live model config.
+    /// Effective context window for `current_model`. This starts from catalog/config metadata and
+    /// is replaced when the harness reports an authoritative runtime value.
     #[serde(default)]
     pub context_window: u32,
+    /// Harness-reported effective windows nested by provider and model. These survive reloads and
+    /// model switches without making Giskard maintain model-specific built-in metadata.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub model_context_windows: HashMap<String, HashMap<String, u32>>,
     /// Per-thread approval policy (P3).
     pub approval_policy: ApprovalPolicy,
     /// Per-model effort retention (C7): maps `"provider/model"` → stored `Effort`, so switching
@@ -902,6 +905,7 @@ mod tests {
             mode: Mode::Build,
             current_model: test_model(),
             context_window: 262_144,
+            model_context_windows: HashMap::new(),
             approval_policy: ApprovalPolicy::Ask,
             model_efforts: HashMap::new(),
             tokens: TokenLedger::default(),
@@ -937,6 +941,7 @@ mod tests {
             mode: Mode::Build,
             current_model: test_model(),
             context_window: 262_144,
+            model_context_windows: HashMap::new(),
             approval_policy: ApprovalPolicy::Ask,
             model_efforts: HashMap::new(),
             tokens: TokenLedger::default(),
@@ -982,6 +987,7 @@ mod tests {
                 mode: Mode::Plan,
                 current_model: test_model(),
                 context_window: 128_000,
+                model_context_windows: HashMap::new(),
                 approval_policy: ApprovalPolicy::Ask,
                 model_efforts: HashMap::new(),
                 tokens: TokenLedger::default(),
@@ -1153,6 +1159,7 @@ mod tests {
                     mode: Mode::Build,
                     current_model: test_model(),
                     context_window: 0,
+                    model_context_windows: HashMap::new(),
                     approval_policy: ApprovalPolicy::Ask,
                     model_efforts: HashMap::new(),
                     tokens: TokenLedger::default(),
@@ -1313,6 +1320,7 @@ mod tests {
                     mode: Mode::Build,
                     current_model: test_model(),
                     context_window: 0,
+                    model_context_windows: HashMap::new(),
                     approval_policy: ApprovalPolicy::Ask,
                     model_efforts: HashMap::new(),
                     tokens: TokenLedger::default(),
@@ -1351,6 +1359,7 @@ mod tests {
                     mode: Mode::Build,
                     current_model: test_model(),
                     context_window: 0,
+                    model_context_windows: HashMap::new(),
                     approval_policy: ApprovalPolicy::Ask,
                     model_efforts: HashMap::new(),
                     tokens: TokenLedger::default(),

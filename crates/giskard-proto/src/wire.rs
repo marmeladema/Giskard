@@ -42,6 +42,12 @@ pub enum WireAgentEvent {
         thread: ThreadId,
         turn: TurnId,
     },
+    ContextWindowUpdated {
+        thread: ThreadId,
+        turn: TurnId,
+        model: ModelRef,
+        context_window: u32,
+    },
     ItemStarted {
         thread: ThreadId,
         turn: TurnId,
@@ -267,6 +273,17 @@ impl From<AgentEvent> for WireAgentEvent {
                 harness_thread_id,
             },
             AgentEvent::TurnStarted { thread, turn } => Self::TurnStarted { thread, turn },
+            AgentEvent::ContextWindowUpdated {
+                thread,
+                turn,
+                model,
+                context_window,
+            } => Self::ContextWindowUpdated {
+                thread,
+                turn,
+                model,
+                context_window,
+            },
             AgentEvent::ItemStarted { thread, turn, item } => {
                 Self::ItemStarted { thread, turn, item }
             }

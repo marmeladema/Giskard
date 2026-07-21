@@ -3,8 +3,7 @@
 //! Applies the metadata-source precedence for a `(provider, model)` pair:
 //! 1. the typed `[[providers.models]]` config entry;
 //! 2. the `/v1/models` dynamic listing (merged over the static list by [`refresh_models`]);
-//! 3. the built-in defaults table in `giskard-core`;
-//! 4. a conservative fallback (`context_window = 128000`, no reasoning effort).
+//! 3. a conservative fallback (`context_window = 128000`, no reasoning effort).
 
 use std::collections::HashMap;
 
@@ -13,7 +12,7 @@ use tokio::sync::RwLock;
 use tracing::warn;
 
 use giskard_core::ids::ProjectId;
-use giskard_core::model::{ModelDescriptor, ModelRef, default_descriptor};
+use giskard_core::model::{ModelDescriptor, ModelRef};
 use giskard_persist::Config;
 use giskard_proto::ModelListingWarning;
 
@@ -59,7 +58,6 @@ fn from_config(config: &Config, provider: &str, model: &str) -> Option<ModelDesc
 /// Resolve the descriptor for a model, following the §8.3 precedence.
 pub fn resolve_descriptor(config: &Config, model: &ModelRef) -> ModelDescriptor {
     from_config(config, &model.provider, &model.model)
-        .or_else(|| default_descriptor(&model.provider, &model.model))
         .unwrap_or_else(|| ModelDescriptor::conservative(&model.provider, &model.model))
 }
 
@@ -69,10 +67,15 @@ pub fn resolve_catalog_descriptor(
     config: &Config,
     model: &ModelRef,
 ) -> ModelDescriptor {
-    catalog
-        .iter()
-        .find(|descriptor| descriptor.provider == model.provider && descriptor.model == model.model)
-        .cloned()
+    from_config(config, &model.provider, &model.model)
+        .or_else(|| {
+            catalog
+                .iter()
+                .find(|descriptor| {
+                    descriptor.provider == model.provider && descriptor.model == model.model
+                })
+                .cloned()
+        })
         .unwrap_or_else(|| resolve_descriptor(config, model))
 }
 
@@ -109,6 +112,21 @@ pub fn context_window_for(config: &Config, model: &ModelRef) -> u32 {
     resolve_descriptor(config, model).context_window
 }
 
+/// Prefer a harness-reported effective window retained for this exact model over catalog/config
+/// metadata. Runtime values are the closest representation of what the harness actually enforces.
+pub fn context_window_with_runtime(
+    model: &ModelRef,
+    descriptor: &ModelDescriptor,
+    runtime_windows: &HashMap<String, HashMap<String, u32>>,
+) -> u32 {
+    runtime_windows
+        .get(&model.provider)
+        .and_then(|models| models.get(&model.model))
+        .copied()
+        .filter(|window| *window > 0)
+        .unwrap_or(descriptor.context_window)
+}
+
 /// The full static model list offered by the model picker (§8.3): every declared
 /// `[[providers.models]]` entry, resolved to a `ModelDescriptor`.
 pub fn list_descriptors(config: &Config) -> Vec<ModelDescriptor> {
@@ -135,7 +153,7 @@ pub fn list_descriptors(config: &Config) -> Vec<ModelDescriptor> {
 ///   `[[providers.models]] display_name` always wins.
 /// - **Reasoning efforts** (the exact levels a model advertises) are applied only to models the
 ///   config did **not** explicitly declare. A `[[providers.models]]` entry keeps its configured
-///   effort setting; for discovery-only / built-in models the catalog is the source of truth.
+///   effort setting; for discovery-only models the catalog is the source of truth.
 ///
 /// The harness never supplies context window (Codex's `model/list` omits it).
 pub fn apply_harness_metadata(
@@ -180,26 +198,54 @@ struct OpenAiModelsResponse {
 #[derive(Deserialize)]
 struct OpenAiModel {
     id: String,
+    #[serde(default)]
+    context_window: Option<serde_json::Value>,
+    #[serde(default)]
+    max_input_tokens: Option<serde_json::Value>,
 }
 
-/// Merge dynamically-listed `(provider, model)` ids over a static descriptor list. Static/config
-/// entries win (metadata precedence, §8.3); ids only present dynamically are added via the defaults
-/// table or the conservative fallback. Result is deduped by `(provider, model)`.
+fn parse_discovered_capacity(value: Option<&serde_json::Value>) -> Result<Option<u32>, ()> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let capacity = value.as_u64().ok_or(())?;
+    let capacity = u32::try_from(capacity).map_err(|_| ())?;
+    if capacity == 0 {
+        return Err(());
+    }
+    Ok(Some(capacity))
+}
+
+/// One model discovered from a provider's OpenAI-compatible `/v1/models` endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredModel {
+    pub provider: String,
+    pub model: String,
+    pub context_window: Option<u32>,
+}
+
+/// Merge dynamically discovered models over a static descriptor list. Static/config entries win;
+/// provider context metadata is used when present, otherwise the conservative fallback remains.
+/// Result is deduped by `(provider, model)`.
 pub fn merge_models(
     mut base: Vec<ModelDescriptor>,
-    dynamic: &[(String, String)],
+    dynamic: &[DiscoveredModel],
 ) -> Vec<ModelDescriptor> {
     use std::collections::BTreeSet;
     let mut seen: BTreeSet<(String, String)> = base
         .iter()
         .map(|d| (d.provider.clone(), d.model.clone()))
         .collect();
-    for (provider, model) in dynamic {
-        if seen.insert((provider.clone(), model.clone())) {
-            base.push(
-                default_descriptor(provider, model)
-                    .unwrap_or_else(|| ModelDescriptor::conservative(provider, model)),
+    for discovered in dynamic {
+        if seen.insert((discovered.provider.clone(), discovered.model.clone())) {
+            let mut descriptor = ModelDescriptor::conservative(
+                discovered.provider.clone(),
+                discovered.model.clone(),
             );
+            if let Some(context_window) = discovered.context_window.filter(|window| *window > 0) {
+                descriptor.context_window = context_window;
+            }
+            base.push(descriptor);
         }
     }
     base
@@ -226,7 +272,7 @@ pub async fn refresh_models(config: &Config) -> (Vec<ModelDescriptor>, Vec<Model
         }
     };
 
-    let mut dynamic: Vec<(String, String)> = Vec::new();
+    let mut dynamic: Vec<DiscoveredModel> = Vec::new();
     for p in &config.providers {
         if !p.model_listing {
             continue;
@@ -249,6 +295,7 @@ pub async fn refresh_models(config: &Config) -> (Vec<ModelDescriptor>, Vec<Model
                 message,
             });
         };
+        let mut invalid_metadata_models = Vec::new();
 
         match request.send().await {
             Ok(resp) => {
@@ -265,14 +312,44 @@ pub async fn refresh_models(config: &Config) -> (Vec<ModelDescriptor>, Vec<Model
                 }
                 match resp.json::<OpenAiModelsResponse>().await {
                     Ok(body) => {
-                        for m in body.data {
-                            dynamic.push((p.id.clone(), m.id));
+                        for model in body.data {
+                            let context_window =
+                                parse_discovered_capacity(model.context_window.as_ref());
+                            let max_input_tokens =
+                                parse_discovered_capacity(model.max_input_tokens.as_ref());
+                            if context_window.is_err() || max_input_tokens.is_err() {
+                                warn!(
+                                    provider = %p.id,
+                                    model = %model.id,
+                                    context_window = ?model.context_window,
+                                    max_input_tokens = ?model.max_input_tokens,
+                                    "ignoring invalid model capacity metadata"
+                                );
+                                invalid_metadata_models.push(model.id.clone());
+                            }
+                            dynamic.push(DiscoveredModel {
+                                provider: p.id.clone(),
+                                model: model.id,
+                                context_window: context_window
+                                    .ok()
+                                    .flatten()
+                                    .or_else(|| max_input_tokens.ok().flatten()),
+                            });
                         }
                     }
                     Err(e) => fail(format!("unparseable /models response: {e}")),
                 }
             }
             Err(e) => fail(format!("could not reach {url}: {e}")),
+        }
+        if !invalid_metadata_models.is_empty() {
+            warnings.push(ModelListingWarning {
+                source: format!("provider:{}", p.id),
+                message: format!(
+                    "ignored invalid context capacity metadata for {} model(s)",
+                    invalid_metadata_models.len()
+                ),
+            });
         }
     }
 
@@ -313,14 +390,39 @@ model_listing = true
     }
 
     #[test]
-    fn falls_back_to_defaults_table() {
+    fn explicit_config_overrides_a_stale_cached_catalog_descriptor() {
+        let config = config_with_glm();
+        let model = ModelRef {
+            provider: "cloudflare-litellm".into(),
+            model: "@cf/z-ai/glm-4.7".into(),
+            reasoning_effort: None,
+        };
+        let stale_catalog = vec![ModelDescriptor {
+            provider: model.provider.clone(),
+            model: model.model.clone(),
+            context_window: 64_000,
+            supports_reasoning_effort: true,
+            reasoning_efforts: vec!["high".into()],
+            display_name: Some("Stale".into()),
+        }];
+
+        let descriptor = resolve_catalog_descriptor(&stale_catalog, &config, &model);
+        assert_eq!(descriptor.context_window, 131_072);
+        assert!(!descriptor.supports_reasoning_effort);
+    }
+
+    #[test]
+    fn known_model_names_do_not_bypass_conservative_fallback() {
         let config = Config::default();
         let m = ModelRef {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
         };
-        assert_eq!(context_window_for(&config, &m), 262_144);
+        assert_eq!(
+            context_window_for(&config, &m),
+            ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW
+        );
     }
 
     #[test]
@@ -351,12 +453,26 @@ model_listing = true
         let base = list_descriptors(&config_with_glm()); // one static config entry
         let dynamic = vec![
             // Already present ⇒ must not duplicate or override the config metadata.
-            ("cloudflare-litellm".into(), "@cf/z-ai/glm-4.7".into()),
-            // New id ⇒ added (unknown ⇒ conservative descriptor).
-            ("cloudflare-litellm".into(), "@cf/meta/llama-4".into()),
+            DiscoveredModel {
+                provider: "cloudflare-litellm".into(),
+                model: "@cf/z-ai/glm-4.7".into(),
+                context_window: Some(1),
+            },
+            // New id with no metadata ⇒ added with a conservative descriptor.
+            DiscoveredModel {
+                provider: "cloudflare-litellm".into(),
+                model: "@cf/meta/llama-4".into(),
+                context_window: None,
+            },
+            // A provider-advertised context window is retained for a new model.
+            DiscoveredModel {
+                provider: "cloudflare-litellm".into(),
+                model: "provider-sized".into(),
+                context_window: Some(258_400),
+            },
         ];
         let merged = merge_models(base, &dynamic);
-        assert_eq!(merged.len(), 2);
+        assert_eq!(merged.len(), 3);
 
         let glm = merged
             .iter()
@@ -373,6 +489,8 @@ model_listing = true
             ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
             "dynamic-only id gets a conservative descriptor"
         );
+        let provider_sized = merged.iter().find(|d| d.model == "provider-sized").unwrap();
+        assert_eq!(provider_sized.context_window, 258_400);
     }
 
     #[test]
@@ -539,7 +657,7 @@ wire_api = "responses"
     #[test]
     fn empty_catalog_efforts_use_the_harness_support_flag() {
         let config = Config::default();
-        let base = vec![default_descriptor("openai", "gpt-5.5").unwrap()];
+        let base = vec![ModelDescriptor::conservative("openai", "gpt-5.5")];
         let unsupported = vec![ModelDescriptor {
             provider: String::new(),
             model: "gpt-5.5".into(),
@@ -563,6 +681,70 @@ wire_api = "responses"
         let merged = apply_harness_metadata(base, &default_only, &config);
         assert!(merged[0].supports_reasoning_effort);
         assert!(merged[0].reasoning_efforts.is_empty());
+    }
+
+    #[test]
+    fn harness_runtime_context_window_wins_for_exact_model() {
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.6-sol".into(),
+            reasoning_effort: None,
+        };
+        let descriptor = ModelDescriptor::conservative("openai", "gpt-5.6-sol");
+        let runtime = HashMap::from([
+            (
+                "openai".into(),
+                HashMap::from([("gpt-5.6-sol".into(), 258_400)]),
+            ),
+            (
+                "other".into(),
+                HashMap::from([("gpt-5.6-sol".into(), 1_000)]),
+            ),
+        ]);
+
+        assert_eq!(
+            context_window_with_runtime(&model, &descriptor, &runtime),
+            258_400
+        );
+        assert_eq!(
+            context_window_with_runtime(&model, &descriptor, &HashMap::new()),
+            ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW
+        );
+    }
+
+    #[test]
+    fn harness_runtime_context_windows_keep_slash_bearing_ids_distinct() {
+        let runtime = HashMap::from([
+            ("a".into(), HashMap::from([("b/c".into(), 100_000)])),
+            ("a/b".into(), HashMap::from([("c".into(), 200_000)])),
+        ]);
+        let first = ModelRef {
+            provider: "a".into(),
+            model: "b/c".into(),
+            reasoning_effort: None,
+        };
+        let second = ModelRef {
+            provider: "a/b".into(),
+            model: "c".into(),
+            reasoning_effort: None,
+        };
+
+        assert_eq!(
+            context_window_with_runtime(
+                &first,
+                &ModelDescriptor::conservative("a", "b/c"),
+                &runtime,
+            ),
+            100_000
+        );
+        assert_eq!(
+            context_window_with_runtime(
+                &second,
+                &ModelDescriptor::conservative("a/b", "c"),
+                &runtime,
+            ),
+            200_000
+        );
     }
 
     #[test]

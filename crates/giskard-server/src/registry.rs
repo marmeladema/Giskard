@@ -25,7 +25,6 @@ use giskard_proto::{RunningTask, ServerMessage, ThreadActivity, ThreadActivityKi
 use crate::hub::Hub;
 use crate::ledger::LedgerHandle;
 use crate::live_buffer::LiveBufferStore;
-use crate::models::context_window_for;
 use crate::running_commands::RunningTaskStore;
 
 #[async_trait]
@@ -1085,6 +1084,37 @@ async fn forward_events(
                 let command_state_changed =
                     apply_running_command_event(&running_commands, &event).await;
 
+                if let AgentEvent::ContextWindowUpdated {
+                    turn,
+                    model,
+                    context_window,
+                    ..
+                } = &event
+                {
+                    if model.provider != ctx.model.provider || model.model != ctx.model.model {
+                        error!(
+                            %project_id,
+                            %thread_id,
+                            turn = %turn,
+                            expected_provider = %ctx.model.provider,
+                            expected_model = %ctx.model.model,
+                            event_provider = %model.provider,
+                            event_model = %model.model,
+                            "dropping context-window update for the wrong turn model"
+                        );
+                        continue;
+                    }
+                    persist_model_context_window(
+                        &store,
+                        project_id,
+                        thread_id,
+                        *turn,
+                        model,
+                        *context_window,
+                    )
+                    .await;
+                }
+
                 match &event {
                     AgentEvent::TurnStarted { turn, .. } => {
                         turn_id = Some(*turn);
@@ -1542,6 +1572,7 @@ fn should_skip_duplicate_notice(
 fn event_turn_id(event: &AgentEvent) -> Option<TurnId> {
     match event {
         AgentEvent::TurnStarted { turn, .. }
+        | AgentEvent::ContextWindowUpdated { turn, .. }
         | AgentEvent::ItemStarted { turn, .. }
         | AgentEvent::ItemDelta { turn, .. }
         | AgentEvent::ItemCompleted { turn, .. }
@@ -1596,6 +1627,7 @@ fn event_thread_id(event: &AgentEvent) -> ThreadId {
     match event {
         AgentEvent::ThreadOpened { thread, .. }
         | AgentEvent::TurnStarted { thread, .. }
+        | AgentEvent::ContextWindowUpdated { thread, .. }
         | AgentEvent::ItemStarted { thread, .. }
         | AgentEvent::ItemDelta { thread, .. }
         | AgentEvent::ItemCompleted { thread, .. }
@@ -1613,6 +1645,7 @@ fn event_kind(event: &AgentEvent) -> &'static str {
     match event {
         AgentEvent::ThreadOpened { .. } => "thread_opened",
         AgentEvent::TurnStarted { .. } => "turn_started",
+        AgentEvent::ContextWindowUpdated { .. } => "context_window_updated",
         AgentEvent::ItemStarted { .. } => "item_started",
         AgentEvent::ItemDelta { .. } => "item_delta",
         AgentEvent::ItemCompleted { .. } => "item_completed",
@@ -1679,6 +1712,7 @@ fn thread_activity_from_event(
             });
         }
         AgentEvent::ItemDelta { .. } => return None,
+        AgentEvent::ContextWindowUpdated { .. } => return None,
         AgentEvent::ItemCompleted { item, .. } => {
             activity.active_turn = true;
             activity.summary = Some(match &item.payload {
@@ -1954,9 +1988,67 @@ async fn persisted_turn_ids(
     }
 }
 
-/// Append a completed `Turn` to the thread file, fold its usage into the thread ledger, recompute
-/// the cached context window, persist atomically (§7.1), and hand the usage delta to the global +
-/// project ledger actor (§10.2). Best-effort: logs on failure.
+/// Persist an effective context window reported by the harness for a turn's model.
+async fn persist_model_context_window(
+    store: &PersistStore,
+    project_id: ProjectId,
+    thread_id: ThreadId,
+    turn_id: TurnId,
+    model: &ModelRef,
+    context_window: u32,
+) {
+    let provider = model.provider.clone();
+    let model_id = model.model.clone();
+    let stored_provider = provider.clone();
+    let stored_model_id = model_id.clone();
+    match store
+        .update_thread(project_id, thread_id, move |tf| {
+            tf.model_context_windows
+                .entry(stored_provider.clone())
+                .or_default()
+                .insert(stored_model_id.clone(), context_window);
+            if tf.current_model.provider == stored_provider
+                && tf.current_model.model == stored_model_id
+            {
+                tf.context_window = context_window;
+            }
+        })
+        .await
+    {
+        Ok(Some(_)) => info!(
+            %project_id,
+            %thread_id,
+            %turn_id,
+            provider = %provider,
+            model = %model_id,
+            context_window,
+            "persisted harness-reported model context window"
+        ),
+        Ok(None) => warn!(
+            %project_id,
+            %thread_id,
+            %turn_id,
+            provider = %provider,
+            model = %model_id,
+            context_window,
+            "thread file missing while persisting model context window"
+        ),
+        Err(error) => error!(
+            %project_id,
+            %thread_id,
+            %turn_id,
+            provider = %provider,
+            model = %model_id,
+            context_window,
+            %error,
+            "failed to persist harness-reported model context window"
+        ),
+    }
+}
+
+/// Append a completed `Turn` to the thread file, fold its usage into the thread ledger, persist
+/// atomically (§7.1), and hand the usage delta to the global + project ledger actor (§10.2).
+/// Best-effort: logs on failure.
 #[derive(Clone, Copy, Debug, Default)]
 struct PersistTurnOutcome {
     history_appended: bool,
@@ -1971,20 +2063,6 @@ async fn persist_turn(
     thread_id: ThreadId,
     turn: Turn,
 ) -> PersistTurnOutcome {
-    // C4: recompute the cached context window from the current model on write.
-    let config = match store.load_config().await {
-        Ok(config) => Some(config),
-        Err(error) => {
-            warn!(
-                %project_id,
-                %thread_id,
-                %error,
-                "failed to load config while persisting turn; context window cache will not be refreshed"
-            );
-            None
-        }
-    };
-
     // Only completed/interrupted turns carry real usage; capture the bits we need before `turn`
     // moves into the closure.
     let should_record = matches!(
@@ -2029,8 +2107,9 @@ async fn persist_turn(
         "appended completed turn to history"
     );
 
-    // Metadata-only RMW under the per-thread lock (§5.4): fold usage into the aggregates cache and
-    // refresh the context window. The history no longer lives here.
+    // Metadata-only RMW under the per-thread lock (§5.4): fold usage into the aggregates cache.
+    // Context-window updates are persisted when the harness reports them; recomputing here would
+    // replace authoritative runtime metadata with a catalog fallback.
     let updated = store
         .update_thread(project_id, thread_id, move |tf| {
             if should_record {
@@ -2038,9 +2117,6 @@ async fn persist_turn(
                     .record(&turn.model.provider, &turn.model.model, &turn.usage);
             }
             tf.updated_at = Utc::now();
-            if let Some(config) = &config {
-                tf.context_window = context_window_for(config, &tf.current_model);
-            }
         })
         .await;
 
@@ -2445,6 +2521,252 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forwarder_drops_context_window_update_for_mismatched_turn_model() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let turn_id = TurnId::new();
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.6-sol".into(),
+            reasoning_effort: None,
+        };
+        store
+            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .await
+            .unwrap();
+        let now = Utc::now();
+        store
+            .save_thread(
+                project_id,
+                &ThreadFile {
+                    version: 1,
+                    id: thread_id,
+                    project_id,
+                    title: "t".into(),
+                    harness_thread_id: "th".into(),
+                    mode: Mode::Build,
+                    current_model: model.clone(),
+                    context_window: 128_000,
+                    model_context_windows: Default::default(),
+                    approval_policy: ApprovalPolicy::Ask,
+                    model_efforts: Default::default(),
+                    tokens: TokenLedger::default(),
+                    created_at: now,
+                    updated_at: now,
+                    archived: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let (tx, _) = broadcast::channel(16);
+        let hub = Arc::new(Hub::new());
+        let (client_tx, mut client_rx) = mpsc::channel(16);
+        hub.subscribe(thread_id, 1, client_tx).await;
+        let ledger = ledger::spawn(store.clone());
+        let handle = spawn_forwarder_handle(
+            thread_id,
+            project_id,
+            AgentEventStream::new(tx.subscribe()),
+            hub,
+            Arc::new(LiveBufferStore::new()),
+            Arc::new(RunningTaskStore::new()),
+            store.clone(),
+            Arc::new(Mutex::new(Default::default())),
+            Arc::new(Mutex::new(Default::default())),
+            ledger,
+            model.clone(),
+            "context window mismatch",
+        );
+
+        tx.send(AgentEvent::TurnStarted {
+            thread: thread_id,
+            turn: turn_id,
+        })
+        .unwrap();
+        tx.send(AgentEvent::ContextWindowUpdated {
+            thread: thread_id,
+            turn: turn_id,
+            model: ModelRef {
+                provider: model.provider.clone(),
+                model: "gpt-5.6-pro".into(),
+                reasoning_effort: None,
+            },
+            context_window: 400_000,
+        })
+        .unwrap();
+        tx.send(AgentEvent::TurnCompleted {
+            thread: thread_id,
+            turn: turn_id,
+            usage: TokenUsage::default(),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        })
+        .unwrap();
+
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), handle)
+            .await
+            .expect("forwarder should exit after turn completion")
+            .unwrap();
+
+        let persisted = store
+            .load_thread(project_id, thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.context_window, 128_000);
+        assert!(
+            persisted.model_context_windows.is_empty(),
+            "a mismatched turn model must not be persisted"
+        );
+        while let Ok(message) = client_rx.try_recv() {
+            assert!(
+                !matches!(
+                    message,
+                    ServerMessage::Event {
+                        agent_event: WireAgentEvent::ContextWindowUpdated { .. },
+                        ..
+                    }
+                ),
+                "a mismatched turn model must not be broadcast"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn forwarder_persists_and_broadcasts_context_window_update_for_matching_turn_model() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let turn_id = TurnId::new();
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.6-sol".into(),
+            reasoning_effort: None,
+        };
+        store
+            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .await
+            .unwrap();
+        let now = Utc::now();
+        store
+            .save_thread(
+                project_id,
+                &ThreadFile {
+                    version: 1,
+                    id: thread_id,
+                    project_id,
+                    title: "t".into(),
+                    harness_thread_id: "th".into(),
+                    mode: Mode::Build,
+                    current_model: model.clone(),
+                    context_window: 128_000,
+                    model_context_windows: Default::default(),
+                    approval_policy: ApprovalPolicy::Ask,
+                    model_efforts: Default::default(),
+                    tokens: TokenLedger::default(),
+                    created_at: now,
+                    updated_at: now,
+                    archived: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let (tx, _) = broadcast::channel(16);
+        let hub = Arc::new(Hub::new());
+        let (client_tx, mut client_rx) = mpsc::channel(16);
+        hub.subscribe(thread_id, 1, client_tx).await;
+        let ledger = ledger::spawn(store.clone());
+        let handle = spawn_forwarder_handle(
+            thread_id,
+            project_id,
+            AgentEventStream::new(tx.subscribe()),
+            hub,
+            Arc::new(LiveBufferStore::new()),
+            Arc::new(RunningTaskStore::new()),
+            store.clone(),
+            Arc::new(Mutex::new(Default::default())),
+            Arc::new(Mutex::new(Default::default())),
+            ledger,
+            model.clone(),
+            "context window match",
+        );
+
+        tx.send(AgentEvent::TurnStarted {
+            thread: thread_id,
+            turn: turn_id,
+        })
+        .unwrap();
+        tx.send(AgentEvent::ContextWindowUpdated {
+            thread: thread_id,
+            turn: turn_id,
+            model: model.clone(),
+            context_window: 258_400,
+        })
+        .unwrap();
+        tx.send(AgentEvent::TurnCompleted {
+            thread: thread_id,
+            turn: turn_id,
+            usage: TokenUsage::default(),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        })
+        .unwrap();
+
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), handle)
+            .await
+            .expect("forwarder should exit after turn completion")
+            .unwrap();
+
+        let persisted = store
+            .load_thread(project_id, thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.context_window, 258_400);
+        assert_eq!(
+            persisted
+                .model_context_windows
+                .get("openai")
+                .and_then(|models| models.get("gpt-5.6-sol")),
+            Some(&258_400)
+        );
+
+        let mut matching_updates = 0;
+        while let Ok(message) = client_rx.try_recv() {
+            if let ServerMessage::Event {
+                agent_event:
+                    WireAgentEvent::ContextWindowUpdated {
+                        thread,
+                        turn,
+                        model: event_model,
+                        context_window,
+                    },
+                ..
+            } = message
+            {
+                matching_updates += 1;
+                assert_eq!(thread, thread_id);
+                assert_eq!(turn, turn_id);
+                assert_eq!(event_model, model);
+                assert_eq!(context_window, 258_400);
+            }
+        }
+        assert_eq!(
+            matching_updates, 1,
+            "matching update must be broadcast once"
+        );
+    }
+
+    #[tokio::test]
     async fn live_turn_forwarders_do_not_persist_later_turns() {
         let tmp = tempfile::TempDir::new().unwrap();
         let data_dir = tmp.path().to_path_buf();
@@ -2473,6 +2795,7 @@ mod tests {
                     mode: Mode::Build,
                     current_model: model.clone(),
                     context_window: 128_000,
+                    model_context_windows: Default::default(),
                     approval_policy: ApprovalPolicy::Ask,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
@@ -2592,6 +2915,7 @@ mod tests {
                     mode: Mode::Build,
                     current_model: model.clone(),
                     context_window: 128_000,
+                    model_context_windows: Default::default(),
                     approval_policy: ApprovalPolicy::Ask,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
@@ -2741,6 +3065,7 @@ mod tests {
                     mode: Mode::Build,
                     current_model: model.clone(),
                     context_window: 128_000,
+                    model_context_windows: Default::default(),
                     approval_policy: ApprovalPolicy::Ask,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
@@ -2861,6 +3186,7 @@ mod tests {
                     mode: Mode::Build,
                     current_model: model.clone(),
                     context_window: 128_000,
+                    model_context_windows: Default::default(),
                     approval_policy: ApprovalPolicy::Ask,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
@@ -2989,6 +3315,7 @@ mod tests {
                     mode: Mode::Build,
                     current_model: model.clone(),
                     context_window: 128_000,
+                    model_context_windows: Default::default(),
                     approval_policy: ApprovalPolicy::Ask,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
@@ -3083,6 +3410,7 @@ mod tests {
                     mode: Mode::Build,
                     current_model: model.clone(),
                     context_window: 128_000,
+                    model_context_windows: Default::default(),
                     approval_policy: ApprovalPolicy::Ask,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
@@ -3247,6 +3575,7 @@ mod tests {
                     mode: Mode::Build,
                     current_model: model.clone(),
                     context_window: 128_000,
+                    model_context_windows: Default::default(),
                     approval_policy: ApprovalPolicy::Ask,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
@@ -3360,6 +3689,7 @@ mod tests {
                     mode: Mode::Build,
                     current_model: model.clone(),
                     context_window: 128_000,
+                    model_context_windows: Default::default(),
                     approval_policy: ApprovalPolicy::Ask,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
@@ -3469,6 +3799,7 @@ mod tests {
                     mode: Mode::Build,
                     current_model: model.clone(),
                     context_window: 128_000,
+                    model_context_windows: Default::default(),
                     approval_policy: ApprovalPolicy::Ask,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
@@ -3730,6 +4061,7 @@ mod tests {
                     mode: Mode::Build,
                     current_model: model.clone(),
                     context_window: 128_000,
+                    model_context_windows: Default::default(),
                     approval_policy: ApprovalPolicy::Ask,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
@@ -3926,6 +4258,7 @@ mod tests {
                     mode: Mode::Build,
                     current_model: model.clone(),
                     context_window: 128_000,
+                    model_context_windows: Default::default(),
                     approval_policy: ApprovalPolicy::Ask,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
@@ -4130,6 +4463,7 @@ mod tests {
                     mode: Mode::Build,
                     current_model: model.clone(),
                     context_window: 128_000,
+                    model_context_windows: Default::default(),
                     approval_policy: ApprovalPolicy::Ask,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
