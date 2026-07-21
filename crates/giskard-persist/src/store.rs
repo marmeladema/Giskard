@@ -65,8 +65,8 @@ pub struct ThreadFile {
     pub harness_thread_id: String,
     pub mode: Mode,
     pub current_model: ModelRef,
-    /// Effective context window for `current_model`. This starts from catalog/config metadata and
-    /// is replaced when the harness reports an authoritative runtime value.
+    /// Effective context window for `current_model`. New threads start conservatively; a persisted
+    /// value is reused on resume and replaced when the harness reports an authoritative value.
     #[serde(default)]
     pub context_window: u32,
     /// Harness-reported effective windows nested by provider and model. These survive reloads and

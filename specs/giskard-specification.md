@@ -24,16 +24,25 @@
 > and all backend design remain authoritative.
 
 **Changelog (1.53 → 1.54), authoritative context-window metadata:**
-- **C4:** Giskard has no model-name defaults table. Initial context capacity comes from exact
+- **C4:** Giskard has no model-name defaults table. Model descriptor capacity comes from exact
   config, provider-advertised `context_window` / `max_input_tokens`, or the conservative fallback.
+  A thread uses its persisted `context_window` immediately on resume; new threads and threads
+  without a persisted value use the conservative 128k fallback.
 - **C8:** harnesses may emit `ContextWindowUpdated` for a turn. The server persists the effective
   value for the event's exact `(provider, model)`, updates the active gauge only while that model is
   selected, and restores it after reloads and model switches without replacing it during turn
   completion.
 - **C9:** the Codex adapter maps
   `thread/tokenUsage/updated.tokenUsage.modelContextWindow`, rejects invalid values with a warning,
-  and suppresses consecutive unchanged reports within a turn. Resume-time historical usage replay
-  is not treated as a new runtime observation.
+  and suppresses consecutive unchanged reports within a turn. Opening and resuming never wait for
+  usage metadata. On resume, the adapter asynchronously monitors the resumed native thread while it
+  remains idle and emits the first valid reported window as
+  `ThreadUpdate::ContextWindowRestored { context_window }`, without model attribution or
+  historical turn-ID correlation. Starting a turn drops that pending resume monitor, so active-turn
+  usage is handled only as normal model-scoped `ContextWindowUpdated` events. If no valid replay
+  arrives and no turn starts, an idle TTL drops the monitor. The server applies, persists, and
+  broadcasts a restored value only if no turn has completed since that resume; completed-turn
+  metadata always wins. Resume-time usage totals are not counted again.
 
 **Changelog (1.52 → 1.53), project model-catalog consistency:**
 - **M8:** the server caches the composed model descriptors per project and uses that same catalog
@@ -351,8 +360,8 @@
 - **WS1:** Browser clients must reject stale messages from a replaced WebSocket connection and must
   ignore any thread-scoped server message whose `thread_id` does not match the currently selected
   thread. This guard applies before rendering or mutating transcript state for `ThreadState`,
-  `HistoryPage`, `LiveTurnSnapshot`, `RunningTasks`, `Event`, `ApprovalRequest`, thread-scoped
-  `TokenUpdate`, and thread-scoped `Error`.
+  `ThreadContextWindowUpdated`, `HistoryPage`, `LiveTurnSnapshot`, `RunningTasks`, `Event`,
+  `ApprovalRequest`, thread-scoped `TokenUpdate`, and thread-scoped `Error`.
 - **WS2:** Thread-scoped `TokenUpdate` messages include `thread_id` on the wire. The browser only
   renders token ledgers into the active thread usage menu when that `thread_id` matches the active
   thread; project/global token updates must not be rendered as thread totals.
@@ -713,9 +722,10 @@
 - **C3:** The per-model token breakdown is stored as a **nested object** (`by_model[provider][model]`),
   not an interpolated `"provider/model"` string key, because provider/model ids can contain slashes
   (e.g. `@cf/z-ai/glm-4.7`) and would be ambiguous to re-split (§5.3, §10.2).
-- **C4:** Thread `context_window` is a **cache**, not a source of truth. This original descriptor-only
-  rule is superseded by 1.54/C8: harness-reported runtime values are retained per model and take
-  precedence over initial descriptor metadata (§5.3, §8.4, §10.3).
+- **C4:** Thread `context_window` is a **cache**, not a source of truth. This original
+  descriptor-only rule is superseded by 1.54/C8-C9: active-turn runtime values are retained per
+  model, while resume-time restoration may update the thread cache without model attribution
+  (§5.3, §8.4, §10.3).
 - **C5:** Defined the resume-failure policy: if resume-by-id fails (Codex thread store purged/rotated),
   start a fresh native thread, keep the Giskard-side history, and warn the user that agent context was
   lost (§4.7, §7.1).
@@ -1325,6 +1335,12 @@ pub struct ThreadHandle {
     pub resumed_model: Option<ModelRef>, // effective model reported by the native open/resume
 }
 
+pub enum ThreadUpdate {
+    ContextWindowRestored {
+        context_window: u32,
+    },
+}
+
 pub struct HarnessNotice {
     pub code: String,
     pub message: String,
@@ -1337,6 +1353,7 @@ pub struct OpenThreadOptions {
     pub workspace_root: PathBuf,      // effective sandbox root (§6.3)
     pub resume: Option<String>,       // Some(native id) ⇒ resume; None ⇒ fresh thread
     pub initial_model: ModelRef,
+    pub updates: ThreadUpdateSink,    // established before open; consumed asynchronously
 }
 
 pub struct TurnStatus {              // outcome of a completed turn
@@ -1714,9 +1731,9 @@ All defined in `giskard-core`, serialized by `giskard-persist`. Illustrative sha
   "harness_thread_id": "th_abc123",     // native id used for resume
   "mode": "build",                       // "plan" | "build"
   "current_model": { "provider": "openai", "model": "gpt-5.5", "reasoning_effort": "high" },
-  "context_window": 258400,              // CACHE ONLY (C4): effective window for current_model;
-                                         //   starts from descriptor metadata and is replaced by a
-                                         //   harness-reported runtime value when available.
+  "context_window": 258400,              // CACHE ONLY (C4): persisted thread denominator;
+                                         //   used immediately on resume, with a 128k fallback
+                                         //   when absent or for a new thread.
   "model_context_windows": {             // C8: harness-reported effective windows retained by
     "openai": { "gpt-5.5": 258400 }      //   exact provider/model for reloads and model switches.
   },
@@ -1742,9 +1759,10 @@ All defined in `giskard-core`, serialized by `giskard-persist`. Illustrative sha
 
 > The thread `tokens` object carries both the aggregate (`total`) **and** the per-model
 > breakdown (`by_model`), matching §10.2. A thread accumulates a distinct `by_model[provider][model]`
-> entry whenever its model changes mid-thread (§8.4). `context_window` is a cache (C4): catalog or
-> config metadata supplies its initial value, while `model_context_windows` retains authoritative
-> effective values reported by the harness for exact provider/model pairs.
+> entry whenever its model changes mid-thread (§8.4). `context_window` is a thread cache (C4): its
+> persisted value is used immediately on resume, with a 128k fallback when absent or for a new
+> thread. `model_context_windows` retains effective active-turn values reported by the harness for
+> exact provider/model pairs.
 
 ```jsonc
 // projects/<id>/tokens.json  and  tokens-global.json
@@ -1898,9 +1916,15 @@ Flow: user clicks "New project" → names it → picks a directory via the file 
   `harness_thread_id` (Codex `thread/resume`) rehydrates the native session; Giskard already
   holds the display history from disk. If resume-by-id fails (Codex store purged/rotated), the
   harness falls back to a fresh native thread and warns that agent context was lost, keeping the
-  Giskard history intact (C5, §4.7). The initial gauge uses the latest persisted runtime window for
-  the selected model, then provider/config metadata, then the conservative fallback. A later turn
-  replaces that value when the harness reports its effective window.
+  Giskard history intact (C5, §4.7). The initial gauge immediately uses the persisted thread
+  `context_window`, or the conservative 128k fallback when no value exists. Resume never waits for
+  usage metadata. The Codex adapter asynchronously monitors the resumed native thread while it
+  remains idle and emits its first valid reported context window without model attribution or
+  historical turn-ID correlation. Starting a turn drops that pending monitor, so active-turn usage
+  stays model-scoped. If no valid replay arrives and no turn starts, an idle TTL drops the monitor.
+  The server applies and persists a restored value only if no turn has completed since this resume,
+  and sends a narrow context-window update to subscribed clients. Completed-turn metadata always
+  wins.
 - **Interrupt:** user can interrupt an in-flight turn (`turn/interrupt`). The UI exposes this as a
   live-turn Stop control; sending another user message while a turn is still live is a separate
   queueing policy and is not implied by interrupt support.
@@ -2300,9 +2324,11 @@ and monthly figures are derived on read by summing `by_day` buckets (single sour
 ### 10.3 Context-window gauge (per thread)
 
 Within a thread, show the thread's current context footprint **relative to the active
-model's context window** (e.g. 15.4k / 258.4k, or / 1M). The denominator starts from
-`ModelDescriptor.context_window` and is replaced by a valid harness-reported effective window for
-the current `(provider, model)`. It **recomputes when the model changes** (§8.4). This is a
+model's context window** (e.g. 15.4k / 258.4k, or / 1M). On resume, the denominator starts from the
+persisted thread `context_window`; new threads and threads without a persisted value start at the
+conservative 128k fallback. A valid active-turn harness report replaces it for the current
+`(provider, model)`, and it **recomputes when the model changes** (§8.4). A resume-time thread update
+may replace the cache only before a turn starts; completed-turn metadata always wins. This is a
 usage-vs-capacity indicator to warn before hitting context limits.
 The gauge is rendered as a header button; activating it opens a compact card with the same current
 context footprint plus cumulative thread token totals from §10.2 and a manual `Compact context`
@@ -2616,6 +2642,8 @@ anything other than `thread_turn_active`.
 (lightweight cross-thread sidebar/notification signal; `approval_requested` carries
 `approval_id`, and `server_request_received` carries `server_request_id`),
 `ThreadState { thread_id, state }` (persisted snapshot on subscribe/resync),
+`ThreadContextWindowUpdated { thread_id, context_window }` (thread-scoped runtime metadata
+discovered asynchronously after native resume),
 `LiveTurnSnapshot { thread_id, turn_id, accumulated, pending_approval?, pending_server_requests }`
 (in-flight turn reconstruction on reconnect, carrying `WireAgentEvent`s, a `WireApprovalRequest`,
 and unresolved `ServerRequest`s),
@@ -2711,11 +2739,16 @@ events through the same event handler used for live WebSocket events.
   **live buffer**: the ordered `AgentEvent`s accumulated since `TurnStarted` (agent-text so
   far, command output so far, pending approval/server requests, current diffs). This buffer is
   discarded on `TurnCompleted` (the finalized items are then on disk). On `Subscribe`, the
-  server sends a **snapshot** first:
+  server sends this **subscription snapshot** sequence:
   1. the persisted thread state (all completed turns) from disk, then
   2. if a turn is currently live, a `LiveTurnSnapshot` reconstructed from the live buffer
      (accumulated text/output + any pending approval/server request), then
   3. subsequent deltas as normal.
+
+  A concurrent metadata broadcast can be queued after subscription but before `ThreadState` is
+  serialized. In particular, `ThreadContextWindowUpdated` may arrive before the snapshot it
+  supersedes. The browser must buffer the latest such update while awaiting any initial or resync
+  `ThreadState`, then apply it after that state when its `thread_id` matches the active thread.
 
   The browser treats this subscribe/resubscribe snapshot as authoritative for the active thread.
   It must clear transient browser-rendered transcript state (including optimistic pending user

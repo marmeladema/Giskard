@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
@@ -55,6 +55,9 @@ pub struct OpenThreadOptions {
     /// Some(native id) ⇒ resume; None ⇒ fresh thread.
     pub resume: Option<String>,
     pub initial_model: ModelRef,
+    /// Race-free sink for thread-scoped metadata that may arrive immediately after the native
+    /// open response. Sending an update must never delay or determine whether opening succeeds.
+    pub updates: ThreadUpdateSink,
 }
 
 /// Handle to an opened thread.
@@ -70,6 +73,42 @@ pub struct ThreadHandle {
     /// success (see `specs/model-provider-switching-analysis.md`). `None` ⇒ the harness gave no
     /// signal and the requested model must be assumed.
     pub resumed_model: Option<ModelRef>,
+}
+
+/// Thread-scoped runtime metadata delivered independently of turns and open responses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadUpdate {
+    /// Context capacity reported asynchronously after a native thread resume.
+    ContextWindowRestored { context_window: u32 },
+}
+
+/// Producer half of the thread-update channel supplied to a harness before opening starts.
+#[derive(Debug, Clone)]
+pub struct ThreadUpdateSink {
+    tx: mpsc::Sender<ThreadUpdate>,
+}
+
+impl ThreadUpdateSink {
+    pub fn send(&self, update: ThreadUpdate) -> Result<(), ThreadUpdate> {
+        self.tx.try_send(update).map_err(|error| error.into_inner())
+    }
+}
+
+/// Consumer half of the thread-update channel owned by the server registry.
+pub struct ThreadUpdateStream {
+    rx: mpsc::Receiver<ThreadUpdate>,
+}
+
+impl ThreadUpdateStream {
+    pub async fn recv(&mut self) -> Option<ThreadUpdate> {
+        self.rx.recv().await
+    }
+}
+
+/// Create the thread-update path before calling [`AgentHarness::open_thread`].
+pub fn thread_update_channel() -> (ThreadUpdateSink, ThreadUpdateStream) {
+    let (tx, rx) = mpsc::channel(16);
+    (ThreadUpdateSink { tx }, ThreadUpdateStream { rx })
 }
 
 #[derive(Debug, Clone)]

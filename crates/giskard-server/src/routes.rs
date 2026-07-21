@@ -492,6 +492,7 @@ async fn open_thread(
             return Err(ApiError::NotFound);
         }
         let catalog = project_model_catalog(&state, &project_config, &app_config).await;
+        let _open_guard = state.registry.lock_thread_open(thread_id).await;
         let thread_file =
             normalize_persisted_thread_model(&state, project_id, thread_id, &app_config, &catalog)
                 .await?
@@ -504,7 +505,6 @@ async fn open_thread(
                 warning: None,
             }));
         }
-
         // Opening an existing thread must not hard-fail when the harness can't attach — most
         // often because the thread's provider was removed from config. The browser opens a
         // thread through this endpoint *before* subscribing over the WebSocket, so a 500 here
@@ -558,15 +558,25 @@ async fn open_thread(
             )));
         }
 
-        if handle.harness_thread_id != thread_file.harness_thread_id {
-            state
-                .store
-                .update_thread(project_id, thread_id, |tf| {
-                    tf.harness_thread_id = handle.harness_thread_id.clone();
-                    tf.updated_at = Utc::now();
-                })
-                .await?;
+        match persist_opened_thread_identity(
+            &state,
+            project_id,
+            thread_id,
+            &handle.harness_thread_id,
+        )
+        .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                state.registry.forget_thread(thread_id).await;
+                return Err(ApiError::NotFound);
+            }
+            Err(error) => {
+                state.registry.forget_thread(thread_id).await;
+                return Err(error.into());
+            }
         }
+        state.registry.activate_thread_updates(thread_id).await;
 
         let warning = handle.warning.as_ref().map(|warning| {
             warning_info(
@@ -607,10 +617,7 @@ async fn open_thread(
         .resumed_model
         .clone()
         .unwrap_or_else(|| project_config.default_model.clone());
-    let catalog = project_model_catalog(&state, &project_config, &app_config).await;
-    let descriptor =
-        crate::models::resolve_catalog_descriptor(&catalog, &app_config, &current_model);
-    let context_window = descriptor.context_window;
+    let context_window = ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW;
     let now = Utc::now();
     let thread_file = ThreadFile {
         version: 1,
@@ -629,7 +636,11 @@ async fn open_thread(
         updated_at: now,
         archived: false,
     };
-    state.store.save_thread(project_id, &thread_file).await?;
+    if let Err(error) = state.store.save_thread(project_id, &thread_file).await {
+        state.registry.forget_thread(handle.thread).await;
+        return Err(error.into());
+    }
+    state.registry.activate_thread_updates(handle.thread).await;
 
     let warning = handle.warning.as_ref().map(|warning| {
         warning_info(
@@ -675,8 +686,7 @@ async fn start_thread_with_message(
     }
 
     let catalog = project_model_catalog(&state, &project_config, &app_config).await;
-    let (model_ref, model_descriptor) =
-        resolve_initial_thread_model(&app_config, &catalog, req.model_ref);
+    let model_ref = resolve_initial_thread_model(&app_config, &catalog, req.model_ref);
     let ws_root = project_config
         .workspace_root
         .as_deref()
@@ -730,7 +740,7 @@ async fn start_thread_with_message(
         harness_thread_id: handle.harness_thread_id.clone(),
         mode: req.mode,
         current_model: model_ref.clone(),
-        context_window: model_descriptor.context_window,
+        context_window: ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
         model_context_windows: std::collections::HashMap::new(),
         approval_policy: req.approval_policy,
         model_efforts: std::collections::HashMap::new(),
@@ -752,6 +762,7 @@ async fn start_thread_with_message(
         .await;
         return Err(ApiError::Internal(error.to_string()));
     }
+    state.registry.activate_thread_updates(thread_id).await;
 
     let overrides = TurnOverrides {
         model: Some(model_ref.clone()),
@@ -805,13 +816,13 @@ fn resolve_initial_thread_model(
     config: &giskard_persist::Config,
     catalog: &[ModelDescriptor],
     model: ModelRef,
-) -> (ModelRef, ModelDescriptor) {
+) -> ModelRef {
     let mut model = crate::models::normalize_model_ref(config, &model);
     let descriptor = crate::models::resolve_catalog_descriptor(catalog, config, &model);
     if !descriptor.supports_reasoning_effort {
         model.reasoning_effort = None;
     }
-    (model, descriptor)
+    model
 }
 
 async fn cleanup_new_thread_after_start_failure(
@@ -1449,14 +1460,40 @@ async fn normalize_persisted_thread_model(
             let current_model = crate::models::normalize_model_ref(config, &thread.current_model);
             let descriptor =
                 crate::models::resolve_catalog_descriptor(catalog, config, &current_model);
-            let context_window = crate::models::context_window_with_runtime(
-                &current_model,
-                &descriptor,
-                &thread.model_context_windows,
-            );
+            let context_window = if current_model == thread.current_model {
+                if thread.context_window > 0 {
+                    thread.context_window
+                } else {
+                    ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW
+                }
+            } else {
+                crate::models::context_window_with_runtime(
+                    &current_model,
+                    &descriptor,
+                    &thread.model_context_windows,
+                )
+            };
             if current_model != thread.current_model || context_window != thread.context_window {
                 thread.current_model = current_model;
                 thread.context_window = context_window;
+                thread.updated_at = Utc::now();
+            }
+        })
+        .await
+}
+
+async fn persist_opened_thread_identity(
+    state: &AppState,
+    project_id: ProjectId,
+    thread_id: ThreadId,
+    harness_thread_id: &str,
+) -> Result<Option<ThreadFile>, PersistError> {
+    let harness_thread_id = harness_thread_id.to_owned();
+    state
+        .store
+        .update_thread(project_id, thread_id, move |thread| {
+            if thread.harness_thread_id != harness_thread_id {
+                thread.harness_thread_id = harness_thread_id.clone();
                 thread.updated_at = Utc::now();
             }
         })
@@ -1994,7 +2031,13 @@ async fn handle_client_msg(
                     )
                 }
             };
-            state.hub.subscribe(thread_id, client_id, tx.clone()).await;
+            for warning in state
+                .registry
+                .subscribe_with_thread_update_notices(thread_id, client_id, tx.clone())
+                .await
+            {
+                let _ = tx.send(ServerMessage::Error { error: warning }).await;
+            }
 
             if let Some(warning) = notice {
                 let _ = tx.send(ServerMessage::Error { error: warning }).await;
@@ -2168,11 +2211,17 @@ async fn handle_client_msg(
                         &app_config,
                         &normalized,
                     );
-                    tf.context_window = crate::models::context_window_with_runtime(
-                        &normalized,
-                        &descriptor,
-                        &tf.model_context_windows,
-                    );
+                    let same_model = tf.current_model.provider == normalized.provider
+                        && tf.current_model.model == normalized.model;
+                    if !same_model {
+                        tf.context_window = crate::models::context_window_with_runtime(
+                            &normalized,
+                            &descriptor,
+                            &tf.model_context_windows,
+                        );
+                    } else if tf.context_window == 0 {
+                        tf.context_window = ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW;
+                    }
                     tf.current_model = normalized;
                     tf.updated_at = chrono::Utc::now();
                 })
@@ -2237,6 +2286,7 @@ async fn handle_client_msg(
             // a *cold* thread too — that is exactly how an orphaned thread (provider removed from
             // config) gets rescued.
             let project_id = project_for_readonly(state, thread_id, "select_model").await?;
+            let _open_guard = state.registry.lock_thread_open(thread_id).await;
             let config = state
                 .store
                 .load_config()
@@ -2258,6 +2308,7 @@ async fn handle_client_msg(
                 })?;
             let catalog = project_model_catalog(state, &project_config, &config).await;
             let model_ref = crate::models::normalize_model_ref(&config, &model_ref);
+            let mut provider_switch = None;
 
             if state
                 .registry
@@ -2299,19 +2350,23 @@ async fn handle_client_msg(
                     .current_model
                     .provider;
                 if stored_provider != model_ref.provider {
-                    if let Some(warning) =
-                        switch_provider_cold(state, project_id, thread_id, &model_ref).await?
-                    {
-                        let _ = tx.send(ServerMessage::Error { error: warning }).await;
-                    }
+                    provider_switch =
+                        Some(switch_provider_cold(state, project_id, thread_id, &model_ref).await?);
                 }
             }
 
             // All model/effort resolution happens inside the RMW closure so it sees the
             // authoritative current model under the per-thread lock (§5.4, C7 effort retention).
-            let tf = state
+            let switched = provider_switch.is_some();
+            let switched_harness_thread_id = provider_switch
+                .as_ref()
+                .map(|switch| switch.harness_thread_id.clone());
+            let updated = state
                 .store
                 .update_thread(project_id, thread_id, move |tf| {
+                    if let Some(harness_thread_id) = switched_harness_thread_id {
+                        tf.harness_thread_id = harness_thread_id;
+                    }
                     let old = crate::models::resolve_catalog_descriptor(
                         &catalog,
                         &config,
@@ -2339,26 +2394,51 @@ async fn handle_client_msg(
                         new_model.reasoning_effort = None;
                     }
 
-                    tf.context_window = crate::models::context_window_with_runtime(
-                        &new_model,
-                        &new_descriptor,
-                        &tf.model_context_windows,
-                    );
+                    if !same_model {
+                        tf.context_window = crate::models::context_window_with_runtime(
+                            &new_model,
+                            &new_descriptor,
+                            &tf.model_context_windows,
+                        );
+                    } else if tf.context_window == 0 {
+                        tf.context_window = ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW;
+                    }
                     tf.current_model = new_model;
                     tf.updated_at = chrono::Utc::now();
                 })
-                .await
-                .map_err(|e| WsError::from_persist(e, "select_model", Some(thread_id)))?
-                .ok_or_else(|| {
-                    WsError::new(
+                .await;
+            let tf = match updated {
+                Ok(Some(thread)) => thread,
+                Ok(None) => {
+                    if switched {
+                        state.registry.forget_thread(thread_id).await;
+                    }
+                    return Err(WsError::new(
                         "thread_not_found",
                         ErrorSeverity::Error,
                         "Thread not found.",
                     )
                     .thread(thread_id)
-                    .action("select_model")
-                })?;
+                    .action("select_model"));
+                }
+                Err(error) => {
+                    if switched {
+                        state.registry.forget_thread(thread_id).await;
+                    }
+                    return Err(WsError::from_persist(
+                        error,
+                        "select_model",
+                        Some(thread_id),
+                    ));
+                }
+            };
             broadcast_thread_state(state, thread_id, &tf).await;
+            if let Some(provider_switch) = provider_switch {
+                state.registry.activate_thread_updates(thread_id).await;
+                if let Some(warning) = provider_switch.warning {
+                    let _ = tx.send(ServerMessage::Error { error: warning }).await;
+                }
+            }
         }
         ClientMessage::SetApprovalPolicy { thread_id, policy } => {
             let project_id = project_for(state, thread_id, "set_approval_policy").await?;
@@ -2607,6 +2687,7 @@ async fn ensure_thread_open(
     thread_id: ThreadId,
     action: &str,
 ) -> Result<ThreadAccess, WsError> {
+    let _open_guard = state.registry.lock_thread_open(thread_id).await;
     if let Some(project_id) = state.registry.get_project_for_thread(thread_id).await {
         return Ok(ThreadAccess {
             project_id,
@@ -2685,17 +2766,31 @@ async fn ensure_thread_open(
         .action(action));
     }
 
-    if handle.harness_thread_id != thread_file.harness_thread_id {
-        let harness_thread_id = handle.harness_thread_id.clone();
-        state
-            .store
-            .update_thread(project_config.id, thread_id, |tf| {
-                tf.harness_thread_id = harness_thread_id;
-                tf.updated_at = Utc::now();
-            })
-            .await
-            .map_err(|e| WsError::from_persist(e, action, Some(thread_id)))?;
+    let persisted = persist_opened_thread_identity(
+        state,
+        project_config.id,
+        thread_id,
+        &handle.harness_thread_id,
+    )
+    .await;
+    match persisted {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            state.registry.forget_thread(thread_id).await;
+            return Err(WsError::new(
+                "thread_not_found",
+                ErrorSeverity::Error,
+                "Thread not found.",
+            )
+            .thread(thread_id)
+            .action(action));
+        }
+        Err(error) => {
+            state.registry.forget_thread(thread_id).await;
+            return Err(WsError::from_persist(error, action, Some(thread_id)));
+        }
     }
+    state.registry.activate_thread_updates(thread_id).await;
 
     let warning = handle.warning.map(|warning| {
         warning_info(
@@ -2892,6 +2987,11 @@ async fn read_only_warning(
     read_only_info(context.as_ref(), detail, thread_id, "subscribe")
 }
 
+struct VerifiedProviderSwitch {
+    harness_thread_id: String,
+    warning: Option<ErrorInfo>,
+}
+
 /// Switch a **cold** thread to a different provider via a verified native re-resume (spec PS1).
 ///
 /// Calls `thread/resume` with the requested model/provider and requires the harness to confirm
@@ -2907,7 +3007,23 @@ async fn switch_provider_cold(
     project_id: ProjectId,
     thread_id: ThreadId,
     requested: &ModelRef,
-) -> Result<Option<ErrorInfo>, WsError> {
+) -> Result<VerifiedProviderSwitch, WsError> {
+    // The caller holds the per-thread open lock across this verified resume and the subsequent
+    // model persistence, so no concurrent attach can observe a half-committed provider switch.
+    if state
+        .registry
+        .get_thread_native_model(thread_id)
+        .await
+        .is_some()
+    {
+        return Err(WsError::new(
+            "thread_provider_locked",
+            ErrorSeverity::Error,
+            "This thread is already bound to its current provider.",
+        )
+        .thread(thread_id)
+        .action("select_model"));
+    }
     let project_config = state
         .store
         .load_project(project_id)
@@ -2996,28 +3112,18 @@ async fn switch_provider_cold(
         .action("select_model"));
     }
 
-    // The C5 fallback (native context lost ⇒ fresh Codex session) yields a new native id; keep
-    // the persisted mapping in sync exactly like the normal open path does.
-    if handle.harness_thread_id != thread_file.harness_thread_id {
-        state
-            .store
-            .update_thread(project_id, thread_id, |tf| {
-                tf.harness_thread_id = handle.harness_thread_id.clone();
-                tf.updated_at = Utc::now();
-            })
-            .await
-            .map_err(|e| WsError::from_persist(e, "select_model", Some(thread_id)))?;
-    }
-
-    Ok(handle.warning.as_ref().map(|warning| {
-        warning_info(
-            warning.code.clone(),
-            warning.message.clone(),
-            warning.detail.clone(),
-            thread_id,
-            "select_model",
-        )
-    }))
+    Ok(VerifiedProviderSwitch {
+        harness_thread_id: handle.harness_thread_id,
+        warning: handle.warning.as_ref().map(|warning| {
+            warning_info(
+                warning.code.clone(),
+                warning.message.clone(),
+                warning.detail.clone(),
+                thread_id,
+                "select_model",
+            )
+        }),
+    })
 }
 
 async fn ensure_provider_change_allowed(

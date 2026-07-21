@@ -17,6 +17,7 @@ use giskard_core::turn::{ApprovalPolicy, Mode, TurnOverrides, TurnStatus, TurnSt
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
     AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+    ThreadUpdate,
 };
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 use giskard_persist::store::ProjectConfig;
@@ -151,6 +152,11 @@ struct CountingOpenHarness {
     started_models: tokio::sync::Mutex<Vec<Option<ModelRef>>>,
     started_inputs: tokio::sync::Mutex<Vec<String>>,
     start_error: tokio::sync::Mutex<Option<HarnessError>>,
+    restored_context_window: tokio::sync::Mutex<Option<u32>>,
+    active_turn_context_window: tokio::sync::Mutex<Option<u32>>,
+    returned_thread: tokio::sync::Mutex<Option<ThreadId>>,
+    hold_open: AtomicBool,
+    release_open: AtomicBool,
 }
 
 impl SlowStartHarness {
@@ -260,6 +266,37 @@ impl CountingOpenHarness {
 
     async fn fail_start_with(&self, error: HarnessError) {
         *self.start_error.lock().await = Some(error);
+    }
+
+    async fn restore_context_window(&self, context_window: u32) {
+        *self.restored_context_window.lock().await = Some(context_window);
+    }
+
+    async fn report_active_turn_context_window(&self, context_window: u32) {
+        *self.active_turn_context_window.lock().await = Some(context_window);
+    }
+
+    async fn return_thread(&self, thread_id: ThreadId) {
+        *self.returned_thread.lock().await = Some(thread_id);
+    }
+
+    fn hold_open(&self) {
+        self.release_open.store(false, Ordering::SeqCst);
+        self.hold_open.store(true, Ordering::SeqCst);
+    }
+
+    fn release_open(&self) {
+        self.release_open.store(true, Ordering::SeqCst);
+    }
+
+    async fn wait_for_open_calls(&self, expected: usize) {
+        tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+            while self.open_calls() < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("harness open call should arrive");
     }
 }
 
@@ -808,13 +845,28 @@ impl AgentHarness for CountingOpenHarness {
 
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
         let open_call = self.open_calls.fetch_add(1, Ordering::SeqCst) + 1;
-        let thread = opts.thread.unwrap_or_default();
+        while self.hold_open.load(Ordering::SeqCst) && !self.release_open.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        let requested_thread = opts.thread.unwrap_or_default();
+        let thread = self
+            .returned_thread
+            .lock()
+            .await
+            .unwrap_or(requested_thread);
         self.opened_models
             .lock()
             .await
             .push(opts.initial_model.clone());
         let (tx, _) = tokio::sync::broadcast::channel(16);
         self.threads.lock().await.insert(thread, tx);
+        if opts.resume.is_some()
+            && let Some(context_window) = *self.restored_context_window.lock().await
+        {
+            let _ = opts
+                .updates
+                .send(ThreadUpdate::ContextWindowRestored { context_window });
+        }
         Ok(ThreadHandle {
             thread,
             harness_thread_id: opts
@@ -832,6 +884,7 @@ impl AgentHarness for CountingOpenHarness {
         overrides: TurnOverrides,
     ) -> Result<TurnId, HarnessError> {
         self.start_calls.fetch_add(1, Ordering::SeqCst);
+        let model = overrides.model.clone();
         self.started_models.lock().await.push(overrides.model);
         self.started_inputs
             .lock()
@@ -852,6 +905,16 @@ impl AgentHarness for CountingOpenHarness {
             thread: thread.thread,
             turn,
         });
+        if let (Some(model), Some(context_window)) =
+            (model, *self.active_turn_context_window.lock().await)
+        {
+            let _ = sender.send(AgentEvent::ContextWindowUpdated {
+                thread: thread.thread,
+                turn,
+                model,
+                context_window,
+            });
+        }
         Ok(turn)
     }
 
@@ -1509,6 +1572,141 @@ async fn login_cookie(client: &reqwest::Client, base: &str) -> String {
         .to_string()
 }
 
+async fn seed_persisted_thread_with_turn(state: &AppState) -> (ProjectId, ThreadId, ModelRef) {
+    let model = ModelRef {
+        provider: "openai".into(),
+        model: "gpt-5.5".into(),
+        reasoning_effort: None,
+    };
+    let project_id = ProjectId::new();
+    state
+        .store
+        .create_project(
+            project_id,
+            "context-restore",
+            "/tmp/context-restore",
+            model.clone(),
+        )
+        .await
+        .unwrap();
+    let thread_id = ThreadId::new();
+    let now = chrono::Utc::now();
+    state
+        .store
+        .save_thread(
+            project_id,
+            &giskard_persist::store::ThreadFile {
+                version: 1,
+                id: thread_id,
+                project_id,
+                title: "Context restore".into(),
+                harness_thread_id: "native-context-restore".into(),
+                mode: Mode::Build,
+                current_model: model.clone(),
+                context_window: 128_000,
+                model_context_windows: Default::default(),
+                approval_policy: ApprovalPolicy::Ask,
+                model_efforts: Default::default(),
+                tokens: Default::default(),
+                created_at: now,
+                updated_at: now,
+                archived: false,
+            },
+        )
+        .await
+        .unwrap();
+    state
+        .store
+        .append_turn(
+            project_id,
+            thread_id,
+            &giskard_core::turn::Turn {
+                id: TurnId::new(),
+                user_input: UserInput::text("previous turn"),
+                items: vec![],
+                model: model.clone(),
+                mode: Mode::Build,
+                status: TurnStatus {
+                    kind: TurnStatusKind::Completed,
+                    message: None,
+                },
+                usage: TokenUsage::default(),
+                diffs: vec![],
+                started_at: now,
+                completed_at: Some(now),
+            },
+        )
+        .await
+        .unwrap();
+    (project_id, thread_id, model)
+}
+
+async fn subscribe_and_wait_for_context_window(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    thread_id: ThreadId,
+    expected_context_window: u32,
+) -> u32 {
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::Subscribe {
+            thread_id,
+            since: None,
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+        loop {
+            let message = ws.next().await.unwrap().unwrap();
+            let tokio_tungstenite::tungstenite::Message::Text(text) = message else {
+                continue;
+            };
+            match serde_json::from_str(&text).unwrap() {
+                ServerMessage::ThreadState(state)
+                    if state.state["context_window"] == expected_context_window =>
+                {
+                    break expected_context_window;
+                }
+                ServerMessage::ThreadContextWindowUpdated { context_window, .. }
+                    if context_window == expected_context_window =>
+                {
+                    break context_window;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("context-window update should arrive")
+}
+
+async fn wait_for_context_window(
+    state: &AppState,
+    project_id: ProjectId,
+    thread_id: ThreadId,
+    expected: u32,
+) -> giskard_persist::store::ThreadFile {
+    tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+        loop {
+            let thread = state
+                .store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if thread.context_window == expected {
+                break thread;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("asynchronous context-window update should be persisted")
+}
+
 async fn connect_ws(
     port: u16,
     cookie: &str,
@@ -1765,6 +1963,7 @@ async fn wait_for_thread_activity(
                         );
                     }
                     ServerMessage::ThreadState(_)
+                    | ServerMessage::ThreadContextWindowUpdated { .. }
                     | ServerMessage::TokenUpdate { .. }
                     | ServerMessage::ApprovalResolved { .. }
                     | ServerMessage::Error { .. }
@@ -2277,6 +2476,7 @@ async fn inactive_thread_progress_sends_activity_without_full_event_subscription
                     ServerMessage::TokenUpdate {
                         thread_id: None, ..
                     }
+                    | ServerMessage::ThreadContextWindowUpdated { .. }
                     | ServerMessage::ApprovalResolved { .. }
                     | ServerMessage::Error { .. }
                     | ServerMessage::ApprovalRequest { .. }
@@ -3518,7 +3718,7 @@ async fn subscribe_reopens_persisted_thread() {
                 harness_thread_id: "th_test".into(),
                 mode: Mode::Build,
                 current_model: model.clone(),
-                context_window: 128_000,
+                context_window: 190_000,
                 model_context_windows: HashMap::from([(
                     "openai".into(),
                     HashMap::from([("gpt-5.5".into(), 258_400)]),
@@ -3569,7 +3769,7 @@ async fn subscribe_reopens_persisted_thread() {
                 let server_msg: ServerMessage = serde_json::from_str(&t).unwrap();
                 if let ServerMessage::ThreadState(state) = server_msg {
                     assert_eq!(state.thread_id, tid);
-                    assert_eq!(state.state["context_window"], 258_400);
+                    assert_eq!(state.state["context_window"], 190_000);
                     got_thread_state = true;
                     break;
                 }
@@ -3581,7 +3781,7 @@ async fn subscribe_reopens_persisted_thread() {
 
     assert!(got_thread_state, "subscribe should return ThreadState");
     let persisted = state.store.load_thread(pid, tid).await.unwrap().unwrap();
-    assert_eq!(persisted.context_window, 258_400);
+    assert_eq!(persisted.context_window, 190_000);
     assert_eq!(state.registry.get_project_for_thread(tid).await, Some(pid));
 }
 
@@ -4565,8 +4765,8 @@ wire_api = "responses"
     assert_eq!(resp.status(), 200);
     let saved_thread = state.store.load_thread(pid, tid).await.unwrap().unwrap();
     assert_eq!(
-        saved_thread.context_window, 262_144,
-        "opening an unchanged model should repair stale descriptor metadata"
+        saved_thread.context_window, 64_000,
+        "opening an unchanged model should preserve persisted runtime metadata"
     );
 }
 
@@ -4670,6 +4870,372 @@ wire_api = "responses"
     let saved_thread = state.store.load_thread(pid, tid).await.unwrap().unwrap();
     assert_eq!(saved_thread.current_model.provider, "proxy");
     assert_eq!(saved_thread.context_window, 262_144);
+}
+
+#[tokio::test]
+async fn http_open_persists_and_broadcasts_restored_context_asynchronously() {
+    let harness = Arc::new(CountingOpenHarness::default());
+    harness.restore_context_window(258_400).await;
+    let (_tmp, state, port) =
+        start_custom_server_on_available_port(Arc::new(CountingOpenFactory {
+            harness: harness.clone(),
+        }))
+        .await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let (project_id, thread_id, _) = seed_persisted_thread_with_turn(&state).await;
+
+    let response = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"thread_id": thread_id, "resume": null}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let persisted = wait_for_context_window(&state, project_id, thread_id, 258_400).await;
+    assert_eq!(persisted.context_window, 258_400);
+    assert!(persisted.model_context_windows.is_empty());
+
+    let mut ws = connect_ws(port, &cookie).await;
+    let context_window = subscribe_and_wait_for_context_window(&mut ws, thread_id, 258_400).await;
+    assert_eq!(context_window, 258_400);
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SendInput {
+            thread_id,
+            text: "start without completing".into(),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+        loop {
+            let message = ws.next().await.unwrap().unwrap();
+            let tokio_tungstenite::tungstenite::Message::Text(text) = message else {
+                continue;
+            };
+            if matches!(
+                serde_json::from_str(&text).unwrap(),
+                ServerMessage::Event {
+                    agent_event: WireAgentEvent::TurnStarted { .. },
+                    ..
+                }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("turn should start");
+    let persisted = state
+        .store
+        .load_thread(project_id, thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        persisted.context_window, 258_400,
+        "starting a turn must not discard resume-time metadata"
+    );
+}
+
+#[tokio::test]
+async fn websocket_reopen_broadcasts_restored_context_asynchronously() {
+    let harness = Arc::new(CountingOpenHarness::default());
+    harness.restore_context_window(258_400).await;
+    let (_tmp, state, port) =
+        start_custom_server_on_available_port(Arc::new(CountingOpenFactory {
+            harness: harness.clone(),
+        }))
+        .await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let (project_id, thread_id, _) = seed_persisted_thread_with_turn(&state).await;
+
+    let mut ws = connect_ws(port, &cookie).await;
+    let context_window = subscribe_and_wait_for_context_window(&mut ws, thread_id, 258_400).await;
+    assert_eq!(context_window, 258_400);
+    assert_eq!(harness.open_calls(), 1);
+
+    let persisted = state
+        .store
+        .load_thread(project_id, thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.context_window, 258_400);
+    assert!(persisted.model_context_windows.is_empty());
+}
+
+#[tokio::test]
+async fn websocket_subscribe_replays_active_turn_context_window() {
+    let harness = Arc::new(CountingOpenHarness::default());
+    harness.report_active_turn_context_window(258_400).await;
+    let (_tmp, state, port) =
+        start_custom_server_on_available_port(Arc::new(CountingOpenFactory {
+            harness: harness.clone(),
+        }))
+        .await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let (project_id, thread_id, _) = seed_persisted_thread_with_turn(&state).await;
+
+    let response = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"thread_id": thread_id, "resume": null}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let mut first_ws = connect_ws(port, &cookie).await;
+    first_ws
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&ClientMessage::Subscribe {
+                thread_id,
+                since: None,
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    first_ws
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&ClientMessage::SendInput {
+                thread_id,
+                text: "start and keep live".into(),
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let active_turn = wait_for_turn_started(&mut first_ws, thread_id).await;
+    let persisted = wait_for_context_window(&state, project_id, thread_id, 258_400).await;
+    assert_eq!(
+        persisted
+            .model_context_windows
+            .get("openai")
+            .and_then(|models| models.get("gpt-5.5")),
+        Some(&258_400)
+    );
+
+    let mut replay_ws = connect_ws(port, &cookie).await;
+    replay_ws
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&ClientMessage::Subscribe {
+                thread_id,
+                since: None,
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut saw_thread_state = false;
+    let mut saw_live_context = false;
+    tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+        loop {
+            let message = replay_ws.next().await.unwrap().unwrap();
+            let tokio_tungstenite::tungstenite::Message::Text(text) = message else {
+                continue;
+            };
+            match serde_json::from_str::<ServerMessage>(&text).unwrap() {
+                ServerMessage::ThreadState(state) if state.thread_id == thread_id => {
+                    assert_eq!(state.state["context_window"], 258_400);
+                    saw_thread_state = true;
+                }
+                ServerMessage::LiveTurnSnapshot(snapshot) if snapshot.thread_id == thread_id => {
+                    assert_eq!(snapshot.turn_id, active_turn);
+                    saw_live_context = snapshot.accumulated.iter().any(|event| {
+                        matches!(
+                            event,
+                            WireAgentEvent::ContextWindowUpdated {
+                                thread,
+                                turn,
+                                model,
+                                context_window,
+                            } if *thread == thread_id
+                                && *turn == active_turn
+                                && model.provider == "openai"
+                                && model.model == "gpt-5.5"
+                                && *context_window == 258_400
+                        )
+                    });
+                }
+                _ => {}
+            }
+            if saw_thread_state && saw_live_context {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("active turn context-window snapshot should be replayed");
+}
+
+#[tokio::test]
+async fn concurrent_existing_thread_opens_share_one_harness_binding() {
+    let harness = Arc::new(CountingOpenHarness::default());
+    harness.hold_open();
+    let (_tmp, state, port) =
+        start_custom_server_on_available_port(Arc::new(CountingOpenFactory {
+            harness: harness.clone(),
+        }))
+        .await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let (project_id, thread_id, _) = seed_persisted_thread_with_turn(&state).await;
+    let url = format!("{base}/api/projects/{project_id}/threads");
+    let body = serde_json::json!({"thread_id": thread_id, "resume": null});
+
+    let first = tokio::spawn({
+        let client = client.clone();
+        let cookie = cookie.clone();
+        let url = url.clone();
+        let body = body.clone();
+        async move {
+            client
+                .post(url)
+                .header("cookie", cookie)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    harness.wait_for_open_calls(1).await;
+
+    let second = tokio::spawn({
+        let client = client.clone();
+        let cookie = cookie.clone();
+        let url = url.clone();
+        async move {
+            client
+                .post(url)
+                .header("cookie", cookie)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+    assert_eq!(harness.open_calls(), 1);
+
+    harness.release_open();
+    assert_eq!(first.await.unwrap().status(), 200);
+    assert_eq!(second.await.unwrap().status(), 200);
+    assert_eq!(harness.open_calls(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn existing_thread_open_rolls_back_binding_when_identity_persistence_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let harness = Arc::new(CountingOpenHarness::default());
+    harness.hold_open();
+    let (tmp, state, port) = start_custom_server_on_available_port(Arc::new(CountingOpenFactory {
+        harness: harness.clone(),
+    }))
+    .await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let (project_id, thread_id, _) = seed_persisted_thread_with_turn(&state).await;
+    let threads_dir = tmp
+        .path()
+        .join("projects")
+        .join(project_id.to_string())
+        .join("threads");
+    let original_permissions = std::fs::metadata(&threads_dir).unwrap().permissions();
+    let failed = tokio::spawn({
+        let client = client.clone();
+        let cookie = cookie.clone();
+        let url = format!("{base}/api/projects/{project_id}/threads");
+        async move {
+            client
+                .post(url)
+                .header("cookie", cookie)
+                .json(&serde_json::json!({"thread_id": thread_id, "resume": null}))
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    harness.wait_for_open_calls(1).await;
+    std::fs::set_permissions(&threads_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    harness.release_open();
+    let failed = failed.await.unwrap();
+    std::fs::set_permissions(&threads_dir, original_permissions).unwrap();
+
+    assert_eq!(failed.status(), 500);
+    assert!(state.registry.get_thread_handle(thread_id).await.is_none());
+
+    let retried = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"thread_id": thread_id, "resume": null}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(retried.status(), 200);
+    assert_eq!(harness.open_calls(), 2);
+}
+
+#[tokio::test]
+async fn existing_thread_open_rejects_wrong_harness_thread_without_binding_it() {
+    let harness = Arc::new(CountingOpenHarness::default());
+    let returned_thread = ThreadId::new();
+    harness.return_thread(returned_thread).await;
+    let (_tmp, state, port) =
+        start_custom_server_on_available_port(Arc::new(CountingOpenFactory {
+            harness: harness.clone(),
+        }))
+        .await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let (project_id, requested_thread, _) = seed_persisted_thread_with_turn(&state).await;
+
+    let response = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"thread_id": requested_thread, "resume": null}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(body["thread_id"], requested_thread.to_string());
+    assert_eq!(body["warning"]["code"], "thread_read_only");
+    assert!(
+        state
+            .registry
+            .get_thread_handle(requested_thread)
+            .await
+            .is_none()
+    );
+    assert!(
+        state
+            .registry
+            .get_thread_handle(returned_thread)
+            .await
+            .is_none()
+    );
 }
 
 #[tokio::test]

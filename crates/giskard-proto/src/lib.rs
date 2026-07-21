@@ -219,6 +219,11 @@ pub enum ServerMessage {
     },
     ThreadActivity(ThreadActivity),
     ThreadState(ThreadState),
+    /// Thread-scoped runtime metadata discovered after the initial thread state was published.
+    ThreadContextWindowUpdated {
+        thread_id: ThreadId,
+        context_window: u32,
+    },
     /// A page of persisted history (H6), oldest-first; `has_more` if older turns exist before it.
     HistoryPage {
         thread_id: ThreadId,
@@ -692,6 +697,20 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn server_message_context_window_update_is_thread_scoped() {
+        let thread_id = ThreadId::new();
+        let message = ServerMessage::ThreadContextWindowUpdated {
+            thread_id,
+            context_window: 258_400,
+        };
+
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(json["type"], "thread_context_window_updated");
+        assert_eq!(json["thread_id"], thread_id.to_string());
+        assert_eq!(json["context_window"], 258_400);
     }
 
     #[test]

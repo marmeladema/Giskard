@@ -147,6 +147,14 @@ Later: item/completed(call_7, processId = 12345) updates the Turn A item
 The adapter keeps draining Codex messages while it knows any command is running
 so that this late completion can clear the running-task state.
 
+## App-server transport
+
+The worker selects between app-server messages, harness commands, and control commands. Its stdio
+reader therefore uses cancellation-safe newline framing: when another selection branch wins after
+only part of a JSON-RPC line is available, the unread line must remain intact for the next poll.
+Giskard retains `codex-codes` for protocol types and mapping, but owns this small transport layer
+because the SDK client currently frames stdout with cancellation-unsafe `read_line`.
+
 ## Background terminal discovery
 
 `thread/backgroundTerminals/list` returns live unified-exec entries for a loaded
@@ -254,11 +262,29 @@ acknowledged. Non-positive values and values outside Giskard's `u32` range are l
 and ignored without dropping the notification's token usage. The server persists
 accepted values per `(provider, model)` so they survive reloads and model switches.
 
-Existing threads initialize the gauge from Giskard's latest persisted runtime value
-for the selected model. If none has been observed, they use provider/config metadata
-or the conservative fallback. Codex may replay historical token usage after
-`thread/resume`; that replay is not a new turn observation and is not folded into
-Giskard's ledgers or context-window metadata.
+Existing threads initialize the gauge immediately from the persisted thread
+`context_window`. New threads and threads without a persisted value use the conservative
+128k fallback.
+
+Opening or resuming a thread never waits for runtime usage metadata. After
+`thread/resume`, the adapter asynchronously monitors that resumed native thread while it
+remains idle. It emits the first valid
+`thread/tokenUsage/updated.tokenUsage.modelContextWindow` value as
+`ThreadUpdate::ContextWindowRestored { context_window }`. This resume-time update has no
+model attribution and is not correlated with historical turn IDs. Its usage totals are not
+folded into Giskard's ledgers.
+
+If a turn starts before a valid resume replay arrives, the adapter drops the pending
+resume monitor and active-turn usage is handled only through
+`AgentEvent::ContextWindowUpdated`. If no valid replay arrives and no turn starts, an
+idle TTL drops the pending monitor so the server-side thread-update forwarder can finish.
+
+The server applies and persists the restored thread context window only if no turn has
+completed since that resume began, then broadcasts
+`ThreadContextWindowUpdated { thread_id, context_window }`. Metadata from a completed turn
+always wins, including when the asynchronous resume update arrives later. Normal
+`AgentEvent::ContextWindowUpdated` events observed during an active turn remain scoped to
+that turn's exact `(provider, model)` as described above.
 
 ## Restart and unload behavior
 

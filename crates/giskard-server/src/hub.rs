@@ -97,12 +97,17 @@ impl Hub {
         });
     }
 
-    pub async fn broadcast(&self, thread_id: ThreadId, msg: ServerMessage) {
+    /// Broadcast to current thread subscribers and return the number of queues that accepted it.
+    pub async fn broadcast(&self, thread_id: ThreadId, msg: ServerMessage) -> usize {
         let mut subs = self.subs.lock().await;
+        let mut delivered = 0;
         if let Some(list) = subs.get_mut(&thread_id) {
             let message_kind = server_message_kind(&msg);
             list.retain(|(client_id, tx)| match tx.try_send(msg.clone()) {
-                Ok(()) => true,
+                Ok(()) => {
+                    delivered += 1;
+                    true
+                }
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     warn!(
                         %thread_id,
@@ -123,6 +128,7 @@ impl Hub {
                 }
             });
         }
+        delivered
     }
 
     pub async fn broadcast_event(&self, thread_id: ThreadId, event: AgentEvent) {
@@ -149,6 +155,7 @@ fn server_message_kind(msg: &ServerMessage) -> &'static str {
         ServerMessage::Event { .. } => "event",
         ServerMessage::ThreadActivity(_) => "thread_activity",
         ServerMessage::ThreadState(_) => "thread_state",
+        ServerMessage::ThreadContextWindowUpdated { .. } => "thread_context_window_updated",
         ServerMessage::HistoryPage { .. } => "history_page",
         ServerMessage::HistoryDelta { .. } => "history_delta",
         ServerMessage::LiveTurnSnapshot(_) => "live_turn_snapshot",

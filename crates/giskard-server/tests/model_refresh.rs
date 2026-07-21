@@ -265,7 +265,7 @@ model_listing = true
         .unwrap();
     assert_eq!(imported.current_model.provider, "mock");
     assert_eq!(imported.current_model.model, "dyn-model-1");
-    assert_eq!(imported.context_window, 258_400);
+    assert_eq!(imported.context_window, 128_000);
 }
 
 /// A provider's `api_key` is sent as `Authorization: Bearer …` on the `/models` discovery request,

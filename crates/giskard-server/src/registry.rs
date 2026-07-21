@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
 use std::time::Instant;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, error, info, warn};
 
 use giskard_core::approval::ApprovalDecision;
@@ -17,10 +18,16 @@ use giskard_core::model::{ModelDescriptor, ModelRef};
 use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::turn::{Mode, Turn, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
-use giskard_harness::{AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle};
+use giskard_harness::{
+    AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle, ThreadUpdate,
+    thread_update_channel,
+};
 use giskard_persist::PersistStore;
 use giskard_persist::store::ProjectConfig;
-use giskard_proto::{RunningTask, ServerMessage, ThreadActivity, ThreadActivityKind, TokenScope};
+use giskard_proto::{
+    ErrorInfo, ErrorSeverity, RunningTask, ServerMessage, ThreadActivity, ThreadActivityKind,
+    TokenScope,
+};
 
 use crate::hub::Hub;
 use crate::ledger::LedgerHandle;
@@ -77,6 +84,33 @@ fn turn_context_kind_label(kind: TurnContextKind) -> &'static str {
 /// spawned event forwarder so it can register approvals as they stream in.
 type ApprovalMap = Arc<Mutex<HashMap<ApprovalId, ThreadId>>>;
 type ServerRequestMap = Arc<Mutex<HashMap<ServerRequestId, ThreadId>>>;
+
+#[derive(Clone, Default)]
+struct ThreadCompletionEpochs {
+    epochs: Arc<StdMutex<HashMap<ThreadId, u64>>>,
+}
+
+impl ThreadCompletionEpochs {
+    fn current(&self, thread_id: ThreadId) -> u64 {
+        *self.epochs().get(&thread_id).unwrap_or(&0)
+    }
+
+    fn advance(&self, thread_id: ThreadId) {
+        let mut epochs = self.epochs();
+        let epoch = epochs.entry(thread_id).or_default();
+        *epoch = epoch.saturating_add(1);
+    }
+
+    fn epochs(&self) -> StdMutexGuard<'_, HashMap<ThreadId, u64>> {
+        match self.epochs.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("thread completion epoch lock was poisoned; recovering state");
+                poisoned.into_inner()
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 struct ThreadBinding {
@@ -265,6 +299,10 @@ impl Drop for ThreadTurnLease {
 pub struct HarnessRegistry {
     harnesses: Mutex<HashMap<ProjectId, Arc<dyn AgentHarness>>>,
     threads: Mutex<HashMap<ThreadId, ThreadBinding>>,
+    thread_open_locks: Mutex<HashMap<ThreadId, Arc<Mutex<()>>>>,
+    thread_updates: Mutex<HashMap<ThreadId, giskard_harness::ThreadUpdateStream>>,
+    thread_update_notices: Arc<Mutex<HashMap<ThreadId, Vec<ErrorInfo>>>>,
+    completion_epochs: ThreadCompletionEpochs,
     /// Per-thread turn gate covering both start-in-progress and live turns. `LiveBufferStore` only
     /// becomes active after `TurnStarted`, so it cannot protect the `start_turn` race itself.
     turn_gate: ThreadTurnGate,
@@ -294,6 +332,10 @@ impl HarnessRegistry {
         Self {
             harnesses: Mutex::new(HashMap::new()),
             threads: Mutex::new(HashMap::new()),
+            thread_open_locks: Mutex::new(HashMap::new()),
+            thread_updates: Mutex::new(HashMap::new()),
+            thread_update_notices: Arc::new(Mutex::new(HashMap::new())),
+            completion_epochs: ThreadCompletionEpochs::default(),
             turn_gate: ThreadTurnGate::default(),
             approvals: Arc::new(Mutex::new(HashMap::new())),
             server_requests: Arc::new(Mutex::new(HashMap::new())),
@@ -335,6 +377,7 @@ impl HarnessRegistry {
             "opening harness thread"
         );
         let harness = self.get_or_create_harness(config.id, config).await?;
+        let (updates, update_stream) = thread_update_channel();
 
         let handle = harness
             .open_thread(OpenThreadOptions {
@@ -343,8 +386,25 @@ impl HarnessRegistry {
                 workspace_root: workspace_root.into(),
                 resume,
                 initial_model: initial_model.clone(),
+                updates,
             })
             .await?;
+
+        if let Some(expected_thread) = thread
+            && handle.thread != expected_thread
+        {
+            error!(
+                project_id = %config.id,
+                thread_id = %expected_thread,
+                returned_thread_id = %handle.thread,
+                harness_thread_id = %handle.harness_thread_id,
+                "harness returned a different thread while resuming"
+            );
+            return Err(HarnessError::Protocol(format!(
+                "harness resumed wrong thread: expected {expected_thread}, got {}",
+                handle.thread
+            )));
+        }
 
         // Bind the model the harness reports as effective when it says so — Codex can ignore
         // resume overrides for a loaded thread, and the binding must reflect reality, not the
@@ -362,6 +422,11 @@ impl HarnessRegistry {
                 native_model,
             },
         );
+        drop(threads);
+        self.thread_updates
+            .lock()
+            .await
+            .insert(handle.thread, update_stream);
         debug!(
             project_id = %config.id,
             thread_id = %handle.thread,
@@ -373,6 +438,51 @@ impl HarnessRegistry {
         );
 
         Ok(handle)
+    }
+
+    /// Commit asynchronous metadata delivery for an opened binding. Callers that must verify a
+    /// native open first can delay this without losing updates because the channel is buffered.
+    pub async fn activate_thread_updates(&self, thread_id: ThreadId) {
+        let Some(updates) = self.thread_updates.lock().await.remove(&thread_id) else {
+            return;
+        };
+        let Some(project_id) = self.get_project_for_thread(thread_id).await else {
+            return;
+        };
+        spawn_thread_update_forwarder(
+            project_id,
+            thread_id,
+            updates,
+            self.store.clone(),
+            self.hub.clone(),
+            self.thread_update_notices.clone(),
+            self.completion_epochs.clone(),
+        );
+    }
+
+    /// Serialize the open/verify/persist/activate transaction for one durable thread.
+    pub async fn lock_thread_open(&self, thread_id: ThreadId) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = self
+            .thread_open_locks
+            .lock()
+            .await
+            .entry(thread_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        lock.lock_owned().await
+    }
+
+    /// Subscribe while holding the same notice lock used by update-failure delivery. This closes
+    /// the gap where a warning could otherwise be stored just after a new subscriber checked.
+    pub async fn subscribe_with_thread_update_notices(
+        &self,
+        thread_id: ThreadId,
+        client_id: usize,
+        tx: mpsc::Sender<ServerMessage>,
+    ) -> Vec<ErrorInfo> {
+        let mut notices = self.thread_update_notices.lock().await;
+        self.hub.subscribe(thread_id, client_id, tx).await;
+        notices.remove(&thread_id).unwrap_or_default()
     }
 
     pub async fn start_turn(
@@ -424,6 +534,7 @@ impl HarnessRegistry {
         let approvals_map = self.approvals.clone();
         let server_requests_map = self.server_requests.clone();
         let ledger = self.ledger.clone();
+        let completion_epochs = self.completion_epochs.clone();
 
         let stream = harness.subscribe(&handle);
         let turn_id = match harness.start_turn(&handle, input, overrides).await {
@@ -470,6 +581,7 @@ impl HarnessRegistry {
                 approvals_map,
                 server_requests_map,
                 ledger,
+                completion_epochs,
                 ctx,
                 Some(turn_gate),
             )
@@ -642,6 +754,7 @@ impl HarnessRegistry {
         let approvals_map = self.approvals.clone();
         let server_requests_map = self.server_requests.clone();
         let ledger = self.ledger.clone();
+        let completion_epochs = self.completion_epochs.clone();
 
         let stream = harness.subscribe(&handle);
         harness.compact_thread(&handle).await?;
@@ -665,6 +778,7 @@ impl HarnessRegistry {
                 approvals_map,
                 server_requests_map,
                 ledger,
+                completion_epochs,
                 ctx,
                 Some(turn_gate),
             )
@@ -851,6 +965,12 @@ impl HarnessRegistry {
     pub async fn forget_thread(&self, thread_id: ThreadId) {
         let mut threads = self.threads.lock().await;
         threads.remove(&thread_id);
+        drop(threads);
+        self.thread_updates.lock().await.remove(&thread_id);
+        self.thread_update_notices.lock().await.remove(&thread_id);
+        // Never reset the generation: an already spawned update forwarder may still hold a sink.
+        // Advancing makes that forwarder stale even if this durable ID is bound again later.
+        self.completion_epochs.advance(thread_id);
     }
 
     pub async fn delete_project(&self, project_id: ProjectId) -> Result<(), HarnessError> {
@@ -873,6 +993,15 @@ impl HarnessRegistry {
         };
 
         if !thread_ids.is_empty() {
+            for thread_id in &thread_ids {
+                self.completion_epochs.advance(*thread_id);
+            }
+            let mut thread_updates = self.thread_updates.lock().await;
+            thread_updates.retain(|thread_id, _| !thread_ids.contains(thread_id));
+
+            let mut thread_update_notices = self.thread_update_notices.lock().await;
+            thread_update_notices.retain(|thread_id, _| !thread_ids.contains(thread_id));
+
             let mut approvals = self.approvals.lock().await;
             approvals.retain(|_, thread_id| !thread_ids.contains(thread_id));
 
@@ -881,6 +1010,126 @@ impl HarnessRegistry {
         }
 
         Ok(())
+    }
+}
+
+fn spawn_thread_update_forwarder(
+    project_id: ProjectId,
+    thread_id: ThreadId,
+    mut updates: giskard_harness::ThreadUpdateStream,
+    store: Arc<PersistStore>,
+    hub: Arc<Hub>,
+    pending_notices: Arc<Mutex<HashMap<ThreadId, Vec<ErrorInfo>>>>,
+    completion_epochs: ThreadCompletionEpochs,
+) -> tokio::task::JoinHandle<()> {
+    let completion_epoch = completion_epochs.current(thread_id);
+    tokio::spawn(async move {
+        while let Some(update) = updates.recv().await {
+            match update {
+                ThreadUpdate::ContextWindowRestored { context_window } => {
+                    if context_window == 0 {
+                        warn!(
+                            %project_id,
+                            %thread_id,
+                            "ignoring zero context window restored by harness"
+                        );
+                        continue;
+                    }
+                    let epochs = completion_epochs.clone();
+                    let applied = Arc::new(AtomicBool::new(false));
+                    let applied_in_update = applied.clone();
+                    match store
+                        .update_thread(project_id, thread_id, move |thread| {
+                            if epochs.current(thread_id) == completion_epoch {
+                                thread.context_window = context_window;
+                                applied_in_update.store(true, Ordering::Release);
+                            }
+                        })
+                        .await
+                    {
+                        Ok(Some(_)) if applied.load(Ordering::Acquire) => {
+                            info!(
+                                %project_id,
+                                %thread_id,
+                                context_window,
+                                "persisted context window restored asynchronously by harness"
+                            );
+                            hub.broadcast(
+                                thread_id,
+                                ServerMessage::ThreadContextWindowUpdated {
+                                    thread_id,
+                                    context_window,
+                                },
+                            )
+                            .await;
+                        }
+                        Ok(Some(_)) => {
+                            debug!(
+                                %project_id,
+                                %thread_id,
+                                context_window,
+                                "ignored restored context window because the thread lifecycle advanced after resume"
+                            );
+                        }
+                        Ok(None) => {
+                            warn!(
+                                %project_id,
+                                %thread_id,
+                                context_window,
+                                "thread file missing while persisting restored context window"
+                            );
+                        }
+                        Err(error) => {
+                            error!(
+                                %project_id,
+                                %thread_id,
+                                context_window,
+                                %error,
+                                "failed to persist context window restored by harness"
+                            );
+                            broadcast_thread_update_warning(
+                                &hub,
+                                &pending_notices,
+                                thread_id,
+                                "The restored context window could not be saved.",
+                                Some(error.to_string()),
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+async fn broadcast_thread_update_warning(
+    hub: &Hub,
+    pending_notices: &Mutex<HashMap<ThreadId, Vec<ErrorInfo>>>,
+    thread_id: ThreadId,
+    message: &str,
+    detail: Option<String>,
+) {
+    let error = ErrorInfo {
+        code: "thread_context_window_persist_failed".into(),
+        severity: ErrorSeverity::Warning,
+        message: message.into(),
+        detail,
+        thread_id: Some(thread_id),
+        action: Some("restore_context_window".into()),
+        process_id: None,
+    };
+    let mut notices = pending_notices.lock().await;
+    let delivered = hub
+        .broadcast(
+            thread_id,
+            ServerMessage::Error {
+                error: error.clone(),
+            },
+        )
+        .await;
+    if delivered == 0 {
+        notices.entry(thread_id).or_default().push(error);
     }
 }
 
@@ -896,6 +1145,7 @@ async fn forward_events(
     approvals: ApprovalMap,
     server_requests: ServerRequestMap,
     ledger: LedgerHandle,
+    completion_epochs: ThreadCompletionEpochs,
     ctx: TurnContext,
     mut turn_gate: Option<ThreadTurnLease>,
 ) {
@@ -1254,6 +1504,7 @@ async fn forward_events(
                         &hub,
                         &ledger,
                         &live_buffers,
+                        &completion_epochs,
                         turn_gate.as_mut(),
                     )
                     .await;
@@ -1324,6 +1575,7 @@ async fn forward_events(
                         &hub,
                         &ledger,
                         &live_buffers,
+                        &completion_epochs,
                         turn_gate.as_mut(),
                     )
                     .await;
@@ -1418,6 +1670,7 @@ async fn forward_events(
                         &hub,
                         &ledger,
                         &live_buffers,
+                        &completion_epochs,
                         turn_gate.as_mut(),
                     )
                     .await;
@@ -1487,8 +1740,10 @@ async fn complete_forwarded_turn(
     hub: &Arc<Hub>,
     ledger: &LedgerHandle,
     live_buffers: &Arc<LiveBufferStore>,
+    completion_epochs: &ThreadCompletionEpochs,
     turn_gate: Option<&mut ThreadTurnLease>,
 ) -> TurnId {
+    completion_epochs.advance(thread_id);
     let tid = turn_id.unwrap_or(completed_turn);
     seen_turn_ids.insert(tid);
     let item_count = current_turn_items.len();
@@ -2186,6 +2441,7 @@ async fn persist_turn(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use chrono::Utc;
@@ -2199,7 +2455,7 @@ mod tests {
     use giskard_core::token::{TokenLedger, TokenUsage};
     use giskard_core::turn::{ApprovalPolicy, Mode, Turn, TurnStatus, TurnStatusKind};
     use giskard_core::user_input::UserInput;
-    use giskard_harness::{AgentEventStream, ThreadHandle};
+    use giskard_harness::{AgentEventStream, ThreadHandle, ThreadUpdate, thread_update_channel};
     use giskard_persist::PersistStore;
     use giskard_persist::store::ThreadFile;
     use giskard_proto::{ServerMessage, ThreadActivityKind, WireAgentEvent};
@@ -2207,14 +2463,161 @@ mod tests {
     use tokio::task::JoinHandle;
 
     use super::{
-        ActiveTurnOwner, CurrentTurnItems, ThreadTurnGate, TurnContext, TurnContextKind,
-        command_completion_is_normal_success, command_status_is_running, forward_events,
+        ActiveTurnOwner, CurrentTurnItems, ThreadCompletionEpochs, ThreadTurnGate, TurnContext,
+        TurnContextKind, broadcast_thread_update_warning, command_completion_is_normal_success,
+        command_status_is_running, forward_events, spawn_thread_update_forwarder,
         thread_activity_from_event, track_item_identity,
     };
     use crate::hub::Hub;
     use crate::ledger;
     use crate::live_buffer::LiveBufferStore;
     use crate::running_commands::RunningTaskStore;
+
+    #[tokio::test]
+    async fn thread_update_warning_is_retained_without_a_subscriber() {
+        let hub = Hub::new();
+        let thread_id = ThreadId::new();
+        let pending = Mutex::new(HashMap::new());
+
+        broadcast_thread_update_warning(
+            &hub,
+            &pending,
+            thread_id,
+            "Context metadata could not be saved.",
+            Some("disk unavailable".into()),
+        )
+        .await;
+
+        let warnings = pending.lock().await.remove(&thread_id).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "thread_context_window_persist_failed");
+        assert_eq!(warnings[0].detail.as_deref(), Some("disk unavailable"));
+    }
+
+    #[tokio::test]
+    async fn restored_context_window_applies_only_before_a_turn_completes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.6-sol".into(),
+            reasoning_effort: None,
+        };
+        store
+            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .await
+            .unwrap();
+        let now = Utc::now();
+        store
+            .save_thread(
+                project_id,
+                &ThreadFile {
+                    version: 1,
+                    id: thread_id,
+                    project_id,
+                    title: "thread".into(),
+                    harness_thread_id: "native-thread".into(),
+                    mode: Mode::Build,
+                    current_model: model,
+                    context_window: 128_000,
+                    model_context_windows: HashMap::new(),
+                    approval_policy: ApprovalPolicy::Ask,
+                    model_efforts: HashMap::new(),
+                    tokens: TokenLedger::default(),
+                    created_at: now,
+                    updated_at: now,
+                    archived: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let hub = Arc::new(Hub::new());
+        let notices = Arc::new(Mutex::new(HashMap::new()));
+        let epochs = ThreadCompletionEpochs::default();
+
+        let (updates, stream) = thread_update_channel();
+        let forwarder = spawn_thread_update_forwarder(
+            project_id,
+            thread_id,
+            stream,
+            store.clone(),
+            hub.clone(),
+            notices.clone(),
+            epochs.clone(),
+        );
+        updates
+            .send(ThreadUpdate::ContextWindowRestored { context_window: 0 })
+            .unwrap();
+        drop(updates);
+        forwarder.await.unwrap();
+        assert_eq!(
+            store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .context_window,
+            128_000
+        );
+
+        let (updates, stream) = thread_update_channel();
+        let forwarder = spawn_thread_update_forwarder(
+            project_id,
+            thread_id,
+            stream,
+            store.clone(),
+            hub.clone(),
+            notices.clone(),
+            epochs.clone(),
+        );
+        updates
+            .send(ThreadUpdate::ContextWindowRestored {
+                context_window: 258_400,
+            })
+            .unwrap();
+        drop(updates);
+        forwarder.await.unwrap();
+        assert_eq!(
+            store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .context_window,
+            258_400
+        );
+
+        let (updates, stream) = thread_update_channel();
+        let forwarder = spawn_thread_update_forwarder(
+            project_id,
+            thread_id,
+            stream,
+            store.clone(),
+            hub,
+            notices,
+            epochs.clone(),
+        );
+        epochs.advance(thread_id);
+        updates
+            .send(ThreadUpdate::ContextWindowRestored {
+                context_window: 400_000,
+            })
+            .unwrap();
+        drop(updates);
+        forwarder.await.unwrap();
+        assert_eq!(
+            store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .context_window,
+            258_400
+        );
+    }
 
     #[test]
     fn command_completion_success_requires_success_status_and_zero_exit() {
@@ -3856,6 +4259,7 @@ mod tests {
                     approvals,
                     server_requests,
                     ledger,
+                    ThreadCompletionEpochs::default(),
                     ctx,
                     Some(lease),
                 )
@@ -3982,6 +4386,7 @@ mod tests {
                 approvals,
                 server_requests,
                 ledger,
+                ThreadCompletionEpochs::default(),
                 ctx,
                 None,
             )

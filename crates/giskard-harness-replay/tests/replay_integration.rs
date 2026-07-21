@@ -119,6 +119,7 @@ async fn open_thread_one_turn_assert_state() {
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
             },
+            updates: giskard_harness::thread_update_channel().0,
         })
         .await
         .expect("open_thread failed");
@@ -254,6 +255,7 @@ async fn replay_persisted_state_roundtrip() {
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
             },
+            updates: giskard_harness::thread_update_channel().0,
         })
         .await
         .unwrap();

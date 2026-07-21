@@ -16,6 +16,7 @@ use giskard_core::token::{TokenLedger, TokenUsage};
 use giskard_core::turn::{ApprovalPolicy, Mode, Turn, TurnStatus, TurnStatusKind};
 use giskard_harness::{
     AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+    ThreadUpdate,
 };
 use giskard_persist::store::{ProjectConfig, ThreadFile};
 use giskard_proto::ClientMessage;
@@ -53,6 +54,11 @@ impl AgentHarness for SwitchHarness {
         let mut effective = opts.initial_model.clone();
         if let Some(provider) = &self.report_provider {
             effective.provider = provider.clone();
+        }
+        if opts.resume.is_some() {
+            let _ = opts.updates.send(ThreadUpdate::ContextWindowRestored {
+                context_window: 999_999,
+            });
         }
         Ok(ThreadHandle {
             thread: opts.thread.unwrap_or_default(),
@@ -389,6 +395,12 @@ async fn cold_provider_switch_succeeds_and_binds_the_thread() {
     .await
     .expect("thread state under the new provider");
     assert_eq!(state_msg["state"]["current_model"]["model"], "glm-5.2");
+    let context_update = next_matching(&mut ws, |v| {
+        v["type"] == "thread_context_window_updated" && v["context_window"] == 999_999
+    })
+    .await
+    .expect("buffered context update after committed provider switch");
+    assert_eq!(context_update["thread_id"], srv.tid.to_string());
 
     // Persisted and natively bound.
     let tf = srv
@@ -399,6 +411,7 @@ async fn cold_provider_switch_succeeds_and_binds_the_thread() {
         .unwrap()
         .unwrap();
     assert_eq!(tf.current_model.provider, NEW_PROVIDER);
+    assert_eq!(tf.context_window, 999_999);
     let native = srv
         .state
         .registry
@@ -444,6 +457,13 @@ async fn unconfirmed_provider_switch_is_rejected_and_persists_nothing() {
     next_matching(&mut ws, |v| v["code"] == "thread_read_only")
         .await
         .expect("read-only warning");
+    let before_switch = srv
+        .state
+        .store
+        .load_thread(srv.pid, srv.tid)
+        .await
+        .unwrap()
+        .unwrap();
 
     send_msg(
         &mut ws,
@@ -467,6 +487,15 @@ async fn unconfirmed_provider_switch_is_rejected_and_persists_nothing() {
         .unwrap()
         .unwrap();
     assert_eq!(tf.current_model.provider, DEAD_PROVIDER);
+    assert_eq!(tf.context_window, before_switch.context_window);
+    assert_eq!(
+        tf.model_context_windows,
+        before_switch.model_context_windows
+    );
+    assert!(
+        tf.model_context_windows.is_empty(),
+        "failed switch must discard buffered native metadata"
+    );
     assert!(
         srv.state
             .registry

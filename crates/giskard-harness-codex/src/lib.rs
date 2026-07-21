@@ -8,6 +8,7 @@
 //! lifecycles, background-command ownership, and termination routing.
 
 mod mapping;
+mod transport;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -36,7 +37,7 @@ use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
     AgentEventStream, AgentHarness, HarnessCapabilities, HarnessNotice, OpenThreadOptions,
-    ThreadHandle,
+    ThreadHandle, ThreadUpdate,
 };
 
 use mapping::CodexMapper;
@@ -55,6 +56,12 @@ const CODEX_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(50);
 const WORKER_QUEUE_WARN_AFTER: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const WORKER_QUEUE_WARN_AFTER: Duration = Duration::from_millis(50);
+// Idle TTL only: `thread/resume` never waits for usage replay. If no valid replay arrives and no
+// turn starts, this drops the pending sender so the server-side update forwarder can finish.
+#[cfg(not(test))]
+const RESUME_USAGE_REPLAY_IDLE_TTL: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const RESUME_USAGE_REPLAY_IDLE_TTL: Duration = Duration::from_millis(50);
 const THREAD_BACKGROUND_TERMINALS_TERMINATE: &str = "thread/backgroundTerminals/terminate";
 
 struct QueuedHarnessCommand {
@@ -65,6 +72,15 @@ struct QueuedHarnessCommand {
 struct QueuedControlCommand {
     token: WorkerQueueToken,
     command: ControlCommand,
+}
+
+struct PendingResumeUsage {
+    project: ProjectId,
+    thread: ThreadId,
+    harness_thread_id: String,
+    updates: giskard_harness::ThreadUpdateSink,
+    started_at: Instant,
+    deadline: Instant,
 }
 
 #[derive(Debug, Serialize)]
@@ -459,52 +475,6 @@ trait CodexTransport: Send {
         Self: Sized;
 }
 
-#[async_trait]
-impl CodexTransport for codex_codes::AsyncClient {
-    async fn request_json(
-        &mut self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value, HarnessError> {
-        self.request(method, &params)
-            .await
-            .map_err(|e| HarnessError::Transport(e.to_string()))
-    }
-
-    async fn next_message(&mut self) -> Result<Option<codex_codes::ServerMessage>, HarnessError> {
-        self.next_message()
-            .await
-            .map_err(|e| HarnessError::Transport(e.to_string()))
-    }
-
-    async fn respond_json(
-        &mut self,
-        id: codex_codes::jsonrpc::RequestId,
-        value: serde_json::Value,
-    ) -> Result<(), HarnessError> {
-        self.respond(id, &value)
-            .await
-            .map_err(|e| HarnessError::Transport(e.to_string()))
-    }
-
-    async fn respond_error_json(
-        &mut self,
-        id: codex_codes::jsonrpc::RequestId,
-        code: i64,
-        message: &str,
-    ) -> Result<(), HarnessError> {
-        self.respond_error(id, code, message)
-            .await
-            .map_err(|e| HarnessError::Transport(e.to_string()))
-    }
-
-    async fn shutdown_transport(self) -> Result<(), HarnessError> {
-        self.shutdown()
-            .await
-            .map_err(|e| HarnessError::Transport(e.to_string()))
-    }
-}
-
 async fn codex_request<P, R>(
     client: &mut dyn CodexTransport,
     context: CodexOperationContext<'_>,
@@ -679,15 +649,8 @@ impl CodexHarness {
 
 async fn start_codex_client(
     builder: codex_codes::AppServerBuilder,
-) -> Result<codex_codes::AsyncClient, HarnessError> {
-    let mut client = codex_codes::AsyncClient::spawn(builder)
-        .await
-        .map_err(|e| HarnessError::Spawn(e.to_string()))?;
-    client
-        .initialize(&build_initialize_params())
-        .await
-        .map_err(|e| HarnessError::Spawn(e.to_string()))?;
-    Ok(client)
+) -> Result<transport::CodexStdioTransport, HarnessError> {
+    transport::CodexStdioTransport::start(builder, build_initialize_params()).await
 }
 
 fn build_initialize_params() -> codex_codes::InitializeParams {
@@ -954,14 +917,19 @@ async fn background_task<C>(
 {
     let mut mapper = CodexMapper::new(workspace_root);
     let mut pending_compactions: HashMap<ThreadId, PendingCompaction> = HashMap::new();
+    let mut pending_resume_usage: HashMap<String, PendingResumeUsage> = HashMap::new();
     let mut active_turns: ActiveTurns = HashMap::new();
     let mut first_event_warn_tick = tokio::time::interval(Duration::from_secs(1));
+    let mut resume_usage_cleanup_tick =
+        tokio::time::interval(RESUME_USAGE_REPLAY_IDLE_TTL.min(Duration::from_secs(1)));
 
     loop {
         tokio::select! {
-            msg = client.next_message(), if should_poll_codex_messages(&mapper, &active_turns, &pending_compactions) => {
+            msg = client.next_message(), if should_poll_codex_messages(&mapper, &active_turns, &pending_compactions)
+                || !pending_resume_usage.is_empty() => {
                 match msg {
                     Ok(Some(msg)) => {
+                        observe_pending_resume_usage(&mut pending_resume_usage, &msg);
                         match handle_background_server_message(
                                 &mut client,
                                 &mut mapper,
@@ -1006,8 +974,11 @@ async fn background_task<C>(
                     }
                     Err(e) => {
                         let message = e.to_string();
+                        let abandoned_resume_usage = pending_resume_usage.len();
+                        pending_resume_usage.clear();
                         if active_turns.is_empty() {
                             warn!(
+                                abandoned_resume_usage,
                                 pending_compactions = pending_compactions.len(),
                                 pending_compaction_states = ?pending_compaction_states(&pending_compactions),
                                 "Codex idle stream failed while background work was running: {message}"
@@ -1042,7 +1013,37 @@ async fn background_task<C>(
                     HarnessCommand::OpenThread { opts, response } => {
                         let result =
                             handle_open_thread(&mut client, &mut mapper, &opts, &senders).await;
-                        let _ = response.send(result);
+                        match result {
+                            Ok((handle, monitor_resume_usage)) => {
+                                if monitor_resume_usage {
+                                    let started_at = Instant::now();
+                                    let pending = PendingResumeUsage {
+                                        project: opts.project,
+                                        thread: handle.thread,
+                                        harness_thread_id: handle.harness_thread_id.clone(),
+                                        updates: opts.updates.clone(),
+                                        started_at,
+                                        deadline: started_at + RESUME_USAGE_REPLAY_IDLE_TTL,
+                                    };
+                                    if let Some(replaced) = pending_resume_usage.insert(
+                                        pending.harness_thread_id.clone(),
+                                        pending,
+                                    ) {
+                                        debug!(
+                                            project_id = %replaced.project,
+                                            thread_id = %replaced.thread,
+                                            harness_thread_id = %replaced.harness_thread_id,
+                                            elapsed_ms = replaced.started_at.elapsed().as_millis(),
+                                            "replaced pending Codex resume usage monitor"
+                                        );
+                                    }
+                                }
+                                let _ = response.send(Ok(handle));
+                            }
+                            Err(error) => {
+                                let _ = response.send(Err(error));
+                            }
+                        }
                     }
                     HarnessCommand::StartTurn {
                         thread,
@@ -1061,6 +1062,10 @@ async fn background_task<C>(
                         let acknowledged_turn = result.as_ref().ok().copied();
                         let _ = response.send(result);
                         if let Some(acknowledged_turn) = acknowledged_turn {
+                            cancel_pending_resume_usage_for_turn_start(
+                                &mut pending_resume_usage,
+                                &thread,
+                            );
                             active_turns.insert(
                                 thread.thread,
                                 ActiveTurn::new(thread, acknowledged_turn),
@@ -1094,6 +1099,11 @@ async fn background_task<C>(
             }
             _ = first_event_warn_tick.tick(), if !active_turns.is_empty() => {
                 warn_slow_first_events(&mut active_turns);
+            }
+            _ = resume_usage_cleanup_tick.tick(), if !pending_resume_usage.is_empty() => {
+                expire_pending_resume_usage(
+                    &mut pending_resume_usage,
+                );
             }
         }
     }
@@ -1167,6 +1177,113 @@ fn should_poll_codex_messages(
     pending_compactions: &HashMap<ThreadId, PendingCompaction>,
 ) -> bool {
     !active_turns.is_empty() || mapper.has_running_commands() || !pending_compactions.is_empty()
+}
+
+fn observe_pending_resume_usage(
+    pending_usage: &mut HashMap<String, PendingResumeUsage>,
+    message: &codex_codes::ServerMessage,
+) {
+    let codex_codes::ServerMessage::Notification(
+        codex_codes::messages::Notification::ThreadTokenUsageUpdated(notification),
+    ) = message
+    else {
+        return;
+    };
+    let Some(pending) = pending_usage.get(&notification.thread_id) else {
+        return;
+    };
+    let elapsed_ms = pending.started_at.elapsed().as_millis();
+    let reported_context_window = notification.token_usage.model_context_window;
+    let context_window = reported_context_window
+        .and_then(|window| u32::try_from(window).ok())
+        .filter(|window| *window > 0);
+    match context_window {
+        Some(context_window) => {
+            let Some(pending) = pending_usage.remove(&notification.thread_id) else {
+                return;
+            };
+            info!(
+                project_id = %pending.project,
+                thread_id = %pending.thread,
+                harness_thread_id = %pending.harness_thread_id,
+                native_turn_id = %notification.turn_id,
+                context_window,
+                elapsed_ms,
+                "received Codex context window notification after thread resume"
+            );
+            if pending
+                .updates
+                .send(ThreadUpdate::ContextWindowRestored { context_window })
+                .is_err()
+            {
+                debug!(
+                    project_id = %pending.project,
+                    thread_id = %pending.thread,
+                    harness_thread_id = %pending.harness_thread_id,
+                    native_turn_id = %notification.turn_id,
+                    "could not deliver Codex resume context window to thread update channel"
+                );
+            }
+        }
+        None if reported_context_window.is_some() => {
+            warn!(
+                project_id = %pending.project,
+                thread_id = %pending.thread,
+                harness_thread_id = %pending.harness_thread_id,
+                native_turn_id = %notification.turn_id,
+                context_window = ?reported_context_window,
+                elapsed_ms,
+                "ignoring invalid Codex context window notification while resuming thread"
+            );
+        }
+        None => {
+            debug!(
+                project_id = %pending.project,
+                thread_id = %pending.thread,
+                harness_thread_id = %pending.harness_thread_id,
+                native_turn_id = %notification.turn_id,
+                elapsed_ms,
+                "Codex resume token usage replay did not include a model context window"
+            );
+        }
+    }
+}
+
+fn expire_pending_resume_usage(pending_usage: &mut HashMap<String, PendingResumeUsage>) {
+    let now = Instant::now();
+    let expired = pending_usage
+        .iter()
+        .filter_map(|(thread_id, pending)| (pending.deadline <= now).then_some(thread_id.clone()))
+        .collect::<Vec<_>>();
+    for thread_id in expired {
+        let Some(pending) = pending_usage.remove(&thread_id) else {
+            continue;
+        };
+        debug!(
+            project_id = %pending.project,
+            thread_id = %pending.thread,
+            harness_thread_id = %pending.harness_thread_id,
+            elapsed_ms = pending.started_at.elapsed().as_millis(),
+            idle_ttl_ms = RESUME_USAGE_REPLAY_IDLE_TTL.as_millis(),
+            "Codex did not replay token usage after thread resume; stopping asynchronous monitor"
+        );
+    }
+}
+
+fn cancel_pending_resume_usage_for_turn_start(
+    pending_usage: &mut HashMap<String, PendingResumeUsage>,
+    thread: &ThreadHandle,
+) {
+    let Some(pending) = pending_usage.remove(&thread.harness_thread_id) else {
+        return;
+    };
+    debug!(
+        project_id = %pending.project,
+        thread_id = %pending.thread,
+        harness_thread_id = %pending.harness_thread_id,
+        elapsed_ms = pending.started_at.elapsed().as_millis(),
+        "stopping Codex resume usage monitor because a turn started"
+    );
 }
 
 fn fallback_thread(mapper: &CodexMapper, active_turns: &ActiveTurns) -> ThreadId {
@@ -1643,7 +1760,7 @@ async fn handle_open_thread(
     mapper: &mut CodexMapper,
     opts: &OpenThreadOptions,
     senders: &SenderMap,
-) -> Result<ThreadHandle, HarnessError> {
+) -> Result<(ThreadHandle, bool), HarnessError> {
     let cwd = opts.workspace_root.to_string_lossy().to_string();
     let thread_id = opts.thread.unwrap_or_default();
 
@@ -1651,12 +1768,16 @@ async fn handle_open_thread(
     // warn the caller that agent context was lost while keeping the Giskard-side history.
     let mut resume_warning = None;
 
+    let mut monitor_resume_usage = false;
     let (harness_thread_id, resumed_model) = if let Some(ref resume_id) = opts.resume {
         let context = CodexOperationContext::for_project("thread_resume", opts.project)
             .with_thread_id(thread_id)
             .with_harness_thread_id(resume_id);
         match resume_thread(client, context, resume_id, &cwd, &opts.initial_model).await {
-            Ok(opened) => opened,
+            Ok((harness_thread_id, resumed_model)) => {
+                monitor_resume_usage = true;
+                (harness_thread_id, resumed_model)
+            }
             Err(e) => {
                 // C5: Codex thread store purged/rotated. Start fresh instead of hard-failing.
                 resume_warning = Some(HarnessNotice {
@@ -1702,12 +1823,15 @@ async fn handle_open_thread(
         .await;
     }
 
-    Ok(ThreadHandle {
-        thread: thread_id,
-        harness_thread_id,
-        warning: resume_warning,
-        resumed_model,
-    })
+    Ok((
+        ThreadHandle {
+            thread: thread_id,
+            harness_thread_id,
+            warning: resume_warning,
+            resumed_model,
+        },
+        monitor_resume_usage,
+    ))
 }
 
 /// The model/provider a `thread/start` / `thread/resume` response reports as effective. Codex can
@@ -2655,6 +2779,26 @@ mod tests {
             self.state.lock().await.requests.clone()
         }
 
+        async fn wait_for_request(&self, method: &str) {
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    if self
+                        .state
+                        .lock()
+                        .await
+                        .requests
+                        .iter()
+                        .any(|request| request.method == method)
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("fake Codex request should be observed");
+        }
+
         async fn responses(&self) -> Vec<FakeResponse> {
             self.state.lock().await.responses.clone()
         }
@@ -2902,7 +3046,12 @@ mod tests {
             "modelProvider": provider,
             "sandbox": {},
             "thread": {
-                "id": native_thread_id
+                "id": native_thread_id,
+                "turns": [{
+                    "id": "historical-turn",
+                    "items": [],
+                    "status": "completed"
+                }]
             }
         })
     }
@@ -2914,6 +3063,7 @@ mod tests {
             workspace_root: PathBuf::from("/tmp"),
             resume: resume.map(str::to_owned),
             initial_model: test_model(None),
+            updates: giskard_harness::thread_update_channel().0,
         }
     }
 
@@ -2949,6 +3099,39 @@ mod tests {
                 .expect("test user input request should deserialize"),
             ),
         }
+    }
+
+    fn token_usage_message(
+        native_thread_id: &str,
+        native_turn_id: &str,
+        context_window: serde_json::Value,
+    ) -> codex_codes::ServerMessage {
+        codex_codes::ServerMessage::Notification(
+            codex_codes::messages::Notification::ThreadTokenUsageUpdated(
+                serde_json::from_value(json!({
+                    "threadId": native_thread_id,
+                    "turnId": native_turn_id,
+                    "tokenUsage": {
+                        "last": {
+                            "cachedInputTokens": 10,
+                            "inputTokens": 100,
+                            "outputTokens": 40,
+                            "reasoningOutputTokens": 5,
+                            "totalTokens": 140
+                        },
+                        "total": {
+                            "cachedInputTokens": 10,
+                            "inputTokens": 100,
+                            "outputTokens": 40,
+                            "reasoningOutputTokens": 5,
+                            "totalTokens": 140
+                        },
+                        "modelContextWindow": context_window
+                    }
+                }))
+                .expect("token usage notification should deserialize"),
+            ),
+        )
     }
 
     fn command_approval_request(
@@ -3173,9 +3356,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_worker_reports_context_window_after_resume() {
+        let (harness, controller) = spawn_fake_harness();
+        let thread = ThreadId::new();
+        let mut opts = open_opts(Some(thread), Some("native-existing"));
+        let (updates, mut update_stream) = giskard_harness::thread_update_channel();
+        opts.updates = updates;
+
+        let handle = timeout(Duration::from_secs(1), harness.open_thread(opts))
+            .await
+            .expect("resume must not wait for a usage replay")
+            .expect("resume should succeed");
+        assert_eq!(handle.thread, thread);
+        controller
+            .wait_for_request(codex_codes::protocol::methods::THREAD_RESUME)
+            .await;
+        controller
+            .send_server_message(token_usage_message(
+                "native-existing",
+                "historical-turn",
+                json!(258_400),
+            ))
+            .await;
+
+        let update = timeout(Duration::from_secs(1), update_stream.recv())
+            .await
+            .expect("resume usage replay should be forwarded")
+            .expect("thread update stream should remain open");
+        assert_eq!(
+            update,
+            ThreadUpdate::ContextWindowRestored {
+                context_window: 258_400,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_worker_resume_does_not_wait_when_usage_replay_is_absent() {
+        let (harness, _controller) = spawn_fake_harness();
+        let mut opts = open_opts(Some(ThreadId::new()), Some("native-without-usage"));
+        let (updates, mut update_stream) = giskard_harness::thread_update_channel();
+        opts.updates = updates;
+
+        timeout(Duration::from_secs(1), harness.open_thread(opts))
+            .await
+            .expect("resume must not wait for an optional usage replay")
+            .expect("resume should succeed");
+
+        let update = timeout(Duration::from_secs(1), update_stream.recv())
+            .await
+            .expect("asynchronous replay monitor should expire independently");
+        assert_eq!(update, None);
+    }
+
+    #[tokio::test]
+    async fn expired_resume_monitor_closes_its_update_stream() {
+        let (updates, mut update_stream) = giskard_harness::thread_update_channel();
+        let mut pending = HashMap::from([(
+            "native-late".to_string(),
+            PendingResumeUsage {
+                project: ProjectId::new(),
+                thread: ThreadId::new(),
+                harness_thread_id: "native-late".into(),
+                updates,
+                started_at: Instant::now(),
+                deadline: Instant::now() - Duration::from_millis(1),
+            },
+        )]);
+
+        expire_pending_resume_usage(&mut pending);
+        assert!(pending.is_empty());
+        assert_eq!(update_stream.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn codex_worker_rejects_invalid_resume_context_window() {
+        let (harness, controller) = spawn_fake_harness();
+        let mut opts = open_opts(Some(ThreadId::new()), Some("native-invalid"));
+        let (updates, mut update_stream) = giskard_harness::thread_update_channel();
+        opts.updates = updates;
+        timeout(Duration::from_secs(1), harness.open_thread(opts))
+            .await
+            .expect("resume must not wait for a usage replay")
+            .expect("resume should remain usable");
+        controller
+            .wait_for_request(codex_codes::protocol::methods::THREAD_RESUME)
+            .await;
+        controller
+            .send_server_message(token_usage_message(
+                "native-invalid",
+                "historical-turn",
+                json!(0),
+            ))
+            .await;
+
+        let update = timeout(Duration::from_secs(1), update_stream.recv())
+            .await
+            .expect("invalid replay should close its update stream");
+        assert_eq!(update, None);
+    }
+
+    #[tokio::test]
+    async fn codex_worker_drops_resume_usage_monitor_when_turn_starts() {
+        let (harness, controller) = spawn_fake_harness();
+        let mut opts = open_opts(Some(ThreadId::new()), Some("native-existing"));
+        let (updates, mut update_stream) = giskard_harness::thread_update_channel();
+        opts.updates = updates;
+        let handle = timeout(Duration::from_secs(1), harness.open_thread(opts))
+            .await
+            .expect("resume must not wait for a usage replay")
+            .expect("resume should succeed");
+        let mut stream = harness.subscribe(&handle);
+
+        let turn = harness
+            .start_turn(&handle, UserInput::text("new work"), build_turn_overrides())
+            .await
+            .expect("turn should start");
+        let update = timeout(Duration::from_secs(1), update_stream.recv())
+            .await
+            .expect("turn start should close the resume update channel");
+        assert_eq!(update, None);
+
+        let native_turn_id = controller.started_turns().await[0].native_turn_id.clone();
+        controller
+            .send_server_message(token_usage_message(
+                "native-existing",
+                &native_turn_id,
+                json!(258_400),
+            ))
+            .await;
+        let event = recv_matching_event(&mut stream, "active context window", |event| {
+            matches!(
+                event,
+                AgentEvent::ContextWindowUpdated {
+                    thread,
+                    turn: event_turn,
+                    context_window,
+                    ..
+                } if *thread == handle.thread
+                    && *event_turn == turn
+                    && *context_window == 258_400
+            )
+        })
+        .await;
+        assert!(matches!(event, AgentEvent::ContextWindowUpdated { .. }));
+    }
+
+    #[tokio::test]
     async fn codex_worker_resumes_thread_while_turn_is_active() {
         let (harness, controller) = spawn_fake_harness();
         let first = harness.open_thread(open_opts(None, None)).await.unwrap();
+        let mut first_stream = harness.subscribe(&first);
         harness
             .start_turn(
                 &first,
@@ -3185,17 +3516,55 @@ mod tests {
             .await
             .unwrap();
         let resumed_thread = ThreadId::new();
+        let mut opts = open_opts(Some(resumed_thread), Some("native-existing"));
+        let (updates, mut update_stream) = giskard_harness::thread_update_channel();
+        opts.updates = updates;
 
-        let resumed = timeout(
-            Duration::from_secs(1),
-            harness.open_thread(open_opts(Some(resumed_thread), Some("native-existing"))),
-        )
-        .await
-        .expect("resuming another thread must not wait for the active turn")
-        .unwrap();
+        let resumed = tokio::spawn({
+            let harness = harness.clone();
+            async move { harness.open_thread(opts).await }
+        });
+        controller
+            .wait_for_request(codex_codes::protocol::methods::THREAD_RESUME)
+            .await;
+        let resumed = timeout(Duration::from_secs(1), resumed)
+            .await
+            .expect("resuming another thread must not wait for usage replay")
+            .expect("resume task should not panic")
+            .unwrap();
+        let started = controller.started_turns().await.remove(0);
+        controller
+            .send_server_message(generic_user_input_request(
+                "while-resuming",
+                &started.native_thread_id,
+                &started.native_turn_id,
+            ))
+            .await;
+        recv_matching_event(&mut first_stream, "request while resuming", |event| {
+            matches!(event, AgentEvent::ServerRequestReceived { .. })
+        })
+        .await;
+        controller
+            .send_server_message(token_usage_message(
+                "native-existing",
+                "historical-turn",
+                json!(258_400),
+            ))
+            .await;
+
+        let update = timeout(Duration::from_secs(1), update_stream.recv())
+            .await
+            .expect("resume usage replay should be forwarded")
+            .expect("thread update stream should remain open");
 
         assert_eq!(resumed.thread, resumed_thread);
         assert_eq!(resumed.harness_thread_id, "native-existing");
+        assert!(matches!(
+            update,
+            ThreadUpdate::ContextWindowRestored {
+                context_window: 258_400,
+            }
+        ));
         assert!(controller.requests().await.iter().any(|req| {
             req.method == codex_codes::protocol::methods::THREAD_RESUME
                 && req.params["threadId"] == "native-existing"

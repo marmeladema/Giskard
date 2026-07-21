@@ -39,7 +39,7 @@ let state = {
   activeTaskGroup:null, taskGroupSeq:0, taskItemSeq:0, taskGroupsById:new Map(), taskGroupsByItemId:new Map(),
   expandedTaskGroups:new Set(), manuallyToggledTaskGroups:new Set(), expandedTaskDetails:new Map(),
   linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, activeTurn:false, interruptPending:false, compactPending:false,
-  awaitingInitialThreadState:false, awaitingThreadResync:false, awaitingIncrementalResync:false, resyncStickBottom:false, contextWindow:0, contextUsed:null, tokenLedger:null, approvalPolicy:"ask", currentModel:null,
+  awaitingInitialThreadState:false, awaitingThreadResync:false, awaitingIncrementalResync:false, awaitingThreadMetadataState:false, resyncStickBottom:false, contextWindow:0, contextUsed:null, tokenLedger:null, approvalPolicy:"ask", currentModel:null, pendingContextWindowUpdate:null,
   mcpServers:[], mcpCapabilities:{ status:false, reload:false, oauth_login:false }, mcpLoading:false, mcpError:null, expandedMcps:new Set(),
   threadReadOnly:false, readOnlyProvider:null, readOnlyMessage:null,
   pickerTypeahead:"", pickerTypeaheadTimer:null, pickerSelectedRow:null,
@@ -970,6 +970,8 @@ function clearThreadView(tid) {
   state.pendingUserEl = null; state.pendingUserText = null;
   state.compactPending = false;
   state.currentModel = null;
+  state.awaitingThreadMetadataState = false;
+  state.pendingContextWindowUpdate = null;
   $("effortControl").hidden = true;
   setTurnActive(false);
   state.awaitingInitialThreadState = false;
@@ -1262,6 +1264,8 @@ function openDraftThread(pid, defaultModel) {
   state.pendingUserText = null;
   state.compactPending = false;
   state.currentModel = normalizeDraftModel(defaultModel);
+  state.awaitingThreadMetadataState = false;
+  state.pendingContextWindowUpdate = null;
   prepareProjectModelCatalog(pid);
   state.mcpServers = []; state.mcpError = null; state.expandedMcps = new Set();
   state.mcpCapabilities = { status:false, reload:false, oauth_login:false };
@@ -1325,6 +1329,8 @@ async function openThread(pid, tid, title, opts) {
   state.draftThread = null;
   state.compactPending = false;
   state.currentModel = null;
+  state.awaitingThreadMetadataState = true;
+  state.pendingContextWindowUpdate = null;
   prepareProjectModelCatalog(pid);
   $("effortControl").hidden = true;
   state.mcpServers = []; state.mcpError = null; state.expandedMcps = new Set();
@@ -1482,6 +1488,7 @@ async function connectWs(opts) {
     state.wsLastProblem = "";
     setWsStatus("open", "Connected to agent.");
     markWsForegroundRecovered(ws);
+    state.awaitingThreadMetadataState = true;
     // Incremental resync: if we already have persisted history rendered, ask only for the turns
     // after our newest one (`since`). The server replies with a HistoryDelta and we keep the
     // immutable completed-turn DOM, repainting only the in-flight turn. Without a cursor (nothing
@@ -1641,6 +1648,7 @@ function isThreadScopedServerMessage(msg) {
   if (!msg) return false;
   switch (msg.type) {
     case "thread_state":
+    case "thread_context_window_updated":
     case "history_page":
     case "history_delta":
     case "live_turn_snapshot":
@@ -1672,6 +1680,9 @@ function handleServer(msg) {
   if (!isCurrentThreadServerMessage(msg)) return;
   switch (msg.type) {
     case "thread_state": renderThreadState(msg.state); break;
+    case "thread_context_window_updated":
+      applyThreadContextWindowUpdate(msg);
+      break;
     case "history_page": renderHistoryPage(msg); break;
     case "history_delta": renderHistoryDelta(msg); break;
     case "live_turn_snapshot": renderLiveTurnSnapshot(msg); break;
@@ -2029,11 +2040,14 @@ function handleIncomingApprovalRequest(request, tid, opts) {
 function renderThreadState(s) {
   if (!s) return;
   const shouldResetTranscript = state.awaitingInitialThreadState || state.awaitingThreadResync;
+  const pendingContextWindowUpdate = state.pendingContextWindowUpdate;
+  state.pendingContextWindowUpdate = null;
   // An incremental resync keeps the transcript. Remember whether the viewport was pinned to the
   // bottom now, before the in-flight turn is repainted, so we can restore that afterwards.
   if (state.awaitingIncrementalResync) state.resyncStickBottom = transcriptShouldStickToBottom();
   state.awaitingInitialThreadState = false;
   state.awaitingThreadResync = false;
+  state.awaitingThreadMetadataState = false;
   setMode(s.mode || "build");
   setApprovalPolicy(s.approval_policy || "ask");
   if (s.current_model) {
@@ -2062,9 +2076,21 @@ function renderThreadState(s) {
   }
   if (s.tokens) renderTokens(s.tokens);
   updateGauge(state.contextUsed, s.context_window || 0);
+  if (pendingContextWindowUpdate) {
+    applyThreadContextWindowUpdate(pendingContextWindowUpdate);
+  }
   if (shouldResetTranscript) {
     resetTranscriptForAuthoritativeSnapshot();
   }
+}
+function applyThreadContextWindowUpdate(update) {
+  if (!update || !Number.isFinite(update.context_window) || update.context_window <= 0) return;
+  if (state.awaitingThreadMetadataState) {
+    state.pendingContextWindowUpdate = update;
+    return;
+  }
+  state.pendingContextWindowUpdate = null;
+  updateGauge(state.contextUsed, update.context_window);
 }
 function resetTranscriptForAuthoritativeSnapshot() {
   const keepFirstTurnActive =
