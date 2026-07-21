@@ -9,6 +9,7 @@ use crate::highlight::Highlighter;
 use crate::hub::Hub;
 use crate::ledger::{self, LedgerHandle};
 use crate::live_buffer::LiveBufferStore;
+use crate::models::ProjectModelCatalogStore;
 use crate::registry::{HarnessFactory, HarnessRegistry};
 use crate::routes::{protected_routes, public_routes};
 use crate::running_commands::RunningTaskStore;
@@ -25,6 +26,7 @@ pub struct AppState {
     pub registry: Arc<HarnessRegistry>,
     pub live_buffers: Arc<LiveBufferStore>,
     pub running_commands: Arc<RunningTaskStore>,
+    pub model_catalogs: Arc<ProjectModelCatalogStore>,
     pub highlighter: Arc<Highlighter>,
     /// Single-writer token-ledger actor handle (§5.4).
     pub ledger: LedgerHandle,
@@ -55,6 +57,7 @@ impl AppState {
         let hub = Arc::new(Hub::new());
         let live_buffers = Arc::new(LiveBufferStore::new());
         let running_commands = Arc::new(RunningTaskStore::new());
+        let model_catalogs = Arc::new(ProjectModelCatalogStore::default());
         let highlighter = match viz_config {
             Some(viz) => Arc::new(Highlighter::with_max_size(viz.max_highlight_size)),
             None => Arc::new(Highlighter::new()),
@@ -74,6 +77,7 @@ impl AppState {
             registry,
             live_buffers,
             running_commands,
+            model_catalogs,
             highlighter,
             ledger,
             session_key: session_key.into(),

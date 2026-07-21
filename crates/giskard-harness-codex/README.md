@@ -222,8 +222,11 @@ Each returned model is mapped to a Giskard `ModelDescriptor` (`map_model`):
 - **Display name** — Codex's friendly `display_name` is carried through, so the
   picker can show it instead of the raw slug.
 - **Reasoning efforts** — the model's `supported_reasoning_efforts` are preserved
-  verbatim (Codex `ReasoningEffort` is a bare string), and
-  `supports_reasoning_effort` is set when that list is non-empty.
+  verbatim (Codex `ReasoningEffort` is a bare string). Codex exposes the default
+  separately from the selectable alternatives. If the alternatives list is empty
+  and `default_reasoning_effort` is not `none`, the adapter inserts that default as
+  the sole Giskard effort, matching the Codex TUI. An empty alternatives list with
+  a `none` default maps to no reasoning-effort support.
 - **Hidden models** are filtered out (only picker-visible entries are returned).
 - **Empty provider** — the `model/list` catalog is provider-agnostic (a bare
   model slug, no provider), so descriptors leave `provider` empty; matching a

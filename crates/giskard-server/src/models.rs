@@ -6,12 +6,41 @@
 //! 3. the built-in defaults table in `giskard-core`;
 //! 4. a conservative fallback (`context_window = 128000`, no reasoning effort).
 
+use std::collections::HashMap;
+
 use serde::Deserialize;
+use tokio::sync::RwLock;
 use tracing::warn;
 
+use giskard_core::ids::ProjectId;
 use giskard_core::model::{ModelDescriptor, ModelRef, default_descriptor};
 use giskard_persist::Config;
-use giskard_proto::ProviderListingWarning;
+use giskard_proto::ModelListingWarning;
+
+/// Last successfully composed model list for each project.
+///
+/// The browser and model-mutation routes must resolve against the same descriptors: otherwise a
+/// catalog-only reasoning effort can be displayed by the picker and then discarded when a turn is
+/// created. The project endpoint refreshes this store; mutation routes load it on demand when the
+/// browser has not fetched the catalog yet.
+#[derive(Default)]
+pub struct ProjectModelCatalogStore {
+    catalogs: RwLock<HashMap<ProjectId, Vec<ModelDescriptor>>>,
+}
+
+impl ProjectModelCatalogStore {
+    pub async fn get(&self, project_id: ProjectId) -> Option<Vec<ModelDescriptor>> {
+        self.catalogs.read().await.get(&project_id).cloned()
+    }
+
+    pub async fn replace(&self, project_id: ProjectId, models: Vec<ModelDescriptor>) {
+        self.catalogs.write().await.insert(project_id, models);
+    }
+
+    pub async fn remove(&self, project_id: ProjectId) {
+        self.catalogs.write().await.remove(&project_id);
+    }
+}
 
 /// Build a `ModelDescriptor` from a typed config entry, if the provider + model are declared.
 fn from_config(config: &Config, provider: &str, model: &str) -> Option<ModelDescriptor> {
@@ -32,6 +61,19 @@ pub fn resolve_descriptor(config: &Config, model: &ModelRef) -> ModelDescriptor 
     from_config(config, &model.provider, &model.model)
         .or_else(|| default_descriptor(&model.provider, &model.model))
         .unwrap_or_else(|| ModelDescriptor::conservative(&model.provider, &model.model))
+}
+
+/// Resolve against a composed project catalog before falling back to static metadata.
+pub fn resolve_catalog_descriptor(
+    catalog: &[ModelDescriptor],
+    config: &Config,
+    model: &ModelRef,
+) -> ModelDescriptor {
+    catalog
+        .iter()
+        .find(|descriptor| descriptor.provider == model.provider && descriptor.model == model.model)
+        .cloned()
+        .unwrap_or_else(|| resolve_descriptor(config, model))
 }
 
 pub fn normalize_model_ref(config: &Config, model: &ModelRef) -> ModelRef {
@@ -101,15 +143,15 @@ pub fn apply_harness_metadata(
     harness_models: &[ModelDescriptor],
     config: &Config,
 ) -> Vec<ModelDescriptor> {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
     let by_id: HashMap<&str, &ModelDescriptor> = harness_models
         .iter()
         .map(|m| (m.model.as_str(), m))
         .collect();
-    let declared: HashSet<&str> = config
+    let declared: HashSet<(&str, &str)> = config
         .providers
         .iter()
-        .flat_map(|p| p.models.iter().map(|m| m.id.as_str()))
+        .flat_map(|p| p.models.iter().map(|m| (p.id.as_str(), m.id.as_str())))
         .collect();
     for d in &mut base {
         let Some(h) = by_id.get(d.model.as_str()) else {
@@ -118,8 +160,8 @@ pub fn apply_harness_metadata(
         if d.display_name.is_none() {
             d.display_name = h.display_name.clone();
         }
-        if !declared.contains(d.model.as_str()) && !h.reasoning_efforts.is_empty() {
-            d.supports_reasoning_effort = true;
+        if !declared.contains(&(d.provider.as_str(), d.model.as_str())) {
+            d.supports_reasoning_effort = h.supports_reasoning_effort;
             d.reasoning_efforts = h.reasoning_efforts.clone();
         }
     }
@@ -167,13 +209,11 @@ pub fn merge_models(
 /// `model_listing`, merging the results over the static list (§8.3). Best-effort: a provider whose
 /// endpoint errors, returns a non-success status, or sends unparseable JSON is skipped (its static
 /// entries remain), so the call always returns at least the static list. Each such failure is
-/// logged **and** returned as a [`ProviderListingWarning`] so it can be surfaced to the user rather
+/// logged **and** returned as a [`ModelListingWarning`] so it can be surfaced to the user rather
 /// than silently yielding no models (e.g. a 401 from a proxy whose api_key is missing/wrong).
-pub async fn refresh_models(
-    config: &Config,
-) -> (Vec<ModelDescriptor>, Vec<ProviderListingWarning>) {
+pub async fn refresh_models(config: &Config) -> (Vec<ModelDescriptor>, Vec<ModelListingWarning>) {
     let base = list_descriptors(config);
-    let mut warnings: Vec<ProviderListingWarning> = Vec::new();
+    let mut warnings: Vec<ModelListingWarning> = Vec::new();
 
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -204,8 +244,8 @@ pub async fn refresh_models(
 
         let mut fail = |message: String| {
             warn!(provider = %p.id, %url, %message, "model discovery failed; skipping provider");
-            warnings.push(ProviderListingWarning {
-                provider: p.id.clone(),
+            warnings.push(ModelListingWarning {
+                source: format!("provider:{}", p.id),
                 message,
             });
         };
@@ -494,6 +534,70 @@ wire_api = "responses"
         assert_eq!(d.display_name, None);
         assert!(!d.supports_reasoning_effort);
         assert!(d.reasoning_efforts.is_empty());
+    }
+
+    #[test]
+    fn empty_catalog_efforts_use_the_harness_support_flag() {
+        let config = Config::default();
+        let base = vec![default_descriptor("openai", "gpt-5.5").unwrap()];
+        let unsupported = vec![ModelDescriptor {
+            provider: String::new(),
+            model: "gpt-5.5".into(),
+            context_window: ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
+            supports_reasoning_effort: false,
+            reasoning_efforts: Vec::new(),
+            display_name: Some("GPT-5.5".into()),
+        }];
+        let merged = apply_harness_metadata(base.clone(), &unsupported, &config);
+        assert!(!merged[0].supports_reasoning_effort);
+        assert!(merged[0].reasoning_efforts.is_empty());
+
+        let default_only = vec![ModelDescriptor {
+            provider: String::new(),
+            model: "gpt-5.5".into(),
+            context_window: ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
+            supports_reasoning_effort: true,
+            reasoning_efforts: Vec::new(),
+            display_name: Some("GPT-5.5".into()),
+        }];
+        let merged = apply_harness_metadata(base, &default_only, &config);
+        assert!(merged[0].supports_reasoning_effort);
+        assert!(merged[0].reasoning_efforts.is_empty());
+    }
+
+    #[test]
+    fn configured_effort_precedence_is_scoped_to_provider_and_model() {
+        let config: Config = toml::from_str(
+            r#"
+[[providers]]
+id = "configured"
+name = "Configured"
+wire_api = "responses"
+  [[providers.models]]
+  id = "shared-model"
+  context_window = 1000
+  supports_reasoning_effort = false
+
+[[providers]]
+id = "discovered"
+name = "Discovered"
+wire_api = "responses"
+"#,
+        )
+        .unwrap();
+        let base = vec![ModelDescriptor::conservative("discovered", "shared-model")];
+        let harness = vec![ModelDescriptor {
+            provider: String::new(),
+            model: "shared-model".into(),
+            context_window: ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
+            supports_reasoning_effort: true,
+            reasoning_efforts: vec!["focused".into()],
+            display_name: Some("Shared Model".into()),
+        }];
+
+        let merged = apply_harness_metadata(base, &harness, &config);
+        assert!(merged[0].supports_reasoning_effort);
+        assert_eq!(merged[0].reasoning_efforts, vec!["focused"]);
     }
 
     #[test]

@@ -9,7 +9,7 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.52
+**Version:** 1.53
 
 > **Amendment — frontend approach (supersedes the Dioxus/WASM design below).**
 > This document was written targeting a **Dioxus fullstack / WebAssembly** frontend (`giskard-ui`),
@@ -22,6 +22,20 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.52 → 1.53), project model-catalog consistency:**
+- **M8:** the server caches the composed model descriptors per project and uses that same catalog
+  for picker responses, new-thread creation, and model selection. Catalog-derived reasoning support
+  and exact effort values therefore survive persistence and reach the harness.
+- **M9:** config effort precedence is scoped to the exact `(provider, model)` entry. For models not
+  declared under that provider, the harness catalog's reasoning-support flag and effort list are
+  authoritative. The Codex adapter normalizes a non-`none` default with no selectable alternatives
+  into a one-entry effort list, so an empty Codex alternatives list does not by itself disable
+  reasoning effort.
+- **M10:** global models used by project creation remain separate from the active project's harness
+  catalog. Project changes invalidate stale picker options until the matching catalog loads.
+- **M11:** provider and harness model-listing failures are returned as structured warnings with a
+  source label and surfaced by the browser while the usable portion of the catalog remains active.
 
 **Changelog (1.51 → 1.52), reliable Markdown finalization:**
 - **M4:** completed agent, reasoning, and user messages use the Markdown renderer whether their
@@ -350,11 +364,11 @@
 
 **Changelog (1.31 → 1.32), thread reasoning-effort selector:**
 - **RE1:** The thread header shows an `Effort` selector immediately after the model picker when the
-  selected model descriptor advertises `supports_reasoning_effort`. The selector offers
-  `Model default`, `Minimal`, `Low`, `Medium`, `High`, and `Extra High` for Codex-compatible
-  reasoning models, sends the selected value through `SelectModel.model_ref.reasoning_effort`, and
-  hides for models that do not support reasoning effort.
-- **RE2:** Selecting `Model default` for the current model clears the thread's explicit
+  selected model descriptor advertises `supports_reasoning_effort`. The selector offers `Default`
+  plus the descriptor's exact `reasoning_efforts`; descriptors without an exact list use the common
+  Codex-compatible fallback set. It sends the selected value through
+  `SelectModel.model_ref.reasoning_effort` and hides for models without reasoning effort.
+- **RE2:** Selecting `Default` for the current model clears the thread's explicit
   `reasoning_effort`, so the next turn omits the effort parameter. Switching away from and back to
   a reasoning model still restores that model's last explicit effort via the existing per-thread
   `model_efforts` map.
@@ -2055,17 +2069,29 @@ LiteLLM gateway fronting Cloudflare Workers AI.
   `(provider, model)` per §8.1):
   - **`display_name`** — applied when the config left one unset, so an explicit config name wins.
   - **`reasoning_efforts`** — the exact effort levels the model advertises, used to populate the
-    effort selector (§8.5). Applied only to models the config did **not** explicitly declare; a
-    `[[providers.models]]` entry keeps its configured `supports_reasoning_effort`. Efforts are
-    model-defined strings (see `Effort` in §8.5), so whatever the catalog lists is offered verbatim.
+    effort selector (§8.5). Applied only when the exact `(provider, model)` pair is not explicitly
+    declared; a `[[providers.models]]` entry under another provider does not suppress the overlay.
+    A catalog entry's `supports_reasoning_effort` flag and effort list are authoritative for an
+    undeclared pair. An empty effort list can therefore describe either an unsupported model or a
+    reasoning model without model-specific selectable levels; §8.5 defines the browser fallback for
+    the latter. Efforts are model-defined strings (see `Effort` in §8.5), so whatever the catalog
+    lists is offered verbatim.
+
+  Codex exposes `default_reasoning_effort` separately from `supported_reasoning_efforts`. When the
+  alternatives list is empty but the default is not `none`, the Codex TUI treats that default as the
+  sole valid effort. The adapter mirrors that behavior by normalizing the default into a one-entry
+  Giskard `reasoning_efforts` list. Only an empty alternatives list paired with a `none` default maps
+  to no reasoning-effort support.
 
   The harness never supplies `context_window` (Codex's `model/list` omits it). Per-provider
-  discovery failures come back as `warnings`; the overlay is best-effort, so a non-Codex harness (or
-  a Codex process that can't answer) just yields the config + discovery list with config/raw
-  metadata. The list is loaded once per project (not per thread) and re-fetched by the picker's
-  "Reload models" action. The global `/api/models` route is the no-project baseline (config +
-  discovery, no harness metadata) for the startup list and the
-  new-project dialog.
+  provider or harness listing failures come back as structured `warnings` whose `source` identifies
+  `provider:<id>` or `harness:<kind>`. The overlay is best-effort, so failures preserve the usable
+  config + discovery list while remaining visible to the user. The composed list is cached per
+  project and is the descriptor source for both picker display and model mutations; the picker and
+  turn-start/select paths must not resolve the same model against different metadata. "Reload
+  models" replaces that project's cache. The global `/api/models` route remains a separate
+  no-project baseline (config + discovery, no harness metadata) for the startup list and new-project
+  dialog; an active project's catalog must never overwrite it.
 - **Stale-provider normalization (E5).** When a persisted/project `ModelRef` names a provider
   that is no longer configured, but its `model` id appears under exactly one configured provider,
   the server rewrites the provider to that configured provider before opening/resuming or starting

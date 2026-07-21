@@ -366,7 +366,7 @@ model_listing = true
 
     let warnings = refreshed["warnings"].as_array().unwrap();
     assert_eq!(warnings.len(), 1, "one provider failed: {refreshed}");
-    assert_eq!(warnings[0]["provider"], "secured");
+    assert_eq!(warnings[0]["source"], "provider:secured");
     assert!(
         warnings[0]["message"].as_str().unwrap().contains("401"),
         "warning names the status: {}",

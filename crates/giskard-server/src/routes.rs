@@ -405,6 +405,7 @@ async fn delete_project(
         .delete_project(id)
         .await
         .map_err(harness_api_error)?;
+    state.model_catalogs.remove(id).await;
     state.store.delete_project(id).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -672,7 +673,9 @@ async fn start_thread_with_message(
         state.store.save_project(&project_config).await?;
     }
 
-    let model_ref = resolve_initial_thread_model(&app_config, req.model_ref);
+    let catalog = project_model_catalog(&state, &project_config, &app_config).await;
+    let (model_ref, model_descriptor) =
+        resolve_initial_thread_model(&app_config, &catalog, req.model_ref);
     let ws_root = project_config
         .workspace_root
         .as_deref()
@@ -726,7 +729,7 @@ async fn start_thread_with_message(
         harness_thread_id: handle.harness_thread_id.clone(),
         mode: req.mode,
         current_model: model_ref.clone(),
-        context_window: crate::models::context_window_for(&app_config, &model_ref),
+        context_window: model_descriptor.context_window,
         approval_policy: req.approval_policy,
         model_efforts: std::collections::HashMap::new(),
         tokens: giskard_core::token::TokenLedger::default(),
@@ -796,13 +799,17 @@ async fn start_thread_with_message(
     }))
 }
 
-fn resolve_initial_thread_model(config: &giskard_persist::Config, model: ModelRef) -> ModelRef {
+fn resolve_initial_thread_model(
+    config: &giskard_persist::Config,
+    catalog: &[ModelDescriptor],
+    model: ModelRef,
+) -> (ModelRef, ModelDescriptor) {
     let mut model = crate::models::normalize_model_ref(config, &model);
-    let descriptor = crate::models::resolve_descriptor(config, &model);
+    let descriptor = crate::models::resolve_catalog_descriptor(catalog, config, &model);
     if !descriptor.supports_reasoning_effort {
         model.reasoning_effort = None;
     }
-    model
+    (model, descriptor)
 }
 
 async fn cleanup_new_thread_after_start_failure(
@@ -1403,9 +1410,43 @@ async fn project_list_models(
         .await?
         .ok_or(ApiError::NotFound)?;
     let config = state.store.load_config().await?;
-    let (base, warnings) = crate::models::refresh_models(&config).await;
-    let models = overlay_harness_metadata(&state, &project_config, &config, base).await;
+    let (models, warnings) = refresh_project_model_catalog(&state, &project_config, &config).await;
     Ok(Json(ListModelsResponse { models, warnings }))
+}
+
+/// Return the last catalog fetched for this project, refreshing it on demand when a client starts
+/// or mutates a thread before the browser has loaded the picker. This keeps model mutation aligned
+/// with the descriptors that drive the UI without repeating provider and harness discovery for
+/// every turn.
+async fn project_model_catalog(
+    state: &AppState,
+    project_config: &ProjectConfig,
+    config: &Config,
+) -> Vec<ModelDescriptor> {
+    if let Some(models) = state.model_catalogs.get(project_config.id).await {
+        return models;
+    }
+    refresh_project_model_catalog(state, project_config, config)
+        .await
+        .0
+}
+
+async fn refresh_project_model_catalog(
+    state: &AppState,
+    project_config: &ProjectConfig,
+    config: &Config,
+) -> (Vec<ModelDescriptor>, Vec<ModelListingWarning>) {
+    let (base, mut warnings) = crate::models::refresh_models(config).await;
+    let (models, harness_warning) =
+        overlay_harness_metadata(state, project_config, config, base).await;
+    if let Some(warning) = harness_warning {
+        warnings.push(warning);
+    }
+    state
+        .model_catalogs
+        .replace(project_config.id, models.clone())
+        .await;
+    (models, warnings)
 }
 
 /// Overlay the project harness's model metadata (friendly names + advertised reasoning efforts) onto
@@ -1417,9 +1458,9 @@ async fn overlay_harness_metadata(
     project_config: &ProjectConfig,
     config: &Config,
     base: Vec<ModelDescriptor>,
-) -> Vec<ModelDescriptor> {
+) -> (Vec<ModelDescriptor>, Option<ModelListingWarning>) {
     match state.registry.capabilities(project_config).await {
-        Ok(caps) if !caps.model_listing => return base,
+        Ok(caps) if !caps.model_listing => return (base, None),
         Ok(_) => {}
         Err(e) => {
             warn!(
@@ -1428,11 +1469,20 @@ async fn overlay_harness_metadata(
                 error = %e,
                 "cannot read harness capabilities; serving models without harness metadata"
             );
-            return base;
+            return (
+                base,
+                Some(ModelListingWarning {
+                    source: format!("harness:{}", project_config.harness),
+                    message: format!("could not read model-listing capabilities: {e}"),
+                }),
+            );
         }
     }
     match state.registry.list_models(project_config).await {
-        Ok(harness_models) => crate::models::apply_harness_metadata(base, &harness_models, config),
+        Ok(harness_models) => (
+            crate::models::apply_harness_metadata(base, &harness_models, config),
+            None,
+        ),
         Err(e) => {
             warn!(
                 project_id = %project_config.id,
@@ -1440,7 +1490,13 @@ async fn overlay_harness_metadata(
                 error = %e,
                 "harness model listing failed; serving models without harness metadata"
             );
-            base
+            (
+                base,
+                Some(ModelListingWarning {
+                    source: format!("harness:{}", project_config.harness),
+                    message: format!("model listing failed: {e}"),
+                }),
+            )
         }
     }
 }
@@ -2133,6 +2189,21 @@ async fn handle_client_msg(
                 .load_config()
                 .await
                 .map_err(|e| WsError::from_persist(e, "select_model", Some(thread_id)))?;
+            let project_config = state
+                .store
+                .load_project(project_id)
+                .await
+                .map_err(|e| WsError::from_persist(e, "select_model", Some(thread_id)))?
+                .ok_or_else(|| {
+                    WsError::new(
+                        "project_not_found",
+                        ErrorSeverity::Error,
+                        "Project not found.",
+                    )
+                    .thread(thread_id)
+                    .action("select_model")
+                })?;
+            let catalog = project_model_catalog(state, &project_config, &config).await;
             let model_ref = crate::models::normalize_model_ref(&config, &model_ref);
 
             if state
@@ -2188,14 +2259,19 @@ async fn handle_client_msg(
             let tf = state
                 .store
                 .update_thread(project_id, thread_id, move |tf| {
-                    let old = crate::models::resolve_descriptor(&config, &tf.current_model);
+                    let old = crate::models::resolve_catalog_descriptor(
+                        &catalog,
+                        &config,
+                        &tf.current_model,
+                    );
                     if old.supports_reasoning_effort {
                         if let Some(effort) = tf.current_model.reasoning_effort.clone() {
                             tf.model_efforts.insert(tf.current_model.key(), effort);
                         }
                     }
 
-                    let new_descriptor = crate::models::resolve_descriptor(&config, &model_ref);
+                    let new_descriptor =
+                        crate::models::resolve_catalog_descriptor(&catalog, &config, &model_ref);
                     let mut new_model = model_ref.clone();
                     let same_model = tf.current_model.provider == new_model.provider
                         && tf.current_model.model == new_model.model;
@@ -2210,7 +2286,7 @@ async fn handle_client_msg(
                         new_model.reasoning_effort = None;
                     }
 
-                    tf.context_window = crate::models::context_window_for(&config, &new_model);
+                    tf.context_window = new_descriptor.context_window;
                     tf.current_model = new_model;
                     tf.updated_at = chrono::Utc::now();
                 })

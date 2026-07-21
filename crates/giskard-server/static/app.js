@@ -30,7 +30,7 @@ let state = {
   // streamed); `newestPersistedTurnId` is the id of the newest turn known to have completed — the
   // high-water mark a future resync will use as its "give me turns after this" cursor.
   currentRenderTurnId:null, newestPersistedTurnId:null,
-  models:[], modelsProject:null, pendingModelBeforeSelect:null, streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null,
+  globalModels:[], models:[], modelsProject:null, modelsLoadingProject:null, pendingModelBeforeSelect:null, streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null,
   streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), renderedItemBodyByKey:new Map(), itemKindsByItemId:new Map(),
   pendingApprovals:new Map(), answeredApprovals:new Map(), renderedApprovalStateKeys:new Set(), pendingServerRequests:new Map(),
   runningCommands:new Map(), commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null,
@@ -84,7 +84,7 @@ async function startApp() {
   $("app").classList.add("open");
   initServiceWorkerNotifications();
   initNotificationSettings();
-  try { state.models = (await api("GET","/api/models")).models || []; } catch { state.models=[]; }
+  try { state.globalModels = (await api("GET","/api/models")).models || []; } catch { state.globalModels=[]; }
   renderModelSelect();
   await loadProjects();
   refreshModels();   // background: merge in any provider /v1/models discovery (§8.3)
@@ -103,13 +103,13 @@ async function refreshModels(opts) {
   try {
     const res = await api("POST","/api/models/refresh");
     if (res && Array.isArray(res.models)) {
-      if (!state.projectId) { state.models = res.models; renderModelSelect(); }
+      state.globalModels = res.models;
       populateModalModels();
     }
     // Surface per-provider discovery failures (e.g. a 401 from a misconfigured api_key) so they
     // aren't silent. Suppressed on the modal-open auto-refresh to avoid duplicate toasts.
     if (opts.announce !== false && res && Array.isArray(res.warnings)) {
-      for (const w of res.warnings) notice(`Model discovery — ${w.provider}: ${w.message}`, "warning");
+      for (const w of res.warnings) notice(`Model discovery — ${w.source}: ${w.message}`, "warning");
     }
   } catch (e) {
     notice("Could not refresh models: "+e.message, "warning");
@@ -127,6 +127,19 @@ async function refreshModels(opts) {
 // project's response landing after a project switch.
 let _loadingProjectModels = false;
 let _pendingProjectModelLoad = null;
+function projectModelCatalogReady() {
+  return !!state.projectId &&
+    state.modelsProject === state.projectId &&
+    state.modelsLoadingProject !== state.projectId;
+}
+function prepareProjectModelCatalog(pid) {
+  if (state.modelsProject === pid) return;
+  state.models = [];
+  state.modelsProject = null;
+  closeModelPicker();
+  renderModelSelect();
+  updateComposerControls();
+}
 async function loadProjectModels(pid, opts) {
   opts = opts || {};
   if (!pid) return;
@@ -135,6 +148,10 @@ async function loadProjectModels(pid, opts) {
   if (_loadingProjectModels) { _pendingProjectModelLoad = { pid, opts }; return; }
   if (!opts.force && pid === state.modelsProject) return;   // already loaded for this project
   _loadingProjectModels = true;
+  if (pid === state.projectId) {
+    state.modelsLoadingProject = pid;
+    updateComposerControls();
+  }
   const btn = $("refreshModels"); if (btn) btn.disabled = true;
   try {
     const res = await api("GET", `/api/projects/${pid}/models`);
@@ -142,18 +159,19 @@ async function loadProjectModels(pid, opts) {
       state.models = res.models;
       state.modelsProject = pid;
       renderModelSelect();
-      populateModalModels();
       updateModelButton();
     }
     // Only surface warnings/errors while `pid` is still the active project — a switch mid-request
     // must not misattribute the previous project's discovery failures to the new one.
     if (opts.announce && res && Array.isArray(res.warnings) && pid === state.projectId) {
-      for (const w of res.warnings) notice(`Model discovery — ${w.provider}: ${w.message}`, "warning");
+      for (const w of res.warnings) notice(`Model discovery — ${w.source}: ${w.message}`, "warning");
     }
   } catch (e) {
     if (opts.announce && pid === state.projectId) notice("Could not reload models: "+e.message, "warning");
   } finally {
     _loadingProjectModels = false;
+    if (state.modelsLoadingProject === pid) state.modelsLoadingProject = null;
+    updateComposerControls();
     if (btn) btn.disabled = false;
     const pending = _pendingProjectModelLoad;
     _pendingProjectModelLoad = null;
@@ -986,13 +1004,13 @@ function populateModalModels() {
   const sel = $("pmModel"); if (!sel) return;
   const prev = sel.value;
   sel.innerHTML = "";
-  for (const m of state.models) {
+  for (const m of state.globalModels) {
     const o = document.createElement("option");
     o.value = `${m.provider}/${m.model}`; o.textContent = modelOptionLabel(m);
     o.dataset.provider = m.provider; o.dataset.model = m.model;
     sel.append(o);
   }
-  if (!state.models.length) { const o=document.createElement("option"); o.textContent="(no models configured)"; sel.append(o); }
+  if (!state.globalModels.length) { const o=document.createElement("option"); o.textContent="(no models configured)"; sel.append(o); }
   if (prev) sel.value = prev;
 }
 function openProjectModal() {
@@ -1244,6 +1262,7 @@ function openDraftThread(pid, defaultModel) {
   state.pendingUserText = null;
   state.compactPending = false;
   state.currentModel = normalizeDraftModel(defaultModel);
+  prepareProjectModelCatalog(pid);
   state.mcpServers = []; state.mcpError = null; state.expandedMcps = new Set();
   state.mcpCapabilities = { status:false, reload:false, oauth_login:false };
   $("tasksMenu").hidden = true;
@@ -1306,6 +1325,7 @@ async function openThread(pid, tid, title, opts) {
   state.draftThread = null;
   state.compactPending = false;
   state.currentModel = null;
+  prepareProjectModelCatalog(pid);
   $("effortControl").hidden = true;
   state.mcpServers = []; state.mcpError = null; state.expandedMcps = new Set();
   state.mcpCapabilities = { status:false, reload:false, oauth_login:false };
@@ -1539,9 +1559,10 @@ function updateComposerControls() {
   $("stopBtn").hidden = !state.activeTurn || draft;
   $("stopBtn").disabled = !ready || state.interruptPending;
   $("stopBtn").textContent = state.interruptPending ? "Stopping…" : "Stop";
-  $("modelSel").disabled = !hasThreadSurface || (!ready && !draft);
-  $("modelPickerBtn").disabled = !hasThreadSurface || (!ready && !draft);
-  $("effortSel").disabled = !hasThreadSurface || (!ready && !draft);
+  const modelCatalogReady = projectModelCatalogReady();
+  $("modelSel").disabled = !hasThreadSurface || !modelCatalogReady || (!ready && !draft);
+  $("modelPickerBtn").disabled = !hasThreadSurface || !modelCatalogReady || (!ready && !draft);
+  $("effortSel").disabled = !hasThreadSurface || !modelCatalogReady || (!ready && !draft);
   const compactBtn = $("compactBtn");
   if (compactBtn) {
     compactBtn.disabled = !state.threadId || draft || state.activeTurn || state.compactPending || !ready;
@@ -2032,7 +2053,8 @@ function renderThreadState(s) {
         notice(`Thread resumed under provider ${s.current_model.provider}.`);
       }
     }
-    syncModelControls();
+    if (projectModelCatalogReady()) syncModelControls();
+    else renderModelSelect();
   }
   if (s.title) {
     updateThreadRowTitle(s.id || s.thread_id || state.threadId, s.title);
@@ -5622,7 +5644,18 @@ function renderModelSelect() {
     o.dataset.supportsReasoningEffort = m.supports_reasoning_effort ? "true" : "false";
     sel.append(o);
   }
-  if (!state.models.length) { const o=document.createElement("option"); o.textContent="(no models configured)"; sel.append(o); }
+  if (!state.models.length) {
+    const o=document.createElement("option");
+    if (state.currentModel && state.currentModel.provider && state.currentModel.model) {
+      o.value = modelKey(state.currentModel);
+      o.textContent = modelOptionLabel(state.currentModel);
+      o.dataset.provider = state.currentModel.provider;
+      o.dataset.model = state.currentModel.model;
+    } else {
+      o.textContent = state.projectId ? "(loading models...)" : "(no models configured)";
+    }
+    sel.append(o);
+  }
   if (prev) sel.value = prev;   // preserve the current selection across a refresh
   syncModelOptionAvailability();
   syncEffortControl();
