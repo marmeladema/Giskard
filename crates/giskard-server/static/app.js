@@ -3501,6 +3501,15 @@ function taskTitleText(cmd) {
   if (cmd.kind === "tool") return (cmd.server ? cmd.server + ":" : "") + (cmd.command || "tool");
   return "$ " + (cmd.command || "(command)");
 }
+// The client accumulates the full running output from command_output deltas, but the server's
+// RunningTasks snapshot and replayed item payloads may carry only a capped tail (see MAX_OUTPUT_TAIL
+// in running_commands.rs). Keep whichever is longer so those updates never shrink the overlay's full
+// log back to the tail during a live session.
+function mergeRunningOutput(prev, next) {
+  prev = prev || "";
+  next = next || "";
+  return prev.length >= next.length ? prev : next;
+}
 function commandFromItem(item, p, turnId, key, existing) {
   return commandFromParts({
     id:existing ? existing.id : key,
@@ -3511,7 +3520,7 @@ function commandFromItem(item, p, turnId, key, existing) {
     status:p.status || "in_progress",
     processId:p.process_id || (existing && existing.processId) || "",
     startedAtMs:existing ? existing.startedAtMs : Date.now(),
-    output:p.output || (existing && existing.output) || "",
+    output:mergeRunningOutput(existing && existing.output, p.output),
     afterTurn:existing ? existing.afterTurn : false,
     terminating:existing ? existing.terminating : false
   });
@@ -3838,7 +3847,7 @@ function renderRunningCommandSnapshot(commands) {
       status:info.status || "in_progress",
       processId:info.process_id || "",
       startedAtMs:normalizeTimestampMs(info.started_at_ms, existing ? existing.startedAtMs : Date.now()),
-      output:info.output || "",
+      output:mergeRunningOutput(existing && existing.output, info.output),
       afterTurn:!!info.after_turn,
       terminating:info.terminating !== undefined ? !!info.terminating : !!(existing && existing.terminating)
     });

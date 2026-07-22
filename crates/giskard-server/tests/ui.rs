@@ -1167,6 +1167,13 @@ async fn index_page_is_served_and_public() {
         "streaming overlay refreshes are coalesced to one repaint per frame"
     );
     assert!(
+        body.contains("function mergeRunningOutput(prev, next)")
+            && body.contains("return prev.length >= next.length ? prev : next;")
+            && body.contains("output:mergeRunningOutput(existing && existing.output, info.output)"),
+        "a running-command snapshot keeps the fuller delta-accumulated output instead of the \
+         server's capped tail"
+    );
+    assert!(
         body.contains("renderMarkdown(body, p.text"),
         "UI renders completed agent/reasoning text as Markdown through the server"
     );
