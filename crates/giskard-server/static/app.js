@@ -34,11 +34,11 @@ let state = {
   streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), renderedItemBodyByKey:new Map(), itemKindsByItemId:new Map(),
   pendingApprovals:new Map(), answeredApprovals:new Map(), renderedApprovalStateKeys:new Set(), pendingServerRequests:new Map(),
   runningCommands:new Map(), commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null,
-  commandPayloadsByItemId:new Map(), endedCommandsByItemId:new Map(), expandedCommandOutputs:new Set(), manuallyToggledCommandOutputs:new Set(),
-  toolPayloadsByItemId:new Map(), toolBodyElsByItemId:new Map(), expandedToolOutputs:new Set(), manuallyToggledToolOutputs:new Set(),
+  commandPayloadsByItemId:new Map(), endedCommandsByItemId:new Map(),
+  toolPayloadsByItemId:new Map(), toolBodyElsByItemId:new Map(),
   activeTaskGroup:null, taskGroupSeq:0, taskItemSeq:0, taskGroupsById:new Map(), taskGroupsByItemId:new Map(),
   expandedTaskGroups:new Set(), manuallyToggledTaskGroups:new Set(), expandedTaskDetails:new Map(),
-  linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, activeTurn:false, interruptPending:false, compactPending:false,
+  linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, outputOverlay:null, activeTurn:false, interruptPending:false, compactPending:false,
   awaitingInitialThreadState:false, awaitingThreadResync:false, awaitingIncrementalResync:false, resyncStickBottom:false, contextWindow:0, contextUsed:null, tokenLedger:null, approvalPolicy:"ask", currentModel:null,
   mcpServers:[], mcpCapabilities:{ status:false, reload:false, oauth_login:false }, mcpLoading:false, mcpError:null, expandedMcps:new Set(),
   threadReadOnly:false, readOnlyProvider:null, readOnlyMessage:null,
@@ -48,8 +48,11 @@ let state = {
   lastNotificationPromptNoticeAt:0, swRegistration:null,
   collapsedProjects:new Set(loadCollapsedProjects()), pendingRemoveProject:null
 };
-const COMMAND_AUTO_COLLAPSE_LINES = 120;
-const COMMAND_AUTO_COLLAPSE_BYTES = 16 * 1024;
+// The inline transcript row shows only a compact preview of a command's/tool's output — the most
+// recent lines (its live "progress"), capped to whichever of these limits is hit first. The full
+// text is always one click away in the output overlay.
+const INLINE_PREVIEW_LINES = 7;
+const INLINE_PREVIEW_BYTES = 2 * 1024;
 const THREAD_TITLE_MAX = 120;
 const EFFORT_OPTIONS = [
   { value:"minimal", label:"Minimal" },
@@ -2269,10 +2272,6 @@ function rebuildRenderTrackingFromDom() {
     for (const key of Array.from(m.keys())) if (!liveTaskIds.has(key)) m.delete(key);
   }
   pruneKeySet(state.commandStopRequestedByItemId, liveTaskIds);
-  pruneKeySet(state.expandedCommandOutputs, liveTaskIds);
-  pruneKeySet(state.manuallyToggledCommandOutputs, liveTaskIds);
-  pruneKeySet(state.expandedToolOutputs, liveTaskIds);
-  pruneKeySet(state.manuallyToggledToolOutputs, liveTaskIds);
 
   for (const [groupId, group] of Array.from(state.taskGroupsById)) {
     if (!attached(group && group.el)) {
@@ -3532,9 +3531,56 @@ function commandOutputStatsLabel(stats, phase) {
   const lineWord = stats.lineCount === 1 ? "line" : "lines";
   return `${stats.lineCount.toLocaleString()} ${lineWord} · ${formatBytes(stats.bytes)}`;
 }
-function commandOutputShouldAutoCollapse(stats) {
-  return stats.lineCount > COMMAND_AUTO_COLLAPSE_LINES ||
-    stats.bytes > COMMAND_AUTO_COLLAPSE_BYTES;
+function outputByteLen(text) {
+  try { return new TextEncoder().encode(text).length; } catch { return text.length; }
+}
+function tailByLines(text, maxLines) {
+  let i = text.length - 1;
+  if (i >= 0 && text.charCodeAt(i) === 10) i--; // ignore a single trailing newline when counting
+  let count = 0;
+  for (; i >= 0; i--) {
+    if (text.charCodeAt(i) === 10) {
+      count++;
+      if (count >= maxLines) return text.slice(i + 1);
+    }
+  }
+  return text;
+}
+function headByLines(text, maxLines) {
+  let count = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) === 10) {
+      count++;
+      if (count >= maxLines) return text.slice(0, i + 1);
+    }
+  }
+  return text;
+}
+function clampTailBytes(text, maxBytes) {
+  if (outputByteLen(text) <= maxBytes) return text;
+  let t = text.length > maxBytes ? text.slice(text.length - maxBytes) : text;
+  const nl = t.indexOf("\n"); // drop the partial leading line so the preview starts cleanly
+  if (nl >= 0 && nl < t.length - 1) t = t.slice(nl + 1);
+  return t;
+}
+function clampHeadBytes(text, maxBytes) {
+  if (outputByteLen(text) <= maxBytes) return text;
+  let t = text.slice(0, maxBytes);
+  const nl = t.lastIndexOf("\n"); // drop the partial trailing line
+  if (nl > 0) t = t.slice(0, nl + 1);
+  return t;
+}
+// Compact the inline preview to the freshest INLINE_PREVIEW_LINES / INLINE_PREVIEW_BYTES. Commands
+// and tool output keep the tail (latest progress); tool input keeps the head (the call arguments).
+function inlineOutputPreview(text, mode) {
+  text = String(text || "");
+  const stats = commandOutputStats(text);
+  if (stats.lineCount <= INLINE_PREVIEW_LINES && stats.bytes <= INLINE_PREVIEW_BYTES) {
+    return { text, truncated: false };
+  }
+  let preview = mode === "head" ? headByLines(text, INLINE_PREVIEW_LINES) : tailByLines(text, INLINE_PREVIEW_LINES);
+  preview = mode === "head" ? clampHeadBytes(preview, INLINE_PREVIEW_BYTES) : clampTailBytes(preview, INLINE_PREVIEW_BYTES);
+  return { text: preview, truncated: true };
 }
 function commandOutputPhaseForId(id) {
   const cmd = state.runningCommands.get(id);
@@ -3549,63 +3595,10 @@ function commandOutputForId(id) {
   const payload = state.commandPayloadsByItemId.get(id);
   return payload ? payload.output || "" : "";
 }
-function isCommandOutputExpanded(itemId, phase, output, stats) {
-  const key = idKey(itemId);
-  if (key && state.manuallyToggledCommandOutputs.has(key)) {
-    return state.expandedCommandOutputs.has(key);
-  }
-  if (phase === "completed") return false;
-  return !commandOutputShouldAutoCollapse(stats || commandOutputStats(output));
-}
 function makeCommandHead() {
   const head = document.createElement("div");
   head.className = "cmd-head";
   return { head };
-}
-function wireCommandRowToggle(msg, itemId, expanded) {
-  const key = idKey(itemId);
-  if (!key) return;
-  msg.classList.add("toggleable");
-  msg.title = expanded ? "Collapse command output" : "Show command output";
-  msg.tabIndex = 0;
-  msg.setAttribute("role", "button");
-  msg.setAttribute("aria-expanded", expanded ? "true" : "false");
-  msg.onclick = (e) => {
-    if (e.defaultPrevented || e.target.closest("button,a,input,select,textarea")) return;
-    toggleCommandOutput(key);
-  };
-  msg.onkeydown = (e) => {
-    if (e.key === "Enter" || e.key === " ") {
-      e.preventDefault();
-      toggleCommandOutput(key);
-    }
-  };
-}
-function toggleCommandOutput(itemId) {
-  const key = idKey(itemId);
-  if (!key) return;
-  const phase = commandOutputPhaseForId(key);
-  const output = commandOutputForId(key);
-  const expanded = isCommandOutputExpanded(key, phase, output);
-  state.manuallyToggledCommandOutputs.add(key);
-  if (expanded) state.expandedCommandOutputs.delete(key);
-  else state.expandedCommandOutputs.add(key);
-  rerenderCommandRow(key);
-}
-function rerenderCommandRow(id) {
-  const body = commandBodyFor(id);
-  if (!body) return;
-  const cmd = state.runningCommands.get(id);
-  if (cmd) { renderCommandBody(body, cmd); return; }
-  const ended = state.endedCommandsByItemId.get(id);
-  if (ended) { renderEndedCommandBody(body, ended.command, ended.status, ended.opts); return; }
-  const payload = state.commandPayloadsByItemId.get(id);
-  if (payload) renderItemBody(body, payload);
-}
-function rerenderToolRow(id) {
-  const body = toolBodyFor(id);
-  const payload = state.toolPayloadsByItemId.get(id);
-  if (body && payload) renderItemBody(body, payload);
 }
 function clearRowToggle(msg) {
   msg.classList.remove("toggleable", "collapsed", "expanded");
@@ -3621,25 +3614,36 @@ function renderCommandOutputBlock(body, opts) {
   const phase = opts.phase || "completed";
   const output = String(opts.output || "");
   const stats = commandOutputStats(output);
-  const expanded = isCommandOutputExpanded(itemId, phase, output, stats);
+  // The command's output snippet is shown whenever the command row itself is visible — there is no
+  // second collapse level. The full log lives in the overlay via the "Open" button.
   const msg = body.parentElement;
-  msg.classList.toggle("collapsed", !expanded);
-  msg.classList.toggle("expanded", expanded);
-  wireCommandRowToggle(msg, itemId, expanded);
+  clearRowToggle(msg);
 
   const summary = document.createElement("div");
   summary.className = "meta cmd-output-summary";
   const label = commandOutputStatsLabel(stats, phase);
-  summary.textContent = !stats.chars ? label :
-    expanded ? `Output · ${label}` : `Output collapsed · ${label}`;
+  const text = document.createElement("span");
+  text.className = "cmd-output-summary-text";
+  text.textContent = stats.chars ? `Output · ${label}` : label;
+  summary.append(text);
+  if (stats.chars || phase === "running") {
+    summary.append(makeOutputOverlayButton(itemId, "command"));
+  }
   body.append(summary);
 
-  if (!expanded || !stats.chars) return;
+  if (!stats.chars) return;
+  const preview = inlineOutputPreview(output, "tail");
+  if (preview.truncated) {
+    const note = document.createElement("div");
+    note.className = "meta cmd-output-truncated";
+    note.textContent = "Showing the latest output — Open ⤢ for the full log";
+    body.append(note);
+  }
   const out = document.createElement("pre");
   out.className = "out";
   body.append(out);
-  if (opts.linkify) renderLinkedText(out, output);
-  else out.textContent = output;
+  if (opts.linkify) renderLinkedText(out, preview.text);
+  else out.textContent = preview.text;
 }
 function renderCommandBody(body, cmd) {
   const msg = body.parentElement;
@@ -3675,6 +3679,7 @@ function renderCommandBody(body, cmd) {
   }
   renderCommandOutputBlock(body, { itemId:cmd.id, output:cmd.output || "", phase:"running" });
   syncTaskGroupItem(cmd.id);
+  refreshOutputOverlay(cmd.id);
 }
 function commandStatusLabel(cmd) {
   const elapsed = formatDuration(Date.now() - (cmd.startedAtMs || Date.now()));
@@ -3770,10 +3775,13 @@ function appendRunningCommandOutput(turnId, itemId, chunk) {
   const key = scopedItemKey(turnId, itemId);
   const cmd = state.runningCommands.get(key);
   if (!cmd) return false;
+  // Retain the full streamed output (not just a tail): the inline row renders only a bounded
+  // preview, but the output overlay shows the complete log as it streams. The server still keeps
+  // the authoritative full output and sends it on completion.
   cmd.output = (cmd.output || "") + (chunk || "");
-  if (cmd.output.length > 8000) cmd.output = cmd.output.slice(-8000);
   const body = commandBodyFor(key);
   if (body) renderCommandBody(body, cmd);
+  else refreshOutputOverlay(key);
   renderRunningCommands();
   return true;
 }
@@ -3903,6 +3911,7 @@ function renderEndedCommandBody(body, cmd, status, opts) {
   if (meta.childNodes.length) body.append(meta);
   renderCommandOutputBlock(body, { itemId:cmd.id, output:cmd.output || "", phase:"completed" });
   syncTaskGroupItem(cmd.id);
+  refreshOutputOverlay(cmd.id);
 }
 function renderRunningCommands() {
   const cmds = Array.from(state.runningCommands.values());
@@ -4354,12 +4363,8 @@ function resetRenderState() {
   state.commandStopRequestedByItemId = new Set();
   state.commandPayloadsByItemId = new Map();
   state.endedCommandsByItemId = new Map();
-  state.expandedCommandOutputs = new Set();
-  state.manuallyToggledCommandOutputs = new Set();
   state.toolPayloadsByItemId = new Map();
   state.toolBodyElsByItemId = new Map();
-  state.expandedToolOutputs = new Set();
-  state.manuallyToggledToolOutputs = new Set();
   state.activeTaskGroup = null;
   state.taskGroupSeq = 0;
   state.taskItemSeq = 0;
@@ -4515,7 +4520,10 @@ function renderItemBody(body, p) {
     body.innerHTML = renderActivity(p);
   }
   const taskItemId = msg.dataset.commandItemId || msg.dataset.toolItemId || "";
-  if (taskItemId) syncTaskGroupItem(taskItemId);
+  if (taskItemId) {
+    syncTaskGroupItem(taskItemId);
+    refreshOutputOverlay(taskItemId);
+  }
 }
 function renderItemBodyForItem(body, item, turnId) {
   const p = item && item.payload ? item.payload : item;
@@ -4905,48 +4913,6 @@ function toolIoText(value) {
 function toolIoStats(blocks) {
   return commandOutputStats(blocks.map(block => `${block.label}\n${block.text}`).join("\n\n"));
 }
-function isToolIoExpanded(itemId, phase, blocks, stats) {
-  const key = idKey(itemId);
-  if (key && state.manuallyToggledToolOutputs.has(key)) {
-    return state.expandedToolOutputs.has(key);
-  }
-  if (phase === "completed") return false;
-  return !commandOutputShouldAutoCollapse(stats || toolIoStats(blocks));
-}
-function wireToolRowToggle(msg, itemId, expanded) {
-  const key = idKey(itemId);
-  if (!key) return;
-  msg.classList.add("toggleable");
-  msg.title = expanded ? "Collapse tool input/output" : "Show tool input/output";
-  msg.tabIndex = 0;
-  msg.setAttribute("role", "button");
-  msg.setAttribute("aria-expanded", expanded ? "true" : "false");
-  msg.onclick = (e) => {
-    if (e.defaultPrevented || e.target.closest("button,a,input,select,textarea")) return;
-    toggleToolOutput(key);
-  };
-  msg.onkeydown = (e) => {
-    if (e.key === "Enter" || e.key === " ") {
-      e.preventDefault();
-      toggleToolOutput(key);
-    }
-  };
-}
-function toggleToolOutput(itemId) {
-  const key = idKey(itemId);
-  if (!key) return;
-  const payload = state.toolPayloadsByItemId.get(key);
-  if (!payload) return;
-  const blocks = toolIoBlocks(payload);
-  if (!blocks.length) return;
-  const stateName = toolVisualStateFromStatus(payload.status, payload.error);
-  const phase = stateName === "running" ? "running" : "completed";
-  const expanded = isToolIoExpanded(key, phase, blocks);
-  state.manuallyToggledToolOutputs.add(key);
-  if (expanded) state.expandedToolOutputs.delete(key);
-  else state.expandedToolOutputs.add(key);
-  rerenderToolRow(key);
-}
 function renderToolIoBlocks(body, opts) {
   const blocks = opts.blocks || [];
   if (!blocks.length) {
@@ -4956,30 +4922,44 @@ function renderToolIoBlocks(body, opts) {
   const itemId = idKey(opts.itemId);
   const phase = opts.phase || "completed";
   const stats = toolIoStats(blocks);
-  const expanded = isToolIoExpanded(itemId, phase, blocks, stats);
+  // Like command output, the tool input/output preview is shown whenever the tool row is visible —
+  // there is no second collapse level. The full input/output lives in the overlay via "Open".
   const msg = body.parentElement;
-  msg.classList.toggle("collapsed", !expanded);
-  msg.classList.toggle("expanded", expanded);
-  wireToolRowToggle(msg, itemId, expanded);
+  clearRowToggle(msg);
 
   const summary = document.createElement("div");
   summary.className = "meta cmd-output-summary";
   const label = commandOutputStatsLabel(stats, phase);
-  summary.textContent = expanded ? `Tool data · ${label}` : `Tool data collapsed · ${label}`;
+  const text = document.createElement("span");
+  text.className = "cmd-output-summary-text";
+  text.textContent = stats.chars ? `Tool data · ${label}` : label;
+  summary.append(text);
+  if (stats.chars || phase === "running") {
+    summary.append(makeOutputOverlayButton(itemId, "tool"));
+  }
   body.append(summary);
 
-  if (!expanded) return;
+  let anyTruncated = false;
   for (const block of blocks) {
     const section = document.createElement("div");
     section.className = "tool-io";
     const heading = document.createElement("div");
     heading.className = "meta";
     heading.textContent = block.label;
+    // Input keeps its head (the call arguments); output keeps its tail (latest result/progress).
+    const preview = inlineOutputPreview(block.text, block.label === "Input" ? "head" : "tail");
+    if (preview.truncated) anyTruncated = true;
     const pre = document.createElement("pre");
     pre.className = "out";
-    pre.textContent = block.text;
+    pre.textContent = preview.text;
     section.append(heading, pre);
     body.append(section);
+  }
+  if (anyTruncated) {
+    const note = document.createElement("div");
+    note.className = "meta cmd-output-truncated";
+    note.textContent = "Preview trimmed — Open ⤢ for the full input/output";
+    body.append(note);
   }
 }
 function toolVisualStateFromStatus(status, error) {
@@ -5443,6 +5423,202 @@ function closeCodeOverlay() {
   delete $("codeOverlay").dataset.requestId;
   state.codePath = null;
   state.codeLine = null;
+  state.outputOverlay = null;
+  cancelOutputOverlayRefresh();
+}
+
+/* ---------- command / tool output overlay ----------
+   Reuses the #codeOverlay modal (same head/close/escape/backdrop plumbing as the source and diff
+   views) to show a command's or tool's full output in a large scrollable card instead of an inline
+   collapsible block. While the underlying command is still running, the card live-updates: every
+   render path that refreshes the inline row also calls refreshOutputOverlay, so the modal tracks the
+   command's state and streaming output in place. */
+// Stable core of the server's live_buffer truncation marker (see live_buffer.rs). When a client
+// reconnects mid-command, the server can only replay a compacted head+tail snapshot with this
+// marker spliced into the output; the full log is restored on completion. We detect the marker to
+// show a clear "truncated" banner in the overlay rather than relying on the reader spotting it.
+const LIVE_OUTPUT_TRUNCATED_MARKER = "command output truncated in the live reconnect snapshot";
+function outputHasTruncationMarker(blocks) {
+  return blocks.some((b) => String(b.text || "").includes(LIVE_OUTPUT_TRUNCATED_MARKER));
+}
+function makeOutputOverlayButton(itemId, kind) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "output-overlay-btn";
+  btn.textContent = "Open ⤢";
+  btn.title = kind === "tool" ? "Open tool input/output in a full card" : "Open command output in a full card";
+  btn.onclick = (e) => {
+    e.stopPropagation();
+    openOutputOverlay(itemId, kind);
+  };
+  return btn;
+}
+function commandLabelForId(id) {
+  const cmd = state.runningCommands.get(id);
+  if (cmd) return cmd.command || "";
+  const ended = state.endedCommandsByItemId.get(id);
+  if (ended && ended.command) return ended.command.command || "";
+  const payload = state.commandPayloadsByItemId.get(id);
+  return payload ? payload.command || "" : "";
+}
+function outputOverlayModel(itemId, kind) {
+  const key = idKey(itemId);
+  if (!key) return null;
+  if (kind === "tool") {
+    const payload = state.toolPayloadsByItemId.get(key);
+    if (!payload) return null;
+    const blocks = toolIoBlocks(payload);
+    const stateName = toolVisualStateFromStatus(payload.status, payload.error);
+    const running = stateName === "running";
+    return {
+      kind,
+      title: taskTitleText({ kind: "tool", server: payload.server || "", command: payload.name || "tool" }),
+      phase: running ? "running" : "completed",
+      running,
+      stateLabel: running ? "Running" : (stateName === "succeeded" ? "Completed" : stateName === "failed" ? "Failed" : "Ended"),
+      blocks,
+      stats: toolIoStats(blocks),
+      linkify: false,
+      truncated: outputHasTruncationMarker(blocks),
+      error: payload.error || ""
+    };
+  }
+  const phase = commandOutputPhaseForId(key);
+  const running = phase === "running";
+  const output = commandOutputForId(key);
+  const cmd = state.runningCommands.get(key);
+  const ended = state.endedCommandsByItemId.get(key);
+  const payload = state.commandPayloadsByItemId.get(key);
+  let stateLabel = running ? "Running" : "Completed";
+  if (!running) {
+    const status = (ended && ended.status) || (payload && payload.status) || (cmd && cmd.status) || "";
+    const stateName = commandVisualStateFromStatus(status);
+    stateLabel = stateName === "succeeded" ? "Completed" : stateName === "failed" ? "Failed" :
+      stateName === "terminated" ? "Stopped" : "Completed";
+  }
+  const blocks = output ? [{ label: "Output", text: output }] : [];
+  return {
+    kind: "command",
+    title: "$ " + (commandLabelForId(key) || "(command)"),
+    phase,
+    running,
+    stateLabel,
+    blocks,
+    stats: commandOutputStats(output),
+    linkify: true,
+    truncated: outputHasTruncationMarker(blocks),
+    error: ""
+  };
+}
+function openOutputOverlay(itemId, kind) {
+  const key = idKey(itemId);
+  if (!key) return;
+  // Take over the shared overlay from any source/diff view: null codePath + no requestId means the
+  // async highlight/diff callbacks bail instead of overwriting our content.
+  state.codePath = null;
+  state.codeLine = null;
+  delete $("codeOverlay").dataset.requestId;
+  state.outputOverlay = { itemId: key, kind };
+  cancelOutputOverlayRefresh();
+  $("codeOverlay").classList.add("open");
+  $("codeDownload").disabled = false;
+  // Clear any leftover source/diff content so the first render's scroll-pin check starts from an
+  // empty view (and a running command opens scrolled to its streaming tail).
+  $("codeView").replaceChildren();
+  renderOutputOverlay();
+}
+function renderOutputOverlay() {
+  const ov = state.outputOverlay;
+  if (!ov) return;
+  const model = outputOverlayModel(ov.itemId, ov.kind);
+  if (!model) {
+    $("codePath").textContent = ov.kind === "tool" ? "Tool" : "Command";
+    $("codeMeta").textContent = "No data available.";
+    $("codeView").innerHTML = `<div class="code-empty">No output to show.</div>`;
+    $("codeDownload").disabled = true;
+    return;
+  }
+  $("codePath").textContent = model.title;
+  const statLabel = commandOutputStatsLabel(model.stats, model.phase);
+  const spinner = model.running ? "⟳ " : "";
+  const truncSuffix = model.truncated ? " · truncated" : "";
+  $("codeMeta").textContent = model.stats.chars
+    ? `${spinner}${model.stateLabel} · ${statLabel}${truncSuffix}`
+    : `${spinner}${model.stateLabel} · ${model.running ? "no output yet" : "no output"}`;
+  $("codeDownload").disabled = !model.stats.chars;
+
+  const view = $("codeView");
+  // Preserve the reader's scroll unless they're pinned to the bottom, in which case follow the
+  // streaming tail like a terminal.
+  const pinned = view.scrollHeight - view.scrollTop - view.clientHeight < 32;
+  const prevScroll = view.scrollTop;
+
+  const wrap = document.createElement("div");
+  wrap.className = "output-overlay";
+  if (model.truncated) {
+    const banner = document.createElement("div");
+    banner.className = "output-overlay-banner";
+    banner.textContent = model.running
+      ? "⚠ Truncated reconnect snapshot — the middle of the output was dropped when this session reconnected. The full log will appear when the command finishes."
+      : "⚠ Truncated — the middle of this output was dropped in a reconnect snapshot and could not be recovered.";
+    wrap.append(banner);
+  }
+  if (!model.blocks.length) {
+    const empty = document.createElement("div");
+    empty.className = "code-empty";
+    empty.textContent = model.running ? "Waiting for output…" : "No output.";
+    wrap.append(empty);
+  } else {
+    for (const block of model.blocks) {
+      const section = document.createElement("div");
+      section.className = "output-overlay-block";
+      if (model.blocks.length > 1 || block.label !== "Output") {
+        const heading = document.createElement("div");
+        heading.className = "meta output-overlay-heading";
+        heading.textContent = block.label;
+        section.append(heading);
+      }
+      const pre = document.createElement("pre");
+      pre.className = "out";
+      // Linkify only for completed commands: while streaming, re-linkifying on every delta would
+      // hammer the link-resolution endpoint, so we show plain text until the command settles.
+      if (model.linkify && !model.running) renderLinkedText(pre, block.text);
+      else pre.textContent = block.text;
+      section.append(pre);
+      wrap.append(section);
+    }
+  }
+  if (model.error) {
+    const err = document.createElement("div");
+    err.className = "meta output-overlay-error";
+    err.textContent = "error: " + model.error;
+    wrap.append(err);
+  }
+  view.replaceChildren(wrap);
+  // Follow the tail when pinned; otherwise hold the reader's place so a delta doesn't yank them to
+  // the top. New output is appended at the end, so the earlier lines keep their offset.
+  view.scrollTop = pinned ? view.scrollHeight : prevScroll;
+}
+let outputOverlayRaf = 0;
+function cancelOutputOverlayRefresh() {
+  if (!outputOverlayRaf) return;
+  (window.cancelAnimationFrame || clearTimeout)(outputOverlayRaf);
+  outputOverlayRaf = 0;
+}
+function refreshOutputOverlay(itemId) {
+  const ov = state.outputOverlay;
+  if (!ov) return;
+  if (idKey(itemId) !== ov.itemId) return;
+  if (!$("codeOverlay").classList.contains("open")) return;
+  // Coalesce bursts of streaming deltas into at most one repaint per frame: rebuilding the whole
+  // <pre> from the full retained output on every chunk would be O(n²) over a chatty command.
+  if (outputOverlayRaf) return;
+  const schedule = window.requestAnimationFrame || ((cb) => setTimeout(cb, 16));
+  outputOverlayRaf = schedule(() => {
+    outputOverlayRaf = 0;
+    if (!state.outputOverlay || !$("codeOverlay").classList.contains("open")) return;
+    renderOutputOverlay();
+  });
 }
 function renderCodeHtml(res, targetLine) {
   const totalLines = Number(res.total_lines) || 0;
@@ -5492,8 +5668,27 @@ function formatBytes(value) {
 }
 $("codeClose").onclick = closeCodeOverlay;
 $("codeDownload").onclick = () => {
+  if (state.outputOverlay) { downloadOutputOverlay(); return; }
   if (state.projectId && state.codePath) window.location.href = projectFileUrl("raw", state.codePath);
 };
+function downloadOutputOverlay() {
+  const ov = state.outputOverlay;
+  if (!ov) return;
+  const model = outputOverlayModel(ov.itemId, ov.kind);
+  if (!model || !model.blocks.length) return;
+  const text = model.blocks.length === 1 && model.blocks[0].label === "Output"
+    ? model.blocks[0].text
+    : model.blocks.map((b) => `# ${b.label}\n${b.text}`).join("\n\n");
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = ov.kind === "tool" ? "tool-output.txt" : "command-output.txt";
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
 $("codeOverlay").addEventListener("click", (e) => { if (e.target === $("codeOverlay")) closeCodeOverlay(); });
 
 /* ---------- composer + controls ---------- */
