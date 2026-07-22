@@ -3226,8 +3226,8 @@ function createTaskGroup(target) {
   head.className = "task-group-head";
   head.tabIndex = 0;
   head.setAttribute("role", "button");
-  head.title = "Expand or collapse all task details";
-  head.setAttribute("aria-label", "Expand or collapse all task details");
+  head.title = "Show or hide the task rows";
+  head.setAttribute("aria-label", "Show or hide the task rows");
   const caret = document.createElement("span");
   caret.className = "task-group-caret";
   const title = document.createElement("div");
@@ -3349,16 +3349,20 @@ function toggleTaskGroup(groupId) {
   const group = state.taskGroupsById.get(groupId);
   if (!group) return;
   state.manuallyToggledTaskGroups.add(groupId);
-  state.expandedTaskGroups.add(groupId);
-  const detailIds = expandedTaskDetailIds(groupId);
-  const itemIds = group.itemOrder.slice();
-  const allExpanded = itemIds.length > 0 && itemIds.every(id => detailIds.has(id));
-  detailIds.clear();
-  if (!allExpanded) {
-    for (const id of itemIds) detailIds.add(id);
-  } else if (itemIds.includes(state.selectedCommandId)) {
-    state.selectedCommandId = null;
-    clearTaskSelection();
+  // The group summary toggles the visibility of the task rows themselves. Each row is expanded to
+  // its detail (the inline command/tool output snippet) separately, by clicking the row. Collapsing
+  // the group only hides the rows; their individual expanded/collapsed state is preserved.
+  if (state.expandedTaskGroups.has(groupId)) {
+    state.expandedTaskGroups.delete(groupId);
+    if (group.itemOrder.includes(state.selectedCommandId)) {
+      state.selectedCommandId = null;
+      clearTaskSelection();
+      // Drop the stale highlight from the running-task panel too (clearTaskSelection only touches
+      // transcript rows), matching selectTaskGroupItem's selection-change handling.
+      renderRunningCommands();
+    }
+  } else {
+    state.expandedTaskGroups.add(groupId);
   }
   syncTaskGroupState(group);
 }
