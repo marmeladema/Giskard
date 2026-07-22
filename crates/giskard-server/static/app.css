@@ -492,8 +492,16 @@
   .cmd-meta { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
   .cmd-actions { display:flex; gap:6px; align-items:center; }
   .cmd-actions button { font-size:12px; padding:3px 7px; }
-  .cmd-output-summary { margin-top:6px; }
-  .msg.cmd.toggleable, .msg.tool.toggleable { cursor:pointer; }
+  .cmd-output-summary { margin-top:6px; display:flex; align-items:center; gap:8px; }
+  .cmd-output-summary-text { min-width:0; }
+  .output-overlay-btn {
+    margin-left:auto; flex:none; font-size:11px; padding:1px 8px; line-height:1.6;
+    color:var(--muted); background:var(--panel2); border:1px solid var(--border); border-radius:6px;
+    cursor:pointer;
+  }
+  .output-overlay-btn:hover { color:var(--fg); border-color:var(--accent); }
+  .cmd-output-truncated { margin-top:6px; font-style:italic; opacity:.85; }
+  .msg.tool.toggleable { cursor:pointer; }
   .tool-io { margin-top:6px; }
 
   /* modal dialog + directory picker */
@@ -542,6 +550,17 @@
   .diff-overlay { padding:16px; }
   .diff-overlay .code-block { margin:0; }
   .code-empty { padding:24px; color:var(--muted); }
+  .output-overlay { padding:16px; color:var(--fg); }
+  .output-overlay-banner {
+    margin-bottom:12px; padding:8px 12px; border-radius:8px; font-size:12.5px; line-height:1.4;
+    color:#ffd7a8; background:rgba(210,153,34,.14); border:1px solid rgba(210,153,34,.4);
+  }
+  .output-overlay-block + .output-overlay-block { margin-top:16px; }
+  .output-overlay-heading { margin:0 0 4px; text-transform:uppercase; letter-spacing:.04em; }
+  .output-overlay pre.out {
+    font-size:12.5px; line-height:1.45; white-space:pre-wrap; overflow-wrap:anywhere;
+  }
+  .output-overlay-error { margin-top:12px; color:#ffb4ae; }
 
   /* =================== Appearance themes ===================
      Three selectable looks (persisted client-side). Each sets a palette; IDE and Terminal also

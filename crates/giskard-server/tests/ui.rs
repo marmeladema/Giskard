@@ -960,8 +960,8 @@ async fn index_page_is_served_and_public() {
         "UI renders tool-call items"
     );
     assert!(
-        body.contains("toolPayloadsByItemId") && body.contains("expandedToolOutputs"),
-        "UI tracks tool-call payloads and expansion state by item"
+        body.contains("toolPayloadsByItemId"),
+        "UI tracks tool-call payloads by item"
     );
     assert!(
         body.contains(".msg.tool.state-succeeded") && body.contains(".msg.tool.state-failed"),
@@ -990,25 +990,20 @@ async fn index_page_is_served_and_public() {
         "running tool-call transcript durations refresh on the shared running-task timer"
     );
     assert!(
-        body.contains("wireToolRowToggle"),
-        "the transcript tool row owns the input/output toggle handler"
+        !body.contains("wireToolRowToggle") && !body.contains("toggleToolOutput"),
+        "the tool input/output row no longer carries a collapse toggle"
     );
     assert!(
-        body.contains("function isToolIoExpanded")
-            && body.contains("if (phase === \"completed\") return false"),
-        "completed tool-call input/output is collapsed by default"
+        !body.contains("expandedToolOutputs") && !body.contains("manuallyToggledToolOutputs"),
+        "tool input/output expansion state is no longer tracked"
     );
     assert!(
-        body.contains("toggleToolOutput"),
-        "tool rows can toggle collapsed input/output"
-    );
-    assert!(
-        body.contains("Tool data collapsed"),
-        "collapsed tool-call rows summarize hidden input/output"
+        body.contains("Tool data · ${label}"),
+        "visible tool rows summarize their input/output with line/byte stats"
     );
     assert!(
         !body.contains("tool-io-toggle"),
-        "tool-call collapse must not use a separate toggle button"
+        "tool-call input/output must not use a separate toggle button"
     );
     assert!(
         body.contains("startToolCall"),
@@ -1086,40 +1081,28 @@ async fn index_page_is_served_and_public() {
         "UI renders command output through the collapsible output block"
     );
     assert!(
-        body.contains("if (phase === \"completed\") return false"),
-        "completed command output is collapsed by default"
+        body.contains("second collapse level"),
+        "command output has no second collapse level; the snippet shows whenever the row is visible"
     );
     assert!(
-        body.contains("commandOutputShouldAutoCollapse"),
-        "running command output can auto-collapse when it grows large"
+        body.contains("inlineOutputPreview"),
+        "command output is shown as a bounded latest-lines preview inline"
     );
     assert!(
-        body.contains("COMMAND_AUTO_COLLAPSE_LINES"),
-        "UI has a line threshold for running command auto-collapse"
+        body.contains("INLINE_PREVIEW_LINES"),
+        "UI has a line threshold for the inline output preview"
     );
     assert!(
-        body.contains("expandedCommandOutputs"),
-        "UI tracks command output expansion state by item"
+        !body.contains("toggleCommandOutput") && !body.contains("wireCommandRowToggle"),
+        "the command output row no longer carries a collapse toggle"
     );
     assert!(
-        body.contains("manuallyToggledCommandOutputs"),
-        "UI preserves manual command output toggles while the thread is open"
-    );
-    assert!(
-        body.contains("toggleCommandOutput"),
-        "command rows can toggle collapsed output"
-    );
-    assert!(
-        body.contains("wireCommandRowToggle"),
-        "the transcript command row owns the output toggle handler"
-    );
-    assert!(
-        body.contains("e.target.closest(\"button,a,input,select,textarea\")"),
-        "nested controls inside command rows do not trigger collapse"
+        !body.contains("expandedCommandOutputs") && !body.contains("manuallyToggledCommandOutputs"),
+        "command output expansion state is no longer tracked"
     );
     assert!(
         !body.contains("cmd-toggle"),
-        "command output collapse must not use a separate arrow-style button"
+        "command output must not use a separate arrow-style toggle button"
     );
     assert!(
         body.contains("grid-template-columns:78px minmax(0,1fr)"),
@@ -1138,12 +1121,32 @@ async fn index_page_is_served_and_public() {
         "long command output can wrap instead of widening the row"
     );
     assert!(
-        body.contains("Output collapsed"),
-        "collapsed command rows summarize hidden output"
+        body.contains("`Output · ${label}`"),
+        "visible command rows summarize their output with line/byte stats"
     );
     assert!(
-        body.contains("if (opts.linkify) renderLinkedText(out, output)"),
-        "UI linkifies command output only when the output block is expanded"
+        body.contains("if (opts.linkify) renderLinkedText(out, preview.text)"),
+        "UI linkifies the command output preview only when the output block is expanded"
+    );
+    assert!(
+        body.contains("makeOutputOverlayButton") && body.contains("openOutputOverlay"),
+        "command/tool rows expose an affordance to open full output in the overlay card"
+    );
+    assert!(
+        body.contains("LIVE_OUTPUT_TRUNCATED_MARKER") && body.contains("output-overlay-banner"),
+        "the output overlay flags reconnect-truncated snapshots with a visible banner"
+    );
+    assert!(
+        body.contains("No data available.") && body.contains("No output to show."),
+        "the output overlay handles a missing item with an empty-state message"
+    );
+    assert!(
+        body.contains("Waiting for output…") && body.contains("No output."),
+        "the output overlay distinguishes a running item awaiting output from an empty one"
+    );
+    assert!(
+        body.contains("requestAnimationFrame") && body.contains("cancelOutputOverlayRefresh"),
+        "streaming overlay refreshes are coalesced to one repaint per frame"
     );
     assert!(
         body.contains("renderMarkdown(body, p.text"),
@@ -2006,8 +2009,6 @@ fn browser_incremental_resync_reconciles_in_flight_turn() {
         "state.toolPayloadsByItemId",
         "state.taskGroupsByItemId",
         "pruneKeySet(state.commandStopRequestedByItemId, liveTaskIds);",
-        "pruneKeySet(state.expandedCommandOutputs, liveTaskIds);",
-        "pruneKeySet(state.expandedToolOutputs, liveTaskIds);",
         "state.pendingApprovals.delete(id)",
         "state.pendingServerRequests.delete(id)",
         "state.renderedApprovalStateKeys = approvalKeys;",
