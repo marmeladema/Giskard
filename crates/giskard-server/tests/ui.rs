@@ -1231,12 +1231,31 @@ async fn index_page_is_served_and_public() {
         "UI passes linkified line targets into the source overlay"
     );
     assert!(
-        body.contains("makePathLink(c.path"),
-        "UI routes structured file-change paths into the source overlay"
+        body.contains("displayPathForProject(c.path)")
+            && body.contains("makePathLink(c.path || \"\", displayPathForProject(c.path), null)"),
+        "UI displays project-local file-change paths relatively while preserving source targets"
+    );
+    assert!(
+        body.contains("return value === \"/\" ? value : value.replace")
+            && body.contains("if (root === \"/\") return value.slice(1);"),
+        "project-root path display keeps / as a valid root"
     );
     assert!(
         body.contains("projectFileUrl(\"highlight\""),
         "UI requests server-side syntax highlighted source"
+    );
+    assert!(
+        body.contains("id=\"codeSourceToggle\"")
+            && body.contains("function renderMarkdownCodeOverlay")
+            && body.contains("function showSourceCodeOverlay")
+            && body.contains("isMarkdownSourcePath(path, res.language)")
+            && body.contains("`/api/projects/${projectId}/raw?path=${encodeURIComponent(path)}`")
+            && body.contains("`/api/projects/${projectId}/render`, { text: source }")
+            && body.contains(
+                "showCodeOverlayWarning(\"Markdown preview unavailable; showing source.\")"
+            )
+            && body.contains(".code-overlay-warning"),
+        "Markdown files in the source overlay render as Markdown with a source toggle and visible fallback"
     );
     assert!(
         body.contains("projectFileUrl(\"raw\""),
@@ -2523,6 +2542,88 @@ fn browser_applies_harness_context_window_updates_to_the_gauge() {
     assert!(source.contains("ev.model.provider === state.currentModel.provider"));
     assert!(source.contains("ev.model.model === state.currentModel.model"));
     assert!(source.contains("updateGauge(state.contextUsed, ev.context_window);"));
+}
+
+#[test]
+fn browser_displays_root_project_file_changes_relatively() {
+    let source = app_js();
+    let display = between(
+        source,
+        "function trimTrailingSlash(path) {",
+        "function fileChangeEntries(p) {",
+    );
+    assert!(
+        display.contains(r#"return value === "/" ? value : value.replace(/\/+$/,"");"#),
+        "trailing slash trimming must preserve / as a valid project root"
+    );
+    assert!(
+        display.contains("if (root === \"/\") return value.slice(1);"),
+        "absolute files under a / project root should display without the leading slash"
+    );
+}
+
+#[test]
+fn browser_surfaces_markdown_overlay_fallback_warning() {
+    let source = app_js();
+    let markdown_overlay = between(
+        source,
+        "async function renderMarkdownCodeOverlay(path, highlightRes, projectId, requestId) {",
+        "function showMarkdownCodeOverlay() {",
+    );
+    assert!(
+        markdown_overlay
+            .contains("showCodeOverlayWarning(\"Markdown preview unavailable; showing source.\")")
+            && markdown_overlay.contains("setCodeSourceToggle(false);"),
+        "Markdown preview fallback should be visible while keeping source fallback usable"
+    );
+    assert!(
+        markdown_overlay.contains(
+            "if (!rendered || typeof rendered.html !== \"string\") {\n        throw new Error(\"Markdown renderer returned an invalid response\");\n      }"
+        ) && markdown_overlay
+            .contains("if (typeof html !== \"string\") throw new Error(\"Markdown renderer returned an invalid response\");"),
+        "invalid Markdown render payloads should take the visible fallback path"
+    );
+    let warning = between(
+        source,
+        "function showCodeOverlayWarning(message) {",
+        "function showMarkdownCodeOverlay() {",
+    );
+    assert!(
+        warning.contains("view.prepend(banner);")
+            && warning.contains("banner.className = \"code-overlay-warning\"")
+            && warning.contains("if (existing) existing.remove();"),
+        "overlay warning should be rendered as a visible, deduplicated banner"
+    );
+}
+
+#[test]
+fn browser_scopes_source_overlay_async_results_to_open_request() {
+    let source = app_js();
+    let open = between(
+        source,
+        "async function openCodeOverlay(path, line) {",
+        "async function renderMarkdownCodeOverlay",
+    );
+    assert!(
+        open.contains("const requestId = Math.random().toString(36).slice(2);")
+            && open.contains("$(\"codeOverlay\").dataset.requestId = requestId;")
+            && open.contains("if (!codeOverlayRequestMatches(path, projectId, requestId)) return;")
+            && open.contains("await renderMarkdownCodeOverlay(path, res, projectId, requestId);"),
+        "source overlay opens should stamp and validate a per-open request token"
+    );
+    let markdown_overlay = between(
+        source,
+        "async function renderMarkdownCodeOverlay(path, highlightRes, projectId, requestId) {",
+        "function showCodeOverlayWarning(message) {",
+    );
+    assert!(
+        markdown_overlay
+            .matches("codeOverlayRequestMatches(path, projectId, requestId)")
+            .count()
+            >= 3
+            && markdown_overlay.contains("state.codeOverlaySource = { path, line, requestId,"),
+        "Markdown overlay async raw/render completions should reject stale request tokens"
+    );
 }
 
 fn between<'a>(haystack: &'a str, start: &str, end: &str) -> &'a str {

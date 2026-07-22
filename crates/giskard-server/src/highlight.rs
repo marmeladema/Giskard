@@ -30,7 +30,7 @@ const DEFAULT_MAX_HIGHLIGHT_SIZE: usize = 10 * 1024 * 1024;
 /// Maximum number of cached highlight results before FIFO eviction kicks in.
 const MAX_CACHE_ENTRIES: usize = 128;
 
-static SNIPPET_SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+static SNIPPET_SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(two_face::syntax::extra_newlines);
 static SNIPPET_THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
 /// The cached, fully-highlighted form of a file: one HTML fragment per source line
@@ -105,7 +105,7 @@ impl Highlighter {
     /// Create a new highlighter with a custom maximum file size (spec §11.3).
     pub fn with_max_size(max_size: usize) -> Self {
         Self {
-            syntax_set: SyntaxSet::load_defaults_newlines(),
+            syntax_set: two_face::syntax::extra_newlines(),
             theme_set: ThemeSet::load_defaults(),
             cache: Mutex::new(Vec::new()),
             max_size,
@@ -433,6 +433,10 @@ mod tests {
             detect_language(Path::new("/script.py")),
             Some("Python".into())
         );
+        assert_eq!(
+            detect_language(Path::new("/config.toml")),
+            Some("TOML".into())
+        );
         assert_eq!(detect_language(Path::new("/noext")), None);
     }
 
@@ -442,6 +446,22 @@ mod tests {
         assert_eq!(result.language, "Rust");
         assert!(result.recognized_language);
         assert!(result.html.contains("fn"));
+    }
+
+    #[test]
+    fn highlight_toml_snippet_reports_language() {
+        let result = highlight_snippet("[server]\nbind = \"127.0.0.1:0\"\n", Some("toml"));
+        assert_eq!(result.language, "TOML");
+        assert!(result.recognized_language);
+        assert!(result.html.contains("<span"));
+    }
+
+    #[test]
+    fn highlight_diff_snippet_reports_language() {
+        let result = highlight_snippet("--- old\n+++ new\n-removed\n+added\n", Some("diff"));
+        assert_eq!(result.language, "Diff");
+        assert!(result.recognized_language);
+        assert!(result.html.contains("<span"));
     }
 
     #[test]
@@ -466,6 +486,20 @@ mod tests {
         assert!(result.html.contains("fn"));
         assert!(result.html.starts_with("<pre"));
         assert!(result.html.ends_with("</pre>"));
+        assert_eq!(result.file_size, content.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn highlight_toml_file() {
+        let tmp = tempfile::NamedTempFile::with_suffix(".toml").unwrap();
+        let content = "[server]\nbind = \"127.0.0.1:0\"\nsecure_cookies = false\n";
+        tokio::fs::write(tmp.path(), content).await.unwrap();
+
+        let h = Highlighter::new();
+        let result = h.highlight_file(tmp.path(), None, None).await.unwrap();
+        assert!(!result.is_binary);
+        assert_eq!(result.language, Some("TOML".into()));
+        assert!(result.html.contains("<span"));
         assert_eq!(result.file_size, content.len() as u64);
     }
 
