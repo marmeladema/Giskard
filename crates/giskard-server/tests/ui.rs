@@ -1289,12 +1289,11 @@ async fn index_page_is_served_and_public() {
         "UI renders source line numbers in the code overlay"
     );
     assert!(
-        body.contains(".code-table")
-            && between(&body, ".code-table {", "}").contains("min-width:max-content")
-            && between(&body, ".code-table {", "}").contains("background:#0b0e13"),
-        "the code table grows to the widest line and carries the background, so long lines that \
-         scroll horizontally stay on the dark background (a background on the scroll container \
-         alone can fail to cover horizontally-scrolled content on mobile browsers)"
+        between(&body, ".code-source pre {", "}").contains("width:max-content")
+            && between(&body, ".code-source pre {", "}").contains("min-width:100%"),
+        "the source <pre> (which carries the syntax theme background inline) is sized directly to \
+         the widest line, so the theme background follows a horizontally-scrolled long line \
+         regardless of how the browser resolves grid track sizing"
     );
     assert!(
         body.contains("scrollToCodeLine"),

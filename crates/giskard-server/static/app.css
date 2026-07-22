@@ -541,10 +541,7 @@
   .code-title { font-family:var(--mono); word-break:break-all; font-size:13px; }
   .code-meta { margin-top:4px; color:var(--muted); font-size:12px; }
   .code-view { flex:1; overflow:auto; background:#0b0e13; }
-  /* Grow the table to the widest line (min-width:max-content) and paint the background on it, not
-     just the viewport-sized scrollport, so long lines that scroll horizontally stay on the dark
-     background instead of spilling onto the page/backdrop behind the overlay. */
-  .code-table { display:grid; grid-template-columns:auto minmax(0,1fr); min-height:100%; min-width:max-content; background:#0b0e13; }
+  .code-table { display:grid; grid-template-columns:auto minmax(0,1fr); min-height:100%; }
   .code-line-nos {
     padding:16px 10px 16px 14px; border-right:1px solid var(--border); background:#0d1117;
     color:var(--muted); font-family:var(--mono); font-size:12.5px; line-height:1.45; text-align:right;
@@ -553,7 +550,11 @@
   .code-line-no { height:1.45em; min-width:3ch; }
   .code-line-no.focused { color:#fff; background:rgba(79,140,255,.28); border-radius:4px; }
   .code-source { min-width:0; }
-  .code-source pre { margin:0; padding:16px; min-height:100%; overflow:visible; font-family:var(--mono); font-size:12.5px; line-height:1.45; white-space:pre; }
+  /* The <pre> carries the syntax theme's background inline. Size its box to the widest line
+     (width:max-content) instead of letting the text overflow a viewport-width box, so that grey
+     background follows the line when scrolling horizontally; min-width:100% still fills short files.
+     This sizes the visible element directly rather than relying on grid track sizing to grow it. */
+  .code-source pre { margin:0; padding:16px; min-height:100%; width:max-content; min-width:100%; font-family:var(--mono); font-size:12.5px; line-height:1.45; white-space:pre; }
   .code-markdown { max-width:900px; padding:20px 24px 40px; color:var(--fg); }
   .code-markdown pre { background:#0b0e13; }
   .code-overlay-warning {
