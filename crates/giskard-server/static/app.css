@@ -440,6 +440,7 @@
   .task-group-status { flex:0 0 auto; }
   .task-group-status .cmd-status { font-size:11.5px; }
   .task-group-list { display:flex; flex-direction:column; gap:5px; margin-top:6px; }
+  .task-group-list[hidden] { display:none; }   /* the flex display above would otherwise defeat [hidden] */
   .task-group-item {
     display:grid; grid-template-columns:auto minmax(0,1fr) auto; gap:7px; align-items:center;
     border:1px solid var(--border); border-radius:8px; padding:5px 8px; background:var(--panel2);

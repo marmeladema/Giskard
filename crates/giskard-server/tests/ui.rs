@@ -614,12 +614,26 @@ async fn index_page_is_served_and_public() {
         "clicking an expanded task summary collapses that task detail again"
     );
     assert!(
-        body.contains("head.title = \"Expand or collapse all task details\"")
-            && body.contains("const allExpanded = itemIds.length > 0")
-            && body.contains("if (!allExpanded) {")
-            && body.contains("for (const id of itemIds) detailIds.add(id);")
-            && body.contains("itemIds.includes(state.selectedCommandId)"),
-        "the task group header expands all details and collapses them when all are open"
+        body.contains("head.title = \"Show or hide the task rows\"")
+            && body.contains("head.setAttribute(\"aria-label\", \"Show or hide the task rows\")")
+            && body.contains("if (state.expandedTaskGroups.has(groupId)) {")
+            && body.contains("state.expandedTaskGroups.delete(groupId);")
+            && body.contains("state.expandedTaskGroups.add(groupId);"),
+        "the task group summary toggles the visibility of the task rows, not every row's detail"
+    );
+    let toggle_group = between(
+        &body,
+        "function toggleTaskGroup(",
+        "function taskVisualStateFromElement(",
+    );
+    assert!(
+        !toggle_group.contains("detailIds"),
+        "toggling a task group's row visibility preserves each row's expanded detail state"
+    );
+    assert!(
+        toggle_group.contains("state.selectedCommandId = null;")
+            && toggle_group.contains("renderRunningCommands();"),
+        "collapsing a task group clears the selected row and refreshes the running-task panel"
     );
     assert!(
         body.contains("wireTaskGroupItemRow(row, group.id, key)")
@@ -634,6 +648,10 @@ async fn index_page_is_served_and_public() {
             && body.contains(".task-group-item-status { color:var(--muted); font-size:11px;")
             && body.contains(".task-group-entry > .msg .role { font-size:10px; }"),
         "task group summaries and details use tighter typography than normal transcript rows"
+    );
+    assert!(
+        body.contains(".task-group-list[hidden] { display:none; }"),
+        "collapsing a task group actually hides its rows (the flex display must not defeat [hidden])"
     );
     assert!(
         body.contains("function appendBubble")
