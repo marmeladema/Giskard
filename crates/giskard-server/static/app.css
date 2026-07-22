@@ -341,7 +341,10 @@
   .md li > input[type=checkbox] { margin-right:6px; vertical-align:middle; }
   .md code { font-family:var(--mono); font-size:.9em; background:rgba(110,118,129,.2); padding:1px 5px; border-radius:4px; }
   .md pre { max-width:100%; overflow-x:auto; background:#0b0e13; border:1px solid var(--border); border-radius:8px; padding:10px 12px; margin:8px 0; }
-  .md pre code { background:none; padding:0; font-size:12.5px; white-space:pre; }
+  /* Give the code element the background and grow it to the widest line (min-width:max-content), so a
+     horizontally-scrolled long line stays on the dark background: a background on the scrolling <pre>
+     alone can fail to cover scrolled content on mobile browsers. */
+  .md pre code { display:block; min-width:max-content; background:#0b0e13; padding:0; font-size:12.5px; white-space:pre; }
   .md .code-block { max-width:100%; margin:8px 0; border:1px solid var(--border); border-radius:8px; overflow:hidden; background:#0b0e13; }
   .md .code-block-head { display:flex; align-items:center; gap:8px; min-height:30px; padding:0 8px 0 12px; border-bottom:1px solid var(--border); background:#111720; color:var(--muted); font-size:12px; font-weight:600; }
   .md .code-block-head .code-copy {
@@ -352,7 +355,7 @@
   .md .code-block-head .code-copy.ok { color:#3fb950; border-color:#238636; }
   .md .code-block-head .code-copy.err { color:#f85149; border-color:#da3633; }
   .md .code-block pre { max-width:100%; overflow-x:auto; margin:0; padding:10px 12px; background:#0b0e13; border:0; border-radius:0; }
-  .md .code-block pre code { background:none; padding:0; font-size:12.5px; white-space:pre; }
+  .md .code-block pre code { display:block; min-width:max-content; background:#0b0e13; padding:0; font-size:12.5px; white-space:pre; }
   .md blockquote { margin:8px 0; padding:2px 12px; border-left:3px solid var(--border); color:var(--muted); }
   .md a { color:#79c0ff; text-decoration:underline; text-underline-offset:2px; }
   .md a:hover { color:#a5d6ff; }
@@ -538,7 +541,10 @@
   .code-title { font-family:var(--mono); word-break:break-all; font-size:13px; }
   .code-meta { margin-top:4px; color:var(--muted); font-size:12px; }
   .code-view { flex:1; overflow:auto; background:#0b0e13; }
-  .code-table { display:grid; grid-template-columns:auto minmax(0,1fr); min-height:100%; }
+  /* Grow the table to the widest line (min-width:max-content) and paint the background on it, not
+     just the viewport-sized scrollport, so long lines that scroll horizontally stay on the dark
+     background instead of spilling onto the page/backdrop behind the overlay. */
+  .code-table { display:grid; grid-template-columns:auto minmax(0,1fr); min-height:100%; min-width:max-content; background:#0b0e13; }
   .code-line-nos {
     padding:16px 10px 16px 14px; border-right:1px solid var(--border); background:#0d1117;
     color:var(--muted); font-family:var(--mono); font-size:12.5px; line-height:1.45; text-align:right;

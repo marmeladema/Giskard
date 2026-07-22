@@ -1210,6 +1210,14 @@ async fn index_page_is_served_and_public() {
             && body.contains("code.textContent"),
         "rendered code blocks get a copy-to-clipboard button reading the raw source"
     );
+    for code_rule in [".md pre code {", ".md .code-block pre code {"] {
+        let rule = between(&body, code_rule, "}");
+        assert!(
+            rule.contains("min-width:max-content") && rule.contains("background:#0b0e13"),
+            "markdown code (`{code_rule}`) carries the background and grows to the widest line, so \
+             long lines that scroll horizontally stay on the dark background on mobile"
+        );
+    }
     assert!(
         body.contains("navigator.clipboard.writeText")
             && body.contains("document.execCommand(\"copy\")"),
@@ -1279,6 +1287,14 @@ async fn index_page_is_served_and_public() {
     assert!(
         body.contains("code-line-nos"),
         "UI renders source line numbers in the code overlay"
+    );
+    assert!(
+        body.contains(".code-table")
+            && between(&body, ".code-table {", "}").contains("min-width:max-content")
+            && between(&body, ".code-table {", "}").contains("background:#0b0e13"),
+        "the code table grows to the widest line and carries the background, so long lines that \
+         scroll horizontally stay on the dark background (a background on the scroll container \
+         alone can fail to cover horizontally-scrolled content on mobile browsers)"
     );
     assert!(
         body.contains("scrollToCodeLine"),
