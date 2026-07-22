@@ -38,7 +38,7 @@ let state = {
   toolPayloadsByItemId:new Map(), toolBodyElsByItemId:new Map(),
   activeTaskGroup:null, taskGroupSeq:0, taskItemSeq:0, taskGroupsById:new Map(), taskGroupsByItemId:new Map(),
   expandedTaskGroups:new Set(), manuallyToggledTaskGroups:new Set(), expandedTaskDetails:new Map(),
-  linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, outputOverlay:null, activeTurn:false, interruptPending:false, compactPending:false,
+  linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, codeOverlaySource:null, outputOverlay:null, activeTurn:false, interruptPending:false, compactPending:false,
   awaitingInitialThreadState:false, awaitingThreadResync:false, awaitingIncrementalResync:false, resyncStickBottom:false, contextWindow:0, contextUsed:null, tokenLedger:null, approvalPolicy:"ask", currentModel:null,
   mcpServers:[], mcpCapabilities:{ status:false, reload:false, oauth_login:false }, mcpLoading:false, mcpError:null, expandedMcps:new Set(),
   threadReadOnly:false, readOnlyProvider:null, readOnlyMessage:null,
@@ -46,7 +46,7 @@ let state = {
   currentPlan:null, planExpanded:localStorage.getItem("giskard.planExpanded")==="1",
   threadActivity:new Map(), pendingApprovalFocus:null, notifiedApprovals:new Map(), approvalNotifications:new Map(), browserDiagnostics:[],
   lastNotificationPromptNoticeAt:0, swRegistration:null,
-  collapsedProjects:new Set(loadCollapsedProjects()), pendingRemoveProject:null
+  collapsedProjects:new Set(loadCollapsedProjects()), pendingRemoveProject:null, projectDirs:{}
 };
 // The inline transcript row shows only a compact preview of a command's/tool's output — the most
 // recent lines (its live "progress"), capped to whichever of these limits is hit first. The full
@@ -528,9 +528,11 @@ async function loadProjects() {
   const { projects } = await api("GET","/api/projects");
   const box = $("projects"); box.innerHTML="";
   state.projectNames = {};   // id → name, for the mobile "project / thread" breadcrumb
+  state.projectDirs = {};     // id → workspace root, for display-only relative file-change paths
   const pending = [];
   for (const p of projects) {
     state.projectNames[p.id] = p.name;
+    state.projectDirs[p.id] = p.dir || "";
     const d = document.createElement("div"); d.className="proj";
     d.dataset.pid = p.id;
     const collapsed = state.collapsedProjects.has(p.id);
@@ -4755,6 +4757,24 @@ function makePathLink(path, label, line) {
   };
   return btn;
 }
+function currentProjectDir() {
+  return (state.projectDirs && state.projectId && state.projectDirs[state.projectId]) || "";
+}
+function trimTrailingSlash(path) {
+  const value = String(path || "");
+  return value === "/" ? value : value.replace(/\/+$/,"");
+}
+function displayPathForProject(path) {
+  const value = String(path || "");
+  if (!value) return "";
+  if (!value.startsWith("/")) return value;
+  const root = trimTrailingSlash(currentProjectDir());
+  if (!root || !root.startsWith("/")) return value;
+  if (value === root) return ".";
+  if (root === "/") return value.slice(1);
+  const prefix = root + "/";
+  return value.startsWith(prefix) ? value.slice(prefix.length) : value;
+}
 function fileChangeEntries(p) {
   if (p && p.changes && p.changes.length) return p.changes;
   return [{ path:p && p.path, change:p && p.change, diff:p && p.diff }];
@@ -4837,7 +4857,7 @@ function renderFileChange(body, p) {
     const kind = document.createElement("span");
     kind.className = "mono";
     kind.textContent = c.change || "modified";
-    row.append(kind, document.createTextNode(" "), makePathLink(c.path || "", c.path || "", null));
+    row.append(kind, document.createTextNode(" "), makePathLink(c.path || "", displayPathForProject(c.path), null));
     if (c.diff) {
       row.append(document.createTextNode(" "));
       const diffBtn = document.createElement("button");
@@ -5348,21 +5368,39 @@ function markdownCodeFence(language, text) {
   const fence = "`".repeat(Math.max(3, longest + 1));
   return `${fence}${language || ""}\n${text}${text.endsWith("\n") ? "" : "\n"}${fence}`;
 }
+function isMarkdownSourcePath(path, language) {
+  const lower = String(path || "").toLowerCase();
+  return lower.endsWith(".md") || lower.endsWith(".markdown") || String(language || "").toLowerCase() === "markdown";
+}
+function setCodeSourceToggle(visible, label) {
+  const btn = $("codeSourceToggle");
+  btn.hidden = !visible;
+  btn.disabled = !visible;
+  if (visible) btn.textContent = label || "Source";
+}
+function codeOverlayRequestMatches(path, projectId, requestId) {
+  return state.codePath === path &&
+    state.projectId === projectId &&
+    $("codeOverlay").dataset.requestId === requestId;
+}
 async function openCodeOverlay(path, line) {
   if (!state.projectId || !path) return;
+  const requestId = Math.random().toString(36).slice(2);
   state.codePath = path;
   state.codeLine = normalizeLine(line, null);
+  state.codeOverlaySource = null;
   $("codeOverlay").classList.add("open");
-  delete $("codeOverlay").dataset.requestId;
+  $("codeOverlay").dataset.requestId = requestId;
   $("codePath").textContent = state.codeLine ? `${path}#${state.codeLine}` : path;
   $("codeMeta").textContent = "Loading…";
   $("codeView").innerHTML = `<div class="code-empty">Loading source…</div>`;
   $("codeDownload").disabled = false;
+  setCodeSourceToggle(false);
 
   const projectId = state.projectId;
   try {
     const res = await api("GET", projectFileUrl("highlight", path));
-    if (state.codePath !== path || state.projectId !== projectId) return;
+    if (!codeOverlayRequestMatches(path, projectId, requestId)) return;
     const bits = [];
     if (res.language) bits.push(res.language);
     if (res.file_size !== undefined) bits.push(formatBytes(res.file_size));
@@ -5374,20 +5412,79 @@ async function openCodeOverlay(path, line) {
       $("codeView").innerHTML = `<div class="code-empty">Preview unavailable for this file size. Download to inspect it.</div>`;
     } else {
       renderCodeHtml(res, state.codeLine);
+      if (isMarkdownSourcePath(path, res.language)) {
+        await renderMarkdownCodeOverlay(path, res, projectId, requestId);
+      }
     }
   } catch (e) {
-    if (state.codePath !== path || state.projectId !== projectId) return;
+    if (!codeOverlayRequestMatches(path, projectId, requestId)) return;
     $("codeMeta").textContent = "Could not load source";
     $("codeView").innerHTML = `<div class="code-empty">${escapeHtml(e.message || "Could not load file.")}</div>`;
     $("codeDownload").disabled = true;
+    setCodeSourceToggle(false);
   }
+}
+async function renderMarkdownCodeOverlay(path, highlightRes, projectId, requestId) {
+  const line = state.codeLine;
+  try {
+    const source = await api("GET", `/api/projects/${projectId}/raw?path=${encodeURIComponent(path)}`);
+    if (!codeOverlayRequestMatches(path, projectId, requestId)) return;
+    const cacheKey = projectId + "\n" + String(source || "");
+    let html;
+    if (state.markdownCache.has(cacheKey)) {
+      html = state.markdownCache.get(cacheKey);
+    } else {
+      const rendered = await api("POST", `/api/projects/${projectId}/render`, { text: source });
+      if (!rendered || typeof rendered.html !== "string") {
+        throw new Error("Markdown renderer returned an invalid response");
+      }
+      html = rendered.html;
+      state.markdownCache.set(cacheKey, html);
+    }
+    if (typeof html !== "string") throw new Error("Markdown renderer returned an invalid response");
+    if (!codeOverlayRequestMatches(path, projectId, requestId)) return;
+    state.codeOverlaySource = { path, line, requestId, highlightRes, markdownHtml:html, rendered:true };
+    showMarkdownCodeOverlay();
+  } catch (e) {
+    console.warn("Giskard markdown file render failed; keeping highlighted source.", e);
+    if (codeOverlayRequestMatches(path, projectId, requestId)) {
+      showCodeOverlayWarning("Markdown preview unavailable; showing source.");
+      setCodeSourceToggle(false);
+    }
+  }
+}
+function showCodeOverlayWarning(message) {
+  const view = $("codeView");
+  const existing = view.querySelector(".code-overlay-warning");
+  if (existing) existing.remove();
+  const banner = document.createElement("div");
+  banner.className = "code-overlay-warning";
+  banner.textContent = message;
+  view.prepend(banner);
+}
+function showMarkdownCodeOverlay() {
+  const source = state.codeOverlaySource;
+  if (!source || !source.rendered) return;
+  const view = $("codeView");
+  view.innerHTML = `<div class="code-markdown md">${source.markdownHtml}</div>`;
+  wirePathLinks(view);
+  wireCodeCopy(view);
+  setCodeSourceToggle(true, "Source");
+}
+function showSourceCodeOverlay() {
+  const source = state.codeOverlaySource;
+  if (!source) return;
+  renderCodeHtml(source.highlightRes, source.line);
+  setCodeSourceToggle(true, "Rendered");
 }
 async function openDiffOverlay(path, diff) {
   diff = String(diff || "");
   if (!state.projectId || !diff.trim()) return;
   state.codePath = null;
   state.codeLine = null;
+  state.codeOverlaySource = null;
   $("codeOverlay").classList.add("open");
+  setCodeSourceToggle(false);
   $("codePath").textContent = `Diff: ${path || "File change"}`;
   const requestId = Math.random().toString(36).slice(2);
   $("codeOverlay").dataset.requestId = requestId;
@@ -5427,7 +5524,9 @@ function closeCodeOverlay() {
   delete $("codeOverlay").dataset.requestId;
   state.codePath = null;
   state.codeLine = null;
+  state.codeOverlaySource = null;
   state.outputOverlay = null;
+  setCodeSourceToggle(false);
   cancelOutputOverlayRefresh();
 }
 
@@ -5521,11 +5620,13 @@ function openOutputOverlay(itemId, kind) {
   // async highlight/diff callbacks bail instead of overwriting our content.
   state.codePath = null;
   state.codeLine = null;
+  state.codeOverlaySource = null;
   delete $("codeOverlay").dataset.requestId;
   state.outputOverlay = { itemId: key, kind };
   cancelOutputOverlayRefresh();
   $("codeOverlay").classList.add("open");
   $("codeDownload").disabled = false;
+  setCodeSourceToggle(false);
   // Clear any leftover source/diff content so the first render's scroll-pin check starts from an
   // empty view (and a running command opens scrolled to its streaming tail).
   $("codeView").replaceChildren();
@@ -5671,6 +5772,13 @@ function formatBytes(value) {
   return n.toLocaleString() + " B";
 }
 $("codeClose").onclick = closeCodeOverlay;
+$("codeSourceToggle").onclick = () => {
+  const source = state.codeOverlaySource;
+  if (!source) return;
+  source.rendered = !source.rendered;
+  if (source.rendered) showMarkdownCodeOverlay();
+  else showSourceCodeOverlay();
+};
 $("codeDownload").onclick = () => {
   if (state.outputOverlay) { downloadOutputOverlay(); return; }
   if (state.projectId && state.codePath) window.location.href = projectFileUrl("raw", state.codePath);

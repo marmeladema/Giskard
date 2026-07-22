@@ -104,6 +104,12 @@ session_days = 30
     tokio::fs::write(proj_dir.path().join("data.bin"), b"bin\x00ary\x00data")
         .await
         .unwrap();
+    tokio::fs::write(
+        proj_dir.path().join("config.toml"),
+        "[server]\nbind = \"127.0.0.1:0\"\nsecure_cookies = false\n",
+    )
+    .await
+    .unwrap();
     tokio::fs::write(proj_dir.path().join("image.png"), TINY_PNG)
         .await
         .unwrap();
@@ -157,6 +163,34 @@ async fn highlight_rust_file() {
     assert!(body["file_size"].as_u64().unwrap() > 0);
     let html = body["html"].as_str().unwrap();
     assert!(!html.is_empty());
+}
+
+#[tokio::test]
+async fn highlight_toml_file() {
+    let port = 19026;
+    let (_data_dir, _proj_dir, _state, pid, cookie) = start_server(port).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!(
+            "{base}/api/projects/{pid}/highlight?path=config.toml"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["language"].as_str(), Some("TOML"));
+    assert!(!body["is_binary"].as_bool().unwrap());
+    let html = body["html"].as_str().unwrap();
+    assert!(!html.is_empty());
+    assert!(
+        html.contains("<span"),
+        "TOML should be syntax highlighted, got {html}"
+    );
 }
 
 #[tokio::test]

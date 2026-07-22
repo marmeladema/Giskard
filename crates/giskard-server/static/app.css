@@ -548,6 +548,12 @@
   .code-line-no.focused { color:#fff; background:rgba(79,140,255,.28); border-radius:4px; }
   .code-source { min-width:0; }
   .code-source pre { margin:0; padding:16px; min-height:100%; overflow:visible; font-family:var(--mono); font-size:12.5px; line-height:1.45; white-space:pre; }
+  .code-markdown { max-width:900px; padding:20px 24px 40px; color:var(--fg); }
+  .code-markdown pre { background:#0b0e13; }
+  .code-overlay-warning {
+    margin:12px 16px 0; padding:8px 12px; border-radius:8px; font-size:12.5px; line-height:1.4;
+    color:#ffd7a8; background:rgba(210,153,34,.14); border:1px solid rgba(210,153,34,.4);
+  }
   .diff-overlay { padding:16px; }
   .diff-overlay .code-block { margin:0; }
   .code-empty { padding:24px; color:var(--muted); }
