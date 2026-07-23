@@ -210,6 +210,18 @@
   }
   #transcript::-webkit-scrollbar-thumb:hover { background:var(--scroll-thumb-hover); }
   #transcript::-webkit-scrollbar-corner { background:var(--scroll-track); }
+  /* Empty-state explainer shown in the transcript of an unsent draft thread. */
+  .draft-empty { min-height:100%; display:flex; align-items:center; justify-content:center; padding:32px 20px; }
+  .draft-empty-inner { max-width:440px; text-align:center; color:var(--muted); }
+  .draft-empty-icon { font-size:30px; line-height:1; margin-bottom:12px; opacity:.9; }
+  .draft-empty-title { margin:0 0 8px; font-size:16px; font-weight:600; color:var(--fg); }
+  .draft-empty-text { margin:0 0 12px; font-size:13px; line-height:1.55; }
+  .draft-empty-text strong { color:var(--fg); }
+  .draft-empty-hint { margin:0; font-size:12px; line-height:1.5; opacity:.85; }
+  .draft-empty kbd {
+    font-family:var(--mono); font-size:11px; padding:1px 5px; border-radius:4px;
+    background:var(--panel2); border:1px solid var(--border); color:var(--fg);
+  }
   .msg {
     position:relative;
     max-width:80%; min-width:0; margin:10px 0; padding:10px 12px; border-radius:10px;

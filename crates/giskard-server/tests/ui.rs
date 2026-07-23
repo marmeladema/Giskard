@@ -510,6 +510,18 @@ async fn index_page_is_served_and_public() {
         "the transcript scrollbar is scoped and appearance-aware"
     );
     assert!(
+        body.contains("function renderDraftPlaceholder")
+            && body.contains("renderDraftPlaceholder();")
+            && body.contains("draft-empty-title")
+            && body.contains(".draft-empty {"),
+        "an unsent draft thread shows an explainer in the empty transcript instead of a blank view"
+    );
+    assert!(
+        between(&body, "async function startDraftThread", "api(\"POST\"")
+            .contains("$(\"transcript\").innerHTML = \"\";"),
+        "sending the first message clears the draft placeholder before the user row is appended"
+    );
+    assert!(
         body.contains(
             "const shouldResetTranscript = state.awaitingInitialThreadState || state.awaitingThreadResync"
         ) && body.contains("state.awaitingThreadResync = false")

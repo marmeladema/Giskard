@@ -1249,6 +1249,21 @@ function clearComposerDraft(key) {
   if (input && composerDraftKey() === key) input.value = "";
 }
 
+// The transcript of a brand-new (unsent) thread is empty, which left users unsure what the view is
+// or what to do. Fill it with a centered explainer: what a draft thread is, and that sending the
+// first message creates it. Cleared as soon as a real row is appended (see startDraftThread) or the
+// user opens another thread (openThread rebuilds the transcript).
+function renderDraftPlaceholder() {
+  $("transcript").innerHTML =
+    '<div class="draft-empty"><div class="draft-empty-inner">' +
+    '<div class="draft-empty-icon" aria-hidden="true">✏️</div>' +
+    '<h2 class="draft-empty-title">Start a new thread</h2>' +
+    "<p class=\"draft-empty-text\">This is a <strong>draft</strong> — nothing is saved yet. " +
+    "Type your first message in the composer below and send it to create the thread and start the conversation.</p>" +
+    '<p class="draft-empty-hint">Pick a model and mode above the composer first. ' +
+    "<kbd>Enter</kbd> sends · <kbd>Shift</kbd>+<kbd>Enter</kbd> adds a newline.</p>" +
+    "</div></div>";
+}
 function openDraftThread(pid, defaultModel) {
   saveComposerDraft();
   clearWsReconnectTimer();
@@ -1290,7 +1305,8 @@ function openDraftThread(pid, defaultModel) {
   $("thrHeader").style.display="flex"; $("composer").style.display="flex";
   $("pickerBar").style.display="flex";
   setThreadTitle("New thread");
-  $("transcript").className=""; $("transcript").innerHTML=""; $("notices").innerHTML="";
+  $("transcript").className=""; $("notices").innerHTML="";
+  renderDraftPlaceholder();
   setWsStatus("draft", "Draft thread. Send a message to create it.");
   syncModelControls();
   closeDrawers();
@@ -5856,6 +5872,7 @@ async function startDraftThread(text) {
   }
 
   const draftKey = composerDraftKey();
+  $("transcript").innerHTML = "";   // drop the draft placeholder before the first real row
   const body = bubble("user pending","you");
   body.textContent = text;
   const msgEl = body.parentElement;
