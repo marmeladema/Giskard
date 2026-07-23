@@ -2473,6 +2473,14 @@ fn sidebar_activity_notifications_target_approval_rows() {
     ));
     assert!(body.contains("closeApprovalNotification(data.threadId, data.approvalId);"));
     assert!(body.contains("openThread(meta.pid, tid, meta.title, { focusApprovalId:approvalId })"));
+    // Same-thread click after waking a frozen tab: if the approval isn't shown and the socket only
+    // looks open, force a resync so the stale transcript refreshes and the approval renders.
+    assert!(body.contains("if (!approvalRowById(approvalId) && wsIsOpen()) {"));
+    assert!(
+        body.contains("connectWs({ reconnect:true, reason:\"approval notification refresh\" });")
+    );
+    // The focus budget must outlast a full reconnect + resync on a slow mobile network.
+    assert!(body.contains("if (pending.attempts > 120) {"));
     assert!(body.contains("function approvalRowById(id)"));
     assert!(body.contains("row.scrollIntoView({ block:\"center\", behavior:\"smooth\" });"));
     assert!(body.contains("row.classList.add(\"approval-target\")"));

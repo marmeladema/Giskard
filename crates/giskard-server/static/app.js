@@ -2016,6 +2016,15 @@ async function focusApprovalTarget(tid, approvalId) {
       approvalId:String(approvalId),
       attempts:0
     };
+    // The thread is already open, but the click often arrives after the tab was backgrounded/frozen,
+    // where the transcript is stale and the approval was never rendered. If the socket still *looks*
+    // open, `reconnectIfNeeded` won't refresh it (its wsIsOpen() guard), so force a resync here so
+    // the approval — and any turns since — actually render. The resync's approval card then triggers
+    // the focus. When the approval is already on screen we just focus it, no reconnect needed.
+    if (!approvalRowById(approvalId) && wsIsOpen()) {
+      recordNotificationDiagnostic("approval_focus_forced_resync", { tid, approval_id: approvalId });
+      connectWs({ reconnect:true, reason:"approval notification refresh" });
+    }
     schedulePendingApprovalFocus();
   }
 }
@@ -2620,7 +2629,10 @@ function schedulePendingApprovalFocus() {
     return;
   }
   pending.attempts = (pending.attempts || 0) + 1;
-  if (pending.attempts > 40) {
+  // ~18s budget (120 * 150ms): a notification tap that woke a frozen tab must outlast a full
+  // reconnect + resync on a slow mobile network before the approval row renders. The approval-card
+  // render also calls this directly, so a resync that lands within the budget focuses immediately.
+  if (pending.attempts > 120) {
     state.pendingApprovalFocus = null;
     notice("Approval is no longer pending.", "warning");
     return;
