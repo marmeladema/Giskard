@@ -2761,6 +2761,57 @@ async fn thread_rename_updates_thread_summary_and_persistence() {
 }
 
 #[tokio::test]
+async fn starting_thread_generates_title_from_first_prompt() {
+    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let project_id = create_project_only(&client, &base, &cookie).await;
+
+    let started = client
+        .post(format!("{base}/api/projects/{project_id}/threads/start"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({
+            "text": "Task:\n\n- [ ] Investigate thread title generation. Keep the rest as context.",
+            "model_ref": {"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null},
+            "mode": "build",
+            "approval_policy": "ask",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(started.status(), 200);
+    let started: serde_json::Value = started.json().await.unwrap();
+    let thread_id: ThreadId = started["thread_id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(
+        started["title"].as_str(),
+        Some("Investigate thread title generation")
+    );
+
+    let saved = state
+        .store
+        .load_thread(project_id, thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.title, "Investigate thread title generation");
+
+    let listed: serde_json::Value = client
+        .get(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        listed["threads"][0]["title"].as_str(),
+        Some("Investigate thread title generation")
+    );
+}
+
+#[tokio::test]
 async fn thread_delete_removes_native_and_persisted_thread() {
     let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
     let base = format!("http://127.0.0.1:{port}");

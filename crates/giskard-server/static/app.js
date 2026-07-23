@@ -5893,7 +5893,7 @@ async function startDraftThread(text) {
     clearComposerDraft(draftKey);
     state.draftThread = null;
     await loadThreads(pid);
-    await openThread(pid, tid, "New thread", { firstTurnStarting:true });
+    await openThread(pid, tid, res.title || "New thread", { firstTurnStarting:true });
     state.firstTurnStartingThreadId = String(tid);
     setTurnActive(true);
     if (res.warning) notice(res.warning.message || "warning", res.warning.severity || "warning");
