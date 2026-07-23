@@ -230,6 +230,8 @@ impl AgentHarness for ReplayHarness {
             // A deterministic replay applies exactly the requested model, so echo it as
             // effective — this is what lets server tests exercise verified provider switches.
             resumed_model: Some(opts.initial_model.clone()),
+            agent_name: None,
+            parent_harness_thread_id: None,
         })
     }
 
@@ -320,6 +322,7 @@ impl AgentHarness for ReplayHarness {
                         title: "Context compacted".into(),
                         detail: None,
                         metadata: None,
+                        subagent: None,
                     },
                     created_at: chrono::Utc::now(),
                 },
@@ -470,6 +473,7 @@ mod tests {
                 thread: None,
                 workspace_root: "/tmp".into(),
                 resume: Some("th_test".into()),
+                resume_policy: giskard_harness::ResumePolicy::AllowFreshFallback,
                 initial_model: ModelRef {
                     provider: "openai".into(),
                     model: "gpt-5.5".into(),
@@ -532,6 +536,7 @@ mod tests {
                 thread: Some(requested_thread),
                 workspace_root: "/tmp".into(),
                 resume: Some("th_test".into()),
+                resume_policy: giskard_harness::ResumePolicy::AllowFreshFallback,
                 initial_model: ModelRef {
                     provider: "openai".into(),
                     model: "gpt-5.5".into(),

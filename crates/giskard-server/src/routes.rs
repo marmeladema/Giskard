@@ -21,6 +21,8 @@ use futures::{SinkExt, StreamExt};
 use giskard_core::error::{HarnessError, PersistError};
 use giskard_core::ids::{ProjectId, ThreadId};
 use giskard_core::model::{ModelDescriptor, ModelRef};
+use giskard_core::text::trimmed_non_empty;
+use giskard_core::thread::ThreadKind;
 use giskard_core::turn::{ApprovalPolicy, Mode, TurnOverrides};
 use giskard_core::user_input::UserInput;
 use giskard_persist::Config;
@@ -33,8 +35,12 @@ use crate::auth::{
     SESSION_COOKIE, TokenPurpose, auth_middleware, create_session_cookie,
     get_session_token_from_header, sign_token, verify_token,
 };
+use crate::thread_graph::{
+    descendant_deletion_order, graph_issue, load_thread_graph, should_refresh_subagent_title,
+};
 
 const HARNESS_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+const PROJECT_LIFECYCLE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_THREAD_TITLE_CHARS: usize = 120;
 const GENERATED_THREAD_TITLE_CHARS: usize = 72;
 const GENERATED_THREAD_TITLE_WORDS: usize = 8;
@@ -53,6 +59,10 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
         .route(
             "/api/projects/{id}/threads/start",
             post(start_thread_with_message),
+        )
+        .route(
+            "/api/projects/{id}/threads/{parent_thread_id}/subagent-links/{item_id}/open",
+            post(open_subagent_link),
         )
         .route(
             "/api/projects/{id}/threads/{thread_id}",
@@ -376,6 +386,11 @@ async fn delete_project(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<ProjectId>,
 ) -> Result<axum::http::StatusCode, ApiError> {
+    let _lifecycle_guard = state
+        .registry
+        .lock_project_lifecycle_with_timeout(id, PROJECT_LIFECYCLE_LOCK_TIMEOUT)
+        .await
+        .map_err(harness_api_error)?;
     state
         .store
         .load_project(id)
@@ -416,7 +431,9 @@ async fn reject_thread_mutation_if_live(
     state: &AppState,
     thread_id: ThreadId,
 ) -> Result<(), ApiError> {
-    if state.live_buffers.is_active(thread_id).await {
+    if state.registry.thread_has_active_turn(thread_id).await
+        || state.live_buffers.is_active(thread_id).await
+    {
         return Err(ApiError::Conflict(
             "thread has an active turn; stop it before archiving or deleting".into(),
         ));
@@ -434,10 +451,10 @@ async fn list_threads(
     AxumPath(project_id): AxumPath<ProjectId>,
 ) -> Result<Json<ListThreadsResponse>, ApiError> {
     let thread_ids = state.store.list_threads(project_id).await?;
-    let mut threads = Vec::new();
+    let mut loaded = Vec::new();
     for tid in thread_ids {
         match state.store.load_thread(project_id, tid).await {
-            Ok(Some(tf)) => threads.push(thread_summary(&tf)),
+            Ok(Some(tf)) => loaded.push(tf),
             Ok(None) => {}
             Err(e) => {
                 warn!(
@@ -449,8 +466,43 @@ async fn list_threads(
             }
         }
     }
+    let graph = loaded
+        .iter()
+        .cloned()
+        .map(|thread| (thread.id, thread))
+        .collect();
+    for thread in &loaded {
+        if let Some(issue) = graph_issue(&graph, thread) {
+            error!(
+                %project_id,
+                thread_id = %thread.id,
+                parent_thread_id = ?thread.parent_thread_id,
+                kind = ?thread.kind,
+                issue,
+                action = "list_threads",
+                "invalid persisted thread graph"
+            );
+        }
+    }
+    let mut threads = loaded.iter().map(thread_summary).collect::<Vec<_>>();
     threads.sort_by_key(|t| std::cmp::Reverse(t.updated_at));
     Ok(Json(ListThreadsResponse { threads }))
+}
+
+async fn find_thread_by_harness_id(
+    state: &AppState,
+    project_id: ProjectId,
+    harness_thread_id: &str,
+) -> Result<Option<ThreadFile>, ApiError> {
+    for tid in state.store.list_threads(project_id).await? {
+        let Some(tf) = state.store.load_thread(project_id, tid).await? else {
+            continue;
+        };
+        if tf.harness_thread_id == harness_thread_id {
+            return Ok(Some(tf));
+        }
+    }
+    Ok(None)
 }
 
 async fn open_thread(
@@ -512,17 +564,30 @@ async fn open_thread(
         // thread through this endpoint *before* subscribing over the WebSocket, so a 500 here
         // would make the whole thread unviewable. Degrade to a read-only open instead: the
         // client proceeds to subscribe and the persisted history loads; only new turns fail.
-        let handle = match state
-            .registry
-            .open_thread(
-                &project_config,
-                ws_root,
-                Some(thread_id),
-                Some(thread_file.harness_thread_id.clone()),
-                current_model.clone(),
-            )
-            .await
-        {
+        let open_result = if thread_file.kind == ThreadKind::Subagent {
+            state
+                .registry
+                .open_linked_thread(
+                    &project_config,
+                    ws_root,
+                    Some(thread_id),
+                    thread_file.harness_thread_id.clone(),
+                    current_model.clone(),
+                )
+                .await
+        } else {
+            state
+                .registry
+                .open_thread(
+                    &project_config,
+                    ws_root,
+                    Some(thread_id),
+                    Some(thread_file.harness_thread_id.clone()),
+                    current_model.clone(),
+                )
+                .await
+        };
+        let handle = match open_result {
             Ok(handle) => handle,
             Err(error) => {
                 warn!(
@@ -592,6 +657,65 @@ async fn open_thread(
             "creating a new thread requires an initial message".into(),
         ));
     };
+    let _lifecycle_guard = state
+        .registry
+        .lock_project_lifecycle_with_timeout(project_id, PROJECT_LIFECYCLE_LOCK_TIMEOUT)
+        .await
+        .map_err(harness_api_error)?;
+
+    if let Some(existing) = find_thread_by_harness_id(&state, project_id, &resume).await? {
+        let (handle, warning) =
+            if let Some(handle) = state.registry.get_thread_handle(existing.id).await {
+                (handle, None)
+            } else {
+                let handle = if existing.kind == ThreadKind::Subagent {
+                    state
+                        .registry
+                        .open_linked_thread(
+                            &project_config,
+                            ws_root,
+                            Some(existing.id),
+                            existing.harness_thread_id.clone(),
+                            existing.current_model.clone(),
+                        )
+                        .await
+                } else {
+                    state
+                        .registry
+                        .open_thread(
+                            &project_config,
+                            ws_root,
+                            Some(existing.id),
+                            Some(existing.harness_thread_id.clone()),
+                            existing.current_model.clone(),
+                        )
+                        .await
+                }
+                .map_err(harness_api_error)?;
+                let warning = handle.warning.as_ref().map(|warning| {
+                    warning_info(
+                        warning.code.clone(),
+                        warning.message.clone(),
+                        warning.detail.clone(),
+                        handle.thread,
+                        "open_thread",
+                    )
+                });
+                (handle, warning)
+            };
+        refresh_route_imported_subagent_title(
+            &state,
+            project_id,
+            existing.id,
+            handle.agent_name.as_deref(),
+        )
+        .await?;
+        return Ok(Json(OpenThreadResponse {
+            thread_id: handle.thread,
+            harness_thread_id: handle.harness_thread_id,
+            warning,
+        }));
+    }
 
     let handle = state
         .registry
@@ -614,14 +738,18 @@ async fn open_thread(
         crate::models::resolve_catalog_descriptor(&catalog, &app_config, &current_model);
     let context_window = descriptor.context_window;
     let now = Utc::now();
+    let title = "New thread".to_owned();
     let thread_file = ThreadFile {
         version: 1,
         id: handle.thread,
         project_id,
-        title: "New thread".into(),
+        title,
         harness_thread_id: handle.harness_thread_id.clone(),
+        parent_thread_id: None,
+        spawned_by_turn_id: None,
+        kind: ThreadKind::Primary,
         mode: Mode::Build,
-        current_model,
+        current_model: current_model.clone(),
         context_window,
         model_context_windows: std::collections::HashMap::new(),
         approval_policy: ApprovalPolicy::Ask,
@@ -647,6 +775,42 @@ async fn open_thread(
         thread_id: handle.thread,
         harness_thread_id: handle.harness_thread_id,
         warning,
+    }))
+}
+
+async fn open_subagent_link(
+    State(state): State<AppState>,
+    AxumPath((project_id, parent_thread_id, item_id)): AxumPath<(ProjectId, ThreadId, ItemId)>,
+) -> Result<Json<OpenSubagentLinkResponse>, ApiError> {
+    // Materialization is serialized with every other lifecycle mutation for the project and may
+    // be queued behind a slow native resume. Bound the complete browser action so this endpoint
+    // has the same availability guarantee as HTTP handlers waiting directly on the lifecycle lock.
+    let thread_id = tokio::time::timeout(
+        PROJECT_LIFECYCLE_LOCK_TIMEOUT,
+        state
+            .registry
+            .open_subagent_link(project_id, parent_thread_id, item_id),
+    )
+    .await
+    .map_err(|_| {
+        ApiError::Unavailable(format!(
+            "timed out opening sub-agent link from thread {parent_thread_id}"
+        ))
+    })?
+    .map_err(harness_api_error)?
+    .ok_or_else(|| {
+        ApiError::Conflict(format!(
+            "item {item_id} is not an openable sub-agent link from thread {parent_thread_id}"
+        ))
+    })?;
+    let thread = state
+        .store
+        .load_thread(project_id, thread_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    Ok(Json(OpenSubagentLinkResponse {
+        thread_id,
+        title: thread.title,
     }))
 }
 
@@ -731,6 +895,9 @@ async fn start_thread_with_message(
         project_id,
         title: title.clone(),
         harness_thread_id: handle.harness_thread_id.clone(),
+        parent_thread_id: None,
+        spawned_by_turn_id: None,
+        kind: ThreadKind::Primary,
         mode: req.mode,
         current_model: model_ref.clone(),
         context_window: model_descriptor.context_window,
@@ -1125,6 +1292,9 @@ fn thread_summary(tf: &ThreadFile) -> ThreadSummary {
     ThreadSummary {
         id: tf.id,
         title: tf.title.clone(),
+        parent_thread_id: tf.parent_thread_id,
+        spawned_by_turn_id: tf.spawned_by_turn_id,
+        kind: tf.kind,
         mode: tf.mode,
         archived: tf.archived,
         created_at: tf.created_at,
@@ -1145,11 +1315,44 @@ fn normalize_thread_title(raw: &str) -> Result<String, ApiError> {
     Ok(title)
 }
 
+async fn refresh_route_imported_subagent_title(
+    state: &AppState,
+    project_id: ProjectId,
+    thread_id: ThreadId,
+    agent_name: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(agent_name) = agent_name.and_then(trimmed_non_empty) else {
+        return Ok(());
+    };
+    let desired = normalize_thread_title(&format!("Sub-agent: {agent_name}"))?;
+    let Some(thread) = state.store.load_thread(project_id, thread_id).await? else {
+        return Ok(());
+    };
+    if thread.kind != ThreadKind::Subagent
+        || !should_refresh_subagent_title(&thread.title, &desired)
+    {
+        return Ok(());
+    }
+    state
+        .store
+        .update_thread(project_id, thread_id, |thread| {
+            thread.title = desired.clone();
+            thread.updated_at = Utc::now();
+        })
+        .await?;
+    Ok(())
+}
+
 async fn archive_thread(
     State(state): State<AppState>,
     AxumPath((project_id, thread_id)): AxumPath<(ProjectId, ThreadId)>,
     Json(req): Json<ArchiveThreadRequest>,
 ) -> Result<Json<ThreadSummary>, ApiError> {
+    if state.registry.thread_has_passive_monitor(thread_id).await {
+        return Err(ApiError::Conflict(
+            "thread has delegated sub-agent work; wait for it to finish before archiving".into(),
+        ));
+    }
     reject_thread_mutation_if_live(&state, thread_id).await?;
     let project_config = state
         .store
@@ -1230,23 +1433,110 @@ async fn delete_thread(
     State(state): State<AppState>,
     AxumPath((project_id, thread_id)): AxumPath<(ProjectId, ThreadId)>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    reject_thread_mutation_if_live(&state, thread_id).await?;
+    let _lifecycle_guard = state
+        .registry
+        .lock_project_lifecycle_with_timeout(project_id, PROJECT_LIFECYCLE_LOCK_TIMEOUT)
+        .await
+        .map_err(harness_api_error)?;
+    let graph = load_thread_graph(&state.store, project_id).await?;
+    let deletion_order = descendant_deletion_order(&graph, thread_id);
+    if deletion_order.is_empty() {
+        return Err(ApiError::NotFound);
+    }
+    // Preflight the complete subtree before deleting any native or local record. A busy descendant
+    // must reject the entire request instead of leaving a partially deleted ownership tree.
+    for candidate in &deletion_order {
+        reject_thread_mutation_if_live(&state, *candidate).await?;
+    }
+    // Idle pre-turn monitors are cancellable delegated subscriptions, not durable work. Stop the
+    // complete subtree before deleting anything, then preflight again so a child turn that raced
+    // the first check rejects the request without leaving a partially deleted ownership graph.
+    for candidate in &deletion_order {
+        state
+            .registry
+            .stop_passive_subagent_monitor(*candidate)
+            .await
+            .map_err(harness_api_error)?;
+    }
+    for candidate in &deletion_order {
+        reject_thread_mutation_if_live(&state, *candidate).await?;
+    }
     let project_config = state
         .store
         .load_project(project_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let thread_file = state
-        .store
-        .load_thread(project_id, thread_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    state
-        .registry
-        .delete_thread(&project_config, thread_id, thread_file.harness_thread_id)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    state.store.delete_thread(project_id, thread_id).await?;
+    let descendant_count = deletion_order.len().saturating_sub(1);
+    info!(
+        %project_id,
+        %thread_id,
+        descendant_count,
+        action = "delete_thread",
+        "deleting thread subtree in leaf-first order"
+    );
+    for (deleted_count, candidate) in deletion_order.iter().enumerate() {
+        let Some(thread_file) = graph.get(candidate) else {
+            error!(
+                %project_id,
+                root_thread_id = %thread_id,
+                thread_id = %candidate,
+                deleted_count,
+                action = "delete_thread",
+                "thread disappeared from the loaded deletion graph"
+            );
+            return Err(ApiError::Internal(
+                "thread deletion graph changed unexpectedly".into(),
+            ));
+        };
+        if let Err(error) = state
+            .registry
+            .delete_thread(
+                &project_config,
+                *candidate,
+                thread_file.harness_thread_id.clone(),
+            )
+            .await
+        {
+            error!(
+                %project_id,
+                root_thread_id = %thread_id,
+                thread_id = %candidate,
+                harness_thread_id = %thread_file.harness_thread_id,
+                deleted_count,
+                total_count = deletion_order.len(),
+                action = "delete_thread",
+                %error,
+                "failed to delete native thread while cascading thread deletion"
+            );
+            return Err(ApiError::Internal(format!(
+                "failed to delete thread subtree after deleting {deleted_count} thread(s): {error}"
+            )));
+        }
+        if let Err(error) = state.store.delete_thread(project_id, *candidate).await {
+            error!(
+                %project_id,
+                root_thread_id = %thread_id,
+                thread_id = %candidate,
+                harness_thread_id = %thread_file.harness_thread_id,
+                deleted_count,
+                total_count = deletion_order.len(),
+                action = "delete_thread",
+                %error,
+                "native thread was deleted but local thread removal failed"
+            );
+            return Err(error.into());
+        }
+        info!(
+            %project_id,
+            root_thread_id = %thread_id,
+            thread_id = %candidate,
+            harness_thread_id = %thread_file.harness_thread_id,
+            deleted_count = deleted_count + 1,
+            total_count = deletion_order.len(),
+            action = "delete_thread",
+            "deleted thread from cascading subtree"
+        );
+    }
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -2018,6 +2308,7 @@ fn harness_api_error(error: HarnessError) -> ApiError {
         HarnessError::ThreadBusy { .. } => {
             ApiError::Conflict("Thread already has an active turn.".into())
         }
+        HarnessError::Timeout(message) => ApiError::Unavailable(message),
         other => ApiError::Internal(other.to_string()),
     }
 }
@@ -3008,17 +3299,30 @@ async fn ensure_thread_open(
         %action,
         "reopening persisted thread"
     );
-    let handle = state
-        .registry
-        .open_thread(
-            &project_config,
-            ws_root,
-            Some(thread_id),
-            Some(thread_file.harness_thread_id.clone()),
-            current_model,
-        )
-        .await
-        .map_err(|e| WsError::from_harness(e, action, Some(thread_id)))?;
+    let handle = if thread_file.kind == ThreadKind::Subagent {
+        state
+            .registry
+            .open_linked_thread(
+                &project_config,
+                ws_root,
+                Some(thread_id),
+                thread_file.harness_thread_id.clone(),
+                current_model,
+            )
+            .await
+    } else {
+        state
+            .registry
+            .open_thread(
+                &project_config,
+                ws_root,
+                Some(thread_id),
+                Some(thread_file.harness_thread_id.clone()),
+                current_model,
+            )
+            .await
+    }
+    .map_err(|e| WsError::from_harness(e, action, Some(thread_id)))?;
 
     if handle.thread != thread_id {
         return Err(WsError::new(
@@ -3297,17 +3601,30 @@ async fn switch_provider_cold(
         "attempting verified cold-resume provider switch"
     );
 
-    let handle = state
-        .registry
-        .open_thread(
-            &project_config,
-            ws_root,
-            Some(thread_id),
-            Some(thread_file.harness_thread_id.clone()),
-            requested.clone(),
-        )
-        .await
-        .map_err(|e| WsError::from_harness(e, "select_model", Some(thread_id)))?;
+    let handle = if thread_file.kind == ThreadKind::Subagent {
+        state
+            .registry
+            .open_linked_thread(
+                &project_config,
+                ws_root,
+                Some(thread_id),
+                thread_file.harness_thread_id.clone(),
+                requested.clone(),
+            )
+            .await
+    } else {
+        state
+            .registry
+            .open_thread(
+                &project_config,
+                ws_root,
+                Some(thread_id),
+                Some(thread_file.harness_thread_id.clone()),
+                requested.clone(),
+            )
+            .await
+    }
+    .map_err(|e| WsError::from_harness(e, "select_model", Some(thread_id)))?;
 
     let confirmed = handle.resumed_model.as_ref().is_some_and(|effective| {
         effective.provider == requested.provider && effective.model == requested.model
@@ -3573,6 +3890,7 @@ pub enum ApiError {
     BadRequest(String),
     Forbidden(String),
     Conflict(String),
+    Unavailable(String),
     Internal(String),
 }
 
@@ -3596,6 +3914,11 @@ impl IntoResponse for ApiError {
             ),
             ApiError::Conflict(msg) => (
                 axum::http::StatusCode::CONFLICT,
+                msg,
+                ApiErrorLogLevel::Warn,
+            ),
+            ApiError::Unavailable(msg) => (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 msg,
                 ApiErrorLogLevel::Warn,
             ),

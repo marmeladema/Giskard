@@ -45,6 +45,7 @@ let state = {
   pickerTypeahead:"", pickerTypeaheadTimer:null, pickerSelectedRow:null,
   currentPlan:null, planExpanded:localStorage.getItem("giskard.planExpanded")==="1",
   threadActivity:new Map(), pendingApprovalFocus:null, notifiedApprovals:new Map(), approvalNotifications:new Map(), browserDiagnostics:[],
+  subagentImports:new Map(), projectThreads:new Map(),
   lastNotificationPromptNoticeAt:0, swRegistration:null,
   collapsedProjects:new Set(loadCollapsedProjects()), pendingRemoveProject:null, projectDirs:{}
 };
@@ -612,25 +613,92 @@ function restoreLastThread() {
   try { last = JSON.parse(localStorage.getItem("giskard.lastThread") || "null"); } catch { last = null; }
   if (!last || !last.pid || !last.tid) return;
   const el = document.querySelector(`.thread[data-tid="${last.tid}"]`);
-  if (!el) { localStorage.removeItem("giskard.lastThread"); return; }
-  openThread(last.pid, last.tid, currentThreadTitle(el), { silent:true });
+  const meta = knownProjectThreads(last.pid).find(t => String(t.id) === String(last.tid));
+  if (!meta) { localStorage.removeItem("giskard.lastThread"); return; }
+  openThread(last.pid, last.tid, el ? currentThreadTitle(el) : (meta.title || "Thread"), { silent:true });
 }
 
 async function loadThreads(pid) {
   const box = $("threads-"+pid); if (!box) return;
   try {
     const { threads } = await api("GET",`/api/projects/${pid}/threads`);
+    rememberProjectThreads(pid, threads);
     box.innerHTML="";
-    for (const t of threads.filter(t => !t.archived)) box.append(threadRow(pid, t));
-    const archived = threads.filter(t => t.archived);
+    appendThreadRows(box, pid, threads.filter(t => !t.archived && !isManagedSubagentThread(t, threads)));
+    const archived = threads.filter(t => t.archived && !isManagedSubagentThread(t, threads));
     if (archived.length) {
       const label = document.createElement("div");
       label.className = "thread-section-label";
       label.textContent = "Archived";
       box.append(label);
-      for (const t of archived) box.append(threadRow(pid, t));
+      appendThreadRows(box, pid, archived);
     }
   } catch {}
+}
+
+function rememberProjectThreads(pid, threads) {
+  if (!pid || !Array.isArray(threads)) return;
+  const projectId = String(pid);
+  const normalized = threads.map(t => Object.assign({}, t, {
+    id:String(t.id),
+    parent_thread_id:t.parent_thread_id ? String(t.parent_thread_id) : null,
+    spawned_by_turn_id:t.spawned_by_turn_id ? String(t.spawned_by_turn_id) : null
+  }));
+  state.projectThreads.set(projectId, normalized);
+
+  // Link results are browser-local accelerators only. Discard them when the authoritative thread
+  // list reloads; a later click resolves the trusted item coordinates idempotently on the server.
+  const projectPrefix = `${projectId}:`;
+  for (const key of Array.from(state.subagentImports.keys())) {
+    if (key.startsWith(projectPrefix)) state.subagentImports.delete(key);
+  }
+  renderParentThreadButton();
+  renderSubagentsButton();
+}
+
+function knownProjectThreads(pid) {
+  return state.projectThreads.get(String(pid || state.projectId)) || [];
+}
+
+function appendThreadRows(box, pid, threads) {
+  const byParent = new Map();
+  const ids = new Set(threads.map(t => String(t.id)));
+  const roots = [];
+  for (const t of threads) {
+    const parent = t.parent_thread_id ? String(t.parent_thread_id) : "";
+    if (parent && ids.has(parent)) {
+      if (!byParent.has(parent)) byParent.set(parent, []);
+      byParent.get(parent).push(t);
+    } else {
+      roots.push(t);
+    }
+  }
+  const appendOne = (t) => {
+    box.append(threadRow(pid, t));
+    for (const child of byParent.get(String(t.id)) || []) appendOne(child);
+  };
+  for (const t of roots) appendOne(t);
+}
+
+// Hide only sub-agents whose ownership chain is complete and terminates at a primary root.
+// Dangling, malformed, and cyclic metadata stays in the main sidebar as a recovery path.
+function isManagedSubagentThread(t, threads) {
+  if (!t || t.kind !== "subagent" || !t.parent_thread_id) return false;
+  const byId = new Map((threads || []).map(thread => [String(thread.id), thread]));
+  const seen = new Set();
+  let current = t;
+  while (current) {
+    const id = String(current.id || "");
+    if (!id || seen.has(id)) return false;
+    seen.add(id);
+    const parentId = current.parent_thread_id ? String(current.parent_thread_id) : "";
+    // `ThreadKind::Primary` is the serde default and may be omitted from summaries.
+    if (!parentId) return !current.kind || current.kind === "primary";
+    if (current.kind !== "subagent") return false;
+    current = byId.get(parentId);
+    if (!current) return false;
+  }
+  return false;
 }
 
 function loadCollapsedProjects() {
@@ -737,6 +805,17 @@ function updateThreadRowTitle(tid, title) {
     const pid = el.dataset.pid || state.projectId;
     applyThreadTitleToElement(el, pid, tid, title);
   });
+  updateKnownThreadTitle(tid, title);
+}
+
+function updateKnownThreadTitle(tid, title) {
+  const key = String(tid || "");
+  if (!key || !title) return;
+  for (const threads of state.projectThreads.values()) {
+    const thread = threads.find(t => String(t.id) === key);
+    if (thread) thread.title = title;
+  }
+  renderSubagentsButton();
 }
 
 function currentThreadTitle(el) {
@@ -759,6 +838,50 @@ function threadMetaForId(tid) {
   };
 }
 
+function knownThreadForId(pid, tid) {
+  const key = String(tid || "");
+  if (!key) return null;
+  return knownProjectThreads(pid).find(thread => String(thread.id) === key) || null;
+}
+
+function activeParentThread() {
+  if (!state.projectId || !state.threadId) return null;
+  const current = knownThreadForId(state.projectId, state.threadId);
+  const parentId = current && current.parent_thread_id ? String(current.parent_thread_id) : "";
+  if (!parentId) return null;
+  const parent = knownThreadForId(state.projectId, parentId);
+  return {
+    id:parentId,
+    title:(parent && parent.title) || "Parent thread"
+  };
+}
+
+function renderParentThreadButton() {
+  const btn = $("parentThreadBtn");
+  if (!btn) return;
+  const parent = activeParentThread();
+  btn.hidden = !parent;
+  btn.disabled = !parent;
+  btn.dataset.parentThreadId = parent ? parent.id : "";
+  const label = parent ? `Back to parent thread: ${parent.title}` : "Back to parent thread";
+  btn.title = label;
+  btn.setAttribute("aria-label", label);
+}
+
+async function openParentThread() {
+  const parent = activeParentThread();
+  if (!parent) return;
+  const btn = $("parentThreadBtn");
+  btn.disabled = true;
+  try {
+    await openThread(state.projectId, parent.id, parent.title);
+  } finally {
+    renderParentThreadButton();
+  }
+}
+
+$("parentThreadBtn").onclick = openParentThread;
+
 function clearThreadActivity(tid) {
   if (!tid) return;
   const activity = state.threadActivity.get(String(tid));
@@ -771,6 +894,7 @@ function clearThreadActivity(tid) {
     state.threadActivity.delete(String(tid));
   }
   renderThreadActivityIndicator(tid);
+  renderSubagentsButton();
 }
 
 function renderThreadActivityIndicator(tid) {
@@ -805,6 +929,7 @@ function setThreadActivity(tid, activity) {
   const key = String(tid);
   state.threadActivity.set(key, activity);
   renderThreadActivityIndicator(key);
+  renderSubagentsButton();
 }
 
 function setActiveThreadActivity(kind, activeTurn, summary, extra) {
@@ -832,6 +957,7 @@ function clearActiveThreadActivityLater(tid, kind) {
     if (!activity || activity.source !== "active_thread_event" || activity.kind !== kind || activity.active_turn) return;
     state.threadActivity.delete(key);
     renderThreadActivityIndicator(key);
+    renderSubagentsButton();
   }, ACTIVE_THREAD_COMPLETED_MARK_MS);
 }
 
@@ -850,6 +976,7 @@ function clearApprovalThreadActivity(tid, approvalId) {
     state.threadActivity.delete(key);
   }
   renderThreadActivityIndicator(key);
+  renderSubagentsButton();
 }
 
 function clearServerRequestThreadActivity(tid, requestId) {
@@ -867,6 +994,7 @@ function clearServerRequestThreadActivity(tid, requestId) {
     state.threadActivity.delete(key);
   }
   renderThreadActivityIndicator(key);
+  renderSubagentsButton();
 }
 
 function normalizeThreadTitleInput(value) {
@@ -961,11 +1089,38 @@ async function renameThread(pid, tid, title) {
   return api("PATCH", `/api/projects/${pid}/threads/${tid}/title`, { title });
 }
 
+function threadDescendantIds(pid, tid) {
+  const childrenByParent = new Map();
+  for (const thread of knownProjectThreads(pid)) {
+    const parentId = thread.parent_thread_id ? String(thread.parent_thread_id) : "";
+    if (!parentId) continue;
+    if (!childrenByParent.has(parentId)) childrenByParent.set(parentId, []);
+    childrenByParent.get(parentId).push(String(thread.id));
+  }
+  const rootId = String(tid);
+  const seen = new Set([rootId]);
+  const descendants = [];
+  const pending = [...(childrenByParent.get(rootId) || [])];
+  while (pending.length) {
+    const childId = pending.pop();
+    if (!childId || seen.has(childId)) continue;
+    seen.add(childId);
+    descendants.push(childId);
+    pending.push(...(childrenByParent.get(childId) || []));
+  }
+  return descendants;
+}
+
 async function deleteThread(pid, tid, title) {
-  if (!confirm(`Delete thread "${title}"? This also deletes the Codex thread.`)) return;
+  const descendants = threadDescendantIds(pid, tid);
+  const cascade = descendants.length
+    ? `, its ${descendants.length} linked sub-agent thread${descendants.length === 1 ? "" : "s"}, and all corresponding Codex threads`
+    : " and its corresponding Codex thread";
+  if (!confirm(`Permanently delete thread "${title}"${cascade}? This cannot be undone.`)) return;
   try {
     await api("DELETE", `/api/projects/${pid}/threads/${tid}`);
-    clearThreadView(tid);
+    const deletedIds = new Set([String(tid), ...descendants]);
+    if (state.threadId && deletedIds.has(String(state.threadId))) clearThreadView(state.threadId);
     await loadThreads(pid);
   } catch (e) {
     notice("Delete thread failed: " + e.message, "error");
@@ -984,6 +1139,7 @@ function clearThreadView(tid) {
     try { ws.close(); } catch {}
   }
   state.projectId = null; state.threadId = null;
+  renderParentThreadButton();
   state.draftThread = null;
   state.firstTurnStartingThreadId = null;
   state.pendingUserEl = null; state.pendingUserText = null;
@@ -1290,6 +1446,7 @@ function openDraftThread(pid, defaultModel) {
 
   state.projectId = pid;
   state.threadId = null;
+  renderParentThreadButton();
   state.draftThread = { projectId:pid, title:"New thread" };
   state.firstTurnStartingThreadId = null;
   state.pendingUserEl = null;
@@ -1300,9 +1457,11 @@ function openDraftThread(pid, defaultModel) {
   state.mcpServers = []; state.mcpError = null; state.expandedMcps = new Set();
   state.mcpCapabilities = { status:false, reload:false, oauth_login:false };
   $("tasksMenu").hidden = true;
+  $("subagentsMenu").hidden = true;
   $("mcpMenu").hidden = true;
   $("usageMenu").hidden = true;
   renderMcpButton();
+  renderSubagentsButton();
   loadProjectModels(pid);   // load this project's model list (config + discovery + Codex names)
   setMode("build");
   setApprovalPolicy("ask");
@@ -1355,6 +1514,7 @@ async function openThread(pid, tid, title, opts) {
 
   clearThreadActivity(tid);
   state.projectId = pid; state.threadId = tid; state.pendingUserEl = null; state.pendingUserText = null;
+  renderParentThreadButton();
   state.threadReadOnly = false; state.readOnlyProvider = null; state.readOnlyMessage = null;
   updateReadOnlyBanner();
   state.draftThread = null;
@@ -1365,9 +1525,11 @@ async function openThread(pid, tid, title, opts) {
   state.mcpServers = []; state.mcpError = null; state.expandedMcps = new Set();
   state.mcpCapabilities = { status:false, reload:false, oauth_login:false };
   $("tasksMenu").hidden = true;
+  $("subagentsMenu").hidden = true;
   $("mcpMenu").hidden = true;
   $("usageMenu").hidden = true;
   renderMcpButton();
+  renderSubagentsButton();
   loadMcpServers({ announce:false });
   loadProjectModels(pid);   // load this project's model list (config + discovery + Codex names)
   setTurnActive(false);
@@ -1794,6 +1956,7 @@ function handleThreadActivity(msg) {
   }
   state.threadActivity.set(tid, activity);
   renderThreadActivityIndicator(tid);
+  renderSubagentsButton();
   if (activity.kind === "approval_requested") maybeNotifyApproval(tid, activity);
 }
 
@@ -2421,6 +2584,7 @@ function handleEvent(ev) {
       if (ev.turn) {
         document.querySelectorAll('.msg[data-turn="pending"]').forEach(m => { m.dataset.turn = ev.turn; });
       }
+      renderLiveTurnUserInput(ev.turn, ev.user_input);
       setTurnActive(true);
       setActiveThreadActivity("progress", true, "Turn running");
       break;
@@ -2530,6 +2694,7 @@ function renderLiveTurnSnapshot(snap) {
     // Adopt the live turn id so its rows stamp correctly even if the accumulated events don't lead
     // with a turn_started (the turn_started handler will confirm the same id).
     state.currentRenderTurnId = snap.turn_id;
+    renderLiveTurnUserInput(snap.turn_id, snap.user_input);
     setTurnActive(true);
     setActiveThreadActivity("progress", true, "Turn running");
   }
@@ -2545,6 +2710,39 @@ function renderLiveTurnSnapshot(snap) {
     });
     renderServerRequest(request);
   }
+}
+
+function renderLiveTurnUserInput(turnId, userInput) {
+  const text = userInput && userInput.text;
+  if (!turnId || !text) return;
+  const exists = Array.from(document.querySelectorAll(".msg.user")).some(
+    row => row.dataset && String(row.dataset.turn || "") === String(turnId)
+  );
+  if (exists) return;
+  const body = bubble("user","you");
+  body.parentElement.dataset.liveUserInput = "true";
+  renderItemBody(body, { kind:"user_message", text });
+}
+
+function provisionalUserBodyForTurn(turnId) {
+  const target = renderTarget();
+  return Array.from(target.querySelectorAll(".msg.user[data-live-user-input='true'] .body")).find(
+    body => body.parentElement && String(body.parentElement.dataset.turn || "") === String(turnId || "")
+  ) || null;
+}
+
+function isSyntheticSubagentPrompt(item) {
+  return !!(item && String(item.harness_item_id || "").startsWith("subagent_prompt:"));
+}
+
+function placeRowFirstInTurn(row, turnId) {
+  const target = row && row.parentElement;
+  if (!target || !turnId) return;
+  const first = Array.from(target.children).find(candidate =>
+    candidate !== row && candidate.classList && candidate.classList.contains("msg") &&
+    String(candidate.dataset.turn || "") === String(turnId)
+  );
+  if (first) target.insertBefore(row, first);
 }
 
 function renderApprovalRequest(request) {
@@ -3973,6 +4171,108 @@ function renderTasksButton(cmds) {
   btn.title = count ? `${count} running task${count === 1 ? "" : "s"}` : "No running tasks";
   $("tasksCount").textContent = String(count);
 }
+
+function subagentThreadsForActiveProject() {
+  const activeThreadId = state.threadId ? String(state.threadId) : "";
+  const threads = knownProjectThreads(state.projectId);
+  return threads.filter(t =>
+    isManagedSubagentThread(t, threads) && String(t.parent_thread_id || "") === activeThreadId
+  );
+}
+
+function subagentActivityForThread(threadId) {
+  return state.threadActivity.get(String(threadId || "")) || null;
+}
+
+function subagentIsRunning(thread) {
+  const activity = subagentActivityForThread(thread.id);
+  return !!(activity && activity.active_turn);
+}
+
+function subagentCounts() {
+  const agents = subagentThreadsForActiveProject();
+  const running = agents.filter(subagentIsRunning).length;
+  return { total:agents.length, running };
+}
+
+function renderSubagentsButton() {
+  const btn = $("subagentsBtn");
+  if (!btn) return;
+  const counts = subagentCounts();
+  const stateName = counts.running ? "running" : "idle";
+  btn.className = `badge subagents-btn state-${stateName}`;
+  btn.disabled = !state.projectId || (!counts.total && !counts.running);
+  btn.title = counts.total
+    ? `${counts.running} running sub-agent${counts.running === 1 ? "" : "s"} · ${counts.total} total`
+    : "No sub-agents";
+  $("subagentsCount").textContent = String(counts.running || counts.total);
+  if (!$("subagentsMenu").hidden) renderSubagentsMenu();
+}
+
+function renderSubagentsMenu() {
+  const menu = $("subagentsMenu");
+  const agents = subagentThreadsForActiveProject();
+  const counts = subagentCounts();
+  const rows = agents.map(renderSubagentCard).join("");
+  const summary = agents.length
+    ? `<div class="subagents-summary">${counts.running} running · ${counts.total} total</div>`
+    : "";
+  menu.innerHTML = `
+    <div class="subagents-head">
+      <strong>Sub-agents</strong>
+      <button id="subagentsClose" type="button">Close</button>
+    </div>
+    ${summary}
+    <div class="subagents-list">${rows || `<div class="muted">No sub-agents for this thread yet.</div>`}</div>`;
+  $("subagentsClose").onclick = () => { $("subagentsMenu").hidden = true; };
+  menu.querySelectorAll("[data-subagent-thread-id]").forEach(btn => {
+    btn.onclick = () => {
+      const tid = btn.dataset.subagentThreadId;
+      const meta = threadMetaForId(tid) || agents.find(t => String(t.id) === String(tid));
+      openThread(state.projectId, tid, (meta && meta.title) || "Sub-agent");
+    };
+  });
+}
+
+function renderSubagentCard(thread) {
+  const activity = subagentActivityForThread(thread.id);
+  const running = !!(activity && activity.active_turn);
+  const stateLabel = running ? "Running" : (activity && activity.kind === "error" ? "Error" : "Idle");
+  const parent = thread.parent_thread_id ? knownProjectThreads(state.projectId).find(t => String(t.id) === String(thread.parent_thread_id)) : null;
+  const parentLabel = parent && parent.title ? `Parent: ${parent.title}` : "Parent thread";
+  const summary = activity && activity.summary ? activity.summary : parentLabel;
+  const active = state.threadId && String(state.threadId) === String(thread.id);
+  const name = subagentDisplayName(thread);
+  return `<button type="button" class="subagent-card${active ? " active" : ""}" data-subagent-thread-id="${escapeAttr(thread.id)}">
+    <span class="subagent-card-title">
+      <span class="subagent-card-name">${escapeHtml(name)}</span>
+      <span class="subagent-card-state${running ? " running" : ""}">${stateLabel}</span>
+    </span>
+    <span class="subagent-card-meta">${escapeHtml(summary)}</span>
+  </button>`;
+}
+
+function subagentDisplayName(thread) {
+  const title = String((thread && thread.title) || "").trim();
+  const name = title.replace(/^Sub-agent:\s*/i, "").trim();
+  return name && !subagentNameLooksLikeId(name) ? name : "Sub-agent";
+}
+
+function subagentNameLooksLikeId(name) {
+  return /^[0-9a-f]{8,}(?:-[0-9a-f]{4,})+$/i.test(String(name || "").trim());
+}
+
+function toggleSubagentsMenu() {
+  const menu = $("subagentsMenu");
+  menu.hidden = !menu.hidden;
+  if (!menu.hidden) {
+    $("tasksMenu").hidden = true;
+    $("mcpMenu").hidden = true;
+    $("usageMenu").hidden = true;
+    renderSubagentsMenu();
+  }
+}
+
 function taskButtonState(cmds) {
   if (!cmds.length) return "idle";
   if (cmds.some(cmd => cmd.terminating)) return "stopping";
@@ -4054,6 +4354,7 @@ function toggleTasksMenu() {
   const menu = $("tasksMenu");
   menu.hidden = !menu.hidden;
   if (!menu.hidden) {
+    $("subagentsMenu").hidden = true;
     $("mcpMenu").hidden = true;
     $("usageMenu").hidden = true;
     renderTasksMenu();
@@ -4061,6 +4362,14 @@ function toggleTasksMenu() {
 }
 $("tasksBtn").onclick = (e) => { e.stopPropagation(); toggleTasksMenu(); };
 $("tasksMenu").onclick = (e) => e.stopPropagation();
+$("subagentsBtn").onclick = (e) => { e.stopPropagation(); toggleSubagentsMenu(); };
+$("subagentsMenu").onclick = (e) => e.stopPropagation();
+document.addEventListener("click", (e) => {
+  const menu = $("subagentsMenu");
+  if (menu.hidden) return;
+  if (e.target.closest && e.target.closest(".subagents-wrap")) return;
+  menu.hidden = true;
+});
 document.addEventListener("click", (e) => {
   const menu = $("tasksMenu");
   if (menu.hidden) return;
@@ -4165,6 +4474,8 @@ function startToolCall(item, turnId) {
     output:null,
     server:tool.server || null,
     status:tool.status || "in_progress",
+    metadata:tool.metadata || null,
+    subagent:tool.subagent || null,
     error:null
   });
 }
@@ -4184,6 +4495,8 @@ function appendToolProgress(turnId, itemId, text) {
       output:null,
       server:null,
       status:"in_progress",
+      metadata:null,
+      subagent:null,
       error:null
     });
   }
@@ -4329,6 +4642,9 @@ function addItem(item, turnId, fromHistory) {
       }
       registerRenderedItemBody(existing, item, turnId);
       renderItemBodyForItem(existing, item, turnId);
+      if (p.kind==="user_message" && isSyntheticSubagentPrompt(item)) {
+        placeRowFirstInTurn(existing.parentElement, turnId);
+      }
       if (p.kind==="command_execution") finishRunningCommand(item, turnId);
       markRenderedItem(item, turnId);
       return;
@@ -4358,9 +4674,19 @@ function addItem(item, turnId, fromHistory) {
       markRenderedItem(item, turnId);
       return;
     }
+    const provisionalBody = provisionalUserBodyForTurn(turnId);
+    if (provisionalBody) {
+      delete provisionalBody.parentElement.dataset.liveUserInput;
+      renderItemBodyForItem(provisionalBody, item, turnId);
+      registerRenderedItemBody(provisionalBody, item, turnId);
+      placeRowFirstInTurn(provisionalBody.parentElement, turnId);
+      markRenderedItem(item, turnId);
+      return;
+    }
     const body = bubble("user","you");
     renderItemBody(body, p);
     registerRenderedItemBody(body, item, turnId);
+    if (isSyntheticSubagentPrompt(item)) placeRowFirstInTurn(body.parentElement, turnId);
   }
   else {
     if (p.kind==="file_change") {
@@ -4563,6 +4889,7 @@ function renderItemBody(body, p) {
     renderToolBody(body, p);
   } else if (p.kind==="activity") {
     body.innerHTML = renderActivity(p);
+    attachSubagentLinkActions(body, p);
   }
   const taskItemId = msg.dataset.commandItemId || msg.dataset.toolItemId || "";
   if (taskItemId) {
@@ -4954,6 +5281,7 @@ function renderToolBody(body, p) {
     phase:stateName === "running" ? "running" : "completed",
     blocks:toolIoBlocks(p)
   });
+  attachSubagentLinkActions(body, p);
   if (p.error) {
     const err = document.createElement("div");
     err.className = "meta";
@@ -5052,10 +5380,94 @@ function toolTerminalDurationMs(msg, startedAtMs) {
 }
 function renderActivity(p) {
   if (isImageViewActivity(p)) return renderImageViewActivity(p);
+  if (subagentLinkInfo(p)) return renderSubagentActivity(p);
   const detail = p.detail ? `<div>${escapeHtml(p.detail)}</div>` : "";
   const metadata = visibleActivityMetadata(p);
   const meta = metadata ? `<pre class="out">${escapeHtml(jsonPreview(metadata))}</pre>` : "";
   return `<div>${escapeHtml(p.title||"Activity")}</div>${detail}${meta}`;
+}
+function subagentLinkInfo(p) {
+  const link = p && p.subagent;
+  if (!link) return null;
+  return {
+    agentPath:String(link.path || ""),
+    title:p.title || "Sub-agent"
+  };
+}
+function renderSubagentActivity(p) {
+  const info = subagentLinkInfo(p);
+  if (!info) return "";
+  const detail = p.detail ? `<div>${escapeHtml(p.detail)}</div>` : "";
+  return [
+    `<div>${escapeHtml(info.title)}</div>`,
+    detail,
+    `<button type="button" class="subagent-open-btn" data-agent-path="${escapeAttr(info.agentPath)}">Open linked thread</button>`
+  ].join("");
+}
+function attachSubagentLinkActions(body, p) {
+  const info = subagentLinkInfo(p);
+  if (!info) return;
+  let btn = body.querySelector(".subagent-open-btn");
+  if (!btn) {
+    btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "subagent-open-btn";
+    btn.textContent = "Open linked thread";
+    body.append(btn);
+  }
+  const parentTid = state.threadId;
+  btn.dataset.agentPath = info.agentPath;
+  btn.onclick = () => openSubagentThreadFromActivity(btn, info, {
+    focus:true,
+    parentTid,
+    itemId:subagentActivityItemId(btn)
+  });
+}
+
+function validGiskardItemId(value) {
+  const itemId = value === undefined || value === null ? "" : String(value).trim();
+  return /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/i.test(itemId) ? itemId : null;
+}
+
+function subagentActivityItemId(btn) {
+  const row = btn && btn.closest ? btn.closest(".msg") : null;
+  const ids = identityTokens(row && row.dataset ? row.dataset.item : null);
+  return ids.map(validGiskardItemId).find(Boolean) || null;
+}
+function subagentImportKey(pid, parentTid, itemId) {
+  return [pid || "", parentTid || "", itemId || ""].join(":");
+}
+async function importSubagentThread(parentTid, itemId) {
+  const pid = state.projectId;
+  const res = await api(
+    "POST",
+    `/api/projects/${pid}/threads/${parentTid}/subagent-links/${itemId}/open`
+  );
+  return { threadId:res.thread_id, title:res.title || "Sub-agent" };
+}
+async function openSubagentThreadFromActivity(btn, info, opts) {
+  opts = opts || {};
+  const itemId = validGiskardItemId(opts.itemId);
+  if (!state.projectId || !opts.parentTid || !info || !itemId) return;
+  btn.dataset.linkItemId = itemId;
+  const key = subagentImportKey(state.projectId, opts.parentTid, itemId);
+  let imported = state.subagentImports.get(key);
+  if (!imported || !imported.threadId) {
+    btn.disabled = true;
+    btn.textContent = "Opening...";
+    try {
+      const result = await importSubagentThread(opts.parentTid, itemId);
+      imported = { status:"ready", threadId:result.threadId, title:result.title };
+      state.subagentImports.set(key, imported);
+      await loadThreads(state.projectId);
+    } catch (e) {
+      btn.disabled = false;
+      btn.textContent = "Open linked thread";
+      notice("Open linked thread failed: " + apiFailureMessage(e), "error");
+      return;
+    }
+  }
+  await openThread(state.projectId, imported.threadId, imported.title || "Sub-agent");
 }
 function isImageViewActivity(p) {
   return !!(p && p.kind === "activity" && p.title === "Image viewed" && imageViewPath(p));
@@ -5278,6 +5690,7 @@ function toggleMcpMenu() {
   menu.hidden = !menu.hidden;
   if (!menu.hidden) {
     $("tasksMenu").hidden = true;
+    $("subagentsMenu").hidden = true;
     $("usageMenu").hidden = true;
     renderMcpMenu();
     loadMcpServers({ announce:false });
@@ -6230,6 +6643,7 @@ function toggleUsageMenu() {
   menu.hidden = !menu.hidden;
   if (!menu.hidden) {
     $("tasksMenu").hidden = true;
+    $("subagentsMenu").hidden = true;
     $("mcpMenu").hidden = true;
     renderUsageMenu();
   }

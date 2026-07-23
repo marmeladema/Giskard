@@ -8,6 +8,10 @@ export const PASSWORD = process.env.GISKARD_REPLAY_PASSWORD ?? "giskard";
  * `SCRIPTED_REPLY` in `crates/giskard-server/src/bin/giskard-server-replay.rs`.
  */
 export const SCRIPTED_REPLY = "Hello from the scripted replay harness!";
+export const SCRIPTED_SUBAGENT_TRIGGER = "Spawn the scripted linked sub-agent.";
+export const SCRIPTED_NESTED_SUBAGENT_TRIGGER = "Spawn a scripted nested sub-agent.";
+export const SCRIPTED_SUBAGENT_PROMPT = "Review the linked child task.";
+export const SCRIPTED_SUBAGENT_REPLY = "Child replay output";
 
 /** Log in through the real login form and wait for the app shell to become visible. */
 export async function login(page: Page, password: string = PASSWORD): Promise<void> {

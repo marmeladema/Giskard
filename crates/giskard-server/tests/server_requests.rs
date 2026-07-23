@@ -94,6 +94,8 @@ impl AgentHarness for ServerRequestHarness {
                 .unwrap_or_else(|| "server_request_harness".into()),
             warning: None,
             resumed_model: Some(opts.initial_model.clone()),
+            agent_name: None,
+            parent_harness_thread_id: None,
         })
     }
 
@@ -514,7 +516,7 @@ async fn wait_for_server_request(ws: &mut TestWs) {
         match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
                 if let Ok(ServerMessage::Event { agent_event, .. }) = serde_json::from_str(&text) {
-                    if matches!(agent_event, WireAgentEvent::ServerRequestReceived { .. }) {
+                    if matches!(*agent_event, WireAgentEvent::ServerRequestReceived { .. }) {
                         return;
                     }
                 }

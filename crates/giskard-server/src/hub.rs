@@ -131,7 +131,7 @@ impl Hub {
             thread_id,
             ServerMessage::Event {
                 thread_id,
-                agent_event: event.into(),
+                agent_event: Box::new(event.into()),
             },
         )
         .await;

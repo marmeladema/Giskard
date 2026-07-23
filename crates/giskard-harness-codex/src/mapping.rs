@@ -14,10 +14,12 @@ use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{
     CommandExecutionStart, FileChangeEntry, FileChangeKind, Item, ItemDelta, ItemKind, ItemPayload,
-    ItemStart, ToolCallStart, command_status_is_running, normalized_command_status,
+    ItemStart, SubagentAction, SubagentLink, SubagentStatus, ToolCallStart,
+    command_status_is_running, normalized_command_status,
 };
 use giskard_core::model::ModelRef;
 use giskard_core::server_request::ServerRequest as GiskardServerRequest;
+use giskard_core::text::trimmed_non_empty;
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{ApprovalPolicy, Mode, TurnStatus, TurnStatusKind};
 
@@ -105,6 +107,10 @@ impl CodexMapper {
 
     pub fn has_running_commands(&self) -> bool {
         !self.running_commands.is_empty()
+    }
+
+    pub fn has_active_turns(&self) -> bool {
+        !self.active_turns.is_empty()
     }
 
     pub fn running_command_fallback_thread(&self) -> Option<ThreadId> {
@@ -561,6 +567,7 @@ impl CodexMapper {
                             title: "Context compacted".into(),
                             detail: None,
                             metadata: serde_json::to_value(n).ok(),
+                            subagent: None,
                         },
                         created_at: Utc::now(),
                     },
@@ -734,6 +741,7 @@ impl CodexMapper {
                     title: title.into(),
                     detail: (!detail.trim().is_empty()).then_some(detail),
                     metadata: serde_json::to_value(metadata).ok(),
+                    subagent: None,
                 },
                 created_at: Utc::now(),
             },
@@ -1861,8 +1869,7 @@ fn mcp_elicitation_meta(
 fn string_field<'a>(map: &'a serde_json::Map<String, Value>, key: &str) -> Option<&'a str> {
     map.get(key)
         .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+        .and_then(trimmed_non_empty)
 }
 
 fn to_json_value<T: Serialize>(value: &T) -> Value {
@@ -2213,6 +2220,8 @@ fn map_thread_item_start(
             input: arguments.clone(),
             server: Some(server.clone()),
             status: Some(tool_status_string(status)),
+            metadata: None,
+            subagent: None,
             started_at_ms,
         }),
         codex_codes::ThreadItem::DynamicToolCall {
@@ -2226,6 +2235,8 @@ fn map_thread_item_start(
             input: arguments.clone(),
             server: namespace.clone(),
             status: Some(tool_status_string(status)),
+            metadata: None,
+            subagent: None,
             started_at_ms,
         }),
         codex_codes::ThreadItem::CollabAgentToolCall {
@@ -2233,6 +2244,8 @@ fn map_thread_item_start(
             status,
             prompt,
             model,
+            agents_states,
+            receiver_thread_ids,
             ..
         } => Some(ToolCallStart {
             name: json_display(tool),
@@ -2242,6 +2255,13 @@ fn map_thread_item_start(
             }),
             server: Some("collab-agent".into()),
             status: Some(json_display(status)),
+            metadata: None,
+            subagent: collab_agent_link(
+                tool,
+                agents_states,
+                receiver_thread_ids,
+                prompt.as_deref(),
+            ),
             started_at_ms,
         }),
         _ => None,
@@ -2334,6 +2354,8 @@ fn map_thread_item_complete(
             output: result.as_ref().and_then(json_value),
             server: Some(server.clone()),
             status: Some(enum_string(status)),
+            metadata: None,
+            subagent: None,
             error: error.as_ref().map(|e| e.message.clone()),
         },
         codex_codes::ThreadItem::DynamicToolCall {
@@ -2353,6 +2375,8 @@ fn map_thread_item_complete(
                 .or_else(|| success.map(|s| json!({ "success": s }))),
             server: namespace.clone(),
             status: Some(enum_string(status)),
+            metadata: None,
+            subagent: None,
             error: None,
         },
         codex_codes::ThreadItem::CollabAgentToolCall {
@@ -2360,6 +2384,8 @@ fn map_thread_item_complete(
             status,
             prompt,
             model,
+            agents_states,
+            receiver_thread_ids,
             ..
         } => ItemPayload::ToolCall {
             name: json_display(tool),
@@ -2370,6 +2396,13 @@ fn map_thread_item_complete(
             output: Some(status.clone()),
             server: Some("collab-agent".into()),
             status: Some(json_display(status)),
+            metadata: None,
+            subagent: collab_agent_link(
+                tool,
+                agents_states,
+                receiver_thread_ids,
+                prompt.as_deref(),
+            ),
             error: None,
         },
         codex_codes::ThreadItem::HookPrompt { fragments, .. } => ItemPayload::Activity {
@@ -2382,6 +2415,7 @@ fn map_thread_item_complete(
                     .join("\n"),
             ),
             metadata: json_value(fragments),
+            subagent: None,
         },
         codex_codes::ThreadItem::SubAgentActivity {
             agent_path,
@@ -2389,24 +2423,35 @@ fn map_thread_item_complete(
             kind,
             ..
         } => ItemPayload::Activity {
-            title: format!("Sub-agent {}", enum_string(kind)),
-            detail: Some(format!("{agent_path} ({agent_thread_id})")),
-            metadata: json_value(item),
+            title: subagent_activity_title(agent_path, kind),
+            detail: None,
+            metadata: None,
+            subagent: Some(SubagentLink {
+                harness_thread_id: agent_thread_id.clone(),
+                path: Some(agent_path.clone()),
+                initial_prompt: None,
+                action: subagent_activity_action(kind),
+                status: None,
+                message: None,
+            }),
         },
         codex_codes::ThreadItem::WebSearch { query, action, .. } => ItemPayload::Activity {
             title: "Web search".into(),
             detail: Some(query.clone()),
             metadata: action.as_ref().and_then(json_value),
+            subagent: None,
         },
         codex_codes::ThreadItem::ImageView { path, .. } => ItemPayload::Activity {
             title: "Image viewed".into(),
             detail: Some(path.0.clone()),
             metadata: json_value(item),
+            subagent: None,
         },
         codex_codes::ThreadItem::Sleep { duration_ms, .. } => ItemPayload::Activity {
             title: "Sleep".into(),
             detail: Some(format!("{duration_ms} ms")),
             metadata: json_value(item),
+            subagent: None,
         },
         codex_codes::ThreadItem::ImageGeneration {
             status,
@@ -2429,21 +2474,25 @@ fn map_thread_item_complete(
                 .join("\n"),
             ),
             metadata: json_value(item),
+            subagent: None,
         },
         codex_codes::ThreadItem::EnteredReviewMode { review, .. } => ItemPayload::Activity {
             title: "Entered review mode".into(),
             detail: Some(review.clone()),
             metadata: None,
+            subagent: None,
         },
         codex_codes::ThreadItem::ExitedReviewMode { review, .. } => ItemPayload::Activity {
             title: "Exited review mode".into(),
             detail: Some(review.clone()),
             metadata: None,
+            subagent: None,
         },
         codex_codes::ThreadItem::ContextCompaction { .. } => ItemPayload::Activity {
             title: "Context compacted".into(),
             detail: None,
             metadata: json_value(item),
+            subagent: None,
         },
     };
 
@@ -2466,6 +2515,106 @@ fn json_display(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
         _ => value.to_string(),
+    }
+}
+
+fn collab_agent_link(
+    tool: &Value,
+    agents_states: &impl Serialize,
+    receiver_thread_ids: &[String],
+    prompt: Option<&str>,
+) -> Option<SubagentLink> {
+    let tool = json_display(tool);
+    let mut receivers = receiver_thread_ids
+        .iter()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty());
+    let harness_thread_id = receivers.next()?.to_owned();
+    // `wait` may target multiple children, while the neutral item schema deliberately carries one
+    // link. Do not attribute aggregate status or fallback output to an arbitrary receiver.
+    if tool == "wait" && receivers.next().is_some() {
+        return None;
+    }
+    let action = match tool.as_str() {
+        "spawnAgent" => SubagentAction::Spawned,
+        "sendInput" | "wait" => SubagentAction::Interacted,
+        "resumeAgent" => SubagentAction::Started,
+        "closeAgent" => SubagentAction::Interrupted,
+        _ => return None,
+    };
+    let state = serde_json::to_value(agents_states)
+        .ok()
+        .and_then(|value| subagent_link_state_from_json(&value, &harness_thread_id));
+    let (status, message) = state
+        .map(|state| (state.status, state.message))
+        .unwrap_or_default();
+    Some(SubagentLink {
+        harness_thread_id,
+        path: None,
+        initial_prompt: (tool == "spawnAgent")
+            .then(|| prompt.and_then(trimmed_non_empty).map(ToOwned::to_owned))
+            .flatten(),
+        action,
+        status,
+        message,
+    })
+}
+
+struct SubagentLinkState {
+    status: Option<SubagentStatus>,
+    message: Option<String>,
+}
+
+fn subagent_link_state_from_json(
+    value: &Value,
+    harness_thread_id: &str,
+) -> Option<SubagentLinkState> {
+    // Codex keys `agentsStates` by native thread id, not by nickname or agent path. Looking up the
+    // linked receiver is essential when a `wait` result contains states for multiple children.
+    let state = value.as_object()?.get(harness_thread_id)?;
+    let status = state
+        .get("status")
+        .and_then(Value::as_str)
+        .and_then(codex_subagent_status);
+    let message = state
+        .get("message")
+        .and_then(Value::as_str)
+        .and_then(trimmed_non_empty)
+        .map(ToOwned::to_owned);
+    Some(SubagentLinkState { status, message })
+}
+
+fn codex_subagent_status(status: &str) -> Option<SubagentStatus> {
+    match status {
+        "pendingInit" => Some(SubagentStatus::Pending),
+        "running" => Some(SubagentStatus::Running),
+        "completed" => Some(SubagentStatus::Completed),
+        "interrupted" => Some(SubagentStatus::Interrupted),
+        "errored" => Some(SubagentStatus::Failed),
+        "shutdown" => Some(SubagentStatus::Shutdown),
+        "notFound" => Some(SubagentStatus::NotFound),
+        _ => None,
+    }
+}
+
+fn subagent_activity_action(kind: &codex_codes::SubAgentActivityKind) -> SubagentAction {
+    match kind {
+        codex_codes::SubAgentActivityKind::Started => SubagentAction::Started,
+        codex_codes::SubAgentActivityKind::Interacted => SubagentAction::Interacted,
+        codex_codes::SubAgentActivityKind::Interrupted => SubagentAction::Interrupted,
+    }
+}
+
+fn subagent_activity_title(agent_path: &str, kind: &codex_codes::SubAgentActivityKind) -> String {
+    let action = enum_string(kind);
+    let task_name = agent_path
+        .rsplit('/')
+        .map(str::trim)
+        .find(|segment| !segment.is_empty());
+
+    match task_name {
+        Some(task_name) => format!("Sub-agent {task_name} {action}"),
+        None => format!("Sub-agent {action}"),
     }
 }
 
@@ -4553,6 +4702,292 @@ mod tests {
     }
 
     #[test]
+    fn collab_agent_spawn_maps_to_subagent_link() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let notif = completed_item(serde_json::json!({
+            "type": "collabAgentToolCall",
+            "id": "collab1",
+            "tool": "spawnAgent",
+            "status": "completed",
+            "prompt": "Investigate the issue",
+            "model": "gpt-5.6-terra",
+            "senderThreadId": "parent-native",
+            "receiverThreadIds": ["child-native"],
+            "agentsStates": {
+                "child-native": { "status": "completed", "message": "Done" }
+            }
+        }));
+
+        match mapper.map_notification(&notif, ThreadId::new()).unwrap() {
+            AgentEvent::ItemCompleted { item, .. } => match item.payload {
+                ItemPayload::ToolCall {
+                    name,
+                    server,
+                    metadata,
+                    subagent,
+                    ..
+                } => {
+                    assert_eq!(name, "spawnAgent");
+                    assert_eq!(server.as_deref(), Some("collab-agent"));
+                    assert_eq!(metadata, None);
+                    let subagent = subagent.expect("spawn link is preserved");
+                    assert_eq!(subagent.harness_thread_id, "child-native");
+                    assert_eq!(subagent.path, None);
+                    assert_eq!(
+                        subagent.initial_prompt.as_deref(),
+                        Some("Investigate the issue")
+                    );
+                    assert_eq!(subagent.action, SubagentAction::Spawned);
+                    assert_eq!(subagent.status, Some(SubagentStatus::Completed));
+                    assert_eq!(subagent.message.as_deref(), Some("Done"));
+                }
+                other => panic!("expected tool call, got {other:?}"),
+            },
+            other => panic!("expected item completion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_collab_agent_spawn_start_without_receiver_has_no_link() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let notif = started_item(serde_json::json!({
+            "type": "collabAgentToolCall",
+            "id": "collab-start",
+            "tool": "spawnAgent",
+            "status": "inProgress",
+            "prompt": "Investigate while streaming",
+            "model": "gpt-5.5",
+            "senderThreadId": "parent-native",
+            "receiverThreadIds": [],
+            "agentsStates": {}
+        }));
+
+        match mapper.map_notification(&notif, ThreadId::new()).unwrap() {
+            AgentEvent::ItemStarted { item, .. } => {
+                let tool = item.tool.expect("spawn start metadata is preserved");
+                assert_eq!(tool.name, "spawnAgent");
+                assert_eq!(tool.subagent, None);
+            }
+            other => panic!("expected item start, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collab_agent_spawn_does_not_use_receiver_id_as_display_path() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let notif = completed_item(serde_json::json!({
+            "type": "collabAgentToolCall",
+            "id": "collab1",
+            "tool": "spawnAgent",
+            "status": "completed",
+            "prompt": "Investigate the issue",
+            "model": "gpt-5.6-terra",
+            "senderThreadId": "parent-native",
+            "receiverThreadIds": ["child-native"],
+            "agentsStates": {
+                "child-native": { "status": "completed", "message": "Done" }
+            }
+        }));
+
+        match mapper.map_notification(&notif, ThreadId::new()).unwrap() {
+            AgentEvent::ItemCompleted { item, .. } => match item.payload {
+                ItemPayload::ToolCall { subagent, .. } => {
+                    let subagent = subagent.expect("spawn link is preserved");
+                    assert_eq!(subagent.harness_thread_id, "child-native");
+                    assert_eq!(subagent.path, None);
+                    assert_eq!(subagent.status, Some(SubagentStatus::Completed));
+                    assert_eq!(subagent.message.as_deref(), Some("Done"));
+                }
+                other => panic!("expected tool call, got {other:?}"),
+            },
+            other => panic!("expected item completion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collab_agent_state_is_selected_by_receiver_thread_id() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let notif = completed_item(serde_json::json!({
+            "type": "collabAgentToolCall",
+            "id": "collab1",
+            "tool": "sendInput",
+            "status": "completed",
+            "prompt": "Continue",
+            "model": null,
+            "senderThreadId": "parent-native",
+            "receiverThreadIds": ["child-native"],
+            "agentsStates": {
+                "aaa-other-child": { "status": "completed", "message": "Wrong child" },
+                "child-native": { "status": "running", "message": "Still working" }
+            }
+        }));
+
+        match mapper.map_notification(&notif, ThreadId::new()).unwrap() {
+            AgentEvent::ItemCompleted { item, .. } => match item.payload {
+                ItemPayload::ToolCall { subagent, .. } => {
+                    let subagent = subagent.expect("interaction link is preserved");
+                    assert_eq!(subagent.harness_thread_id, "child-native");
+                    assert_eq!(subagent.path, None);
+                    assert_eq!(subagent.initial_prompt, None);
+                    assert_eq!(subagent.action, SubagentAction::Interacted);
+                    assert_eq!(subagent.status, Some(SubagentStatus::Running));
+                    assert_eq!(subagent.message.as_deref(), Some("Still working"));
+                }
+                other => panic!("expected tool call, got {other:?}"),
+            },
+            other => panic!("expected item completion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_collab_lifecycle_tools_map_single_child_links() {
+        for (tool, expected_action, status) in [
+            ("resumeAgent", SubagentAction::Started, "running"),
+            ("wait", SubagentAction::Interacted, "completed"),
+            ("closeAgent", SubagentAction::Interrupted, "shutdown"),
+        ] {
+            let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+            let notif = completed_item(serde_json::json!({
+                "type": "collabAgentToolCall",
+                "id": format!("collab-{tool}"),
+                "tool": tool,
+                "status": "completed",
+                "prompt": null,
+                "model": null,
+                "senderThreadId": "parent-native",
+                "receiverThreadIds": ["child-native"],
+                "agentsStates": {
+                    "child-native": { "status": status, "message": "Lifecycle result" }
+                }
+            }));
+
+            match mapper.map_notification(&notif, ThreadId::new()).unwrap() {
+                AgentEvent::ItemCompleted { item, .. } => match item.payload {
+                    ItemPayload::ToolCall { subagent, .. } => {
+                        let subagent = subagent.expect("lifecycle link is preserved");
+                        assert_eq!(subagent.harness_thread_id, "child-native");
+                        assert_eq!(subagent.action, expected_action);
+                        assert_eq!(subagent.message.as_deref(), Some("Lifecycle result"));
+                    }
+                    other => panic!("expected tool call, got {other:?}"),
+                },
+                other => panic!("expected item completion, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_wait_with_multiple_receivers_has_no_ambiguous_link() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let notif = completed_item(serde_json::json!({
+            "type": "collabAgentToolCall",
+            "id": "collab-wait",
+            "tool": "wait",
+            "status": "completed",
+            "prompt": null,
+            "model": null,
+            "senderThreadId": "parent-native",
+            "receiverThreadIds": ["child-a", "child-b"],
+            "agentsStates": {
+                "child-a": { "status": "completed", "message": "A" },
+                "child-b": { "status": "completed", "message": "B" }
+            }
+        }));
+
+        match mapper.map_notification(&notif, ThreadId::new()).unwrap() {
+            AgentEvent::ItemCompleted { item, .. } => match item.payload {
+                ItemPayload::ToolCall { subagent, .. } => assert_eq!(subagent, None),
+                other => panic!("expected tool call, got {other:?}"),
+            },
+            other => panic!("expected item completion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subagent_activity_maps_to_subagent_link() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let notif = completed_item(serde_json::json!({
+            "type": "subAgentActivity",
+            "id": "subagent1",
+            "kind": "interacted",
+            "agentThreadId": "child-native",
+            "agentPath": "explorer"
+        }));
+
+        match mapper.map_notification(&notif, ThreadId::new()).unwrap() {
+            AgentEvent::ItemCompleted { item, .. } => match item.payload {
+                ItemPayload::Activity {
+                    title,
+                    detail,
+                    metadata,
+                    subagent,
+                    ..
+                } => {
+                    assert_eq!(title, "Sub-agent explorer interacted");
+                    assert_eq!(detail, None);
+                    assert_eq!(metadata, None);
+                    let subagent = subagent.expect("activity link is preserved");
+                    assert_eq!(subagent.harness_thread_id, "child-native");
+                    assert_eq!(subagent.path.as_deref(), Some("explorer"));
+                    assert_eq!(subagent.action, SubagentAction::Interacted);
+                    assert_eq!(subagent.status, None);
+                    assert_eq!(subagent.message, None);
+                }
+                other => panic!("expected activity, got {other:?}"),
+            },
+            other => panic!("expected item completion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn current_subagent_started_activity_maps_without_inventing_a_prompt() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let notif = completed_item(serde_json::json!({
+            "type": "subAgentActivity",
+            "id": "subagent-started",
+            "kind": "started",
+            "agentThreadId": "child-native",
+            "agentPath": "/root/explorer"
+        }));
+
+        match mapper.map_notification(&notif, ThreadId::new()).unwrap() {
+            AgentEvent::ItemCompleted { item, .. } => match item.payload {
+                ItemPayload::Activity {
+                    title,
+                    detail,
+                    subagent,
+                    ..
+                } => {
+                    assert_eq!(title, "Sub-agent explorer started");
+                    assert_eq!(detail, None);
+                    let subagent = subagent.expect("started activity exposes the child link");
+                    assert_eq!(subagent.harness_thread_id, "child-native");
+                    assert_eq!(subagent.path.as_deref(), Some("/root/explorer"));
+                    assert_eq!(subagent.initial_prompt, None);
+                    assert_eq!(subagent.action, SubagentAction::Started);
+                }
+                other => panic!("expected activity, got {other:?}"),
+            },
+            other => panic!("expected item completion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subagent_activity_title_uses_path_leaf_with_a_safe_fallback() {
+        assert_eq!(
+            subagent_activity_title(
+                "/root/nested_reload_parent",
+                &codex_codes::SubAgentActivityKind::Started,
+            ),
+            "Sub-agent nested_reload_parent started"
+        );
+        assert_eq!(
+            subagent_activity_title("///", &codex_codes::SubAgentActivityKind::Interrupted),
+            "Sub-agent interrupted"
+        );
+    }
+
+    #[test]
     fn mcp_tool_call_started_preserves_pending_tool_metadata() {
         let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
         let notif = started_item(serde_json::json!({
@@ -4615,6 +5050,7 @@ mod tests {
                     title,
                     detail,
                     metadata,
+                    ..
                 } => {
                     assert_eq!(title, "Image viewed");
                     assert_eq!(detail.as_deref(), Some("/tmp/project/screenshot.png"));
@@ -4642,6 +5078,7 @@ mod tests {
                     title,
                     detail,
                     metadata,
+                    ..
                 } => {
                     assert_eq!(title, "Context compacted");
                     assert_eq!(detail, None);
@@ -4672,6 +5109,7 @@ mod tests {
                     title,
                     detail,
                     metadata,
+                    ..
                 } => {
                     assert_eq!(title, "Context compacted");
                     assert_eq!(detail, None);

@@ -79,12 +79,22 @@
         <div class="mbTitle" id="mbTitle">Giskard</div>
       </div>
       <header class="thr" id="thrHeader" style="display:none">
+        <button id="parentThreadBtn" class="badge parent-thread-btn" type="button" hidden
+                title="Back to parent thread" aria-label="Back to parent thread">
+          <span aria-hidden="true">←</span><span>Parent</span>
+        </button>
         <span id="wsStatusBadge" class="badge ws-badge state-closed" title="WebSocket disconnected">Disconnected</span>
         <div class="tasks-wrap">
           <button id="tasksBtn" class="badge tasks-btn state-idle" title="Running tasks" aria-label="Running tasks">
             <span>Tasks</span><span id="tasksCount" class="mono">0</span>
           </button>
           <div id="tasksMenu" class="tasks-popover" hidden></div>
+        </div>
+        <div class="subagents-wrap">
+          <button id="subagentsBtn" class="badge subagents-btn state-idle" title="Sub-agents" aria-label="Sub-agents">
+            <span>Sub-agents</span><span id="subagentsCount" class="mono">0</span>
+          </button>
+          <div id="subagentsMenu" class="subagents-popover" hidden></div>
         </div>
         <div class="mcp-wrap">
           <button id="mcpBtn" class="badge mcp-btn" title="MCP servers" aria-label="MCP servers">

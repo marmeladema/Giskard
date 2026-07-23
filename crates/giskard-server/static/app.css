@@ -94,7 +94,10 @@
   .project-menu button:hover { background:var(--panel2); }
   .project-threads[hidden] { display:none; }
   .thread-row { position:relative; display:flex; align-items:center; gap:4px; margin:3px 0 3px 8px; border-radius:6px; }
+  .thread-row.subagent-thread-row { margin-left:24px; }
   .thread { flex:1; min-width:0; padding:5px 8px; border-radius:6px; cursor:pointer; color:var(--muted); font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:flex; align-items:center; gap:6px; }
+  .thread.subagent-thread { font-size:12px; }
+  .thread.subagent-thread::before { content:"sub"; flex:none; color:var(--muted); font-size:10px; }
   .thread:hover { background:var(--panel2); }
   .thread.active { background:var(--panel2); color:var(--fg); }
   .thread-status { flex:none; width:10px; text-align:center; color:var(--muted); font-weight:700; }
@@ -111,6 +114,7 @@
   .thread-menu button { display:block; width:100%; padding:6px 8px; border:0; background:transparent; text-align:left; }
   .thread-menu button:hover { background:var(--panel2); }
   .thread-section-label { margin:8px 0 3px 8px; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:0; }
+  .subagent-open-btn { margin-top:8px; padding:4px 8px; font-size:12px; }
 
   header.thr { display:flex; gap:12px; align-items:center; padding:10px 14px; border-bottom:1px solid var(--border); background:var(--panel); flex-wrap:wrap; }
   /* Header controls are chrome, not content: keep their type a step smaller than the body so the
@@ -120,6 +124,8 @@
     color:var(--muted); border-color:var(--border); background:transparent; opacity:.65;
   }
   header.thr .gauge { font-size:11px; }
+  .parent-thread-btn { display:flex; align-items:center; gap:5px; color:var(--muted); }
+  .parent-thread-btn[hidden] { display:none; }
   .mcp-wrap { position:relative; }
   .mcp-btn { display:flex; align-items:center; gap:6px; }
   .mcp-dot { width:8px; height:8px; border-radius:50%; background:var(--muted); display:inline-block; }
@@ -180,6 +186,29 @@
   .tasks-summary { color:var(--muted); font-size:12px; margin-bottom:8px; }
   .tasks-section { margin-top:8px; padding-top:8px; border-top:1px solid var(--border); }
   .tasks-section-title { margin-bottom:6px; color:var(--fg); font-size:11px; font-weight:600; text-transform:uppercase; }
+  .subagents-wrap { position:relative; }
+  .subagents-btn { display:flex; align-items:center; gap:6px; }
+  .subagents-btn.state-idle { color:var(--muted); }
+  .subagents-btn.state-running { color:#f0d98c; border-color:#d29922; background:rgba(210,153,34,.08); }
+  .subagents-popover {
+    position:absolute; left:0; top:34px; z-index:35; width:min(460px, calc(100vw - 24px));
+    max-height:70vh; overflow:auto; padding:10px; border:1px solid var(--border);
+    border-radius:8px; background:var(--panel); box-shadow:0 20px 48px rgba(0,0,0,.45);
+  }
+  .subagents-popover[hidden] { display:none; }
+  .subagents-head { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+  .subagents-head strong { flex:1; }
+  .subagents-head button { font-size:12px; padding:4px 8px; }
+  .subagents-summary { color:var(--muted); font-size:12px; margin-bottom:8px; }
+  .subagents-list { display:grid; gap:8px; }
+  .subagent-card { display:grid; gap:4px; width:100%; padding:8px; border:1px solid var(--border); border-radius:8px; background:var(--panel2); text-align:left; }
+  .subagent-card:hover { border-color:var(--accent); }
+  .subagent-card.active { border-color:var(--accent); background:rgba(79,140,255,.10); }
+  .subagent-card-title { display:flex; align-items:center; gap:8px; min-width:0; }
+  .subagent-card-name { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .subagent-card-state { font-size:11px; color:var(--muted); }
+  .subagent-card-state.running { color:#f0d98c; }
+  .subagent-card-meta { color:var(--muted); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .usage-wrap { position:relative; margin-left:auto; }
   .usage-btn { display:flex; align-items:center; gap:6px; }
   .usage-popover {

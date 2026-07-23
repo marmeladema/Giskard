@@ -9,7 +9,7 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.54
+**Version:** 1.55
 
 > **Amendment — frontend approach (supersedes the Dioxus/WASM design below).**
 > This document was written targeting a **Dioxus fullstack / WebAssembly** frontend (`giskard-ui`),
@@ -22,6 +22,86 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.54 → 1.55), harness-neutral sub-agent support:**
+- **SA1:** Giskard models harness-neutral sub-agent links and linked child threads. Thread metadata
+  carries `parent_thread_id`, `spawned_by_turn_id`, and `kind = subagent`; native imports reuse an
+  existing `harness_thread_id`; and transcript links can idempotently resolve, import, and open a
+  child. Rendering history alone never imports a thread.
+
+  The Codex adapter maps both legacy `multi_agent_v1` (`collabAgentToolCall/spawnAgent`) and current
+  collaboration v2 (`subAgentActivity` with `kind = started`) into that model. A real legacy spawn
+  start has no receiver ID, so its completion exposes the child and retains the spawn prompt.
+  Legacy `agentsStates` is keyed by native thread ID and must be read for the linked receiver;
+  single-child `sendInput`, `wait`, `resumeAgent`, and `closeAgent` calls also provide lifecycle
+  evidence, while multi-child waits remain unlinked. Current activity links contain no prompt, so
+  Giskard uses `Sub-agent turn` rather than deriving input from inherited parent history. Their
+  visible activity label uses the
+  final non-empty agent-path component as the task name and omits the native child id; both full
+  values remain in server-side link metadata. Browser wire links redact native thread IDs. Passive
+  `TurnStarted` events and live snapshots carry the best known input; when a real prompt is
+  available, a stable synthetic `user_message` is inserted or upgraded in place before output.
+  Live and persisted transcripts therefore contain exactly one ordered prompt row, including
+  server-resolved imports and prompts whose metadata arrives late. Synthetic fallback state is
+  explicit rather than inferred from the literal text, so a real prompt equal to `Sub-agent turn`
+  remains genuine input.
+
+  Linked-thread discovery never changes established ownership: primary threads are not reclassified,
+  children are not reparented, and self-links, cycles, invalid parent chains, and native-parent
+  mismatches are rejected. Invalid persisted graphs are logged and remain visible in the primary
+  sidebar for recovery. Reverse child-to-parent activity remains a navigation link and never creates
+  a duplicate thread.
+
+  Materializing or reopening a child is separate from monitoring it. Giskard starts a passive
+  forwarder only for explicit non-terminal lifecycle evidence (`spawned`, `started`, `interacted`,
+  `pending`, or `running`). Explicit active evidence has a ten-minute no-event pre-turn safety bound
+  that restarts on activity and no longer applies after a turn starts. Terminal observations (`interrupted`,
+  `completed`, `failed`, `shutdown`, or `not_found`) wake an existing idle monitor but never start a
+  new one. Reopening a persisted child without lifecycle evidence does not arm a monitor, and an
+  unchanged generated title does not rewrite its metadata.
+
+  Linked children require an identity-preserving native resume. Codex may emit the activity link
+  immediately before the new rollout becomes readable, so the adapter retries only the exact
+  matching missing-rollout response for a short bounded window. It must return the advertised
+  native ID and must never use the primary-thread fresh-session fallback for a child; otherwise the
+  passive monitor can attach to a replacement thread and miss early commentary and command-start
+  events from the real child. Primary thread recovery remains unchanged.
+
+  Passive and interactive forwarders share the per-thread turn gate, so only one subscriber can
+  persist a native turn. Direct child turns fail with `thread_turn_active` while delegated work owns
+  the child; once idle, follow-ups are normal persisted turns that neither change ownership nor
+  automatically report results to the parent. If terminal output arrives without native child
+  events, its fallback is persisted immediately unless history already exists; monitor teardown
+  and setup atomically claim a racing fallback so terminal results are neither lost nor duplicated.
+  Idle monitors are cancellable and awaited by deletion, which performs another active-work
+  preflight before removing any subtree records.
+
+  A turn-scoped event can precede `TurnStarted`; the first such event creates the exact live-turn
+  reconnect buffer, and the later start notification reuses it without discarding accumulated
+  items. A genuine new start replaces a stale conflicting buffer without dropping the new turn;
+  conflicting non-start events remain live and persistable without mixing buffers. Browser links
+  carry only Giskard parent-thread and item IDs. The server derives native routing, prompt,
+  lifecycle evidence, and `spawned_by_turn_id` from the authoritative live or persisted item;
+  clients cannot assert ownership or lifecycle metadata.
+
+  The browser omits valid managed children from the primary sidebar and exposes them through the
+  **Sub-agents** header monitor with running state and harness-reported agent names. Child selection
+  is restored after reload, and a child's **Parent** control opens its immediate owning thread,
+  including for nested ownership.
+
+  Deleting any thread recursively deletes its direct and transitive children from both the native
+  harness and local persistence in leaf-first order. The server preflights the entire subtree, and
+  an active turn or running task anywhere returns `409 Conflict` before deletion begins. The browser
+  confirms descendant count, native scope, and irreversibility, then clears any deleted active view.
+  HTTP imports, asynchronously observed imports, and deletion share one project lifecycle lock;
+  HTTP contention is bounded to five seconds and returns `503 Service Unavailable`. Linked
+  lifecycle evidence is processed through a per-parent FIFO so terminal evidence cannot overtake
+  earlier active evidence. Materialization runs outside the parent event-forwarding path and
+  repeated live-child activity avoids full project scans. Deletion cancels idle monitors and
+  repeats its preflight before the first native or local record is removed.
+  Codex treats only the exact JSON-RPC `-32600` response
+  `no rollout found for thread id <requested-id>` as idempotent deletion success; a different ID or
+  any other native failure still aborts before local deletion.
 
 **Changelog (1.53 → 1.54), authoritative context-window metadata:**
 - **C4:** Giskard has no model-name defaults table. Initial context capacity comes from exact
@@ -2578,9 +2658,28 @@ This guarantees a coherent experience when a future, less-capable harness is plu
 - Messages are tagged with `project_id` / `thread_id`. Defined once in `giskard-proto`.
 - **Thread open/create is REST-backed:** `POST /api/projects/{project_id}/threads` accepts
   `{ thread_id?: ThreadId, resume?: String }` and opens/reattaches persisted threads or explicit
-  native resume/import flows. Blank creation is rejected. New first-message creation uses
-  `POST /api/projects/{project_id}/threads/start` with `{ text, model_ref, mode,
-  approval_policy }` and returns `{ thread_id, harness_thread_id, turn_id, warning? }`.
+  native resume/import flows. Unknown fields are rejected, so this endpoint cannot fabricate
+  linked ownership or lifecycle evidence. Blank creation is rejected. New first-message creation uses
+  `POST /api/projects/{project_id}/threads/start` with `{ text, model_ref, mode, approval_policy }`
+  and returns `{ thread_id, harness_thread_id, turn_id, warning? }`.
+
+  A transcript link is opened through
+  `POST /api/projects/{project_id}/threads/{parent_thread_id}/subagent-links/{item_id}/open`.
+  The browser supplies only Giskard-owned coordinates. The server resolves the raw item from the
+  parent's live buffer or persisted turns, derives its native child ID, prompt, lifecycle evidence,
+  and containing `TurnId`, then idempotently materializes or returns the linked thread. Unknown and
+  non-link items return `409 Conflict`. A reverse child-to-parent item returns the existing parent
+  without changing ownership.
+
+Linked-thread ownership is immutable once persisted. Existing primary threads are not reclassified,
+and existing children are not reparented. New child imports reject invalid/cyclic parent chains and
+reject a harness-reported native parent that differs from the owning parent's native ID. Transcript
+rendering is read-only: only an explicit **Open linked thread** action may issue the item-based open
+request. `DELETE /api/projects/{project_id}/threads/{thread_id}` computes the complete
+linked descendant subtree, rejects the request with `409 Conflict` before mutation if any member has
+an active turn or running task, then deletes native and local threads leaf-first so the parent is
+removed last. A Codex native rollout that is verifiably already absent is an idempotent native
+deletion; all other native deletion errors stop the cascade before deleting that local record.
 
 **Client → server** (examples): `Subscribe { thread_id, since? }` (`since` is the incremental-resync
 cursor, H8), `Unsubscribe { thread_id }`,
@@ -2599,6 +2698,20 @@ thread. The browser marks a turn active immediately after successfully sending `
 any harness `TurnStarted` event, and clears that optimistic state if the server rejects the send for
 anything other than `thread_turn_active`.
 
+Passive sub-agent monitoring uses that same per-thread gate. It is armed only by explicit
+non-terminal lifecycle evidence; reopening an existing child without such evidence and terminal
+lifecycle events do not start a monitor. Its first turn-bearing
+event reserves and acknowledges the native turn before any live-buffer, broadcast, or persistence
+mutation. If a normal forwarder already owns the thread, the passive subscriber exits without
+processing it. A terminal observation wakes an idle passive subscriber immediately so queued child
+events win, then fallback recovery or clean exit occurs without waiting for the idle timeout.
+Explicit active evidence has a renewable ten-minute no-event pre-turn safety bound; any stream or
+lifecycle activity restarts it, and it no longer applies once a native turn starts. Direct user
+input is rejected while that passive ownership is registered, then allowed as a normal child turn
+after delegated work becomes idle; it never changes parentage or implicitly forwards the result to
+the parent. Passive and interactive subscribers do not both rebroadcast turnless events: when the
+interactive forwarder owns the turn gate, the passive subscriber yields before broadcasting.
+
 > **Durable settings switches (P2/P3).** `SwitchMode`, `SelectModel`, and `SetApprovalPolicy`
 > persist immediately to `<thread_id>.json` before the server acknowledges, then broadcast a
 > `ThreadState` to all connected tabs. This guarantees the §5 "same state after restart"
@@ -2616,9 +2729,10 @@ anything other than `thread_turn_active`.
 (lightweight cross-thread sidebar/notification signal; `approval_requested` carries
 `approval_id`, and `server_request_received` carries `server_request_id`),
 `ThreadState { thread_id, state }` (persisted snapshot on subscribe/resync),
-`LiveTurnSnapshot { thread_id, turn_id, accumulated, pending_approval?, pending_server_requests }`
-(in-flight turn reconstruction on reconnect, carrying `WireAgentEvent`s, a `WireApprovalRequest`,
-and unresolved `ServerRequest`s),
+`LiveTurnSnapshot { thread_id, turn_id, user_input?, accumulated, pending_approval?,
+pending_server_requests }` (in-flight turn reconstruction on reconnect, carrying the turn input
+when the server synthesized the turn context, `WireAgentEvent`s, a `WireApprovalRequest`, and
+unresolved `ServerRequest`s),
 `RunningTasks { thread_id, tasks: [RunningTask] }` (commands and tool/MCP calls still known to be
 running, including commands that outlived an interrupted turn),
 `TokenUpdate { scope, thread_id?, ledger }`, `ApprovalRequest { thread_id, request }` (a
@@ -2682,6 +2796,10 @@ events through the same event handler used for live WebSocket events.
 > (`Event`, `ApprovalRequest`, the `LiveTurnSnapshot` contents) is mapped `core → Wire*` at the
 > fan-out boundary, so paths are UTF-8 `String`s on the wire. Client→server messages are path-free
 > (`SendInput` is text; `SavePlan.path` is a `String` re-validated server-side).
+> Started and completed sub-agent items use `WireSubagentLink`, which retains display/prompt/
+> lifecycle fields but omits the native harness thread ID. `ThreadSummary` likewise exposes only
+> Giskard ownership IDs. Native routing identities remain in core/persistence and are resolved by
+> the item-based open endpoint.
 
 - **Fan-out:** the server keeps `thread_id → set<client_conn>` for full transcript traffic and a
   global connected-client registry for lightweight browser activity. An `AgentEvent` is serialized

@@ -90,7 +90,49 @@ pub struct ToolCallStart {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<SubagentLink>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at_ms: Option<i64>,
+}
+
+/// Harness-neutral link from a transcript item to a child sub-agent thread.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentLink {
+    /// Harness-native thread id to resume/import as a Giskard child thread.
+    pub harness_thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Initial task prompt used to start the child thread, when the harness exposes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_prompt: Option<String>,
+    pub action: SubagentAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<SubagentStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentAction {
+    Spawned,
+    Started,
+    Interacted,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentStatus {
+    Pending,
+    Running,
+    Completed,
+    Interrupted,
+    Failed,
+    Shutdown,
+    NotFound,
 }
 
 /// The finalized item persisted in thread history and sent on `ItemCompleted`.
@@ -149,6 +191,10 @@ pub enum ItemPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent: Option<SubagentLink>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
     Activity {
@@ -157,6 +203,8 @@ pub enum ItemPayload {
         detail: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metadata: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent: Option<SubagentLink>,
     },
 }
 
@@ -237,6 +285,8 @@ mod tests {
                 input: serde_json::json!({ "jql": "project = ERE" }),
                 server: Some("cf-tools".into()),
                 status: Some("in_progress".into()),
+                metadata: None,
+                subagent: None,
                 started_at_ms: Some(1_700_000_000_000),
             }),
         };

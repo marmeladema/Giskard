@@ -18,7 +18,8 @@ use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{
-    FileChangeEntry, FileChangeKind, Item, ItemDelta, ItemPayload, ItemStart,
+    CommandExecutionStart, FileChangeEntry, FileChangeKind, Item, ItemDelta, ItemKind, ItemPayload,
+    ItemStart, SubagentAction, SubagentLink, SubagentStatus, ToolCallStart,
 };
 use giskard_core::model::ModelRef;
 use giskard_core::server_request::ServerRequest;
@@ -41,6 +42,8 @@ pub enum WireAgentEvent {
     TurnStarted {
         thread: ThreadId,
         turn: TurnId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_input: Option<UserInput>,
     },
     ContextWindowUpdated {
         thread: ThreadId,
@@ -51,7 +54,7 @@ pub enum WireAgentEvent {
     ItemStarted {
         thread: ThreadId,
         turn: TurnId,
-        item: ItemStart,
+        item: WireItemStart,
     },
     ItemDelta {
         thread: ThreadId,
@@ -123,6 +126,49 @@ pub struct WireItem {
     pub created_at: DateTime<Utc>,
 }
 
+/// Wire-mirror of [`ItemStart`]. Native routing identifiers stay server-side.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireItemStart {
+    pub id: ItemId,
+    pub harness_item_id: String,
+    pub kind: ItemKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<CommandExecutionStart>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<WireToolCallStart>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireToolCallStart {
+    pub name: String,
+    pub input: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<WireSubagentLink>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
+}
+
+/// Browser-safe sub-agent metadata. The harness-native thread id is intentionally omitted; link
+/// opening is resolved server-side from the owning Giskard thread and item ids.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireSubagentLink {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_prompt: Option<String>,
+    pub action: SubagentAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<SubagentStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 /// Wire-mirror of [`ItemPayload`] (paths as `String`; `serde_json::Value` kept as-is).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -167,6 +213,10 @@ pub enum WireItemPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent: Option<WireSubagentLink>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
     Activity {
@@ -175,6 +225,8 @@ pub enum WireItemPayload {
         detail: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metadata: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent: Option<WireSubagentLink>,
     },
 }
 
@@ -272,7 +324,11 @@ impl From<AgentEvent> for WireAgentEvent {
                 thread,
                 harness_thread_id,
             },
-            AgentEvent::TurnStarted { thread, turn } => Self::TurnStarted { thread, turn },
+            AgentEvent::TurnStarted { thread, turn } => Self::TurnStarted {
+                thread,
+                turn,
+                user_input: None,
+            },
             AgentEvent::ContextWindowUpdated {
                 thread,
                 turn,
@@ -284,9 +340,11 @@ impl From<AgentEvent> for WireAgentEvent {
                 model,
                 context_window,
             },
-            AgentEvent::ItemStarted { thread, turn, item } => {
-                Self::ItemStarted { thread, turn, item }
-            }
+            AgentEvent::ItemStarted { thread, turn, item } => Self::ItemStarted {
+                thread,
+                turn,
+                item: item.into(),
+            },
             AgentEvent::ItemDelta {
                 thread,
                 turn,
@@ -401,6 +459,44 @@ impl From<Item> for WireItem {
     }
 }
 
+impl From<ItemStart> for WireItemStart {
+    fn from(item: ItemStart) -> Self {
+        Self {
+            id: item.id,
+            harness_item_id: item.harness_item_id,
+            kind: item.kind,
+            command: item.command,
+            tool: item.tool.map(Into::into),
+        }
+    }
+}
+
+impl From<ToolCallStart> for WireToolCallStart {
+    fn from(tool: ToolCallStart) -> Self {
+        Self {
+            name: tool.name,
+            input: tool.input,
+            server: tool.server,
+            status: tool.status,
+            metadata: tool.metadata,
+            subagent: tool.subagent.map(Into::into),
+            started_at_ms: tool.started_at_ms,
+        }
+    }
+}
+
+impl From<SubagentLink> for WireSubagentLink {
+    fn from(link: SubagentLink) -> Self {
+        Self {
+            path: link.path,
+            initial_prompt: link.initial_prompt,
+            action: link.action,
+            status: link.status,
+            message: link.message,
+        }
+    }
+}
+
 impl From<ItemPayload> for WireItemPayload {
     fn from(p: ItemPayload) -> Self {
         match p {
@@ -441,6 +537,8 @@ impl From<ItemPayload> for WireItemPayload {
                 output,
                 server,
                 status,
+                metadata,
+                subagent,
                 error,
             } => Self::ToolCall {
                 name,
@@ -448,16 +546,20 @@ impl From<ItemPayload> for WireItemPayload {
                 output,
                 server,
                 status,
+                metadata,
+                subagent: subagent.map(Into::into),
                 error,
             },
             ItemPayload::Activity {
                 title,
                 detail,
                 metadata,
+                subagent,
             } => Self::Activity {
                 title,
                 detail,
                 metadata,
+                subagent: subagent.map(Into::into),
             },
         }
     }
@@ -707,5 +809,68 @@ mod tests {
         assert_eq!(json["kind"], "error");
         assert_eq!(json["error"]["code"], "harness_protocol_error");
         assert_eq!(json["error"]["message"], "protocol error: bad frame");
+    }
+
+    #[test]
+    fn subagent_native_thread_id_is_redacted_from_started_and_completed_items() {
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let item_id = ItemId::new();
+        let native_thread_id = "native-secret-child";
+        let link = SubagentLink {
+            harness_thread_id: native_thread_id.into(),
+            path: Some("reviewer".into()),
+            initial_prompt: Some("review this".into()),
+            action: SubagentAction::Spawned,
+            status: Some(SubagentStatus::Running),
+            message: None,
+        };
+        let started: WireAgentEvent = AgentEvent::ItemStarted {
+            thread,
+            turn,
+            item: ItemStart {
+                id: item_id,
+                harness_item_id: "spawn-call".into(),
+                kind: ItemKind::ToolCall,
+                command: None,
+                tool: Some(ToolCallStart {
+                    name: "spawn_subagent".into(),
+                    input: serde_json::json!({"prompt": "review this"}),
+                    server: None,
+                    status: Some("in_progress".into()),
+                    metadata: None,
+                    subagent: Some(link.clone()),
+                    started_at_ms: None,
+                }),
+            },
+        }
+        .into();
+        let completed: WireAgentEvent = AgentEvent::ItemCompleted {
+            thread,
+            turn,
+            item: Item {
+                id: item_id,
+                harness_item_id: "spawn-call".into(),
+                payload: ItemPayload::Activity {
+                    title: "Sub-agent started".into(),
+                    detail: None,
+                    metadata: None,
+                    subagent: Some(link),
+                },
+                created_at: Utc::now(),
+            },
+        }
+        .into();
+
+        for event in [started, completed] {
+            let json = serde_json::to_value(event).unwrap();
+            assert!(!json.to_string().contains(native_thread_id));
+            let subagent = json
+                .pointer("/item/tool/subagent")
+                .or_else(|| json.pointer("/item/payload/subagent"))
+                .expect("wire item should retain browser-safe sub-agent metadata");
+            assert!(subagent.get("harness_thread_id").is_none());
+            assert_eq!(subagent["path"], "reviewer");
+        }
     }
 }

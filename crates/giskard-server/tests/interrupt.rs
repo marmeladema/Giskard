@@ -160,6 +160,8 @@ impl AgentHarness for InterruptHarness {
             harness_thread_id: opts.resume.unwrap_or_else(|| "interrupt_harness".into()),
             warning: None,
             resumed_model: Some(opts.initial_model.clone()),
+            agent_name: None,
+            parent_harness_thread_id: None,
         })
     }
 
@@ -877,20 +879,19 @@ async fn wait_for_completed_command_after_interrupted_turn(ws: &mut TestWs) {
             continue;
         };
         match serde_json::from_str::<ServerMessage>(&text).unwrap() {
-            ServerMessage::Event {
-                agent_event: WireAgentEvent::ItemCompleted { item, .. },
-                ..
-            } => {
-                if let giskard_proto::WireItemPayload::CommandExecution {
-                    status,
-                    exit_code,
-                    duration_ms,
-                    ..
-                } = item.payload
-                {
-                    saw_completed_command = status.as_deref() == Some("completed")
-                        && exit_code == Some(0)
-                        && duration_ms == Some(60_000);
+            ServerMessage::Event { agent_event, .. } => {
+                if let WireAgentEvent::ItemCompleted { item, .. } = *agent_event {
+                    if let giskard_proto::WireItemPayload::CommandExecution {
+                        status,
+                        exit_code,
+                        duration_ms,
+                        ..
+                    } = item.payload
+                    {
+                        saw_completed_command = status.as_deref() == Some("completed")
+                            && exit_code == Some(0)
+                            && duration_ms == Some(60_000);
+                    }
                 }
             }
             ServerMessage::RunningTasks { tasks, .. } => {
@@ -920,13 +921,11 @@ async fn wait_for_interrupted_turn(ws: &mut TestWs) {
             continue;
         };
         let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
-        if let ServerMessage::Event {
-            agent_event: WireAgentEvent::TurnCompleted { status, .. },
-            ..
-        } = server_msg
-        {
-            assert_eq!(status.kind, TurnStatusKind::Interrupted);
-            return;
+        if let ServerMessage::Event { agent_event, .. } = server_msg {
+            if let WireAgentEvent::TurnCompleted { status, .. } = *agent_event {
+                assert_eq!(status.kind, TurnStatusKind::Interrupted);
+                return;
+            }
         }
     }
 }

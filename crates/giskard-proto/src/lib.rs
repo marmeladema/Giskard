@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use chrono::{DateTime, Utc};
 use giskard_core::ids::{ProjectId, ThreadId, TurnId};
+use giskard_core::thread::ThreadKind;
+use giskard_core::user_input::UserInput;
 
 pub mod wire;
 pub use wire::{
@@ -25,6 +27,7 @@ pub use giskard_core::event::AgentEvent;
 pub use giskard_core::ids::{ApprovalId, ItemId};
 pub use giskard_core::item::{
     CommandExecutionStart, FileChangeEntry, FileChangeKind, ItemDelta, ItemKind, ItemStart,
+    SubagentAction, SubagentLink, SubagentStatus,
 };
 pub use giskard_core::mcp::{
     McpAuthStatus, McpOauthStart, McpResource, McpResourceTemplate, McpServerInfo, McpServerStatus,
@@ -141,6 +144,8 @@ pub enum ThreadActivityKind {
 pub struct LiveTurnSnapshot {
     pub thread_id: ThreadId,
     pub turn_id: TurnId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_input: Option<UserInput>,
     pub accumulated: Vec<WireAgentEvent>,
     pub pending_approval: Option<WireApprovalRequest>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -215,7 +220,7 @@ pub struct ErrorInfo {
 pub enum ServerMessage {
     Event {
         thread_id: ThreadId,
-        agent_event: WireAgentEvent,
+        agent_event: Box<WireAgentEvent>,
     },
     ThreadActivity(ThreadActivity),
     ThreadState(ThreadState),
@@ -317,10 +322,20 @@ pub struct CreateProjectResponse {
 pub struct ThreadSummary {
     pub id: ThreadId,
     pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_thread_id: Option<ThreadId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_by_turn_id: Option<TurnId>,
+    #[serde(default, skip_serializing_if = "is_primary_thread")]
+    pub kind: ThreadKind,
     pub mode: Mode,
     pub archived: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+fn is_primary_thread(value: &ThreadKind) -> bool {
+    *value == ThreadKind::Primary
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -329,9 +344,16 @@ pub struct ListThreadsResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OpenThreadRequest {
     pub thread_id: Option<ThreadId>,
     pub resume: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenSubagentLinkResponse {
+    pub thread_id: ThreadId,
+    pub title: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -536,6 +558,26 @@ mod tests {
             ClientMessage::SendInput { text, .. } => assert_eq!(text, "Refactor the auth module"),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn open_thread_request_rejects_client_asserted_subagent_metadata() {
+        let result = serde_json::from_value::<OpenThreadRequest>(serde_json::json!({
+            "thread_id": null,
+            "resume": "native-child",
+            "subagent_action": "spawned",
+            "subagent_status": "completed",
+            "subagent_message": "done"
+        }));
+        assert!(result.is_err());
+
+        let request: OpenThreadRequest = serde_json::from_value(serde_json::json!({
+            "thread_id": null,
+            "resume": "native-child"
+        }))
+        .unwrap();
+        assert_eq!(request.thread_id, None);
+        assert_eq!(request.resume.as_deref(), Some("native-child"));
     }
 
     #[test]
@@ -876,6 +918,7 @@ mod tests {
         let snapshot = LiveTurnSnapshot {
             thread_id: tid,
             turn_id: turn,
+            user_input: None,
             accumulated: vec![],
             pending_approval: None,
             pending_server_requests: vec![ServerRequest {

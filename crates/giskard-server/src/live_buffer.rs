@@ -6,6 +6,7 @@ use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ItemId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{ItemDelta, ItemPayload};
 use giskard_core::server_request::ServerRequest;
+use giskard_core::user_input::UserInput;
 use giskard_proto::{LiveTurnSnapshot, WireAgentEvent, WireApprovalRequest};
 
 const MAX_LIVE_COMMAND_OUTPUT: usize = 16 * 1024;
@@ -14,6 +15,7 @@ const LIVE_COMMAND_OUTPUT_TRUNCATED: &str = "\n\n[... command output truncated i
 
 struct LiveTurn {
     turn_id: TurnId,
+    user_input: Option<UserInput>,
     events: Vec<AgentEvent>,
 }
 
@@ -29,14 +31,64 @@ impl LiveBufferStore {
     }
 
     pub async fn start_turn(&self, thread_id: ThreadId) {
+        self.start_turn_with_user_input(thread_id, None).await;
+    }
+
+    pub async fn start_turn_with_user_input(
+        &self,
+        thread_id: ThreadId,
+        user_input: Option<UserInput>,
+    ) {
+        self.replace_turn_with_user_input(thread_id, TurnId::new(), user_input)
+            .await;
+    }
+
+    pub async fn replace_turn_with_user_input(
+        &self,
+        thread_id: ThreadId,
+        turn_id: TurnId,
+        user_input: Option<UserInput>,
+    ) {
         let mut buffers = self.buffers.lock().await;
         buffers.insert(
             thread_id,
             LiveTurn {
-                turn_id: TurnId::new(),
+                turn_id,
+                user_input,
                 events: Vec::new(),
             },
         );
+    }
+
+    /// Ensure an exact turn has a reconnect buffer without replacing events already observed for
+    /// it. Harnesses may publish a turn-scoped item before their delayed `TurnStarted` event; that
+    /// item is still live state and must survive a browser reload.
+    pub async fn ensure_turn_with_user_input(
+        &self,
+        thread_id: ThreadId,
+        turn_id: TurnId,
+        user_input: Option<UserInput>,
+    ) -> Result<(), TurnId> {
+        use std::collections::hash_map::Entry;
+
+        let mut buffers = self.buffers.lock().await;
+        match buffers.entry(thread_id) {
+            Entry::Vacant(entry) => {
+                entry.insert(LiveTurn {
+                    turn_id,
+                    user_input,
+                    events: Vec::new(),
+                });
+                Ok(())
+            }
+            Entry::Occupied(mut entry) if entry.get().turn_id == turn_id => {
+                if entry.get().user_input.is_none() && user_input.is_some() {
+                    entry.get_mut().user_input = user_input;
+                }
+                Ok(())
+            }
+            Entry::Occupied(entry) => Err(entry.get().turn_id),
+        }
     }
 
     pub async fn append(&self, thread_id: ThreadId, event: AgentEvent) {
@@ -67,6 +119,24 @@ impl LiveBufferStore {
         buffers.contains_key(&thread_id)
     }
 
+    /// Return raw server-side lifecycle events for one Giskard item. This is intentionally not a
+    /// wire snapshot: linked-thread opening needs the native routing id that wire conversion
+    /// redacts before data reaches the browser.
+    pub async fn item_events(&self, thread_id: ThreadId, item_id: ItemId) -> Vec<AgentEvent> {
+        let buffers = self.buffers.lock().await;
+        buffers
+            .get(&thread_id)
+            .into_iter()
+            .flat_map(|turn| turn.events.iter())
+            .filter(|event| match event {
+                AgentEvent::ItemStarted { item, .. } => item.id == item_id,
+                AgentEvent::ItemCompleted { item, .. } => item.id == item_id,
+                _ => false,
+            })
+            .cloned()
+            .collect()
+    }
+
     pub async fn snapshot(&self, thread_id: ThreadId) -> Option<LiveTurnSnapshot> {
         let buffers = self.buffers.lock().await;
         buffers.get(&thread_id).map(|turn| {
@@ -85,6 +155,7 @@ impl LiveBufferStore {
             LiveTurnSnapshot {
                 thread_id,
                 turn_id: turn.turn_id,
+                user_input: turn.user_input.clone(),
                 accumulated,
                 pending_approval,
                 pending_server_requests,
@@ -252,6 +323,55 @@ mod tests {
             }),
             tool: None,
         }
+    }
+
+    #[tokio::test]
+    async fn turn_started_does_not_discard_an_earlier_turn_item() {
+        let store = LiveBufferStore::new();
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let input = UserInput::text("Sub-agent turn");
+        let item = AgentEvent::ItemCompleted {
+            thread,
+            turn,
+            item: Item {
+                id: ItemId::new(),
+                harness_item_id: "subagent-started".into(),
+                payload: ItemPayload::Activity {
+                    title: "Sub-agent started".into(),
+                    detail: None,
+                    metadata: None,
+                    subagent: None,
+                },
+                created_at: Utc::now(),
+            },
+        };
+
+        store
+            .ensure_turn_with_user_input(thread, turn, Some(input.clone()))
+            .await
+            .expect("first event starts the exact turn buffer");
+        store.append(thread, item).await;
+        store
+            .ensure_turn_with_user_input(thread, turn, Some(input.clone()))
+            .await
+            .expect("late turn start reuses the buffer");
+        store
+            .append(thread, AgentEvent::TurnStarted { thread, turn })
+            .await;
+
+        let snapshot = store.snapshot(thread).await.expect("snapshot");
+        assert_eq!(snapshot.turn_id, turn);
+        assert_eq!(snapshot.user_input, Some(input));
+        assert_eq!(snapshot.accumulated.len(), 2);
+        assert!(matches!(
+            snapshot.accumulated[0],
+            WireAgentEvent::ItemCompleted { .. }
+        ));
+        assert!(matches!(
+            snapshot.accumulated[1],
+            WireAgentEvent::TurnStarted { .. }
+        ));
     }
 
     #[tokio::test]

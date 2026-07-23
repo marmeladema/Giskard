@@ -4,6 +4,7 @@ use std::process::Command;
 use chrono::Utc;
 use giskard_core::ids::{ProjectId, ThreadId};
 use giskard_core::model::ModelRef;
+use giskard_core::thread::ThreadKind;
 use giskard_core::token::TokenLedger;
 use giskard_core::turn::{ApprovalPolicy, Mode};
 use giskard_persist::PersistStore;
@@ -31,6 +32,9 @@ fn test_thread(
         project_id,
         title: title.into(),
         harness_thread_id: format!("harness-{thread_id}"),
+        parent_thread_id: None,
+        spawned_by_turn_id: None,
+        kind: ThreadKind::Primary,
         mode,
         current_model: test_model(),
         context_window: 262_144,

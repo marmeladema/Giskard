@@ -117,8 +117,12 @@ Then open **http://127.0.0.1:8787**, log in, and:
    sent, so choose the **Plan/Build** mode, **approval policy**, and **model** first if needed.
 3. Type in the composer (Enter to send). The first send creates the Codex thread with the selected
    provider/model and starts the turn. Existing threads show the **Tasks** menu for running
-   commands/tools, **MCP** status menu, and **Context** usage button; scrolling the transcript to
-   the top lazy-loads older history.
+   commands/tools, **Sub-agents** monitor, **MCP** status menu, and **Context** usage button;
+   scrolling the transcript to the top lazy-loads older history.
+4. Linked child threads appear in the **Sub-agents** monitor and can be opened from their activity
+   rows; their header **Parent** button returns to the owning thread. See
+   [Sub-agent threads](docs/subagents.md) for spawning protocols, monitoring, prompts, direct
+   follow-ups, ownership, and deletion behavior.
 
 The header context value is a context-window indicator, not a billing total. Codex currently exposes
 the latest turn's input tokens rather than a dedicated context-occupancy field, so Giskard uses that
@@ -326,7 +330,9 @@ The browser (and any client) drives everything through a small REST surface plus
 WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticket`, `GET /api/ws`,
 `GET/POST /api/projects`, `GET/DELETE /api/projects/{id}`, `GET/POST
 /api/projects/{id}/threads`, `POST /api/projects/{id}/threads/start`, `DELETE
-/api/projects/{id}/threads/{thread_id}`, `PATCH /api/projects/{id}/threads/{thread_id}/title`,
+/api/projects/{id}/threads/{thread_id}`, `POST
+/api/projects/{id}/threads/{parent_thread_id}/subagent-links/{item_id}/open`, `PATCH
+/api/projects/{id}/threads/{thread_id}/title`,
 `POST /api/projects/{id}/threads/{thread_id}/archive`, `GET /api/models`, `POST
 /api/models/refresh`, `GET /api/projects/{id}/models`,
 `GET /api/tokens`, `GET /api/projects/{id}/tokens`,
@@ -339,6 +345,13 @@ WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticke
 `POST /api/projects/{id}/threads/start` creates the durable thread from the first user message,
 persists a deterministic title generated from that prompt, and returns the title with the new
 thread and turn identifiers.
+
+`POST /api/projects/{id}/threads` opens an existing local thread when `thread_id` is provided, or
+imports/resumes a native harness thread when `resume` is provided. Linked transcript items use the
+dedicated parent/item endpoint above; the server resolves native routing, ownership, provenance,
+prompt, and lifecycle evidence from its authoritative item rather than accepting those fields from
+the browser. Thread summaries and browser-facing sub-agent payloads omit native harness thread IDs.
+See [Sub-agent threads](docs/subagents.md) for the full contract.
 
 If you open a thread whose agent can no longer be started — most often because its
 **provider was removed from config** (e.g. you swapped one proxy provider id for another) — the

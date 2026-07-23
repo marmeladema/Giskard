@@ -114,6 +114,7 @@ async fn open_thread_one_turn_assert_state() {
             thread: None,
             workspace_root: "/tmp/test".into(),
             resume: Some("th_test_001".into()),
+            resume_policy: giskard_harness::ResumePolicy::AllowFreshFallback,
             initial_model: ModelRef {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
@@ -249,6 +250,7 @@ async fn replay_persisted_state_roundtrip() {
             thread: None,
             workspace_root: "/tmp/test".into(),
             resume: Some("th_test_001".into()),
+            resume_policy: giskard_harness::ResumePolicy::AllowFreshFallback,
             initial_model: ModelRef {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
@@ -311,6 +313,9 @@ async fn replay_persisted_state_roundtrip() {
         project_id: pid,
         title: "Fix auth".into(),
         harness_thread_id: handle.harness_thread_id.clone(),
+        parent_thread_id: None,
+        spawned_by_turn_id: None,
+        kind: giskard_core::ThreadKind::Primary,
         mode: Mode::Plan,
         current_model: ModelRef {
             provider: "openai".into(),

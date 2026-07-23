@@ -75,6 +75,8 @@ impl AgentHarness for CapturingHarness {
             harness_thread_id: opts.resume.unwrap_or_else(|| "cap".into()),
             warning: None,
             resumed_model: Some(opts.initial_model.clone()),
+            agent_name: None,
+            parent_harness_thread_id: None,
         })
     }
 
