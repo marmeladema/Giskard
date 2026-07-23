@@ -11,6 +11,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use giskard_core::ids::{ProjectId, ThreadId, TurnId};
 use giskard_core::model::{Effort, ModelRef};
+use giskard_core::thread::ThreadKind;
 use giskard_core::token::{DailyTokenLedger, TokenLedger};
 use giskard_core::turn::{ApprovalPolicy, Mode, Turn};
 
@@ -63,6 +64,12 @@ pub struct ThreadFile {
     pub project_id: ProjectId,
     pub title: String,
     pub harness_thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_thread_id: Option<ThreadId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_by_turn_id: Option<TurnId>,
+    #[serde(default, skip_serializing_if = "is_primary_thread")]
+    pub kind: ThreadKind,
     pub mode: Mode,
     pub current_model: ModelRef,
     /// Effective context window for `current_model`. This starts from catalog/config metadata and
@@ -90,6 +97,10 @@ pub struct ThreadFile {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn is_primary_thread(value: &ThreadKind) -> bool {
+    *value == ThreadKind::Primary
 }
 
 fn parse_turn_history(path: &Path, data: &str) -> Result<Vec<Turn>, PersistError> {
@@ -902,6 +913,9 @@ mod tests {
             project_id: pid,
             title: "Fix auth".into(),
             harness_thread_id: "th_abc".into(),
+            parent_thread_id: None,
+            spawned_by_turn_id: None,
+            kind: ThreadKind::Primary,
             mode: Mode::Build,
             current_model: test_model(),
             context_window: 262_144,
@@ -938,6 +952,9 @@ mod tests {
             project_id: pid,
             title: "Fix auth".into(),
             harness_thread_id: "th_abc".into(),
+            parent_thread_id: None,
+            spawned_by_turn_id: None,
+            kind: ThreadKind::Primary,
             mode: Mode::Build,
             current_model: test_model(),
             context_window: 262_144,
@@ -984,6 +1001,9 @@ mod tests {
                 project_id: pid,
                 title: "t".into(),
                 harness_thread_id: "th".into(),
+                parent_thread_id: None,
+                spawned_by_turn_id: None,
+                kind: ThreadKind::Primary,
                 mode: Mode::Plan,
                 current_model: test_model(),
                 context_window: 128_000,
@@ -1156,6 +1176,9 @@ mod tests {
                     project_id: pid,
                     title: "t".into(),
                     harness_thread_id: "th".into(),
+                    parent_thread_id: None,
+                    spawned_by_turn_id: None,
+                    kind: ThreadKind::Primary,
                     mode: Mode::Build,
                     current_model: test_model(),
                     context_window: 0,
@@ -1317,6 +1340,9 @@ mod tests {
                     project_id: pid,
                     title: "t".into(),
                     harness_thread_id: "th".into(),
+                    parent_thread_id: None,
+                    spawned_by_turn_id: None,
+                    kind: ThreadKind::Primary,
                     mode: Mode::Build,
                     current_model: test_model(),
                     context_window: 0,
@@ -1356,6 +1382,9 @@ mod tests {
                     project_id: pid,
                     title: "t".into(),
                     harness_thread_id: "th".into(),
+                    parent_thread_id: None,
+                    spawned_by_turn_id: None,
+                    kind: ThreadKind::Primary,
                     mode: Mode::Build,
                     current_model: test_model(),
                     context_window: 0,

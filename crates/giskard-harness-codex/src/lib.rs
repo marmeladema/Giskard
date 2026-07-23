@@ -31,18 +31,20 @@ use giskard_core::mcp::{
 };
 use giskard_core::model::ModelDescriptor;
 use giskard_core::server_request::ServerRequestResponse;
+use giskard_core::text::trimmed_non_empty;
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
     AgentEventStream, AgentHarness, HarnessCapabilities, HarnessNotice, OpenThreadOptions,
-    ThreadHandle,
+    ResumePolicy, ThreadHandle,
 };
 
 use mapping::CodexMapper;
 
 const BROADCAST_CAPACITY: usize = 256;
 const TURN_FIRST_EVENT_WARN_AFTER: Duration = Duration::from_secs(15);
+const STRICT_RESUME_RETRY_DELAYS_MS: [u64; 7] = [10, 20, 40, 80, 160, 320, 500];
 #[cfg(not(test))]
 const CODEX_JSON_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
@@ -1166,7 +1168,10 @@ fn should_poll_codex_messages(
     active_turns: &ActiveTurns,
     pending_compactions: &HashMap<ThreadId, PendingCompaction>,
 ) -> bool {
-    !active_turns.is_empty() || mapper.has_running_commands() || !pending_compactions.is_empty()
+    !active_turns.is_empty()
+        || mapper.has_active_turns()
+        || mapper.has_running_commands()
+        || !pending_compactions.is_empty()
 }
 
 fn fallback_thread(mapper: &CodexMapper, active_turns: &ActiveTurns) -> ThreadId {
@@ -1651,12 +1656,24 @@ async fn handle_open_thread(
     // warn the caller that agent context was lost while keeping the Giskard-side history.
     let mut resume_warning = None;
 
-    let (harness_thread_id, resumed_model) = if let Some(ref resume_id) = opts.resume {
+    let opened = if let Some(ref resume_id) = opts.resume {
         let context = CodexOperationContext::for_project("thread_resume", opts.project)
             .with_thread_id(thread_id)
             .with_harness_thread_id(resume_id);
-        match resume_thread(client, context, resume_id, &cwd, &opts.initial_model).await {
+        match resume_thread_with_policy(
+            client,
+            context,
+            resume_id,
+            &cwd,
+            &opts.initial_model,
+            opts.resume_policy,
+        )
+        .await
+        {
             Ok(opened) => opened,
+            Err(error) if opts.resume_policy == ResumePolicy::RequireExisting => {
+                return Err(error);
+            }
             Err(e) => {
                 // C5: Codex thread store purged/rotated. Start fresh instead of hard-failing.
                 resume_warning = Some(HarnessNotice {
@@ -1681,14 +1698,14 @@ async fn handle_open_thread(
     };
 
     // B4: bind the (possibly re-established) native id to the durable ThreadId.
-    mapper.register_thread(harness_thread_id.clone(), thread_id);
+    mapper.register_thread(opened.harness_thread_id.clone(), thread_id);
 
     let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
     ensure_thread_sender(senders, thread_id, tx);
 
     let _ = broadcast_event(senders, thread_id, || AgentEvent::ThreadOpened {
         thread: thread_id,
-        harness_thread_id: harness_thread_id.clone(),
+        harness_thread_id: opened.harness_thread_id.clone(),
     })
     .await;
 
@@ -1704,10 +1721,67 @@ async fn handle_open_thread(
 
     Ok(ThreadHandle {
         thread: thread_id,
-        harness_thread_id,
+        harness_thread_id: opened.harness_thread_id,
         warning: resume_warning,
-        resumed_model,
+        resumed_model: opened.model,
+        agent_name: opened.agent_name,
+        parent_harness_thread_id: opened.parent_harness_thread_id,
     })
+}
+
+struct OpenedNativeThread {
+    harness_thread_id: String,
+    model: Option<giskard_core::model::ModelRef>,
+    agent_name: Option<String>,
+    parent_harness_thread_id: Option<String>,
+}
+
+async fn resume_thread_with_policy(
+    client: &mut dyn CodexTransport,
+    context: CodexOperationContext<'_>,
+    resume_id: &str,
+    cwd: &str,
+    model: &giskard_core::model::ModelRef,
+    policy: ResumePolicy,
+) -> Result<OpenedNativeThread, HarnessError> {
+    let mut retry = 0usize;
+    loop {
+        match resume_thread(client, context, resume_id, cwd, model).await {
+            Ok(opened) => {
+                if policy == ResumePolicy::RequireExisting && opened.harness_thread_id != resume_id
+                {
+                    return Err(HarnessError::Protocol(format!(
+                        "strict resume returned native thread {} instead of {resume_id}",
+                        opened.harness_thread_id
+                    )));
+                }
+                if retry > 0 {
+                    info!(
+                        harness_thread_id = %resume_id,
+                        attempts = retry + 1,
+                        "resumed newly materialized native thread after retry"
+                    );
+                }
+                return Ok(opened);
+            }
+            Err(error)
+                if policy == ResumePolicy::RequireExisting
+                    && codex_reports_missing_rollout(&error, resume_id)
+                    && retry < STRICT_RESUME_RETRY_DELAYS_MS.len() =>
+            {
+                let delay_ms = STRICT_RESUME_RETRY_DELAYS_MS[retry];
+                debug!(
+                    harness_thread_id = %resume_id,
+                    attempt = retry + 1,
+                    delay_ms,
+                    "native thread was advertised before its rollout was materialized; retrying strict resume"
+                );
+                retry += 1;
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// The model/provider a `thread/start` / `thread/resume` response reports as effective. Codex can
@@ -1736,7 +1810,7 @@ async fn resume_thread(
     resume_id: &str,
     cwd: &str,
     model: &giskard_core::model::ModelRef,
-) -> Result<(String, Option<giskard_core::model::ModelRef>), HarnessError> {
+) -> Result<OpenedNativeThread, HarnessError> {
     let params: codex_codes::ThreadResumeParams = serde_json::from_value(serde_json::json!({
         "threadId": resume_id,
         "cwd": cwd,
@@ -1752,7 +1826,22 @@ async fn resume_thread(
     )
     .await?;
     let resumed = effective_model(&resp.model, &resp.model_provider, model);
-    Ok((resp.thread.id, resumed))
+    Ok(OpenedNativeThread {
+        harness_thread_id: resp.thread.id,
+        model: resumed,
+        agent_name: resp
+            .thread
+            .agent_nickname
+            .as_deref()
+            .and_then(trimmed_non_empty)
+            .map(ToOwned::to_owned),
+        parent_harness_thread_id: resp
+            .thread
+            .parent_thread_id
+            .as_deref()
+            .and_then(trimmed_non_empty)
+            .map(ToOwned::to_owned),
+    })
 }
 
 async fn start_thread(
@@ -1760,7 +1849,7 @@ async fn start_thread(
     context: CodexOperationContext<'_>,
     cwd: &str,
     initial_model: &giskard_core::model::ModelRef,
-) -> Result<(String, Option<giskard_core::model::ModelRef>), HarnessError> {
+) -> Result<OpenedNativeThread, HarnessError> {
     let params: codex_codes::ThreadStartParams = serde_json::from_value(serde_json::json!({
         "cwd": cwd,
         "model": initial_model.model,
@@ -1775,7 +1864,22 @@ async fn start_thread(
     )
     .await?;
     let started = effective_model(&resp.model, &resp.model_provider, initial_model);
-    Ok((resp.thread.id, started))
+    Ok(OpenedNativeThread {
+        harness_thread_id: resp.thread.id,
+        model: started,
+        agent_name: resp
+            .thread
+            .agent_nickname
+            .as_deref()
+            .and_then(trimmed_non_empty)
+            .map(ToOwned::to_owned),
+        parent_harness_thread_id: resp
+            .thread
+            .parent_thread_id
+            .as_deref()
+            .and_then(trimmed_non_empty)
+            .map(ToOwned::to_owned),
+    })
 }
 
 async fn handle_start_turn(
@@ -2522,14 +2626,40 @@ async fn handle_delete_thread(
     let params = codex_codes::ThreadDeleteParams {
         thread_id: thread.harness_thread_id.clone(),
     };
-    let _: codex_codes::ThreadDeleteResponse = codex_request(
+    let result: Result<codex_codes::ThreadDeleteResponse, HarnessError> = codex_request(
         client,
         CodexOperationContext::for_thread("delete_thread", thread),
         codex_codes::protocol::methods::THREAD_DELETE,
         &params,
     )
-    .await?;
-    Ok(())
+    .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) if codex_reports_missing_rollout(&error, &thread.harness_thread_id) => {
+            warn!(
+                thread_id = %thread.thread,
+                harness_thread_id = %thread.harness_thread_id,
+                action = "delete_thread",
+                "native Codex rollout is already absent; completing thread deletion idempotently"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn codex_reports_missing_rollout(error: &HarnessError, harness_thread_id: &str) -> bool {
+    // This is intentionally coupled to the pinned Codex/codex-codes protocol chain: Codex emits
+    // `InvalidRequest("no rollout found for thread id …")`, app-server preserves it as JSON-RPC
+    // -32600, and codex-codes formats that response with this prefix. Keep the match fail-closed if
+    // any layer changes; a different "thread not found" error must remain visible to the caller.
+    const PREFIX: &str = "JSON-RPC error (-32600): no rollout found for thread id ";
+    let HarnessError::Transport(message) = error else {
+        return false;
+    };
+    message
+        .strip_prefix(PREFIX)
+        .is_some_and(|missing_id| missing_id == harness_thread_id)
 }
 
 async fn handle_interrupt_turn(
@@ -2571,6 +2701,8 @@ mod tests {
             harness_thread_id: "native-thread".into(),
             warning: None,
             resumed_model: None,
+            agent_name: None,
+            parent_harness_thread_id: None,
         }
     }
 
@@ -2622,6 +2754,8 @@ mod tests {
         hang_methods: HashSet<String>,
         background_terminal_terminate_result: Option<bool>,
         command_exec_terminate_error: Option<String>,
+        thread_delete_error: Option<String>,
+        thread_resume_missing_rollout_failures: usize,
         model_list_error: Option<String>,
         hang_response_json: bool,
         hang_shutdown: bool,
@@ -2687,6 +2821,17 @@ mod tests {
             self.state.lock().await.command_exec_terminate_error = Some(message.into());
         }
 
+        async fn fail_thread_delete(&self, message: &str) {
+            self.state.lock().await.thread_delete_error = Some(message.into());
+        }
+
+        async fn fail_thread_resume_missing_rollout(&self, failures: usize) {
+            self.state
+                .lock()
+                .await
+                .thread_resume_missing_rollout_failures = failures;
+        }
+
         async fn fail_model_list(&self, message: &str) {
             self.state.lock().await.model_list_error = Some(message.into());
         }
@@ -2744,11 +2889,19 @@ mod tests {
                             .as_str()
                             .filter(|id| !id.is_empty())
                             .unwrap_or("native-resumed");
-                        Ok(thread_open_response(
-                            native_thread_id,
-                            params["model"].as_str().unwrap_or("gpt-5.5"),
-                            params["modelProvider"].as_str().unwrap_or("openai"),
-                        ))
+                        if state.thread_resume_missing_rollout_failures > 0 {
+                            state.thread_resume_missing_rollout_failures -= 1;
+                            Err(HarnessError::Transport(format!(
+                                "JSON-RPC error (-32600): no rollout found for thread id \
+                                 {native_thread_id}"
+                            )))
+                        } else {
+                            Ok(thread_open_response(
+                                native_thread_id,
+                                params["model"].as_str().unwrap_or("gpt-5.5"),
+                                params["modelProvider"].as_str().unwrap_or("openai"),
+                            ))
+                        }
                     }
                     codex_codes::protocol::methods::TURN_START => {
                         state.turn_counter += 1;
@@ -2771,8 +2924,14 @@ mod tests {
                     | codex_codes::protocol::methods::THREAD_UNARCHIVE
                     | codex_codes::protocol::methods::THREAD_NAME_SET
                     | codex_codes::protocol::methods::CONFIG_MCPSERVER_RELOAD
-                    | codex_codes::protocol::methods::THREAD_DELETE
                     | codex_codes::protocol::methods::TURN_INTERRUPT => Ok(json!({})),
+                    codex_codes::protocol::methods::THREAD_DELETE => {
+                        if let Some(message) = state.thread_delete_error.clone() {
+                            Err(HarnessError::Transport(message))
+                        } else {
+                            Ok(json!({}))
+                        }
+                    }
                     THREAD_BACKGROUND_TERMINALS_TERMINATE => {
                         let terminated = state.background_terminal_terminate_result.unwrap_or(true);
                         Ok(json!({ "terminated": terminated }))
@@ -2894,6 +3053,7 @@ mod tests {
     }
 
     fn thread_open_response(native_thread_id: &str, model: &str, provider: &str) -> Value {
+        let parent_thread_id = (native_thread_id == "native-existing").then_some("native-parent");
         json!({
             "approvalPolicy": "never",
             "approvalsReviewer": null,
@@ -2902,7 +3062,8 @@ mod tests {
             "modelProvider": provider,
             "sandbox": {},
             "thread": {
-                "id": native_thread_id
+                "id": native_thread_id,
+                "parentThreadId": parent_thread_id
             }
         })
     }
@@ -2913,6 +3074,7 @@ mod tests {
             thread,
             workspace_root: PathBuf::from("/tmp"),
             resume: resume.map(str::to_owned),
+            resume_policy: ResumePolicy::AllowFreshFallback,
             initial_model: test_model(None),
         }
     }
@@ -3002,6 +3164,7 @@ mod tests {
                     title: "Context compacted".into(),
                     detail: None,
                     metadata: None,
+                    subagent: None,
                 },
                 created_at: Utc::now(),
             },
@@ -3088,6 +3251,8 @@ mod tests {
             harness_thread_id: "native-thread-2".into(),
             warning: None,
             resumed_model: None,
+            agent_name: None,
+            parent_harness_thread_id: None,
         };
         let first_turn = TurnId::new();
         let second_turn = TurnId::new();
@@ -3196,10 +3361,105 @@ mod tests {
 
         assert_eq!(resumed.thread, resumed_thread);
         assert_eq!(resumed.harness_thread_id, "native-existing");
+        assert_eq!(
+            resumed.parent_harness_thread_id.as_deref(),
+            Some("native-parent")
+        );
         assert!(controller.requests().await.iter().any(|req| {
             req.method == codex_codes::protocol::methods::THREAD_RESUME
                 && req.params["threadId"] == "native-existing"
         }));
+    }
+
+    #[tokio::test]
+    async fn strict_resume_retries_materialization_without_starting_a_replacement() {
+        let (harness, controller) = spawn_fake_harness();
+        controller.fail_thread_resume_missing_rollout(1).await;
+        let mut opts = open_opts(None, Some("native-emerging-child"));
+        opts.resume_policy = ResumePolicy::RequireExisting;
+
+        let opened = harness.open_thread(opts).await.unwrap();
+
+        assert_eq!(opened.harness_thread_id, "native-emerging-child");
+        let requests = controller.requests().await;
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| {
+                    request.method == codex_codes::protocol::methods::THREAD_RESUME
+                })
+                .count(),
+            2
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| { request.method == codex_codes::protocol::methods::THREAD_START })
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_resume_exhaustion_never_starts_a_replacement() {
+        let (harness, controller) = spawn_fake_harness();
+        controller
+            .fail_thread_resume_missing_rollout(STRICT_RESUME_RETRY_DELAYS_MS.len() + 1)
+            .await;
+        let mut opts = open_opts(None, Some("native-unmaterialized-child"));
+        opts.resume_policy = ResumePolicy::RequireExisting;
+
+        let error = harness.open_thread(opts).await.unwrap_err();
+
+        assert!(codex_reports_missing_rollout(
+            &error,
+            "native-unmaterialized-child"
+        ));
+        let requests = controller.requests().await;
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| {
+                    request.method == codex_codes::protocol::methods::THREAD_RESUME
+                })
+                .count(),
+            STRICT_RESUME_RETRY_DELAYS_MS.len() + 1
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| { request.method == codex_codes::protocol::methods::THREAD_START })
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_resume_keeps_fresh_thread_recovery_after_missing_rollout() {
+        let (harness, controller) = spawn_fake_harness();
+        controller.fail_thread_resume_missing_rollout(1).await;
+
+        let opened = harness
+            .open_thread(open_opts(None, Some("native-missing")))
+            .await
+            .unwrap();
+
+        assert_eq!(opened.harness_thread_id, "native-thread-1");
+        assert_eq!(
+            opened.warning.as_ref().map(|warning| warning.code.as_str()),
+            Some("codex_resume_failed")
+        );
+        let requests = controller.requests().await;
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == codex_codes::protocol::methods::THREAD_RESUME)
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == codex_codes::protocol::methods::THREAD_START)
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -3469,6 +3729,48 @@ mod tests {
             }
             other => panic!("expected a transport error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn codex_delete_is_idempotent_when_matching_rollout_is_missing() {
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
+        controller
+            .fail_thread_delete(&format!(
+                "JSON-RPC error (-32600): no rollout found for thread id {}",
+                thread.harness_thread_id
+            ))
+            .await;
+
+        timeout(Duration::from_secs(1), harness.delete_thread(&thread))
+            .await
+            .expect("delete_thread should complete")
+            .expect("an already-absent matching rollout should be idempotent success");
+
+        assert!(controller.requests().await.iter().any(|request| {
+            request.method == codex_codes::protocol::methods::THREAD_DELETE
+                && request.params["threadId"] == thread.harness_thread_id
+        }));
+    }
+
+    #[tokio::test]
+    async fn codex_delete_preserves_nonmatching_transport_failure() {
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
+        controller
+            .fail_thread_delete(
+                "JSON-RPC error (-32600): no rollout found for thread id different-thread",
+            )
+            .await;
+
+        let error = timeout(Duration::from_secs(1), harness.delete_thread(&thread))
+            .await
+            .expect("delete_thread should complete")
+            .expect_err("a nonmatching missing-rollout error must remain fatal");
+        assert!(matches!(
+            error,
+            HarnessError::Transport(message) if message.ends_with("different-thread")
+        ));
     }
 
     #[tokio::test]

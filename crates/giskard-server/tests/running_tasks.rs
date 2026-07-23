@@ -68,6 +68,8 @@ impl AgentHarness for ToolHarness {
             harness_thread_id: opts.resume.unwrap_or_else(|| "tool_harness".into()),
             warning: None,
             resumed_model: Some(opts.initial_model.clone()),
+            agent_name: None,
+            parent_harness_thread_id: None,
         })
     }
 
@@ -94,6 +96,8 @@ impl AgentHarness for ToolHarness {
                     input: serde_json::json!({ "q": "cats" }),
                     server: Some("wiki".into()),
                     status: Some("in_progress".into()),
+                    metadata: None,
+                    subagent: None,
                     started_at_ms: Some(1_785_000_000_000),
                 }),
             },

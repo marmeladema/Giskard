@@ -29,7 +29,9 @@ use tracing::info;
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ItemId, ThreadId, TurnId};
-use giskard_core::item::{Item, ItemDelta, ItemKind, ItemPayload, ItemStart};
+use giskard_core::item::{
+    Item, ItemDelta, ItemKind, ItemPayload, ItemStart, SubagentAction, SubagentLink,
+};
 use giskard_core::model::ModelRef;
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
@@ -42,6 +44,12 @@ use giskard_server::{AppState, HarnessFactory, build_app};
 
 /// The scripted agent's fixed reply. Tests assert on this exact string, so keep it stable.
 const SCRIPTED_REPLY: &str = "Hello from the scripted replay harness!";
+const SCRIPTED_SUBAGENT_TRIGGER: &str = "Spawn the scripted linked sub-agent.";
+const SCRIPTED_NESTED_SUBAGENT_TRIGGER: &str = "Spawn a scripted nested sub-agent.";
+const SCRIPTED_SUBAGENT_PROMPT: &str = "Review the linked child task.";
+const SCRIPTED_SUBAGENT_REPLY: &str = "Child replay output";
+const SCRIPTED_SUBAGENT_PREFIX: &str = "scripted-subagent|";
+const SCRIPTED_NESTED_SUBAGENT_PREFIX: &str = "scripted-nested-subagent|";
 
 /// A harness that speaks the neutral protocol but has no backend: every turn streams the same
 /// canned agent message, so the browser-visible transcript is fully deterministic.
@@ -78,6 +86,163 @@ impl ScriptedHarness {
             .find(|(id, _)| *id == thread)
             .map(|(_, tx)| tx.clone())
     }
+
+    fn subagent_parent(native_thread_id: &str) -> Option<String> {
+        [SCRIPTED_SUBAGENT_PREFIX, SCRIPTED_NESTED_SUBAGENT_PREFIX]
+            .into_iter()
+            .find_map(|prefix| native_thread_id.strip_prefix(prefix))
+            .and_then(|value| value.rsplit_once('|'))
+            .map(|(parent, _)| parent.to_owned())
+    }
+
+    fn spawn_nested_subagent_turn(
+        sender: broadcast::Sender<AgentEvent>,
+        thread_id: ThreadId,
+        parent_harness_thread_id: String,
+    ) {
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+            while sender.receiver_count() == 0 && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+            if sender.receiver_count() == 0 {
+                return;
+            }
+
+            let turn = TurnId::new();
+            // Mirror the collaboration-v2 race seen from Codex: a turn-scoped sub-agent activity
+            // can arrive before the corresponding TurnStarted notification.
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            let _ = sender.send(AgentEvent::ItemCompleted {
+                thread: thread_id,
+                turn,
+                item: Item {
+                    id: ItemId::new(),
+                    harness_item_id: format!("scripted_nested_subagent_link_{turn}"),
+                    payload: ItemPayload::Activity {
+                        title: "Sub-agent running".into(),
+                        detail: Some("Nested replay child".into()),
+                        metadata: None,
+                        subagent: Some(SubagentLink {
+                            harness_thread_id: format!(
+                                "{SCRIPTED_SUBAGENT_PREFIX}{parent_harness_thread_id}|{turn}"
+                            ),
+                            path: Some("Nested replay child".into()),
+                            initial_prompt: Some("Run the nested replay task.".into()),
+                            action: SubagentAction::Started,
+                            status: None,
+                            message: None,
+                        }),
+                    },
+                    created_at: chrono::Utc::now(),
+                },
+            });
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            let _ = sender.send(AgentEvent::TurnStarted {
+                thread: thread_id,
+                turn,
+            });
+            tokio::task::yield_now().await;
+            let wait_item_id = ItemId::new();
+            let _ = sender.send(AgentEvent::ItemStarted {
+                thread: thread_id,
+                turn,
+                item: ItemStart {
+                    id: wait_item_id,
+                    harness_item_id: format!("scripted_nested_wait_{turn}"),
+                    kind: ItemKind::ToolCall,
+                    command: None,
+                    tool: Some(giskard_core::item::ToolCallStart {
+                        name: "wait".into(),
+                        input: serde_json::json!({}),
+                        server: Some("collab-agent".into()),
+                        status: Some("in_progress".into()),
+                        metadata: None,
+                        subagent: None,
+                        started_at_ms: None,
+                    }),
+                },
+            });
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            let _ = sender.send(AgentEvent::TurnCompleted {
+                thread: thread_id,
+                turn,
+                usage: TokenUsage::new(30, 6),
+                status: TurnStatus {
+                    kind: TurnStatusKind::Completed,
+                    message: None,
+                },
+            });
+        });
+    }
+
+    fn spawn_subagent_turn(
+        sender: broadcast::Sender<AgentEvent>,
+        thread_id: ThreadId,
+        parent_harness_thread_id: String,
+    ) {
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+            while sender.receiver_count() == 0 && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+            if sender.receiver_count() == 0 {
+                return;
+            }
+
+            let turn = TurnId::new();
+            let _ = sender.send(AgentEvent::TurnStarted {
+                thread: thread_id,
+                turn,
+            });
+            tokio::task::yield_now().await;
+            let _ = sender.send(AgentEvent::ItemCompleted {
+                thread: thread_id,
+                turn,
+                item: Item {
+                    id: ItemId::new(),
+                    harness_item_id: format!("scripted_child_reply_{turn}"),
+                    payload: ItemPayload::AgentMessage {
+                        text: SCRIPTED_SUBAGENT_REPLY.into(),
+                    },
+                    created_at: chrono::Utc::now(),
+                },
+            });
+            tokio::task::yield_now().await;
+            let _ = sender.send(AgentEvent::ItemCompleted {
+                thread: thread_id,
+                turn,
+                item: Item {
+                    id: ItemId::new(),
+                    harness_item_id: format!("scripted_reverse_link_{turn}"),
+                    payload: ItemPayload::Activity {
+                        title: "Sub-agent interacted".into(),
+                        detail: Some("Sent a result to the parent".into()),
+                        metadata: None,
+                        subagent: Some(SubagentLink {
+                            harness_thread_id: parent_harness_thread_id,
+                            path: Some("/root".into()),
+                            initial_prompt: None,
+                            action: SubagentAction::Interacted,
+                            status: None,
+                            message: None,
+                        }),
+                    },
+                    created_at: chrono::Utc::now(),
+                },
+            });
+            tokio::task::yield_now().await;
+            let _ = sender.send(AgentEvent::TurnCompleted {
+                thread: thread_id,
+                turn,
+                usage: TokenUsage::new(40, 12),
+                status: TurnStatus {
+                    kind: TurnStatusKind::Completed,
+                    message: None,
+                },
+            });
+        });
+    }
 }
 
 #[async_trait]
@@ -97,12 +262,24 @@ impl AgentHarness for ScriptedHarness {
             .clone()
             .unwrap_or_else(|| format!("scripted_{thread}"));
 
-        let (tx, _rx) = broadcast::channel(256);
+        let (new_sender, _) = broadcast::channel(256);
         let mut threads = self.threads.lock().await;
-        if let Some((_, existing)) = threads.iter_mut().find(|(id, _)| *id == thread) {
-            *existing = tx.clone();
-        } else {
-            threads.push((thread, tx.clone()));
+        let (sender, is_new) =
+            if let Some((_, existing)) = threads.iter().find(|(id, _)| *id == thread) {
+                (existing.clone(), false)
+            } else {
+                threads.push((thread, new_sender.clone()));
+                (new_sender, true)
+            };
+        drop(threads);
+
+        let parent_harness_thread_id = Self::subagent_parent(&harness_thread_id);
+        if is_new && let Some(parent) = parent_harness_thread_id.clone() {
+            if harness_thread_id.starts_with(SCRIPTED_NESTED_SUBAGENT_PREFIX) {
+                Self::spawn_nested_subagent_turn(sender, thread, harness_thread_id.clone());
+            } else {
+                Self::spawn_subagent_turn(sender, thread, parent);
+            }
         }
 
         Ok(ThreadHandle {
@@ -110,13 +287,17 @@ impl AgentHarness for ScriptedHarness {
             harness_thread_id,
             warning: None,
             resumed_model: Some(opts.initial_model),
+            agent_name: parent_harness_thread_id
+                .as_ref()
+                .map(|_| "Replay child".to_string()),
+            parent_harness_thread_id,
         })
     }
 
     async fn start_turn(
         &self,
         thread: &ThreadHandle,
-        _input: UserInput,
+        input: UserInput,
         _overrides: TurnOverrides,
     ) -> Result<TurnId, HarnessError> {
         let turn = TurnId::new();
@@ -125,10 +306,64 @@ impl AgentHarness for ScriptedHarness {
             return Err(HarnessError::ThreadNotFound(thread_id));
         };
 
+        let input_text = input.as_text();
+        let subagent_native_thread_id = match input_text {
+            Some(SCRIPTED_SUBAGENT_TRIGGER) => Some(format!(
+                "{SCRIPTED_SUBAGENT_PREFIX}{}|{turn}",
+                thread.harness_thread_id
+            )),
+            Some(SCRIPTED_NESTED_SUBAGENT_TRIGGER) => Some(format!(
+                "{SCRIPTED_NESTED_SUBAGENT_PREFIX}{}|{turn}",
+                thread.harness_thread_id
+            )),
+            _ => None,
+        };
+
         // Stream the canned reply the way a real harness would: start, incremental deltas, then a
         // completed item and a turn-completed with token usage. Emitted off-task with yields so the
         // WebSocket layer observes distinct frames (the transcript renders progressively).
         tokio::spawn(async move {
+            if let Some(native_thread_id) = subagent_native_thread_id {
+                let _ = sender.send(AgentEvent::TurnStarted {
+                    thread: thread_id,
+                    turn,
+                });
+                tokio::task::yield_now().await;
+                let _ = sender.send(AgentEvent::ItemCompleted {
+                    thread: thread_id,
+                    turn,
+                    item: Item {
+                        id: ItemId::new(),
+                        harness_item_id: format!("scripted_subagent_link_{turn}"),
+                        payload: ItemPayload::Activity {
+                            title: "Sub-agent running".into(),
+                            detail: Some("Replay child".into()),
+                            metadata: None,
+                            subagent: Some(SubagentLink {
+                                harness_thread_id: native_thread_id,
+                                path: Some("Replay child".into()),
+                                initial_prompt: Some(SCRIPTED_SUBAGENT_PROMPT.into()),
+                                action: SubagentAction::Started,
+                                status: None,
+                                message: None,
+                            }),
+                        },
+                        created_at: chrono::Utc::now(),
+                    },
+                });
+                tokio::task::yield_now().await;
+                let _ = sender.send(AgentEvent::TurnCompleted {
+                    thread: thread_id,
+                    turn,
+                    usage: TokenUsage::new(25, 5),
+                    status: TurnStatus {
+                        kind: TurnStatusKind::Completed,
+                        message: None,
+                    },
+                });
+                return;
+            }
+
             let item_id = ItemId::new();
             let _ = sender.send(AgentEvent::TurnStarted {
                 thread: thread_id,
@@ -210,6 +445,14 @@ impl AgentHarness for ScriptedHarness {
     }
 
     async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
+        Ok(())
+    }
+
+    async fn delete_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
+        self.threads
+            .lock()
+            .await
+            .retain(|(thread_id, _)| *thread_id != thread.thread);
         Ok(())
     }
 

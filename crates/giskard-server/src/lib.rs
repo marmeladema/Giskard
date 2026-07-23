@@ -12,6 +12,7 @@ pub mod plan;
 pub mod registry;
 pub mod routes;
 pub mod running_commands;
+mod thread_graph;
 pub mod throttle;
 pub mod tokens;
 

@@ -8,7 +8,8 @@ use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{
-    CommandExecutionStart, Item, ItemDelta, ItemKind, ItemPayload, ItemStart,
+    CommandExecutionStart, Item, ItemDelta, ItemKind, ItemPayload, ItemStart, SubagentAction,
+    SubagentLink, ToolCallStart,
 };
 use giskard_core::model::ModelRef;
 use giskard_core::server_request::{ServerRequest, ServerRequestResponse};
@@ -16,7 +17,8 @@ use giskard_core::token::TokenUsage;
 use giskard_core::turn::{ApprovalPolicy, Mode, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ResumePolicy,
+    ThreadHandle,
 };
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 use giskard_persist::store::ProjectConfig;
@@ -134,6 +136,11 @@ struct SlowStartHarness {
 #[derive(Default)]
 struct ActivityHarness {
     threads: tokio::sync::Mutex<HashMap<ThreadId, tokio::sync::broadcast::Sender<AgentEvent>>>,
+    resume_policies: tokio::sync::Mutex<Vec<(String, ResumePolicy)>>,
+    hold_native_child_open: AtomicBool,
+    native_child_open_started: AtomicBool,
+    release_native_child_open: AtomicBool,
+    deleted_harness_thread_ids: tokio::sync::Mutex<Vec<String>>,
     approval_responses: tokio::sync::Mutex<Vec<(ApprovalId, ApprovalDecision)>>,
     server_responses: tokio::sync::Mutex<Vec<(ServerRequestId, ServerRequestResponse)>>,
     pending_approvals: tokio::sync::Mutex<HashMap<ApprovalId, (ThreadId, TurnId)>>,
@@ -186,6 +193,32 @@ impl SlowStartHarness {
 }
 
 impl ActivityHarness {
+    async fn resume_policies(&self) -> Vec<(String, ResumePolicy)> {
+        self.resume_policies.lock().await.clone()
+    }
+
+    fn hold_native_child_open(&self) {
+        self.hold_native_child_open.store(true, Ordering::SeqCst);
+    }
+
+    async fn wait_for_native_child_open(&self) {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        while !self.native_child_open_started.load(Ordering::SeqCst) {
+            if tokio::time::Instant::now() >= deadline {
+                panic!("native child open did not start");
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn release_native_child_open(&self) {
+        self.release_native_child_open.store(true, Ordering::SeqCst);
+    }
+
+    async fn deleted_harness_thread_ids(&self) -> Vec<String> {
+        self.deleted_harness_thread_ids.lock().await.clone()
+    }
+
     async fn wait_for_approval_response(&self) -> (ApprovalId, ApprovalDecision) {
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
         loop {
@@ -223,6 +256,162 @@ impl ActivityHarness {
             status: TurnStatus {
                 kind: TurnStatusKind::Completed,
                 message: None,
+            },
+        });
+        Ok(())
+    }
+
+    async fn wait_for_subscribers(&self, thread: ThreadId, expected: usize) {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            if let Some(sender) = self.threads.lock().await.get(&thread) {
+                if sender.receiver_count() >= expected {
+                    return;
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("timed out waiting for {expected} subscribers on {thread}");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn wait_for_subscriber_count(&self, thread: ThreadId, expected: usize) {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            let count = self
+                .threads
+                .lock()
+                .await
+                .get(&thread)
+                .map(tokio::sync::broadcast::Sender::receiver_count)
+                .unwrap_or_default();
+            if count == expected {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for {expected} subscribers on {thread}; observed {count}"
+                );
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn emit_external_turn(
+        &self,
+        thread: ThreadId,
+        text: &str,
+    ) -> Result<TurnId, HarnessError> {
+        let Some(sender) = self.threads.lock().await.get(&thread).cloned() else {
+            return Err(HarnessError::ThreadNotFound(thread));
+        };
+        let turn = TurnId::new();
+        let item = Item {
+            id: ItemId::new(),
+            harness_item_id: format!("external_{turn}"),
+            payload: ItemPayload::AgentMessage {
+                text: text.to_string(),
+            },
+            created_at: chrono::Utc::now(),
+        };
+        let _ = sender.send(AgentEvent::TurnStarted { thread, turn });
+        tokio::task::yield_now().await;
+        let _ = sender.send(AgentEvent::ItemCompleted { thread, turn, item });
+        tokio::task::yield_now().await;
+        let _ = sender.send(AgentEvent::TurnCompleted {
+            thread,
+            turn,
+            usage: TokenUsage::default(),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        });
+        Ok(turn)
+    }
+
+    async fn emit_external_turn_without_completion(
+        &self,
+        thread: ThreadId,
+        text: &str,
+    ) -> Result<TurnId, HarnessError> {
+        let Some(sender) = self.threads.lock().await.get(&thread).cloned() else {
+            return Err(HarnessError::ThreadNotFound(thread));
+        };
+        let turn = TurnId::new();
+        let item = Item {
+            id: ItemId::new(),
+            harness_item_id: format!("external_{turn}"),
+            payload: ItemPayload::AgentMessage {
+                text: text.to_string(),
+            },
+            created_at: chrono::Utc::now(),
+        };
+        let _ = sender.send(AgentEvent::TurnStarted { thread, turn });
+        tokio::task::yield_now().await;
+        let _ = sender.send(AgentEvent::ItemCompleted { thread, turn, item });
+        Ok(turn)
+    }
+
+    async fn emit_external_command_without_completion(
+        &self,
+        thread: ThreadId,
+        command: &str,
+    ) -> Result<(TurnId, ItemId), HarnessError> {
+        let Some(sender) = self.threads.lock().await.get(&thread).cloned() else {
+            return Err(HarnessError::ThreadNotFound(thread));
+        };
+        let turn = TurnId::new();
+        let item_id = ItemId::new();
+        let _ = sender.send(AgentEvent::TurnStarted { thread, turn });
+        tokio::task::yield_now().await;
+        let _ = sender.send(AgentEvent::ItemStarted {
+            thread,
+            turn,
+            item: ItemStart {
+                id: item_id,
+                harness_item_id: format!("external_command_{turn}"),
+                kind: ItemKind::CommandExecution,
+                command: Some(CommandExecutionStart {
+                    command: command.to_string(),
+                    cwd: "/tmp/subagent-command".into(),
+                    status: Some("in_progress".into()),
+                    process_id: Some(format!("process_{turn}")),
+                    started_at_ms: None,
+                }),
+                tool: None,
+            },
+        });
+        Ok((turn, item_id))
+    }
+
+    async fn complete_external_command(
+        &self,
+        thread: ThreadId,
+        turn: TurnId,
+        item_id: ItemId,
+        command: &str,
+    ) -> Result<(), HarnessError> {
+        let Some(sender) = self.threads.lock().await.get(&thread).cloned() else {
+            return Err(HarnessError::ThreadNotFound(thread));
+        };
+        let _ = sender.send(AgentEvent::ItemCompleted {
+            thread,
+            turn,
+            item: Item {
+                id: item_id,
+                harness_item_id: format!("external_command_{turn}"),
+                payload: ItemPayload::CommandExecution {
+                    command: command.to_string(),
+                    cwd: "/tmp/subagent-command".into(),
+                    output: String::new(),
+                    exit_code: Some(0),
+                    status: Some("completed".into()),
+                    process_id: Some(format!("process_{turn}")),
+                    duration_ms: Some(30_000),
+                },
+                created_at: chrono::Utc::now(),
             },
         });
         Ok(())
@@ -295,6 +484,8 @@ impl AgentHarness for UnsupportedCompactionHarness {
             harness_thread_id: opts.resume.unwrap_or_else(|| format!("test_{thread}")),
             warning: None,
             resumed_model: Some(opts.initial_model.clone()),
+            agent_name: None,
+            parent_harness_thread_id: None,
         })
     }
 
@@ -382,6 +573,8 @@ impl AgentHarness for SlowCompactionHarness {
             harness_thread_id: opts.resume.unwrap_or_else(|| format!("test_{thread}")),
             warning: None,
             resumed_model: Some(opts.initial_model.clone()),
+            agent_name: None,
+            parent_harness_thread_id: None,
         })
     }
 
@@ -481,6 +674,7 @@ impl AgentHarness for SlowCompactionHarness {
                         title: "Context compacted".into(),
                         detail: None,
                         metadata: None,
+                        subagent: None,
                     },
                     created_at: chrono::Utc::now(),
                 },
@@ -528,14 +722,41 @@ impl AgentHarness for ActivityHarness {
     }
 
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
+        if let Some(native_thread_id) = opts.resume.as_ref() {
+            self.resume_policies
+                .lock()
+                .await
+                .push((native_thread_id.clone(), opts.resume_policy));
+        }
+        if matches!(
+            opts.resume.as_deref(),
+            Some("native-child" | "native-terminal-child")
+        ) && self.hold_native_child_open.load(Ordering::SeqCst)
+        {
+            self.native_child_open_started.store(true, Ordering::SeqCst);
+            while !self.release_native_child_open.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        }
         let thread = opts.thread.unwrap_or_default();
         let (tx, _) = tokio::sync::broadcast::channel(32);
         self.threads.lock().await.insert(thread, tx);
+        let harness_thread_id = opts.resume.unwrap_or_else(|| format!("test_{thread}"));
+        let agent_name = (harness_thread_id == "native-collab-child").then(|| "James".to_string());
+        let parent_harness_thread_id = match harness_thread_id.as_str() {
+            "native-collab-child" => Some("native-parent".to_string()),
+            "native-terminal-child" => Some("native-parent".to_string()),
+            "native-grandchild" => Some("native-collab-child".to_string()),
+            "native-foreign-child" => Some("native-other-parent".to_string()),
+            _ => None,
+        };
         Ok(ThreadHandle {
             thread,
-            harness_thread_id: opts.resume.unwrap_or_else(|| format!("test_{thread}")),
+            harness_thread_id,
             warning: None,
             resumed_model: Some(opts.initial_model.clone()),
+            agent_name,
+            parent_harness_thread_id,
         })
     }
 
@@ -599,6 +820,312 @@ impl AgentHarness for ActivityHarness {
                     received_at: chrono::Utc::now(),
                 },
             });
+        } else if text.contains("subagent terminal fallback") {
+            let item_id = ItemId::new();
+            let harness_item_id = format!("subagent_terminal_{turn}");
+            let _ = sender.send(AgentEvent::ItemStarted {
+                thread: thread_id,
+                turn,
+                item: ItemStart {
+                    id: item_id,
+                    harness_item_id: harness_item_id.clone(),
+                    kind: ItemKind::ToolCall,
+                    command: None,
+                    tool: Some(ToolCallStart {
+                        name: "spawn_subagent".into(),
+                        input: serde_json::json!({ "prompt": "recover completed work" }),
+                        server: Some("test-harness".into()),
+                        status: Some("in_progress".into()),
+                        metadata: None,
+                        subagent: Some(SubagentLink {
+                            harness_thread_id: "native-terminal-child".into(),
+                            path: Some("terminal-reviewer".into()),
+                            initial_prompt: Some("recover completed work".into()),
+                            action: SubagentAction::Spawned,
+                            status: Some(giskard_core::item::SubagentStatus::Pending),
+                            message: None,
+                        }),
+                        started_at_ms: Some(1_785_000_000_000),
+                    }),
+                },
+            });
+            let item = Item {
+                id: item_id,
+                harness_item_id,
+                payload: ItemPayload::ToolCall {
+                    name: "spawn_subagent".into(),
+                    input: serde_json::json!({ "prompt": "recover completed work" }),
+                    output: Some(serde_json::json!({ "status": "completed" })),
+                    server: Some("test-harness".into()),
+                    status: Some("completed".into()),
+                    metadata: None,
+                    subagent: Some(SubagentLink {
+                        harness_thread_id: "native-terminal-child".into(),
+                        path: Some("terminal-reviewer".into()),
+                        initial_prompt: Some("recover completed work".into()),
+                        action: SubagentAction::Spawned,
+                        status: Some(giskard_core::item::SubagentStatus::Completed),
+                        message: Some("Recovered terminal child output".into()),
+                    }),
+                    error: None,
+                },
+                created_at: chrono::Utc::now(),
+            };
+            let _ = sender.send(AgentEvent::ItemCompleted {
+                thread: thread_id,
+                turn,
+                item,
+            });
+            self.complete_turn(thread_id, turn).await?;
+        } else if text.contains("subagent interrupted") {
+            let item = Item {
+                id: ItemId::new(),
+                harness_item_id: format!("subagent_interrupted_{turn}"),
+                payload: ItemPayload::Activity {
+                    title: "Sub-agent interrupted".into(),
+                    detail: Some("explorer (native-child)".into()),
+                    metadata: None,
+                    subagent: Some(SubagentLink {
+                        harness_thread_id: "native-child".into(),
+                        path: Some("explorer".into()),
+                        initial_prompt: None,
+                        action: SubagentAction::Interrupted,
+                        status: None,
+                        message: None,
+                    }),
+                },
+                created_at: chrono::Utc::now(),
+            };
+            let _ = sender.send(AgentEvent::ItemCompleted {
+                thread: thread_id,
+                turn,
+                item,
+            });
+            self.complete_turn(thread_id, turn).await?;
+        } else if text.contains("plain activity") {
+            let item = Item {
+                id: ItemId::new(),
+                harness_item_id: format!("plain_activity_{turn}"),
+                payload: ItemPayload::Activity {
+                    title: "Plain activity".into(),
+                    detail: Some("not a linked thread".into()),
+                    metadata: None,
+                    subagent: None,
+                },
+                created_at: chrono::Utc::now(),
+            };
+            let _ = sender.send(AgentEvent::ItemCompleted {
+                thread: thread_id,
+                turn,
+                item,
+            });
+        } else if text.contains("foreign subagent activity") {
+            let item = Item {
+                id: ItemId::new(),
+                harness_item_id: format!("foreign_subagent_activity_{turn}"),
+                payload: ItemPayload::Activity {
+                    title: "Sub-agent running".into(),
+                    detail: Some("foreign (native-foreign-child)".into()),
+                    metadata: None,
+                    subagent: Some(SubagentLink {
+                        harness_thread_id: "native-foreign-child".into(),
+                        path: Some("foreign".into()),
+                        initial_prompt: None,
+                        action: SubagentAction::Started,
+                        status: None,
+                        message: None,
+                    }),
+                },
+                created_at: chrono::Utc::now(),
+            };
+            let _ = sender.send(AgentEvent::ItemCompleted {
+                thread: thread_id,
+                turn,
+                item,
+            });
+        } else if text.contains("subagent activity") {
+            let item = Item {
+                id: ItemId::new(),
+                harness_item_id: format!("subagent_activity_{turn}"),
+                payload: ItemPayload::Activity {
+                    title: "Sub-agent running".into(),
+                    detail: Some("explorer (native-child)".into()),
+                    metadata: None,
+                    subagent: Some(SubagentLink {
+                        harness_thread_id: "native-child".into(),
+                        path: Some("explorer".into()),
+                        initial_prompt: None,
+                        action: SubagentAction::Started,
+                        status: None,
+                        message: None,
+                    }),
+                },
+                created_at: chrono::Utc::now(),
+            };
+            let _ = sender.send(AgentEvent::ItemCompleted {
+                thread: thread_id,
+                turn,
+                item,
+            });
+        } else if text.contains("subagent delayed metadata") {
+            let item = Item {
+                id: ItemId::new(),
+                harness_item_id: format!("subagent_activity_{turn}"),
+                payload: ItemPayload::Activity {
+                    title: "Sub-agent running".into(),
+                    detail: Some("explorer (native-collab-child)".into()),
+                    metadata: None,
+                    subagent: Some(SubagentLink {
+                        harness_thread_id: "native-collab-child".into(),
+                        path: Some("explorer".into()),
+                        initial_prompt: None,
+                        action: SubagentAction::Started,
+                        status: None,
+                        message: None,
+                    }),
+                },
+                created_at: chrono::Utc::now(),
+            };
+            let _ = sender.send(AgentEvent::ItemCompleted {
+                thread: thread_id,
+                turn,
+                item,
+            });
+            tokio::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                let _ = sender.send(AgentEvent::ItemStarted {
+                    thread: thread_id,
+                    turn,
+                    item: ItemStart {
+                        id: ItemId::new(),
+                        harness_item_id: format!("collab_spawn_{turn}"),
+                        kind: ItemKind::ToolCall,
+                        command: None,
+                        tool: Some(ToolCallStart {
+                            name: "spawn_subagent".into(),
+                            input: serde_json::json!({ "prompt": "delayed investigate" }),
+                            server: Some("test-harness".into()),
+                            status: Some("in_progress".into()),
+                            metadata: None,
+                            subagent: Some(SubagentLink {
+                                harness_thread_id: "native-collab-child".into(),
+                                path: Some("explorer".into()),
+                                initial_prompt: Some("delayed investigate".into()),
+                                action: SubagentAction::Spawned,
+                                status: None,
+                                message: None,
+                            }),
+                            started_at_ms: Some(1_785_000_000_000),
+                        }),
+                    },
+                });
+            });
+        } else if text.contains("collab spawn input fallback") {
+            let _ = sender.send(AgentEvent::ItemStarted {
+                thread: thread_id,
+                turn,
+                item: ItemStart {
+                    id: ItemId::new(),
+                    harness_item_id: format!("collab_spawn_{turn}"),
+                    kind: ItemKind::ToolCall,
+                    command: None,
+                    tool: Some(ToolCallStart {
+                        name: "spawn_subagent".into(),
+                        input: serde_json::json!({ "message": "fallback investigate" }),
+                        server: Some("test-harness".into()),
+                        status: Some("in_progress".into()),
+                        metadata: None,
+                        subagent: Some(SubagentLink {
+                            harness_thread_id: "native-collab-child".into(),
+                            path: Some("explorer".into()),
+                            initial_prompt: None,
+                            action: SubagentAction::Spawned,
+                            status: None,
+                            message: None,
+                        }),
+                        started_at_ms: Some(1_785_000_000_000),
+                    }),
+                },
+            });
+        } else if text.contains("nested collab spawn") {
+            let _ = sender.send(AgentEvent::ItemStarted {
+                thread: thread_id,
+                turn,
+                item: ItemStart {
+                    id: ItemId::new(),
+                    harness_item_id: format!("nested_collab_spawn_{turn}"),
+                    kind: ItemKind::ToolCall,
+                    command: None,
+                    tool: Some(ToolCallStart {
+                        name: "spawn_subagent".into(),
+                        input: serde_json::json!({ "prompt": "nested investigate" }),
+                        server: Some("test-harness".into()),
+                        status: Some("in_progress".into()),
+                        metadata: None,
+                        subagent: Some(SubagentLink {
+                            harness_thread_id: "native-grandchild".into(),
+                            path: Some("nested-explorer".into()),
+                            initial_prompt: Some("nested investigate".into()),
+                            action: SubagentAction::Spawned,
+                            status: None,
+                            message: None,
+                        }),
+                        started_at_ms: Some(1_785_000_000_000),
+                    }),
+                },
+            });
+        } else if text.contains("collab spawn") {
+            let _ = sender.send(AgentEvent::ItemStarted {
+                thread: thread_id,
+                turn,
+                item: ItemStart {
+                    id: ItemId::new(),
+                    harness_item_id: format!("collab_spawn_{turn}"),
+                    kind: ItemKind::ToolCall,
+                    command: None,
+                    tool: Some(ToolCallStart {
+                        name: "spawn_subagent".into(),
+                        input: serde_json::json!({ "prompt": "investigate" }),
+                        server: Some("test-harness".into()),
+                        status: Some("in_progress".into()),
+                        metadata: None,
+                        subagent: Some(SubagentLink {
+                            harness_thread_id: "native-collab-child".into(),
+                            path: Some("explorer".into()),
+                            initial_prompt: Some("investigate".into()),
+                            action: SubagentAction::Spawned,
+                            status: None,
+                            message: None,
+                        }),
+                        started_at_ms: Some(1_785_000_000_000),
+                    }),
+                },
+            });
+        } else if text.contains("reverse parent activity") {
+            let item = Item {
+                id: ItemId::new(),
+                harness_item_id: format!("reverse_parent_activity_{turn}"),
+                payload: ItemPayload::Activity {
+                    title: "Sub-agent interacted".into(),
+                    detail: Some("/root (native-parent)".into()),
+                    metadata: None,
+                    subagent: Some(SubagentLink {
+                        harness_thread_id: "native-parent".into(),
+                        path: Some("/root".into()),
+                        initial_prompt: None,
+                        action: SubagentAction::Interacted,
+                        status: None,
+                        message: None,
+                    }),
+                },
+                created_at: chrono::Utc::now(),
+            };
+            let _ = sender.send(AgentEvent::ItemCompleted {
+                thread: thread_id,
+                turn,
+                item,
+            });
+            self.complete_turn(thread_id, turn).await?;
         } else {
             self.complete_turn(thread_id, turn).await?;
         }
@@ -654,6 +1181,15 @@ impl AgentHarness for ActivityHarness {
         Ok(())
     }
 
+    async fn delete_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
+        self.deleted_harness_thread_ids
+            .lock()
+            .await
+            .push(thread.harness_thread_id.clone());
+        self.threads.lock().await.remove(&thread.thread);
+        Ok(())
+    }
+
     async fn shutdown(&self) -> Result<(), HarnessError> {
         Ok(())
     }
@@ -691,6 +1227,8 @@ impl AgentHarness for SlowStartHarness {
             harness_thread_id: opts.resume.unwrap_or_else(|| format!("test_{thread}")),
             warning: None,
             resumed_model: Some(opts.initial_model.clone()),
+            agent_name: None,
+            parent_harness_thread_id: None,
         })
     }
 
@@ -822,6 +1360,8 @@ impl AgentHarness for CountingOpenHarness {
                 .unwrap_or_else(|| format!("count_{thread}_{open_call}")),
             warning: None,
             resumed_model: Some(opts.initial_model.clone()),
+            agent_name: None,
+            parent_harness_thread_id: None,
         })
     }
 
@@ -1576,6 +2116,88 @@ async fn create_project_only(client: &reqwest::Client, base: &str, cookie: &str)
     project_id
 }
 
+async fn wait_for_live_item_id(
+    state: &AppState,
+    thread_id: ThreadId,
+    harness_item_prefix: &str,
+) -> ItemId {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        if let Some(item_id) = state
+            .live_buffers
+            .snapshot(thread_id)
+            .await
+            .and_then(|snapshot| {
+                snapshot
+                    .accumulated
+                    .into_iter()
+                    .find_map(|event| match event {
+                        WireAgentEvent::ItemStarted { item, .. }
+                            if item.harness_item_id.starts_with(harness_item_prefix) =>
+                        {
+                            Some(item.id)
+                        }
+                        WireAgentEvent::ItemCompleted { item, .. }
+                            if item.harness_item_id.starts_with(harness_item_prefix) =>
+                        {
+                            Some(item.id)
+                        }
+                        _ => None,
+                    })
+            })
+        {
+            return item_id;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("item with harness prefix {harness_item_prefix} did not become live");
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn open_subagent_link(
+    client: &reqwest::Client,
+    base: &str,
+    cookie: &str,
+    project_id: ProjectId,
+    parent_thread_id: ThreadId,
+    item_id: ItemId,
+) -> reqwest::Response {
+    client
+        .post(format!(
+            "{base}/api/projects/{project_id}/threads/{parent_thread_id}/subagent-links/{item_id}/open"
+        ))
+        .header("cookie", cookie)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn wait_for_native_thread(
+    state: &AppState,
+    project_id: ProjectId,
+    harness_thread_id: &str,
+) -> giskard_persist::store::ThreadFile {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        for thread_id in state.store.list_threads(project_id).await.unwrap() {
+            let thread = state
+                .store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if thread.harness_thread_id == harness_thread_id {
+                return thread;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("native thread {harness_thread_id} was not materialized");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+}
+
 async fn wait_for_ws_error(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -1612,10 +2234,12 @@ async fn wait_for_turn_completed(
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
                 if let Ok(ServerMessage::Event {
                     thread_id: event_thread,
-                    agent_event: WireAgentEvent::TurnCompleted { .. },
+                    agent_event,
                 }) = serde_json::from_str(&text)
                 {
-                    if event_thread == thread_id {
+                    if event_thread == thread_id
+                        && matches!(*agent_event, WireAgentEvent::TurnCompleted { .. })
+                    {
                         return;
                     }
                 }
@@ -1641,11 +2265,13 @@ async fn wait_for_turn_started(
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
                 if let Ok(ServerMessage::Event {
                     thread_id: event_thread,
-                    agent_event: WireAgentEvent::TurnStarted { turn, .. },
+                    agent_event,
                 }) = serde_json::from_str(&text)
                 {
                     if event_thread == thread_id {
-                        return turn;
+                        if let WireAgentEvent::TurnStarted { turn, .. } = *agent_event {
+                            return turn;
+                        }
                     }
                 }
             }
@@ -1654,6 +2280,134 @@ async fn wait_for_turn_started(
         }
     }
     panic!("turn start for {thread_id} was not observed");
+}
+
+async fn wait_for_turn_started_with_input(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    thread_id: ThreadId,
+) -> (TurnId, Option<UserInput>) {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                if let Ok(ServerMessage::Event {
+                    thread_id: event_thread,
+                    agent_event,
+                }) = serde_json::from_str(&text)
+                {
+                    if event_thread == thread_id {
+                        if let WireAgentEvent::TurnStarted {
+                            turn, user_input, ..
+                        } = *agent_event
+                        {
+                            return (turn, user_input);
+                        }
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => {}
+        }
+    }
+    panic!("turn start for {thread_id} was not observed");
+}
+
+async fn wait_for_thread_state(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    thread_id: ThreadId,
+) {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                if let Ok(ServerMessage::ThreadState(state)) = serde_json::from_str(&text) {
+                    if state.thread_id == thread_id {
+                        return;
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => {}
+        }
+    }
+    panic!("thread state for {thread_id} was not observed");
+}
+
+async fn wait_for_agent_message_item(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    thread_id: ThreadId,
+    expected_text: &str,
+) -> TurnId {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                if let Ok(ServerMessage::Event {
+                    thread_id: event_thread,
+                    agent_event,
+                }) = serde_json::from_str(&text)
+                {
+                    if event_thread == thread_id {
+                        if let WireAgentEvent::ItemCompleted { turn, item, .. } = *agent_event {
+                            if matches!(
+                                item.payload,
+                                giskard_proto::WireItemPayload::AgentMessage { ref text }
+                                    if text == expected_text
+                            ) {
+                                return turn;
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => {}
+        }
+    }
+    panic!("agent message item for {thread_id} was not observed");
+}
+
+async fn wait_for_command_started(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    thread_id: ThreadId,
+    expected_command: &str,
+) -> TurnId {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                if let Ok(ServerMessage::Event {
+                    thread_id: event_thread,
+                    agent_event,
+                }) = serde_json::from_str(&text)
+                {
+                    if event_thread == thread_id {
+                        if let WireAgentEvent::ItemStarted { turn, item, .. } = *agent_event {
+                            if item.kind == ItemKind::CommandExecution
+                                && matches!(
+                                    item.command,
+                                    Some(command) if command.command == expected_command
+                                )
+                            {
+                                return turn;
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => {}
+        }
+    }
+    panic!("command start for {thread_id} was not observed");
 }
 
 async fn wait_for_approval_request(
@@ -1668,11 +2422,13 @@ async fn wait_for_approval_request(
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
                 if let Ok(ServerMessage::Event {
                     thread_id: event_thread,
-                    agent_event: WireAgentEvent::ApprovalRequested { request, .. },
+                    agent_event,
                 }) = serde_json::from_str(&text)
                 {
                     if event_thread == thread_id {
-                        return request.id.to_string();
+                        if let WireAgentEvent::ApprovalRequested { request, .. } = *agent_event {
+                            return request.id.to_string();
+                        }
                     }
                 }
             }
@@ -1950,7 +2706,7 @@ async fn compact_context_streams_and_persists_compaction_turn() {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
                 let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
                 if let ServerMessage::Event { agent_event, .. } = server_msg {
-                    match agent_event {
+                    match *agent_event {
                         WireAgentEvent::ItemCompleted { item, .. } => {
                             if let giskard_proto::WireItemPayload::Activity { title, .. } =
                                 item.payload
@@ -2068,6 +2824,66 @@ async fn wire_turn_id_matches_persisted_turn_id() {
 }
 
 #[tokio::test]
+async fn new_turn_start_replaces_stale_live_buffer_without_dropping_events() {
+    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    let stale_turn = TurnId::new();
+    state
+        .live_buffers
+        .replace_turn_with_user_input(
+            thread_id,
+            stale_turn,
+            Some(UserInput::text("stale interrupted turn")),
+        )
+        .await;
+    let mut ws = connect_ws(port, &cookie).await;
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::Subscribe {
+            thread_id,
+            since: None,
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    wait_for_thread_state(&mut ws, thread_id).await;
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::CompactContext { thread_id })
+            .unwrap()
+            .into(),
+    ))
+    .await
+    .unwrap();
+
+    let new_turn = wait_for_turn_started(&mut ws, thread_id).await;
+    assert_ne!(new_turn, stale_turn);
+    wait_for_turn_completed(&mut ws, thread_id).await;
+    assert!(state.live_buffers.snapshot(thread_id).await.is_none());
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        if state
+            .store
+            .load_all_turns(project_id, thread_id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|turn| turn.id == new_turn)
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("new turn was not persisted after replacing its stale live buffer");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
 async fn compact_context_does_not_block_turns_on_other_threads_or_projects() {
     let (_tmp, state, port) = start_slow_compaction_server_on_available_port().await;
     let base = format!("http://127.0.0.1:{port}");
@@ -2141,13 +2957,15 @@ async fn compact_context_does_not_block_turns_on_other_threads_or_projects() {
                 let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
                 if let ServerMessage::Event {
                     thread_id,
-                    agent_event: WireAgentEvent::TurnCompleted { .. },
+                    agent_event,
                 } = server_msg
                 {
-                    if thread_id == other_thread {
-                        other_completed = true;
-                    } else if thread_id == other_project_thread {
-                        other_project_completed = true;
+                    if matches!(*agent_event, WireAgentEvent::TurnCompleted { .. }) {
+                        if thread_id == other_thread {
+                            other_completed = true;
+                        } else if thread_id == other_project_thread {
+                            other_project_completed = true;
+                        }
                     }
                 }
             }
@@ -2758,6 +3576,1739 @@ async fn thread_rename_updates_thread_summary_and_persistence() {
         .unwrap()
         .unwrap();
     assert_eq!(saved.title, "Better title now");
+}
+
+#[tokio::test]
+async fn importing_subagent_thread_records_parent_and_reuses_native_child() {
+    let harness = Arc::new(ActivityHarness::default());
+    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let project_id = create_project_only(&client, &base, &cookie).await;
+
+    let parent_resp = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"resume": "native-parent"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(parent_resp.status(), 200);
+    let parent_body = parent_resp.json::<serde_json::Value>().await.unwrap();
+    let parent_id: ThreadId = parent_body["thread_id"].as_str().unwrap().parse().unwrap();
+    let parent_file = state
+        .store
+        .load_thread(project_id, parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let spawned_by_turn_id = state
+        .registry
+        .start_turn(
+            parent_id,
+            UserInput::text("subagent activity"),
+            TurnOverrides {
+                model: Some(parent_file.current_model.clone()),
+                mode: parent_file.mode,
+                approval_policy: parent_file.approval_policy,
+            },
+            parent_file.current_model.clone(),
+        )
+        .await
+        .unwrap();
+    let link_item_id = wait_for_live_item_id(&state, parent_id, "subagent_activity_").await;
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    let child_id = loop {
+        let mut found = None;
+        for thread_id in state.store.list_threads(project_id).await.unwrap() {
+            let thread = state
+                .store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if thread.harness_thread_id == "native-child" {
+                found = Some(thread.id);
+                break;
+            }
+        }
+        if let Some(thread_id) = found {
+            break thread_id;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("subagent activity did not auto-import native child thread");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    };
+    let saved = state
+        .store
+        .load_thread(project_id, child_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.harness_thread_id, "native-child");
+    assert_eq!(saved.parent_thread_id, Some(parent_id));
+    assert_eq!(saved.spawned_by_turn_id, Some(spawned_by_turn_id));
+    assert_eq!(saved.kind, giskard_core::ThreadKind::Subagent);
+    assert!(
+        harness
+            .resume_policies()
+            .await
+            .iter()
+            .any(|(native_id, policy)| {
+                native_id == "native-child" && *policy == ResumePolicy::RequireExisting
+            })
+    );
+
+    let external_turn = harness
+        .emit_external_turn(child_id, "subagent live output")
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        let turns = state
+            .store
+            .load_all_turns(project_id, child_id)
+            .await
+            .unwrap();
+        if let Some(turn) = turns.iter().find(|turn| turn.id == external_turn) {
+            assert_eq!(turn.user_input.as_text(), Some("Sub-agent turn"));
+            assert!(turn.items.iter().any(|item| {
+                matches!(
+                    &item.payload,
+                    ItemPayload::AgentMessage { text } if text == "subagent live output"
+                )
+            }));
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("passive subagent turn was not persisted");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+    harness
+        .complete_turn(parent_id, spawned_by_turn_id)
+        .await
+        .unwrap();
+
+    let listed = client
+        .get(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let child_summary = listed["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|thread| thread["id"].as_str() == Some(&child_id.to_string()))
+        .unwrap();
+    assert!(
+        listed["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|thread| thread.get("harness_thread_id").is_none()),
+        "thread summaries must not expose native harness thread ids"
+    );
+    assert_eq!(child_summary["kind"], "subagent");
+    let parent_id_string = parent_id.to_string();
+    let spawned_by_turn_id_string = spawned_by_turn_id.to_string();
+    assert_eq!(
+        child_summary["parent_thread_id"].as_str(),
+        Some(parent_id_string.as_str())
+    );
+    assert_eq!(
+        child_summary["spawned_by_turn_id"].as_str(),
+        Some(spawned_by_turn_id_string.as_str())
+    );
+
+    let duplicate =
+        open_subagent_link(&client, &base, &cookie, project_id, parent_id, link_item_id)
+            .await
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+    let child_id_string = child_id.to_string();
+    assert_eq!(
+        duplicate["thread_id"].as_str(),
+        Some(child_id_string.as_str())
+    );
+    assert_eq!(state.store.list_threads(project_id).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn route_and_forwarder_import_same_native_child_once() {
+    let harness = Arc::new(ActivityHarness::default());
+    harness.hold_native_child_open();
+    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let project_id = create_project_only(&client, &base, &cookie).await;
+
+    let parent_resp = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"resume": "native-parent"}))
+        .send()
+        .await
+        .unwrap();
+    let parent_id: ThreadId = parent_resp.json::<serde_json::Value>().await.unwrap()["thread_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let parent_file = state
+        .store
+        .load_thread(project_id, parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let spawned_by_turn_id = state
+        .registry
+        .start_turn(
+            parent_id,
+            UserInput::text("subagent activity"),
+            TurnOverrides {
+                model: Some(parent_file.current_model.clone()),
+                mode: parent_file.mode,
+                approval_policy: parent_file.approval_policy,
+            },
+            parent_file.current_model,
+        )
+        .await
+        .unwrap();
+
+    harness.wait_for_native_child_open().await;
+    let link_item_id = wait_for_live_item_id(&state, parent_id, "subagent_activity_").await;
+
+    let blocked_delete = tokio::time::timeout(
+        tokio::time::Duration::from_secs(6),
+        client
+            .delete(format!(
+                "{base}/api/projects/{project_id}/threads/{parent_id}"
+            ))
+            .header("cookie", &cookie)
+            .send(),
+    )
+    .await
+    .expect("lifecycle-lock contention should have a bounded HTTP response")
+    .unwrap();
+    assert_eq!(blocked_delete.status(), 503);
+
+    let route_client = client.clone();
+    let route_base = base.clone();
+    let route_cookie = cookie.clone();
+    let route_import = tokio::spawn(async move {
+        open_subagent_link(
+            &route_client,
+            &route_base,
+            &route_cookie,
+            project_id,
+            parent_id,
+            link_item_id,
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+    harness.release_native_child_open();
+
+    let route_response = route_import.await.unwrap();
+    assert_eq!(route_response.status(), 200);
+    let route_child_id: ThreadId =
+        route_response.json::<serde_json::Value>().await.unwrap()["thread_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+    let threads = state.store.list_threads(project_id).await.unwrap();
+    assert_eq!(threads.len(), 2);
+    let native_children = futures_util::future::join_all(threads.into_iter().map(|thread_id| {
+        let store = state.store.clone();
+        async move { store.load_thread(project_id, thread_id).await.unwrap() }
+    }))
+    .await
+    .into_iter()
+    .flatten()
+    .filter(|thread| thread.harness_thread_id == "native-child")
+    .collect::<Vec<_>>();
+    assert_eq!(native_children.len(), 1);
+    assert_eq!(native_children[0].id, route_child_id);
+    assert_eq!(
+        harness
+            .resume_policies()
+            .await
+            .iter()
+            .filter(|(native_id, _)| native_id == "native-child")
+            .count(),
+        1
+    );
+
+    harness
+        .emit_external_turn(route_child_id, "child complete")
+        .await
+        .unwrap();
+    harness
+        .complete_turn(parent_id, spawned_by_turn_id)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn passive_subagent_command_start_streams_before_completion() {
+    let harness = Arc::new(ActivityHarness::default());
+    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let project_id = create_project_only(&client, &base, &cookie).await;
+
+    let parent_resp = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"resume": "native-parent"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(parent_resp.status(), 200);
+    let parent_body = parent_resp.json::<serde_json::Value>().await.unwrap();
+    let parent_id: ThreadId = parent_body["thread_id"].as_str().unwrap().parse().unwrap();
+    let parent_file = state
+        .store
+        .load_thread(project_id, parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let spawned_by_turn_id = state
+        .registry
+        .start_turn(
+            parent_id,
+            UserInput::text("subagent activity"),
+            TurnOverrides {
+                model: Some(parent_file.current_model.clone()),
+                mode: parent_file.mode,
+                approval_policy: parent_file.approval_policy,
+            },
+            parent_file.current_model.clone(),
+        )
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    let child_id = loop {
+        let mut found = None;
+        for thread_id in state.store.list_threads(project_id).await.unwrap() {
+            let thread = state
+                .store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if thread.harness_thread_id == "native-child" {
+                found = Some(thread.id);
+                break;
+            }
+        }
+        if let Some(thread_id) = found {
+            break thread_id;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("subagent activity did not auto-import native child thread");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    };
+
+    harness.wait_for_subscribers(child_id, 1).await;
+
+    let mut ws = connect_ws(port, &cookie).await;
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::Subscribe {
+            thread_id: child_id,
+            since: None,
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    wait_for_thread_state(&mut ws, child_id).await;
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SendInput {
+            thread_id: child_id,
+            text: "too early".into(),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let error = wait_for_ws_error(&mut ws, "send_input", "thread_turn_active").await;
+    assert_eq!(error.thread_id, Some(child_id));
+
+    let command = "sleep 30";
+    let (external_turn, command_item_id) = harness
+        .emit_external_command_without_completion(child_id, command)
+        .await
+        .unwrap();
+    let streamed_turn = wait_for_command_started(&mut ws, child_id, command).await;
+    assert_eq!(streamed_turn, external_turn);
+
+    let snapshot = state
+        .live_buffers
+        .snapshot(child_id)
+        .await
+        .expect("sub-agent live turn should remain buffered before completion");
+    assert_eq!(snapshot.thread_id, child_id);
+    assert_eq!(snapshot.turn_id, external_turn);
+    assert!(snapshot.accumulated.iter().any(|event| {
+        matches!(
+            event,
+            WireAgentEvent::ItemStarted { item, .. }
+                if item.id == command_item_id
+                    && item.kind == ItemKind::CommandExecution
+                    && matches!(&item.command, Some(start) if start.command == command)
+        )
+    }));
+    assert!(
+        state
+            .store
+            .load_all_turns(project_id, child_id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|turn| turn.id != external_turn),
+        "sub-agent turn should not be persisted before completion"
+    );
+
+    harness
+        .complete_external_command(child_id, external_turn, command_item_id, command)
+        .await
+        .unwrap();
+    harness
+        .complete_turn(child_id, external_turn)
+        .await
+        .unwrap();
+    wait_for_turn_completed(&mut ws, child_id).await;
+    harness.wait_for_subscriber_count(child_id, 0).await;
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SendInput {
+            thread_id: child_id,
+            text: "idle child follow-up".into(),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    wait_for_turn_completed(&mut ws, child_id).await;
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        if state
+            .store
+            .load_all_turns(project_id, child_id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|turn| turn.user_input.as_text() == Some("idle child follow-up"))
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("idle sub-agent follow-up was not persisted");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+    harness
+        .complete_turn(parent_id, spawned_by_turn_id)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn collab_agent_spawn_start_imports_subagent_thread() {
+    let harness = Arc::new(ActivityHarness::default());
+    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let project_id = create_project_only(&client, &base, &cookie).await;
+
+    let parent_resp = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"resume": "native-parent"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(parent_resp.status(), 200);
+    let parent_body = parent_resp.json::<serde_json::Value>().await.unwrap();
+    let parent_id: ThreadId = parent_body["thread_id"].as_str().unwrap().parse().unwrap();
+    let parent_file = state
+        .store
+        .load_thread(project_id, parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let spawned_by_turn_id = state
+        .registry
+        .start_turn(
+            parent_id,
+            UserInput::text("collab spawn"),
+            TurnOverrides {
+                model: Some(parent_file.current_model.clone()),
+                mode: parent_file.mode,
+                approval_policy: parent_file.approval_policy,
+            },
+            parent_file.current_model.clone(),
+        )
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    let child = loop {
+        let mut found = None;
+        for thread_id in state.store.list_threads(project_id).await.unwrap() {
+            let thread = state
+                .store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if thread.harness_thread_id == "native-collab-child" {
+                found = Some(thread);
+                break;
+            }
+        }
+        if let Some(thread) = found {
+            break thread;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("sub-agent link did not auto-import native child thread");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    };
+
+    assert_eq!(child.parent_thread_id, Some(parent_id));
+    assert_eq!(child.spawned_by_turn_id, Some(spawned_by_turn_id));
+    assert_eq!(child.kind, giskard_core::ThreadKind::Subagent);
+    assert_eq!(child.title, "Sub-agent: James");
+
+    harness.wait_for_subscribers(child.id, 1).await;
+    let external_turn = harness
+        .emit_external_turn(child.id, "collab child output")
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        let turns = state
+            .store
+            .load_all_turns(project_id, child.id)
+            .await
+            .unwrap();
+        if let Some(turn) = turns.iter().find(|turn| turn.id == external_turn) {
+            assert_eq!(turn.user_input.as_text(), Some("investigate"));
+            assert!(turn.items.iter().any(|item| {
+                matches!(
+                    &item.payload,
+                    ItemPayload::AgentMessage { text } if text == "collab child output"
+                )
+            }));
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("passive collab sub-agent turn was not persisted");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn collab_agent_spawn_uses_tool_input_prompt_when_link_prompt_is_missing() {
+    let harness = Arc::new(ActivityHarness::default());
+    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let project_id = create_project_only(&client, &base, &cookie).await;
+
+    let parent_resp = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"resume": "native-parent"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(parent_resp.status(), 200);
+    let parent_body = parent_resp.json::<serde_json::Value>().await.unwrap();
+    let parent_id: ThreadId = parent_body["thread_id"].as_str().unwrap().parse().unwrap();
+    let parent_file = state
+        .store
+        .load_thread(project_id, parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    state
+        .registry
+        .start_turn(
+            parent_id,
+            UserInput::text("collab spawn input fallback"),
+            TurnOverrides {
+                model: Some(parent_file.current_model.clone()),
+                mode: parent_file.mode,
+                approval_policy: parent_file.approval_policy,
+            },
+            parent_file.current_model.clone(),
+        )
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    let child = loop {
+        let mut found = None;
+        for thread_id in state.store.list_threads(project_id).await.unwrap() {
+            let thread = state
+                .store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if thread.harness_thread_id == "native-collab-child" {
+                found = Some(thread);
+                break;
+            }
+        }
+        if let Some(thread) = found {
+            break thread;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("sub-agent link did not auto-import native child thread");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    };
+
+    harness.wait_for_subscribers(child.id, 1).await;
+    let mut ws = connect_ws(port, &cookie).await;
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::Subscribe {
+            thread_id: child.id,
+            since: None,
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    wait_for_thread_state(&mut ws, child.id).await;
+
+    let external_turn = harness
+        .emit_external_turn_without_completion(child.id, "fallback child output")
+        .await
+        .unwrap();
+    let (streamed_turn, streamed_input) = wait_for_turn_started_with_input(&mut ws, child.id).await;
+    assert_eq!(streamed_turn, external_turn);
+    assert_eq!(
+        streamed_input.as_ref().and_then(UserInput::as_text),
+        Some("fallback investigate")
+    );
+    harness
+        .complete_turn(child.id, external_turn)
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        let turns = state
+            .store
+            .load_all_turns(project_id, child.id)
+            .await
+            .unwrap();
+        if let Some(turn) = turns.iter().find(|turn| turn.id == external_turn) {
+            assert_eq!(turn.user_input.as_text(), Some("fallback investigate"));
+            assert!(matches!(
+                turn.items.first().map(|item| &item.payload),
+                Some(ItemPayload::UserMessage { text }) if text == "fallback investigate"
+            ));
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("passive sub-agent turn was not persisted");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn passive_subagent_prompt_updates_when_spawn_metadata_arrives_late() {
+    let harness = Arc::new(ActivityHarness::default());
+    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let project_id = create_project_only(&client, &base, &cookie).await;
+
+    let parent_resp = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"resume": "native-parent"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(parent_resp.status(), 200);
+    let parent_body = parent_resp.json::<serde_json::Value>().await.unwrap();
+    let parent_id: ThreadId = parent_body["thread_id"].as_str().unwrap().parse().unwrap();
+    let parent_file = state
+        .store
+        .load_thread(project_id, parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    state
+        .registry
+        .start_turn(
+            parent_id,
+            UserInput::text("subagent delayed metadata"),
+            TurnOverrides {
+                model: Some(parent_file.current_model.clone()),
+                mode: parent_file.mode,
+                approval_policy: parent_file.approval_policy,
+            },
+            parent_file.current_model.clone(),
+        )
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    let child = loop {
+        let mut found = None;
+        for thread_id in state.store.list_threads(project_id).await.unwrap() {
+            let thread = state
+                .store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if thread.harness_thread_id == "native-collab-child" {
+                found = Some(thread);
+                break;
+            }
+        }
+        if let Some(thread) = found {
+            break thread;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("sub-agent activity did not auto-import native child thread");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    };
+
+    harness.wait_for_subscribers(child.id, 1).await;
+    let external_turn = harness
+        .emit_external_turn_without_completion(child.id, "delayed metadata child output")
+        .await
+        .unwrap();
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+    harness
+        .complete_turn(child.id, external_turn)
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        let turns = state
+            .store
+            .load_all_turns(project_id, child.id)
+            .await
+            .unwrap();
+        if let Some(turn) = turns.iter().find(|turn| turn.id == external_turn) {
+            assert_eq!(turn.user_input.as_text(), Some("delayed investigate"));
+            assert!(matches!(
+                turn.items.first().map(|item| &item.payload),
+                Some(ItemPayload::UserMessage { text }) if text == "delayed investigate"
+            ));
+            assert!(turn.items.iter().any(|item| {
+                matches!(
+                    &item.payload,
+                    ItemPayload::AgentMessage { text } if text == "delayed metadata child output"
+                )
+            }));
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("passive sub-agent turn was not persisted");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn server_resolved_subagent_link_uses_agent_name_prompt_and_turn() {
+    let harness = Arc::new(ActivityHarness::default());
+    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let project_id = create_project_only(&client, &base, &cookie).await;
+
+    let parent_resp = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"resume": "native-parent"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(parent_resp.status(), 200);
+    let parent_body = parent_resp.json::<serde_json::Value>().await.unwrap();
+    let parent_id: ThreadId = parent_body["thread_id"].as_str().unwrap().parse().unwrap();
+    let parent_file = state
+        .store
+        .load_thread(project_id, parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let spawned_by_turn_id = state
+        .registry
+        .start_turn(
+            parent_id,
+            UserInput::text("collab spawn"),
+            TurnOverrides {
+                model: Some(parent_file.current_model.clone()),
+                mode: parent_file.mode,
+                approval_policy: parent_file.approval_policy,
+            },
+            parent_file.current_model,
+        )
+        .await
+        .unwrap();
+    let link_item_id = wait_for_live_item_id(&state, parent_id, "collab_spawn_").await;
+
+    let import_resp =
+        open_subagent_link(&client, &base, &cookie, project_id, parent_id, link_item_id).await;
+    assert_eq!(import_resp.status(), 200);
+    let import_body = import_resp.json::<serde_json::Value>().await.unwrap();
+    let child_id: ThreadId = import_body["thread_id"].as_str().unwrap().parse().unwrap();
+    let child = state
+        .store
+        .load_thread(project_id, child_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(child.title, "Sub-agent: James");
+    assert_eq!(child.parent_thread_id, Some(parent_id));
+    assert_eq!(child.spawned_by_turn_id, Some(spawned_by_turn_id));
+
+    harness.wait_for_subscribers(child_id, 1).await;
+    let mut ws = connect_ws(port, &cookie).await;
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::Subscribe {
+            thread_id: child_id,
+            since: None,
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    wait_for_thread_state(&mut ws, child_id).await;
+
+    let external_turn = harness
+        .emit_external_turn_without_completion(child_id, "server-resolved child output")
+        .await
+        .unwrap();
+    let (streamed_turn, streamed_input) = wait_for_turn_started_with_input(&mut ws, child_id).await;
+    assert_eq!(streamed_turn, external_turn);
+    assert_eq!(
+        streamed_input.as_ref().and_then(UserInput::as_text),
+        Some("investigate")
+    );
+    let snapshot = state
+        .live_buffers
+        .snapshot(child_id)
+        .await
+        .expect("server-resolved sub-agent live turn should remain buffered before completion");
+    assert_eq!(
+        snapshot.user_input.as_ref().and_then(UserInput::as_text),
+        Some("investigate")
+    );
+    let streamed_turn =
+        wait_for_agent_message_item(&mut ws, child_id, "server-resolved child output").await;
+    assert_eq!(streamed_turn, external_turn);
+
+    harness
+        .complete_turn(child_id, external_turn)
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        let turns = state
+            .store
+            .load_all_turns(project_id, child_id)
+            .await
+            .unwrap();
+        if let Some(turn) = turns.iter().find(|turn| turn.id == external_turn) {
+            assert_eq!(turn.user_input.as_text(), Some("investigate"));
+            assert!(matches!(
+                turn.items.first().map(|item| &item.payload),
+                Some(ItemPayload::UserMessage { text }) if text == "investigate"
+            ));
+            assert!(turn.items.iter().any(|item| {
+                matches!(
+                    &item.payload,
+                    ItemPayload::AgentMessage { text } if text == "server-resolved child output"
+                )
+            }));
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("server-resolved passive sub-agent turn was not persisted");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+    harness
+        .complete_turn(parent_id, spawned_by_turn_id)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn subagent_link_open_rejects_unknown_and_non_link_items() {
+    let harness = Arc::new(ActivityHarness::default());
+    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let project_id = create_project_only(&client, &base, &cookie).await;
+    let parent: serde_json::Value = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"resume": "native-parent"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let parent_id: ThreadId = parent["thread_id"].as_str().unwrap().parse().unwrap();
+    let parent_file = state
+        .store
+        .load_thread(project_id, parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let turn_id = state
+        .registry
+        .start_turn(
+            parent_id,
+            UserInput::text("plain activity"),
+            TurnOverrides {
+                model: Some(parent_file.current_model.clone()),
+                mode: parent_file.mode,
+                approval_policy: parent_file.approval_policy,
+            },
+            parent_file.current_model,
+        )
+        .await
+        .unwrap();
+    let plain_item_id = wait_for_live_item_id(&state, parent_id, "plain_activity_").await;
+
+    let non_link = open_subagent_link(
+        &client,
+        &base,
+        &cookie,
+        project_id,
+        parent_id,
+        plain_item_id,
+    )
+    .await;
+    assert_eq!(non_link.status(), 409);
+
+    let unknown = open_subagent_link(
+        &client,
+        &base,
+        &cookie,
+        project_id,
+        parent_id,
+        ItemId::new(),
+    )
+    .await;
+    assert_eq!(unknown.status(), 409);
+    harness.complete_turn(parent_id, turn_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn terminal_subagent_link_recovers_fallback_without_starting_monitor() {
+    let harness = Arc::new(ActivityHarness::default());
+    harness.hold_native_child_open();
+    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let project_id = create_project_only(&client, &base, &cookie).await;
+
+    let parent_resp = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"resume": "native-parent"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(parent_resp.status(), 200);
+    let parent_body = parent_resp.json::<serde_json::Value>().await.unwrap();
+    let parent_id: ThreadId = parent_body["thread_id"].as_str().unwrap().parse().unwrap();
+    let parent_file = state
+        .store
+        .load_thread(project_id, parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    state
+        .registry
+        .start_turn(
+            parent_id,
+            UserInput::text("subagent terminal fallback"),
+            TurnOverrides {
+                model: Some(parent_file.current_model.clone()),
+                mode: parent_file.mode,
+                approval_policy: parent_file.approval_policy,
+            },
+            parent_file.current_model,
+        )
+        .await
+        .unwrap();
+
+    harness.wait_for_native_child_open().await;
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        let terminal_link_persisted = state
+            .store
+            .load_all_turns(project_id, parent_id)
+            .await
+            .unwrap()
+            .iter()
+            .flat_map(|turn| &turn.items)
+            .any(|item| item.harness_item_id.starts_with("subagent_terminal_"));
+        if terminal_link_persisted {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("terminal lifecycle evidence was not queued behind active evidence");
+        }
+        tokio::task::yield_now().await;
+    }
+    harness.release_native_child_open();
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    let (child, recovered_turn) = loop {
+        let mut recovered = None;
+        for thread_id in state.store.list_threads(project_id).await.unwrap() {
+            let thread = state
+                .store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if thread.harness_thread_id != "native-terminal-child" {
+                continue;
+            }
+            if let Some(turn) = state
+                .store
+                .load_all_turns(project_id, thread.id)
+                .await
+                .unwrap()
+                .into_iter()
+                .next()
+            {
+                recovered = Some((thread, turn));
+                break;
+            }
+        }
+        if let Some(recovered) = recovered {
+            break recovered;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("terminal sub-agent fallback was not recovered immediately");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    };
+
+    assert_eq!(child.title, "Sub-agent: terminal-reviewer");
+    assert_eq!(
+        recovered_turn.user_input.as_text(),
+        Some("recover completed work")
+    );
+    assert_eq!(recovered_turn.status.kind, TurnStatusKind::Completed);
+    assert!(matches!(
+        recovered_turn.items.first().map(|item| &item.payload),
+        Some(ItemPayload::AgentMessage { text }) if text == "Recovered terminal child output"
+    ));
+    harness.wait_for_subscriber_count(child.id, 0).await;
+}
+
+#[tokio::test]
+async fn persisted_or_interrupted_subagent_does_not_restart_passive_monitor() {
+    let harness = Arc::new(ActivityHarness::default());
+    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let project_id = create_project_only(&client, &base, &cookie).await;
+
+    let parent_resp = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"resume": "native-parent"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(parent_resp.status(), 200);
+    let parent_body = parent_resp.json::<serde_json::Value>().await.unwrap();
+    let parent_id: ThreadId = parent_body["thread_id"].as_str().unwrap().parse().unwrap();
+    let parent_file = state
+        .store
+        .load_thread(project_id, parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let spawned_by_turn_id = state
+        .registry
+        .start_turn(
+            parent_id,
+            UserInput::text("subagent activity"),
+            TurnOverrides {
+                model: Some(parent_file.current_model.clone()),
+                mode: parent_file.mode,
+                approval_policy: parent_file.approval_policy,
+            },
+            parent_file.current_model.clone(),
+        )
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    let child = loop {
+        let mut found = None;
+        for thread_id in state.store.list_threads(project_id).await.unwrap() {
+            let thread = state
+                .store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if thread.harness_thread_id == "native-child" {
+                found = Some(thread);
+                break;
+            }
+        }
+        if let Some(thread) = found {
+            break thread;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("active sub-agent was not materialized");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    };
+
+    harness.wait_for_subscribers(child.id, 1).await;
+    let child_turn = harness
+        .emit_external_turn(child.id, "persisted child output")
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        if state
+            .store
+            .load_all_turns(project_id, child.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|turn| turn.id == child_turn)
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("child turn was not persisted");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+    harness.wait_for_subscriber_count(child.id, 0).await;
+    harness
+        .complete_turn(parent_id, spawned_by_turn_id)
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        if !state.registry.thread_has_active_turn(parent_id).await
+            && !state
+                .store
+                .load_all_turns(project_id, parent_id)
+                .await
+                .unwrap()
+                .is_empty()
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("parent turn did not finish before interrupted activity test");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+
+    state
+        .registry
+        .start_turn(
+            parent_id,
+            UserInput::text("subagent interrupted"),
+            TurnOverrides {
+                model: Some(parent_file.current_model.clone()),
+                mode: parent_file.mode,
+                approval_policy: parent_file.approval_policy,
+            },
+            parent_file.current_model,
+        )
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        if state
+            .store
+            .load_all_turns(project_id, parent_id)
+            .await
+            .unwrap()
+            .len()
+            >= 2
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("interrupted sub-agent activity was not processed");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+    harness.wait_for_subscriber_count(child.id, 0).await;
+
+    let interrupted_item_id = state
+        .store
+        .load_all_turns(project_id, parent_id)
+        .await
+        .unwrap()
+        .iter()
+        .flat_map(|turn| &turn.items)
+        .find(|item| item.harness_item_id.starts_with("subagent_interrupted_"))
+        .map(|item| item.id)
+        .expect("interrupted sub-agent link should be persisted on the parent turn");
+
+    let before_reopen = state
+        .store
+        .load_thread(project_id, child.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let reopen = open_subagent_link(
+        &client,
+        &base,
+        &cookie,
+        project_id,
+        parent_id,
+        interrupted_item_id,
+    )
+    .await;
+    assert_eq!(reopen.status(), 200);
+    harness.wait_for_subscriber_count(child.id, 0).await;
+    let after_reopen = state
+        .store
+        .load_thread(project_id, child.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_reopen.updated_at, before_reopen.updated_at);
+}
+
+#[tokio::test]
+async fn reverse_subagent_activity_preserves_parent_and_uses_one_forwarder() {
+    let harness = Arc::new(ActivityHarness::default());
+    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let project_id = create_project_only(&client, &base, &cookie).await;
+
+    let parent_resp = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"resume": "native-parent"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(parent_resp.status(), 200);
+    let parent_body = parent_resp.json::<serde_json::Value>().await.unwrap();
+    let parent_id: ThreadId = parent_body["thread_id"].as_str().unwrap().parse().unwrap();
+    let parent_file = state
+        .store
+        .load_thread(project_id, parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let parent_turn = state
+        .registry
+        .start_turn(
+            parent_id,
+            UserInput::text("collab spawn"),
+            TurnOverrides {
+                model: Some(parent_file.current_model.clone()),
+                mode: parent_file.mode,
+                approval_policy: parent_file.approval_policy,
+            },
+            parent_file.current_model.clone(),
+        )
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    let child = loop {
+        let mut found = None;
+        for thread_id in state.store.list_threads(project_id).await.unwrap() {
+            let thread = state
+                .store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if thread.harness_thread_id == "native-collab-child" {
+                found = Some(thread);
+                break;
+            }
+        }
+        if let Some(thread) = found {
+            break thread;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("collaboration child was not materialized");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    };
+    harness.wait_for_subscribers(child.id, 1).await;
+    assert!(state.registry.thread_has_active_turn(parent_id).await);
+
+    let mut child_ws = connect_ws(port, &cookie).await;
+    child_ws
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&ClientMessage::Subscribe {
+                thread_id: child.id,
+                since: None,
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    wait_for_thread_state(&mut child_ws, child.id).await;
+
+    let child_handle = state
+        .registry
+        .get_thread_handle(child.id)
+        .await
+        .expect("materialized child should remain open");
+    let child_turn = harness
+        .start_turn(
+            &child_handle,
+            UserInput::text("reverse parent activity"),
+            TurnOverrides {
+                model: Some(child.current_model.clone()),
+                mode: child.mode,
+                approval_policy: child.approval_policy,
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut reverse_items = 0;
+    let mut completions = 0;
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    let mut completion_observed_at = None;
+    while tokio::time::Instant::now() < deadline
+        && completion_observed_at.is_none_or(|observed| {
+            tokio::time::Instant::now().duration_since(observed)
+                < tokio::time::Duration::from_millis(200)
+        })
+    {
+        let Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) =
+            tokio::time::timeout(tokio::time::Duration::from_millis(100), child_ws.next()).await
+        else {
+            continue;
+        };
+        let Ok(ServerMessage::Event {
+            thread_id,
+            agent_event,
+        }) = serde_json::from_str(&text)
+        else {
+            continue;
+        };
+        if thread_id != child.id {
+            continue;
+        }
+        match *agent_event {
+            WireAgentEvent::ItemCompleted { turn, item, .. }
+                if turn == child_turn
+                    && item.harness_item_id.starts_with("reverse_parent_activity_") =>
+            {
+                reverse_items += 1;
+            }
+            WireAgentEvent::TurnCompleted { turn, .. } if turn == child_turn => {
+                completions += 1;
+                completion_observed_at.get_or_insert_with(tokio::time::Instant::now);
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        reverse_items, 1,
+        "reverse activity should be broadcast once"
+    );
+    assert_eq!(completions, 1, "child completion should be broadcast once");
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        let turns = state
+            .store
+            .load_all_turns(project_id, child.id)
+            .await
+            .unwrap();
+        if turns.iter().any(|turn| turn.id == child_turn) {
+            assert_eq!(turns.iter().filter(|turn| turn.id == child_turn).count(), 1);
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("child reverse-interaction turn was not persisted");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+
+    let saved_parent = state
+        .store
+        .load_thread(project_id, parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved_parent.kind, giskard_core::ThreadKind::Primary);
+    assert_eq!(saved_parent.parent_thread_id, None);
+    assert_eq!(saved_parent.spawned_by_turn_id, None);
+    assert_eq!(state.store.list_threads(project_id).await.unwrap().len(), 2);
+    assert!(state.registry.thread_has_active_turn(parent_id).await);
+
+    let reverse_item_id = state
+        .store
+        .load_all_turns(project_id, child.id)
+        .await
+        .unwrap()
+        .iter()
+        .flat_map(|turn| &turn.items)
+        .find(|item| item.harness_item_id.starts_with("reverse_parent_activity_"))
+        .map(|item| item.id)
+        .expect("reverse parent activity should be persisted");
+    let navigation = open_subagent_link(
+        &client,
+        &base,
+        &cookie,
+        project_id,
+        child.id,
+        reverse_item_id,
+    )
+    .await;
+    assert_eq!(navigation.status(), 200);
+    let navigation = navigation.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(
+        navigation["thread_id"].as_str(),
+        Some(parent_id.to_string().as_str())
+    );
+
+    let blocked_delete = client
+        .delete(format!(
+            "{base}/api/projects/{project_id}/threads/{parent_id}"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blocked_delete.status(), 409);
+
+    let saved_parent = state
+        .store
+        .load_thread(project_id, parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved_parent.kind, giskard_core::ThreadKind::Primary);
+    assert_eq!(saved_parent.parent_thread_id, None);
+
+    harness.complete_turn(parent_id, parent_turn).await.unwrap();
+}
+
+#[tokio::test]
+async fn route_rejects_native_child_with_a_different_parent() {
+    let harness = Arc::new(ActivityHarness::default());
+    let (_tmp, state, port) = start_activity_server_on_available_port(harness).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let project_id = create_project_only(&client, &base, &cookie).await;
+
+    let parent_resp = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"resume": "native-parent"}))
+        .send()
+        .await
+        .unwrap();
+    let parent_body = parent_resp.json::<serde_json::Value>().await.unwrap();
+    let parent_id: ThreadId = parent_body["thread_id"].as_str().unwrap().parse().unwrap();
+    let parent_file = state
+        .store
+        .load_thread(project_id, parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    state
+        .registry
+        .start_turn(
+            parent_id,
+            UserInput::text("foreign subagent activity"),
+            TurnOverrides {
+                model: Some(parent_file.current_model.clone()),
+                mode: parent_file.mode,
+                approval_policy: parent_file.approval_policy,
+            },
+            parent_file.current_model,
+        )
+        .await
+        .unwrap();
+    let item_id = wait_for_live_item_id(&state, parent_id, "foreign_subagent_activity_").await;
+
+    let import = open_subagent_link(&client, &base, &cookie, project_id, parent_id, item_id).await;
+    assert_eq!(import.status(), 409);
+    assert_eq!(
+        state.store.list_threads(project_id).await.unwrap(),
+        vec![parent_id]
+    );
+}
+
+#[tokio::test]
+async fn parent_deletion_cascades_to_all_descendants_leaf_first() {
+    let harness = Arc::new(ActivityHarness::default());
+    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let project_id = create_project_only(&client, &base, &cookie).await;
+
+    let parent: serde_json::Value = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"resume": "native-parent"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let parent_id: ThreadId = parent["thread_id"].as_str().unwrap().parse().unwrap();
+    let parent_file = state
+        .store
+        .load_thread(project_id, parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let parent_turn = state
+        .registry
+        .start_turn(
+            parent_id,
+            UserInput::text("collab spawn"),
+            TurnOverrides {
+                model: Some(parent_file.current_model.clone()),
+                mode: parent_file.mode,
+                approval_policy: parent_file.approval_policy,
+            },
+            parent_file.current_model,
+        )
+        .await
+        .unwrap();
+    let child = wait_for_native_thread(&state, project_id, "native-collab-child").await;
+    let child_id = child.id;
+    harness.wait_for_subscribers(child_id, 1).await;
+    let child_handle = state
+        .registry
+        .get_thread_handle(child_id)
+        .await
+        .expect("materialized child should remain open");
+    let child_turn = harness
+        .start_turn(
+            &child_handle,
+            UserInput::text("nested collab spawn"),
+            TurnOverrides {
+                model: Some(child.current_model.clone()),
+                mode: child.mode,
+                approval_policy: child.approval_policy,
+            },
+        )
+        .await
+        .unwrap();
+    let grandchild = wait_for_native_thread(&state, project_id, "native-grandchild").await;
+    let grandchild_id = grandchild.id;
+    harness.complete_turn(child_id, child_turn).await.unwrap();
+    harness.complete_turn(parent_id, parent_turn).await.unwrap();
+    harness.wait_for_subscriber_count(child_id, 0).await;
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while state.registry.thread_has_active_turn(parent_id).await {
+        if tokio::time::Instant::now() >= deadline {
+            panic!("parent spawn turn did not complete");
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(!state.registry.thread_has_active_turn(parent_id).await);
+    assert!(!state.registry.thread_has_passive_monitor(child_id).await);
+    assert!(
+        state
+            .registry
+            .thread_has_passive_monitor(grandchild_id)
+            .await
+    );
+    assert_eq!(state.store.list_threads(project_id).await.unwrap().len(), 3);
+
+    let deletion = client
+        .delete(format!(
+            "{base}/api/projects/{project_id}/threads/{parent_id}"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deletion.status(), 204);
+    assert!(
+        state
+            .store
+            .list_threads(project_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    for deleted_id in [grandchild_id, child_id, parent_id] {
+        assert!(
+            state
+                .store
+                .load_thread(project_id, deleted_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            state.registry.get_project_for_thread(deleted_id).await,
+            None
+        );
+        assert!(!state.registry.thread_has_passive_monitor(deleted_id).await);
+    }
+    assert_eq!(
+        harness.deleted_harness_thread_ids().await,
+        vec![
+            "native-grandchild".to_string(),
+            "native-collab-child".to_string(),
+            "native-parent".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn parent_deletion_rejects_active_descendant_before_deleting_anything() {
+    let harness = Arc::new(ActivityHarness::default());
+    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let project_id = create_project_only(&client, &base, &cookie).await;
+
+    let parent: serde_json::Value = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"resume": "native-parent"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let parent_id: ThreadId = parent["thread_id"].as_str().unwrap().parse().unwrap();
+    let parent_file = state
+        .store
+        .load_thread(project_id, parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let parent_turn = state
+        .registry
+        .start_turn(
+            parent_id,
+            UserInput::text("collab spawn"),
+            TurnOverrides {
+                model: Some(parent_file.current_model.clone()),
+                mode: parent_file.mode,
+                approval_policy: parent_file.approval_policy,
+            },
+            parent_file.current_model,
+        )
+        .await
+        .unwrap();
+    let child_file = wait_for_native_thread(&state, project_id, "native-collab-child").await;
+    let child_id = child_file.id;
+    harness.wait_for_subscribers(child_id, 1).await;
+    harness.complete_turn(parent_id, parent_turn).await.unwrap();
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while state.registry.thread_has_active_turn(parent_id).await {
+        if tokio::time::Instant::now() >= deadline {
+            panic!("parent spawn turn did not complete before descendant activity");
+        }
+        tokio::task::yield_now().await;
+    }
+    let child_handle = state
+        .registry
+        .get_thread_handle(child_id)
+        .await
+        .expect("imported child should remain open");
+    harness
+        .start_turn(
+            &child_handle,
+            UserInput::text("approval"),
+            TurnOverrides {
+                model: Some(child_file.current_model.clone()),
+                mode: child_file.mode,
+                approval_policy: child_file.approval_policy,
+            },
+        )
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while !state.registry.thread_has_active_turn(child_id).await {
+        if tokio::time::Instant::now() >= deadline {
+            panic!("passive monitor did not claim the active child turn");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+
+    let deletion = client
+        .delete(format!(
+            "{base}/api/projects/{project_id}/threads/{parent_id}"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deletion.status(), 409);
+    assert_eq!(state.store.list_threads(project_id).await.unwrap().len(), 2);
+    assert!(harness.deleted_harness_thread_ids().await.is_empty());
 }
 
 #[tokio::test]
@@ -3486,7 +6037,7 @@ async fn websocket_serializes_harness_error_events() {
             .unwrap()
             .unwrap();
         match serde_json::from_str::<ServerMessage>(msg.to_text().unwrap()).unwrap() {
-            ServerMessage::Event { agent_event, .. } => match agent_event {
+            ServerMessage::Event { agent_event, .. } => match *agent_event {
                 WireAgentEvent::Error { error, .. } => {
                     assert_eq!(error.code, "harness_protocol_error");
                     assert_eq!(error.message, "protocol error: bad frame");
@@ -3567,6 +6118,9 @@ async fn subscribe_reopens_persisted_thread() {
                 project_id: pid,
                 title: "Saved thread".into(),
                 harness_thread_id: "th_test".into(),
+                parent_thread_id: None,
+                spawned_by_turn_id: None,
+                kind: giskard_core::ThreadKind::Primary,
                 mode: Mode::Build,
                 current_model: model.clone(),
                 context_window: 128_000,
@@ -3702,6 +6256,9 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
                 project_id: pid,
                 title: "Saved thread".into(),
                 harness_thread_id: "th_test".into(),
+                parent_thread_id: None,
+                spawned_by_turn_id: None,
+                kind: giskard_core::ThreadKind::Primary,
                 mode: Mode::Build,
                 current_model: model.clone(),
                 context_window: 128_000,
@@ -3774,7 +6331,7 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
                 let server_msg: ServerMessage = serde_json::from_str(&t).unwrap();
                 if let ServerMessage::Event { agent_event, .. } = server_msg {
-                    if matches!(agent_event, WireAgentEvent::TurnCompleted { .. }) {
+                    if matches!(*agent_event, WireAgentEvent::TurnCompleted { .. }) {
                         saw_completed = true;
                         break;
                     }
@@ -3856,6 +6413,9 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
                 project_id: pid,
                 title: "Saved thread".into(),
                 harness_thread_id: "th_dupe".into(),
+                parent_thread_id: None,
+                spawned_by_turn_id: None,
+                kind: giskard_core::ThreadKind::Primary,
                 mode: Mode::Build,
                 current_model: model.clone(),
                 context_window: 128_000,
@@ -3966,7 +6526,7 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
                 let server_msg: ServerMessage = serde_json::from_str(&t).unwrap();
                 if let ServerMessage::Event { agent_event, .. } = server_msg {
-                    match agent_event {
+                    match *agent_event {
                         WireAgentEvent::ItemCompleted { item, .. } => match item.payload {
                             giskard_proto::WireItemPayload::AgentMessage { text }
                             | giskard_proto::WireItemPayload::UserMessage { text } => {
@@ -4081,6 +6641,9 @@ async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
                 project_id: pid,
                 title: "Saved thread".into(),
                 harness_thread_id: "th_reuse".into(),
+                parent_thread_id: None,
+                spawned_by_turn_id: None,
+                kind: giskard_core::ThreadKind::Primary,
                 mode: Mode::Build,
                 current_model: model.clone(),
                 context_window: 128_000,
@@ -4182,13 +6745,11 @@ async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
         match tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
                 let server_msg: ServerMessage = serde_json::from_str(&t).unwrap();
-                if let ServerMessage::Event {
-                    agent_event: WireAgentEvent::TurnCompleted { turn, .. },
-                    ..
-                } = server_msg
-                {
-                    if turn == new_turn {
-                        saw_new_turn_complete = true;
+                if let ServerMessage::Event { agent_event, .. } = server_msg {
+                    if let WireAgentEvent::TurnCompleted { turn, .. } = *agent_event {
+                        if turn == new_turn {
+                            saw_new_turn_complete = true;
+                        }
                     }
                 }
             }
@@ -4334,7 +6895,7 @@ async fn failed_turn_is_persisted_with_error_message() {
                 if let ServerMessage::Event { agent_event, .. } =
                     serde_json::from_str::<ServerMessage>(&t).unwrap()
                 {
-                    match agent_event {
+                    match *agent_event {
                         WireAgentEvent::Error { error, .. } => {
                             assert!(error.message.contains("usageLimitExceeded"));
                             saw_error = true;
@@ -4472,7 +7033,7 @@ async fn notice_event_is_delivered_to_client() {
                 if let ServerMessage::Event { agent_event, .. } =
                     serde_json::from_str::<ServerMessage>(&t).unwrap()
                 {
-                    match agent_event {
+                    match *agent_event {
                         WireAgentEvent::Notice { message, .. } => {
                             assert!(message.contains("Model metadata"));
                             saw_notice = true;
@@ -4569,6 +7130,9 @@ wire_api = "responses"
                 project_id: pid,
                 title: "Saved thread".into(),
                 harness_thread_id: "th_test".into(),
+                parent_thread_id: None,
+                spawned_by_turn_id: None,
+                kind: giskard_core::ThreadKind::Primary,
                 mode: Mode::Build,
                 current_model: ModelRef {
                     provider: "openai".into(),
@@ -4673,6 +7237,9 @@ wire_api = "responses"
                 project_id: pid,
                 title: "Live stale thread".into(),
                 harness_thread_id: "th_live".into(),
+                parent_thread_id: None,
+                spawned_by_turn_id: None,
+                kind: giskard_core::ThreadKind::Primary,
                 mode: Mode::Build,
                 current_model: stale_model.clone(),
                 context_window: 128_000,
@@ -5231,7 +7798,7 @@ async fn login_project_thread_message() {
                 if let tokio_tungstenite::tungstenite::Message::Text(t) = msg {
                     let server_msg: ServerMessage = serde_json::from_str(&t).unwrap();
                     if let ServerMessage::Event { agent_event, .. } = server_msg {
-                        let is_done = matches!(agent_event, WireAgentEvent::TurnCompleted { .. });
+                        let is_done = matches!(*agent_event, WireAgentEvent::TurnCompleted { .. });
                         events.push(agent_event);
                         if is_done {
                             break;
@@ -5247,13 +7814,13 @@ async fn login_project_thread_message() {
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, WireAgentEvent::TurnCompleted { .. })),
+            .any(|e| matches!(e.as_ref(), WireAgentEvent::TurnCompleted { .. })),
         "should receive TurnCompleted"
     );
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, WireAgentEvent::ItemDelta { .. })),
+            .any(|e| matches!(e.as_ref(), WireAgentEvent::ItemDelta { .. })),
         "should receive ItemDelta"
     );
 }

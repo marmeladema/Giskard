@@ -330,7 +330,8 @@ async fn modes_models_approvals_and_plan_dump() {
         match tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
                 if let Ok(ServerMessage::Event { agent_event, .. }) = serde_json::from_str(&t) {
-                    if let WireAgentEvent::ApprovalRequested { request, .. } = &agent_event {
+                    if let WireAgentEvent::ApprovalRequested { request, .. } = agent_event.as_ref()
+                    {
                         assert!(request.metadata.iter().any(|metadata| {
                             matches!(
                                 metadata,
@@ -378,7 +379,7 @@ async fn modes_models_approvals_and_plan_dump() {
                         }));
                         saw_approval_metadata = true;
                     }
-                    if matches!(agent_event, WireAgentEvent::TurnCompleted { .. }) {
+                    if matches!(*agent_event, WireAgentEvent::TurnCompleted { .. }) {
                         saw_completed = true;
                         break;
                     }

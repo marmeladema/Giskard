@@ -92,6 +92,53 @@ Some Codex notifications carry an item ID without producing a visible Giskard
 item. The mapper may seed the scoped item registry from those notifications so
 that later deltas and completion still resolve to the same `ItemId`.
 
+## Sub-agent links
+
+Codex collaboration items are mapped into harness-neutral `SubagentLink` values before they leave
+the adapter. Both native spawning protocols are supported:
+
+- legacy `multi_agent_v1` is exposed by the app server as a `collabAgentToolCall` whose tool is
+  `spawnAgent`; its start event has no receiver, so the adapter links the child on completion and
+  preserves the supplied prompt as `initial_prompt`. `agentsStates` is keyed by native thread id;
+  the adapter reads only the linked receiver's state. Single-child `sendInput`, `wait`,
+  `resumeAgent`, and `closeAgent` calls also carry lifecycle links, while a multi-child `wait`
+  remains unlinked rather than attributing aggregate state to one child; and
+- current collaboration v2 is exposed as a completed `subAgentActivity` with `kind = started`; the
+  adapter preserves its child thread id and agent path. Its activity title uses the final non-empty
+  path component as the task name and does not expose the native child id; the complete path and id
+  remain in link metadata. This event does not contain the delegated prompt, so the server uses its
+  explicit `Sub-agent turn` fallback rather than misidentifying an inherited parent turn as the
+  task.
+
+The server imports the child from either representation and passively monitors only lifecycle
+evidence that can denote active work (`spawned`, `started`, `interacted`, `pending`, or `running`).
+An explicitly active monitor has a 10-minute no-event pre-turn safety bound; any event restarts it,
+and a started turn may run without that bound. Terminal evidence wakes an already-armed idle monitor
+and never creates a new one; reopening a persisted child without lifecycle evidence does not monitor
+it. The browser addresses links by Giskard parent-thread and item IDs; the server resolves native
+routing and lifecycle metadata from its authoritative item, and native thread IDs are redacted from
+browser-facing sub-agent payloads. Linked children use strict native resume: Codex can advertise a
+newly spawned child milliseconds before its rollout is readable, so the adapter retries only the exact matching
+`no rollout found` response for a short bounded window. It never applies the normal fresh-thread
+fallback to a linked child, because that would replace the advertised routing identity and miss the
+child's early commentary and command-start events. Primary threads retain the existing fresh-session
+recovery when their stored native rollout is genuinely gone. Idle child threads accept direct user
+follow-ups, while sends are rejected during delegated work. See
+[Sub-agent threads](../../docs/subagents.md) for the complete lifecycle and ownership contract. When
+opening or resuming a Codex thread, the adapter also maps
+`thread.agent_nickname` to
+`ThreadHandle.agent_name`; Giskard uses that harness-neutral name to title imported sub-agent
+threads and their Sub-agents card entries. It maps `thread.parent_thread_id` to
+`ThreadHandle.parent_harness_thread_id` as a validation signal: the server accepts a proposed
+Giskard parent only when it agrees with this native parent when Codex supplies one. Reverse
+child-to-parent activity therefore remains transcript navigation and cannot reparent the real
+parent thread.
+
+Codex thread deletion is idempotent only for the exact JSON-RPC `-32600` response `no rollout found
+for thread id <requested-id>`. That response proves the requested native rollout is already absent,
+so the adapter returns success and lets Giskard remove stale local metadata. A different native ID,
+JSON-RPC code, timeout, authentication failure, or any other transport error remains an error.
+
 ## Command item ID versus process ID
 
 A Codex command execution item can contain both:

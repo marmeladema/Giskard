@@ -59,6 +59,8 @@ impl AgentHarness for SwitchHarness {
             harness_thread_id: opts.resume.unwrap_or_else(|| "fresh".into()),
             warning: None,
             resumed_model: Some(effective),
+            agent_name: None,
+            parent_harness_thread_id: None,
         })
     }
 
@@ -177,6 +179,9 @@ fn seeded_thread(project_id: ProjectId, thread_id: ThreadId) -> ThreadFile {
         project_id,
         title: "Orphaned thread".into(),
         harness_thread_id: format!("harness-{thread_id}"),
+        parent_thread_id: None,
+        spawned_by_turn_id: None,
+        kind: giskard_core::ThreadKind::Primary,
         mode: Mode::Build,
         current_model: dead_model(),
         context_window: 131_072,

@@ -12,6 +12,8 @@ pub mod item;
 pub mod mcp;
 pub mod model;
 pub mod server_request;
+pub mod text;
+pub mod thread;
 pub mod token;
 pub mod turn;
 pub mod user_input;
@@ -21,13 +23,17 @@ pub use diff::{DiffHunk, DiffLine, FileDiff};
 pub use error::{GiskardError, HarnessError, PersistError};
 pub use event::AgentEvent;
 pub use ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
-pub use item::{FileChangeKind, Item, ItemDelta, ItemKind, ItemPayload, ItemStart};
+pub use item::{
+    FileChangeKind, Item, ItemDelta, ItemKind, ItemPayload, ItemStart, SubagentAction,
+    SubagentLink, SubagentStatus,
+};
 pub use mcp::{
     McpAuthStatus, McpOauthStart, McpResource, McpResourceTemplate, McpServerInfo, McpServerStatus,
     McpTool,
 };
 pub use model::{Effort, ModelDescriptor, ModelRef};
 pub use server_request::{ServerRequest, ServerRequestResponse};
+pub use thread::ThreadKind;
 pub use token::{ByModel, DailyTokenLedger, TokenLedger, TokenUsage};
 pub use turn::{ApprovalPolicy, Mode, Turn, TurnOverrides, TurnStatus, TurnStatusKind};
 pub use user_input::UserInput;

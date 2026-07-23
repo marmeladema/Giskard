@@ -54,7 +54,20 @@ pub struct OpenThreadOptions {
     pub workspace_root: PathBuf,
     /// Some(native id) ⇒ resume; None ⇒ fresh thread.
     pub resume: Option<String>,
+    /// Whether a failed native resume may recover by starting a replacement thread.
+    ///
+    /// Linked sub-agent imports must use `RequireExisting`: their advertised native id is the
+    /// ownership and event-routing identity, so silently replacing it would attach Giskard to a
+    /// different thread. Normal primary-thread reopen keeps the historical fresh-session recovery.
+    pub resume_policy: ResumePolicy,
     pub initial_model: ModelRef,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ResumePolicy {
+    #[default]
+    AllowFreshFallback,
+    RequireExisting,
 }
 
 /// Handle to an opened thread.
@@ -70,6 +83,27 @@ pub struct ThreadHandle {
     /// success (see `specs/model-provider-switching-analysis.md`). `None` ⇒ the harness gave no
     /// signal and the requested model must be assumed.
     pub resumed_model: Option<ModelRef>,
+    /// Optional user-facing sub-agent name reported by the harness, such as Codex's random
+    /// AgentControl nickname.
+    pub agent_name: Option<String>,
+    /// Harness-native parent thread id when the native protocol exposes the relationship.
+    /// Servers use this only to validate a proposed Giskard parent; it never replaces a durable
+    /// Giskard `ThreadId`.
+    pub parent_harness_thread_id: Option<String>,
+}
+
+impl ThreadHandle {
+    /// Build a minimal handle for native operations on a persisted thread that is not attached.
+    pub fn detached(thread: ThreadId, harness_thread_id: String) -> Self {
+        Self {
+            thread,
+            harness_thread_id,
+            warning: None,
+            resumed_model: None,
+            agent_name: None,
+            parent_harness_thread_id: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

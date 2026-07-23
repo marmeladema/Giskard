@@ -1,31 +1,45 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
-use std::time::Instant;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, Weak};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::Utc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard, oneshot, watch};
+use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
-use giskard_core::item::{Item, ItemPayload, command_status_is_running, normalized_command_status};
+use giskard_core::item::{
+    Item, ItemPayload, SubagentAction, SubagentStatus, command_status_is_running,
+    normalized_command_status,
+};
 use giskard_core::mcp::{McpOauthStart, McpServerStatus};
 use giskard_core::model::{ModelDescriptor, ModelRef};
 use giskard_core::server_request::ServerRequestResponse;
+use giskard_core::text::trimmed_non_empty;
+use giskard_core::thread::ThreadKind;
 use giskard_core::turn::{Mode, Turn, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
-use giskard_harness::{AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle};
+use giskard_harness::{
+    AgentHarness, HarnessCapabilities, OpenThreadOptions, ResumePolicy, ThreadHandle,
+};
 use giskard_persist::PersistStore;
-use giskard_persist::store::ProjectConfig;
-use giskard_proto::{RunningTask, ServerMessage, ThreadActivity, ThreadActivityKind, TokenScope};
+use giskard_persist::store::{ProjectConfig, ThreadFile};
+use giskard_proto::{
+    RunningTask, ServerMessage, ThreadActivity, ThreadActivityKind, TokenScope, WireAgentEvent,
+};
 
 use crate::hub::Hub;
 use crate::ledger::LedgerHandle;
 use crate::live_buffer::LiveBufferStore;
 use crate::running_commands::RunningTaskStore;
+use crate::thread_graph::{
+    ExistingLinkDisposition, classify_existing_link, load_thread_graph, parent_chain_is_valid,
+    should_refresh_subagent_title,
+};
 
 #[async_trait]
 pub trait HarnessFactory: Send + Sync {
@@ -39,12 +53,17 @@ struct TurnContext {
     model: ModelRef,
     mode: Mode,
     kind: TurnContextKind,
+    passive_input_is_fallback: bool,
+    subagent_fallback: Option<SubagentFallbackTranscript>,
+    passive_subagent_metadata: Option<PassiveSubagentMetadataMap>,
+    passive_pre_turn_timeout: Option<Duration>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TurnContextKind {
     User,
     ManualCompaction,
+    PassiveSubagent,
 }
 
 #[derive(Clone, Copy)]
@@ -54,6 +73,7 @@ enum ForwarderExitReason {
     AfterTurnCommandsDrained,
     StreamEndedRecovered,
     StreamEndedWithoutTurn,
+    DuplicateForwarder,
 }
 
 fn forwarder_exit_reason_label(reason: ForwarderExitReason) -> &'static str {
@@ -63,6 +83,7 @@ fn forwarder_exit_reason_label(reason: ForwarderExitReason) -> &'static str {
         ForwarderExitReason::AfterTurnCommandsDrained => "after_turn_commands_drained",
         ForwarderExitReason::StreamEndedRecovered => "stream_ended_recovered",
         ForwarderExitReason::StreamEndedWithoutTurn => "stream_ended_without_turn",
+        ForwarderExitReason::DuplicateForwarder => "duplicate_forwarder",
     }
 }
 
@@ -70,19 +91,118 @@ fn turn_context_kind_label(kind: TurnContextKind) -> &'static str {
     match kind {
         TurnContextKind::User => "user",
         TurnContextKind::ManualCompaction => "manual_compaction",
+        TurnContextKind::PassiveSubagent => "passive_subagent",
     }
+}
+
+fn live_turn_user_input(ctx: &TurnContext) -> Option<UserInput> {
+    if ctx.kind != TurnContextKind::PassiveSubagent {
+        return None;
+    }
+    ctx.user_input
+        .as_text()
+        .and_then(trimmed_non_empty)
+        .map(UserInput::text)
+}
+
+fn passive_subagent_prompt_text(ctx: &TurnContext) -> Option<String> {
+    if ctx.kind != TurnContextKind::PassiveSubagent || ctx.passive_input_is_fallback {
+        return None;
+    }
+    ctx.user_input
+        .as_text()
+        .and_then(trimmed_non_empty)
+        .map(ToOwned::to_owned)
 }
 
 /// Shared handle to the pending-approvals map (`ApprovalId -> ThreadId`), cloneable into the
 /// spawned event forwarder so it can register approvals as they stream in.
 type ApprovalMap = Arc<Mutex<HashMap<ApprovalId, ThreadId>>>;
 type ServerRequestMap = Arc<Mutex<HashMap<ServerRequestId, ThreadId>>>;
+type PassiveSubagentMetadataMap = Arc<Mutex<HashMap<ThreadId, PassiveSubagentMetadata>>>;
+type PassiveMonitorTasks = Arc<PassiveMonitorTaskTracker>;
+type ProjectLifecycleLocks = Arc<Mutex<HashMap<ProjectId, Weak<Mutex<()>>>>>;
+const ACTIVE_SUBAGENT_PRE_TURN_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const PASSIVE_MONITOR_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct PassiveMonitorTaskTracker {
+    counts: Mutex<HashMap<ThreadId, usize>>,
+    completion: watch::Sender<u64>,
+}
+
+impl Default for PassiveMonitorTaskTracker {
+    fn default() -> Self {
+        let (completion, _) = watch::channel(0);
+        Self {
+            counts: Mutex::new(HashMap::new()),
+            completion,
+        }
+    }
+}
+
+impl PassiveMonitorTaskTracker {
+    async fn register(&self, thread_id: ThreadId) {
+        *self.counts.lock().await.entry(thread_id).or_default() += 1;
+    }
+
+    async fn contains(&self, thread_id: ThreadId) -> bool {
+        self.counts.lock().await.contains_key(&thread_id)
+    }
+
+    async fn finish(&self, thread_id: ThreadId) {
+        let mut counts = self.counts.lock().await;
+        match counts.get_mut(&thread_id) {
+            Some(count) if *count > 1 => *count -= 1,
+            Some(_) => {
+                counts.remove(&thread_id);
+            }
+            None => {
+                warn!(
+                    %thread_id,
+                    "passive sub-agent monitor task completed without a registered task"
+                );
+            }
+        }
+        drop(counts);
+        self.completion.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
+    }
+
+    fn subscribe(&self) -> watch::Receiver<u64> {
+        self.completion.subscribe()
+    }
+}
 
 #[derive(Clone)]
 struct ThreadBinding {
     project: ProjectId,
     handle: ThreadHandle,
     native_model: ModelRef,
+}
+
+#[derive(Clone, Default)]
+struct PassiveSubagentMetadata {
+    initial_prompt: Option<String>,
+    fallback: Option<SubagentFallbackTranscript>,
+    active_lifecycle_observed: bool,
+    terminal_observed: bool,
+    cancelled: bool,
+    lifecycle_notify: Arc<Notify>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PassiveMonitorSignal {
+    Continue,
+    Terminal,
+    Cancelled,
+}
+
+#[derive(Clone, Copy)]
+enum LifecycleSignal {
+    None,
+    Active,
+    Terminal,
 }
 
 #[derive(Clone, Default)]
@@ -263,8 +383,13 @@ impl Drop for ThreadTurnLease {
 }
 
 pub struct HarnessRegistry {
-    harnesses: Mutex<HashMap<ProjectId, Arc<dyn AgentHarness>>>,
-    threads: Mutex<HashMap<ThreadId, ThreadBinding>>,
+    shared: Arc<RegistryShared>,
+    factory: Arc<dyn HarnessFactory>,
+}
+
+struct RegistryShared {
+    harnesses: Arc<Mutex<HashMap<ProjectId, Arc<dyn AgentHarness>>>>,
+    threads: Arc<Mutex<HashMap<ThreadId, ThreadBinding>>>,
     /// Per-thread turn gate covering both start-in-progress and live turns. `LiveBufferStore` only
     /// becomes active after `TurnStarted`, so it cannot protect the `start_turn` race itself.
     turn_gate: ThreadTurnGate,
@@ -274,12 +399,49 @@ pub struct HarnessRegistry {
     /// Which thread a pending non-approval server request belongs to. Browser responses carry only
     /// the opaque request id, so this mirrors the approval routing map for Codex server requests.
     server_requests: ServerRequestMap,
-    factory: Arc<dyn HarnessFactory>,
+    passive_monitors: Arc<Mutex<HashSet<ThreadId>>>,
+    passive_subagent_metadata: PassiveSubagentMetadataMap,
+    /// Generation count spanning subscription and post-forwarder fallback persistence. A new
+    /// monitor may start after an old subscription exits, so deletion waits for all generations.
+    passive_monitor_tasks: PassiveMonitorTasks,
+    /// Per-parent FIFO for linked lifecycle evidence. Harness events are ordered, so preserving
+    /// that order here prevents a later terminal observation from racing ahead of an active one.
+    subagent_materialization_queues:
+        Arc<Mutex<HashMap<ThreadId, VecDeque<SubagentMaterializationJob>>>>,
+    project_lifecycle_locks: ProjectLifecycleLocks,
     hub: Arc<Hub>,
     live_buffers: Arc<LiveBufferStore>,
     running_commands: Arc<RunningTaskStore>,
     store: Arc<PersistStore>,
     ledger: LedgerHandle,
+}
+
+impl RegistryShared {
+    fn new(
+        hub: Arc<Hub>,
+        live_buffers: Arc<LiveBufferStore>,
+        running_commands: Arc<RunningTaskStore>,
+        store: Arc<PersistStore>,
+        ledger: LedgerHandle,
+    ) -> Self {
+        Self {
+            harnesses: Arc::new(Mutex::new(HashMap::new())),
+            threads: Arc::new(Mutex::new(HashMap::new())),
+            turn_gate: ThreadTurnGate::default(),
+            approvals: Arc::new(Mutex::new(HashMap::new())),
+            server_requests: Arc::new(Mutex::new(HashMap::new())),
+            passive_monitors: Arc::new(Mutex::new(HashSet::new())),
+            passive_subagent_metadata: Arc::new(Mutex::new(HashMap::new())),
+            passive_monitor_tasks: Arc::new(PassiveMonitorTaskTracker::default()),
+            subagent_materialization_queues: Arc::new(Mutex::new(HashMap::new())),
+            project_lifecycle_locks: Arc::new(Mutex::new(HashMap::new())),
+            hub,
+            live_buffers,
+            running_commands,
+            store,
+            ledger,
+        }
+    }
 }
 
 impl HarnessRegistry {
@@ -292,18 +454,37 @@ impl HarnessRegistry {
         ledger: LedgerHandle,
     ) -> Self {
         Self {
-            harnesses: Mutex::new(HashMap::new()),
-            threads: Mutex::new(HashMap::new()),
-            turn_gate: ThreadTurnGate::default(),
-            approvals: Arc::new(Mutex::new(HashMap::new())),
-            server_requests: Arc::new(Mutex::new(HashMap::new())),
+            shared: Arc::new(RegistryShared::new(
+                hub,
+                live_buffers,
+                running_commands,
+                store,
+                ledger,
+            )),
             factory,
-            hub,
-            live_buffers,
-            running_commands,
-            store,
-            ledger,
         }
+    }
+
+    /// Serialize persisted thread-graph mutations within one project. Child imports may originate
+    /// from either an HTTP request or an asynchronously observed harness event, while subtree and
+    /// project deletion mutate the same graph. One project-scoped lock makes each find/open/save
+    /// or load/preflight/delete sequence atomic with respect to the others.
+    pub async fn lock_project_lifecycle(&self, project_id: ProjectId) -> OwnedMutexGuard<()> {
+        lock_project_lifecycle(&self.shared.project_lifecycle_locks, project_id).await
+    }
+
+    pub async fn lock_project_lifecycle_with_timeout(
+        &self,
+        project_id: ProjectId,
+        wait: Duration,
+    ) -> Result<OwnedMutexGuard<()>, HarnessError> {
+        timeout(wait, self.lock_project_lifecycle(project_id))
+            .await
+            .map_err(|_| {
+                HarnessError::Timeout(format!(
+                    "timed out waiting for project {project_id} lifecycle lock"
+                ))
+            })
     }
 
     async fn get_or_create_harness(
@@ -311,7 +492,7 @@ impl HarnessRegistry {
         project: ProjectId,
         config: &ProjectConfig,
     ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
-        let mut harnesses = self.harnesses.lock().await;
+        let mut harnesses = self.shared.harnesses.lock().await;
         if let Some(h) = harnesses.get(&project) {
             return Ok(h.clone());
         }
@@ -328,13 +509,54 @@ impl HarnessRegistry {
         resume: Option<String>,
         initial_model: ModelRef,
     ) -> Result<ThreadHandle, HarnessError> {
+        self.open_thread_with_resume_policy(
+            config,
+            workspace_root,
+            thread,
+            resume,
+            initial_model,
+            ResumePolicy::AllowFreshFallback,
+        )
+        .await
+    }
+
+    pub async fn open_linked_thread(
+        &self,
+        config: &ProjectConfig,
+        workspace_root: &str,
+        thread: Option<ThreadId>,
+        resume: String,
+        initial_model: ModelRef,
+    ) -> Result<ThreadHandle, HarnessError> {
+        self.open_thread_with_resume_policy(
+            config,
+            workspace_root,
+            thread,
+            Some(resume),
+            initial_model,
+            ResumePolicy::RequireExisting,
+        )
+        .await
+    }
+
+    async fn open_thread_with_resume_policy(
+        &self,
+        config: &ProjectConfig,
+        workspace_root: &str,
+        thread: Option<ThreadId>,
+        resume: Option<String>,
+        initial_model: ModelRef,
+        resume_policy: ResumePolicy,
+    ) -> Result<ThreadHandle, HarnessError> {
         debug!(
             project_id = %config.id,
             thread_id = ?thread,
             resume = ?resume,
+            ?resume_policy,
             "opening harness thread"
         );
         let harness = self.get_or_create_harness(config.id, config).await?;
+        let requested_native_id = resume.clone();
 
         let handle = harness
             .open_thread(OpenThreadOptions {
@@ -342,9 +564,22 @@ impl HarnessRegistry {
                 thread,
                 workspace_root: workspace_root.into(),
                 resume,
+                resume_policy,
                 initial_model: initial_model.clone(),
             })
             .await?;
+
+        // This is the harness-neutral identity boundary. Individual adapters may enforce the same
+        // contract internally, but the registry must not rely on adapter-specific validation.
+        if resume_policy == ResumePolicy::RequireExisting
+            && requested_native_id.as_deref() != Some(handle.harness_thread_id.as_str())
+        {
+            return Err(HarnessError::Protocol(format!(
+                "linked-thread resume returned native thread {} instead of {}",
+                handle.harness_thread_id,
+                requested_native_id.as_deref().unwrap_or_default()
+            )));
+        }
 
         // Bind the model the harness reports as effective when it says so — Codex can ignore
         // resume overrides for a loaded thread, and the binding must reflect reality, not the
@@ -353,7 +588,7 @@ impl HarnessRegistry {
             .resumed_model
             .clone()
             .unwrap_or_else(|| initial_model.clone());
-        let mut threads = self.threads.lock().await;
+        let mut threads = self.shared.threads.lock().await;
         threads.insert(
             handle.thread,
             ThreadBinding {
@@ -382,7 +617,14 @@ impl HarnessRegistry {
         overrides: TurnOverrides,
         effective_model: ModelRef,
     ) -> Result<TurnId, HarnessError> {
-        let threads = self.threads.lock().await;
+        if self.thread_has_passive_monitor(thread_id).await {
+            warn!(
+                %thread_id,
+                "refusing direct turn while passive sub-agent monitoring owns the thread"
+            );
+            return Err(HarnessError::ThreadBusy { thread: thread_id });
+        }
+        let threads = self.shared.threads.lock().await;
         let binding = threads
             .get(&thread_id)
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
@@ -399,7 +641,7 @@ impl HarnessRegistry {
             "starting harness turn"
         );
 
-        let harnesses = self.harnesses.lock().await;
+        let harnesses = self.shared.harnesses.lock().await;
         let harness = harnesses
             .get(&project_id)
             .ok_or(HarnessError::ThreadNotFound(thread_id))?
@@ -411,19 +653,18 @@ impl HarnessRegistry {
             model: effective_model,
             mode: overrides.mode,
             kind: TurnContextKind::User,
+            passive_input_is_fallback: false,
+            subagent_fallback: None,
+            passive_subagent_metadata: None,
+            passive_pre_turn_timeout: None,
         };
         let request_started = Instant::now();
         let mut turn_gate = self
+            .shared
             .turn_gate
             .reserve(thread_id, ActiveTurnOwner::new(project_id, &handle, &ctx))?;
 
-        let hub = self.hub.clone();
-        let live_buffers = self.live_buffers.clone();
-        let running_commands = self.running_commands.clone();
-        let store = self.store.clone();
-        let approvals_map = self.approvals.clone();
-        let server_requests_map = self.server_requests.clone();
-        let ledger = self.ledger.clone();
+        let shared = self.shared.clone();
 
         let stream = harness.subscribe(&handle);
         let turn_id = match harness.start_turn(&handle, input, overrides).await {
@@ -459,21 +700,7 @@ impl HarnessRegistry {
         };
 
         tokio::spawn(async move {
-            forward_events(
-                thread_id,
-                project_id,
-                stream,
-                hub,
-                live_buffers,
-                running_commands,
-                store,
-                approvals_map,
-                server_requests_map,
-                ledger,
-                ctx,
-                Some(turn_gate),
-            )
-            .await;
+            forward_events(shared, thread_id, project_id, stream, ctx, Some(turn_gate)).await;
         });
 
         Ok(turn_id)
@@ -486,6 +713,7 @@ impl HarnessRegistry {
         decision: ApprovalDecision,
     ) -> Result<ThreadId, HarnessError> {
         let thread_id = self
+            .shared
             .approvals
             .lock()
             .await
@@ -501,6 +729,7 @@ impl HarnessRegistry {
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
 
         let harness = self
+            .shared
             .harnesses
             .lock()
             .await
@@ -508,7 +737,7 @@ impl HarnessRegistry {
             .cloned()
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
 
-        self.approvals.lock().await.remove(&request_id);
+        self.shared.approvals.lock().await.remove(&request_id);
         harness.respond_approval(request_id, decision).await?;
         Ok(thread_id)
     }
@@ -520,6 +749,7 @@ impl HarnessRegistry {
         response: ServerRequestResponse,
     ) -> Result<(), HarnessError> {
         let thread_id = self
+            .shared
             .server_requests
             .lock()
             .await
@@ -535,6 +765,7 @@ impl HarnessRegistry {
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
 
         let harness = self
+            .shared
             .harnesses
             .lock()
             .await
@@ -545,7 +776,7 @@ impl HarnessRegistry {
         harness
             .respond_server_request(request_id.clone(), response)
             .await?;
-        self.server_requests.lock().await.remove(&request_id);
+        self.shared.server_requests.lock().await.remove(&request_id);
         Ok(())
     }
 
@@ -559,6 +790,7 @@ impl HarnessRegistry {
             .await
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
         let harness = self
+            .shared
             .harnesses
             .lock()
             .await
@@ -608,6 +840,7 @@ impl HarnessRegistry {
             .await
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
         let harness = self
+            .shared
             .harnesses
             .lock()
             .await
@@ -630,18 +863,17 @@ impl HarnessRegistry {
             model: effective_model,
             mode,
             kind: TurnContextKind::ManualCompaction,
+            passive_input_is_fallback: false,
+            subagent_fallback: None,
+            passive_subagent_metadata: None,
+            passive_pre_turn_timeout: None,
         };
         let turn_gate = self
+            .shared
             .turn_gate
             .reserve(thread_id, ActiveTurnOwner::new(project_id, &handle, &ctx))?;
 
-        let hub = self.hub.clone();
-        let live_buffers = self.live_buffers.clone();
-        let running_commands = self.running_commands.clone();
-        let store = self.store.clone();
-        let approvals_map = self.approvals.clone();
-        let server_requests_map = self.server_requests.clone();
-        let ledger = self.ledger.clone();
+        let shared = self.shared.clone();
 
         let stream = harness.subscribe(&handle);
         harness.compact_thread(&handle).await?;
@@ -654,23 +886,52 @@ impl HarnessRegistry {
         );
 
         tokio::spawn(async move {
-            forward_events(
-                thread_id,
-                project_id,
-                stream,
-                hub,
-                live_buffers,
-                running_commands,
-                store,
-                approvals_map,
-                server_requests_map,
-                ledger,
-                ctx,
-                Some(turn_gate),
-            )
-            .await;
+            forward_events(shared, thread_id, project_id, stream, ctx, Some(turn_gate)).await;
         });
         Ok(())
+    }
+
+    pub(crate) async fn open_subagent_link(
+        &self,
+        project_id: ProjectId,
+        parent_thread_id: ThreadId,
+        item_id: ItemId,
+    ) -> Result<Option<ThreadId>, HarnessError> {
+        let Some((spawned_by_turn_id, info)) =
+            resolve_subagent_link_info(&self.shared, project_id, parent_thread_id, item_id).await?
+        else {
+            return Ok(None);
+        };
+        if let Some(parent_target) = resolve_reverse_subagent_target(
+            &self.shared,
+            project_id,
+            parent_thread_id,
+            &info.native_thread_id,
+        )
+        .await?
+        {
+            return Ok(Some(parent_target));
+        }
+
+        let (result, receiver) = oneshot::channel();
+        enqueue_subagent_materialization(
+            parent_thread_id,
+            SubagentMaterializationJob {
+                project_id,
+                spawned_by_turn_id,
+                item_id,
+                origin: "explicit_open",
+                info,
+                result: Some(result),
+            },
+            self.shared.clone(),
+        )
+        .await;
+        receiver.await.map_err(|_| {
+            HarnessError::Protocol(format!(
+                "sub-agent materialization queue closed for item {item_id}"
+            ))
+        })?
     }
 
     pub async fn terminate_command(
@@ -687,6 +948,7 @@ impl HarnessRegistry {
             .await
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
         let harness = self
+            .shared
             .harnesses
             .lock()
             .await
@@ -735,12 +997,7 @@ impl HarnessRegistry {
         let handle = self
             .get_thread_handle(thread_id)
             .await
-            .unwrap_or(ThreadHandle {
-                thread: thread_id,
-                harness_thread_id,
-                warning: None,
-                resumed_model: None,
-            });
+            .unwrap_or_else(|| ThreadHandle::detached(thread_id, harness_thread_id));
         harness.set_thread_archived(&handle, archived).await
     }
 
@@ -755,12 +1012,7 @@ impl HarnessRegistry {
         let handle = self
             .get_thread_handle(thread_id)
             .await
-            .unwrap_or(ThreadHandle {
-                thread: thread_id,
-                harness_thread_id,
-                warning: None,
-                resumed_model: None,
-            });
+            .unwrap_or_else(|| ThreadHandle::detached(thread_id, harness_thread_id));
         harness.set_thread_name(&handle, &name).await
     }
 
@@ -810,95 +1062,1386 @@ impl HarnessRegistry {
         thread_id: ThreadId,
         harness_thread_id: String,
     ) -> Result<(), HarnessError> {
+        self.stop_passive_subagent_monitor(thread_id).await?;
         let harness = self.get_or_create_harness(config.id, config).await?;
         let handle = self
             .get_thread_handle(thread_id)
             .await
-            .unwrap_or(ThreadHandle {
-                thread: thread_id,
-                harness_thread_id,
-                warning: None,
-                resumed_model: None,
-            });
+            .unwrap_or_else(|| ThreadHandle::detached(thread_id, harness_thread_id));
         harness.delete_thread(&handle).await?;
         self.forget_thread(thread_id).await;
         Ok(())
     }
 
     pub async fn get_thread_handle(&self, thread_id: ThreadId) -> Option<ThreadHandle> {
-        let threads = self.threads.lock().await;
+        let threads = self.shared.threads.lock().await;
         threads
             .get(&thread_id)
             .map(|binding| binding.handle.clone())
     }
 
     pub async fn get_thread_native_model(&self, thread_id: ThreadId) -> Option<ModelRef> {
-        let threads = self.threads.lock().await;
+        let threads = self.shared.threads.lock().await;
         threads
             .get(&thread_id)
             .map(|binding| binding.native_model.clone())
     }
 
     pub async fn get_project_for_thread(&self, thread_id: ThreadId) -> Option<ProjectId> {
-        let threads = self.threads.lock().await;
+        let threads = self.shared.threads.lock().await;
         threads.get(&thread_id).map(|binding| binding.project)
     }
 
     pub async fn thread_has_active_turn(&self, thread_id: ThreadId) -> bool {
-        self.turn_gate.is_active(thread_id)
+        self.shared.turn_gate.is_active(thread_id)
+    }
+
+    pub async fn thread_has_passive_monitor(&self, thread_id: ThreadId) -> bool {
+        if self
+            .shared
+            .passive_monitors
+            .lock()
+            .await
+            .contains(&thread_id)
+        {
+            return true;
+        }
+        self.shared.passive_monitor_tasks.contains(thread_id).await
+    }
+
+    pub async fn stop_passive_subagent_monitor(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<(), HarnessError> {
+        let monitor_exists = {
+            let monitors = self.shared.passive_monitors.lock().await;
+            if !monitors.contains(&thread_id) {
+                self.shared
+                    .passive_subagent_metadata
+                    .lock()
+                    .await
+                    .remove(&thread_id);
+                false
+            } else {
+                let mut metadata = self.shared.passive_subagent_metadata.lock().await;
+                let entry = metadata.entry(thread_id).or_default();
+                entry.cancelled = true;
+                entry.lifecycle_notify.notify_one();
+                true
+            }
+        };
+        if !monitor_exists && !self.shared.passive_monitor_tasks.contains(thread_id).await {
+            return Ok(());
+        }
+
+        let deadline = tokio::time::Instant::now() + PASSIVE_MONITOR_STOP_TIMEOUT;
+        let mut completions = self.shared.passive_monitor_tasks.subscribe();
+        loop {
+            if !self.shared.passive_monitor_tasks.contains(thread_id).await {
+                return Ok(());
+            }
+            if tokio::time::timeout_at(deadline, completions.changed())
+                .await
+                .is_err()
+            {
+                return Err(HarnessError::Protocol(format!(
+                    "timed out stopping passive sub-agent monitor for thread {thread_id}"
+                )));
+            }
+        }
     }
 
     pub async fn forget_thread(&self, thread_id: ThreadId) {
-        let mut threads = self.threads.lock().await;
+        let mut threads = self.shared.threads.lock().await;
         threads.remove(&thread_id);
     }
 
     pub async fn delete_project(&self, project_id: ProjectId) -> Result<(), HarnessError> {
-        let harness = self.harnesses.lock().await.get(&project_id).cloned();
-        if let Some(harness) = harness {
-            harness.shutdown().await?;
-            self.harnesses.lock().await.remove(&project_id);
+        let thread_ids = self
+            .shared
+            .threads
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(thread_id, binding)| {
+                (binding.project == project_id).then_some(*thread_id)
+            })
+            .collect::<HashSet<_>>();
+        for thread_id in &thread_ids {
+            self.stop_passive_subagent_monitor(*thread_id).await?;
         }
 
-        let thread_ids = {
-            let mut threads = self.threads.lock().await;
-            let thread_ids = threads
+        let harness = self.shared.harnesses.lock().await.get(&project_id).cloned();
+        if let Some(harness) = harness {
+            harness.shutdown().await?;
+            self.shared.harnesses.lock().await.remove(&project_id);
+        }
+
+        let removed_thread_ids = {
+            let mut threads = self.shared.threads.lock().await;
+            let removed_thread_ids = threads
                 .iter()
                 .filter_map(|(thread_id, binding)| {
                     (binding.project == project_id).then_some(*thread_id)
                 })
                 .collect::<HashSet<_>>();
             threads.retain(|_, binding| binding.project != project_id);
-            thread_ids
+            removed_thread_ids
         };
 
-        if !thread_ids.is_empty() {
-            let mut approvals = self.approvals.lock().await;
-            approvals.retain(|_, thread_id| !thread_ids.contains(thread_id));
+        if !removed_thread_ids.is_empty() {
+            let mut approvals = self.shared.approvals.lock().await;
+            approvals.retain(|_, thread_id| !removed_thread_ids.contains(thread_id));
 
-            let mut server_requests = self.server_requests.lock().await;
-            server_requests.retain(|_, thread_id| !thread_ids.contains(thread_id));
+            let mut server_requests = self.shared.server_requests.lock().await;
+            server_requests.retain(|_, thread_id| !removed_thread_ids.contains(thread_id));
         }
 
         Ok(())
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+async fn lock_project_lifecycle(
+    locks: &ProjectLifecycleLocks,
+    project_id: ProjectId,
+) -> OwnedMutexGuard<()> {
+    let lock = {
+        let mut locks = locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        match locks.get(&project_id).and_then(Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(Mutex::new(()));
+                locks.insert(project_id, Arc::downgrade(&lock));
+                lock
+            }
+        }
+    };
+    lock.lock_owned().await
+}
+
+#[derive(Clone)]
+struct SubagentActivityInfo {
+    native_thread_id: String,
+    agent_name: Option<String>,
+    agent_path: Option<String>,
+    initial_prompt: Option<String>,
+    title: Option<String>,
+    action: SubagentAction,
+    status: Option<SubagentStatus>,
+    fallback: Option<SubagentFallbackTranscript>,
+}
+
+type SubagentMaterializationResult = Result<Option<ThreadId>, HarnessError>;
+
+struct SubagentMaterializationJob {
+    project_id: ProjectId,
+    spawned_by_turn_id: TurnId,
+    item_id: ItemId,
+    origin: &'static str,
+    info: SubagentActivityInfo,
+    result: Option<oneshot::Sender<SubagentMaterializationResult>>,
+}
+
+#[derive(Clone)]
+struct SubagentFallbackTranscript {
+    message: String,
+    status: SubagentStatus,
+}
+
+struct FallbackTurnContext {
+    user_input: UserInput,
+    model: ModelRef,
+    mode: Mode,
+}
+
+impl From<&TurnContext> for FallbackTurnContext {
+    fn from(ctx: &TurnContext) -> Self {
+        Self {
+            user_input: ctx.user_input.clone(),
+            model: ctx.model.clone(),
+            mode: ctx.mode,
+        }
+    }
+}
+
+fn subagent_activity_info(item: &Item) -> Option<SubagentActivityInfo> {
+    match &item.payload {
+        ItemPayload::Activity {
+            title, subagent, ..
+        } => subagent_link_info(subagent.as_ref(), Some(title.clone()), None),
+        ItemPayload::ToolCall {
+            input, subagent, ..
+        } => subagent_link_info(
+            subagent.as_ref(),
+            None,
+            subagent_prompt_from_tool_input(input),
+        ),
+        _ => None,
+    }
+}
+
+async fn resolve_subagent_link_info(
+    shared: &RegistryShared,
+    project_id: ProjectId,
+    parent_thread_id: ThreadId,
+    item_id: ItemId,
+) -> Result<Option<(TurnId, SubagentActivityInfo)>, HarnessError> {
+    let parent_exists = shared
+        .store
+        .load_thread(project_id, parent_thread_id)
+        .await
+        .map_err(|error| HarnessError::Protocol(error.to_string()))?
+        .is_some();
+    if !parent_exists {
+        return Err(HarnessError::ThreadNotFound(parent_thread_id));
+    }
+
+    for event in shared
+        .live_buffers
+        .item_events(parent_thread_id, item_id)
+        .await
+        .into_iter()
+        .rev()
+    {
+        match event {
+            AgentEvent::ItemCompleted { turn, item, .. } => {
+                if let Some(info) = subagent_activity_info(&item) {
+                    return Ok(Some((turn, info)));
+                }
+            }
+            AgentEvent::ItemStarted { turn, item, .. } => {
+                if let Some(info) = subagent_start_info(&item) {
+                    return Ok(Some((turn, info)));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let turns = shared
+        .store
+        .load_all_turns(project_id, parent_thread_id)
+        .await
+        .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+    for turn in turns.into_iter().rev() {
+        if let Some(info) = turn
+            .items
+            .iter()
+            .rev()
+            .find(|item| item.id == item_id)
+            .and_then(subagent_activity_info)
+        {
+            return Ok(Some((turn.id, info)));
+        }
+    }
+    Ok(None)
+}
+
+async fn resolve_reverse_subagent_target(
+    shared: &RegistryShared,
+    project_id: ProjectId,
+    source_thread_id: ThreadId,
+    native_thread_id: &str,
+) -> Result<Option<ThreadId>, HarnessError> {
+    let graph = load_thread_graph(&shared.store, project_id)
+        .await
+        .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+    let Some(source) = graph.get(&source_thread_id) else {
+        return Err(HarnessError::ThreadNotFound(source_thread_id));
+    };
+    let target = graph
+        .values()
+        .find(|thread| thread.harness_thread_id == native_thread_id);
+    Ok(target
+        .filter(|target| source.parent_thread_id == Some(target.id))
+        .map(|target| target.id))
+}
+
+fn subagent_start_info(item: &giskard_core::item::ItemStart) -> Option<SubagentActivityInfo> {
+    let tool = item.tool.as_ref()?;
+    subagent_link_info(
+        tool.subagent.as_ref(),
+        None,
+        subagent_prompt_from_tool_input(&tool.input),
+    )
+}
+
+fn subagent_link_info(
+    subagent: Option<&giskard_core::item::SubagentLink>,
+    title: Option<String>,
+    prompt_fallback: Option<String>,
+) -> Option<SubagentActivityInfo> {
+    let subagent = subagent?;
+    let native_thread_id = trimmed_non_empty(&subagent.harness_thread_id)?;
+    let agent_path = subagent
+        .path
+        .as_deref()
+        .and_then(trimmed_non_empty)
+        .map(ToOwned::to_owned);
+    let initial_prompt = subagent
+        .initial_prompt
+        .as_deref()
+        .and_then(trimmed_non_empty)
+        .map(ToOwned::to_owned)
+        .or(prompt_fallback);
+    Some(SubagentActivityInfo {
+        native_thread_id: native_thread_id.to_owned(),
+        agent_name: None,
+        agent_path,
+        initial_prompt,
+        title,
+        action: subagent.action,
+        status: subagent.status,
+        fallback: subagent_fallback_transcript(subagent),
+    })
+}
+
+fn subagent_prompt_from_tool_input(input: &serde_json::Value) -> Option<String> {
+    for key in ["prompt", "message", "task", "instructions"] {
+        if let Some(prompt) = input
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .and_then(trimmed_non_empty)
+        {
+            return Some(prompt.to_owned());
+        }
+    }
+    input
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|items| {
+            items.iter().find_map(|item| {
+                item.get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(trimmed_non_empty)
+                    .map(ToOwned::to_owned)
+            })
+        })
+}
+
+fn subagent_fallback_transcript(
+    subagent: &giskard_core::item::SubagentLink,
+) -> Option<SubagentFallbackTranscript> {
+    terminal_subagent_fallback(subagent.status, subagent.message.as_deref())
+}
+
+fn terminal_subagent_fallback(
+    status: Option<SubagentStatus>,
+    message: Option<&str>,
+) -> Option<SubagentFallbackTranscript> {
+    let status = status?;
+    if !matches!(
+        status,
+        SubagentStatus::Completed
+            | SubagentStatus::Interrupted
+            | SubagentStatus::Failed
+            | SubagentStatus::Shutdown
+            | SubagentStatus::NotFound
+    ) {
+        return None;
+    }
+    let message = message.and_then(trimmed_non_empty)?.to_owned();
+    Some(SubagentFallbackTranscript { message, status })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SubagentMonitorPolicy {
+    should_monitor: bool,
+    terminal_observed: bool,
+    active_observed: bool,
+    pre_turn_timeout: Option<Duration>,
+}
+
+struct SubagentObservation {
+    effective_model: ModelRef,
+    mode: Mode,
+    initial_prompt: Option<String>,
+    policy: SubagentMonitorPolicy,
+    fallback: Option<SubagentFallbackTranscript>,
+}
+
+fn subagent_monitor_policy(
+    action: Option<SubagentAction>,
+    status: Option<SubagentStatus>,
+) -> SubagentMonitorPolicy {
+    let terminal_observed = subagent_observation_is_terminal(action, status);
+    let active_observed = !terminal_observed
+        && (matches!(
+            status,
+            Some(SubagentStatus::Pending | SubagentStatus::Running)
+        ) || matches!(
+            action,
+            Some(SubagentAction::Spawned | SubagentAction::Started | SubagentAction::Interacted)
+        ));
+    SubagentMonitorPolicy {
+        should_monitor: active_observed,
+        terminal_observed,
+        active_observed,
+        // Active evidence gets a generous no-event safety bound so a missed terminal event cannot
+        // block direct follow-ups forever. Any stream event restarts the bound, and once a native
+        // turn begins normal turn completion—not this pre-turn timeout—owns the lifecycle.
+        pre_turn_timeout: active_observed.then_some(ACTIVE_SUBAGENT_PRE_TURN_IDLE_TIMEOUT),
+    }
+}
+
+fn subagent_observation_is_terminal(
+    action: Option<SubagentAction>,
+    status: Option<SubagentStatus>,
+) -> bool {
+    action == Some(SubagentAction::Interrupted)
+        || matches!(
+            status,
+            Some(
+                SubagentStatus::Completed
+                    | SubagentStatus::Interrupted
+                    | SubagentStatus::Failed
+                    | SubagentStatus::Shutdown
+                    | SubagentStatus::NotFound
+            )
+        )
+}
+
+fn subagent_thread_title(info: &SubagentActivityInfo) -> String {
+    let raw = info
+        .agent_name
+        .as_ref()
+        .map(|name| format!("Sub-agent: {name}"))
+        .or_else(|| {
+            info.agent_path
+                .as_ref()
+                .map(|path| format!("Sub-agent: {path}"))
+        })
+        .or_else(|| info.title.clone())
+        .unwrap_or_else(|| "Sub-agent".to_string());
+    normalize_subagent_title(raw)
+}
+
+fn normalize_subagent_title(raw: String) -> String {
+    let title = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let title = if title.is_empty() {
+        "Sub-agent".to_string()
+    } else {
+        title
+    };
+    title.chars().take(120).collect()
+}
+
+fn subagent_info_with_agent_name(
+    mut info: SubagentActivityInfo,
+    agent_name: Option<String>,
+) -> SubagentActivityInfo {
+    if let Some(agent_name) = agent_name {
+        info.agent_name = Some(agent_name);
+    }
+    info
+}
+
+async fn update_passive_subagent_metadata(
+    map: &PassiveSubagentMetadataMap,
+    thread_id: ThreadId,
+    initial_prompt: Option<String>,
+    fallback: Option<SubagentFallbackTranscript>,
+    signal: LifecycleSignal,
+) {
+    let mut metadata = map.lock().await;
+    let entry = metadata.entry(thread_id).or_default();
+    merge_passive_subagent_metadata(entry, initial_prompt, fallback, signal);
+}
+
+fn merge_passive_subagent_metadata(
+    entry: &mut PassiveSubagentMetadata,
+    initial_prompt: Option<String>,
+    fallback: Option<SubagentFallbackTranscript>,
+    signal: LifecycleSignal,
+) {
+    if let Some(initial_prompt) = initial_prompt {
+        entry.initial_prompt = Some(initial_prompt);
+    }
+    if let Some(fallback) = fallback {
+        entry.fallback = Some(fallback);
+    }
+    match signal {
+        LifecycleSignal::None => {}
+        LifecycleSignal::Active => {
+            entry.active_lifecycle_observed = true;
+            entry.lifecycle_notify.notify_one();
+        }
+        LifecycleSignal::Terminal => {
+            entry.terminal_observed = true;
+            entry.lifecycle_notify.notify_one();
+        }
+    }
+}
+
+async fn register_passive_subagent_monitor(
+    passive_monitors: &Arc<Mutex<HashSet<ThreadId>>>,
+    passive_subagent_metadata: &PassiveSubagentMetadataMap,
+    passive_monitor_tasks: &PassiveMonitorTasks,
+    thread_id: ThreadId,
+    initial_prompt: Option<String>,
+    fallback: Option<SubagentFallbackTranscript>,
+    signal: LifecycleSignal,
+) -> bool {
+    // Monitor ownership and metadata are published atomically under the same lock order used by
+    // terminal recovery. A terminal observation therefore either updates this monitor or runs
+    // fallback recovery itself; it cannot slip between metadata creation and monitor insertion.
+    let mut monitors = passive_monitors.lock().await;
+    let inserted = monitors.insert(thread_id);
+    let mut metadata = passive_subagent_metadata.lock().await;
+    let entry = metadata.entry(thread_id).or_default();
+    merge_passive_subagent_metadata(entry, initial_prompt, fallback, signal);
+    if inserted {
+        passive_monitor_tasks.register(thread_id).await;
+    }
+    inserted
+}
+
+async fn finish_passive_subagent_monitor_task(
+    passive_monitor_tasks: &PassiveMonitorTasks,
+    thread_id: ThreadId,
+) {
+    passive_monitor_tasks.finish(thread_id).await;
+}
+
+async fn take_passive_subagent_monitor_metadata(
+    passive_monitors: &Arc<Mutex<HashSet<ThreadId>>>,
+    passive_subagent_metadata: &PassiveSubagentMetadataMap,
+    thread_id: ThreadId,
+) -> Option<PassiveSubagentMetadata> {
+    // Keep monitor ownership and metadata removal under one lock order. Terminal observations use
+    // the same order, so either the live monitor receives the fallback or teardown claims it for
+    // immediate recovery; there is no gap where a result can be attached to an exited forwarder.
+    let mut monitors = passive_monitors.lock().await;
+    monitors.remove(&thread_id);
+    passive_subagent_metadata.lock().await.remove(&thread_id)
+}
+
+async fn refresh_passive_subagent_context(
+    thread_id: ThreadId,
+    ctx: &mut TurnContext,
+) -> PassiveMonitorSignal {
+    if ctx.kind != TurnContextKind::PassiveSubagent {
+        return PassiveMonitorSignal::Continue;
+    }
+    let Some(metadata_map) = ctx.passive_subagent_metadata.as_ref() else {
+        return PassiveMonitorSignal::Continue;
+    };
+    let Some(metadata) = metadata_map.lock().await.get(&thread_id).cloned() else {
+        return PassiveMonitorSignal::Continue;
+    };
+    if let Some(initial_prompt) = metadata
+        .initial_prompt
+        .as_deref()
+        .and_then(trimmed_non_empty)
+    {
+        ctx.user_input = UserInput::text(initial_prompt);
+        ctx.passive_input_is_fallback = false;
+    }
+    if metadata.fallback.is_some() {
+        ctx.subagent_fallback = metadata.fallback;
+    }
+    if metadata.active_lifecycle_observed {
+        ctx.passive_pre_turn_timeout = Some(ACTIVE_SUBAGENT_PRE_TURN_IDLE_TIMEOUT);
+    }
+    if metadata.cancelled {
+        PassiveMonitorSignal::Cancelled
+    } else if metadata.terminal_observed {
+        PassiveMonitorSignal::Terminal
+    } else {
+        PassiveMonitorSignal::Continue
+    }
+}
+
+async fn materialize_subagent_thread(
+    parent_thread_id: ThreadId,
+    project_id: ProjectId,
+    spawned_by_turn_id: TurnId,
+    info: SubagentActivityInfo,
+    shared: Arc<RegistryShared>,
+) -> Result<Option<ThreadId>, HarnessError> {
+    let _lifecycle_guard =
+        lock_project_lifecycle(&shared.project_lifecycle_locks, project_id).await;
+    let Some(project_config) = shared
+        .store
+        .load_project(project_id)
+        .await
+        .map_err(|error| HarnessError::Protocol(error.to_string()))?
+    else {
+        return Err(HarnessError::Protocol(format!(
+            "project {project_id} disappeared while importing sub-agent"
+        )));
+    };
+    let parent_file = shared
+        .store
+        .load_thread(project_id, parent_thread_id)
+        .await
+        .map_err(|error| HarnessError::Protocol(error.to_string()))?
+        .ok_or_else(|| {
+            HarnessError::Protocol(format!(
+                "parent thread {parent_thread_id} disappeared while importing sub-agent"
+            ))
+        })?;
+    let live_existing_id = shared
+        .threads
+        .lock()
+        .await
+        .iter()
+        .find_map(|(thread_id, binding)| {
+            (binding.project == project_id
+                && binding.handle.harness_thread_id == info.native_thread_id)
+                .then_some(*thread_id)
+        });
+    let (graph, existing) = if let Some(existing_id) = live_existing_id {
+        let existing = shared
+            .store
+            .load_thread(project_id, existing_id)
+            .await
+            .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+        (None, existing)
+    } else {
+        let graph = load_thread_graph(&shared.store, project_id)
+            .await
+            .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+        let existing = graph
+            .values()
+            .find(|thread| thread.harness_thread_id == info.native_thread_id)
+            .cloned();
+        (Some(graph), existing)
+    };
+
+    if let Some(existing) = existing {
+        // A live binding has already passed the full ownership validation while it was imported.
+        // Repeated `interacted` activity can therefore use its immutable direct ownership fields
+        // instead of re-reading every thread file on the parent forwarder's hot path.
+        let disposition = match graph.as_ref() {
+            Some(graph) => classify_existing_link(graph, parent_thread_id, &existing),
+            None if existing.id == parent_thread_id => ExistingLinkDisposition::SelfLink,
+            None if existing.kind == ThreadKind::Primary || existing.parent_thread_id.is_none() => {
+                ExistingLinkDisposition::PrimaryThread
+            }
+            None if existing.parent_thread_id != Some(parent_thread_id) => {
+                ExistingLinkDisposition::DifferentParent
+            }
+            None => ExistingLinkDisposition::OwnedChild,
+        };
+        if disposition != ExistingLinkDisposition::OwnedChild {
+            warn!(
+                %project_id,
+                %parent_thread_id,
+                existing_thread_id = %existing.id,
+                existing_kind = ?existing.kind,
+                existing_parent_thread_id = ?existing.parent_thread_id,
+                linked_harness_thread_id = %info.native_thread_id,
+                disposition = ?disposition,
+                reason = disposition.reason(),
+                "ignoring sub-agent materialization for an existing thread with incompatible ownership"
+            );
+            return Ok(None);
+        }
+        let policy = subagent_monitor_policy(Some(info.action), info.status);
+        let opened_agent_name = if policy.should_monitor {
+            ensure_subagent_thread_open(&project_config, &existing, &shared).await?
+        } else {
+            shared
+                .threads
+                .lock()
+                .await
+                .get(&existing.id)
+                .and_then(|binding| binding.handle.agent_name.clone())
+        };
+        let refreshed_info = subagent_info_with_agent_name(info.clone(), opened_agent_name);
+        let desired_title = subagent_thread_title(&refreshed_info);
+        if should_refresh_subagent_title(&existing.title, &desired_title) {
+            shared
+                .store
+                .update_thread(project_id, existing.id, |thread| {
+                    if should_refresh_subagent_title(&thread.title, &desired_title) {
+                        thread.title = desired_title.clone();
+                    }
+                    thread.updated_at = Utc::now();
+                })
+                .await
+                .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+        }
+        observe_external_subagent_with_context(
+            project_id,
+            existing.id,
+            SubagentObservation {
+                effective_model: existing.current_model.clone(),
+                mode: existing.mode,
+                initial_prompt: refreshed_info.initial_prompt,
+                policy,
+                fallback: refreshed_info.fallback,
+            },
+            shared,
+        )
+        .await?;
+        return Ok(Some(existing.id));
+    }
+
+    let graph = match graph {
+        Some(graph) => graph,
+        None => load_thread_graph(&shared.store, project_id)
+            .await
+            .map_err(|error| HarnessError::Protocol(error.to_string()))?,
+    };
+    if !parent_chain_is_valid(&graph, parent_thread_id) {
+        warn!(
+            %project_id,
+            %parent_thread_id,
+            linked_harness_thread_id = %info.native_thread_id,
+            "refusing to materialize a sub-agent under an invalid parent chain"
+        );
+        return Ok(None);
+    }
+
+    let model = parent_file.current_model.clone();
+    let mode = parent_file.mode;
+    let context_window = parent_file.context_window;
+    let model_context_windows = parent_file.model_context_windows.clone();
+    let approval_policy = parent_file.approval_policy;
+    let model_efforts = parent_file.model_efforts.clone();
+
+    let harness = shared
+        .harnesses
+        .lock()
+        .await
+        .get(&project_id)
+        .cloned()
+        .ok_or(HarnessError::ThreadNotFound(parent_thread_id))?;
+    let workspace_root = project_config
+        .workspace_root
+        .as_deref()
+        .unwrap_or(&project_config.dir)
+        .to_owned();
+    let handle = harness
+        .open_thread(OpenThreadOptions {
+            project: project_id,
+            thread: None,
+            workspace_root: workspace_root.into(),
+            resume: Some(info.native_thread_id.clone()),
+            resume_policy: ResumePolicy::RequireExisting,
+            initial_model: model.clone(),
+        })
+        .await?;
+    // This path calls the harness directly rather than `open_thread_with_resume_policy`, so retain
+    // the registry's harness-neutral strict-resume check even when the adapter also validates it.
+    if handle.harness_thread_id != info.native_thread_id {
+        return Err(HarnessError::Protocol(format!(
+            "linked-thread resume returned native thread {} instead of {}",
+            handle.harness_thread_id, info.native_thread_id
+        )));
+    }
+    if let Some(native_parent) = handle.parent_harness_thread_id.as_deref()
+        && native_parent != parent_file.harness_thread_id
+    {
+        warn!(
+            %project_id,
+            %parent_thread_id,
+            proposed_parent_harness_thread_id = %parent_file.harness_thread_id,
+            reported_parent_harness_thread_id = %native_parent,
+            linked_harness_thread_id = %handle.harness_thread_id,
+            "refusing to materialize a native thread under a mismatched parent"
+        );
+        return Ok(None);
+    }
+    let current_model = handle.resumed_model.clone().unwrap_or(model);
+    let info = subagent_info_with_agent_name(info, handle.agent_name.clone());
+    let native_model = current_model.clone();
+    shared.threads.lock().await.insert(
+        handle.thread,
+        ThreadBinding {
+            project: project_id,
+            handle: handle.clone(),
+            native_model,
+        },
+    );
+
+    let now = Utc::now();
+    let thread_file = ThreadFile {
+        version: 1,
+        id: handle.thread,
+        project_id,
+        title: subagent_thread_title(&info),
+        harness_thread_id: handle.harness_thread_id.clone(),
+        parent_thread_id: Some(parent_thread_id),
+        spawned_by_turn_id: Some(spawned_by_turn_id),
+        kind: ThreadKind::Subagent,
+        mode,
+        current_model: current_model.clone(),
+        context_window,
+        model_context_windows,
+        approval_policy,
+        model_efforts,
+        tokens: giskard_core::token::TokenLedger::default(),
+        created_at: now,
+        updated_at: now,
+        archived: false,
+    };
+    shared
+        .store
+        .save_thread(project_id, &thread_file)
+        .await
+        .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+    let policy = subagent_monitor_policy(Some(info.action), info.status);
+    observe_external_subagent_with_context(
+        project_id,
+        handle.thread,
+        SubagentObservation {
+            effective_model: current_model,
+            mode,
+            initial_prompt: info.initial_prompt,
+            policy,
+            fallback: info.fallback,
+        },
+        shared,
+    )
+    .await?;
+    Ok(Some(handle.thread))
+}
+
+async fn enqueue_subagent_materialization(
+    parent_thread_id: ThreadId,
+    job: SubagentMaterializationJob,
+    shared: Arc<RegistryShared>,
+) {
+    let should_start_worker = {
+        let mut queues = shared.subagent_materialization_queues.lock().await;
+        let should_start = !queues.contains_key(&parent_thread_id);
+        queues.entry(parent_thread_id).or_default().push_back(job);
+        should_start
+    };
+    if should_start_worker {
+        tokio::spawn(run_subagent_materialization_queue(parent_thread_id, shared));
+    }
+}
+
+async fn run_subagent_materialization_queue(
+    parent_thread_id: ThreadId,
+    shared: Arc<RegistryShared>,
+) {
+    loop {
+        let job = {
+            let mut queues = shared.subagent_materialization_queues.lock().await;
+            let job = queues
+                .get_mut(&parent_thread_id)
+                .and_then(VecDeque::pop_front);
+            if job.is_none() {
+                queues.remove(&parent_thread_id);
+            }
+            job
+        };
+        let Some(job) = job else {
+            return;
+        };
+        let result = materialize_subagent_thread(
+            parent_thread_id,
+            job.project_id,
+            job.spawned_by_turn_id,
+            job.info,
+            shared.clone(),
+        )
+        .await;
+        match &result {
+            Ok(Some(subagent_thread_id)) => {
+                info!(
+                    project_id = %job.project_id,
+                    %parent_thread_id,
+                    %subagent_thread_id,
+                    turn = %job.spawned_by_turn_id,
+                    item_id = %job.item_id,
+                    origin = %job.origin,
+                    "materialized sub-agent thread from linked activity"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    project_id = %job.project_id,
+                    %parent_thread_id,
+                    turn = %job.spawned_by_turn_id,
+                    item_id = %job.item_id,
+                    origin = %job.origin,
+                    error = %error,
+                    "failed to materialize sub-agent thread from linked activity"
+                );
+            }
+        }
+        if let Some(sender) = job.result {
+            let _ = sender.send(result);
+        }
+    }
+}
+
+async fn ensure_subagent_thread_open(
+    project_config: &ProjectConfig,
+    thread_file: &ThreadFile,
+    shared: &RegistryShared,
+) -> Result<Option<String>, HarnessError> {
+    if let Some(binding) = shared.threads.lock().await.get(&thread_file.id) {
+        return Ok(binding.handle.agent_name.clone());
+    }
+    let harness = shared
+        .harnesses
+        .lock()
+        .await
+        .get(&project_config.id)
+        .cloned()
+        .ok_or(HarnessError::ThreadNotFound(thread_file.id))?;
+    let workspace_root = project_config
+        .workspace_root
+        .as_deref()
+        .unwrap_or(&project_config.dir)
+        .to_owned();
+    let handle = harness
+        .open_thread(OpenThreadOptions {
+            project: project_config.id,
+            thread: Some(thread_file.id),
+            workspace_root: workspace_root.into(),
+            resume: Some(thread_file.harness_thread_id.clone()),
+            resume_policy: ResumePolicy::RequireExisting,
+            initial_model: thread_file.current_model.clone(),
+        })
+        .await?;
+    // This path calls the harness directly rather than `open_thread_with_resume_policy`, so retain
+    // the registry's harness-neutral strict-resume check even when the adapter also validates it.
+    if handle.harness_thread_id != thread_file.harness_thread_id {
+        return Err(HarnessError::Protocol(format!(
+            "linked-thread resume returned native thread {} instead of {}",
+            handle.harness_thread_id, thread_file.harness_thread_id
+        )));
+    }
+    let native_model = handle
+        .resumed_model
+        .clone()
+        .unwrap_or_else(|| thread_file.current_model.clone());
+    let agent_name = handle.agent_name.clone();
+    shared.threads.lock().await.insert(
+        handle.thread,
+        ThreadBinding {
+            project: project_config.id,
+            handle,
+            native_model,
+        },
+    );
+    Ok(agent_name)
+}
+
+async fn start_passive_subagent_monitor(
+    thread_id: ThreadId,
+    observation: SubagentObservation,
+    shared: Arc<RegistryShared>,
+) -> Result<(), HarnessError> {
+    let SubagentObservation {
+        effective_model,
+        mode,
+        initial_prompt,
+        policy,
+        fallback,
+    } = observation;
+    if !register_passive_subagent_monitor(
+        &shared.passive_monitors,
+        &shared.passive_subagent_metadata,
+        &shared.passive_monitor_tasks,
+        thread_id,
+        initial_prompt.clone(),
+        fallback.clone(),
+        if policy.active_observed {
+            LifecycleSignal::Active
+        } else {
+            LifecycleSignal::None
+        },
+    )
+    .await
+    {
+        return Ok(());
+    }
+
+    let error_cleanup_shared = shared.clone();
+    let result = async {
+        let threads = shared.threads.lock().await;
+        let binding = threads
+            .get(&thread_id)
+            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+        let project_id = binding.project;
+        let handle = binding.handle.clone();
+        drop(threads);
+
+        let harness = shared
+            .harnesses
+            .lock()
+            .await
+            .get(&project_id)
+            .cloned()
+            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+
+        let stream = harness.subscribe(&handle);
+        let cleanup_model = effective_model.clone();
+        let cleanup_mode = mode;
+        let prompt_text = initial_prompt.as_deref().and_then(trimmed_non_empty);
+        let ctx = TurnContext {
+            user_input: UserInput::text(prompt_text.unwrap_or("Sub-agent turn")),
+            model: effective_model,
+            mode,
+            kind: TurnContextKind::PassiveSubagent,
+            passive_input_is_fallback: prompt_text.is_none(),
+            subagent_fallback: fallback,
+            passive_subagent_metadata: Some(shared.passive_subagent_metadata.clone()),
+            passive_pre_turn_timeout: policy.pre_turn_timeout,
+        };
+
+        info!(
+            %project_id,
+            %thread_id,
+            harness_thread_id = %handle.harness_thread_id,
+            "starting passive monitor for external harness turn"
+        );
+
+        let cleanup_shared = shared.clone();
+        let cleanup_tasks = shared.passive_monitor_tasks.clone();
+        tokio::spawn(async move {
+            forward_events(shared, thread_id, project_id, stream, ctx, None).await;
+            if let Some(metadata) = take_passive_subagent_monitor_metadata(
+                &cleanup_shared.passive_monitors,
+                &cleanup_shared.passive_subagent_metadata,
+                thread_id,
+            )
+            .await
+            {
+                if metadata.cancelled {
+                    debug!(
+                        %project_id,
+                        %thread_id,
+                        "passive sub-agent monitor cleanup skipped fallback after cancellation"
+                    );
+                } else if let Some(fallback) = metadata.fallback {
+                    persist_terminal_subagent_fallback(
+                        project_id,
+                        thread_id,
+                        cleanup_model,
+                        cleanup_mode,
+                        metadata.initial_prompt,
+                        fallback,
+                        cleanup_shared,
+                    )
+                    .await;
+                }
+            }
+            finish_passive_subagent_monitor_task(&cleanup_tasks, thread_id).await;
+        });
+
+        Ok(())
+    }
+    .await;
+
+    if result.is_err() {
+        take_passive_subagent_monitor_metadata(
+            &error_cleanup_shared.passive_monitors,
+            &error_cleanup_shared.passive_subagent_metadata,
+            thread_id,
+        )
+        .await;
+        finish_passive_subagent_monitor_task(
+            &error_cleanup_shared.passive_monitor_tasks,
+            thread_id,
+        )
+        .await;
+    }
+    result
+}
+
+async fn observe_external_subagent_with_context(
+    project_id: ProjectId,
+    thread_id: ThreadId,
+    observation: SubagentObservation,
+    shared: Arc<RegistryShared>,
+) -> Result<(), HarnessError> {
+    if observation.policy.should_monitor {
+        // Setup is cancellation-shielded after the child record has been persisted. The detached
+        // task owns monitor registration and cleanup even if its HTTP importer disconnects.
+        let task = launch_passive_subagent_monitor(thread_id, observation, shared);
+        return match task.await {
+            Ok(result) => result,
+            Err(error) => {
+                error!(
+                    %thread_id,
+                    %error,
+                    "passive sub-agent monitor setup task failed"
+                );
+                Err(HarnessError::Protocol(format!(
+                    "passive sub-agent monitor setup task failed: {error}"
+                )))
+            }
+        };
+    }
+
+    if observation.policy.terminal_observed {
+        return recover_terminal_subagent_fallback(
+            project_id,
+            thread_id,
+            observation.effective_model,
+            observation.mode,
+            observation.initial_prompt,
+            observation.fallback,
+            shared,
+        )
+        .await;
+    }
+
+    debug!(
+        %thread_id,
+        "skipping passive monitor for sub-agent observation without active work"
+    );
+    Ok(())
+}
+
+fn launch_passive_subagent_monitor(
+    thread_id: ThreadId,
+    observation: SubagentObservation,
+    shared: Arc<RegistryShared>,
+) -> tokio::task::JoinHandle<Result<(), HarnessError>> {
+    tokio::spawn(start_passive_subagent_monitor(
+        thread_id,
+        observation,
+        shared,
+    ))
+}
+
+async fn recover_terminal_subagent_fallback(
+    project_id: ProjectId,
+    thread_id: ThreadId,
+    effective_model: ModelRef,
+    mode: Mode,
+    initial_prompt: Option<String>,
+    fallback: Option<SubagentFallbackTranscript>,
+    shared: Arc<RegistryShared>,
+) -> Result<(), HarnessError> {
+    let attached_to_monitor = {
+        let monitors = shared.passive_monitors.lock().await;
+        if monitors.contains(&thread_id) {
+            update_passive_subagent_metadata(
+                &shared.passive_subagent_metadata,
+                thread_id,
+                initial_prompt.clone(),
+                fallback.clone(),
+                LifecycleSignal::Terminal,
+            )
+            .await;
+            true
+        } else {
+            false
+        }
+    };
+    if attached_to_monitor {
+        debug!(
+            %thread_id,
+            "attached terminal fallback to active passive sub-agent monitor"
+        );
+        return Ok(());
+    }
+
+    let Some(fallback) = fallback else {
+        debug!(
+            %thread_id,
+            "terminal sub-agent observation requires no monitor or fallback recovery"
+        );
+        return Ok(());
+    };
+
+    persist_terminal_subagent_fallback(
+        project_id,
+        thread_id,
+        effective_model,
+        mode,
+        initial_prompt,
+        fallback,
+        shared,
+    )
+    .await;
+    Ok(())
+}
+
+async fn persist_terminal_subagent_fallback(
+    project_id: ProjectId,
+    thread_id: ThreadId,
+    effective_model: ModelRef,
+    mode: Mode,
+    initial_prompt: Option<String>,
+    fallback: SubagentFallbackTranscript,
+    shared: Arc<RegistryShared>,
+) {
+    let prompt_text = initial_prompt.as_deref().and_then(trimmed_non_empty);
+    let ctx = FallbackTurnContext {
+        user_input: UserInput::text(prompt_text.unwrap_or("Sub-agent turn")),
+        model: effective_model,
+        mode,
+    };
+    let mut seen_turn_ids = persisted_turn_ids(&shared.store, project_id, thread_id).await;
+    persist_subagent_fallback_transcript(
+        thread_id,
+        project_id,
+        &ctx,
+        fallback,
+        &mut seen_turn_ids,
+        &shared,
+    )
+    .await;
+}
+
+async fn broadcast_event_with_context(
+    hub: &Arc<Hub>,
+    thread_id: ThreadId,
+    event: AgentEvent,
+    ctx: &TurnContext,
+) {
+    broadcast_event_with_user_input(hub, thread_id, event, live_turn_user_input(ctx)).await;
+}
+
+async fn broadcast_event_with_user_input(
+    hub: &Arc<Hub>,
+    thread_id: ThreadId,
+    event: AgentEvent,
+    user_input: Option<UserInput>,
+) {
+    let agent_event = match event {
+        AgentEvent::TurnStarted { thread, turn } => WireAgentEvent::TurnStarted {
+            thread,
+            turn,
+            user_input,
+        },
+        other => other.into(),
+    };
+    hub.broadcast(
+        thread_id,
+        ServerMessage::Event {
+            thread_id,
+            agent_event: Box::new(agent_event),
+        },
+    )
+    .await;
+}
+
+#[derive(Default)]
+struct SyntheticSubagentPrompt {
+    item_id: Option<ItemId>,
+    text: Option<String>,
+}
+
+async fn synthesize_passive_subagent_prompt_item(
+    thread_id: ThreadId,
+    turn: TurnId,
+    ctx: &TurnContext,
+    current_turn_items: &mut CurrentTurnItems,
+    prompt: &mut SyntheticSubagentPrompt,
+    hub: &Arc<Hub>,
+    live_buffers: &Arc<LiveBufferStore>,
+) {
+    let Some(text) = passive_subagent_prompt_text(ctx) else {
+        return;
+    };
+    if prompt.text.as_deref() == Some(text.as_str()) {
+        return;
+    }
+    let item_id = *prompt.item_id.get_or_insert_with(ItemId::new);
+    prompt.text = Some(text.clone());
+    let item = Item {
+        id: item_id,
+        harness_item_id: format!("subagent_prompt:{turn}"),
+        payload: ItemPayload::UserMessage { text },
+        created_at: Utc::now(),
+    };
+    current_turn_items.upsert_first(&item);
+    let event = AgentEvent::ItemCompleted {
+        thread: thread_id,
+        turn,
+        item,
+    };
+    if live_buffers.is_active(thread_id).await {
+        live_buffers.append(thread_id, event.clone()).await;
+    }
+    broadcast_event_with_context(hub, thread_id, event, ctx).await;
+}
+
+enum PassivePreTurnOutcome {
+    Event(Box<Result<AgentEvent, tokio::sync::broadcast::error::RecvError>>),
+    EvidenceAdopted,
+    Stop(PassivePreTurnStop),
+}
+
+enum PassivePreTurnStop {
+    Cancelled,
+    Terminal,
+    TimedOut { timeout: Option<Duration> },
+}
+
+async fn passive_pre_turn_recv(
+    stream: &mut giskard_harness::AgentEventStream,
+    lifecycle_notify: Option<&Arc<Notify>>,
+    thread_id: ThreadId,
+    ctx: &mut TurnContext,
+) -> PassivePreTurnOutcome {
+    let wait_for_event = async {
+        if let Some(notify) = lifecycle_notify {
+            tokio::select! {
+                biased;
+                result = stream.recv() => Some(result),
+                _ = notify.notified() => None,
+            }
+        } else {
+            Some(stream.recv().await)
+        }
+    };
+    let wait_result = if let Some(pre_turn_timeout) = ctx.passive_pre_turn_timeout {
+        timeout(pre_turn_timeout, wait_for_event).await.ok()
+    } else {
+        Some(wait_for_event.await)
+    };
+
+    match wait_result {
+        Some(Some(result)) => PassivePreTurnOutcome::Event(Box::new(result)),
+        Some(None) => match refresh_passive_subagent_context(thread_id, ctx).await {
+            PassiveMonitorSignal::Continue => PassivePreTurnOutcome::EvidenceAdopted,
+            PassiveMonitorSignal::Cancelled => {
+                PassivePreTurnOutcome::Stop(PassivePreTurnStop::Cancelled)
+            }
+            PassiveMonitorSignal::Terminal => {
+                PassivePreTurnOutcome::Stop(PassivePreTurnStop::Terminal)
+            }
+        },
+        None => {
+            let elapsed_timeout = ctx.passive_pre_turn_timeout;
+            match refresh_passive_subagent_context(thread_id, ctx).await {
+                PassiveMonitorSignal::Cancelled => {
+                    PassivePreTurnOutcome::Stop(PassivePreTurnStop::Cancelled)
+                }
+                PassiveMonitorSignal::Terminal => {
+                    PassivePreTurnOutcome::Stop(PassivePreTurnStop::Terminal)
+                }
+                PassiveMonitorSignal::Continue => {
+                    PassivePreTurnOutcome::Stop(PassivePreTurnStop::TimedOut {
+                        timeout: elapsed_timeout,
+                    })
+                }
+            }
+        }
+    }
+}
+
 async fn forward_events(
+    shared: Arc<RegistryShared>,
     thread_id: ThreadId,
     project_id: ProjectId,
     mut stream: giskard_harness::AgentEventStream,
-    hub: Arc<Hub>,
-    live_buffers: Arc<LiveBufferStore>,
-    running_commands: Arc<RunningTaskStore>,
-    store: Arc<PersistStore>,
-    approvals: ApprovalMap,
-    server_requests: ServerRequestMap,
-    ledger: LedgerHandle,
-    ctx: TurnContext,
+    mut ctx: TurnContext,
     mut turn_gate: Option<ThreadTurnLease>,
 ) {
+    let hub = shared.hub.clone();
+    let live_buffers = shared.live_buffers.clone();
+    let running_commands = shared.running_commands.clone();
+    let store = shared.store.clone();
+    let approvals = shared.approvals.clone();
+    let server_requests = shared.server_requests.clone();
     let mut turn_id: Option<TurnId> = None;
     let mut owned_turn: Option<TurnId> = None;
     let mut owned_turn_completed = false;
@@ -908,9 +2451,22 @@ async fn forward_events(
     let mut seen_turn_ids = persisted_turn_ids(&store, project_id, thread_id).await;
     let mut seen_notices = HashSet::new();
     let mut item_ids_by_harness: HashMap<(TurnId, String), ItemId> = HashMap::new();
+    let mut synthetic_subagent_prompt = SyntheticSubagentPrompt::default();
     let forwarder_started = Instant::now();
     let mut saw_context_compaction_marker = false;
     let mut stream_error: Option<String> = None;
+    let passive_lifecycle_notify = if ctx.kind == TurnContextKind::PassiveSubagent {
+        match ctx.passive_subagent_metadata.as_ref() {
+            Some(metadata) => metadata
+                .lock()
+                .await
+                .get(&thread_id)
+                .map(|entry| entry.lifecycle_notify.clone()),
+            None => None,
+        }
+    } else {
+        None
+    };
     debug!(
         %project_id,
         %thread_id,
@@ -924,8 +2480,98 @@ async fn forward_events(
     );
 
     let exit_reason = loop {
-        match stream.recv().await {
+        let recv_result = if ctx.kind == TurnContextKind::PassiveSubagent
+            && owned_turn.is_none()
+            && turn_id.is_none()
+        {
+            match passive_pre_turn_recv(
+                &mut stream,
+                passive_lifecycle_notify.as_ref(),
+                thread_id,
+                &mut ctx,
+            )
+            .await
+            {
+                PassivePreTurnOutcome::Event(result) => *result,
+                PassivePreTurnOutcome::EvidenceAdopted => {
+                    debug!(
+                        %project_id,
+                        %thread_id,
+                        timeout_ms = ?ctx.passive_pre_turn_timeout.map(|value| value.as_millis()),
+                        "passive subagent monitor adopted active lifecycle evidence"
+                    );
+                    continue;
+                }
+                PassivePreTurnOutcome::Stop(stop) => {
+                    if !matches!(stop, PassivePreTurnStop::Cancelled)
+                        && let Some(fallback) = ctx.subagent_fallback.clone()
+                    {
+                        let fallback_ctx = FallbackTurnContext::from(&ctx);
+                        persist_subagent_fallback_transcript(
+                            thread_id,
+                            project_id,
+                            &fallback_ctx,
+                            fallback,
+                            &mut seen_turn_ids,
+                            &shared,
+                        )
+                        .await;
+                    }
+                    match stop {
+                        PassivePreTurnStop::Cancelled => info!(
+                            %project_id,
+                            %thread_id,
+                            elapsed_ms = forwarder_started.elapsed().as_millis(),
+                            "passive subagent monitor cancelled before observing a turn"
+                        ),
+                        PassivePreTurnStop::Terminal => info!(
+                            %project_id,
+                            %thread_id,
+                            elapsed_ms = forwarder_started.elapsed().as_millis(),
+                            "passive subagent monitor stopped after terminal observation before a turn"
+                        ),
+                        PassivePreTurnStop::TimedOut { timeout } => info!(
+                            %project_id,
+                            %thread_id,
+                            timeout_ms = timeout.map(|value| value.as_millis()).unwrap_or_default(),
+                            elapsed_ms = forwarder_started.elapsed().as_millis(),
+                            "passive subagent monitor timed out before observing a turn"
+                        ),
+                    }
+                    break ForwarderExitReason::StreamEndedWithoutTurn;
+                }
+            }
+        } else {
+            stream.recv().await
+        };
+        match recv_result {
             Ok(event) => {
+                if ctx.kind == TurnContextKind::PassiveSubagent
+                    && turn_gate.is_none()
+                    && event_turn_id(&event).is_none()
+                    && shared.turn_gate.is_active(thread_id)
+                {
+                    warn!(
+                        %project_id,
+                        %thread_id,
+                        event_kind = event_kind(&event),
+                        "passive sub-agent forwarder yielded turnless event to an active forwarder"
+                    );
+                    break ForwarderExitReason::DuplicateForwarder;
+                }
+                if ctx.kind == TurnContextKind::PassiveSubagent
+                    && owned_turn.is_none()
+                    && turn_id.is_none()
+                    && refresh_passive_subagent_context(thread_id, &mut ctx).await
+                        == PassiveMonitorSignal::Cancelled
+                {
+                    info!(
+                        %project_id,
+                        %thread_id,
+                        "passive subagent monitor cancelled before processing a queued event"
+                    );
+                    break ForwarderExitReason::StreamEndedWithoutTurn;
+                }
                 let event_thread = event_thread_id(&event);
                 if event_thread != thread_id {
                     error!(
@@ -946,6 +2592,57 @@ async fn forward_events(
                         "skipping duplicate harness notice"
                     );
                     continue;
+                }
+
+                if ctx.kind == TurnContextKind::PassiveSubagent
+                    && turn_gate.is_none()
+                    && let Some(passive_turn) = event_turn_id(&event)
+                    && !seen_turn_ids.contains(&passive_turn)
+                {
+                    let handle = shared
+                        .threads
+                        .lock()
+                        .await
+                        .get(&thread_id)
+                        .map(|binding| binding.handle.clone());
+                    let Some(handle) = handle else {
+                        error!(
+                            %project_id,
+                            %thread_id,
+                            %passive_turn,
+                            "passive sub-agent forwarder lost its thread binding"
+                        );
+                        break ForwarderExitReason::DuplicateForwarder;
+                    };
+                    match shared
+                        .turn_gate
+                        .reserve(thread_id, ActiveTurnOwner::new(project_id, &handle, &ctx))
+                    {
+                        Ok(mut lease) => {
+                            lease.acknowledge_turn(passive_turn);
+                            turn_gate = Some(lease);
+                        }
+                        Err(HarnessError::ThreadBusy { .. }) => {
+                            warn!(
+                                %project_id,
+                                %thread_id,
+                                %passive_turn,
+                                event_kind = event_kind(&event),
+                                "passive subscriber yielded to the existing turn forwarder"
+                            );
+                            break ForwarderExitReason::DuplicateForwarder;
+                        }
+                        Err(error) => {
+                            error!(
+                                %project_id,
+                                %thread_id,
+                                %passive_turn,
+                                %error,
+                                "passive subscriber could not reserve turn ownership"
+                            );
+                            break ForwarderExitReason::DuplicateForwarder;
+                        }
+                    }
                 }
 
                 if let Some((event_turn, harness_item_id, existing_item_id, conflicting_item_id)) =
@@ -1081,6 +2778,24 @@ async fn forward_events(
                     continue;
                 }
 
+                if ctx.kind == TurnContextKind::PassiveSubagent {
+                    refresh_passive_subagent_context(thread_id, &mut ctx).await;
+                    if let Some(turn) = event_turn {
+                        if !matches!(event, AgentEvent::TurnStarted { .. }) {
+                            synthesize_passive_subagent_prompt_item(
+                                thread_id,
+                                turn,
+                                &ctx,
+                                &mut current_turn_items,
+                                &mut synthetic_subagent_prompt,
+                                &hub,
+                                &live_buffers,
+                            )
+                            .await;
+                        }
+                    }
+                }
+
                 let command_state_changed =
                     apply_running_command_event(&running_commands, &event).await;
 
@@ -1133,7 +2848,39 @@ async fn forward_events(
                             );
                         }
                     }
+                    AgentEvent::ItemStarted { item, turn, .. } => {
+                        if let Some(info) = subagent_start_info(item) {
+                            enqueue_subagent_materialization(
+                                thread_id,
+                                SubagentMaterializationJob {
+                                    project_id,
+                                    spawned_by_turn_id: *turn,
+                                    item_id: item.id,
+                                    origin: "item_started",
+                                    info,
+                                    result: None,
+                                },
+                                shared.clone(),
+                            )
+                            .await;
+                        }
+                    }
                     AgentEvent::ItemCompleted { item, turn, .. } => {
+                        if let Some(info) = subagent_activity_info(item) {
+                            enqueue_subagent_materialization(
+                                thread_id,
+                                SubagentMaterializationJob {
+                                    project_id,
+                                    spawned_by_turn_id: *turn,
+                                    item_id: item.id,
+                                    origin: "item_completed",
+                                    info,
+                                    result: None,
+                                },
+                                shared.clone(),
+                            )
+                            .await;
+                        }
                         if ctx.kind == TurnContextKind::ManualCompaction
                             && is_context_compaction_item(item)
                         {
@@ -1206,10 +2953,48 @@ async fn forward_events(
                     _ => None,
                 };
 
-                if is_turn_start {
-                    live_buffers.start_turn(thread_id).await;
+                // A harness may deliver an item for an unseen turn before TurnStarted. Start the
+                // reconnect buffer from the first turn-scoped event and reuse it when the delayed
+                // start arrives, otherwise a reload in that window loses the already-visible item.
+                let mut append_to_live_buffer = true;
+                if let Some(buffer_turn) = event_turn {
+                    if let Err(existing_turn) = live_buffers
+                        .ensure_turn_with_user_input(
+                            thread_id,
+                            buffer_turn,
+                            live_turn_user_input(&ctx),
+                        )
+                        .await
+                    {
+                        if matches!(event, AgentEvent::TurnStarted { .. }) {
+                            warn!(
+                                %project_id,
+                                %thread_id,
+                                %buffer_turn,
+                                %existing_turn,
+                                "replacing a stale live buffer when a new turn started"
+                            );
+                            live_buffers
+                                .replace_turn_with_user_input(
+                                    thread_id,
+                                    buffer_turn,
+                                    live_turn_user_input(&ctx),
+                                )
+                                .await;
+                        } else {
+                            error!(
+                                %project_id,
+                                %thread_id,
+                                %buffer_turn,
+                                %existing_turn,
+                                event_kind = event_kind(&event),
+                                "not buffering an event for a different turn; live delivery and persistence continue"
+                            );
+                            append_to_live_buffer = false;
+                        }
+                    }
                 }
-                if live_buffers.is_active(thread_id).await {
+                if append_to_live_buffer && live_buffers.is_active(thread_id).await {
                     live_buffers.append(thread_id, event.clone()).await;
                 }
 
@@ -1250,10 +3035,7 @@ async fn forward_events(
                         started_at,
                         turn_id,
                         &mut seen_turn_ids,
-                        &store,
-                        &hub,
-                        &ledger,
-                        &live_buffers,
+                        &shared,
                         turn_gate.as_mut(),
                     )
                     .await;
@@ -1277,7 +3059,22 @@ async fn forward_events(
                 }
 
                 broadcast_thread_activity(&hub, thread_id, &event, true).await;
-                hub.broadcast_event(thread_id, event).await;
+                broadcast_event_with_context(&hub, thread_id, event, &ctx).await;
+
+                if is_turn_start {
+                    if let Some(turn) = event_turn {
+                        synthesize_passive_subagent_prompt_item(
+                            thread_id,
+                            turn,
+                            &ctx,
+                            &mut current_turn_items,
+                            &mut synthetic_subagent_prompt,
+                            &hub,
+                            &live_buffers,
+                        )
+                        .await;
+                    }
+                }
 
                 if command_state_changed {
                     broadcast_running_commands(&hub, &running_commands, thread_id).await;
@@ -1320,10 +3117,7 @@ async fn forward_events(
                         started_at,
                         turn_id,
                         &mut seen_turn_ids,
-                        &store,
-                        &hub,
-                        &ledger,
-                        &live_buffers,
+                        &shared,
                         turn_gate.as_mut(),
                     )
                     .await;
@@ -1414,10 +3208,7 @@ async fn forward_events(
                         started_at,
                         turn_id,
                         &mut seen_turn_ids,
-                        &store,
-                        &hub,
-                        &ledger,
-                        &live_buffers,
+                        &shared,
                         turn_gate.as_mut(),
                     )
                     .await;
@@ -1470,6 +3261,107 @@ async fn forward_events(
     }
 }
 
+async fn persist_subagent_fallback_transcript(
+    thread_id: ThreadId,
+    project_id: ProjectId,
+    ctx: &FallbackTurnContext,
+    fallback: SubagentFallbackTranscript,
+    seen_turn_ids: &mut HashSet<TurnId>,
+    shared: &RegistryShared,
+) {
+    if !seen_turn_ids.is_empty() {
+        debug!(
+            %project_id,
+            %thread_id,
+            persisted_turn_count = seen_turn_ids.len(),
+            "skipping sub-agent fallback transcript because history already exists"
+        );
+        return;
+    }
+
+    let turn_id = TurnId::new();
+    let item = Item {
+        id: ItemId::new(),
+        harness_item_id: format!("subagent_fallback:{turn_id}"),
+        payload: ItemPayload::AgentMessage {
+            text: fallback.message,
+        },
+        created_at: Utc::now(),
+    };
+    let status = TurnStatus {
+        kind: subagent_status_turn_kind(fallback.status),
+        message: None,
+    };
+    let started_at = Utc::now();
+    let turn = Turn {
+        id: turn_id,
+        user_input: ctx.user_input.clone(),
+        items: vec![item.clone()],
+        model: ctx.model.clone(),
+        mode: ctx.mode,
+        status: status.clone(),
+        usage: giskard_core::token::TokenUsage::default(),
+        diffs: Vec::new(),
+        started_at,
+        completed_at: Some(Utc::now()),
+    };
+    let outcome = persist_turn(
+        &shared.store,
+        &shared.hub,
+        &shared.ledger,
+        project_id,
+        thread_id,
+        turn,
+    )
+    .await;
+    if !outcome.history_appended {
+        return;
+    }
+    seen_turn_ids.insert(turn_id);
+
+    for event in [
+        AgentEvent::TurnStarted {
+            thread: thread_id,
+            turn: turn_id,
+        },
+        AgentEvent::ItemCompleted {
+            thread: thread_id,
+            turn: turn_id,
+            item,
+        },
+        AgentEvent::TurnCompleted {
+            thread: thread_id,
+            turn: turn_id,
+            usage: giskard_core::token::TokenUsage::default(),
+            status,
+        },
+    ] {
+        broadcast_event_with_user_input(
+            &shared.hub,
+            thread_id,
+            event,
+            Some(ctx.user_input.clone()),
+        )
+        .await;
+    }
+    info!(
+        %project_id,
+        %thread_id,
+        turn = %turn_id,
+        "persisted fallback transcript for completed sub-agent"
+    );
+}
+
+fn subagent_status_turn_kind(status: SubagentStatus) -> TurnStatusKind {
+    match status {
+        SubagentStatus::Interrupted | SubagentStatus::Shutdown => TurnStatusKind::Interrupted,
+        SubagentStatus::Failed | SubagentStatus::NotFound => TurnStatusKind::Failed,
+        SubagentStatus::Pending | SubagentStatus::Running | SubagentStatus::Completed => {
+            TurnStatusKind::Completed
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn complete_forwarded_turn(
     thread_id: ThreadId,
@@ -1483,10 +3375,7 @@ async fn complete_forwarded_turn(
     started_at: chrono::DateTime<Utc>,
     turn_id: Option<TurnId>,
     seen_turn_ids: &mut HashSet<TurnId>,
-    store: &Arc<PersistStore>,
-    hub: &Arc<Hub>,
-    ledger: &LedgerHandle,
-    live_buffers: &Arc<LiveBufferStore>,
+    shared: &RegistryShared,
     turn_gate: Option<&mut ThreadTurnLease>,
 ) -> TurnId {
     let tid = turn_id.unwrap_or(completed_turn);
@@ -1519,7 +3408,15 @@ async fn complete_forwarded_turn(
         started_at,
         completed_at: Some(Utc::now()),
     };
-    let persist_outcome = persist_turn(store, hub, ledger, project_id, thread_id, turn).await;
+    let persist_outcome = persist_turn(
+        &shared.store,
+        &shared.hub,
+        &shared.ledger,
+        project_id,
+        thread_id,
+        turn,
+    )
+    .await;
     if ctx.kind == TurnContextKind::ManualCompaction {
         info!(
             %project_id,
@@ -1532,7 +3429,7 @@ async fn complete_forwarded_turn(
             "context compaction persistence path finished"
         );
     }
-    live_buffers.clear_turn(thread_id).await;
+    shared.live_buffers.clear_turn(thread_id).await;
     if let Some(turn_gate) = turn_gate {
         turn_gate.release();
     }
@@ -1957,6 +3854,12 @@ impl CurrentTurnItems {
         false
     }
 
+    fn upsert_first(&mut self, item: &Item) {
+        self.items.retain(|existing| existing.id != item.id);
+        self.items.insert(0, item.clone());
+        self.rebuild_indexes();
+    }
+
     fn append_indexed(&mut self, item: &Item) {
         let idx = self.items.len();
         self.items.push(item.clone());
@@ -2186,6 +4089,7 @@ async fn persist_turn(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     use chrono::Utc;
@@ -2193,7 +4097,10 @@ mod tests {
     use giskard_core::error::HarnessError;
     use giskard_core::event::AgentEvent;
     use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
-    use giskard_core::item::{CommandExecutionStart, Item, ItemKind, ItemPayload, ItemStart};
+    use giskard_core::item::{
+        CommandExecutionStart, Item, ItemKind, ItemPayload, ItemStart, SubagentAction,
+        SubagentStatus,
+    };
     use giskard_core::model::ModelRef;
     use giskard_core::server_request::ServerRequest;
     use giskard_core::token::{TokenLedger, TokenUsage};
@@ -2201,7 +4108,7 @@ mod tests {
     use giskard_core::user_input::UserInput;
     use giskard_harness::{AgentEventStream, ThreadHandle};
     use giskard_persist::PersistStore;
-    use giskard_persist::store::ThreadFile;
+    use giskard_persist::store::{ProjectConfig, ThreadFile};
     use giskard_proto::{ServerMessage, ThreadActivityKind, WireAgentEvent};
     use tokio::sync::{Mutex, broadcast, mpsc};
     use tokio::task::JoinHandle;
@@ -2209,12 +4116,29 @@ mod tests {
     use super::{
         ActiveTurnOwner, CurrentTurnItems, ThreadTurnGate, TurnContext, TurnContextKind,
         command_completion_is_normal_success, command_status_is_running, forward_events,
-        thread_activity_from_event, track_item_identity,
+        passive_subagent_prompt_text, persist_subagent_fallback_transcript,
+        should_refresh_subagent_title, subagent_monitor_policy,
+        take_passive_subagent_monitor_metadata, thread_activity_from_event, track_item_identity,
+        update_passive_subagent_metadata,
     };
     use crate::hub::Hub;
     use crate::ledger;
     use crate::live_buffer::LiveBufferStore;
     use crate::running_commands::RunningTaskStore;
+
+    struct UnusedHarnessFactory;
+
+    #[async_trait::async_trait]
+    impl super::HarnessFactory for UnusedHarnessFactory {
+        async fn create(
+            &self,
+            _config: &ProjectConfig,
+        ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
+            Err(HarnessError::Protocol(
+                "unused test harness factory was called".into(),
+            ))
+        }
+    }
 
     #[test]
     fn command_completion_success_requires_success_status_and_zero_exit() {
@@ -2228,6 +4152,325 @@ mod tests {
         ));
         assert!(!command_completion_is_normal_success("failed", Some(0)));
         assert!(!command_completion_is_normal_success("interrupted", None));
+    }
+
+    #[test]
+    fn active_subagent_monitor_uses_a_long_pre_turn_idle_timeout() {
+        for action in [
+            SubagentAction::Spawned,
+            SubagentAction::Started,
+            SubagentAction::Interacted,
+        ] {
+            let policy = subagent_monitor_policy(Some(action), None);
+            assert!(policy.should_monitor);
+            assert!(policy.active_observed);
+            assert_eq!(
+                policy.pre_turn_timeout,
+                Some(super::ACTIVE_SUBAGENT_PRE_TURN_IDLE_TIMEOUT)
+            );
+        }
+        assert!(
+            subagent_monitor_policy(Some(SubagentAction::Spawned), Some(SubagentStatus::Pending))
+                .should_monitor
+        );
+        assert!(
+            subagent_monitor_policy(Some(SubagentAction::Spawned), Some(SubagentStatus::Running))
+                .should_monitor
+        );
+
+        let ignored = subagent_monitor_policy(None, None);
+        assert!(!ignored.should_monitor);
+
+        let interrupted = subagent_monitor_policy(Some(SubagentAction::Interrupted), None);
+        assert!(!interrupted.should_monitor);
+        assert!(interrupted.terminal_observed);
+        for status in [
+            SubagentStatus::Completed,
+            SubagentStatus::Interrupted,
+            SubagentStatus::Failed,
+            SubagentStatus::Shutdown,
+            SubagentStatus::NotFound,
+        ] {
+            let policy = subagent_monitor_policy(Some(SubagentAction::Started), Some(status));
+            assert!(!policy.should_monitor);
+            assert!(policy.terminal_observed);
+        }
+    }
+
+    #[test]
+    fn real_prompt_equal_to_fallback_copy_is_not_suppressed() {
+        let mut ctx = TurnContext {
+            user_input: UserInput::text("Sub-agent turn"),
+            model: ModelRef {
+                provider: "openai".into(),
+                model: "gpt-5.6-sol".into(),
+                reasoning_effort: None,
+            },
+            mode: Mode::Build,
+            kind: TurnContextKind::PassiveSubagent,
+            passive_input_is_fallback: false,
+            subagent_fallback: None,
+            passive_subagent_metadata: None,
+            passive_pre_turn_timeout: None,
+        };
+        assert_eq!(
+            passive_subagent_prompt_text(&ctx).as_deref(),
+            Some("Sub-agent turn")
+        );
+
+        ctx.passive_input_is_fallback = true;
+        assert_eq!(passive_subagent_prompt_text(&ctx), None);
+    }
+
+    #[tokio::test]
+    async fn passive_monitor_releases_after_pre_turn_idle_timeout() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.6-sol".into(),
+            reasoning_effort: None,
+        };
+        store
+            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .await
+            .unwrap();
+        let (tx, _) = broadcast::channel(8);
+        let hub = Arc::new(Hub::new());
+        let live_buffers = Arc::new(LiveBufferStore::new());
+        let running_commands = Arc::new(RunningTaskStore::new());
+        let ledger = ledger::spawn(store.clone());
+        let shared = Arc::new(super::RegistryShared::new(
+            hub,
+            live_buffers,
+            running_commands,
+            store,
+            ledger,
+        ));
+        let ctx = TurnContext {
+            user_input: UserInput::text("Sub-agent turn"),
+            model,
+            mode: Mode::Build,
+            kind: TurnContextKind::PassiveSubagent,
+            passive_input_is_fallback: true,
+            subagent_fallback: None,
+            passive_subagent_metadata: None,
+            passive_pre_turn_timeout: Some(tokio::time::Duration::from_millis(20)),
+        };
+
+        let forwarder = tokio::spawn(forward_events(
+            shared,
+            thread_id,
+            project_id,
+            AgentEventStream::new(tx.subscribe()),
+            ctx,
+            None,
+        ));
+
+        tokio::time::timeout(tokio::time::Duration::from_secs(1), forwarder)
+            .await
+            .expect("idle passive monitor should honor its pre-turn timeout")
+            .unwrap();
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn monitor_stop_waits_for_post_forwarder_cleanup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let registry = Arc::new(super::HarnessRegistry::new(
+            Arc::new(UnusedHarnessFactory),
+            Arc::new(Hub::new()),
+            Arc::new(LiveBufferStore::new()),
+            Arc::new(RunningTaskStore::new()),
+            store.clone(),
+            ledger::spawn(store),
+        ));
+        let thread_id = ThreadId::new();
+        registry
+            .shared
+            .passive_monitor_tasks
+            .register(thread_id)
+            .await;
+
+        let stopping = {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.stop_passive_subagent_monitor(thread_id).await })
+        };
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        assert!(
+            !stopping.is_finished(),
+            "monitor stop returned before cleanup completed"
+        );
+
+        super::finish_passive_subagent_monitor_task(
+            &registry.shared.passive_monitor_tasks,
+            thread_id,
+        )
+        .await;
+        tokio::time::timeout(tokio::time::Duration::from_secs(1), stopping)
+            .await
+            .expect("monitor stop should finish after cleanup")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn generated_subagent_title_refresh_is_idempotent() {
+        assert!(!should_refresh_subagent_title(
+            "Sub-agent: Linnaeus",
+            "Sub-agent: Linnaeus"
+        ));
+        assert!(should_refresh_subagent_title(
+            "Sub-agent: server_lifecycle_audit",
+            "Sub-agent: Linnaeus"
+        ));
+        assert!(!should_refresh_subagent_title(
+            "My reviewer",
+            "Sub-agent: Linnaeus"
+        ));
+    }
+
+    #[tokio::test]
+    async fn monitor_teardown_claims_late_terminal_fallback() {
+        let thread_id = ThreadId::new();
+        let passive_monitors = Arc::new(Mutex::new(HashSet::from([thread_id])));
+        let passive_subagent_metadata = Arc::new(Mutex::new(Default::default()));
+        let fallback = super::SubagentFallbackTranscript {
+            message: "late terminal result".into(),
+            status: SubagentStatus::Completed,
+        };
+
+        update_passive_subagent_metadata(
+            &passive_subagent_metadata,
+            thread_id,
+            Some("late prompt".into()),
+            Some(fallback),
+            super::LifecycleSignal::Terminal,
+        )
+        .await;
+
+        let claimed = take_passive_subagent_monitor_metadata(
+            &passive_monitors,
+            &passive_subagent_metadata,
+            thread_id,
+        )
+        .await
+        .expect("teardown should claim monitor metadata");
+        assert_eq!(claimed.initial_prompt.as_deref(), Some("late prompt"));
+        assert_eq!(
+            claimed
+                .fallback
+                .as_ref()
+                .map(|value| value.message.as_str()),
+            Some("late terminal result")
+        );
+        assert!(!passive_monitors.lock().await.contains(&thread_id));
+        assert!(
+            !passive_subagent_metadata
+                .lock()
+                .await
+                .contains_key(&thread_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_fallback_transcript_persists_when_history_is_empty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.6-sol".into(),
+            reasoning_effort: None,
+        };
+        store
+            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .await
+            .unwrap();
+        let now = Utc::now();
+        store
+            .save_thread(
+                project_id,
+                &ThreadFile {
+                    version: 1,
+                    id: thread_id,
+                    project_id,
+                    title: "Sub-agent".into(),
+                    harness_thread_id: "native-child".into(),
+                    parent_thread_id: Some(ThreadId::new()),
+                    spawned_by_turn_id: Some(TurnId::new()),
+                    kind: giskard_core::ThreadKind::Subagent,
+                    mode: Mode::Build,
+                    current_model: model.clone(),
+                    context_window: 128_000,
+                    model_context_windows: Default::default(),
+                    approval_policy: ApprovalPolicy::Ask,
+                    model_efforts: Default::default(),
+                    tokens: TokenLedger::default(),
+                    created_at: now,
+                    updated_at: now,
+                    archived: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let hub = Arc::new(Hub::new());
+        let (client_tx, mut client_rx) = mpsc::channel(8);
+        hub.subscribe(thread_id, 1, client_tx).await;
+        let shared = Arc::new(super::RegistryShared::new(
+            hub,
+            Arc::new(LiveBufferStore::new()),
+            Arc::new(RunningTaskStore::new()),
+            store.clone(),
+            ledger::spawn(store.clone()),
+        ));
+        let ctx = super::FallbackTurnContext {
+            user_input: UserInput::text("Sub-agent turn"),
+            model,
+            mode: Mode::Build,
+        };
+        let mut seen_turn_ids = HashSet::new();
+
+        persist_subagent_fallback_transcript(
+            thread_id,
+            project_id,
+            &ctx,
+            super::SubagentFallbackTranscript {
+                message: "Completed child work".into(),
+                status: SubagentStatus::Completed,
+            },
+            &mut seen_turn_ids,
+            &shared,
+        )
+        .await;
+
+        let turns = store.load_all_turns(project_id, thread_id).await.unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user_input.as_text(), Some("Sub-agent turn"));
+        assert!(matches!(
+            &turns[0].items[0].payload,
+            ItemPayload::AgentMessage { text } if text == "Completed child work"
+        ));
+        assert_eq!(turns[0].status.kind, TurnStatusKind::Completed);
+
+        let mut saw_item = false;
+        while let Ok(message) = client_rx.try_recv() {
+            if let ServerMessage::Event { agent_event, .. } = message {
+                if let WireAgentEvent::ItemCompleted { item, .. } = *agent_event {
+                    saw_item = matches!(
+                        item.payload,
+                        giskard_proto::WireItemPayload::AgentMessage { ref text }
+                            if text == "Completed child work"
+                    );
+                }
+            }
+        }
+        assert!(saw_item, "fallback transcript should be broadcast live");
     }
 
     #[test]
@@ -2546,6 +4789,9 @@ mod tests {
                     project_id,
                     title: "t".into(),
                     harness_thread_id: "th".into(),
+                    parent_thread_id: None,
+                    spawned_by_turn_id: None,
+                    kind: giskard_core::ThreadKind::Primary,
                     mode: Mode::Build,
                     current_model: model.clone(),
                     context_window: 128_000,
@@ -2625,13 +4871,8 @@ mod tests {
         );
         while let Ok(message) = client_rx.try_recv() {
             assert!(
-                !matches!(
-                    message,
-                    ServerMessage::Event {
-                        agent_event: WireAgentEvent::ContextWindowUpdated { .. },
-                        ..
-                    }
-                ),
+                !matches!(message, ServerMessage::Event { agent_event, .. }
+                    if matches!(agent_event.as_ref(), WireAgentEvent::ContextWindowUpdated { .. })),
                 "a mismatched turn model must not be broadcast"
             );
         }
@@ -2663,6 +4904,9 @@ mod tests {
                     project_id,
                     title: "t".into(),
                     harness_thread_id: "th".into(),
+                    parent_thread_id: None,
+                    spawned_by_turn_id: None,
+                    kind: giskard_core::ThreadKind::Primary,
                     mode: Mode::Build,
                     current_model: model.clone(),
                     context_window: 128_000,
@@ -2742,22 +4986,20 @@ mod tests {
 
         let mut matching_updates = 0;
         while let Ok(message) = client_rx.try_recv() {
-            if let ServerMessage::Event {
-                agent_event:
-                    WireAgentEvent::ContextWindowUpdated {
-                        thread,
-                        turn,
-                        model: event_model,
-                        context_window,
-                    },
-                ..
-            } = message
-            {
-                matching_updates += 1;
-                assert_eq!(thread, thread_id);
-                assert_eq!(turn, turn_id);
-                assert_eq!(event_model, model);
-                assert_eq!(context_window, 258_400);
+            if let ServerMessage::Event { agent_event, .. } = message {
+                if let WireAgentEvent::ContextWindowUpdated {
+                    thread,
+                    turn,
+                    model: event_model,
+                    context_window,
+                } = *agent_event
+                {
+                    matching_updates += 1;
+                    assert_eq!(thread, thread_id);
+                    assert_eq!(turn, turn_id);
+                    assert_eq!(event_model, model);
+                    assert_eq!(context_window, 258_400);
+                }
             }
         }
         assert_eq!(
@@ -2792,6 +5034,9 @@ mod tests {
                     project_id,
                     title: "t".into(),
                     harness_thread_id: "th".into(),
+                    parent_thread_id: None,
+                    spawned_by_turn_id: None,
+                    kind: giskard_core::ThreadKind::Primary,
                     mode: Mode::Build,
                     current_model: model.clone(),
                     context_window: 128_000,
@@ -2912,6 +5157,9 @@ mod tests {
                     project_id,
                     title: "t".into(),
                     harness_thread_id: "th".into(),
+                    parent_thread_id: None,
+                    spawned_by_turn_id: None,
+                    kind: giskard_core::ThreadKind::Primary,
                     mode: Mode::Build,
                     current_model: model.clone(),
                     context_window: 128_000,
@@ -3062,6 +5310,9 @@ mod tests {
                     project_id,
                     title: "t".into(),
                     harness_thread_id: "th".into(),
+                    parent_thread_id: None,
+                    spawned_by_turn_id: None,
+                    kind: giskard_core::ThreadKind::Primary,
                     mode: Mode::Build,
                     current_model: model.clone(),
                     context_window: 128_000,
@@ -3183,6 +5434,9 @@ mod tests {
                     project_id,
                     title: "target".into(),
                     harness_thread_id: "th_target".into(),
+                    parent_thread_id: None,
+                    spawned_by_turn_id: None,
+                    kind: giskard_core::ThreadKind::Primary,
                     mode: Mode::Build,
                     current_model: model.clone(),
                     context_window: 128_000,
@@ -3312,6 +5566,9 @@ mod tests {
                     project_id,
                     title: "target".into(),
                     harness_thread_id: "th_target".into(),
+                    parent_thread_id: None,
+                    spawned_by_turn_id: None,
+                    kind: giskard_core::ThreadKind::Primary,
                     mode: Mode::Build,
                     current_model: model.clone(),
                     context_window: 128_000,
@@ -3407,6 +5664,9 @@ mod tests {
                     project_id,
                     title: "target".into(),
                     harness_thread_id: "th_target".into(),
+                    parent_thread_id: None,
+                    spawned_by_turn_id: None,
+                    kind: giskard_core::ThreadKind::Primary,
                     mode: Mode::Build,
                     current_model: model.clone(),
                     context_window: 128_000,
@@ -3572,6 +5832,9 @@ mod tests {
                     project_id,
                     title: "target".into(),
                     harness_thread_id: "th_target".into(),
+                    parent_thread_id: None,
+                    spawned_by_turn_id: None,
+                    kind: giskard_core::ThreadKind::Primary,
                     mode: Mode::Build,
                     current_model: model.clone(),
                     context_window: 128_000,
@@ -3632,14 +5895,14 @@ mod tests {
             .expect("broadcast")
             .expect("message");
         match received {
-            ServerMessage::Event {
-                agent_event: WireAgentEvent::ServerRequestReceived { turn, request, .. },
-                ..
-            } => {
-                assert!(turn.is_none());
-                assert_eq!(request.id, request_id);
-                assert_eq!(request.method, "mcpServer/elicitation/request");
-            }
+            ServerMessage::Event { agent_event, .. } => match *agent_event {
+                WireAgentEvent::ServerRequestReceived { turn, request, .. } => {
+                    assert!(turn.is_none());
+                    assert_eq!(request.id, request_id);
+                    assert_eq!(request.method, "mcpServer/elicitation/request");
+                }
+                other => panic!("expected turnless server request event, got {other:?}"),
+            },
             other => panic!("expected turnless server request event, got {other:?}"),
         }
 
@@ -3659,6 +5922,115 @@ mod tests {
             live_buffers.snapshot(thread_id).await.is_none(),
             "turnless request alone must not create target-thread live turn state"
         );
+    }
+
+    #[tokio::test]
+    async fn passive_forwarder_does_not_duplicate_turnless_event_owned_by_user_forwarder() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: None,
+        };
+        store
+            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .await
+            .unwrap();
+        let (tx, _) = broadcast::channel(16);
+        let user_stream = AgentEventStream::new(tx.subscribe());
+        let passive_stream = AgentEventStream::new(tx.subscribe());
+        let hub = Arc::new(Hub::new());
+        let (client_tx, mut client_rx) = mpsc::channel(16);
+        hub.subscribe(thread_id, 1, client_tx).await;
+        let shared = Arc::new(super::RegistryShared::new(
+            hub,
+            Arc::new(LiveBufferStore::new()),
+            Arc::new(RunningTaskStore::new()),
+            store.clone(),
+            ledger::spawn(store),
+        ));
+        let user_ctx = TurnContext {
+            user_input: UserInput::text("user turn"),
+            model: model.clone(),
+            mode: Mode::Build,
+            kind: TurnContextKind::User,
+            passive_input_is_fallback: false,
+            subagent_fallback: None,
+            passive_subagent_metadata: None,
+            passive_pre_turn_timeout: None,
+        };
+        let handle = ThreadHandle::detached(thread_id, "native-thread".into());
+        let lease = shared
+            .turn_gate
+            .reserve(
+                thread_id,
+                ActiveTurnOwner::new(project_id, &handle, &user_ctx),
+            )
+            .unwrap();
+        let user_forwarder = tokio::spawn(forward_events(
+            shared.clone(),
+            thread_id,
+            project_id,
+            user_stream,
+            user_ctx,
+            Some(lease),
+        ));
+
+        shared.passive_monitors.lock().await.insert(thread_id);
+        shared.passive_monitor_tasks.register(thread_id).await;
+        let passive_forwarder = tokio::spawn(forward_events(
+            shared.clone(),
+            thread_id,
+            project_id,
+            passive_stream,
+            TurnContext {
+                user_input: UserInput::text("Sub-agent turn"),
+                model,
+                mode: Mode::Build,
+                kind: TurnContextKind::PassiveSubagent,
+                passive_input_is_fallback: true,
+                subagent_fallback: None,
+                passive_subagent_metadata: Some(shared.passive_subagent_metadata.clone()),
+                passive_pre_turn_timeout: Some(tokio::time::Duration::from_secs(1)),
+            },
+            None,
+        ));
+
+        tx.send(AgentEvent::Notice {
+            thread: thread_id,
+            turn: None,
+            message: "one owner".into(),
+        })
+        .unwrap();
+
+        let first = tokio::time::timeout(tokio::time::Duration::from_secs(1), client_rx.recv())
+            .await
+            .expect("normal forwarder should broadcast the turnless notice")
+            .expect("subscriber should remain connected");
+        assert!(matches!(
+            first,
+            ServerMessage::Event { agent_event, .. }
+                if matches!(*agent_event, WireAgentEvent::Notice { .. })
+        ));
+        assert!(
+            tokio::time::timeout(tokio::time::Duration::from_millis(100), client_rx.recv())
+                .await
+                .is_err(),
+            "passive and user forwarders must not both broadcast the same turnless event"
+        );
+
+        drop(tx);
+        tokio::time::timeout(tokio::time::Duration::from_secs(1), passive_forwarder)
+            .await
+            .expect("passive duplicate forwarder should exit")
+            .unwrap();
+        tokio::time::timeout(tokio::time::Duration::from_secs(1), user_forwarder)
+            .await
+            .expect("user forwarder should exit after stream close")
+            .unwrap();
     }
 
     #[tokio::test]
@@ -3686,6 +6058,9 @@ mod tests {
                     project_id,
                     title: "t".into(),
                     harness_thread_id: "th".into(),
+                    parent_thread_id: None,
+                    spawned_by_turn_id: None,
+                    kind: giskard_core::ThreadKind::Primary,
                     mode: Mode::Build,
                     current_model: model.clone(),
                     context_window: 128_000,
@@ -3757,7 +6132,7 @@ mod tests {
         while tokio::time::Instant::now() < deadline && !completed {
             match tokio::time::timeout(tokio::time::Duration::from_secs(1), client_rx.recv()).await
             {
-                Ok(Some(ServerMessage::Event { agent_event, .. })) => match agent_event {
+                Ok(Some(ServerMessage::Event { agent_event, .. })) => match *agent_event {
                     WireAgentEvent::Notice { .. } => notice_count += 1,
                     WireAgentEvent::TurnCompleted { .. } => completed = true,
                     _ => {}
@@ -3796,6 +6171,9 @@ mod tests {
                     project_id,
                     title: "t".into(),
                     harness_thread_id: "th".into(),
+                    parent_thread_id: None,
+                    spawned_by_turn_id: None,
+                    kind: giskard_core::ThreadKind::Primary,
                     mode: Mode::Build,
                     current_model: model.clone(),
                     context_window: 128_000,
@@ -3826,6 +6204,10 @@ mod tests {
             model: model.clone(),
             mode: Mode::Build,
             kind: TurnContextKind::ManualCompaction,
+            passive_input_is_fallback: false,
+            subagent_fallback: None,
+            passive_subagent_metadata: None,
+            passive_pre_turn_timeout: None,
         };
         let gate = ThreadTurnGate::default();
         let handle = ThreadHandle {
@@ -3833,33 +6215,27 @@ mod tests {
             harness_thread_id: "native-test-thread".into(),
             resumed_model: None,
             warning: None,
+            agent_name: None,
+            parent_harness_thread_id: None,
         };
         let lease = gate
             .reserve(thread_id, ActiveTurnOwner::new(project_id, &handle, &ctx))
             .unwrap();
         let ctx_for_second_reserve = ctx.clone();
+        let mut shared = super::RegistryShared::new(
+            hub.clone(),
+            live_buffers.clone(),
+            running_commands.clone(),
+            store.clone(),
+            ledger,
+        );
+        shared.approvals = approvals;
+        shared.server_requests = server_requests;
+        let shared = Arc::new(shared);
 
         tokio::spawn({
-            let hub = hub.clone();
-            let live_buffers = live_buffers.clone();
-            let running_commands = running_commands.clone();
-            let store = store.clone();
             async move {
-                forward_events(
-                    thread_id,
-                    project_id,
-                    stream,
-                    hub,
-                    live_buffers,
-                    running_commands,
-                    store,
-                    approvals,
-                    server_requests,
-                    ledger,
-                    ctx,
-                    Some(lease),
-                )
-                .await;
+                forward_events(shared, thread_id, project_id, stream, ctx, Some(lease)).await;
             }
         });
 
@@ -3874,6 +6250,7 @@ mod tests {
                     title: "Context compacted".into(),
                     detail: None,
                     metadata: None,
+                    subagent: None,
                 },
                 created_at: Utc::now(),
             },
@@ -3886,7 +6263,7 @@ mod tests {
             match tokio::time::timeout(tokio::time::Duration::from_secs(1), client_rx.recv()).await
             {
                 Ok(Some(ServerMessage::Event { agent_event, .. })) => {
-                    if matches!(agent_event, WireAgentEvent::TurnCompleted { .. }) {
+                    if matches!(*agent_event, WireAgentEvent::TurnCompleted { .. }) {
                         completed = true;
                     }
                 }
@@ -3969,23 +6346,18 @@ mod tests {
             model,
             mode: Mode::Build,
             kind: TurnContextKind::User,
+            passive_input_is_fallback: false,
+            subagent_fallback: None,
+            passive_subagent_metadata: None,
+            passive_pre_turn_timeout: None,
         };
+        let mut shared =
+            super::RegistryShared::new(hub, live_buffers, running_commands, store, ledger);
+        shared.approvals = approvals;
+        shared.server_requests = server_requests;
+        let shared = Arc::new(shared);
         tokio::spawn(async move {
-            forward_events(
-                thread_id,
-                project_id,
-                stream,
-                hub,
-                live_buffers,
-                running_commands,
-                store,
-                approvals,
-                server_requests,
-                ledger,
-                ctx,
-                None,
-            )
-            .await;
+            forward_events(shared, thread_id, project_id, stream, ctx, None).await;
         })
     }
 
@@ -4058,6 +6430,9 @@ mod tests {
                     project_id,
                     title: "t".into(),
                     harness_thread_id: "th".into(),
+                    parent_thread_id: None,
+                    spawned_by_turn_id: None,
+                    kind: giskard_core::ThreadKind::Primary,
                     mode: Mode::Build,
                     current_model: model.clone(),
                     context_window: 128_000,
@@ -4217,15 +6592,13 @@ mod tests {
             "earlier turn item must remain untouched"
         );
         while let Ok(message) = client_rx.try_recv() {
-            if let ServerMessage::Event {
-                agent_event: WireAgentEvent::ItemCompleted { item, .. },
-                ..
-            } = message
-            {
-                assert_ne!(
-                    item.id, conflicting_item_id,
-                    "conflicting native identity must not be broadcast"
-                );
+            if let ServerMessage::Event { agent_event, .. } = message {
+                if let WireAgentEvent::ItemCompleted { item, .. } = *agent_event {
+                    assert_ne!(
+                        item.id, conflicting_item_id,
+                        "conflicting native identity must not be broadcast"
+                    );
+                }
             }
         }
     }
@@ -4255,6 +6628,9 @@ mod tests {
                     project_id,
                     title: "t".into(),
                     harness_thread_id: "th".into(),
+                    parent_thread_id: None,
+                    spawned_by_turn_id: None,
+                    kind: giskard_core::ThreadKind::Primary,
                     mode: Mode::Build,
                     current_model: model.clone(),
                     context_window: 128_000,
@@ -4394,7 +6770,7 @@ mod tests {
                 tokio::time::timeout(tokio::time::Duration::from_millis(100), client_rx.recv())
                     .await
             {
-                match agent_event {
+                match *agent_event {
                     WireAgentEvent::ItemStarted { item, .. }
                         if item.harness_item_id == reused_harness =>
                     {
@@ -4460,6 +6836,9 @@ mod tests {
                     project_id,
                     title: "t".into(),
                     harness_thread_id: "th".into(),
+                    parent_thread_id: None,
+                    spawned_by_turn_id: None,
+                    kind: giskard_core::ThreadKind::Primary,
                     mode: Mode::Build,
                     current_model: model.clone(),
                     context_window: 128_000,
@@ -4569,17 +6948,17 @@ mod tests {
         let mut delta_texts = Vec::new();
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
         while tokio::time::Instant::now() < deadline {
-            if let Ok(Some(ServerMessage::Event {
-                agent_event:
-                    WireAgentEvent::ItemDelta {
-                        delta: giskard_proto::ItemDelta::Text { text },
-                        ..
-                    },
-                ..
-            })) = tokio::time::timeout(tokio::time::Duration::from_millis(100), client_rx.recv())
-                .await
+            if let Ok(Some(ServerMessage::Event { agent_event, .. })) =
+                tokio::time::timeout(tokio::time::Duration::from_millis(100), client_rx.recv())
+                    .await
             {
-                delta_texts.push(text);
+                if let WireAgentEvent::ItemDelta {
+                    delta: giskard_proto::ItemDelta::Text { text },
+                    ..
+                } = *agent_event
+                {
+                    delta_texts.push(text);
+                }
             }
         }
         assert_eq!(

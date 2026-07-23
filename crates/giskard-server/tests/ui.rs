@@ -483,6 +483,14 @@ async fn index_page_is_served_and_public() {
         "project rows expose a remove action with source-directory-safe confirmation"
     );
     assert!(
+        body.contains("function threadDescendantIds(pid, tid)")
+            && body.contains("linked sub-agent thread")
+            && body.contains("all corresponding Codex threads")
+            && body.contains("This cannot be undone")
+            && body.contains("deletedIds.has(String(state.threadId))"),
+        "thread deletion warns about and clears recursively deleted sub-agent threads"
+    );
+    assert!(
         body.contains("overflow:visible")
             && body.contains("z-index:40")
             && body.contains("z-index:70"),
@@ -566,16 +574,44 @@ async fn index_page_is_served_and_public() {
         "thread header exposes a running-task summary button and menu"
     );
     assert!(
+        body.contains("id=\"subagentsBtn\"") && body.contains("id=\"subagentsMenu\""),
+        "thread header exposes a sub-agent monitor button and menu"
+    );
+    assert!(
         body.contains("function renderTasksButton")
             && body.contains("taskButtonState")
             && body.contains("$(\"tasksCount\").textContent = String(count)"),
         "task button shows the current running-task count and state"
     );
     assert!(
+        body.contains("projectThreads:new Map()")
+            && body.contains("function rememberProjectThreads(pid, threads)")
+            && body.contains("function isManagedSubagentThread(t, threads)")
+            && body.contains("function subagentThreadsForActiveProject()")
+            && body.contains("function renderSubagentsButton()"),
+        "sub-agent monitor derives known child threads from project thread summaries"
+    );
+    assert!(
+        body.contains("function renderSubagentsMenu()")
+            && body.contains("function renderSubagentCard(thread)")
+            && body.contains("function subagentDisplayName(thread)")
+            && body.contains("title.replace(/^Sub-agent:\\s*/i, \"\").trim()")
+            && body.contains("data-subagent-thread-id")
+            && body.contains("openThread(state.projectId, tid"),
+        "sub-agent monitor renders child-thread cards that open the child transcript"
+    );
+    assert!(
         body.contains(".tasks-btn.state-idle")
             && body.contains(".tasks-btn.state-running")
             && body.contains(".tasks-btn.state-stopping"),
         "task button has distinct visual states for idle, running, and stop-requested tasks"
+    );
+    assert!(
+        body.contains(".subagents-btn.state-idle")
+            && body.contains(".subagents-btn.state-running")
+            && body.contains(".subagent-card")
+            && body.contains(".subagent-card-state.running"),
+        "sub-agent monitor has button and card styling for idle/running states"
     );
     assert!(
         body.contains("function renderTaskCards")
@@ -1063,6 +1099,25 @@ async fn index_page_is_served_and_public() {
     assert!(
         body.contains("renderActivity"),
         "UI renders generic activity items"
+    );
+    assert!(
+        body.contains("function subagentLinkInfo")
+            && body.contains("function attachSubagentLinkActions")
+            && body.contains("function openSubagentThreadFromActivity")
+            && body.contains("function subagentActivityItemId")
+            && body.contains("btn.dataset.linkItemId = itemId")
+            && body.contains("/subagent-links/${itemId}/open")
+            && !body.contains("link.harness_thread_id")
+            && !body.contains("subagent_action:info.kind")
+            && !body.contains("subagent_status:info.status")
+            && !body.contains("subagent_message:info.message")
+            && !body.contains("function autoImportSubagentThread")
+            && body.contains("Open linked thread"),
+        "UI opens harness-neutral sub-agent links through trusted item coordinates"
+    );
+    assert!(
+        body.contains("!isManagedSubagentThread(t, threads)") && body.contains("subagent-open-btn"),
+        "UI hides valid managed sub-agents while keeping malformed graphs recoverable"
     );
     assert!(
         body.contains("function isImageViewActivity")
