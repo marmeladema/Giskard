@@ -336,6 +336,10 @@ WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticke
 /api/projects/{id}/mcp/oauth-login`. Wire types are defined once in `giskard-proto`. See
 [§13.6](specs/giskard-specification.md) for the message protocol.
 
+`POST /api/projects/{id}/threads/start` creates the durable thread from the first user message,
+persists a deterministic title generated from that prompt, and returns the title with the new
+thread and turn identifiers.
+
 If you open a thread whose agent can no longer be started — most often because its
 **provider was removed from config** (e.g. you swapped one proxy provider id for another) — the
 thread still opens **read-only**: its history loads, a persistent banner above the composer names

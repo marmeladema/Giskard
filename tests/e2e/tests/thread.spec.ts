@@ -23,11 +23,13 @@ test.describe("projects and threads", () => {
     await input.fill(message);
     await page.locator("#sendBtn").click();
 
+    const transcript = page.locator("#transcript");
+
     // The user's message echoes into the transcript immediately.
-    await expect(page.getByText(message)).toBeVisible();
+    await expect(transcript.locator(".msg.user", { hasText: message })).toBeVisible();
 
     // The scripted harness streams a canned reply over the WebSocket; it lands in the transcript.
-    await expect(page.getByText(SCRIPTED_REPLY)).toBeVisible();
+    await expect(transcript.locator(".msg.agent", { hasText: SCRIPTED_REPLY })).toBeVisible();
 
     // Starting the turn persisted a real thread, so a thread row now exists in the sidebar.
     await expect(page.locator(".thread").first()).toBeVisible();
@@ -41,14 +43,15 @@ test.describe("projects and threads", () => {
     const message = "First message";
     await input.fill(message);
     await page.locator("#sendBtn").click();
-    await expect(page.getByText(SCRIPTED_REPLY)).toBeVisible();
+    const transcript = page.locator("#transcript");
+    await expect(transcript.locator(".msg.agent", { hasText: SCRIPTED_REPLY })).toBeVisible();
 
     // The composer is emptied once the message is sent, and the composer itself stays available.
     await expect(input).toHaveValue("");
     await expect(input).toBeVisible();
 
     // Both sides of the exchange remain in the transcript.
-    await expect(page.getByText(message)).toBeVisible();
-    await expect(page.getByText(SCRIPTED_REPLY)).toBeVisible();
+    await expect(transcript.locator(".msg.user", { hasText: message })).toBeVisible();
+    await expect(transcript.locator(".msg.agent", { hasText: SCRIPTED_REPLY })).toBeVisible();
   });
 });

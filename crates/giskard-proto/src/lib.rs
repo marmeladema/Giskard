@@ -353,6 +353,7 @@ pub struct StartThreadRequest {
 #[derive(Debug, Clone, Serialize)]
 pub struct StartThreadResponse {
     pub thread_id: ThreadId,
+    pub title: String,
     pub harness_thread_id: String,
     pub turn_id: TurnId,
     #[serde(default, skip_serializing_if = "Option::is_none")]

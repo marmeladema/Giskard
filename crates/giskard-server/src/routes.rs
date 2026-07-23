@@ -36,6 +36,8 @@ use crate::auth::{
 
 const HARNESS_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_THREAD_TITLE_CHARS: usize = 120;
+const GENERATED_THREAD_TITLE_CHARS: usize = 72;
+const GENERATED_THREAD_TITLE_WORDS: usize = 8;
 
 pub fn protected_routes(state: AppState) -> Router<AppState> {
     Router::new()
@@ -722,11 +724,12 @@ async fn start_thread_with_message(
     }
 
     let now = Utc::now();
+    let title = thread_title_from_first_prompt(&text);
     let thread_file = ThreadFile {
         version: 1,
         id: thread_id,
         project_id,
-        title: "New thread".into(),
+        title: title.clone(),
         harness_thread_id: handle.harness_thread_id.clone(),
         mode: req.mode,
         current_model: model_ref.clone(),
@@ -795,6 +798,7 @@ async fn start_thread_with_message(
 
     Ok(Json(StartThreadResponse {
         thread_id,
+        title,
         harness_thread_id: handle.harness_thread_id,
         turn_id,
         warning,
@@ -812,6 +816,257 @@ fn resolve_initial_thread_model(
         model.reasoning_effort = None;
     }
     (model, descriptor)
+}
+
+fn thread_title_from_first_prompt(prompt: &str) -> String {
+    let mut candidate = meaningful_prompt_lines(prompt)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| collapse_whitespace(prompt));
+    candidate = collapse_whitespace(&candidate);
+    candidate = replace_ticket_urls(&candidate);
+    candidate = strip_broad_prompt_boilerplate(&candidate).to_string();
+    candidate = trim_at_title_boundary(&candidate);
+    candidate = limit_title_words(&candidate, GENERATED_THREAD_TITLE_WORDS);
+    candidate = candidate
+        .trim_end_matches(|ch: char| ch.is_ascii_whitespace() || ".,;:!?-/".contains(ch))
+        .to_string();
+    candidate = truncate_title(&candidate, GENERATED_THREAD_TITLE_CHARS);
+    if candidate.is_empty() {
+        "New thread".into()
+    } else {
+        candidate
+    }
+}
+
+fn ticket_key(text: &str) -> Option<String> {
+    text.split(|ch: char| ch.is_ascii_whitespace() || matches!(ch, '/' | '?' | '#' | '&'))
+        .find(|part| {
+            let Some((prefix, number)) = part.split_once('-') else {
+                return false;
+            };
+            prefix.len() >= 2
+                && prefix.chars().all(|ch| ch.is_ascii_uppercase())
+                && number.chars().all(|ch| ch.is_ascii_digit())
+        })
+        .map(|ticket| ticket.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-'))
+        .filter(|ticket| !ticket.is_empty())
+        .map(str::to_string)
+}
+
+fn replace_ticket_urls(text: &str) -> String {
+    text.split_whitespace()
+        .map(|word| {
+            if word.starts_with("http://") || word.starts_with("https://") {
+                ticket_key(word).unwrap_or_else(|| word.to_string())
+            } else {
+                word.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn strip_broad_prompt_boilerplate(text: &str) -> &str {
+    let lower = text.to_ascii_lowercase();
+    for prefix in [
+        "i want to ",
+        "i need to ",
+        "we need to ",
+        "can you ",
+        "could you ",
+        "please ",
+    ] {
+        if lower.starts_with(prefix) {
+            return text[prefix.len()..].trim_start();
+        }
+    }
+    text
+}
+
+fn trim_at_title_boundary(text: &str) -> String {
+    let mut end = text.len();
+    for delimiter in [": ", "; ", "? ", "! ", ", "] {
+        if let Some(idx) = text.find(delimiter) {
+            end = end.min(idx);
+        }
+    }
+    if let Some(idx) = first_sentence_period_boundary(text) {
+        end = end.min(idx);
+    }
+    text[..end].trim().to_string()
+}
+
+fn first_sentence_period_boundary(text: &str) -> Option<usize> {
+    let mut previous = None;
+    for (idx, ch) in text.char_indices() {
+        if ch == '.' && !previous.is_some_and(|previous: char| previous.is_ascii_digit()) {
+            let after_period = &text[idx + ch.len_utf8()..];
+            if after_period.starts_with(char::is_whitespace) {
+                return Some(idx);
+            }
+        }
+        previous = Some(ch);
+    }
+    None
+}
+
+fn limit_title_words(text: &str, max_words: usize) -> String {
+    let words = text.split_whitespace().take(max_words).collect::<Vec<_>>();
+    let mut title = words.join(" ");
+    while let Some(last) = title.split_whitespace().last() {
+        let trimmed = last.trim_matches(|ch: char| !ch.is_ascii_alphanumeric());
+        if !matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "a" | "an" | "the" | "and" | "or" | "of" | "for" | "to" | "in" | "on" | "with"
+        ) {
+            break;
+        }
+        let new_len = title.len().saturating_sub(last.len());
+        title.truncate(new_len);
+        title = title.trim_end().to_string();
+    }
+    title
+}
+
+fn meaningful_prompt_lines(text: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut in_fence = false;
+    for raw in text.replace("\r\n", "\n").replace('\r', "\n").lines() {
+        let stripped = raw.trim();
+        if stripped.starts_with("```") || stripped.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+
+        let line = strip_markdown_prefix(stripped);
+        if line.is_empty() || is_generic_heading(&line) {
+            continue;
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+fn strip_markdown_prefix(line: &str) -> String {
+    let mut line = line.trim();
+
+    let hashes = line.chars().take_while(|ch| *ch == '#').count();
+    if (1..=6).contains(&hashes) {
+        let rest = &line[hashes..];
+        if rest.starts_with(char::is_whitespace) {
+            line = rest.trim_start();
+        }
+    }
+
+    if let Some(rest) = line.strip_prefix('>') {
+        line = rest.trim_start();
+    }
+
+    if let Some(first) = line.chars().next()
+        && matches!(first, '-' | '*' | '+')
+    {
+        let rest = &line[first.len_utf8()..];
+        if rest.starts_with(char::is_whitespace) {
+            line = rest.trim_start();
+            if let Some(rest) = strip_checkbox_prefix(line) {
+                line = rest;
+            }
+        }
+    }
+
+    line = strip_numbered_prefix(line).unwrap_or(line);
+    line.trim().to_string()
+}
+
+fn strip_checkbox_prefix(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix('[')?;
+    let mut chars = rest.chars();
+    let mark = chars.next()?;
+    if !matches!(mark, ' ' | 'x' | 'X') {
+        return None;
+    }
+    let after_mark = chars.as_str();
+    let after_bracket = after_mark.strip_prefix(']')?;
+    if !after_bracket.starts_with(char::is_whitespace) {
+        return None;
+    }
+    Some(after_bracket.trim_start())
+}
+
+fn strip_numbered_prefix(line: &str) -> Option<&str> {
+    let mut digits_end = 0;
+    for (idx, ch) in line.char_indices() {
+        if ch.is_ascii_digit() {
+            digits_end = idx + ch.len_utf8();
+            continue;
+        }
+        break;
+    }
+    if digits_end == 0 {
+        return None;
+    }
+    let rest = &line[digits_end..];
+    let delimiter = rest.chars().next()?;
+    if !matches!(delimiter, '.' | ')') {
+        return None;
+    }
+    let after_delimiter = &rest[delimiter.len_utf8()..];
+    if !after_delimiter.starts_with(char::is_whitespace) {
+        return None;
+    }
+    Some(after_delimiter.trim_start())
+}
+
+fn is_generic_heading(line: &str) -> bool {
+    matches!(
+        line.trim_end_matches(':')
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "ask" | "prompt" | "question" | "request" | "task" | "todo"
+    )
+}
+
+fn collapse_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_title(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+
+    let mut end = text.len();
+    for (count, (idx, _)) in text.char_indices().enumerate() {
+        if count == max_chars {
+            end = idx;
+            break;
+        }
+    }
+
+    let clipped = text[..end].trim_end();
+    let mut boundary = None;
+    let mut boundary_chars = 0;
+    for (count, (idx, ch)) in clipped.char_indices().enumerate() {
+        if matches!(ch, ' ' | '-' | '/') {
+            boundary = Some(idx);
+            boundary_chars = count;
+        }
+    }
+    let clipped = if boundary_chars >= max_chars / 2 {
+        boundary
+            .map(|idx| clipped[..idx].trim_end())
+            .unwrap_or(clipped)
+    } else {
+        clipped
+    };
+    clipped
+        .trim_end_matches(|ch: char| ch.is_ascii_whitespace() || " ,;:-".contains(ch))
+        .to_string()
 }
 
 async fn cleanup_new_thread_after_start_failure(
@@ -1101,6 +1356,97 @@ mod tests {
                 ("zeta.txt", false),
             ]
         );
+    }
+
+    #[test]
+    fn thread_title_uses_first_meaningful_prompt_line() {
+        let title = thread_title_from_first_prompt(
+            r#"
+Task:
+
+```rust
+fn main() {}
+```
+
+- [ ] Fix the OAuth callback regression. Then add tests.
+"#,
+        );
+
+        assert_eq!(title, "Fix the OAuth callback regression");
+    }
+
+    #[test]
+    fn thread_title_strips_markdown_prefixes_and_sentence_punctuation() {
+        assert_eq!(
+            thread_title_from_first_prompt("### Investigate thread title generation! More detail."),
+            "Investigate thread title generation"
+        );
+        assert_eq!(
+            thread_title_from_first_prompt("> 1. Revisit creation flow?"),
+            "Revisit creation flow"
+        );
+    }
+
+    #[test]
+    fn thread_title_handles_anonymized_real_prompt_shapes() {
+        let cases = [
+            (
+                "Do we have a policy-engine integration test for IP sets and compliance mode?",
+                "Do we have a policy-engine integration test",
+            ),
+            (
+                "Let's fix https://tracker.example/browse/BUG-12345",
+                "Let's fix BUG-12345",
+            ),
+            (
+                "Let's look at changes between 2026.7.16 and 2026.7.17 for anything which could lead to request bodies not being received by origin under some circumstances",
+                "Let's look at changes between 2026.7.16 and 2026.7.17",
+            ),
+            (
+                "In a new branch called user/policy-engine-0.357.0, we need to update policy-engine to that version. But in order to ease future updates, it would be great to produce a skill file in the new .skills directory",
+                "In a new branch called user/policy-engine-0.357.0",
+            ),
+            (
+                "I want to investigate a different approach to the FromCatalog / from_catalogs action variant. Right now we need to add a FromCatalog variant when we want a dynamic value based on a catalog item.",
+                "investigate a different approach to the FromCatalog",
+            ),
+            (
+                "I want to rework a little bit a few UI things:\n1. on the files changed activity, for files within the project, we should show relative path\n2. we don't seem to have TOML syntax highlighting",
+                "rework a little bit a few UI things",
+            ),
+            (
+                "On another Acme IDE instance, I have a case of a broken thread: on load the thread seems to not have an active turn, however sending a message is returning an error saying a turn is already active.",
+                "On another Acme IDE instance",
+            ),
+            (
+                "Can you review the last 2 commits of this branch. First one is already on main, its expected",
+                "review the last 2 commits of this branch",
+            ),
+            ("Hello", "Hello"),
+        ];
+
+        for (prompt, expected) in cases {
+            assert_eq!(
+                thread_title_from_first_prompt(prompt),
+                expected,
+                "prompt: {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn thread_title_falls_back_for_empty_prompt() {
+        assert_eq!(thread_title_from_first_prompt(" \n\t "), "New thread");
+    }
+
+    #[test]
+    fn thread_title_truncates_at_readable_boundary() {
+        let prompt = format!("{} final words", "a".repeat(MAX_THREAD_TITLE_CHARS - 10));
+        let title = thread_title_from_first_prompt(&prompt);
+
+        assert!(title.len() <= MAX_THREAD_TITLE_CHARS);
+        assert!(!title.ends_with(' '));
+        assert!(!title.ends_with('-'));
     }
 }
 

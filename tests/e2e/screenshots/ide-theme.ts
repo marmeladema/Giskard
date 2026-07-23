@@ -42,14 +42,15 @@ test("IDE theme", async ({ page }, testInfo) => {
   await page.locator("#sendBtn").click();
 
   // Wait for the streamed reply so the transcript has real content.
-  await expect(page.getByText(SCRIPTED_REPLY)).toBeVisible();
+  const transcript = page.locator("#transcript");
+  await expect(transcript.locator(".msg.agent", { hasText: SCRIPTED_REPLY })).toBeVisible();
 
   // Reload so the thread re-opens from persisted history: this drops the just-finished turn's
   // "Agent is running…" composer state and gives a clean, idle UI to capture. The last thread is
   // restored automatically (client-side), and on mobile that leaves the transcript (not the drawer)
   // in view.
   await page.reload();
-  await expect(page.getByText(SCRIPTED_REPLY)).toBeVisible();
+  await expect(transcript.locator(".msg.agent", { hasText: SCRIPTED_REPLY })).toBeVisible();
   await expect(page.locator("#stopBtn")).toBeHidden();
 
   // Drop focus so no text caret blinks into the capture.
