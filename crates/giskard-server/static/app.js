@@ -67,9 +67,23 @@ async function api(method, path, body) {
   const opts = { method, headers:{} };
   if (body !== undefined) { opts.headers["Content-Type"]="application/json"; opts.body=JSON.stringify(body); }
   const r = await fetch(path, opts);
-  if (!r.ok) throw new Error((await r.text()) || r.status);
+  if (!r.ok) {
+    const err = new Error((await r.text()) || `HTTP ${r.status}`);
+    err.status = r.status;
+    throw err;
+  }
   const ct = r.headers.get("content-type")||"";
   return ct.includes("json") ? r.json() : r.text();
+}
+function apiFailureMessage(e) {
+  const msg = e && e.message ? e.message : String(e);
+  if (e && e.status === 401) {
+    return "401 unauthorized. Log in again. If you are using plain HTTP, set server.secure_cookies = false and restart Giskard.";
+  }
+  if (msg === "Failed to fetch" || e instanceof TypeError) {
+    return `${msg}. The browser could not reach Giskard for this API request. Check that the server is still running and that you are using the same URL you logged in with.`;
+  }
+  return msg;
 }
 
 /* ---------- auth ---------- */
@@ -1038,7 +1052,7 @@ function parentOf(p) { const s = String(p).replace(/\/+$/,""); const i = s.lastI
 async function browsePicker(path) {
   let res;
   try { res = await api("GET", `/api/browse?path=${encodeURIComponent(path)}`); }
-  catch (e) { $("pmErr").textContent = "Cannot open folder: "+e.message; return; }
+  catch (e) { $("pmErr").textContent = "Cannot open folder: "+apiFailureMessage(e); return; }
   state.pickerDir = res.path;
   localStorage.setItem("giskard.lastBrowse", res.path);
   $("pmPath").textContent = res.path;
@@ -1132,7 +1146,7 @@ $("pmNewFolder").onclick = async () => {
   try {
     const res = await api("POST","/api/browse/mkdir",{ parent: state.pickerDir, name });
     await browsePicker(res.path);   // navigate into the folder we just created
-  } catch (e) { $("pmErr").textContent = "Create folder failed: "+e.message; }
+  } catch (e) { $("pmErr").textContent = "Create folder failed: "+apiFailureMessage(e); }
 };
 
 $("pmCreate").onclick = async () => {
@@ -1148,7 +1162,7 @@ $("pmCreate").onclick = async () => {
     await api("POST","/api/projects",{ name, dir, default_model:model });
     closeProjectModal();
     await loadProjects();
-  } catch (e) { $("pmErr").textContent = "Create project failed: "+e.message; }
+  } catch (e) { $("pmErr").textContent = "Create project failed: "+apiFailureMessage(e); }
 };
 
 function openRemoveProjectModal(project) {
