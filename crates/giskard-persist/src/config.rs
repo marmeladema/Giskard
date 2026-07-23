@@ -291,6 +291,35 @@ idle_shutdown_secs = 0
         assert_eq!(config.harness.kind, "codex");
     }
 
+    #[test]
+    fn missing_browse_table_defaults_to_unrestricted_roots() {
+        let config: Config = toml::from_str(
+            r#"
+[server]
+bind = "127.0.0.1:8787"
+
+[auth]
+password_hash = "hash"
+"#,
+        )
+        .unwrap();
+
+        assert!(config.browse.roots.is_empty());
+    }
+
+    #[test]
+    fn empty_browse_roots_is_unrestricted_roots() {
+        let config: Config = toml::from_str(
+            r#"
+[browse]
+roots = []
+"#,
+        )
+        .unwrap();
+
+        assert!(config.browse.roots.is_empty());
+    }
+
     /// The annotated `config.example.toml` shipped at the repo root must always parse against the
     /// current `Config` structs, so the documented example can't silently drift from the code.
     #[test]
