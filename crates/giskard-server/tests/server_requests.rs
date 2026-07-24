@@ -515,10 +515,10 @@ async fn wait_for_server_request(ws: &mut TestWs) {
     while Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
-                if let Ok(ServerMessage::Event { agent_event, .. }) = serde_json::from_str(&text) {
-                    if matches!(*agent_event, WireAgentEvent::ServerRequestReceived { .. }) {
-                        return;
-                    }
+                if let Ok(ServerMessage::Event { agent_event, .. }) = serde_json::from_str(&text)
+                    && matches!(*agent_event, WireAgentEvent::ServerRequestReceived { .. })
+                {
+                    return;
                 }
             }
             Ok(Some(Ok(_))) => {}

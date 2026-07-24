@@ -1270,11 +1270,11 @@ async fn handle_background_server_message(
                         remaining_active_turns = active_turns.len(),
                         "Codex turn completion observed"
                     );
-                } else if let Some((turn, message)) = fatal_completion {
-                    if emit_fatal_turn_completion(senders, thread, turn, message).await {
-                        active_turns.remove(&thread);
-                        mapper.clear_active_turn(thread);
-                    }
+                } else if let Some((turn, message)) = fatal_completion
+                    && emit_fatal_turn_completion(senders, thread, turn, message).await
+                {
+                    active_turns.remove(&thread);
+                    mapper.clear_active_turn(thread);
                 }
                 if let Some(elapsed_ms) = completed_compaction {
                     return StreamOutcome::CompactionCompleted { thread, elapsed_ms };

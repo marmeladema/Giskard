@@ -228,3 +228,107 @@ test.describe("linked sub-agent threads", () => {
     await expect(runningActivity.getByRole("button", { name: "Open linked thread" })).toBeVisible();
   });
 });
+
+test.describe("cross-project thread deletion", () => {
+  test.beforeEach(async ({ page }) => {
+    await login(page);
+  });
+
+  // Deleting a thread cascades to descendants the server discovered itself, so the browser clears
+  // the active transcript when that thread no longer exists in the refreshed list. That decision
+  // must be scoped to the deleted thread's project: if the user has navigated to a thread in a
+  // different project, deleting elsewhere must not wipe the unrelated active view. A source-string
+  // assertion cannot observe this race, so exercise it end to end.
+  test("deleting a thread in another project keeps the active view", async ({ page }) => {
+    // Use two freshly created projects instead of the shared "Demo" project, so this test is
+    // isolated from threads other tests leave behind on the reused replay server. The replay
+    // server leaves browse roots unrestricted, so projects can be seeded against an existing
+    // directory instead of driving the folder picker.
+    const createProject = (name: string): Promise<string> =>
+      page.evaluate(async (projectName) => {
+        const res = await fetch("/api/projects", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: projectName,
+            dir: "/tmp",
+            default_model: { provider: "replay", model: "replay-model" },
+          }),
+        });
+        return (await res.json()).id as string;
+      }, name);
+    const deleteProject = (id: string): Promise<void> =>
+      page.evaluate(async (projectId) => {
+        await fetch(`/api/projects/${projectId}`, { method: "DELETE" });
+      }, id);
+    // Create a persisted thread server-side, avoiding the shared composer and its WebSocket-open
+    // timing (an unrelated concern that only makes this UI test flaky).
+    const startThread = (pid: string, text: string): Promise<string> =>
+      page.evaluate(
+        async ({ pid, text }) => {
+          const res = await fetch(`/api/projects/${pid}/threads/start`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              text,
+              model_ref: { provider: "replay", model: "replay-model" },
+              mode: "build",
+              approval_policy: "ask",
+            }),
+          });
+          return (await res.json()).thread_id as string;
+        },
+        { pid, text },
+      );
+
+    const otherProjectName = "Other project A";
+    const activeProjectName = "Active project B";
+    const otherProjectId = await createProject(otherProjectName);
+    const activeProjectId = await createProject(activeProjectName);
+
+    try {
+      const otherThreadId = await startThread(otherProjectId, "thread in project A");
+      const activeThreadId = await startThread(activeProjectId, "thread in project B");
+      expect(activeThreadId).not.toBe(otherThreadId);
+
+      // Render both projects and their threads in the sidebar.
+      await page.evaluate(() =>
+        (window as unknown as { loadProjects: () => Promise<void> }).loadProjects(),
+      );
+      const lastThread = () =>
+        page.evaluate(() => JSON.parse(localStorage.getItem("giskard.lastThread") || "null"));
+      const otherRow = page.locator(`.thread[data-tid="${otherThreadId}"]`);
+      const activeRow = page.locator(`.thread[data-tid="${activeThreadId}"]`);
+      await expect(otherRow).toBeVisible();
+      await expect(activeRow).toBeVisible();
+
+      // Open project B's thread so it is unambiguously the active view.
+      await activeRow.click();
+      await expect
+        .poll(async () => {
+          const selection = await lastThread();
+          return `${selection?.pid}:${selection?.tid}`;
+        })
+        .toBe(`${activeProjectId}:${activeThreadId}`);
+
+      // Delete project A's thread via its row menu while project B's thread is the active view.
+      const otherRowContainer = otherRow.locator("xpath=..");
+      await otherRowContainer.locator(".thread-menu-btn").click();
+      const dialogPromise = page.waitForEvent("dialog");
+      const deleteClick = otherRowContainer.locator(".thread-menu .danger").click();
+      const dialog = await dialogPromise;
+      await dialog.accept();
+      await deleteClick;
+      await expect(otherRow).toHaveCount(0);
+
+      // The active view is unaffected: its selection persists (a non-scoped clear would null it
+      // out), because cascade-delete clearing is scoped to the deleted thread's project.
+      const afterSelection = await lastThread();
+      expect(afterSelection?.pid).toBe(activeProjectId);
+      expect(afterSelection?.tid).toBe(activeThreadId);
+    } finally {
+      await deleteProject(otherProjectId);
+      await deleteProject(activeProjectId);
+    }
+  });
+});

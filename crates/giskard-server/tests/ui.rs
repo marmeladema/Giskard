@@ -599,9 +599,10 @@ async fn index_page_is_served_and_public() {
          dropping them"
     );
     assert!(
-        body.contains("deletedIds.has(activeThread) || !knownThreadForId(pid, activeThread)"),
-        "cascade delete clears the active view from the refreshed thread list, not only the \
-         pre-request client cache"
+        body.contains("deletedIds.has(activeThread) || !knownThreadForId(pid, activeThread)")
+            && body.contains("String(state.projectId || \"\") === String(pid)"),
+        "cascade delete clears the active view from the refreshed thread list, scoped to the \
+         deleted thread's project so unrelated views survive"
     );
     assert!(
         body.contains("function renderSubagentsMenu()")

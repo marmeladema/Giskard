@@ -419,10 +419,10 @@ impl AgentHarness for ScriptedHarness {
     }
 
     fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Ok(threads) = self.threads.try_lock() {
-            if let Some((_, tx)) = threads.iter().find(|(id, _)| *id == thread.thread) {
-                return AgentEventStream::new(tx.subscribe());
-            }
+        if let Ok(threads) = self.threads.try_lock()
+            && let Some((_, tx)) = threads.iter().find(|(id, _)| *id == thread.thread)
+        {
+            return AgentEventStream::new(tx.subscribe());
         }
         let (_, rx) = broadcast::channel(1);
         AgentEventStream::new(rx)

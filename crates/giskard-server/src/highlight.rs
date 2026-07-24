@@ -148,10 +148,10 @@ impl Highlighter {
         let cache_key = path.to_path_buf();
         {
             let cache = self.cache.lock().await;
-            if let Some((_, entry)) = cache.iter().find(|(k, _)| *k == cache_key) {
-                if entry.mtime == mtime {
-                    return Ok(apply_range(&entry.cached, start_line, end_line));
-                }
+            if let Some((_, entry)) = cache.iter().find(|(k, _)| *k == cache_key)
+                && entry.mtime == mtime
+            {
+                return Ok(apply_range(&entry.cached, start_line, end_line));
             }
         }
 

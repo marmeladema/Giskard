@@ -285,35 +285,35 @@ session_days = 30
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
     loop {
-        if let Ok(turns) = state.store.load_all_turns(pid, thread_id).await {
-            if !turns.is_empty() {
-                let turn = &turns[0];
-                assert_eq!(
-                    turn.diffs.len(),
-                    2,
-                    "two distinct file paths should have diffs (dedup by path)"
-                );
+        if let Ok(turns) = state.store.load_all_turns(pid, thread_id).await
+            && !turns.is_empty()
+        {
+            let turn = &turns[0];
+            assert_eq!(
+                turn.diffs.len(),
+                2,
+                "two distinct file paths should have diffs (dedup by path)"
+            );
 
-                let main_rs_diff = turn
-                    .diffs
-                    .iter()
-                    .find(|d| d.path.to_string_lossy() == "src/main.rs")
-                    .expect("src/main.rs diff should exist");
-                assert_eq!(main_rs_diff.change, FileChangeKind::Modified);
-                assert!(
-                    main_rs_diff.new_text.as_ref().unwrap().contains("hello"),
-                    "should contain the latest diff (hello, not hi)"
-                );
+            let main_rs_diff = turn
+                .diffs
+                .iter()
+                .find(|d| d.path.to_string_lossy() == "src/main.rs")
+                .expect("src/main.rs diff should exist");
+            assert_eq!(main_rs_diff.change, FileChangeKind::Modified);
+            assert!(
+                main_rs_diff.new_text.as_ref().unwrap().contains("hello"),
+                "should contain the latest diff (hello, not hi)"
+            );
 
-                let lib_rs_diff = turn
-                    .diffs
-                    .iter()
-                    .find(|d| d.path.to_string_lossy() == "src/lib.rs")
-                    .expect("src/lib.rs diff should exist");
-                assert_eq!(lib_rs_diff.change, FileChangeKind::Created);
+            let lib_rs_diff = turn
+                .diffs
+                .iter()
+                .find(|d| d.path.to_string_lossy() == "src/lib.rs")
+                .expect("src/lib.rs diff should exist");
+            assert_eq!(lib_rs_diff.change, FileChangeKind::Created);
 
-                return;
-            }
+            return;
         }
         if tokio::time::Instant::now() >= deadline {
             panic!("turn was not persisted within 10 seconds");
