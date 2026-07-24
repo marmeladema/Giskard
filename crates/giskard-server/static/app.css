@@ -407,7 +407,23 @@
   .md del { opacity:.7; }
 
   .composer { display:flex; gap:8px; padding:12px; border-top:1px solid var(--border); background:var(--panel); }
+  .composer.drag-over { outline:2px solid var(--accent); outline-offset:-4px; background:var(--panel2); }
+  .composer #attachBtn { width:34px; min-width:34px; height:34px; align-self:flex-end; padding:0; font-size:18px; line-height:1; }
   .composer textarea { flex:1; resize:none; height:52px; }
+  .attachment-tray {
+    display:flex; flex-wrap:wrap; gap:6px; padding:0 12px 10px; background:var(--panel);
+    border-top:0;
+  }
+  .attachment-tray[hidden] { display:none; }
+  .attachment-chip {
+    display:inline-flex; align-items:center; gap:6px; max-width:min(320px, 100%);
+    padding:3px 6px 3px 8px; border:1px solid var(--border); border-radius:6px;
+    background:var(--panel2); color:var(--fg); font-size:12px;
+  }
+  .attachment-chip-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+  .attachment-chip-size { color:var(--muted); white-space:nowrap; }
+  .attachment-chip button { width:22px; height:22px; padding:0; line-height:1; }
+  .attachment-loading { align-self:center; color:var(--muted); font-size:12px; }
 
   /* Turn/model pickers: small low-emphasis chips below the composer that open popovers upward
      (they sit at the very bottom). The bar splits them left (mode+approval) and right (model). */

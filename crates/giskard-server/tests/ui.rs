@@ -92,6 +92,13 @@ async fn index_page_is_served_and_public() {
     );
     assert!(body.contains("send_input"), "composer wired to SendInput");
     assert!(
+        body.contains("initComposerFileDrop()")
+            && body.contains("composer.addEventListener(\"drop\"")
+            && body.contains("await attachFiles(Array.from(e.dataTransfer.files || []))")
+            && body.contains(".composer.drag-over"),
+        "composer accepts dragged files through the attachment pipeline"
+    );
+    assert!(
         body.contains("id=\"stopBtn\""),
         "UI exposes a stop button for live turns"
     );
@@ -924,10 +931,12 @@ async fn index_page_is_served_and_public() {
         "UI exposes WS reconnecting state"
     );
     assert!(
-        body.contains(
-            "$(\"sendBtn\").disabled = readOnly || state.activeTurn || (!ready && !draft)"
-        ) && body.contains("if (isDraftThread()) {")
-            && body.contains("startDraftThread(text);"),
+        body.contains("const attachmentsLoading = pendingAttachmentOperationCount() > 0")
+            && body.contains(
+                "$(\"sendBtn\").disabled = readOnly || state.activeTurn || attachmentsLoading"
+            )
+            && body.contains("if (isDraftThread()) {")
+            && body.contains("startDraftThread(text, attachments);"),
         "UI allows draft first sends without a WebSocket, blocks existing-thread sends until open, \
          and blocks sends on read-only threads"
     );
@@ -1712,7 +1721,7 @@ fn browser_marks_turn_active_when_send_is_accepted() {
     );
     assert_order(
         send_input,
-        "if (!send({ type:\"send_input\", thread_id: state.threadId, text }))",
+        "if (!send({ type:\"send_input\", thread_id: state.threadId, text, attachments }))",
         "setTurnActive(true);",
     );
     assert_order(
@@ -1775,7 +1784,7 @@ fn browser_scopes_unsent_composer_text_to_thread() {
 
     let start_draft = between(
         body,
-        "async function startDraftThread(text) {",
+        "async function startDraftThread(text, attachments) {",
         "function interruptTurn()",
     );
     assert_order(
@@ -1918,9 +1927,11 @@ fn browser_stamps_transcript_rows_with_their_turn_id() {
         "const prevRenderTurnId = state.currentRenderTurnId;",
         "state.currentRenderTurnId = turn.id;",
     );
+    assert!(persisted.contains("addItem(userMessageItemWithText(it, inputText), turn.id, true);"));
+    assert!(persisted.contains("addItem(it, turn.id, true);"));
     assert_order(
         persisted,
-        "for (const it of items) addItem(it, turn.id, true);",
+        "for (const it of items) {",
         "state.currentRenderTurnId = prevRenderTurnId;",
     );
 
@@ -1993,7 +2004,8 @@ fn browser_tracks_rendered_items_by_scoped_dom_identity() {
         "function resetRenderState()",
     );
     for expected in [
-        "const visible = hasVisiblePayload(p);",
+        "const hasPreservedUserDisplay = p.kind === \"user_message\" &&",
+        "const visible = hasVisiblePayload(p) || hasPreservedUserDisplay;",
         "const existing = renderedItemBody(item, turnId);",
         "const harnessExisting = renderedHarnessItemBody(item, turnId);",
         "if (existing && harnessExisting && existing!==harnessExisting) {",

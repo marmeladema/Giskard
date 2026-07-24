@@ -318,6 +318,7 @@ async fn modes_models_approvals_and_plan_dump() {
     ws.send(ws_text(&ClientMessage::SendInput {
         thread_id: tid,
         text: "make a plan".into(),
+        attachments: Vec::new(),
     }))
     .await
     .unwrap();

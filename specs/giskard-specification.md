@@ -9,7 +9,7 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.55
+**Version:** 1.56
 
 > **Amendment — frontend approach (supersedes the Dioxus/WASM design below).**
 > This document was written targeting a **Dioxus fullstack / WebAssembly** frontend (`giskard-ui`),
@@ -22,6 +22,15 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.55 → 1.56), image and file attachments:**
+- **A1:** User input may carry transient attachments. Browser requests include attachment metadata
+  and base64 bytes, but persisted and in-memory cached `UserInput` values omit raw bytes. Image
+  MIME types must match PNG, JPEG, GIF, or WebP file signatures before image attachments map to
+  Codex `UserInput::Image` data URLs. Non-image files, including PDFs, are transferred to the Codex
+  harness host with `fs/writeFile`; the resulting harness-host path is appended to the prompt.
+  Each turn uses a randomized harness-host temp directory that is removed on completion and
+  lifecycle failures. Giskard does not write upload bytes into the project workspace.
 
 **Changelog (1.54 → 1.55), harness-neutral sub-agent support:**
 - **SA1:** Giskard models harness-neutral sub-agent links and linked child threads. Thread metadata
@@ -749,7 +758,8 @@
 - Added §4.5 **normative type sketches** for all previously-undefined referenced types (`Item`,
   `FileDiff`, `ApprovalRequest`, `HarnessError`, `OpenThreadOptions`, `ThreadHandle`,
   `TurnStatus`, `UserInput`, etc.).
-- Removed `attachments` from `SendInput`; attachments are explicitly out of v1 scope (§13.6, §4.5).
+- Removed `attachments` from `SendInput`; attachments were out of v1 scope at that point
+  (superseded by the 1.56 attachment contract above).
 - Defined "session" for `accept_for_session` = harness-process lifetime, fail-closed on respawn (§9.2.1).
 - Defined reconnect/live-turn resync via a per-turn in-memory live buffer + snapshot (§13.6).
 - Clarified Plan mode × approval policy: orthogonal but read-only makes policy moot; policy value
@@ -1634,9 +1644,21 @@ pub struct ModelDescriptor {
 pub struct TokenUsage { pub input: u64, pub output: u64, pub total: u64 }
 
 // ---- User input ----
+pub enum AttachmentKind { Image, File }
+
+pub struct UserAttachment {
+    pub name: String,
+    pub mime_type: String,
+    pub size: u64,
+    pub kind: AttachmentKind,
+    pub data_base64: String, // transient request payload; skipped when persisted
+}
+
 pub enum UserInput {
-    Text { text: String },
-    // NOTE: image/file attachments are NOT in v1 scope. If added later, extend here.
+    Text {
+        text: String,
+        attachments: Vec<UserAttachment>,
+    },
 }
 
 // ---- Errors ----
@@ -1866,7 +1888,8 @@ there is one source of truth to correct if needed.
   `context_window`, C4). The metadata `.json` never holds `turns[]`. The server may cache the parsed
   history in memory for the process lifetime, but the cache is never authoritative: reads validate
   file metadata before reuse, disk append succeeds before in-memory append, and delete/repair paths
-  invalidate stale entries.
+  invalidate stale entries. Transient attachment bytes are redacted before a turn is added to this
+  cache.
 - **Crash consistency:** because writes are atomic renames, a crash leaves either the old or
   the new complete file, never a partial one. On startup the server validates each JSON file;
   a corrupt file is moved aside to `<file>.corrupt-<ts>` and logged, and the app continues
@@ -2660,8 +2683,9 @@ This guarantees a coherent experience when a future, less-capable harness is plu
   `{ thread_id?: ThreadId, resume?: String }` and opens/reattaches persisted threads or explicit
   native resume/import flows. Unknown fields are rejected, so this endpoint cannot fabricate
   linked ownership or lifecycle evidence. Blank creation is rejected. New first-message creation uses
-  `POST /api/projects/{project_id}/threads/start` with `{ text, model_ref, mode, approval_policy }`
-  and returns `{ thread_id, harness_thread_id, turn_id, warning? }`.
+  `POST /api/projects/{project_id}/threads/start` with
+  `{ text, attachments?, model_ref, mode, approval_policy }` and returns
+  `{ thread_id, harness_thread_id, turn_id, warning? }`.
 
   A transcript link is opened through
   `POST /api/projects/{project_id}/threads/{parent_thread_id}/subagent-links/{item_id}/open`.
@@ -2683,7 +2707,7 @@ deletion; all other native deletion errors stop the cascade before deleting that
 
 **Client → server** (examples): `Subscribe { thread_id, since? }` (`since` is the incremental-resync
 cursor, H8), `Unsubscribe { thread_id }`,
-`SendInput { thread_id, text }`, `SwitchMode { thread_id, mode }`,
+`SendInput { thread_id, text, attachments? }`, `SwitchMode { thread_id, mode }`,
 `SelectModel { thread_id, model_ref }`, `SetApprovalPolicy { thread_id, policy }`,
 `Interrupt { thread_id }`, `CompactContext { thread_id }`,
 `TerminateCommand { thread_id, process_id }`,
@@ -2720,8 +2744,18 @@ interactive forwarder owns the turn gate, the passive subscriber yields before b
 > durable now. Draft-thread setting changes are local until the first message creates the thread;
 > they become durable as part of `POST /threads/start`.
 
-> **`SendInput` carries text only in v1.** Image/file attachments are out of scope (matching
-> `UserInput` in §4.5). If added later, extend both `UserInput` and this message together.
+> **Attachment payloads are transient.** `SendInput` and first-message thread creation accept up to
+> eight attachments and 25 MiB of decoded attachment data in total. Each attachment carries name,
+> MIME type, byte size, kind, and base64 bytes in the browser request. The server validates base64,
+> decoded size, bounded metadata, the aggregate limit, and supported image signatures before
+> starting a turn; an image's declared MIME type must match its PNG, JPEG, GIF, or WebP signature.
+> Raw bytes are omitted from Giskard history and its parsed in-memory history cache. For the Codex
+> harness,
+> image attachments become `UserInput::Image { url: "data:<mime>;base64,<bytes>" }`; other files
+> are transferred with Codex `fs/writeFile` to a randomized, per-turn harness-host temp directory,
+> and that path is appended to the text prompt. The Codex adapter removes the directory with
+> `fs/remove` after the turn, an upload/start failure, stream loss, command/control channel closure,
+> or shutdown. It never writes upload bytes into the project workspace.
 
 **Server → client** (examples): `Event { thread_id, agent_event }` (a serialized
 `WireAgentEvent` — the path-mirrored wire form of `AgentEvent`, §3.5),

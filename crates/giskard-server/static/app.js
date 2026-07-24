@@ -20,6 +20,11 @@ const BROWSER_DIAGNOSTIC_LIMIT = 120;
 const NOTIFICATION_DEDUP_MS = 15000;
 const ACTIVE_THREAD_COMPLETED_MARK_MS = 2500;
 const BROWSER_DIAGNOSTIC_VERSION = "browser-diagnostics-v1";
+const MAX_ATTACHMENTS_PER_MESSAGE = 8;
+const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+const MAX_TOTAL_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+const MAX_ATTACHMENT_NAME_BYTES = 255;
+const MAX_ATTACHMENT_MIME_BYTES = 127;
 let state = {
   projectId:null, threadId:null, mode:"build", ws:null, wsStatus:"closed", wsConnectId:0,
   wsReconnectTimer:null, wsReconnectAttempt:0, wsStatusDetail:"WebSocket disconnected",
@@ -46,9 +51,12 @@ let state = {
   currentPlan:null, planExpanded:localStorage.getItem("giskard.planExpanded")==="1",
   threadActivity:new Map(), pendingApprovalFocus:null, notifiedApprovals:new Map(), approvalNotifications:new Map(), browserDiagnostics:[],
   subagentImports:new Map(), projectThreads:new Map(),
-  lastNotificationPromptNoticeAt:0, swRegistration:null,
+  lastNotificationPromptNoticeAt:0, swRegistration:null, pendingAttachments:[],
+  attachmentGeneration:0, pendingAttachmentOperations:new Map(),
   collapsedProjects:new Set(loadCollapsedProjects()), pendingRemoveProject:null, projectDirs:{}
 };
+let attachmentIngestQueue = Promise.resolve();
+const activeAttachmentReaders = new Set();
 // The inline transcript row shows only a compact preview of a command's/tool's output — the most
 // recent lines (its live "progress"), capped to whichever of these limits is hit first. The full
 // text is always one click away in the output overlay.
@@ -1429,6 +1437,7 @@ function saveComposerDraft() {
 function restoreComposerDraft() {
   const input = $("input");
   if (!input) return;
+  clearPendingAttachments();
   const key = composerDraftKey();
   input.value = key ? (state.inputDrafts.get(key) || "") : "";
 }
@@ -1771,11 +1780,15 @@ function updateComposerControls() {
   const draft = isDraftThread();
   const hasThreadSurface = !!state.threadId || draft;
   const readOnly = state.threadReadOnly && !draft;
-  $("sendBtn").disabled = readOnly || state.activeTurn || (!ready && !draft);
-  $("sendBtn").title = readOnly ? "Read-only thread — pick a model from a configured provider to reactivate it." : "";
+  const attachmentsLoading = pendingAttachmentOperationCount() > 0;
+  const attachmentInputAllowed = hasThreadSurface && !readOnly && !(draft && state.activeTurn);
+  $("sendBtn").disabled = readOnly || state.activeTurn || attachmentsLoading || (!ready && !draft);
+  $("sendBtn").title = readOnly ? "Read-only thread — pick a model from a configured provider to reactivate it." :
+    attachmentsLoading ? "Wait for attached files to finish loading." : "";
   $("stopBtn").hidden = !state.activeTurn || draft;
   $("stopBtn").disabled = !ready || state.interruptPending;
   $("stopBtn").textContent = state.interruptPending ? "Stopping…" : "Stop";
+  $("attachBtn").disabled = !attachmentInputAllowed;
   const modelCatalogReady = projectModelCatalogReady();
   $("modelSel").disabled = !hasThreadSurface || !modelCatalogReady || (!ready && !draft);
   $("modelPickerBtn").disabled = !hasThreadSurface || !modelCatalogReady || (!ready && !draft);
@@ -2565,11 +2578,21 @@ function renderPersistedTurn(turn) {
   state.currentRenderTurnId = turn.id;
   const items = turn.items || [];
   const hasUserItem = items.some(it => ((it.payload||it).kind) === "user_message");
-  const inputText = turn.user_input && turn.user_input.text;
+  const inputText = persistedUserInputDisplayText(turn.user_input);
+  const hasAttachments = !!(turn.user_input && (turn.user_input.attachments || []).length);
   if (!hasUserItem && inputText) {
     renderItemBody(bubble("user","you"), { kind:"user_message", text: inputText });
   }
-  for (const it of items) addItem(it, turn.id, true);
+  let replacedUserItem = false;
+  for (const it of items) {
+    const payload = it.payload || it;
+    if (hasAttachments && !replacedUserItem && payload.kind === "user_message") {
+      addItem(userMessageItemWithText(it, inputText), turn.id, true);
+      replacedUserItem = true;
+    } else {
+      addItem(it, turn.id, true);
+    }
+  }
   const st = turn.status;
   if (st && (st.kind==="failed" || st.kind==="interrupted")) {
     errorBubble(st.message || (st.kind==="interrupted" ? "Turn interrupted." : "Turn failed."));
@@ -2733,7 +2756,7 @@ function renderLiveTurnSnapshot(snap) {
 }
 
 function renderLiveTurnUserInput(turnId, userInput) {
-  const text = userInput && userInput.text;
+  const text = persistedUserInputDisplayText(userInput);
   if (!turnId || !text) return;
   const exists = Array.from(document.querySelectorAll(".msg.user")).some(
     row => row.dataset && String(row.dataset.turn || "") === String(turnId)
@@ -2741,6 +2764,7 @@ function renderLiveTurnUserInput(turnId, userInput) {
   if (exists) return;
   const body = bubble("user","you");
   body.parentElement.dataset.liveUserInput = "true";
+  markAttachmentUserInput(body.parentElement, userInput && userInput.attachments);
   renderItemBody(body, { kind:"user_message", text });
 }
 
@@ -4634,7 +4658,10 @@ function addItem(item, turnId, fromHistory) {
     return;
   }
   const key = scopedItemKey(turnId, item && item.id);
-  const visible = hasVisiblePayload(p);
+  const hasPreservedUserDisplay = p.kind === "user_message" &&
+    ((state.pendingUserEl && preservesUserInputDisplay(state.pendingUserEl)) ||
+     !!provisionalUserBodyForTurn(turnId));
+  const visible = hasVisiblePayload(p) || hasPreservedUserDisplay;
   if (isRenderedItem(item, turnId)) {
     // Upsert: a repeated item id within the same turn refreshes the existing row.
     const existing = renderedItemBody(item, turnId);
@@ -4661,7 +4688,9 @@ function addItem(item, turnId, fromHistory) {
         return;
       }
       registerRenderedItemBody(existing, item, turnId);
-      renderItemBodyForItem(existing, item, turnId);
+      if (!(p.kind === "user_message" && preservesUserInputDisplay(existing))) {
+        renderItemBodyForItem(existing, item, turnId);
+      }
       if (p.kind==="user_message" && isSyntheticSubagentPrompt(item)) {
         placeRowFirstInTurn(existing.parentElement, turnId);
       }
@@ -4684,10 +4713,13 @@ function addItem(item, turnId, fromHistory) {
       state.pendingUserEl = null;
       state.pendingUserText = null;
     }
-    if (state.pendingUserEl && p.text===state.pendingUserText) {
+    if (state.pendingUserEl &&
+        (p.text===state.pendingUserText || preservesUserInputDisplay(state.pendingUserEl))) {
       state.pendingUserEl.classList.remove("pending");
       const pendingBody = state.pendingUserEl.querySelector(".body");
-      renderItemBodyForItem(pendingBody, item, turnId);
+      if (!preservesUserInputDisplay(pendingBody)) {
+        renderItemBodyForItem(pendingBody, item, turnId);
+      }
       registerRenderedItemBody(pendingBody, item, turnId);
       state.pendingUserEl = null;
       state.pendingUserText = null;
@@ -4697,7 +4729,9 @@ function addItem(item, turnId, fromHistory) {
     const provisionalBody = provisionalUserBodyForTurn(turnId);
     if (provisionalBody) {
       delete provisionalBody.parentElement.dataset.liveUserInput;
-      renderItemBodyForItem(provisionalBody, item, turnId);
+      if (!preservesUserInputDisplay(provisionalBody)) {
+        renderItemBodyForItem(provisionalBody, item, turnId);
+      }
       registerRenderedItemBody(provisionalBody, item, turnId);
       placeRowFirstInTurn(provisionalBody.parentElement, turnId);
       markRenderedItem(item, turnId);
@@ -6277,13 +6311,20 @@ $("codeOverlay").addEventListener("click", (e) => { if (e.target === $("codeOver
 
 /* ---------- composer + controls ---------- */
 function sendInput() {
-  const ta = $("input"); const text = ta.value.trim(); if (!text || (!state.threadId && !isDraftThread())) return;
+  const ta = $("input");
+  const text = ta.value.trim();
+  const attachments = state.pendingAttachments.slice();
+  if (pendingAttachmentOperationCount() > 0) {
+    notice("Wait for attached files to finish loading.", "warning");
+    return;
+  }
+  if ((!text && attachments.length === 0) || (!state.threadId && !isDraftThread())) return;
   if (state.activeTurn) {
     notice("Wait for the current turn to finish, or stop it first.", "warning");
     return;
   }
   if (isDraftThread()) {
-    startDraftThread(text);
+    startDraftThread(text, attachments);
     return;
   }
   if (!wsIsOpen()) {
@@ -6293,9 +6334,10 @@ function sendInput() {
   }
   const draftKey = composerDraftKey();
   const body = bubble("user pending","you");
-  body.textContent = text;
+  body.textContent = pendingUserDisplayText(text, attachments);
   const msgEl = body.parentElement;
-  if (!send({ type:"send_input", thread_id: state.threadId, text })) {
+  markAttachmentUserInput(msgEl, attachments);
+  if (!send({ type:"send_input", thread_id: state.threadId, text, attachments })) {
     msgEl.classList.remove("pending");
     msgEl.classList.add("failed");
     notice(`Message not sent: WebSocket is ${state.wsStatus}.`, "error");
@@ -6305,12 +6347,16 @@ function sendInput() {
   state.pendingUserEl = msgEl;
   state.pendingUserText = text;
   clearComposerDraft(draftKey);
+  clearPendingAttachments();
 }
 $("sendBtn").onclick = sendInput;
 $("input").addEventListener("keydown", (e) => { if (e.key==="Enter" && !e.shiftKey) { e.preventDefault(); sendInput(); } });
 $("input").addEventListener("input", saveComposerDraft);
+$("attachBtn").onclick = () => $("attachmentInput").click();
+$("attachmentInput").addEventListener("change", attachSelectedFiles);
+initComposerFileDrop();
 
-async function startDraftThread(text) {
+async function startDraftThread(text, attachments) {
   const pid = state.projectId;
   if (!pid || !isDraftThread()) return;
   if (!state.currentModel || !state.currentModel.provider || !state.currentModel.model) {
@@ -6321,8 +6367,9 @@ async function startDraftThread(text) {
   const draftKey = composerDraftKey();
   $("transcript").innerHTML = "";   // drop the draft placeholder before the first real row
   const body = bubble("user pending","you");
-  body.textContent = text;
+  body.textContent = pendingUserDisplayText(text, attachments);
   const msgEl = body.parentElement;
+  markAttachmentUserInput(msgEl, attachments);
   state.pendingUserEl = msgEl;
   state.pendingUserText = text;
   setTurnActive(true);
@@ -6330,14 +6377,20 @@ async function startDraftThread(text) {
   try {
     const res = await api("POST", `/api/projects/${pid}/threads/start`, {
       text,
+      attachments,
       model_ref: state.currentModel,
       mode: state.mode || "build",
       approval_policy: state.approvalPolicy || "ask"
     });
     const tid = res && res.thread_id;
     if (!tid) throw new Error("new thread response did not include thread_id");
+    if (composerDraftKey() !== draftKey || !isDraftThread() || state.projectId !== pid) {
+      await loadThreads(pid);
+      return;
+    }
     state.firstTurnStartingThreadId = String(tid);
     clearComposerDraft(draftKey);
+    clearPendingAttachments();
     state.draftThread = null;
     await loadThreads(pid);
     await openThread(pid, tid, res.title || "New thread", { firstTurnStarting:true });
@@ -6345,6 +6398,7 @@ async function startDraftThread(text) {
     setTurnActive(true);
     if (res.warning) notice(res.warning.message || "warning", res.warning.severity || "warning");
   } catch (e) {
+    if (composerDraftKey() !== draftKey || !isDraftThread() || state.projectId !== pid) return;
     msgEl.classList.remove("pending");
     msgEl.classList.add("failed");
     state.pendingUserEl = null;
@@ -6352,6 +6406,270 @@ async function startDraftThread(text) {
     setTurnActive(false);
     notice("Message not sent: " + e.message, "error");
   }
+}
+
+async function attachSelectedFiles() {
+  const input = $("attachmentInput");
+  const files = Array.from(input.files || []);
+  input.value = "";
+  await attachFiles(files);
+}
+
+function attachFiles(files) {
+  const batch = Array.from(files || []);
+  if (!batch.length) return Promise.resolve();
+  if (!composerCanAcceptAttachments()) return Promise.resolve();
+  const generation = state.attachmentGeneration;
+  const draftKey = composerDraftKey();
+  state.pendingAttachmentOperations.set(
+    generation,
+    (state.pendingAttachmentOperations.get(generation) || 0) + 1
+  );
+  updateComposerControls();
+  renderPendingAttachments();
+  const operation = attachmentIngestQueue.then(() =>
+    ingestAttachmentBatch(batch, generation, draftKey));
+  attachmentIngestQueue = operation.catch(() => {});
+  return operation.finally(() => {
+    const remaining = Math.max(0,
+      (state.pendingAttachmentOperations.get(generation) || 0) - 1);
+    if (remaining > 0) state.pendingAttachmentOperations.set(generation, remaining);
+    else state.pendingAttachmentOperations.delete(generation);
+    updateComposerControls();
+    renderPendingAttachments();
+  });
+}
+
+function pendingAttachmentOperationCount() {
+  return state.pendingAttachmentOperations.get(state.attachmentGeneration) || 0;
+}
+
+async function ingestAttachmentBatch(files, generation, draftKey) {
+  if (!attachmentOperationIsCurrent(generation, draftKey)) return;
+  const eligible = files.filter((file) => {
+    const name = file.name || "attachment";
+    if (new TextEncoder().encode(name).length > MAX_ATTACHMENT_NAME_BYTES || /[\u0000-\u001f\u007f-\u009f]/.test(name)) {
+      notice(`${name} has an invalid or overlong file name.`, "error");
+      return false;
+    }
+    if (file.size <= 0) {
+      notice(`${name} is empty.`, "error");
+      return false;
+    }
+    if (file.size > MAX_ATTACHMENT_BYTES) {
+      notice(`${name} exceeds the 25 MB limit.`, "error");
+      return false;
+    }
+    return true;
+  });
+  if (state.pendingAttachments.length + eligible.length > MAX_ATTACHMENTS_PER_MESSAGE) {
+    notice(`Attach at most ${MAX_ATTACHMENTS_PER_MESSAGE} files per message.`, "error");
+    return;
+  }
+  const pendingBytes = state.pendingAttachments.reduce(
+    (total, attachment) => total + attachment.size, 0);
+  const addedBytes = eligible.reduce((total, file) => total + file.size, 0);
+  if (pendingBytes + addedBytes > MAX_TOTAL_ATTACHMENT_BYTES) {
+    notice("Attachments exceed the 25 MB total limit.", "error");
+    return;
+  }
+  for (const file of eligible) {
+    try {
+      const [data_base64, header] = await Promise.all([
+        fileToBase64(file),
+        file.slice(0, 16).arrayBuffer()
+      ]);
+      if (!attachmentOperationIsCurrent(generation, draftKey)) return;
+      const declaredMime = normalizedAttachmentMime(file.type);
+      const detectedMime = detectSupportedImageMime(new Uint8Array(header));
+      const imageMime = detectedMime;
+      const fileMime = declaredMime.startsWith("image/")
+        ? "application/octet-stream" : declaredMime;
+      state.pendingAttachments.push({
+        name: file.name || "attachment",
+        mime_type: imageMime || fileMime,
+        size: file.size,
+        kind: imageMime ? "image" : "file",
+        data_base64
+      });
+    } catch (e) {
+      if (!attachmentOperationIsCurrent(generation, draftKey)) return;
+      notice(`Could not attach ${file.name || "file"}: ${e.message}`, "error");
+    }
+  }
+  renderPendingAttachments();
+}
+
+function attachmentOperationIsCurrent(generation, draftKey) {
+  return generation === state.attachmentGeneration && draftKey === composerDraftKey();
+}
+
+function composerCanAcceptAttachments() {
+  const draft = isDraftThread();
+  const hasThreadSurface = !!state.threadId || draft;
+  return hasThreadSurface && !(state.threadReadOnly && !draft) && !(draft && state.activeTurn);
+}
+
+function initComposerFileDrop() {
+  const composer = $("composer");
+  let dragDepth = 0;
+  const clearDrag = () => {
+    dragDepth = 0;
+    composer.classList.remove("drag-over");
+  };
+
+  composer.addEventListener("dragenter", (e) => {
+    if (!dragEventHasFiles(e) || !composerCanAcceptAttachments()) return;
+    e.preventDefault();
+    dragDepth += 1;
+    composer.classList.add("drag-over");
+  });
+  composer.addEventListener("dragover", (e) => {
+    if (!dragEventHasFiles(e) || !composerCanAcceptAttachments()) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+    composer.classList.add("drag-over");
+  });
+  composer.addEventListener("dragleave", (e) => {
+    if (!dragEventHasFiles(e)) return;
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) composer.classList.remove("drag-over");
+  });
+  composer.addEventListener("drop", async (e) => {
+    if (!dragEventHasFiles(e) || !composerCanAcceptAttachments()) return;
+    e.preventDefault();
+    clearDrag();
+    await attachFiles(Array.from(e.dataTransfer.files || []));
+  });
+  composer.addEventListener("dragend", clearDrag);
+}
+
+function dragEventHasFiles(e) {
+  const types = e.dataTransfer && e.dataTransfer.types;
+  return !!types && Array.from(types).includes("Files");
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    activeAttachmentReaders.add(reader);
+    const finish = (callback, value) => {
+      activeAttachmentReaders.delete(reader);
+      callback(value);
+    };
+    reader.onerror = () => finish(reject, reader.error || new Error("file read failed"));
+    reader.onabort = () => finish(reject, new Error("file read canceled"));
+    reader.onload = () => {
+      const result = typeof reader.result === "string" ? reader.result : "";
+      const separator = result.indexOf(",");
+      if (separator < 0) finish(reject, new Error("file encoding failed"));
+      else finish(resolve, result.slice(separator + 1));
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function detectSupportedImageMime(bytes) {
+  const prefix = (...values) => values.every((byte, index) => bytes[index] === byte);
+  if (bytes.length >= 8 && prefix(0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a)) {
+    return "image/png";
+  }
+  if (bytes.length >= 3 && prefix(0xff,0xd8,0xff)) return "image/jpeg";
+  if (bytes.length >= 6 &&
+      (prefix(0x47,0x49,0x46,0x38,0x37,0x61) ||
+       prefix(0x47,0x49,0x46,0x38,0x39,0x61))) {
+    return "image/gif";
+  }
+  if (bytes.length >= 12 && prefix(0x52,0x49,0x46,0x46) &&
+      bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) {
+    return "image/webp";
+  }
+  return null;
+}
+
+function normalizedAttachmentMime(value) {
+  const mime = (value || "").trim().toLowerCase();
+  const token = "[a-z0-9!#$&^_.+-]+";
+  return mime.length <= MAX_ATTACHMENT_MIME_BYTES && new RegExp(`^${token}/${token}$`).test(mime)
+    ? mime : "application/octet-stream";
+}
+
+function renderPendingAttachments() {
+  const tray = $("attachmentTray");
+  tray.innerHTML = "";
+  const loading = pendingAttachmentOperationCount() > 0;
+  tray.hidden = state.pendingAttachments.length === 0 && !loading;
+  state.pendingAttachments.forEach((attachment, index) => {
+    const chip = document.createElement("div");
+    chip.className = "attachment-chip";
+    const name = document.createElement("span");
+    name.className = "attachment-chip-name";
+    name.textContent = attachment.name;
+    const size = document.createElement("span");
+    size.className = "attachment-chip-size";
+    size.textContent = formatAttachmentSize(attachment.size);
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.title = `Remove ${attachment.name}`;
+    remove.setAttribute("aria-label", `Remove ${attachment.name}`);
+    remove.textContent = "×";
+    remove.onclick = () => {
+      state.pendingAttachments.splice(index, 1);
+      renderPendingAttachments();
+    };
+    chip.append(name, size, remove);
+    tray.append(chip);
+  });
+  if (loading) {
+    const status = document.createElement("span");
+    status.className = "attachment-loading";
+    status.textContent = "Loading attachments…";
+    tray.append(status);
+  }
+}
+
+function clearPendingAttachments() {
+  state.attachmentGeneration += 1;
+  for (const reader of activeAttachmentReaders) reader.abort();
+  activeAttachmentReaders.clear();
+  attachmentIngestQueue = Promise.resolve();
+  state.pendingAttachments = [];
+  renderPendingAttachments();
+}
+
+function formatAttachmentSize(size) {
+  if (size >= 1024 * 1024) return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+  if (size >= 1024) return `${Math.ceil(size / 1024)} KB`;
+  return `${size} B`;
+}
+
+function pendingUserDisplayText(text, attachments) {
+  const names = (attachments || []).map(a => a.name).filter(Boolean);
+  if (!names.length) return text;
+  const suffix = names.length === 1 ? `[Attached: ${names[0]}]` : `[Attached: ${names.length} files]`;
+  return text ? `${text}\n\n${suffix}` : suffix;
+}
+
+function markAttachmentUserInput(msg, attachments) {
+  if (msg && attachments && attachments.length) msg.dataset.preserveUserInputDisplay = "true";
+}
+
+function preservesUserInputDisplay(element) {
+  const msg = element && element.classList && element.classList.contains("msg")
+    ? element : element && element.parentElement;
+  return !!(msg && msg.dataset.preserveUserInputDisplay === "true");
+}
+
+function persistedUserInputDisplayText(userInput) {
+  if (!userInput) return "";
+  return pendingUserDisplayText(userInput.text || "", userInput.attachments || []);
+}
+
+function userMessageItemWithText(item, text) {
+  if (item && item.payload) {
+    return { ...item, payload:{ ...item.payload, text } };
+  }
+  return { ...item, text };
 }
 
 function interruptTurn() {
@@ -6709,6 +7027,7 @@ document.addEventListener("click", (e) => {
 function notice(text, severity) {
   const cls = severity===true || severity==="error" ? " err" : severity==="warning" ? " warn" : "";
   const el = document.createElement("div"); el.className="notice"+cls; el.textContent=text;
+  el.setAttribute("role", cls ? "alert" : "status");
   $("notices").prepend(el); setTimeout(()=>el.remove(), 8000);
 }
 function escapeHtml(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }

@@ -186,6 +186,7 @@ async fn token_ledgers_and_dashboard() {
         serde_json::to_string(&ClientMessage::SendInput {
             thread_id,
             text: "go".into(),
+            attachments: Vec::new(),
         })
         .unwrap()
         .into(),

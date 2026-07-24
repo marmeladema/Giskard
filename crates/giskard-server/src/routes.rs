@@ -6,13 +6,14 @@ use std::time::Duration;
 use axum::{
     Router,
     extract::{
-        Path as AxumPath, Query, State,
+        DefaultBodyLimit, Path as AxumPath, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     middleware,
     response::{IntoResponse, Json},
     routing::{delete, get, patch, post},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::Utc;
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};
@@ -44,6 +45,13 @@ const PROJECT_LIFECYCLE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_THREAD_TITLE_CHARS: usize = 120;
 const GENERATED_THREAD_TITLE_CHARS: usize = 72;
 const GENERATED_THREAD_TITLE_WORDS: usize = 8;
+const MAX_ATTACHMENTS_PER_MESSAGE: usize = 8;
+const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+const MAX_TOTAL_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+const MAX_ATTACHMENT_HTTP_BODY_BYTES: usize = 40 * 1024 * 1024;
+const MAX_WS_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_ATTACHMENT_NAME_BYTES: usize = 255;
+const MAX_ATTACHMENT_MIME_BYTES: usize = 127;
 
 pub fn protected_routes(state: AppState) -> Router<AppState> {
     Router::new()
@@ -58,7 +66,8 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
         )
         .route(
             "/api/projects/{id}/threads/start",
-            post(start_thread_with_message),
+            post(start_thread_with_message)
+                .layer(DefaultBodyLimit::max(MAX_ATTACHMENT_HTTP_BODY_BYTES)),
         )
         .route(
             "/api/projects/{id}/threads/{parent_thread_id}/subagent-links/{item_id}/open",
@@ -820,11 +829,12 @@ async fn start_thread_with_message(
     Json(req): Json<StartThreadRequest>,
 ) -> Result<Json<StartThreadResponse>, ApiError> {
     let text = req.text.trim().to_string();
-    if text.is_empty() {
+    if text.is_empty() && req.attachments.is_empty() {
         return Err(ApiError::BadRequest(
-            "creating a new thread requires a non-empty message".into(),
+            "creating a new thread requires a message or attachment".into(),
         ));
     }
+    validate_user_attachments(&req.attachments)?;
 
     let app_config = state.store.load_config().await?;
     let mut project_config = state
@@ -888,7 +898,11 @@ async fn start_thread_with_message(
     }
 
     let now = Utc::now();
-    let title = thread_title_from_first_prompt(&text);
+    let title = if text.is_empty() {
+        thread_title_from_attachments(&req.attachments)
+    } else {
+        thread_title_from_first_prompt(&text)
+    };
     let thread_file = ThreadFile {
         version: 1,
         id: thread_id,
@@ -932,7 +946,7 @@ async fn start_thread_with_message(
         .registry
         .start_turn(
             thread_id,
-            UserInput::text(text),
+            UserInput::text_with_attachments(text, req.attachments),
             overrides,
             model_ref.clone(),
         )
@@ -1004,6 +1018,152 @@ fn thread_title_from_first_prompt(prompt: &str) -> String {
     } else {
         candidate
     }
+}
+
+fn thread_title_from_attachments(attachments: &[UserAttachment]) -> String {
+    let Some(first) = attachments.first() else {
+        return "New thread".into();
+    };
+    let name = collapse_whitespace(&first.name);
+    let title = if attachments.len() == 1 {
+        format!("Attached {name}")
+    } else {
+        format!("Attached {name} and {} more", attachments.len() - 1)
+    };
+    truncate_title(&title, GENERATED_THREAD_TITLE_CHARS)
+}
+
+fn validate_user_attachments(attachments: &[UserAttachment]) -> Result<(), ApiError> {
+    if attachments.len() > MAX_ATTACHMENTS_PER_MESSAGE {
+        return Err(ApiError::BadRequest(format!(
+            "at most {MAX_ATTACHMENTS_PER_MESSAGE} attachments are allowed"
+        )));
+    }
+    let mut total_bytes = 0_usize;
+    for attachment in attachments {
+        total_bytes = checked_attachment_total(total_bytes, validate_user_attachment(attachment)?)?;
+    }
+    Ok(())
+}
+
+fn checked_attachment_total(current: usize, added: usize) -> Result<usize, ApiError> {
+    let total = current
+        .checked_add(added)
+        .ok_or_else(|| ApiError::BadRequest("attachment sizes overflowed".into()))?;
+    if total > MAX_TOTAL_ATTACHMENT_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "attachments exceed the {MAX_TOTAL_ATTACHMENT_BYTES} byte total limit"
+        )));
+    }
+    Ok(total)
+}
+
+fn validate_user_attachment(attachment: &UserAttachment) -> Result<usize, ApiError> {
+    let name = attachment.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::BadRequest("attachment name is required".into()));
+    }
+    if name.len() > MAX_ATTACHMENT_NAME_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "attachment name exceeds the {MAX_ATTACHMENT_NAME_BYTES} byte limit"
+        )));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(ApiError::BadRequest(
+            "attachment name contains control characters".into(),
+        ));
+    }
+    let mime_type = attachment.mime_type.trim().to_ascii_lowercase();
+    if mime_type.is_empty() {
+        return Err(ApiError::BadRequest(
+            "attachment MIME type is required".into(),
+        ));
+    }
+    if mime_type.len() > MAX_ATTACHMENT_MIME_BYTES || !is_valid_mime_type(&mime_type) {
+        return Err(ApiError::BadRequest(format!(
+            "attachment {} has an invalid MIME type",
+            attachment.name
+        )));
+    }
+    if attachment.data_base64.is_empty() {
+        return Err(ApiError::BadRequest("attachment data is required".into()));
+    }
+    let decoded = BASE64_STANDARD
+        .decode(&attachment.data_base64)
+        .map_err(|err| {
+            ApiError::BadRequest(format!(
+                "attachment {} is not valid base64: {err}",
+                attachment.name
+            ))
+        })?;
+    if decoded.is_empty() {
+        return Err(ApiError::BadRequest(format!(
+            "attachment {} is empty",
+            attachment.name
+        )));
+    }
+    if decoded.len() > MAX_ATTACHMENT_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "attachment {} exceeds the {} byte limit",
+            attachment.name, MAX_ATTACHMENT_BYTES
+        )));
+    }
+    if attachment.size != decoded.len() as u64 {
+        return Err(ApiError::BadRequest(format!(
+            "attachment {} size does not match its decoded data",
+            attachment.name
+        )));
+    }
+    if attachment.kind == AttachmentKind::Image {
+        let detected_mime = detect_supported_image_mime(&decoded).ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "attachment {} does not contain a supported image",
+                attachment.name
+            ))
+        })?;
+        if mime_type != detected_mime {
+            return Err(ApiError::BadRequest(format!(
+                "attachment {} MIME type does not match its image data",
+                attachment.name
+            )));
+        }
+    }
+    Ok(decoded.len())
+}
+
+fn is_valid_mime_type(mime_type: &str) -> bool {
+    fn is_token(value: &str) -> bool {
+        !value.is_empty()
+            && value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(
+                        byte,
+                        b'!' | b'#' | b'$' | b'&' | b'^' | b'_' | b'.' | b'+' | b'-'
+                    )
+            })
+    }
+
+    let mut parts = mime_type.split('/');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(type_name), Some(subtype), None) if is_token(type_name) && is_token(subtype)
+    )
+}
+
+fn detect_supported_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
 }
 
 fn ticket_key(text: &str) -> Option<String> {
@@ -1674,6 +1834,115 @@ fn main() {}
             thread_title_from_first_prompt("> 1. Revisit creation flow?"),
             "Revisit creation flow"
         );
+    }
+
+    #[test]
+    fn attachment_title_uses_uploaded_file_name() {
+        let title = thread_title_from_attachments(&[
+            UserAttachment {
+                name: "design.pdf".into(),
+                mime_type: "application/pdf".into(),
+                size: 4,
+                kind: AttachmentKind::File,
+                data_base64: "ZmlsZQ==".into(),
+            },
+            UserAttachment {
+                name: "diagram.png".into(),
+                mime_type: "image/png".into(),
+                size: 5,
+                kind: AttachmentKind::Image,
+                data_base64: "aW1hZ2U=".into(),
+            },
+        ]);
+
+        assert_eq!(title, "Attached design.pdf and 1 more");
+    }
+
+    #[test]
+    fn validates_supported_image_attachment() {
+        validate_user_attachments(&[UserAttachment {
+            name: "diagram.png".into(),
+            mime_type: "image/png".into(),
+            size: 68,
+            kind: AttachmentKind::Image,
+            data_base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".into(),
+        }])
+        .unwrap();
+    }
+
+    #[test]
+    fn rejects_attachment_with_mismatched_size() {
+        let err = validate_user_attachments(&[UserAttachment {
+            name: "notes.pdf".into(),
+            mime_type: "application/pdf".into(),
+            size: 999,
+            kind: AttachmentKind::File,
+            data_base64: "ZmlsZQ==".into(),
+        }])
+        .unwrap_err();
+
+        assert!(err.to_string().contains("size does not match"));
+    }
+
+    #[test]
+    fn rejects_image_mime_that_does_not_match_the_bytes() {
+        let err = validate_user_attachments(&[UserAttachment {
+            name: "diagram.bmp".into(),
+            mime_type: "image/bmp".into(),
+            size: 68,
+            kind: AttachmentKind::Image,
+            data_base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".into(),
+        }])
+        .unwrap_err();
+
+        assert!(err.to_string().contains("MIME type does not match"));
+    }
+
+    #[test]
+    fn rejects_malformed_image_bytes() {
+        let err = validate_user_attachments(&[UserAttachment {
+            name: "diagram.png".into(),
+            mime_type: "image/png".into(),
+            size: 5,
+            kind: AttachmentKind::Image,
+            data_base64: "aW1hZ2U=".into(),
+        }])
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("does not contain a supported image")
+        );
+    }
+
+    #[test]
+    fn rejects_unbounded_or_control_character_metadata() {
+        let long_name = "x".repeat(MAX_ATTACHMENT_NAME_BYTES + 1);
+        let err = validate_user_attachments(&[UserAttachment {
+            name: long_name,
+            mime_type: "application/pdf".into(),
+            size: 4,
+            kind: AttachmentKind::File,
+            data_base64: "ZmlsZQ==".into(),
+        }])
+        .unwrap_err();
+        assert!(err.to_string().contains("name exceeds"));
+
+        let err = validate_user_attachments(&[UserAttachment {
+            name: "notes\ninstructions.pdf".into(),
+            mime_type: "application/pdf".into(),
+            size: 4,
+            kind: AttachmentKind::File,
+            data_base64: "ZmlsZQ==".into(),
+        }])
+        .unwrap_err();
+        assert!(err.to_string().contains("control characters"));
+    }
+
+    #[test]
+    fn rejects_attachments_over_total_size_limit() {
+        let err = checked_attachment_total(MAX_TOTAL_ATTACHMENT_BYTES - 1, 2).unwrap_err();
+        assert!(err.to_string().contains("total limit"));
     }
 
     #[test]
@@ -2372,7 +2641,10 @@ async fn ws_handler(
         return Err(axum::http::StatusCode::UNAUTHORIZED);
     }
 
-    Ok(ws.on_upgrade(move |socket| handle_ws(socket, state)))
+    Ok(ws
+        .max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_ws(socket, state)))
 }
 
 #[derive(Debug, Clone)]
@@ -2771,7 +3043,31 @@ async fn handle_client_msg(
         ClientMessage::Unsubscribe { thread_id } => {
             state.hub.unsubscribe(thread_id, client_id).await;
         }
-        ClientMessage::SendInput { thread_id, text } => {
+        ClientMessage::SendInput {
+            thread_id,
+            text,
+            attachments,
+        } => {
+            let text = text.trim().to_string();
+            if text.is_empty() && attachments.is_empty() {
+                return Err(WsError::new(
+                    "empty_input",
+                    ErrorSeverity::Error,
+                    "Send a message or attach a file.",
+                )
+                .thread(thread_id)
+                .action("send_input"));
+            }
+            validate_user_attachments(&attachments).map_err(|error| {
+                WsError::new(
+                    "invalid_attachment",
+                    ErrorSeverity::Error,
+                    "One or more attachments could not be sent.",
+                )
+                .detail(error.to_string())
+                .thread(thread_id)
+                .action("send_input")
+            })?;
             let project_id = project_for(state, thread_id, "send_input").await?;
             let app_config = state
                 .store
@@ -2840,7 +3136,12 @@ async fn handle_client_msg(
 
             state
                 .registry
-                .start_turn(thread_id, UserInput::text(text), overrides, effective_model)
+                .start_turn(
+                    thread_id,
+                    UserInput::text_with_attachments(text, attachments),
+                    overrides,
+                    effective_model,
+                )
                 .await
                 .map_err(|e| WsError::from_harness(e, "send_input", Some(thread_id)))?;
         }
@@ -3890,6 +4191,19 @@ pub enum ApiError {
     Conflict(String),
     Unavailable(String),
     Internal(String),
+}
+
+impl fmt::Display for ApiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ApiError::NotFound => write!(f, "not found"),
+            ApiError::BadRequest(msg)
+            | ApiError::Forbidden(msg)
+            | ApiError::Conflict(msg)
+            | ApiError::Unavailable(msg)
+            | ApiError::Internal(msg) => f.write_str(msg),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {

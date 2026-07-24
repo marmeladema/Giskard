@@ -1348,11 +1348,27 @@ impl ApprovalResponse {
 
 pub fn map_user_input(input: &giskard_core::user_input::UserInput) -> Vec<codex_codes::UserInput> {
     match input {
-        giskard_core::user_input::UserInput::Text { text } => {
-            vec![codex_codes::UserInput::Text {
-                text: text.clone(),
-                text_elements: None,
-            }]
+        giskard_core::user_input::UserInput::Text { text, attachments } => {
+            let mut input = Vec::new();
+            if !text.is_empty() {
+                input.push(codex_codes::UserInput::Text {
+                    text: text.clone(),
+                    text_elements: None,
+                });
+            }
+            input.extend(attachments.iter().filter_map(|attachment| {
+                if attachment.kind != giskard_core::AttachmentKind::Image {
+                    return None;
+                }
+                Some(codex_codes::UserInput::Image {
+                    detail: None,
+                    url: format!(
+                        "data:{};base64,{}",
+                        attachment.mime_type, attachment.data_base64
+                    ),
+                })
+            }));
+            input
         }
     }
 }
@@ -2849,6 +2865,31 @@ fn parse_hunk_header(line: &str) -> Option<(u32, u32, u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachment_only_user_input_maps_without_empty_text() {
+        let input = giskard_core::UserInput::text_with_attachments(
+            "",
+            vec![giskard_core::UserAttachment {
+                name: "diagram.png".into(),
+                mime_type: "image/png".into(),
+                size: 5,
+                kind: giskard_core::AttachmentKind::Image,
+                data_base64: "aW1hZ2U=".into(),
+            }],
+        );
+
+        let mapped = map_user_input(&input);
+
+        assert_eq!(mapped.len(), 1);
+        match &mapped[0] {
+            codex_codes::UserInput::Image { url, detail } => {
+                assert_eq!(url, "data:image/png;base64,aW1hZ2U=");
+                assert!(detail.is_none());
+            }
+            other => panic!("expected one image input, got {other:?}"),
+        }
+    }
 
     #[test]
     fn map_effort_passes_arbitrary_strings_through() {

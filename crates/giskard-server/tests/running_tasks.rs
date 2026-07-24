@@ -270,6 +270,7 @@ async fn running_tool_call_surfaces_in_running_tasks_snapshot() {
     ws.send(ws_text(&ClientMessage::SendInput {
         thread_id,
         text: "search wikipedia".into(),
+        attachments: Vec::new(),
     }))
     .await
     .unwrap();

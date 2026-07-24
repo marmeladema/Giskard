@@ -296,6 +296,7 @@ wire_api = "responses"
     ws.send(ws_text(&ClientMessage::SendInput {
         thread_id,
         text: "plan it".into(),
+        attachments: Vec::new(),
     }))
     .await
     .unwrap();
@@ -343,6 +344,7 @@ wire_api = "responses"
     ws.send(ws_text(&ClientMessage::SendInput {
         thread_id,
         text: "again".into(),
+        attachments: Vec::new(),
     }))
     .await
     .unwrap();
@@ -385,6 +387,7 @@ wire_api = "responses"
     ws.send(ws_text(&ClientMessage::SendInput {
         thread_id,
         text: "default effort".into(),
+        attachments: Vec::new(),
     }))
     .await
     .unwrap();

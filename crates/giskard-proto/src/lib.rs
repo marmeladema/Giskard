@@ -37,6 +37,7 @@ pub use giskard_core::model::{Effort, ModelDescriptor, ModelRef};
 pub use giskard_core::server_request::{ServerRequest, ServerRequestResponse};
 pub use giskard_core::token::{ByModel, DailyTokenLedger, TokenLedger, TokenUsage};
 pub use giskard_core::turn::{ApprovalPolicy, Mode, TurnStatus, TurnStatusKind};
+pub use giskard_core::user_input::{AttachmentKind, UserAttachment};
 
 // ---- Client → Server ----
 
@@ -58,6 +59,8 @@ pub enum ClientMessage {
     SendInput {
         thread_id: ThreadId,
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<UserAttachment>,
     },
     SwitchMode {
         thread_id: ThreadId,
@@ -367,6 +370,8 @@ pub struct OpenThreadResponse {
 #[derive(Debug, Clone, Deserialize)]
 pub struct StartThreadRequest {
     pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<UserAttachment>,
     pub model_ref: ModelRef,
     pub mode: Mode,
     pub approval_policy: ApprovalPolicy,
@@ -550,12 +555,42 @@ mod tests {
         let msg = ClientMessage::SendInput {
             thread_id: ThreadId::new(),
             text: "Refactor the auth module".into(),
+            attachments: Vec::new(),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"send_input\""));
         let back: ClientMessage = serde_json::from_str(&json).unwrap();
         match back {
             ClientMessage::SendInput { text, .. } => assert_eq!(text, "Refactor the auth module"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn client_message_send_input_serde_with_attachments() {
+        let msg = ClientMessage::SendInput {
+            thread_id: ThreadId::new(),
+            text: "Inspect this".into(),
+            attachments: vec![UserAttachment {
+                name: "diagram.png".into(),
+                mime_type: "image/png".into(),
+                size: 12,
+                kind: AttachmentKind::Image,
+                data_base64: "aW1hZ2U=".into(),
+            }],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"data_base64\":\"aW1hZ2U=\""));
+        let back: ClientMessage = serde_json::from_str(&json).unwrap();
+        match back {
+            ClientMessage::SendInput {
+                text, attachments, ..
+            } => {
+                assert_eq!(text, "Inspect this");
+                assert_eq!(attachments.len(), 1);
+                assert_eq!(attachments[0].kind, AttachmentKind::Image);
+                assert_eq!(attachments[0].data_base64, "aW1hZ2U=");
+            }
             _ => panic!("wrong variant"),
         }
     }
