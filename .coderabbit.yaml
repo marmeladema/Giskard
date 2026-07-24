@@ -27,7 +27,7 @@ reviews:
   path_instructions:
     - path: "crates/**/*.rs"
       instructions: >-
-        Rust, edition 2024 (MSRV 1.85). In runtime (non-test) paths, flag `unwrap`, `expect`,
+        Rust, edition 2024 (MSRV 1.88). In runtime (non-test) paths, flag `unwrap`, `expect`,
         `panic!`, `todo!`, or `unreachable!` unless the condition is proven infallible in local
         context; prefer typed errors, logging, or a structured browser error. Failures must be
         visible at the right boundary: browser-action failures over HTTP/WebSocket, server/operator

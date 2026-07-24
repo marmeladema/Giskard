@@ -88,20 +88,21 @@ pub fn linkify_text(text: &str, workspace_root: &Path) -> Vec<LinkSpan> {
         }
 
         let resolved = resolve_path(path_str, workspace_root);
-        if let Some(full_path) = resolved {
-            if full_path.exists() && full_path.is_file() {
-                let relative = full_path
-                    .strip_prefix(workspace_root)
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| full_path.to_string_lossy().to_string());
+        if let Some(full_path) = resolved
+            && full_path.exists()
+            && full_path.is_file()
+        {
+            let relative = full_path
+                .strip_prefix(workspace_root)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| full_path.to_string_lossy().to_string());
 
-                spans.push(LinkSpan {
-                    start: mat.start(),
-                    end,
-                    path: relative,
-                    line,
-                });
-            }
+            spans.push(LinkSpan {
+                start: mat.start(),
+                end,
+                path: relative,
+                line,
+            });
         }
     }
     spans
@@ -127,10 +128,10 @@ fn split_line_fragment(candidate: &str) -> (&str, Option<usize>) {
         return (candidate, None);
     };
 
-    if let Some((path, maybe_line)) = before_last_colon.rsplit_once(':') {
-        if let Some(line) = parse_positive_usize(maybe_line) {
-            return (path, Some(line));
-        }
+    if let Some((path, maybe_line)) = before_last_colon.rsplit_once(':')
+        && let Some(line) = parse_positive_usize(maybe_line)
+    {
+        return (path, Some(line));
     }
 
     (before_last_colon, Some(last_number))

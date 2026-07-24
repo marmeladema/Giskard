@@ -502,10 +502,10 @@ impl CodexMapper {
                 let thread = self.resolve_thread(&n.thread_id, fallback_thread)?;
                 let turn = self.resolve_turn(thread, &n.turn_id);
                 let mut lines = Vec::new();
-                if let Some(explanation) = &n.explanation {
-                    if !explanation.trim().is_empty() {
-                        lines.push(explanation.clone());
-                    }
+                if let Some(explanation) = &n.explanation
+                    && !explanation.trim().is_empty()
+                {
+                    lines.push(explanation.clone());
                 }
                 for step in &n.plan {
                     lines.push(format!("{}: {}", enum_string(&step.status), step.step));
@@ -1642,14 +1642,14 @@ fn add_permission_profile_metadata(
     if let Some(file_system) = &permissions.file_system {
         add_file_system_permissions_metadata(metadata, workspace_root, file_system);
     }
-    if let Some(network) = &permissions.network {
-        if let Some(enabled) = network.enabled {
-            add_text_metadata(
-                metadata,
-                "Network access",
-                if enabled { "enabled" } else { "disabled" },
-            );
-        }
+    if let Some(network) = &permissions.network
+        && let Some(enabled) = network.enabled
+    {
+        add_text_metadata(
+            metadata,
+            "Network access",
+            if enabled { "enabled" } else { "disabled" },
+        );
     }
 }
 

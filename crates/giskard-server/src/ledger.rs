@@ -90,10 +90,10 @@ async fn actor(store: Arc<PersistStore>, mut rx: mpsc::Receiver<Record>) {
             warn!(%e, "failed to persist global token ledger");
         }
         for pid in dirty {
-            if let Some(ledger) = projects.get(&pid) {
-                if let Err(e) = store.save_project_tokens(pid, ledger).await {
-                    warn!(%pid, %e, "failed to persist project token ledger");
-                }
+            if let Some(ledger) = projects.get(&pid)
+                && let Err(e) = store.save_project_tokens(pid, ledger).await
+            {
+                warn!(%pid, %e, "failed to persist project token ledger");
             }
         }
     }

@@ -2681,41 +2681,39 @@ async fn forward_events(
                     } else if owned_turn_completed {
                         continue;
                     }
-                } else if let Some(turn) = event_turn {
-                    if !seen_turn_ids.contains(&turn) {
-                        owned_turn = Some(turn);
-                        if !matches!(event, AgentEvent::TurnStarted { .. }) {
-                            debug!(
-                                %thread_id,
-                                %turn,
-                                "event forwarder attached to turn before seeing turn start"
-                            );
-                        }
+                } else if let Some(turn) = event_turn
+                    && !seen_turn_ids.contains(&turn)
+                {
+                    owned_turn = Some(turn);
+                    if !matches!(event, AgentEvent::TurnStarted { .. }) {
+                        debug!(
+                            %thread_id,
+                            %turn,
+                            "event forwarder attached to turn before seeing turn start"
+                        );
                     }
                 }
 
-                if let Some(turn) = event_turn {
-                    if seen_turn_ids.contains(&turn) {
-                        let command_state_changed =
-                            apply_seen_turn_running_command_event(&running_commands, &event).await;
-                        if command_state_changed {
-                            if is_terminal_command_completion(&event) {
-                                hub.broadcast_event(thread_id, event).await;
-                            }
-                            broadcast_running_commands(&hub, &running_commands, thread_id).await;
+                if let Some(turn) = event_turn
+                    && seen_turn_ids.contains(&turn)
+                {
+                    let command_state_changed =
+                        apply_seen_turn_running_command_event(&running_commands, &event).await;
+                    if command_state_changed {
+                        if is_terminal_command_completion(&event) {
+                            hub.broadcast_event(thread_id, event).await;
                         }
-                        if owned_turn_completed {
-                            if let Some(owned) = owned_turn {
-                                if !running_commands
-                                    .has_running_for_turn(thread_id, owned)
-                                    .await
-                                {
-                                    break ForwarderExitReason::AfterTurnCommandsDrained;
-                                }
-                            }
-                        }
-                        continue;
+                        broadcast_running_commands(&hub, &running_commands, thread_id).await;
                     }
+                    if owned_turn_completed
+                        && let Some(owned) = owned_turn
+                        && !running_commands
+                            .has_running_for_turn(thread_id, owned)
+                            .await
+                    {
+                        break ForwarderExitReason::AfterTurnCommandsDrained;
+                    }
+                    continue;
                 }
 
                 if owned_turn.is_none() && event_turn.is_none() {
@@ -2780,19 +2778,19 @@ async fn forward_events(
 
                 if ctx.kind == TurnContextKind::PassiveSubagent {
                     refresh_passive_subagent_context(thread_id, &mut ctx).await;
-                    if let Some(turn) = event_turn {
-                        if !matches!(event, AgentEvent::TurnStarted { .. }) {
-                            synthesize_passive_subagent_prompt_item(
-                                thread_id,
-                                turn,
-                                &ctx,
-                                &mut current_turn_items,
-                                &mut synthetic_subagent_prompt,
-                                &hub,
-                                &live_buffers,
-                            )
-                            .await;
-                        }
+                    if let Some(turn) = event_turn
+                        && !matches!(event, AgentEvent::TurnStarted { .. })
+                    {
+                        synthesize_passive_subagent_prompt_item(
+                            thread_id,
+                            turn,
+                            &ctx,
+                            &mut current_turn_items,
+                            &mut synthetic_subagent_prompt,
+                            &hub,
+                            &live_buffers,
+                        )
+                        .await;
                     }
                 }
 
@@ -2957,41 +2955,40 @@ async fn forward_events(
                 // reconnect buffer from the first turn-scoped event and reuse it when the delayed
                 // start arrives, otherwise a reload in that window loses the already-visible item.
                 let mut append_to_live_buffer = true;
-                if let Some(buffer_turn) = event_turn {
-                    if let Err(existing_turn) = live_buffers
+                if let Some(buffer_turn) = event_turn
+                    && let Err(existing_turn) = live_buffers
                         .ensure_turn_with_user_input(
                             thread_id,
                             buffer_turn,
                             live_turn_user_input(&ctx),
                         )
                         .await
-                    {
-                        if matches!(event, AgentEvent::TurnStarted { .. }) {
-                            warn!(
-                                %project_id,
-                                %thread_id,
-                                %buffer_turn,
-                                %existing_turn,
-                                "replacing a stale live buffer when a new turn started"
-                            );
-                            live_buffers
-                                .replace_turn_with_user_input(
-                                    thread_id,
-                                    buffer_turn,
-                                    live_turn_user_input(&ctx),
-                                )
-                                .await;
-                        } else {
-                            error!(
-                                %project_id,
-                                %thread_id,
-                                %buffer_turn,
-                                %existing_turn,
-                                event_kind = event_kind(&event),
-                                "not buffering an event for a different turn; live delivery and persistence continue"
-                            );
-                            append_to_live_buffer = false;
-                        }
+                {
+                    if matches!(event, AgentEvent::TurnStarted { .. }) {
+                        warn!(
+                            %project_id,
+                            %thread_id,
+                            %buffer_turn,
+                            %existing_turn,
+                            "replacing a stale live buffer when a new turn started"
+                        );
+                        live_buffers
+                            .replace_turn_with_user_input(
+                                thread_id,
+                                buffer_turn,
+                                live_turn_user_input(&ctx),
+                            )
+                            .await;
+                    } else {
+                        error!(
+                            %project_id,
+                            %thread_id,
+                            %buffer_turn,
+                            %existing_turn,
+                            event_kind = event_kind(&event),
+                            "not buffering an event for a different turn; live delivery and persistence continue"
+                        );
+                        append_to_live_buffer = false;
                     }
                 }
                 if append_to_live_buffer && live_buffers.is_active(thread_id).await {
@@ -3061,19 +3058,17 @@ async fn forward_events(
                 broadcast_thread_activity(&hub, thread_id, &event, true).await;
                 broadcast_event_with_context(&hub, thread_id, event, &ctx).await;
 
-                if is_turn_start {
-                    if let Some(turn) = event_turn {
-                        synthesize_passive_subagent_prompt_item(
-                            thread_id,
-                            turn,
-                            &ctx,
-                            &mut current_turn_items,
-                            &mut synthetic_subagent_prompt,
-                            &hub,
-                            &live_buffers,
-                        )
-                        .await;
-                    }
+                if is_turn_start && let Some(turn) = event_turn {
+                    synthesize_passive_subagent_prompt_item(
+                        thread_id,
+                        turn,
+                        &ctx,
+                        &mut current_turn_items,
+                        &mut synthetic_subagent_prompt,
+                        &hub,
+                        &live_buffers,
+                    )
+                    .await;
                 }
 
                 if command_state_changed {
@@ -4460,14 +4455,14 @@ mod tests {
 
         let mut saw_item = false;
         while let Ok(message) = client_rx.try_recv() {
-            if let ServerMessage::Event { agent_event, .. } = message {
-                if let WireAgentEvent::ItemCompleted { item, .. } = *agent_event {
-                    saw_item = matches!(
-                        item.payload,
-                        giskard_proto::WireItemPayload::AgentMessage { ref text }
-                            if text == "Completed child work"
-                    );
-                }
+            if let ServerMessage::Event { agent_event, .. } = message
+                && let WireAgentEvent::ItemCompleted { item, .. } = *agent_event
+            {
+                saw_item = matches!(
+                    item.payload,
+                    giskard_proto::WireItemPayload::AgentMessage { ref text }
+                        if text == "Completed child work"
+                );
             }
         }
         assert!(saw_item, "fallback transcript should be broadcast live");
@@ -4986,20 +4981,19 @@ mod tests {
 
         let mut matching_updates = 0;
         while let Ok(message) = client_rx.try_recv() {
-            if let ServerMessage::Event { agent_event, .. } = message {
-                if let WireAgentEvent::ContextWindowUpdated {
+            if let ServerMessage::Event { agent_event, .. } = message
+                && let WireAgentEvent::ContextWindowUpdated {
                     thread,
                     turn,
                     model: event_model,
                     context_window,
                 } = *agent_event
-                {
-                    matching_updates += 1;
-                    assert_eq!(thread, thread_id);
-                    assert_eq!(turn, turn_id);
-                    assert_eq!(event_model, model);
-                    assert_eq!(context_window, 258_400);
-                }
+            {
+                matching_updates += 1;
+                assert_eq!(thread, thread_id);
+                assert_eq!(turn, turn_id);
+                assert_eq!(event_model, model);
+                assert_eq!(context_window, 258_400);
             }
         }
         assert_eq!(
@@ -6592,13 +6586,13 @@ mod tests {
             "earlier turn item must remain untouched"
         );
         while let Ok(message) = client_rx.try_recv() {
-            if let ServerMessage::Event { agent_event, .. } = message {
-                if let WireAgentEvent::ItemCompleted { item, .. } = *agent_event {
-                    assert_ne!(
-                        item.id, conflicting_item_id,
-                        "conflicting native identity must not be broadcast"
-                    );
-                }
+            if let ServerMessage::Event { agent_event, .. } = message
+                && let WireAgentEvent::ItemCompleted { item, .. } = *agent_event
+            {
+                assert_ne!(
+                    item.id, conflicting_item_id,
+                    "conflicting native identity must not be broadcast"
+                );
             }
         }
     }
@@ -6951,14 +6945,12 @@ mod tests {
             if let Ok(Some(ServerMessage::Event { agent_event, .. })) =
                 tokio::time::timeout(tokio::time::Duration::from_millis(100), client_rx.recv())
                     .await
-            {
-                if let WireAgentEvent::ItemDelta {
+                && let WireAgentEvent::ItemDelta {
                     delta: giskard_proto::ItemDelta::Text { text },
                     ..
                 } = *agent_event
-                {
-                    delta_texts.push(text);
-                }
+            {
+                delta_texts.push(text);
             }
         }
         assert_eq!(

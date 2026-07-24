@@ -486,10 +486,10 @@ where
 {
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     loop {
-        if let Ok(Some(tf)) = state.store.load_thread(pid, tid).await {
-            if pred(&tf) {
-                return tf;
-            }
+        if let Ok(Some(tf)) = state.store.load_thread(pid, tid).await
+            && pred(&tf)
+        {
+            return tf;
         }
         if tokio::time::Instant::now() >= deadline {
             panic!("thread predicate not satisfied in time");

@@ -200,10 +200,10 @@ fn command_output_item_id(event: &AgentEvent) -> Option<ItemId> {
 }
 
 fn compact_completed_command_output(mut event: AgentEvent) -> AgentEvent {
-    if let AgentEvent::ItemCompleted { item, .. } = &mut event {
-        if let ItemPayload::CommandExecution { output, .. } = &mut item.payload {
-            *output = compact_command_output(output);
-        }
+    if let AgentEvent::ItemCompleted { item, .. } = &mut event
+        && let ItemPayload::CommandExecution { output, .. } = &mut item.payload
+    {
+        *output = compact_command_output(output);
     }
     event
 }

@@ -1128,11 +1128,18 @@ async function deleteThread(pid, tid, title) {
     await api("DELETE", `/api/projects/${pid}/threads/${tid}`);
     // The server cascades to descendants it discovered itself, which can include children this
     // client never listed. Decide from the refreshed authoritative list whether the active view
-    // was deleted; keep the pre-request set as a fallback in case the sidebar reload fails.
+    // was deleted; keep the pre-request set as a fallback in case the sidebar reload fails
+    // (loadThreads swallows its own errors and leaves the cached list stale).
     const deletedIds = new Set([String(tid), ...descendants]);
-    const activeThread = state.threadId ? String(state.threadId) : null;
     await loadThreads(pid);
-    if (activeThread && (deletedIds.has(activeThread) || !knownThreadForId(pid, activeThread))) {
+    // Read the live view only after the awaits: the user may have navigated to another thread
+    // or another project meanwhile, and an unrelated active view must never be cleared.
+    const activeThread = state.threadId ? String(state.threadId) : null;
+    const sameProject = String(state.projectId || "") === String(pid);
+    if (
+      activeThread && sameProject &&
+      (deletedIds.has(activeThread) || !knownThreadForId(pid, activeThread))
+    ) {
       clearThreadView(activeThread);
     }
   } catch (e) {

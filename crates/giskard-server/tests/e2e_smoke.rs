@@ -264,10 +264,10 @@ impl ActivityHarness {
     async fn wait_for_subscribers(&self, thread: ThreadId, expected: usize) {
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
         loop {
-            if let Some(sender) = self.threads.lock().await.get(&thread) {
-                if sender.receiver_count() >= expected {
-                    return;
-                }
+            if let Some(sender) = self.threads.lock().await.get(&thread)
+                && sender.receiver_count() >= expected
+            {
+                return;
             }
             if tokio::time::Instant::now() >= deadline {
                 panic!("timed out waiting for {expected} subscribers on {thread}");
@@ -501,10 +501,10 @@ impl AgentHarness for UnsupportedCompactionHarness {
     }
 
     fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Ok(threads) = self.threads.try_lock() {
-            if let Some(sender) = threads.get(&thread.thread) {
-                return AgentEventStream::new(sender.subscribe());
-            }
+        if let Ok(threads) = self.threads.try_lock()
+            && let Some(sender) = threads.get(&thread.thread)
+        {
+            return AgentEventStream::new(sender.subscribe());
         }
         let (_, rx) = tokio::sync::broadcast::channel(1);
         AgentEventStream::new(rx)
@@ -623,10 +623,10 @@ impl AgentHarness for SlowCompactionHarness {
     }
 
     fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Ok(threads) = self.threads.try_lock() {
-            if let Some(sender) = threads.get(&thread.thread) {
-                return AgentEventStream::new(sender.subscribe());
-            }
+        if let Ok(threads) = self.threads.try_lock()
+            && let Some(sender) = threads.get(&thread.thread)
+        {
+            return AgentEventStream::new(sender.subscribe());
         }
         let (_, rx) = tokio::sync::broadcast::channel(1);
         AgentEventStream::new(rx)
@@ -1134,10 +1134,10 @@ impl AgentHarness for ActivityHarness {
     }
 
     fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Ok(threads) = self.threads.try_lock() {
-            if let Some(sender) = threads.get(&thread.thread) {
-                return AgentEventStream::new(sender.subscribe());
-            }
+        if let Ok(threads) = self.threads.try_lock()
+            && let Some(sender) = threads.get(&thread.thread)
+        {
+            return AgentEventStream::new(sender.subscribe());
         }
         let (_, rx) = tokio::sync::broadcast::channel(1);
         AgentEventStream::new(rx)
@@ -1283,10 +1283,10 @@ impl AgentHarness for SlowStartHarness {
     }
 
     fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Ok(threads) = self.threads.try_lock() {
-            if let Some(sender) = threads.get(&thread.thread) {
-                return AgentEventStream::new(sender.subscribe());
-            }
+        if let Ok(threads) = self.threads.try_lock()
+            && let Some(sender) = threads.get(&thread.thread)
+        {
+            return AgentEventStream::new(sender.subscribe());
         }
         let (_, rx) = tokio::sync::broadcast::channel(1);
         AgentEventStream::new(rx)
@@ -1396,10 +1396,10 @@ impl AgentHarness for CountingOpenHarness {
     }
 
     fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Ok(threads) = self.threads.try_lock() {
-            if let Some(sender) = threads.get(&thread.thread) {
-                return AgentEventStream::new(sender.subscribe());
-            }
+        if let Ok(threads) = self.threads.try_lock()
+            && let Some(sender) = threads.get(&thread.thread)
+        {
+            return AgentEventStream::new(sender.subscribe());
         }
         let (_, rx) = tokio::sync::broadcast::channel(1);
         AgentEventStream::new(rx)
@@ -2209,10 +2209,11 @@ async fn wait_for_ws_error(
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
-                if let Ok(ServerMessage::Error { error }) = serde_json::from_str(&text) {
-                    if error.action.as_deref() == Some(action) && error.code == code {
-                        return error;
-                    }
+                if let Ok(ServerMessage::Error { error }) = serde_json::from_str(&text)
+                    && error.action.as_deref() == Some(action)
+                    && error.code == code
+                {
+                    return error;
                 }
             }
             Ok(Some(Ok(_))) => {}
@@ -2236,12 +2237,10 @@ async fn wait_for_turn_completed(
                     thread_id: event_thread,
                     agent_event,
                 }) = serde_json::from_str(&text)
+                    && event_thread == thread_id
+                    && matches!(*agent_event, WireAgentEvent::TurnCompleted { .. })
                 {
-                    if event_thread == thread_id
-                        && matches!(*agent_event, WireAgentEvent::TurnCompleted { .. })
-                    {
-                        return;
-                    }
+                    return;
                 }
             }
             Ok(Some(Ok(_))) => {}
@@ -2267,12 +2266,10 @@ async fn wait_for_turn_started(
                     thread_id: event_thread,
                     agent_event,
                 }) = serde_json::from_str(&text)
+                    && event_thread == thread_id
+                    && let WireAgentEvent::TurnStarted { turn, .. } = *agent_event
                 {
-                    if event_thread == thread_id {
-                        if let WireAgentEvent::TurnStarted { turn, .. } = *agent_event {
-                            return turn;
-                        }
-                    }
+                    return turn;
                 }
             }
             Ok(Some(Ok(_))) => {}
@@ -2296,15 +2293,12 @@ async fn wait_for_turn_started_with_input(
                     thread_id: event_thread,
                     agent_event,
                 }) = serde_json::from_str(&text)
+                    && event_thread == thread_id
+                    && let WireAgentEvent::TurnStarted {
+                        turn, user_input, ..
+                    } = *agent_event
                 {
-                    if event_thread == thread_id {
-                        if let WireAgentEvent::TurnStarted {
-                            turn, user_input, ..
-                        } = *agent_event
-                        {
-                            return (turn, user_input);
-                        }
-                    }
+                    return (turn, user_input);
                 }
             }
             Ok(Some(Ok(_))) => {}
@@ -2324,10 +2318,10 @@ async fn wait_for_thread_state(
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
-                if let Ok(ServerMessage::ThreadState(state)) = serde_json::from_str(&text) {
-                    if state.thread_id == thread_id {
-                        return;
-                    }
+                if let Ok(ServerMessage::ThreadState(state)) = serde_json::from_str(&text)
+                    && state.thread_id == thread_id
+                {
+                    return;
                 }
             }
             Ok(Some(Ok(_))) => {}
@@ -2352,18 +2346,15 @@ async fn wait_for_agent_message_item(
                     thread_id: event_thread,
                     agent_event,
                 }) = serde_json::from_str(&text)
+                    && event_thread == thread_id
+                    && let WireAgentEvent::ItemCompleted { turn, item, .. } = *agent_event
+                    && matches!(
+                        item.payload,
+                        giskard_proto::WireItemPayload::AgentMessage { ref text }
+                            if text == expected_text
+                    )
                 {
-                    if event_thread == thread_id {
-                        if let WireAgentEvent::ItemCompleted { turn, item, .. } = *agent_event {
-                            if matches!(
-                                item.payload,
-                                giskard_proto::WireItemPayload::AgentMessage { ref text }
-                                    if text == expected_text
-                            ) {
-                                return turn;
-                            }
-                        }
-                    }
+                    return turn;
                 }
             }
             Ok(Some(Ok(_))) => {}
@@ -2388,19 +2379,15 @@ async fn wait_for_command_started(
                     thread_id: event_thread,
                     agent_event,
                 }) = serde_json::from_str(&text)
+                    && event_thread == thread_id
+                    && let WireAgentEvent::ItemStarted { turn, item, .. } = *agent_event
+                    && item.kind == ItemKind::CommandExecution
+                    && matches!(
+                        item.command,
+                        Some(command) if command.command == expected_command
+                    )
                 {
-                    if event_thread == thread_id {
-                        if let WireAgentEvent::ItemStarted { turn, item, .. } = *agent_event {
-                            if item.kind == ItemKind::CommandExecution
-                                && matches!(
-                                    item.command,
-                                    Some(command) if command.command == expected_command
-                                )
-                            {
-                                return turn;
-                            }
-                        }
-                    }
+                    return turn;
                 }
             }
             Ok(Some(Ok(_))) => {}
@@ -2424,12 +2411,10 @@ async fn wait_for_approval_request(
                     thread_id: event_thread,
                     agent_event,
                 }) = serde_json::from_str(&text)
+                    && event_thread == thread_id
+                    && let WireAgentEvent::ApprovalRequested { request, .. } = *agent_event
                 {
-                    if event_thread == thread_id {
-                        if let WireAgentEvent::ApprovalRequested { request, .. } = *agent_event {
-                            return request.id.to_string();
-                        }
-                    }
+                    return request.id.to_string();
                 }
             }
             Ok(Some(Ok(_))) => {}
@@ -2455,10 +2440,10 @@ async fn wait_for_approval_resolved(
                     request_id: resolved_request,
                     decision,
                 }) = serde_json::from_str(&text)
+                    && resolved_thread == thread_id
+                    && resolved_request == request_id
                 {
-                    if resolved_thread == thread_id && resolved_request == request_id {
-                        return decision;
-                    }
+                    return decision;
                 }
             }
             Ok(Some(Ok(_))) => {}
@@ -2959,13 +2944,12 @@ async fn compact_context_does_not_block_turns_on_other_threads_or_projects() {
                     thread_id,
                     agent_event,
                 } = server_msg
+                    && matches!(*agent_event, WireAgentEvent::TurnCompleted { .. })
                 {
-                    if matches!(*agent_event, WireAgentEvent::TurnCompleted { .. }) {
-                        if thread_id == other_thread {
-                            other_completed = true;
-                        } else if thread_id == other_project_thread {
-                            other_project_completed = true;
-                        }
+                    if thread_id == other_thread {
+                        other_completed = true;
+                    } else if thread_id == other_project_thread {
+                        other_project_completed = true;
                     }
                 }
             }
@@ -6330,11 +6314,11 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
         match tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
                 let server_msg: ServerMessage = serde_json::from_str(&t).unwrap();
-                if let ServerMessage::Event { agent_event, .. } = server_msg {
-                    if matches!(*agent_event, WireAgentEvent::TurnCompleted { .. }) {
-                        saw_completed = true;
-                        break;
-                    }
+                if let ServerMessage::Event { agent_event, .. } = server_msg
+                    && matches!(*agent_event, WireAgentEvent::TurnCompleted { .. })
+                {
+                    saw_completed = true;
+                    break;
                 }
             }
             Ok(Some(Ok(_))) => {}
@@ -6745,12 +6729,11 @@ async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
         match tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
                 let server_msg: ServerMessage = serde_json::from_str(&t).unwrap();
-                if let ServerMessage::Event { agent_event, .. } = server_msg {
-                    if let WireAgentEvent::TurnCompleted { turn, .. } = *agent_event {
-                        if turn == new_turn {
-                            saw_new_turn_complete = true;
-                        }
-                    }
+                if let ServerMessage::Event { agent_event, .. } = server_msg
+                    && let WireAgentEvent::TurnCompleted { turn, .. } = *agent_event
+                    && turn == new_turn
+                {
+                    saw_new_turn_complete = true;
                 }
             }
             Ok(Some(Ok(_))) => {}

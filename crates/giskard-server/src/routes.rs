@@ -1271,20 +1271,19 @@ async fn cleanup_new_thread_after_start_failure(
         }
     }
 
-    if remove_local_thread {
-        if let Err(error) = state
+    if remove_local_thread
+        && let Err(error) = state
             .store
             .delete_thread(project_config.id, thread_id)
             .await
-        {
-            warn!(
-                project_id = %project_config.id,
-                %thread_id,
-                %failed_action,
-                error = %error,
-                "failed to delete local thread after failed new-thread startup"
-            );
-        }
+    {
+        warn!(
+            project_id = %project_config.id,
+            %thread_id,
+            %failed_action,
+            error = %error,
+            "failed to delete local thread after failed new-thread startup"
+        );
     }
 }
 
@@ -2935,12 +2934,11 @@ async fn handle_client_msg(
                     })?
                     .current_model
                     .provider;
-                if stored_provider != model_ref.provider {
-                    if let Some(warning) =
+                if stored_provider != model_ref.provider
+                    && let Some(warning) =
                         switch_provider_cold(state, project_id, thread_id, &model_ref).await?
-                    {
-                        let _ = tx.send(ServerMessage::Error { error: warning }).await;
-                    }
+                {
+                    let _ = tx.send(ServerMessage::Error { error: warning }).await;
                 }
             }
 
@@ -2954,10 +2952,10 @@ async fn handle_client_msg(
                         &config,
                         &tf.current_model,
                     );
-                    if old.supports_reasoning_effort {
-                        if let Some(effort) = tf.current_model.reasoning_effort.clone() {
-                            tf.model_efforts.insert(tf.current_model.key(), effort);
-                        }
+                    if old.supports_reasoning_effort
+                        && let Some(effort) = tf.current_model.reasoning_effort.clone()
+                    {
+                        tf.model_efforts.insert(tf.current_model.key(), effort);
                     }
 
                     let new_descriptor =

@@ -290,14 +290,13 @@ async fn running_tool_call_surfaces_in_running_tasks_snapshot() {
         };
         if let ServerMessage::RunningTasks { tasks, .. } =
             serde_json::from_str::<ServerMessage>(&text).unwrap()
+            && let Some(task) = tasks.iter().find(|t| t.kind == TaskKind::Tool)
         {
-            if let Some(task) = tasks.iter().find(|t| t.kind == TaskKind::Tool) {
-                assert_eq!(task.command, "search");
-                assert_eq!(task.server.as_deref(), Some("wiki"));
-                assert_eq!(task.process_id, None);
-                assert_eq!(task.started_at_ms, 1_785_000_000_000);
-                break task.item_id;
-            }
+            assert_eq!(task.command, "search");
+            assert_eq!(task.server.as_deref(), Some("wiki"));
+            assert_eq!(task.process_id, None);
+            assert_eq!(task.started_at_ms, 1_785_000_000_000);
+            break task.item_id;
         }
     };
 
@@ -323,11 +322,10 @@ async fn running_tool_call_surfaces_in_running_tasks_snapshot() {
         };
         if let ServerMessage::RunningTasks { tasks, .. } =
             serde_json::from_str::<ServerMessage>(&text).unwrap()
+            && tasks.iter().all(|task| task.item_id != tool_item_id)
         {
-            if tasks.iter().all(|task| task.item_id != tool_item_id) {
-                assert!(state.running_commands.snapshot(thread_id).await.is_empty());
-                return;
-            }
+            assert!(state.running_commands.snapshot(thread_id).await.is_empty());
+            return;
         }
     }
 }

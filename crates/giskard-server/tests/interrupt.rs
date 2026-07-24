@@ -754,15 +754,14 @@ async fn wait_for_running_command(ws: &mut TestWs) -> RunningTask {
             continue;
         };
         let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
-        if let ServerMessage::RunningTasks { tasks, .. } = server_msg {
-            if let Some(cmd) = tasks
+        if let ServerMessage::RunningTasks { tasks, .. } = server_msg
+            && let Some(cmd) = tasks
                 .iter()
                 .find(|cmd| cmd.process_id.as_deref() == Some("proc_1"))
-            {
-                assert_eq!(cmd.command, "sleep 60");
-                if cmd.output == "started" {
-                    return cmd.clone();
-                }
+        {
+            assert_eq!(cmd.command, "sleep 60");
+            if cmd.output == "started" {
+                return cmd.clone();
             }
         }
     }
@@ -788,10 +787,9 @@ async fn wait_for_empty_running_commands(ws: &mut TestWs) {
         };
         if let ServerMessage::RunningTasks { tasks, .. } =
             serde_json::from_str::<ServerMessage>(&text).unwrap()
+            && tasks.is_empty()
         {
-            if tasks.is_empty() {
-                return;
-            }
+            return;
         }
     }
 }
@@ -815,13 +813,12 @@ async fn wait_for_terminating_command(ws: &mut TestWs) -> RunningTask {
             continue;
         };
         let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
-        if let ServerMessage::RunningTasks { tasks, .. } = server_msg {
-            if let Some(cmd) = tasks
+        if let ServerMessage::RunningTasks { tasks, .. } = server_msg
+            && let Some(cmd) = tasks
                 .iter()
                 .find(|cmd| cmd.process_id.as_deref() == Some("proc_1") && cmd.terminating)
-            {
-                return cmd.clone();
-            }
+        {
+            return cmd.clone();
         }
     }
 }
@@ -846,10 +843,10 @@ async fn wait_for_error(ws: &mut TestWs, action: &str, code: &str) -> ErrorInfo 
         };
         if let ServerMessage::Error { error } =
             serde_json::from_str::<ServerMessage>(&text).unwrap()
+            && error.action.as_deref() == Some(action)
+            && error.code == code
         {
-            if error.action.as_deref() == Some(action) && error.code == code {
-                return error;
-            }
+            return error;
         }
     }
 }
@@ -880,18 +877,17 @@ async fn wait_for_completed_command_after_interrupted_turn(ws: &mut TestWs) {
         };
         match serde_json::from_str::<ServerMessage>(&text).unwrap() {
             ServerMessage::Event { agent_event, .. } => {
-                if let WireAgentEvent::ItemCompleted { item, .. } = *agent_event {
-                    if let giskard_proto::WireItemPayload::CommandExecution {
+                if let WireAgentEvent::ItemCompleted { item, .. } = *agent_event
+                    && let giskard_proto::WireItemPayload::CommandExecution {
                         status,
                         exit_code,
                         duration_ms,
                         ..
                     } = item.payload
-                    {
-                        saw_completed_command = status.as_deref() == Some("completed")
-                            && exit_code == Some(0)
-                            && duration_ms == Some(60_000);
-                    }
+                {
+                    saw_completed_command = status.as_deref() == Some("completed")
+                        && exit_code == Some(0)
+                        && duration_ms == Some(60_000);
                 }
             }
             ServerMessage::RunningTasks { tasks, .. } => {
@@ -921,11 +917,11 @@ async fn wait_for_interrupted_turn(ws: &mut TestWs) {
             continue;
         };
         let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
-        if let ServerMessage::Event { agent_event, .. } = server_msg {
-            if let WireAgentEvent::TurnCompleted { status, .. } = *agent_event {
-                assert_eq!(status.kind, TurnStatusKind::Interrupted);
-                return;
-            }
+        if let ServerMessage::Event { agent_event, .. } = server_msg
+            && let WireAgentEvent::TurnCompleted { status, .. } = *agent_event
+        {
+            assert_eq!(status.kind, TurnStatusKind::Interrupted);
+            return;
         }
     }
 }

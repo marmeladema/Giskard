@@ -265,10 +265,10 @@ impl AgentHarness for ReplayHarness {
     fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
         // We need to get the sender synchronously. Use try_lock.
         let threads = self.threads.try_lock();
-        if let Ok(threads) = threads {
-            if let Some((_, state)) = threads.iter().find(|(id, _)| *id == thread.thread) {
-                return AgentEventStream::new(state.sender.subscribe());
-            }
+        if let Ok(threads) = threads
+            && let Some((_, state)) = threads.iter().find(|(id, _)| *id == thread.thread)
+        {
+            return AgentEventStream::new(state.sender.subscribe());
         }
         // Fallback: create a dummy channel.
         let (_, rx) = broadcast::channel(1);
