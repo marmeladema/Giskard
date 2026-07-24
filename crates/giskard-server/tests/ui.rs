@@ -176,7 +176,8 @@ async fn index_page_is_served_and_public() {
     assert!(
         body.contains("answeredApprovals")
             && body.contains("approvalStateKey(request)")
-            && body.contains("const answered = state.answeredApprovals.get(stateKey)")
+            && body.contains("const answered = answeredApprovalEntry(request)")
+            && body.contains("state.answeredApprovals.get(approvalStateKey(request))")
             && body.contains("JSON.stringify(requestOrId.kind")
             && body.contains("String(requestOrId.reason")
             && body.contains("JSON.stringify(requestOrId.metadata")

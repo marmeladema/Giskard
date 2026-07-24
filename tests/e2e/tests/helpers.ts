@@ -13,6 +13,13 @@ export const SCRIPTED_NESTED_SUBAGENT_TRIGGER = "Spawn a scripted nested sub-age
 export const SCRIPTED_SUBAGENT_PROMPT = "Review the linked child task.";
 export const SCRIPTED_SUBAGENT_REPLY = "Child replay output";
 
+/**
+ * Prompt that makes the scripted replay harness raise an approval request and then hold the turn
+ * open (no turn-completed). Kept in sync with `SCRIPTED_APPROVAL_TRIGGER` in
+ * `crates/giskard-server/src/bin/giskard-server-replay.rs`.
+ */
+export const SCRIPTED_APPROVAL_TRIGGER = "Trigger a scripted approval request.";
+
 /** Log in through the real login form and wait for the app shell to become visible. */
 export async function login(page: Page, password: string = PASSWORD): Promise<void> {
   await page.goto("/");

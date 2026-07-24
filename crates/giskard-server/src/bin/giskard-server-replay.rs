@@ -26,9 +26,10 @@ use async_trait::async_trait;
 use tokio::sync::broadcast;
 use tracing::info;
 
+use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalRequest};
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ItemId, ThreadId, TurnId};
+use giskard_core::ids::{ApprovalId, ItemId, ThreadId, TurnId};
 use giskard_core::item::{
     Item, ItemDelta, ItemKind, ItemPayload, ItemStart, SubagentAction, SubagentLink,
 };
@@ -50,12 +51,21 @@ const SCRIPTED_SUBAGENT_PROMPT: &str = "Review the linked child task.";
 const SCRIPTED_SUBAGENT_REPLY: &str = "Child replay output";
 const SCRIPTED_SUBAGENT_PREFIX: &str = "scripted-subagent|";
 const SCRIPTED_NESTED_SUBAGENT_PREFIX: &str = "scripted-nested-subagent|";
+/// Prompt that makes the harness raise an approval and then keep the turn in-flight (it never
+/// completes). This lets browser tests answer the approval and reload mid-turn to assert the
+/// answered card is not re-surfaced as actionable. The approval id is fixed so tests can target it.
+const SCRIPTED_APPROVAL_TRIGGER: &str = "Trigger a scripted approval request.";
+const SCRIPTED_APPROVAL_ID: &str = "scripted-approval-1";
 
 /// A harness that speaks the neutral protocol but has no backend: every turn streams the same
 /// canned agent message, so the browser-visible transcript is fully deterministic.
 struct ScriptedHarness {
     capabilities: HarnessCapabilities,
     threads: tokio::sync::Mutex<Vec<(ThreadId, broadcast::Sender<AgentEvent>)>>,
+    /// The thread/turn of an in-flight scripted approval, so `respond_approval` can emit a
+    /// confirmation item on the still-open turn (used by the reload e2e test to know the server has
+    /// recorded the answer before it reconnects).
+    active_approval: tokio::sync::Mutex<Option<(ThreadId, TurnId)>>,
 }
 
 impl ScriptedHarness {
@@ -76,6 +86,7 @@ impl ScriptedHarness {
                 context_compaction: false,
             },
             threads: tokio::sync::Mutex::new(Vec::new()),
+            active_approval: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -319,10 +330,40 @@ impl AgentHarness for ScriptedHarness {
             _ => None,
         };
 
+        let raise_approval = input_text == Some(SCRIPTED_APPROVAL_TRIGGER);
+        if raise_approval {
+            *self.active_approval.lock().await = Some((thread_id, turn));
+        }
+
         // Stream the canned reply the way a real harness would: start, incremental deltas, then a
         // completed item and a turn-completed with token usage. Emitted off-task with yields so the
         // WebSocket layer observes distinct frames (the transcript renders progressively).
         tokio::spawn(async move {
+            if raise_approval {
+                // Raise an approval and deliberately leave the turn in-flight (no TurnCompleted), so
+                // the live buffer keeps the answered state for reconnect assertions.
+                let _ = sender.send(AgentEvent::TurnStarted {
+                    thread: thread_id,
+                    turn,
+                });
+                tokio::task::yield_now().await;
+                let _ = sender.send(AgentEvent::ApprovalRequested {
+                    thread: thread_id,
+                    turn,
+                    request: ApprovalRequest {
+                        id: ApprovalId(SCRIPTED_APPROVAL_ID.into()),
+                        kind: ApprovalKind::CommandExecution {
+                            command: "rm -rf ./build".into(),
+                            cwd: "/tmp/demo".into(),
+                        },
+                        reason: Some("The agent wants to remove the build directory.".into()),
+                        metadata: vec![],
+                        available: vec![ApprovalDecision::Accept, ApprovalDecision::Decline],
+                    },
+                });
+                return;
+            }
+
             if let Some(native_thread_id) = subagent_native_thread_id {
                 let _ = sender.send(AgentEvent::TurnStarted {
                     thread: thread_id,
@@ -431,8 +472,34 @@ impl AgentHarness for ScriptedHarness {
     async fn respond_approval(
         &self,
         _req: giskard_core::ids::ApprovalId,
-        _decision: giskard_core::approval::ApprovalDecision,
+        decision: giskard_core::approval::ApprovalDecision,
     ) -> Result<(), HarnessError> {
+        // Emit a confirmation item on the still-open turn so tests have a deterministic signal that
+        // the answer was routed. The turn stays in-flight (no TurnCompleted) so a reconnect still
+        // replays the answered approval from the live buffer.
+        if let Some((thread_id, turn)) = *self.active_approval.lock().await
+            && let Some(sender) = self.sender_for(thread_id).await
+        {
+            let label = match decision {
+                ApprovalDecision::Accept => "accept",
+                ApprovalDecision::AcceptForSession => "accept_for_session",
+                ApprovalDecision::Decline => "decline",
+                ApprovalDecision::Cancel => "cancel",
+                ApprovalDecision::AcceptWithExecPolicyAmendment { .. } => "accept_amended",
+            };
+            let _ = sender.send(AgentEvent::ItemCompleted {
+                thread: thread_id,
+                turn,
+                item: Item {
+                    id: ItemId::new(),
+                    harness_item_id: format!("scripted_approval_ack_{turn}"),
+                    payload: ItemPayload::AgentMessage {
+                        text: format!("Approval recorded: {label}"),
+                    },
+                    created_at: chrono::Utc::now(),
+                },
+            });
+        }
         Ok(())
     }
 

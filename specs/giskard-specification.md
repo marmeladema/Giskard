@@ -2764,9 +2764,12 @@ interactive forwarder owns the turn gate, the passive subscriber yields before b
 `approval_id`, and `server_request_received` carries `server_request_id`),
 `ThreadState { thread_id, state }` (persisted snapshot on subscribe/resync),
 `LiveTurnSnapshot { thread_id, turn_id, user_input?, accumulated, pending_approval?,
-pending_server_requests }` (in-flight turn reconstruction on reconnect, carrying the turn input
-when the server synthesized the turn context, `WireAgentEvent`s, a `WireApprovalRequest`, and
-unresolved `ServerRequest`s),
+pending_server_requests, answered_approvals }` (in-flight turn reconstruction on reconnect, carrying
+the turn input when the server synthesized the turn context, `WireAgentEvent`s, the still-open
+`WireApprovalRequest`, unresolved `ServerRequest`s, and the `{ request_id, decision }` of approvals
+the user already answered this turn — approval resolution lives only in browser memory, so without
+this a reload would replay an answered approval as pending and answering it again routes a stale id
+to the harness, which errors),
 `RunningTasks { thread_id, tasks: [RunningTask] }` (commands and tool/MCP calls still known to be
 running, including commands that outlived an interrupted turn),
 `TokenUpdate { scope, thread_id?, ledger }`, `ApprovalRequest { thread_id, request }` (a
