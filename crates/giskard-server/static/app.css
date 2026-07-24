@@ -99,7 +99,12 @@
   .thread.subagent-thread { font-size:12px; }
   .thread.subagent-thread::before { content:"sub"; flex:none; color:var(--muted); font-size:10px; }
   .thread:hover { background:var(--panel2); }
-  .thread.active { background:var(--panel2); color:var(--fg); }
+  /* Selected thread: a whisper of accent tint over the neutral raised fill plus a thin accent
+     rail, no bold. The ~9% tint gives selection a hint of color that a plain hover (bare --panel2)
+     lacks, so the two separate cleanly at a glance while staying restrained and editor-like. */
+  .thread.active { background:var(--panel2); background:color-mix(in srgb, var(--accent) 9%, var(--panel2)); color:var(--fg); box-shadow:inset 2px 0 0 var(--accent); }
+  .thread.active:hover { background:var(--panel2); background:color-mix(in srgb, var(--accent) 13%, var(--panel2)); }
+  .thread.active .thread-title { color:var(--fg); }
   .thread-status { flex:none; width:10px; text-align:center; color:var(--muted); font-weight:700; }
   .thread-title { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .thread.has-activity .thread-title { color:var(--fg); }
