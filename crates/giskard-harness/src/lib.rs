@@ -22,7 +22,7 @@ use giskard_core::user_input::UserInput;
 pub struct HarnessCapabilities {
     /// Server-initiated, per-action approval requests (accept/decline while a turn is live).
     pub live_approvals: bool,
-    /// Distinct read-only (plan) vs read-write (build) sandbox modes switchable per turn.
+    /// Distinct per-turn sandbox modes switchable by thread mode.
     pub plan_build_modes: bool,
     /// Per-turn model override (change model between turns of one thread).
     pub per_turn_model: bool,

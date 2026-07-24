@@ -473,6 +473,16 @@ async fn modes_models_approvals_and_plan_dump() {
             break;
         }
     }
+
+    // --- SwitchMode -> Danger (persisted) ---
+    ws.send(ws_text(&ClientMessage::SwitchMode {
+        thread_id: tid,
+        mode: Mode::Danger,
+    }))
+    .await
+    .unwrap();
+    let tf = poll_thread(&state, pid, tid, |tf| tf.mode == Mode::Danger).await;
+    assert_eq!(tf.mode, Mode::Danger, "danger mode switch should persist");
 }
 
 async fn poll_thread<F>(

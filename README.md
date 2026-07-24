@@ -114,7 +114,8 @@ Then open **http://127.0.0.1:8787**, log in, and:
 1. **+** next to *Projects* → name it and give an **absolute directory path** that exists on the
    server machine (the agent's workspace).
 2. **+** on the project → draft a new thread. No Codex thread is created until the first message is
-   sent, so choose the **Plan/Build** mode, **approval policy**, and **model** first if needed.
+   sent, so choose the **Plan/Build/Danger** mode, **approval policy**, and **model** first if
+   needed.
 3. Type in the composer (Enter to send). The first send creates the Codex thread with the selected
    provider/model and starts the turn. Existing threads show the **Tasks** menu for running
    commands/tools, **Sub-agents** monitor, **MCP** status menu, and **Context** usage button;
@@ -226,6 +227,19 @@ switches. Codex supplies this through
 `thread/tokenUsage/updated.tokenUsage.modelContextWindow`; its value may be lower than a model's
 raw advertised maximum because Codex reserves context headroom.
 
+Thread mode controls Codex's per-turn sandbox. **Plan** is read-only with network access,
+**Build** is workspace-write with network access, and **Danger** disables the filesystem sandbox
+entirely by sending Codex `danger-full-access`. Danger can write or delete outside the project
+workspace anywhere the server user can access on the host, so use it only for fully trusted prompts
+and worktrees; pairing it with **Auto approve** allows unattended host-wide filesystem changes.
+**Ask first** keeps Codex approval prompts enabled in Danger mode. If the approval policy is **Read
+only**, Giskard sends Codex's read-only sandbox even when the selected mode is Build or Danger.
+
+Sub-agent mode and approval policy are inherited from the primary parent thread. Child controls are
+locked, every direct child turn resolves the current parent-owned values again, and parent changes
+wait until the complete linked sub-agent tree is idle. Model and reasoning-effort choices remain
+thread-specific.
+
 ---
 
 ## Security
@@ -234,9 +248,9 @@ Read this section before exposing an instance beyond `localhost`. Full details i
 [§12 of the spec](specs/giskard-specification.md).
 
 **Threat model in one sentence:** an authenticated client can drive a coding agent (i.e. execute
-code) and read/write files inside project workspaces with the server user's privileges — so the
-shared password is guarding host access, not just a dashboard. Prefer keeping Giskard on a
-private network (VPN/WireGuard/Tailscale). If you do expose it publicly, always front it with a
+code), and Danger mode can read, write, or delete anywhere the server user can on the host, so the
+shared password is guarding host access, not just a dashboard. Prefer keeping Giskard on a private
+network (VPN/WireGuard/Tailscale). If you do expose it publicly, always front it with a
 TLS-terminating reverse proxy, keep `bind` on `127.0.0.1`, set `secure_cookies = true`, and use a
 long random password.
 

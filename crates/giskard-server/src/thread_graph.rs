@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use giskard_core::error::PersistError;
 use giskard_core::ids::{ProjectId, ThreadId};
 use giskard_core::thread::ThreadKind;
 use giskard_persist::PersistStore;
@@ -91,6 +92,78 @@ pub(crate) fn graph_issue(
             Some("sub-agent parent chain is missing or cyclic")
         }
         _ => None,
+    }
+}
+
+/// Resolve the primary thread that owns permission state for `start`.
+///
+/// Sub-agent mode and approval policy are inherited transitively. Refuse malformed ownership
+/// instead of falling back to the child's cached values, because that fallback could grant a
+/// child broader permissions than its parent.
+pub(crate) fn permission_owner(
+    graph: &HashMap<ThreadId, ThreadFile>,
+    start: ThreadId,
+) -> Result<&ThreadFile, &'static str> {
+    let mut current = start;
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(current) {
+            return Err("sub-agent parent chain is cyclic");
+        }
+        let Some(thread) = graph.get(&current) else {
+            return Err("sub-agent parent chain is missing a thread");
+        };
+        match (thread.kind, thread.parent_thread_id) {
+            (ThreadKind::Primary, None) => return Ok(thread),
+            (ThreadKind::Subagent, Some(parent)) => current = parent,
+            (ThreadKind::Primary, Some(_)) => return Err("primary thread has a parent"),
+            (ThreadKind::Subagent, None) => return Err("sub-agent thread has no parent"),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum PermissionOwnerLoadError {
+    Persist(PersistError),
+    Invalid(&'static str),
+}
+
+/// Load only the ownership chain needed to resolve permissions. This avoids scanning every thread
+/// when repeated harness activity refreshes an already imported child.
+pub(crate) async fn load_permission_owner(
+    store: &PersistStore,
+    project_id: ProjectId,
+    start: ThreadId,
+) -> Result<ThreadFile, PermissionOwnerLoadError> {
+    let mut current = start;
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(current) {
+            return Err(PermissionOwnerLoadError::Invalid(
+                "sub-agent parent chain is cyclic",
+            ));
+        }
+        let thread = store
+            .load_thread(project_id, current)
+            .await
+            .map_err(PermissionOwnerLoadError::Persist)?
+            .ok_or(PermissionOwnerLoadError::Invalid(
+                "sub-agent parent chain is missing a thread",
+            ))?;
+        match (thread.kind, thread.parent_thread_id) {
+            (ThreadKind::Primary, None) => return Ok(thread),
+            (ThreadKind::Subagent, Some(parent)) => current = parent,
+            (ThreadKind::Primary, Some(_)) => {
+                return Err(PermissionOwnerLoadError::Invalid(
+                    "primary thread has a parent",
+                ));
+            }
+            (ThreadKind::Subagent, None) => {
+                return Err(PermissionOwnerLoadError::Invalid(
+                    "sub-agent thread has no parent",
+                ));
+            }
+        }
     }
 }
 
@@ -292,6 +365,25 @@ mod tests {
             graph_issue(&graph, graph.get(&malformed_child).unwrap()),
             Some("sub-agent parent chain is missing or cyclic")
         );
+
+        assert_eq!(permission_owner(&graph, root).unwrap().id, root);
+        assert_eq!(permission_owner(&graph, child).unwrap().id, root);
+        let nested_owner = permission_owner(&graph, grandchild).unwrap();
+        assert_eq!(nested_owner.id, root);
+        assert_eq!(nested_owner.mode, Mode::Build);
+        assert_eq!(nested_owner.approval_policy, ApprovalPolicy::Ask);
+        assert_eq!(
+            permission_owner(&graph, dangling).unwrap_err(),
+            "sub-agent parent chain is missing a thread"
+        );
+        assert_eq!(
+            permission_owner(&graph, malformed_parent).unwrap_err(),
+            "primary thread has a parent"
+        );
+        assert_eq!(
+            permission_owner(&graph, malformed_child).unwrap_err(),
+            "primary thread has a parent"
+        );
     }
 
     #[test]
@@ -323,6 +415,10 @@ mod tests {
 
         graph.get_mut(&root).unwrap().kind = ThreadKind::Subagent;
         graph.get_mut(&root).unwrap().parent_thread_id = Some(child);
+        assert_eq!(
+            permission_owner(&graph, child).unwrap_err(),
+            "sub-agent parent chain is cyclic"
+        );
         let cycle_order = descendant_deletion_order(&graph, root);
         assert_eq!(cycle_order.len(), graph.len());
         assert_eq!(cycle_order.last(), Some(&root));

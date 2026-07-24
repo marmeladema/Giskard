@@ -80,7 +80,8 @@ pub struct ThreadFile {
     /// model switches without making Giskard maintain model-specific built-in metadata.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub model_context_windows: HashMap<String, HashMap<String, u32>>,
-    /// Per-thread approval policy (P3).
+    /// Approval policy (P3). For sub-agents this is a synchronized cache of the primary owner's
+    /// policy; permission-sensitive server paths resolve the ownership chain before use.
     pub approval_policy: ApprovalPolicy,
     /// Per-model effort retention (C7): maps `"provider/model"` → stored `Effort`, so switching
     /// back to a reasoning model restores the user's last effort choice.

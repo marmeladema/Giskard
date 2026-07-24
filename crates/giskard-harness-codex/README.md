@@ -257,6 +257,26 @@ terminate the same unified-exec process. Tracking the process backend explicitly
 or reconciling against `thread/backgroundTerminals/list` would remove this
 heuristic.
 
+## Turn sandbox and approval mapping
+
+For each `turn/start`, the adapter maps Giskard's thread mode to Codex's sandbox
+policy:
+
+- `Plan` -> `readOnly { networkAccess: true }`
+- `Build` -> `workspaceWrite { networkAccess: true }`
+- `Danger` -> `dangerFullAccess`
+
+`Plan` maps Codex `collaborationMode.mode` to `plan`; `Build` and `Danger` map
+it to `default` so a build-like turn resets Codex after a plan turn.
+
+The resolved approval policy is also sent on `turn/start`. In Plan and Build,
+`Ask` maps to Codex `on-request`; in Danger it maps to `untrusted`, preserving
+approval requests while the sandbox is disabled. `Auto` and `ReadOnly` map to
+`never`. Because `ReadOnly` is a Giskard safety policy, it additionally forces
+the effective Codex sandbox to `readOnly { networkAccess: true }` regardless
+of the selected mode. A `Danger` thread therefore only receives Codex
+`dangerFullAccess` when its approval policy is `Ask` or `Auto`.
+
 ## Model catalog (`model/list`)
 
 The adapter advertises the `model_listing` capability and implements

@@ -37,8 +37,8 @@ use crate::ledger::LedgerHandle;
 use crate::live_buffer::LiveBufferStore;
 use crate::running_commands::RunningTaskStore;
 use crate::thread_graph::{
-    ExistingLinkDisposition, classify_existing_link, load_thread_graph, parent_chain_is_valid,
-    should_refresh_subagent_title,
+    ExistingLinkDisposition, PermissionOwnerLoadError, classify_existing_link,
+    load_permission_owner, load_thread_graph, parent_chain_is_valid, should_refresh_subagent_title,
 };
 
 #[async_trait]
@@ -580,6 +580,15 @@ impl HarnessRegistry {
                 requested_native_id.as_deref().unwrap_or_default()
             )));
         }
+        if resume_policy != ResumePolicy::RequireExisting
+            && let Some(parent_harness_thread_id) = handle.parent_harness_thread_id.as_deref()
+        {
+            return Err(HarnessError::InvalidOwnership(format!(
+                "native thread {} reports parent {parent_harness_thread_id}; open it through the \
+                 trusted parent activity link",
+                handle.harness_thread_id
+            )));
+        }
 
         // Bind the model the harness reports as effective when it says so — Codex can ignore
         // resume overrides for a loaded thread, and the binding must reflect reality, not the
@@ -616,6 +625,36 @@ impl HarnessRegistry {
         input: UserInput,
         overrides: TurnOverrides,
         effective_model: ModelRef,
+    ) -> Result<TurnId, HarnessError> {
+        self.start_turn_inner(thread_id, input, overrides, effective_model, None)
+            .await
+    }
+
+    pub(crate) async fn start_turn_with_lifecycle_guard(
+        &self,
+        thread_id: ThreadId,
+        input: UserInput,
+        overrides: TurnOverrides,
+        effective_model: ModelRef,
+        lifecycle_guard: OwnedMutexGuard<()>,
+    ) -> Result<TurnId, HarnessError> {
+        self.start_turn_inner(
+            thread_id,
+            input,
+            overrides,
+            effective_model,
+            Some(lifecycle_guard),
+        )
+        .await
+    }
+
+    async fn start_turn_inner(
+        &self,
+        thread_id: ThreadId,
+        input: UserInput,
+        overrides: TurnOverrides,
+        effective_model: ModelRef,
+        lifecycle_guard: Option<OwnedMutexGuard<()>>,
     ) -> Result<TurnId, HarnessError> {
         if self.thread_has_passive_monitor(thread_id).await {
             warn!(
@@ -663,6 +702,10 @@ impl HarnessRegistry {
             .shared
             .turn_gate
             .reserve(thread_id, ActiveTurnOwner::new(project_id, &handle, &ctx))?;
+        // Permission resolution only needs serialization until this reservation is visible.
+        // Releasing here lets unrelated threads proceed while the harness acknowledges the RPC;
+        // a concurrent permission mutation now observes the active gate and is rejected.
+        drop(lifecycle_guard);
 
         let shared = self.shared.clone();
 
@@ -831,6 +874,28 @@ impl HarnessRegistry {
         effective_model: ModelRef,
         mode: Mode,
     ) -> Result<(), HarnessError> {
+        self.compact_thread_inner(thread_id, effective_model, mode, None)
+            .await
+    }
+
+    pub(crate) async fn compact_thread_with_lifecycle_guard(
+        &self,
+        thread_id: ThreadId,
+        effective_model: ModelRef,
+        mode: Mode,
+        lifecycle_guard: OwnedMutexGuard<()>,
+    ) -> Result<(), HarnessError> {
+        self.compact_thread_inner(thread_id, effective_model, mode, Some(lifecycle_guard))
+            .await
+    }
+
+    async fn compact_thread_inner(
+        &self,
+        thread_id: ThreadId,
+        effective_model: ModelRef,
+        mode: Mode,
+        lifecycle_guard: Option<OwnedMutexGuard<()>>,
+    ) -> Result<(), HarnessError> {
         let handle = self
             .get_thread_handle(thread_id)
             .await
@@ -872,6 +937,7 @@ impl HarnessRegistry {
             .shared
             .turn_gate
             .reserve(thread_id, ActiveTurnOwner::new(project_id, &handle, &ctx))?;
+        drop(lifecycle_guard);
 
         let shared = self.shared.clone();
 
@@ -1107,6 +1173,14 @@ impl HarnessRegistry {
             return true;
         }
         self.shared.passive_monitor_tasks.contains(thread_id).await
+    }
+
+    pub async fn thread_has_pending_subagent_materialization(&self, thread_id: ThreadId) -> bool {
+        self.shared
+            .subagent_materialization_queues
+            .lock()
+            .await
+            .contains_key(&thread_id)
     }
 
     pub async fn stop_passive_subagent_monitor(
@@ -1682,6 +1756,25 @@ async fn materialize_subagent_thread(
                 "parent thread {parent_thread_id} disappeared while importing sub-agent"
             ))
         })?;
+    let permission_owner_file =
+        match load_permission_owner(&shared.store, project_id, parent_thread_id).await {
+            Ok(owner) => owner,
+            Err(PermissionOwnerLoadError::Persist(error)) => {
+                return Err(HarnessError::Protocol(error.to_string()));
+            }
+            Err(PermissionOwnerLoadError::Invalid(detail)) => {
+                warn!(
+                    %project_id,
+                    %parent_thread_id,
+                    linked_harness_thread_id = %info.native_thread_id,
+                    %detail,
+                    "refusing to materialize a sub-agent under invalid permission ownership"
+                );
+                return Ok(None);
+            }
+        };
+    let inherited_mode = permission_owner_file.mode;
+    let inherited_approval_policy = permission_owner_file.approval_policy;
     let live_existing_id = shared
         .threads
         .lock()
@@ -1710,7 +1803,7 @@ async fn materialize_subagent_thread(
         (Some(graph), existing)
     };
 
-    if let Some(existing) = existing {
+    if let Some(mut existing) = existing {
         // A live binding has already passed the full ownership validation while it was imported.
         // Repeated `interacted` activity can therefore use its immutable direct ownership fields
         // instead of re-reading every thread file on the parent forwarder's hot path.
@@ -1752,24 +1845,30 @@ async fn materialize_subagent_thread(
         };
         let refreshed_info = subagent_info_with_agent_name(info.clone(), opened_agent_name);
         let desired_title = subagent_thread_title(&refreshed_info);
-        if should_refresh_subagent_title(&existing.title, &desired_title) {
-            shared
+        if should_refresh_subagent_title(&existing.title, &desired_title)
+            || existing.mode != inherited_mode
+            || existing.approval_policy != inherited_approval_policy
+        {
+            existing = shared
                 .store
                 .update_thread(project_id, existing.id, |thread| {
                     if should_refresh_subagent_title(&thread.title, &desired_title) {
                         thread.title = desired_title.clone();
                     }
+                    thread.mode = inherited_mode;
+                    thread.approval_policy = inherited_approval_policy;
                     thread.updated_at = Utc::now();
                 })
                 .await
-                .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+                .map_err(|error| HarnessError::Protocol(error.to_string()))?
+                .ok_or(HarnessError::ThreadNotFound(existing.id))?;
         }
         observe_external_subagent_with_context(
             project_id,
             existing.id,
             SubagentObservation {
                 effective_model: existing.current_model.clone(),
-                mode: existing.mode,
+                mode: inherited_mode,
                 initial_prompt: refreshed_info.initial_prompt,
                 policy,
                 fallback: refreshed_info.fallback,
@@ -1797,10 +1896,10 @@ async fn materialize_subagent_thread(
     }
 
     let model = parent_file.current_model.clone();
-    let mode = parent_file.mode;
+    let mode = inherited_mode;
     let context_window = parent_file.context_window;
     let model_context_windows = parent_file.model_context_windows.clone();
-    let approval_policy = parent_file.approval_policy;
+    let approval_policy = inherited_approval_policy;
     let model_efforts = parent_file.model_efforts.clone();
 
     let harness = shared
@@ -1906,6 +2005,11 @@ async fn enqueue_subagent_materialization(
     job: SubagentMaterializationJob,
     shared: Arc<RegistryShared>,
 ) {
+    // Publish the job under the same project lock used by permission changes. A mutation therefore
+    // either sees this pending child and stops, or completes first so materialization inherits the
+    // new permission state; enqueue cannot slip between the idle check and the root update.
+    let _lifecycle_guard =
+        lock_project_lifecycle(&shared.project_lifecycle_locks, job.project_id).await;
     let should_start_worker = {
         let mut queues = shared.subagent_materialization_queues.lock().await;
         let should_start = !queues.contains_key(&parent_thread_id);

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -36,7 +37,8 @@ use crate::auth::{
     get_session_token_from_header, sign_token, verify_token,
 };
 use crate::thread_graph::{
-    descendant_deletion_order, graph_issue, load_thread_graph, should_refresh_subagent_title,
+    descendant_deletion_order, graph_issue, load_thread_graph, permission_owner,
+    should_refresh_subagent_title,
 };
 
 const HARNESS_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -727,7 +729,7 @@ async fn open_thread(
             project_config.default_model.clone(),
         )
         .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        .map_err(harness_api_error)?;
 
     let current_model = handle
         .resumed_model
@@ -1737,6 +1739,15 @@ fn main() {}
         assert!(!title.ends_with(' '));
         assert!(!title.ends_with('-'));
     }
+
+    #[test]
+    fn permission_change_blocker_covers_every_activity_source() {
+        assert!(!permission_change_is_blocked(false, false, false, false));
+        assert!(permission_change_is_blocked(true, false, false, false));
+        assert!(permission_change_is_blocked(false, true, false, false));
+        assert!(permission_change_is_blocked(false, false, true, false));
+        assert!(permission_change_is_blocked(false, false, false, true));
+    }
 }
 
 /// Enforce `browse.roots` on a project directory supplied via the API. With roots configured, the
@@ -2304,6 +2315,7 @@ async fn start_mcp_oauth_login(
 fn harness_api_error(error: HarnessError) -> ApiError {
     match error {
         HarnessError::Unsupported(message) => ApiError::BadRequest(message),
+        HarnessError::InvalidOwnership(message) => ApiError::Conflict(message),
         HarnessError::ThreadBusy { .. } => {
             ApiError::Conflict("Thread already has an active turn.".into())
         }
@@ -2427,6 +2439,10 @@ impl WsError {
             }
             HarnessError::Transport(_) => ("harness_transport_error", "Codex transport failed."),
             HarnessError::Protocol(_) => ("harness_protocol_error", "Codex protocol error."),
+            HarnessError::InvalidOwnership(_) => (
+                "invalid_thread_ownership",
+                "The native thread has incompatible ownership metadata.",
+            ),
             HarnessError::Overloaded => ("harness_overloaded", "Codex is overloaded."),
             HarnessError::Unsupported(_) => (
                 "harness_unsupported",
@@ -2476,6 +2492,194 @@ impl fmt::Display for WsError {
         }
         Ok(())
     }
+}
+
+fn invalid_permission_graph_error(
+    thread_id: ThreadId,
+    action: &str,
+    detail: impl Into<String>,
+) -> WsError {
+    WsError::new(
+        "invalid_thread_graph",
+        ErrorSeverity::Error,
+        "Thread permissions could not be resolved because its ownership data is invalid.",
+    )
+    .detail(detail)
+    .thread(thread_id)
+    .action(action)
+}
+
+fn resolved_thread_permissions(
+    graph: &HashMap<ThreadId, ThreadFile>,
+    thread_id: ThreadId,
+) -> Result<(Mode, ApprovalPolicy), &'static str> {
+    let owner = permission_owner(graph, thread_id)?;
+    Ok((owner.mode, owner.approval_policy))
+}
+
+#[derive(Debug)]
+enum PermissionChangeOrderError {
+    ThreadNotFound,
+    Inherited,
+    InvalidGraph {
+        thread_id: ThreadId,
+        detail: &'static str,
+    },
+}
+
+impl PermissionChangeOrderError {
+    fn into_ws_error(self, requested_thread_id: ThreadId, action: &str) -> WsError {
+        match self {
+            Self::ThreadNotFound => WsError::new(
+                "thread_not_found",
+                ErrorSeverity::Error,
+                "Thread not found.",
+            )
+            .thread(requested_thread_id)
+            .action(action),
+            Self::Inherited => WsError::new(
+                "subagent_permissions_inherited",
+                ErrorSeverity::Error,
+                "Sub-agent mode and approval policy are inherited from the parent thread.",
+            )
+            .thread(requested_thread_id)
+            .action(action),
+            Self::InvalidGraph { thread_id, detail } => {
+                invalid_permission_graph_error(thread_id, action, detail)
+            }
+        }
+    }
+}
+
+fn permission_change_order(
+    graph: &HashMap<ThreadId, ThreadFile>,
+    thread_id: ThreadId,
+) -> Result<Vec<ThreadId>, PermissionChangeOrderError> {
+    let thread = graph
+        .get(&thread_id)
+        .ok_or(PermissionChangeOrderError::ThreadNotFound)?;
+    if thread.kind == ThreadKind::Subagent || thread.parent_thread_id.is_some() {
+        return Err(PermissionChangeOrderError::Inherited);
+    }
+
+    let order = descendant_deletion_order(graph, thread_id);
+    for descendant_id in &order {
+        let owner = permission_owner(graph, *descendant_id).map_err(|detail| {
+            PermissionChangeOrderError::InvalidGraph {
+                thread_id: *descendant_id,
+                detail,
+            }
+        })?;
+        if owner.id != thread_id {
+            return Err(PermissionChangeOrderError::InvalidGraph {
+                thread_id: *descendant_id,
+                detail: "permission descendant resolves to a different primary thread",
+            });
+        }
+    }
+    Ok(order)
+}
+
+async fn ensure_permission_change_idle(
+    state: &AppState,
+    thread_ids: &[ThreadId],
+    requested_thread_id: ThreadId,
+    action: &str,
+) -> Result<(), WsError> {
+    for thread_id in thread_ids {
+        let active_turn = state.registry.thread_has_active_turn(*thread_id).await;
+        let passive_monitor = state.registry.thread_has_passive_monitor(*thread_id).await;
+        let pending_materialization = state
+            .registry
+            .thread_has_pending_subagent_materialization(*thread_id)
+            .await;
+        let running_task = state
+            .running_commands
+            .has_running_for_thread(*thread_id)
+            .await;
+        if permission_change_is_blocked(
+            active_turn,
+            passive_monitor,
+            pending_materialization,
+            running_task,
+        ) {
+            warn!(
+                %requested_thread_id,
+                busy_thread_id = %thread_id,
+                active_turn,
+                passive_monitor,
+                pending_materialization,
+                running_task,
+                %action,
+                "rejecting permission change while ownership subtree is active"
+            );
+            return Err(WsError::new(
+                "permission_change_blocked",
+                ErrorSeverity::Error,
+                "Wait for the parent thread and all sub-agents to finish before changing permissions.",
+            )
+            .detail(format!("thread {thread_id} still has active work"))
+            .thread(requested_thread_id)
+            .action(action));
+        }
+    }
+    Ok(())
+}
+
+fn permission_change_is_blocked(
+    active_turn: bool,
+    passive_monitor: bool,
+    pending_materialization: bool,
+    running_task: bool,
+) -> bool {
+    active_turn || passive_monitor || pending_materialization || running_task
+}
+
+async fn update_permission_subtree(
+    state: &AppState,
+    project_id: ProjectId,
+    thread_id: ThreadId,
+    mode: Option<Mode>,
+    policy: Option<ApprovalPolicy>,
+    action: &str,
+) -> Result<Vec<ThreadFile>, WsError> {
+    let graph = load_thread_graph(&state.store, project_id)
+        .await
+        .map_err(|error| WsError::from_persist(error, action, Some(thread_id)))?;
+    let order = permission_change_order(&graph, thread_id)
+        .map_err(|error| error.into_ws_error(thread_id, action))?;
+    ensure_permission_change_idle(state, &order, thread_id, action).await?;
+
+    let mut updated = Vec::with_capacity(order.len());
+    // Leaf-first keeps the primary permission owner unchanged until every descendant cache is
+    // durable. Turn start still resolves the owner on every request, so a partial I/O failure
+    // cannot make a stale child cache authoritative.
+    for target_id in order {
+        let thread = state
+            .store
+            .update_thread(project_id, target_id, |thread| {
+                if let Some(mode) = mode {
+                    thread.mode = mode;
+                }
+                if let Some(policy) = policy {
+                    thread.approval_policy = policy;
+                }
+                thread.updated_at = Utc::now();
+            })
+            .await
+            .map_err(|error| WsError::from_persist(error, action, Some(target_id)))?
+            .ok_or_else(|| {
+                WsError::new(
+                    "thread_not_found",
+                    ErrorSeverity::Error,
+                    "Thread not found.",
+                )
+                .thread(target_id)
+                .action(action)
+            })?;
+        updated.push(thread);
+    }
+    Ok(updated)
 }
 
 fn warning_info(
@@ -2630,6 +2834,51 @@ async fn handle_client_msg(
                     )
                 }
             };
+            let permission_guard = state
+                .registry
+                .lock_project_lifecycle_with_timeout(project_id, PROJECT_LIFECYCLE_LOCK_TIMEOUT)
+                .await
+                .map_err(|error| WsError::from_harness(error, "subscribe", Some(thread_id)))?;
+            let graph = load_thread_graph(&state.store, project_id)
+                .await
+                .map_err(|error| WsError::from_persist(error, "subscribe", Some(thread_id)))?;
+            let repaired_thread = match permission_owner(&graph, thread_id) {
+                Ok(owner) => {
+                    let current = graph.get(&thread_id);
+                    if current.is_some_and(|thread| {
+                        thread.mode != owner.mode || thread.approval_policy != owner.approval_policy
+                    }) {
+                        let mode = owner.mode;
+                        let approval_policy = owner.approval_policy;
+                        state
+                            .store
+                            .update_thread(project_id, thread_id, |thread| {
+                                thread.mode = mode;
+                                thread.approval_policy = approval_policy;
+                                thread.updated_at = Utc::now();
+                            })
+                            .await
+                            .map_err(|error| {
+                                WsError::from_persist(error, "subscribe", Some(thread_id))
+                            })?
+                    } else {
+                        None
+                    }
+                }
+                Err(detail) => {
+                    warn!(
+                        %project_id,
+                        %thread_id,
+                        %detail,
+                        "leaving malformed thread viewable without repairing inherited permissions"
+                    );
+                    None
+                }
+            };
+            drop(permission_guard);
+            if let Some(thread) = repaired_thread {
+                broadcast_thread_state(state, thread_id, &thread).await;
+            }
             state.hub.subscribe(thread_id, client_id, tx.clone()).await;
 
             if let Some(warning) = notice {
@@ -2793,7 +3042,24 @@ async fn handle_client_msg(
                     .action("send_input")
                 })?;
             let catalog = project_model_catalog(state, &project_config, &app_config).await;
-            // RMW under the per-thread lock: bump activity and read back the resolved state.
+            // Serialize permission resolution with parent changes and child materialization. Keep
+            // the lock until `start_turn` reserves the per-thread turn gate, otherwise a parent
+            // could tighten permissions between this snapshot and the native turn start.
+            let permission_guard = state
+                .registry
+                .lock_project_lifecycle_with_timeout(project_id, PROJECT_LIFECYCLE_LOCK_TIMEOUT)
+                .await
+                .map_err(|error| WsError::from_harness(error, "send_input", Some(thread_id)))?;
+            let graph = load_thread_graph(&state.store, project_id)
+                .await
+                .map_err(|error| WsError::from_persist(error, "send_input", Some(thread_id)))?;
+            let (mode, approval_policy) =
+                resolved_thread_permissions(&graph, thread_id).map_err(|detail| {
+                    invalid_permission_graph_error(thread_id, "send_input", detail)
+                })?;
+
+            // RMW under the per-thread lock: bump activity, repair the inherited permission cache,
+            // and read back the complete state passed to the harness.
             let tf = state
                 .store
                 .update_thread(project_id, thread_id, |tf| {
@@ -2810,6 +3076,8 @@ async fn handle_client_msg(
                         &tf.model_context_windows,
                     );
                     tf.current_model = normalized;
+                    tf.mode = mode;
+                    tf.approval_policy = approval_policy;
                     tf.updated_at = chrono::Utc::now();
                 })
                 .await
@@ -2831,7 +3099,7 @@ async fn handle_client_msg(
             //  - the thread's current model (carrying its reasoning effort), so a mid-thread
             //    model/effort change actually reaches the agent. Passing `None` here would leave
             //    Codex on whatever model was set at `thread/start`.
-            //  - the thread's persisted approval policy (§9).
+            //  - the permission owner's persisted approval policy (§9).
             let overrides = TurnOverrides {
                 model: Some(effective_model.clone()),
                 mode: tf.mode,
@@ -2840,30 +3108,36 @@ async fn handle_client_msg(
 
             state
                 .registry
-                .start_turn(thread_id, UserInput::text(text), overrides, effective_model)
+                .start_turn_with_lifecycle_guard(
+                    thread_id,
+                    UserInput::text(text),
+                    overrides,
+                    effective_model,
+                    permission_guard,
+                )
                 .await
                 .map_err(|e| WsError::from_harness(e, "send_input", Some(thread_id)))?;
         }
         ClientMessage::SwitchMode { thread_id, mode } => {
             let project_id = project_for(state, thread_id, "switch_mode").await?;
-            let tf = state
-                .store
-                .update_thread(project_id, thread_id, |tf| {
-                    tf.mode = mode;
-                    tf.updated_at = chrono::Utc::now();
-                })
+            let permission_guard = state
+                .registry
+                .lock_project_lifecycle_with_timeout(project_id, PROJECT_LIFECYCLE_LOCK_TIMEOUT)
                 .await
-                .map_err(|e| WsError::from_persist(e, "switch_mode", Some(thread_id)))?
-                .ok_or_else(|| {
-                    WsError::new(
-                        "thread_not_found",
-                        ErrorSeverity::Error,
-                        "Thread not found.",
-                    )
-                    .thread(thread_id)
-                    .action("switch_mode")
-                })?;
-            broadcast_thread_state(state, thread_id, &tf).await;
+                .map_err(|error| WsError::from_harness(error, "switch_mode", Some(thread_id)))?;
+            let updated = update_permission_subtree(
+                state,
+                project_id,
+                thread_id,
+                Some(mode),
+                None,
+                "switch_mode",
+            )
+            .await?;
+            drop(permission_guard);
+            for thread in updated {
+                broadcast_thread_state(state, thread.id, &thread).await;
+            }
         }
         ClientMessage::SelectModel {
             thread_id,
@@ -2997,24 +3271,26 @@ async fn handle_client_msg(
         }
         ClientMessage::SetApprovalPolicy { thread_id, policy } => {
             let project_id = project_for(state, thread_id, "set_approval_policy").await?;
-            let tf = state
-                .store
-                .update_thread(project_id, thread_id, |tf| {
-                    tf.approval_policy = policy;
-                    tf.updated_at = chrono::Utc::now();
-                })
+            let permission_guard = state
+                .registry
+                .lock_project_lifecycle_with_timeout(project_id, PROJECT_LIFECYCLE_LOCK_TIMEOUT)
                 .await
-                .map_err(|e| WsError::from_persist(e, "set_approval_policy", Some(thread_id)))?
-                .ok_or_else(|| {
-                    WsError::new(
-                        "thread_not_found",
-                        ErrorSeverity::Error,
-                        "Thread not found.",
-                    )
-                    .thread(thread_id)
-                    .action("set_approval_policy")
+                .map_err(|error| {
+                    WsError::from_harness(error, "set_approval_policy", Some(thread_id))
                 })?;
-            broadcast_thread_state(state, thread_id, &tf).await;
+            let updated = update_permission_subtree(
+                state,
+                project_id,
+                thread_id,
+                None,
+                Some(policy),
+                "set_approval_policy",
+            )
+            .await?;
+            drop(permission_guard);
+            for thread in updated {
+                broadcast_thread_state(state, thread.id, &thread).await;
+            }
         }
         ClientMessage::ApprovalDecision {
             request_id,
@@ -3086,9 +3362,29 @@ async fn handle_client_msg(
         }
         ClientMessage::CompactContext { thread_id } => {
             let project_id = project_for(state, thread_id, "compact_context").await?;
+            let permission_guard = state
+                .registry
+                .lock_project_lifecycle_with_timeout(project_id, PROJECT_LIFECYCLE_LOCK_TIMEOUT)
+                .await
+                .map_err(|error| {
+                    WsError::from_harness(error, "compact_context", Some(thread_id))
+                })?;
+            let graph = load_thread_graph(&state.store, project_id)
+                .await
+                .map_err(|error| {
+                    WsError::from_persist(error, "compact_context", Some(thread_id))
+                })?;
+            let (mode, approval_policy) =
+                resolved_thread_permissions(&graph, thread_id).map_err(|detail| {
+                    invalid_permission_graph_error(thread_id, "compact_context", detail)
+                })?;
             let tf = state
                 .store
-                .load_thread(project_id, thread_id)
+                .update_thread(project_id, thread_id, |thread| {
+                    thread.mode = mode;
+                    thread.approval_policy = approval_policy;
+                    thread.updated_at = Utc::now();
+                })
                 .await
                 .map_err(|e| WsError::from_persist(e, "compact_context", Some(thread_id)))?
                 .ok_or_else(|| {
@@ -3102,9 +3398,12 @@ async fn handle_client_msg(
                 })?;
             tokio::time::timeout(
                 HARNESS_CONTROL_TIMEOUT,
-                state
-                    .registry
-                    .compact_thread(thread_id, tf.current_model.clone(), tf.mode),
+                state.registry.compact_thread_with_lifecycle_guard(
+                    thread_id,
+                    tf.current_model.clone(),
+                    tf.mode,
+                    permission_guard,
+                ),
             )
             .await
             .map_err(|_| {

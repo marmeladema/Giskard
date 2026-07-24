@@ -155,7 +155,8 @@ async fn index_page_is_served_and_public() {
         "approval policy changes target the active thread"
     );
     assert!(
-        body.contains("setApprovalPolicy(s.approval_policy || \"ask\")"),
+        body.contains("const approvalPolicy = s.approval_policy || \"ask\";")
+            && body.contains("setApprovalPolicy(approvalPolicy);"),
         "thread state hydrates the approval policy selector"
     );
     assert!(
@@ -925,11 +926,12 @@ async fn index_page_is_served_and_public() {
     );
     assert!(
         body.contains(
-            "$(\"sendBtn\").disabled = readOnly || state.activeTurn || (!ready && !draft)"
+            "$(\"sendBtn\").disabled = readOnly || state.activeTurn || \
+             permissionMutationPending ||"
         ) && body.contains("if (isDraftThread()) {")
             && body.contains("startDraftThread(text);"),
         "UI allows draft first sends without a WebSocket, blocks existing-thread sends until open, \
-         and blocks sends on read-only threads"
+         and blocks sends on read-only or permission-mutating threads"
     );
     assert!(
         body.contains("inputDrafts:new Map()")
@@ -1700,6 +1702,97 @@ fn browser_resubscribe_replaces_transient_transcript_state() {
         "resetRenderState();",
     );
     assert_order(reset, "resetRenderState();", "setTurnActive(false);");
+}
+
+#[test]
+fn browser_mode_picker_preserves_danger_mode() {
+    let index = include_str!("../static/index.html");
+    assert!(
+        index.contains(r#"<option value="danger">Danger</option>"#),
+        "mode picker should expose danger mode"
+    );
+
+    let body = app_js();
+    let labels = between(body, "const MODE_LABELS", "const APPROVAL_LABELS");
+    assert!(labels.contains(r#"danger:"Danger""#));
+    assert!(labels.contains("const VALID_MODES = { build:1, plan:1, danger:1 };"));
+    assert!(labels.contains("function coerceMode(m)"));
+
+    let set_mode = between(
+        body,
+        "function setMode(mode) {",
+        "function setApprovalPolicy",
+    );
+    assert!(set_mode.contains("state.mode = coerceMode(mode);"));
+
+    let onchange = between(
+        body,
+        "$(\"modeSel\").onchange = () => {",
+        "$(\"approvalSel\")",
+    );
+    assert!(onchange.contains("const mode = coerceMode($(\"modeSel\").value);"));
+
+    let controls = between(
+        body,
+        "function updateComposerControls() {",
+        "function setTurnActive",
+    );
+    assert!(controls.contains(r#"state.currentThreadKind === "subagent""#));
+    assert!(controls.contains("!!state.currentParentThreadId"));
+    assert!(controls.contains(r#"thread.kind === "subagent" || !!thread.parent_thread_id"#));
+    assert!(controls.contains("const permissionOwnershipUnknown = !draft && !!state.threadId"));
+    assert!(controls.contains(
+        "const permissionMutationPending = !!state.pendingModeSwitch || \
+             !!state.pendingApprovalSwitch;"
+    ));
+    assert!(controls.contains(
+        "const permissionsLocked = inheritedPermissions || permissionOwnershipUnknown ||"
+    ));
+    assert!(controls.contains("state.activeTurn || permissionMutationPending;"));
+    assert!(controls.contains(r#"$("modeSel").disabled = permissionsLocked"#));
+    assert!(controls.contains(r#"$("approvalSel").disabled = permissionsLocked"#));
+    assert!(controls.contains(r#"$("turnPickerBtn").disabled = permissionsLocked"#));
+    assert!(controls.contains(
+        r#"$("sendBtn").disabled = readOnly || state.activeTurn || permissionMutationPending"#
+    ));
+    assert!(controls.contains("permissionMutationPending || !ready;"));
+
+    let thread_state = between(
+        body,
+        "function renderThreadState(s) {",
+        "function resetTranscriptForAuthoritativeSnapshot",
+    );
+    assert!(thread_state.contains("state.currentThreadKind ="));
+    assert!(thread_state.contains("state.currentParentThreadId ="));
+
+    assert!(onchange.contains("state.pendingModeSwitch = {"));
+    assert!(onchange.contains("threadId:String(state.threadId), previous, requested:mode"));
+    assert!(onchange.contains("updateComposerControls();"));
+
+    let approval_onchange = between(
+        body,
+        "$(\"approvalSel\").onchange = () => {",
+        "function renderModelSelect",
+    );
+    assert!(approval_onchange.contains("state.pendingApprovalSwitch = {"));
+    assert!(
+        approval_onchange.contains("threadId:String(state.threadId), previous, requested:policy")
+    );
+
+    let send_input = between(
+        body,
+        "function sendInput() {",
+        "$(\"sendBtn\").onclick = sendInput;",
+    );
+    assert!(send_input.contains("state.pendingModeSwitch || state.pendingApprovalSwitch"));
+    assert!(send_input.contains("Wait for the permission change to finish before sending."));
+
+    let compact = between(
+        body,
+        "function compactContext() {",
+        "$(\"modeSel\").onchange",
+    );
+    assert!(compact.contains("state.pendingModeSwitch || state.pendingApprovalSwitch"));
 }
 
 #[test]

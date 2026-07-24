@@ -40,6 +40,8 @@ let state = {
   expandedTaskGroups:new Set(), manuallyToggledTaskGroups:new Set(), expandedTaskDetails:new Map(),
   linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, codeOverlaySource:null, outputOverlay:null, activeTurn:false, interruptPending:false, compactPending:false,
   awaitingInitialThreadState:false, awaitingThreadResync:false, awaitingIncrementalResync:false, resyncStickBottom:false, contextWindow:0, contextUsed:null, tokenLedger:null, approvalPolicy:"ask", currentModel:null,
+  pendingModeSwitch:null, pendingApprovalSwitch:null,
+  currentThreadKind:null, currentParentThreadId:null,
   mcpServers:[], mcpCapabilities:{ status:false, reload:false, oauth_login:false }, mcpLoading:false, mcpError:null, expandedMcps:new Set(),
   threadReadOnly:false, readOnlyProvider:null, readOnlyMessage:null,
   pickerTypeahead:"", pickerTypeaheadTimer:null, pickerSelectedRow:null,
@@ -654,6 +656,7 @@ function rememberProjectThreads(pid, threads) {
   }
   renderParentThreadButton();
   renderSubagentsButton();
+  updateComposerControls();
 }
 
 function knownProjectThreads(pid) {
@@ -1466,6 +1469,8 @@ function openDraftThread(pid, defaultModel) {
 
   state.projectId = pid;
   state.threadId = null;
+  state.pendingModeSwitch = null; state.pendingApprovalSwitch = null;
+  state.currentThreadKind = null; state.currentParentThreadId = null;
   renderParentThreadButton();
   state.draftThread = { projectId:pid, title:"New thread" };
   state.firstTurnStartingThreadId = null;
@@ -1534,6 +1539,8 @@ async function openThread(pid, tid, title, opts) {
 
   clearThreadActivity(tid);
   state.projectId = pid; state.threadId = tid; state.pendingUserEl = null; state.pendingUserText = null;
+  state.pendingModeSwitch = null; state.pendingApprovalSwitch = null;
+  state.currentThreadKind = null; state.currentParentThreadId = null;
   renderParentThreadButton();
   state.threadReadOnly = false; state.readOnlyProvider = null; state.readOnlyMessage = null;
   updateReadOnlyBanner();
@@ -1771,8 +1778,21 @@ function updateComposerControls() {
   const draft = isDraftThread();
   const hasThreadSurface = !!state.threadId || draft;
   const readOnly = state.threadReadOnly && !draft;
-  $("sendBtn").disabled = readOnly || state.activeTurn || (!ready && !draft);
-  $("sendBtn").title = readOnly ? "Read-only thread — pick a model from a configured provider to reactivate it." : "";
+  const thread = !draft && knownThreadForId(state.projectId, state.threadId);
+  const inheritedPermissions = state.currentThreadKind === "subagent" ||
+    !!state.currentParentThreadId || (!!thread &&
+      (thread.kind === "subagent" || !!thread.parent_thread_id));
+  const permissionOwnershipUnknown = !draft && !!state.threadId &&
+    !state.currentThreadKind && !state.currentParentThreadId && !thread;
+  const permissionMutationPending = !!state.pendingModeSwitch || !!state.pendingApprovalSwitch;
+  const permissionsLocked = inheritedPermissions || permissionOwnershipUnknown ||
+    state.activeTurn || permissionMutationPending;
+  if (permissionsLocked) closeTurnPicker();
+  $("sendBtn").disabled = readOnly || state.activeTurn || permissionMutationPending ||
+    (!ready && !draft);
+  $("sendBtn").title = readOnly
+    ? "Read-only thread — pick a model from a configured provider to reactivate it."
+    : permissionMutationPending ? "Wait for the permission change to finish." : "";
   $("stopBtn").hidden = !state.activeTurn || draft;
   $("stopBtn").disabled = !ready || state.interruptPending;
   $("stopBtn").textContent = state.interruptPending ? "Stopping…" : "Stop";
@@ -1782,7 +1802,8 @@ function updateComposerControls() {
   $("effortSel").disabled = !hasThreadSurface || !modelCatalogReady || (!ready && !draft);
   const compactBtn = $("compactBtn");
   if (compactBtn) {
-    compactBtn.disabled = !state.threadId || draft || state.activeTurn || state.compactPending || !ready;
+    compactBtn.disabled = !state.threadId || draft || state.activeTurn || state.compactPending ||
+      permissionMutationPending || !ready;
     compactBtn.textContent = state.compactPending ? "Compacting..." : "Compact context";
   }
   $("input").disabled = !hasThreadSurface || readOnly;
@@ -1794,9 +1815,16 @@ function updateComposerControls() {
     state.wsStatus==="connecting" ? "Connecting to agent…" :
     state.wsStatus==="reconnecting" ? "Reconnecting to agent… keep drafting here." :
     "Disconnected from agent.";
-  $("approvalSel").disabled = !hasThreadSurface || (!ready && !draft);
-  $("modeSel").disabled = !hasThreadSurface || (!ready && !draft);
-  $("turnPickerBtn").disabled = !hasThreadSurface || (!ready && !draft);
+  $("approvalSel").disabled = permissionsLocked || !hasThreadSurface || (!ready && !draft);
+  $("modeSel").disabled = permissionsLocked || !hasThreadSurface || (!ready && !draft);
+  $("turnPickerBtn").disabled = permissionsLocked || !hasThreadSurface || (!ready && !draft);
+  $("turnPickerBtn").title = inheritedPermissions
+    ? "Mode & approval policy inherited from the parent thread"
+    : state.activeTurn
+      ? "Mode & approval policy can be changed after the active turn finishes"
+      : permissionMutationPending
+        ? "Waiting for the permission change to be saved"
+      : "Mode & approval policy for this thread";
 }
 function setTurnActive(active) {
   state.activeTurn = active;
@@ -1928,6 +1956,16 @@ function handleServer(msg) {
           state.pendingModelBeforeSelect = null;
           syncModelControls();
         }
+      }
+      if (msg.action==="switch_mode" && state.pendingModeSwitch) {
+        setMode(state.pendingModeSwitch.previous);
+        state.pendingModeSwitch = null;
+        updateComposerControls();
+      }
+      if (msg.action==="set_approval_policy" && state.pendingApprovalSwitch) {
+        setApprovalPolicy(state.pendingApprovalSwitch.previous);
+        state.pendingApprovalSwitch = null;
+        updateComposerControls();
       }
       if (msg.action==="send_input" && state.pendingUserEl) {
         failPendingUserMessage(null);
@@ -2252,8 +2290,23 @@ function renderThreadState(s) {
   if (state.awaitingIncrementalResync) state.resyncStickBottom = transcriptShouldStickToBottom();
   state.awaitingInitialThreadState = false;
   state.awaitingThreadResync = false;
-  setMode(s.mode || "build");
-  setApprovalPolicy(s.approval_policy || "ask");
+  const threadId = String(s.id || s.thread_id || state.threadId || "");
+  const mode = coerceMode(s.mode || "build");
+  const approvalPolicy = s.approval_policy || "ask";
+  state.currentThreadKind = typeof s.kind === "string" ? s.kind : null;
+  state.currentParentThreadId = s.parent_thread_id ? String(s.parent_thread_id) : null;
+  if (state.pendingModeSwitch &&
+      (String(state.pendingModeSwitch.threadId) !== threadId ||
+       shouldResetTranscript || state.pendingModeSwitch.requested === mode)) {
+    state.pendingModeSwitch = null;
+  }
+  if (state.pendingApprovalSwitch &&
+      (String(state.pendingApprovalSwitch.threadId) !== threadId ||
+       shouldResetTranscript || state.pendingApprovalSwitch.requested === approvalPolicy)) {
+    state.pendingApprovalSwitch = null;
+  }
+  setMode(mode);
+  setApprovalPolicy(approvalPolicy);
   if (s.current_model) {
     state.currentModel = s.current_model;
     state.pendingModelBeforeSelect = null;
@@ -2283,6 +2336,7 @@ function renderThreadState(s) {
   if (shouldResetTranscript) {
     resetTranscriptForAuthoritativeSnapshot();
   }
+  updateComposerControls();
 }
 function resetTranscriptForAuthoritativeSnapshot() {
   const keepFirstTurnActive =
@@ -2309,7 +2363,9 @@ function resetTranscriptForAuthoritativeSnapshot() {
   if (keepFirstTurnActive) updateComposerControls();
   else setTurnActive(false);
 }
-const MODE_LABELS = { build:"Build", plan:"Plan" };
+const MODE_LABELS = { build:"Build", plan:"Plan", danger:"Danger" };
+const VALID_MODES = { build:1, plan:1, danger:1 };
+function coerceMode(m) { return VALID_MODES[m] ? m : "build"; }
 const APPROVAL_LABELS = { ask:"Ask first", auto:"Auto approve", read_only:"Read only" };
 // Summarise "mode · approvals" on the turn chip below the composer.
 function updateTurnButton() {
@@ -2319,7 +2375,7 @@ function updateTurnButton() {
   btn.querySelector(".mp-label").textContent = `${mode} · ${appr}`;
 }
 function setMode(mode) {
-  state.mode = mode === "plan" ? "plan" : "build";
+  state.mode = coerceMode(mode);
   $("modeSel").value = state.mode;
   updateTurnButton();
 }
@@ -6282,6 +6338,10 @@ function sendInput() {
     notice("Wait for the current turn to finish, or stop it first.", "warning");
     return;
   }
+  if (state.pendingModeSwitch || state.pendingApprovalSwitch) {
+    notice("Wait for the permission change to finish before sending.", "warning");
+    return;
+  }
   if (isDraftThread()) {
     startDraftThread(text);
     return;
@@ -6372,6 +6432,10 @@ function compactContext() {
     notice("Wait for the current turn to finish before compacting context.", "warning");
     return;
   }
+  if (state.pendingModeSwitch || state.pendingApprovalSwitch) {
+    notice("Wait for the permission change to finish before compacting context.", "warning");
+    return;
+  }
   state.compactPending = true;
   updateComposerControls();
   if (!send({ type:"compact_context", thread_id: state.threadId })) {
@@ -6383,7 +6447,7 @@ function compactContext() {
 
 $("modeSel").onchange = () => {
   const previous = state.mode || "build";
-  const mode = $("modeSel").value === "plan" ? "plan" : "build";
+  const mode = coerceMode($("modeSel").value);
   if (isDraftThread()) {
     setMode(mode);
     return;
@@ -6393,7 +6457,9 @@ $("modeSel").onchange = () => {
     return;
   }
   if (send({ type:"switch_mode", thread_id: state.threadId, mode })) {
+    state.pendingModeSwitch = { threadId:String(state.threadId), previous, requested:mode };
     setMode(mode);
+    updateComposerControls();
   } else {
     setMode(previous);
     notice(`Mode not changed: WebSocket is ${state.wsStatus}.`, "error");
@@ -6412,7 +6478,11 @@ $("approvalSel").onchange = () => {
     return;
   }
   if (send({ type:"set_approval_policy", thread_id: state.threadId, policy })) {
+    state.pendingApprovalSwitch = {
+      threadId:String(state.threadId), previous, requested:policy
+    };
     setApprovalPolicy(policy);
+    updateComposerControls();
   } else {
     setApprovalPolicy(previous);
     notice(`Approval policy not changed: WebSocket is ${state.wsStatus}.`, "error");

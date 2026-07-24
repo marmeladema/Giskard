@@ -1368,21 +1368,37 @@ pub fn map_mode_to_sandbox(mode: Mode) -> codex_codes::SandboxPolicy {
             network_access: Some(true),
             writable_roots: None,
         },
+        Mode::Danger => codex_codes::SandboxPolicy::DangerFullAccess,
     }
+}
+
+pub fn map_turn_sandbox_policy(
+    mode: Mode,
+    approval_policy: ApprovalPolicy,
+) -> codex_codes::SandboxPolicy {
+    if approval_policy == ApprovalPolicy::ReadOnly {
+        return codex_codes::SandboxPolicy::ReadOnly {
+            network_access: Some(true),
+        };
+    }
+    map_mode_to_sandbox(mode)
 }
 
 pub fn map_mode_to_collaboration_mode(mode: Mode) -> codex_codes::ModeKind {
     match mode {
         Mode::Plan => codex_codes::ModeKind::Plan,
         Mode::Build => codex_codes::ModeKind::Default,
+        Mode::Danger => codex_codes::ModeKind::Default,
     }
 }
 
-pub fn map_approval_policy(policy: ApprovalPolicy) -> codex_codes::AskForApproval {
-    match policy {
-        ApprovalPolicy::ReadOnly => codex_codes::AskForApproval::Never,
-        ApprovalPolicy::Ask => codex_codes::AskForApproval::OnRequest,
-        ApprovalPolicy::Auto => codex_codes::AskForApproval::Never,
+pub fn map_turn_approval_policy(mode: Mode, policy: ApprovalPolicy) -> codex_codes::AskForApproval {
+    match (mode, policy) {
+        (_, ApprovalPolicy::ReadOnly) | (_, ApprovalPolicy::Auto) => {
+            codex_codes::AskForApproval::Never
+        }
+        (Mode::Danger, ApprovalPolicy::Ask) => codex_codes::AskForApproval::Untrusted,
+        (_, ApprovalPolicy::Ask) => codex_codes::AskForApproval::OnRequest,
     }
 }
 
@@ -3338,6 +3354,40 @@ mod tests {
     }
 
     #[test]
+    fn danger_mode_uses_codex_full_access_sandbox() {
+        assert_eq!(
+            map_mode_to_sandbox(Mode::Danger),
+            codex_codes::SandboxPolicy::DangerFullAccess
+        );
+    }
+
+    #[test]
+    fn read_only_approval_policy_overrides_mode_sandbox() {
+        assert_eq!(
+            map_turn_sandbox_policy(Mode::Danger, ApprovalPolicy::ReadOnly),
+            codex_codes::SandboxPolicy::ReadOnly {
+                network_access: Some(true)
+            }
+        );
+    }
+
+    #[test]
+    fn danger_ask_uses_untrusted_approval_policy() {
+        assert_eq!(
+            map_turn_approval_policy(Mode::Danger, ApprovalPolicy::Ask),
+            codex_codes::AskForApproval::Untrusted
+        );
+        assert_eq!(
+            map_turn_approval_policy(Mode::Danger, ApprovalPolicy::Auto),
+            codex_codes::AskForApproval::Never
+        );
+        assert_eq!(
+            map_turn_approval_policy(Mode::Build, ApprovalPolicy::Ask),
+            codex_codes::AskForApproval::OnRequest
+        );
+    }
+
+    #[test]
     fn mode_maps_to_matching_codex_collaboration_mode() {
         assert_eq!(
             map_mode_to_collaboration_mode(Mode::Plan),
@@ -3345,6 +3395,10 @@ mod tests {
         );
         assert_eq!(
             map_mode_to_collaboration_mode(Mode::Build),
+            codex_codes::ModeKind::Default
+        );
+        assert_eq!(
+            map_mode_to_collaboration_mode(Mode::Danger),
             codex_codes::ModeKind::Default
         );
     }

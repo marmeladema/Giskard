@@ -13,6 +13,9 @@ use crate::user_input::UserInput;
 pub enum Mode {
     Plan,
     Build,
+    /// Like Build, but with no filesystem sandbox: the agent gets full disk
+    /// access (writes outside the workspace, deletes, etc.). Dangerous.
+    Danger,
 }
 
 impl Mode {
@@ -21,6 +24,7 @@ impl Mode {
         match self {
             Self::Plan => "read-only",
             Self::Build => "workspace-write",
+            Self::Danger => "danger-full-access",
         }
     }
 }
@@ -36,11 +40,12 @@ pub enum ApprovalPolicy {
 
 /// Per-turn overrides sent to the harness (spec §7.5, P1).
 ///
-/// A **resolved snapshot**, not a delta. The server constructs it at `start_turn` from the
-/// thread's persisted state. `model = None` means "reuse the thread's current model."
+/// A **resolved snapshot**, not a delta. The server constructs it at `start_turn` from persisted
+/// state, including inherited sub-agent permissions. `model = None` means "reuse the thread's
+/// current model."
 /// Effort lives only in `ModelRef.reasoning_effort` (no standalone field).
-/// `approval_policy` is the thread's persisted policy, included in the snapshot so the harness
-/// can pass it to `turn/start`.
+/// `approval_policy` is the resolved permission owner's policy, included in the snapshot so the
+/// harness can pass it to `turn/start`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -82,7 +87,7 @@ pub struct Turn {
     pub items: Vec<Item>,
     /// Model used for this turn (may differ across turns of one thread, §8.4).
     pub model: ModelRef,
-    /// Plan | build applied to this turn (§7.4).
+    /// Plan | build | danger applied to this turn (§7.4).
     pub mode: Mode,
     pub status: TurnStatus,
     /// Per-turn usage; the same `TokenUsage` struct is reused in the ledgers (B3).
@@ -105,6 +110,7 @@ mod tests {
     fn mode_sandbox_mapping() {
         assert_eq!(Mode::Plan.sandbox_policy(), "read-only");
         assert_eq!(Mode::Build.sandbox_policy(), "workspace-write");
+        assert_eq!(Mode::Danger.sandbox_policy(), "danger-full-access");
     }
 
     #[test]
@@ -113,6 +119,11 @@ mod tests {
         assert_eq!(json, "\"build\"");
         let back: Mode = serde_json::from_str(&json).unwrap();
         assert_eq!(back, Mode::Build);
+
+        let danger_json = serde_json::to_string(&Mode::Danger).unwrap();
+        assert_eq!(danger_json, "\"danger\"");
+        let danger: Mode = serde_json::from_str(&danger_json).unwrap();
+        assert_eq!(danger, Mode::Danger);
     }
 
     #[test]

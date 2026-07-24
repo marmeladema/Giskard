@@ -1914,8 +1914,10 @@ fn build_turn_start_params(
     overrides: &TurnOverrides,
 ) -> Result<serde_json::Value, HarnessError> {
     let codex_input = mapping::map_user_input(input);
-    let sandbox_policy = mapping::map_mode_to_sandbox(overrides.mode);
-    let approval_policy = mapping::map_approval_policy(overrides.approval_policy);
+    let sandbox_policy =
+        mapping::map_turn_sandbox_policy(overrides.mode, overrides.approval_policy);
+    let approval_policy =
+        mapping::map_turn_approval_policy(overrides.mode, overrides.approval_policy);
     let effort = overrides
         .model
         .as_ref()
@@ -2715,10 +2717,18 @@ mod tests {
     }
 
     fn turn_overrides(mode: Mode, effort: Option<Effort>) -> TurnOverrides {
+        turn_overrides_with_policy(mode, effort, ApprovalPolicy::Ask)
+    }
+
+    fn turn_overrides_with_policy(
+        mode: Mode,
+        effort: Option<Effort>,
+        approval_policy: ApprovalPolicy,
+    ) -> TurnOverrides {
         TurnOverrides {
             model: Some(test_model(effort)),
             mode,
-            approval_policy: ApprovalPolicy::Ask,
+            approval_policy,
         }
     }
 
@@ -4380,5 +4390,48 @@ mod tests {
         assert_eq!(params["collaborationMode"]["settings"]["model"], "gpt-5.5");
         assert!(params.get("effort").is_none());
         assert!(params["collaborationMode"]["settings"]["reasoning_effort"].is_null());
+    }
+
+    #[test]
+    fn danger_turn_start_params_preserve_ask_first_semantics() {
+        let params = build_turn_start_params(
+            &test_thread(),
+            &UserInput::text("work outside the workspace"),
+            &turn_overrides_with_policy(Mode::Danger, None, ApprovalPolicy::Ask),
+        )
+        .unwrap();
+
+        assert_eq!(params["sandboxPolicy"]["type"], "dangerFullAccess");
+        assert_eq!(params["approvalPolicy"], "untrusted");
+        assert_eq!(params["collaborationMode"]["mode"], "default");
+    }
+
+    #[test]
+    fn danger_auto_turn_start_params_disable_approvals() {
+        let params = build_turn_start_params(
+            &test_thread(),
+            &UserInput::text("run unattended"),
+            &turn_overrides_with_policy(Mode::Danger, None, ApprovalPolicy::Auto),
+        )
+        .unwrap();
+
+        assert_eq!(params["sandboxPolicy"]["type"], "dangerFullAccess");
+        assert_eq!(params["approvalPolicy"], "never");
+        assert_eq!(params["collaborationMode"]["mode"], "default");
+    }
+
+    #[test]
+    fn read_only_approval_policy_forces_read_only_sandbox() {
+        let params = build_turn_start_params(
+            &test_thread(),
+            &UserInput::text("inspect only"),
+            &turn_overrides_with_policy(Mode::Danger, None, ApprovalPolicy::ReadOnly),
+        )
+        .unwrap();
+
+        assert_eq!(params["sandboxPolicy"]["type"], "readOnly");
+        assert_eq!(params["sandboxPolicy"]["networkAccess"], true);
+        assert_eq!(params["approvalPolicy"], "never");
+        assert_eq!(params["collaborationMode"]["mode"], "default");
     }
 }

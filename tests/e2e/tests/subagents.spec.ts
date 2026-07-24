@@ -54,6 +54,12 @@ test.describe("linked sub-agent threads", () => {
       JSON.parse(localStorage.getItem("giskard.lastThread") || "null"),
     );
     expect(childSelection?.tid).not.toBe(parentSelection.tid);
+    await expect(page.locator("#turnPickerBtn")).toBeDisabled();
+    await expect(page.locator("#modeSel")).toBeDisabled();
+    await expect(page.locator("#approvalSel")).toBeDisabled();
+    await expect(page.locator("#modelPickerBtn")).toBeEnabled();
+    await expect(page.locator("#modelSel")).toBeEnabled();
+    await expect(page.locator("#effortSel")).toBeEnabled();
     const parentButton = page.getByRole("button", { name: /Back to parent thread:/ });
     await expect(parentButton).toBeVisible();
 
@@ -65,6 +71,9 @@ test.describe("linked sub-agent threads", () => {
     expect(restored?.tid).toBe(childSelection.tid);
     await expect(parentRow).toBeVisible();
     await expect(parentButton).toBeVisible();
+    await expect(page.locator("#turnPickerBtn")).toBeDisabled();
+    await expect(page.locator("#modeSel")).toBeDisabled();
+    await expect(page.locator("#approvalSel")).toBeDisabled();
 
     await parentButton.click();
     await expect.poll(async () => {
@@ -75,6 +84,9 @@ test.describe("linked sub-agent threads", () => {
     }).toBe(parentSelection.tid);
     await expect(parentRow).toBeVisible();
     await expect(parentButton).toBeHidden();
+    await expect(page.locator("#turnPickerBtn")).toBeEnabled();
+    await expect(page.locator("#modeSel")).toBeEnabled();
+    await expect(page.locator("#approvalSel")).toBeEnabled();
 
     const opensBeforeKnownOpen = linkedOpenRequests;
     await transcript.getByRole("button", { name: "Open linked thread" }).click();

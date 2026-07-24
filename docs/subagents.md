@@ -38,6 +38,24 @@ Persisted child metadata contains:
 - `spawned_by_turn_id`
 - the native harness thread ID
 
+On first import, the child copies the parent's current model, mode, approval policy, context window
+cache, and retained model efforts. Model, context-window, and reasoning-effort state may then change
+independently on the child. Mode and approval policy do not: they remain owned by the primary parent
+and are inherited transitively through nested children. Their child-file values are synchronized
+caches, not an authority.
+
+The server rejects child `SwitchMode` and `SetApprovalPolicy` messages, and the browser disables
+those child controls while leaving model and effort controls available. Every direct child send or
+manual compaction resolves mode and policy from the primary permission owner again and repairs a
+stale child cache before calling the harness. A missing, malformed, or cyclic parent chain fails
+closed for those actions instead of falling back to potentially broader child values.
+
+A parent permission change updates its complete descendant tree under the project lifecycle lock.
+The change is rejected while the parent or any descendant has an active turn, running task,
+passive pre-turn monitor, or pending child materialization. This prevents an already-running Danger
+turn or externally spawned child from continuing under broader captured permissions after the
+parent appears to have been tightened.
+
 Ownership is immutable after import. Giskard rejects self-links, cycles, reparenting, a child linked
 under the wrong parent, and a native child whose harness-reported parent disagrees with the proposed
 parent. Malformed or dangling records remain visible in the main sidebar so they can be repaired or
@@ -98,7 +116,8 @@ fallback from being appended.
 ## Direct user follow-ups
 
 An imported child is a resumable native thread, so Giskard allows direct user messages after the
-delegated turn becomes idle. A follow-up creates and persists a normal turn in the child thread.
+delegated turn becomes idle. A follow-up creates and persists a normal turn in the child thread,
+using the primary parent's current mode and approval policy plus the child's own model and effort.
 
 While delegated work owns the passive monitor, a direct send is rejected with
 `thread_turn_active`. This prevents a user turn and the externally started child turn from racing
@@ -118,6 +137,10 @@ native child ID, delegated prompt, lifecycle action/status/message, and `spawned
 that trusted item instead of accepting those values from the client. A reverse child-to-parent item
 returns the existing parent. Unknown items, non-link items, invalid ownership, and mismatched native
 parents are rejected.
+
+The general native-resume route cannot import a thread that the harness reports as a sub-agent. It
+refuses to install a registry binding and requires the child to be opened through its parent activity
+link, so a caller cannot omit ownership metadata and turn a child into an independent primary thread.
 
 `POST /api/projects/{project_id}/threads` remains the normal open/resume endpoint and accepts only
 `thread_id` or `resume`; it cannot fabricate sub-agent ownership. Harness-observed and explicit

@@ -17,6 +17,8 @@ pub enum HarnessError {
     Transport(String),
     #[error("protocol error: {0}")]
     Protocol(String),
+    #[error("invalid thread ownership: {0}")]
+    InvalidOwnership(String),
     #[error("harness overloaded after retries exhausted")]
     Overloaded,
     #[error("capability not offered: {0}")]

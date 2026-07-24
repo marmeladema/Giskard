@@ -145,6 +145,7 @@ struct ActivityHarness {
     server_responses: tokio::sync::Mutex<Vec<(ServerRequestId, ServerRequestResponse)>>,
     pending_approvals: tokio::sync::Mutex<HashMap<ApprovalId, (ThreadId, TurnId)>>,
     pending_server_requests: tokio::sync::Mutex<HashMap<ServerRequestId, (ThreadId, TurnId)>>,
+    started_turns: tokio::sync::Mutex<Vec<(ThreadId, TurnId, TurnOverrides)>>,
 }
 
 #[derive(Default)]
@@ -195,6 +196,16 @@ impl SlowStartHarness {
 impl ActivityHarness {
     async fn resume_policies(&self) -> Vec<(String, ResumePolicy)> {
         self.resume_policies.lock().await.clone()
+    }
+
+    async fn started_turns(&self, thread_id: ThreadId) -> Vec<(TurnId, TurnOverrides)> {
+        self.started_turns
+            .lock()
+            .await
+            .iter()
+            .filter(|(started_thread_id, _, _)| *started_thread_id == thread_id)
+            .map(|(_, turn_id, overrides)| (*turn_id, overrides.clone()))
+            .collect()
     }
 
     fn hold_native_child_open(&self) {
@@ -764,13 +775,17 @@ impl AgentHarness for ActivityHarness {
         &self,
         thread: &ThreadHandle,
         input: UserInput,
-        _overrides: TurnOverrides,
+        overrides: TurnOverrides,
     ) -> Result<TurnId, HarnessError> {
         let Some(sender) = self.threads.lock().await.get(&thread.thread).cloned() else {
             return Err(HarnessError::ThreadNotFound(thread.thread));
         };
         let thread_id = thread.thread;
         let turn = TurnId::new();
+        self.started_turns
+            .lock()
+            .await
+            .push((thread_id, turn, overrides));
         let text = input.as_text().unwrap_or_default().to_string();
         let _ = sender.send(AgentEvent::TurnStarted {
             thread: thread_id,
@@ -902,6 +917,8 @@ impl AgentHarness for ActivityHarness {
                 item,
             });
             self.complete_turn(thread_id, turn).await?;
+        } else if text.contains("hold open") {
+            // The test completes this turn explicitly after exercising a concurrent mutation.
         } else if text.contains("plain activity") {
             let item = Item {
                 id: ItemId::new(),
@@ -3581,6 +3598,15 @@ async fn importing_subagent_thread_records_parent_and_reuses_native_child() {
     assert_eq!(parent_resp.status(), 200);
     let parent_body = parent_resp.json::<serde_json::Value>().await.unwrap();
     let parent_id: ThreadId = parent_body["thread_id"].as_str().unwrap().parse().unwrap();
+    state
+        .store
+        .update_thread(project_id, parent_id, |thread| {
+            thread.mode = Mode::Danger;
+            thread.approval_policy = ApprovalPolicy::ReadOnly;
+        })
+        .await
+        .unwrap()
+        .unwrap();
     let parent_file = state
         .store
         .load_thread(project_id, parent_id)
@@ -3636,6 +3662,8 @@ async fn importing_subagent_thread_records_parent_and_reuses_native_child() {
     assert_eq!(saved.parent_thread_id, Some(parent_id));
     assert_eq!(saved.spawned_by_turn_id, Some(spawned_by_turn_id));
     assert_eq!(saved.kind, giskard_core::ThreadKind::Subagent);
+    assert_eq!(saved.mode, Mode::Danger);
+    assert_eq!(saved.approval_policy, ApprovalPolicy::ReadOnly);
     assert!(
         harness
             .resume_policies()
@@ -3724,6 +3752,402 @@ async fn importing_subagent_thread_records_parent_and_reuses_native_child() {
         Some(child_id_string.as_str())
     );
     assert_eq!(state.store.list_threads(project_id).await.unwrap().len(), 2);
+
+    let idle_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while state.registry.thread_has_active_turn(parent_id).await
+        || state.registry.thread_has_active_turn(child_id).await
+    {
+        assert!(
+            tokio::time::Instant::now() < idle_deadline,
+            "imported ownership tree did not complete its observed turns"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+
+    let mut ws = connect_ws(port, &cookie).await;
+    assert!(state.registry.thread_has_passive_monitor(child_id).await);
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SwitchMode {
+            thread_id: parent_id,
+            mode: Mode::Plan,
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    wait_for_ws_error(&mut ws, "switch_mode", "permission_change_blocked").await;
+
+    // Terminal lifecycle evidence ends the idle pre-turn watcher. Until this arrives, changing
+    // the parent is correctly blocked because the externally spawned child may still start with
+    // the permissions captured at spawn time.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SendInput {
+            thread_id: parent_id,
+            text: "subagent interrupted".into(),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let terminal_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while state.registry.thread_has_active_turn(parent_id).await
+        || state.registry.thread_has_passive_monitor(child_id).await
+    {
+        assert!(
+            tokio::time::Instant::now() < terminal_deadline,
+            "terminal child lifecycle did not release its monitor"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SwitchMode {
+            thread_id: child_id,
+            mode: Mode::Plan,
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    wait_for_ws_error(&mut ws, "switch_mode", "subagent_permissions_inherited").await;
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SetApprovalPolicy {
+            thread_id: child_id,
+            policy: ApprovalPolicy::Auto,
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    wait_for_ws_error(
+        &mut ws,
+        "set_approval_policy",
+        "subagent_permissions_inherited",
+    )
+    .await;
+    wait_for_permissions(
+        &state,
+        project_id,
+        child_id,
+        Mode::Danger,
+        ApprovalPolicy::ReadOnly,
+    )
+    .await;
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SwitchMode {
+            thread_id: parent_id,
+            mode: Mode::Plan,
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SetApprovalPolicy {
+            thread_id: parent_id,
+            policy: ApprovalPolicy::Auto,
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    for target_id in [parent_id, child_id] {
+        wait_for_permissions(
+            &state,
+            project_id,
+            target_id,
+            Mode::Plan,
+            ApprovalPolicy::Auto,
+        )
+        .await;
+    }
+
+    // A command can outlive its turn. It must still block a parent permission change even when
+    // neither the turn gate nor the passive monitor reports activity.
+    let running_process_id = "permission_change_running_child";
+    let tracked = state
+        .running_commands
+        .apply_event(&AgentEvent::ItemStarted {
+            thread: child_id,
+            turn: TurnId::new(),
+            item: ItemStart {
+                id: ItemId::new(),
+                harness_item_id: "permission_change_running_child".into(),
+                kind: ItemKind::CommandExecution,
+                command: Some(CommandExecutionStart {
+                    command: "sleep 60".into(),
+                    cwd: "/tmp/permission-change".into(),
+                    status: Some("in_progress".into()),
+                    process_id: Some(running_process_id.into()),
+                    started_at_ms: None,
+                }),
+                tool: None,
+            },
+        })
+        .await;
+    assert!(tracked);
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SwitchMode {
+            thread_id: parent_id,
+            mode: Mode::Danger,
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    wait_for_ws_error(&mut ws, "switch_mode", "permission_change_blocked").await;
+    assert!(
+        state
+            .running_commands
+            .remove_by_process(child_id, running_process_id)
+            .await
+    );
+
+    // Simulate a child cache left stale by an older Giskard version or an interrupted cascade.
+    // The send boundary must ignore it and repair it from the primary permission owner.
+    state
+        .store
+        .update_thread(project_id, child_id, |thread| {
+            thread.mode = Mode::Danger;
+            thread.approval_policy = ApprovalPolicy::ReadOnly;
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SendInput {
+            thread_id: child_id,
+            text: "direct child follow-up".into(),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let direct_turn_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        let turns = harness.started_turns(child_id).await;
+        if let Some((_, overrides)) = turns.first() {
+            assert_eq!(overrides.mode, Mode::Plan);
+            assert_eq!(overrides.approval_policy, ApprovalPolicy::Auto);
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < direct_turn_deadline,
+            "direct child turn did not reach the harness"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+    wait_for_permissions(
+        &state,
+        project_id,
+        child_id,
+        Mode::Plan,
+        ApprovalPolicy::Auto,
+    )
+    .await;
+
+    let direct_idle_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while state.registry.thread_has_active_turn(child_id).await {
+        assert!(
+            tokio::time::Instant::now() < direct_idle_deadline,
+            "direct child turn did not complete"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SendInput {
+            thread_id: child_id,
+            text: "hold open for permission race".into(),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let active_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    let held_turn = loop {
+        let turns = harness.started_turns(child_id).await;
+        if turns.len() >= 2 && state.registry.thread_has_active_turn(child_id).await {
+            break turns[1].0;
+        }
+        assert!(
+            tokio::time::Instant::now() < active_deadline,
+            "held child turn did not become active"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    };
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SwitchMode {
+            thread_id: parent_id,
+            mode: Mode::Danger,
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    wait_for_ws_error(&mut ws, "switch_mode", "permission_change_blocked").await;
+    for target_id in [parent_id, child_id] {
+        wait_for_permissions(
+            &state,
+            project_id,
+            target_id,
+            Mode::Plan,
+            ApprovalPolicy::Auto,
+        )
+        .await;
+    }
+    harness.complete_turn(child_id, held_turn).await.unwrap();
+
+    let malformed_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while state.registry.thread_has_active_turn(child_id).await {
+        assert!(
+            tokio::time::Instant::now() < malformed_deadline,
+            "held child turn did not release before malformed-graph checks"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+    let started_before_malformed = harness.started_turns(child_id).await.len();
+    state
+        .store
+        .update_thread(project_id, child_id, |thread| {
+            thread.parent_thread_id = Some(ThreadId::new());
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SendInput {
+            thread_id: child_id,
+            text: "must not start under malformed ownership".into(),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    wait_for_ws_error(&mut ws, "send_input", "invalid_thread_graph").await;
+    assert_eq!(
+        harness.started_turns(child_id).await.len(),
+        started_before_malformed,
+        "malformed ownership must be rejected before the harness starts a turn"
+    );
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::CompactContext {
+            thread_id: child_id,
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    wait_for_ws_error(&mut ws, "compact_context", "invalid_thread_graph").await;
+
+    state
+        .store
+        .update_thread(project_id, child_id, |thread| {
+            thread.parent_thread_id = Some(parent_id);
+        })
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn explicit_resume_rejects_native_subagent_without_trusted_parent_link() {
+    let harness = Arc::new(ActivityHarness::default());
+    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let project_id = create_project_only(&client, &base, &cookie).await;
+
+    let response = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"resume": "native-collab-child"}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("open it through the trusted parent activity link")
+    );
+    assert!(
+        state
+            .store
+            .list_threads(project_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Old persisted data may already contain a native child misclassified as a primary thread.
+    // Reopening it must degrade to read-only, and the WebSocket turn boundary must reject it too.
+    let primary_response = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"resume": "native-parent"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(primary_response.status(), reqwest::StatusCode::OK);
+    let primary_id: ThreadId =
+        primary_response.json::<serde_json::Value>().await.unwrap()["thread_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+    state
+        .store
+        .update_thread(project_id, primary_id, |thread| {
+            thread.harness_thread_id = "native-collab-child".into();
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    state.registry.forget_thread(primary_id).await;
+
+    let reopen = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"thread_id": primary_id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reopen.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        reopen.json::<serde_json::Value>().await.unwrap()["warning"]["code"],
+        "thread_read_only"
+    );
+
+    let mut ws = connect_ws(port, &cookie).await;
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::SendInput {
+            thread_id: primary_id,
+            text: "must remain blocked".into(),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    wait_for_ws_error(&mut ws, "send_input", "invalid_thread_ownership").await;
+    assert!(harness.started_turns(primary_id).await.is_empty());
 }
 
 #[tokio::test]
@@ -5736,6 +6160,33 @@ async fn load_policy(
         .unwrap()
         .unwrap()
         .approval_policy
+}
+
+async fn wait_for_permissions(
+    state: &AppState,
+    project_id: ProjectId,
+    thread_id: ThreadId,
+    expected_mode: Mode,
+    expected_policy: ApprovalPolicy,
+) -> giskard_persist::store::ThreadFile {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        let thread = state
+            .store
+            .load_thread(project_id, thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        if thread.mode == expected_mode && thread.approval_policy == expected_policy {
+            return thread;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "thread {thread_id} permissions did not become {expected_mode:?}/{expected_policy:?}"
+            );
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
 }
 
 async fn wait_for_policy(
