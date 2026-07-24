@@ -2,12 +2,13 @@ use std::collections::HashMap;
 
 use tokio::sync::Mutex;
 
+use giskard_core::approval::ApprovalDecision;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ItemId, ServerRequestId, ThreadId, TurnId};
+use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{ItemDelta, ItemPayload};
 use giskard_core::server_request::ServerRequest;
 use giskard_core::user_input::UserInput;
-use giskard_proto::{LiveTurnSnapshot, WireAgentEvent, WireApprovalRequest};
+use giskard_proto::{AnsweredApproval, LiveTurnSnapshot, WireAgentEvent, WireApprovalRequest};
 
 const MAX_LIVE_COMMAND_OUTPUT: usize = 16 * 1024;
 const LIVE_COMMAND_OUTPUT_EDGE: usize = 8 * 1024;
@@ -17,6 +18,10 @@ struct LiveTurn {
     turn_id: TurnId,
     user_input: Option<UserInput>,
     events: Vec<AgentEvent>,
+    /// Approvals the user answered during this turn, and the decision they made. Resolution is not
+    /// otherwise recorded in `events` (there is no harness-emitted approval-resolved event), so
+    /// without this the reconnect snapshot would replay every answered approval as still pending.
+    resolved_approvals: HashMap<ApprovalId, ApprovalDecision>,
 }
 
 pub struct LiveBufferStore {
@@ -56,6 +61,7 @@ impl LiveBufferStore {
                 turn_id,
                 user_input,
                 events: Vec::new(),
+                resolved_approvals: HashMap::new(),
             },
         );
     }
@@ -78,6 +84,7 @@ impl LiveBufferStore {
                     turn_id,
                     user_input,
                     events: Vec::new(),
+                    resolved_approvals: HashMap::new(),
                 });
                 Ok(())
             }
@@ -106,6 +113,21 @@ impl LiveBufferStore {
             if let Some(item_id) = command_delta_item {
                 compact_command_output_deltas(&mut turn.events, item_id);
             }
+        }
+    }
+
+    /// Record that the user answered an approval in the thread's in-flight turn, so the reconnect
+    /// snapshot renders it resolved instead of re-prompting (spec §13.6). No-op if the thread has no
+    /// live turn (e.g. the turn already completed and its buffer was cleared).
+    pub async fn resolve_approval(
+        &self,
+        thread_id: ThreadId,
+        approval_id: ApprovalId,
+        decision: ApprovalDecision,
+    ) {
+        let mut buffers = self.buffers.lock().await;
+        if let Some(turn) = buffers.get_mut(&thread_id) {
+            turn.resolved_approvals.insert(approval_id, decision);
         }
     }
 
@@ -141,14 +163,33 @@ impl LiveBufferStore {
         let buffers = self.buffers.lock().await;
         buffers.get(&thread_id).map(|turn| {
             // C1/§3.5: the snapshot crosses the wire, so narrow core → wire here too.
+            // Skip approvals the user already answered: re-surfacing an answered approval as pending
+            // lets the client re-answer it, which routes a stale id to the harness and errors.
             let pending_approval: Option<WireApprovalRequest> =
-                turn.events.iter().rev().find_map(|e| {
-                    if let AgentEvent::ApprovalRequested { request, .. } = e {
+                turn.events.iter().rev().find_map(|e| match e {
+                    AgentEvent::ApprovalRequested { request, .. }
+                        if !turn.resolved_approvals.contains_key(&request.id) =>
+                    {
                         Some(request.clone().into())
-                    } else {
-                        None
                     }
+                    _ => None,
                 });
+            // Answered approvals still ride along in `accumulated`; the client renders them resolved
+            // from this list rather than re-prompting.
+            let answered_approvals: Vec<AnsweredApproval> = turn
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::ApprovalRequested { request, .. } => turn
+                        .resolved_approvals
+                        .get(&request.id)
+                        .map(|decision| AnsweredApproval {
+                            request_id: request.id.clone(),
+                            decision: decision.clone(),
+                        }),
+                    _ => None,
+                })
+                .collect();
             let accumulated: Vec<WireAgentEvent> =
                 turn.events.iter().cloned().map(Into::into).collect();
             let pending_server_requests = pending_server_requests(&turn.events);
@@ -159,6 +200,7 @@ impl LiveBufferStore {
                 accumulated,
                 pending_approval,
                 pending_server_requests,
+                answered_approvals,
             }
         })
     }
@@ -608,5 +650,108 @@ mod tests {
                 } if label == "Grant root" && path == "/tmp/project" && !*source_link
             )
         }));
+    }
+
+    fn approval_requested(thread: ThreadId, turn: TurnId, id: &str) -> AgentEvent {
+        AgentEvent::ApprovalRequested {
+            thread,
+            turn,
+            request: ApprovalRequest {
+                id: ApprovalId(id.into()),
+                kind: ApprovalKind::CommandExecution {
+                    command: "rm -rf /tmp/x".into(),
+                    cwd: "/tmp/project".into(),
+                },
+                reason: None,
+                metadata: vec![],
+                available: vec![ApprovalDecision::Accept, ApprovalDecision::Decline],
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn answered_approval_is_not_resurfaced_as_pending() {
+        let store = LiveBufferStore::new();
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+
+        store.start_turn(thread).await;
+        store
+            .append(thread, AgentEvent::TurnStarted { thread, turn })
+            .await;
+        store
+            .append(thread, approval_requested(thread, turn, "ap_answered"))
+            .await;
+        store
+            .resolve_approval(
+                thread,
+                ApprovalId("ap_answered".into()),
+                ApprovalDecision::Accept,
+            )
+            .await;
+
+        let snapshot = store.snapshot(thread).await.expect("snapshot");
+        // The answered approval must not come back as actionable — re-answering a stale id errors.
+        assert!(
+            snapshot.pending_approval.is_none(),
+            "answered approval should not be pending after a reload"
+        );
+        // But it is reported as answered so the reconnecting client renders it in its resolved state.
+        assert_eq!(snapshot.answered_approvals.len(), 1);
+        assert_eq!(
+            snapshot.answered_approvals[0].request_id,
+            ApprovalId("ap_answered".into())
+        );
+        assert_eq!(
+            snapshot.answered_approvals[0].decision,
+            ApprovalDecision::Accept
+        );
+    }
+
+    #[tokio::test]
+    async fn unanswered_approval_stays_pending_when_another_is_answered() {
+        let store = LiveBufferStore::new();
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+
+        store.start_turn(thread).await;
+        store
+            .append(thread, AgentEvent::TurnStarted { thread, turn })
+            .await;
+        store
+            .append(thread, approval_requested(thread, turn, "ap_answered"))
+            .await;
+        store
+            .append(thread, approval_requested(thread, turn, "ap_open"))
+            .await;
+        store
+            .resolve_approval(
+                thread,
+                ApprovalId("ap_answered".into()),
+                ApprovalDecision::Decline,
+            )
+            .await;
+
+        let snapshot = store.snapshot(thread).await.expect("snapshot");
+        let pending = snapshot
+            .pending_approval
+            .expect("the still-open approval should remain pending");
+        assert_eq!(pending.id, ApprovalId("ap_open".into()));
+        assert_eq!(snapshot.answered_approvals.len(), 1);
+        assert_eq!(
+            snapshot.answered_approvals[0].request_id,
+            ApprovalId("ap_answered".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_approval_is_a_no_op_without_a_live_turn() {
+        let store = LiveBufferStore::new();
+        let thread = ThreadId::new();
+        // No panic and no snapshot materializes when the turn buffer was already cleared.
+        store
+            .resolve_approval(thread, ApprovalId("ap_1".into()), ApprovalDecision::Accept)
+            .await;
+        assert!(store.snapshot(thread).await.is_none());
     }
 }

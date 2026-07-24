@@ -153,6 +153,21 @@ pub struct LiveTurnSnapshot {
     pub pending_approval: Option<WireApprovalRequest>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_server_requests: Vec<ServerRequest>,
+    /// Approvals the user already answered during this in-flight turn, with the decision they made.
+    ///
+    /// Approval resolution lives only in browser memory, so a reload would otherwise re-surface an
+    /// answered approval as actionable — and answering it again routes a stale id to the harness,
+    /// which errors (spec §13.6). Carrying the answered set lets the reconnecting client render those
+    /// cards in their resolved state instead of re-prompting.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answered_approvals: Vec<AnsweredApproval>,
+}
+
+/// An approval the user resolved during an in-flight turn (part of [`LiveTurnSnapshot`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnsweredApproval {
+    pub request_id: ApprovalId,
+    pub decision: ApprovalDecision,
 }
 
 /// Whether a running task is a shell command or a tool/MCP call. Both are tracked and surfaced the
@@ -962,6 +977,7 @@ mod tests {
                 params: serde_json::json!({ "tool": "example" }),
                 received_at: chrono::Utc::now(),
             }],
+            answered_approvals: vec![],
         };
         let json = serde_json::to_value(&snapshot).unwrap();
         assert_eq!(json["thread_id"], tid.to_string());
@@ -969,6 +985,35 @@ mod tests {
         assert_eq!(
             json["pending_server_requests"][0]["method"],
             "item/tool/call"
+        );
+    }
+
+    #[test]
+    fn live_turn_snapshot_includes_answered_approvals() {
+        let snapshot = LiveTurnSnapshot {
+            thread_id: ThreadId::new(),
+            turn_id: TurnId::new(),
+            user_input: None,
+            accumulated: vec![],
+            pending_approval: None,
+            pending_server_requests: vec![],
+            answered_approvals: vec![AnsweredApproval {
+                request_id: ApprovalId("ap_1".into()),
+                decision: ApprovalDecision::Accept,
+            }],
+        };
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(json["answered_approvals"][0]["request_id"], "ap_1");
+        assert_eq!(json["answered_approvals"][0]["decision"], "accept");
+        let back: LiveTurnSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(back.answered_approvals.len(), 1);
+        assert_eq!(
+            back.answered_approvals[0].request_id,
+            ApprovalId("ap_1".into())
+        );
+        assert_eq!(
+            back.answered_approvals[0].decision,
+            ApprovalDecision::Accept
         );
     }
 }

@@ -37,7 +37,7 @@ let state = {
   currentRenderTurnId:null, newestPersistedTurnId:null,
   globalModels:[], models:[], modelsProject:null, modelsLoadingProject:null, pendingModelBeforeSelect:null, streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null,
   streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), renderedItemBodyByKey:new Map(), itemKindsByItemId:new Map(),
-  pendingApprovals:new Map(), answeredApprovals:new Map(), renderedApprovalStateKeys:new Set(), pendingServerRequests:new Map(),
+  pendingApprovals:new Map(), answeredApprovals:new Map(), answeredApprovalsById:new Map(), renderedApprovalStateKeys:new Set(), pendingServerRequests:new Map(),
   runningCommands:new Map(), commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null,
   commandPayloadsByItemId:new Map(), endedCommandsByItemId:new Map(),
   toolPayloadsByItemId:new Map(), toolBodyElsByItemId:new Map(),
@@ -2236,8 +2236,26 @@ function notifyApprovalRequest(request, tid, opts) {
   });
 }
 
+// Resolve an approval's answer from either the live-session store (keyed by state) or the reload
+// snapshot store (keyed by id, since a reload wiped the browser's state-key memory). Returns the
+// answered entry ({ decision, ... }) or undefined. Single source of truth for the lookup order.
+function answeredApprovalEntry(request) {
+  if (!request || request.id === undefined || request.id === null) return undefined;
+  return state.answeredApprovals.get(approvalStateKey(request))
+    || state.answeredApprovalsById.get(String(request.id));
+}
+function isApprovalAnswered(request) {
+  return !!answeredApprovalEntry(request);
+}
 function handleIncomingApprovalRequest(request, tid, opts) {
   opts = opts || {};
+  // A reconnect snapshot replays already-answered approvals so their cards can be redrawn in the
+  // resolved state. Those must not re-arm the "needs approval" sidebar activity or fire a
+  // notification — the user already answered them. Render the resolved card and stop.
+  if (isApprovalAnswered(request)) {
+    renderApprovalRequest(request);
+    return;
+  }
   recordNotificationDiagnostic("incoming_approval_request", {
     tid,
     request_id: request && request.id ? String(request.id) : null,
@@ -2741,6 +2759,14 @@ function renderLiveTurnSnapshot(snap) {
     setTurnActive(true);
     setActiveThreadActivity("progress", true, "Turn running");
   }
+  // Seed answered approvals before replaying accumulated events: the buffer replays every
+  // ApprovalRequested (answered ones included), and this reload wiped the in-memory answered state,
+  // so without this the answered cards would render actionable again and re-answering errors.
+  for (const answered of (snap.answered_approvals || [])) {
+    if (answered && answered.request_id !== undefined && answered.request_id !== null) {
+      state.answeredApprovalsById.set(String(answered.request_id), { decision: answered.decision });
+    }
+  }
   for (const ev of (snap.accumulated||[])) handleEvent(ev);
   if (snap.pending_approval) {
     handleIncomingApprovalRequest(snap.pending_approval, snap.thread_id || state.threadId, {
@@ -2794,7 +2820,9 @@ function renderApprovalRequest(request) {
   const id = String(request.id);
   const stateKey = approvalStateKey(request);
   if (state.pendingApprovals.has(id) || state.renderedApprovalStateKeys.has(stateKey)) return;
-  const answered = state.answeredApprovals.get(stateKey);
+  // An answer may be keyed by state (live session) or by id (reload snapshot, where the browser's
+  // stateKey memory is gone and the server tells us which ids were already answered).
+  const answered = answeredApprovalEntry(request);
   const body = bubble("approval","approval");
   const msg = body.parentElement;
   msg.dataset.approvalId = id;
@@ -4780,6 +4808,7 @@ function resetRenderState() {
   state.renderedItemBodyByKey = new Map();
   state.itemKindsByItemId = new Map();
   state.pendingApprovals = new Map();
+  state.answeredApprovalsById = new Map();
   state.renderedApprovalStateKeys = new Set();
   state.pendingServerRequests = new Map();
   state.runningCommands = new Map();

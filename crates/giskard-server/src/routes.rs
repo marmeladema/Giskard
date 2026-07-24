@@ -3327,6 +3327,22 @@ async fn handle_client_msg(
                 .respond_approval(giskard_core::ids::ApprovalId(request_id), decision.clone())
                 .await
                 .map_err(|e| WsError::from_harness(e, "approval_decision", None))?;
+            // Record the resolution against the in-flight turn so a browser reload replays this
+            // approval as answered rather than re-prompting the user (spec §13.6).
+            state
+                .live_buffers
+                .resolve_approval(
+                    thread_id,
+                    giskard_core::ids::ApprovalId(request_id_for_broadcast.clone()),
+                    decision.clone(),
+                )
+                .await;
+            debug!(
+                %thread_id,
+                request_id = %request_id_for_broadcast,
+                ?decision,
+                "recorded approval resolution in live buffer for reconnect"
+            );
             state
                 .hub
                 .broadcast(
