@@ -98,12 +98,10 @@
   .thread { flex:1; min-width:0; padding:5px 8px; border-radius:6px; cursor:pointer; color:var(--muted); font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:flex; align-items:center; gap:6px; }
   .thread.subagent-thread { font-size:12px; }
   .thread.subagent-thread::before { content:"sub"; flex:none; color:var(--muted); font-size:10px; }
-  .thread:hover { background:var(--panel2); }
   /* Selected thread: a whisper of accent tint over the neutral raised fill plus a thin accent
      rail, no bold. The ~9% tint gives selection a hint of color that a plain hover (bare --panel2)
      lacks, so the two separate cleanly at a glance while staying restrained and editor-like. */
   .thread.active { background:var(--panel2); background:color-mix(in srgb, var(--accent) 9%, var(--panel2)); color:var(--fg); box-shadow:inset 2px 0 0 var(--accent); }
-  .thread.active:hover { background:var(--panel2); background:color-mix(in srgb, var(--accent) 13%, var(--panel2)); }
   .thread.active .thread-title { color:var(--fg); }
   .thread-status { flex:none; width:10px; text-align:center; color:var(--muted); font-weight:700; }
   .thread-title { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -113,7 +111,15 @@
   .thread.activity-error .thread-status { color:#f85149; }
   .thread-title-input { flex:1; min-width:0; height:28px; padding:4px 7px; font-size:13px; }
   .thread-menu-btn { width:28px; height:28px; padding:0; border-color:transparent; background:transparent; color:var(--muted); }
-  .thread-menu-btn:hover { border-color:var(--border); color:var(--fg); }
+  /* Hover affordances only where a real hovering pointer exists. On touch, :hover "sticks" to the
+     last-tapped element until another is tapped — a previously selected thread kept its hover fill
+     and read as a second, weaker selection. Gating hover here leaves the selection rail + tint as
+     the only persistent signal on touch. */
+  @media (hover: hover) {
+    .thread:hover { background:var(--panel2); }
+    .thread.active:hover { background:var(--panel2); background:color-mix(in srgb, var(--accent) 13%, var(--panel2)); }
+    .thread-menu-btn:hover { border-color:var(--border); color:var(--fg); }
+  }
   .thread-menu { position:absolute; right:0; top:30px; z-index:20; min-width:130px; padding:4px; border:1px solid var(--border); border-radius:6px; background:var(--panel); box-shadow:0 12px 32px rgba(0,0,0,.35); }
   .thread-menu[hidden] { display:none; }
   .thread-menu button { display:block; width:100%; padding:6px 8px; border:0; background:transparent; text-align:left; }
