@@ -159,17 +159,16 @@ impl ProviderConfig {
     /// Resolve the discovery API key: the inline `api_key`, else the value of the env var named by
     /// `api_key_env`. Empty values are treated as unset.
     pub fn resolve_api_key(&self) -> Option<String> {
-        if let Some(key) = self.api_key.as_deref() {
-            if !key.is_empty() {
-                return Some(key.to_string());
-            }
+        if let Some(key) = self.api_key.as_deref()
+            && !key.is_empty()
+        {
+            return Some(key.to_string());
         }
-        if let Some(var) = self.api_key_env.as_deref() {
-            if let Ok(val) = std::env::var(var) {
-                if !val.is_empty() {
-                    return Some(val);
-                }
-            }
+        if let Some(var) = self.api_key_env.as_deref()
+            && let Ok(val) = std::env::var(var)
+            && !val.is_empty()
+        {
+            return Some(val);
         }
         None
     }

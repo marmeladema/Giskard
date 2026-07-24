@@ -61,7 +61,7 @@ Cargo workspace with 7 crates under `crates/`:
 - `giskard-server` — Axum backend + the embedded vanilla static web UI (`static/`)
 
 ## Conventions
-- Edition 2024, MSRV 1.85.
+- Edition 2024, MSRV 1.88.
 - All Codex-specific types confined to `giskard-harness-codex`.
 - Atomic writes for all persistence (temp file + fsync + rename).
 - IDs are ULIDs.

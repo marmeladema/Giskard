@@ -673,11 +673,18 @@ function appendThreadRows(box, pid, threads) {
       roots.push(t);
     }
   }
+  const rendered = new Set();
   const appendOne = (t) => {
+    const id = String(t.id);
+    if (rendered.has(id)) return;
+    rendered.add(id);
     box.append(threadRow(pid, t));
-    for (const child of byParent.get(String(t.id)) || []) appendOne(child);
+    for (const child of byParent.get(id) || []) appendOne(child);
   };
   for (const t of roots) appendOne(t);
+  // A corrupted parent cycle has no root and would otherwise vanish; keep every visible thread
+  // rendered so malformed records stay reachable for repair or deletion.
+  for (const t of threads) appendOne(t);
 }
 
 // Hide only sub-agents whose ownership chain is complete and terminates at a primary root.
@@ -1119,9 +1126,15 @@ async function deleteThread(pid, tid, title) {
   if (!confirm(`Permanently delete thread "${title}"${cascade}? This cannot be undone.`)) return;
   try {
     await api("DELETE", `/api/projects/${pid}/threads/${tid}`);
+    // The server cascades to descendants it discovered itself, which can include children this
+    // client never listed. Decide from the refreshed authoritative list whether the active view
+    // was deleted; keep the pre-request set as a fallback in case the sidebar reload fails.
     const deletedIds = new Set([String(tid), ...descendants]);
-    if (state.threadId && deletedIds.has(String(state.threadId))) clearThreadView(state.threadId);
+    const activeThread = state.threadId ? String(state.threadId) : null;
     await loadThreads(pid);
+    if (activeThread && (deletedIds.has(activeThread) || !knownThreadForId(pid, activeThread))) {
+      clearThreadView(activeThread);
+    }
   } catch (e) {
     notice("Delete thread failed: " + e.message, "error");
   }

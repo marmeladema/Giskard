@@ -51,7 +51,7 @@ The agent harness is a replaceable component behind a neutral `AgentHarness` tra
 
 ## Prerequisites
 
-- **Rust** — edition 2024, MSRV **1.85+** (`rustup` recommended).
+- **Rust** — edition 2024, MSRV **1.88+** (`rustup` recommended).
 - **Codex CLI**, already installed and authenticated on the machine. Giskard does **not** manage
   Codex's credentials — it inherits `~/.codex` (ChatGPT login or an API key / custom provider) when
   it spawns the app-server. If Codex isn't configured, turns will fail with an "unauthenticated"

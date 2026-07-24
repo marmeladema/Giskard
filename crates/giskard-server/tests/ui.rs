@@ -487,7 +487,7 @@ async fn index_page_is_served_and_public() {
             && body.contains("linked sub-agent thread")
             && body.contains("all corresponding Codex threads")
             && body.contains("This cannot be undone")
-            && body.contains("deletedIds.has(String(state.threadId))"),
+            && body.contains("clearThreadView(activeThread)"),
         "thread deletion warns about and clears recursively deleted sub-agent threads"
     );
     assert!(
@@ -590,6 +590,18 @@ async fn index_page_is_served_and_public() {
             && body.contains("function subagentThreadsForActiveProject()")
             && body.contains("function renderSubagentsButton()"),
         "sub-agent monitor derives known child threads from project thread summaries"
+    );
+    assert!(
+        body.contains("const rendered = new Set();")
+            && body.contains("if (rendered.has(id)) return;")
+            && body.contains("for (const t of threads) appendOne(t);"),
+        "sidebar keeps rootless (cyclic/malformed) threads visible for repair instead of \
+         dropping them"
+    );
+    assert!(
+        body.contains("deletedIds.has(activeThread) || !knownThreadForId(pid, activeThread)"),
+        "cascade delete clears the active view from the refreshed thread list, not only the \
+         pre-request client cache"
     );
     assert!(
         body.contains("function renderSubagentsMenu()")
