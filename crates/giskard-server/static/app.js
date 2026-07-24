@@ -756,6 +756,7 @@ function threadRow(pid, t) {
   const title = t.title || t.id.slice(0,8);
   const el = document.createElement("div"); el.className="thread mono";
   applyThreadTitleToElement(el, pid, t.id, title);
+  markThreadRowActive(el, !!state.threadId && String(t.id) === String(state.threadId));
 
   const menuBtn = document.createElement("button");
   menuBtn.type = "button"; menuBtn.className = "thread-menu-btn";
@@ -937,6 +938,25 @@ function renderThreadActivityIndicator(tid) {
 
 function renderAllThreadActivityIndicators() {
   document.querySelectorAll(".thread").forEach(el => renderThreadActivityIndicator(el.dataset.tid));
+}
+
+// Mark a single thread row as the selected one (or not). `aria-current` mirrors the visual state for
+// assistive tech and gives the CSS a stable hook.
+function markThreadRowActive(el, active) {
+  if (!el) return;
+  el.classList.toggle("active", active);
+  if (active) el.setAttribute("aria-current", "true");
+  else el.removeAttribute("aria-current");
+}
+
+// Derive the sidebar selection from `state.threadId` rather than tracking it imperatively. Thread
+// rows are rebuilt whenever the list reloads, so any highlight set by hand goes stale on the next
+// re-render (leaving a previously selected row looking selected); recomputing from the single source
+// of truth keeps exactly one row active.
+function syncActiveThreadHighlight() {
+  const tid = state.threadId ? String(state.threadId) : null;
+  document.querySelectorAll(".thread").forEach(el =>
+    markThreadRowActive(el, tid !== null && String(el.dataset.tid) === tid));
 }
 
 function setThreadActivity(tid, activity) {
@@ -1503,7 +1523,7 @@ function openDraftThread(pid, defaultModel) {
   state.awaitingInitialThreadState = false;
   state.awaitingThreadResync = false;
   resetRenderState();
-  document.querySelectorAll(".thread").forEach(e => e.classList.remove("active"));
+  syncActiveThreadHighlight();   // state.threadId is null for a draft, so this clears any selection
   $("thrHeader").style.display="flex"; $("composer").style.display="flex";
   $("pickerBar").style.display="flex";
   setThreadTitle("New thread");
@@ -1571,7 +1591,7 @@ async function openThread(pid, tid, title, opts) {
   state.awaitingThreadResync = false;
   state.awaitingIncrementalResync = false; state.resyncStickBottom = false;
   resetRenderState();
-  document.querySelectorAll(".thread").forEach(e => e.classList.toggle("active", e.dataset.tid===tid));
+  syncActiveThreadHighlight();
   renderAllThreadActivityIndicators();
   $("thrHeader").style.display="flex"; $("composer").style.display="flex";
   $("pickerBar").style.display="flex";

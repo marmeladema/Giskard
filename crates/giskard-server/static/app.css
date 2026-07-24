@@ -99,7 +99,12 @@
   .thread.subagent-thread { font-size:12px; }
   .thread.subagent-thread::before { content:"sub"; flex:none; color:var(--muted); font-size:10px; }
   .thread:hover { background:var(--panel2); }
-  .thread.active { background:var(--panel2); color:var(--fg); }
+  /* Selected thread: the editor convention — a neutral raised fill plus a thin accent rail, no
+     colored wash and no bold. Reads as clearly selected in a long list while staying restrained.
+     A faint accent-tinted fill (color-mix, where supported) keeps it a step above a plain hover. */
+  .thread.active { background:var(--panel2); background:color-mix(in srgb, var(--accent) 7%, var(--panel2)); color:var(--fg); box-shadow:inset 2px 0 0 var(--accent); }
+  .thread.active:hover { background:var(--panel2); background:color-mix(in srgb, var(--accent) 11%, var(--panel2)); }
+  .thread.active .thread-title { color:var(--fg); }
   .thread-status { flex:none; width:10px; text-align:center; color:var(--muted); font-weight:700; }
   .thread-title { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .thread.has-activity .thread-title { color:var(--fg); }
