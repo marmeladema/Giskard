@@ -115,7 +115,9 @@ Then open **http://127.0.0.1:8787**, log in, and:
    server machine (the agent's workspace).
 2. **+** on the project → draft a new thread. No Codex thread is created until the first message is
    sent, so choose the **Plan/Build** mode, **approval policy**, and **model** first if needed.
-3. Type in the composer (Enter to send). The first send creates the Codex thread with the selected
+3. Type in the composer (Enter to send). Use the attachment button or drop files onto the composer
+   to include images, PDFs, or other files with the message. A message accepts up to eight files
+   and 25 MiB total. The first send creates the Codex thread with the selected
    provider/model and starts the turn. Existing threads show the **Tasks** menu for running
    commands/tools, **Sub-agents** monitor, **MCP** status menu, and **Context** usage button;
    scrolling the transcript to the top lazy-loads older history.
@@ -342,9 +344,15 @@ WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticke
 /api/projects/{id}/mcp/oauth-login`. Wire types are defined once in `giskard-proto`. See
 [§13.6](specs/giskard-specification.md) for the message protocol.
 
-`POST /api/projects/{id}/threads/start` creates the durable thread from the first user message,
-persists a deterministic title generated from that prompt, and returns the title with the new
-thread and turn identifiers.
+`POST /api/projects/{id}/threads/start` creates the durable thread from the first user message or
+attachment set, persists a deterministic title generated from the prompt or first attachment name,
+and returns the title with the new thread and turn identifiers. The request accepts optional
+transient attachment payloads; Giskard validates them and does not persist raw attachment bytes.
+Image MIME types must match PNG, JPEG, GIF, or WebP file signatures. Raw bytes are also redacted
+before turns enter the parsed in-memory history cache. The Codex adapter transfers non-image files
+into a randomized per-turn directory under the harness host's temporary directory. It removes the
+directory after turn completion, upload/start failure, stream loss, channel closure, or shutdown;
+it never writes uploads into the project workspace.
 
 `POST /api/projects/{id}/threads` opens an existing local thread when `thread_id` is provided, or
 imports/resumes a native harness thread when `resume` is provided. Linked transcript items use the

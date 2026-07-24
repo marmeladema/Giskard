@@ -257,6 +257,25 @@ terminate the same unified-exec process. Tracking the process backend explicitly
 or reconciling against `thread/backgroundTerminals/list` would remove this
 heuristic.
 
+## User attachments
+
+Giskard receives browser attachments as transient `UserAttachment` values on
+`UserInput::Text`. The adapter maps them before `turn/start`:
+
+- image attachments are sent as Codex `UserInput::Image` values with
+  `data:<mime>;base64,<bytes>` URLs;
+- other files, including PDFs, are uploaded to the Codex app-server host with
+  `fs/createDirectory` and `fs/writeFile`, then the harness-host path is appended
+  to the text prompt.
+
+Each turn uses a randomized upload directory under the harness host temp
+directory, not the project workspace. The adapter removes it through
+`fs/remove` when the turn ends and also cleans up partial uploads, a failed
+`turn/start`, stream loss, command/control channel closure, and shutdown.
+Cleanup failures are logged but do not replace the turn result. Giskard omits
+raw attachment bytes from persisted history and the parsed in-memory history
+cache.
+
 ## Model catalog (`model/list`)
 
 The adapter advertises the `model_listing` capability and implements

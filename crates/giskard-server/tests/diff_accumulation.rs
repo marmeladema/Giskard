@@ -276,6 +276,7 @@ session_days = 30
         serde_json::to_string(&ClientMessage::SendInput {
             thread_id,
             text: "modify files".into(),
+            attachments: Vec::new(),
         })
         .unwrap()
         .into(),

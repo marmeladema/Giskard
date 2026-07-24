@@ -123,10 +123,13 @@
         <div class="plan-card-body" id="planCardBody" hidden></div>
       </div>
       <div class="composer" id="composer" style="display:none">
+        <input id="attachmentInput" type="file" multiple hidden />
+        <button id="attachBtn" type="button" title="Attach files" aria-label="Attach files">＋</button>
         <textarea id="input" placeholder="Message the agent…  (Enter to send, Shift+Enter for newline)"></textarea>
         <button class="primary" id="sendBtn">Send</button>
         <button class="danger" id="stopBtn" title="Interrupt the running turn" hidden>Stop</button>
       </div>
+      <div class="attachment-tray" id="attachmentTray" role="status" aria-live="polite" hidden></div>
       <!-- Turn settings sit below the composer, split left/right: the turn's "how" (mode +
            approvals) on the left, the model it runs on (model + effort) on the right. Each is a
            compact chip opening a two-column popover. The selects keep their ids so the existing
@@ -184,7 +187,7 @@
 
   <!-- Toast/notice stack: a body-level fixed overlay so it stays visible on mobile and isn't
        clipped by drawer transforms. -->
-  <div id="notices"></div>
+  <div id="notices" aria-live="polite"></div>
 
   <!-- New-project dialog with a directory picker -->
   <div class="overlay" id="projectModal">

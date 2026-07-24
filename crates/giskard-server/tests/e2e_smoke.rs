@@ -2560,6 +2560,7 @@ async fn send_input_rejects_second_turn_before_turn_started() {
             serde_json::to_string(&ClientMessage::SendInput {
                 thread_id,
                 text: "first message".into(),
+                attachments: Vec::new(),
             })
             .unwrap()
             .into(),
@@ -2573,6 +2574,7 @@ async fn send_input_rejects_second_turn_before_turn_started() {
             serde_json::to_string(&ClientMessage::SendInput {
                 thread_id,
                 text: "overlapping message".into(),
+                attachments: Vec::new(),
             })
             .unwrap()
             .into(),
@@ -2593,6 +2595,7 @@ async fn send_input_rejects_second_turn_before_turn_started() {
             serde_json::to_string(&ClientMessage::SendInput {
                 thread_id,
                 text: "after completion".into(),
+                attachments: Vec::new(),
             })
             .unwrap()
             .into(),
@@ -2643,6 +2646,7 @@ async fn send_input_rejects_same_thread_during_compaction() {
         serde_json::to_string(&ClientMessage::SendInput {
             thread_id,
             text: "overlap compaction".into(),
+            attachments: Vec::new(),
         })
         .unwrap()
         .into(),
@@ -2915,6 +2919,7 @@ async fn compact_context_does_not_block_turns_on_other_threads_or_projects() {
         serde_json::to_string(&ClientMessage::SendInput {
             thread_id: other_thread,
             text: "work on another thread".into(),
+            attachments: Vec::new(),
         })
         .unwrap()
         .into(),
@@ -2926,6 +2931,7 @@ async fn compact_context_does_not_block_turns_on_other_threads_or_projects() {
         serde_json::to_string(&ClientMessage::SendInput {
             thread_id: other_project_thread,
             text: "work on another project".into(),
+            attachments: Vec::new(),
         })
         .unwrap()
         .into(),
@@ -2998,6 +3004,7 @@ async fn inactive_thread_progress_sends_activity_without_full_event_subscription
         serde_json::to_string(&ClientMessage::SendInput {
             thread_id: inactive_thread,
             text: "work in inactive thread".into(),
+            attachments: Vec::new(),
         })
         .unwrap()
         .into(),
@@ -3138,6 +3145,7 @@ async fn inactive_thread_requests_send_activity_and_route_responses() {
         serde_json::to_string(&ClientMessage::SendInput {
             thread_id: inactive_thread,
             text: "approval please".into(),
+            attachments: Vec::new(),
         })
         .unwrap()
         .into(),
@@ -3186,6 +3194,7 @@ async fn inactive_thread_requests_send_activity_and_route_responses() {
         serde_json::to_string(&ClientMessage::SendInput {
             thread_id: inactive_thread,
             text: "server request please".into(),
+            attachments: Vec::new(),
         })
         .unwrap()
         .into(),
@@ -3268,6 +3277,7 @@ async fn approval_decision_broadcasts_resolution_to_other_tabs() {
             serde_json::to_string(&ClientMessage::SendInput {
                 thread_id,
                 text: "approval please".into(),
+                attachments: Vec::new(),
             })
             .unwrap()
             .into(),
@@ -3927,6 +3937,7 @@ async fn passive_subagent_command_start_streams_before_completion() {
         serde_json::to_string(&ClientMessage::SendInput {
             thread_id: child_id,
             text: "too early".into(),
+            attachments: Vec::new(),
         })
         .unwrap()
         .into(),
@@ -3986,6 +3997,7 @@ async fn passive_subagent_command_start_streams_before_completion() {
         serde_json::to_string(&ClientMessage::SendInput {
             thread_id: child_id,
             text: "idle child follow-up".into(),
+            attachments: Vec::new(),
         })
         .unwrap()
         .into(),
@@ -6301,6 +6313,7 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
         serde_json::to_string(&ClientMessage::SendInput {
             thread_id: tid,
             text: "Hello".into(),
+            attachments: Vec::new(),
         })
         .unwrap()
         .into(),
@@ -6495,6 +6508,7 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
         serde_json::to_string(&ClientMessage::SendInput {
             thread_id: tid,
             text: "new input".into(),
+            attachments: Vec::new(),
         })
         .unwrap()
         .into(),
@@ -6715,6 +6729,7 @@ async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
         serde_json::to_string(&ClientMessage::SendInput {
             thread_id: tid,
             text: "new input".into(),
+            attachments: Vec::new(),
         })
         .unwrap()
         .into(),
@@ -6862,6 +6877,7 @@ async fn failed_turn_is_persisted_with_error_message() {
         serde_json::to_string(&ClientMessage::SendInput {
             thread_id: tid,
             text: "please summarize the repo".into(),
+            attachments: Vec::new(),
         })
         .unwrap()
         .into(),
@@ -7000,6 +7016,7 @@ async fn notice_event_is_delivered_to_client() {
         serde_json::to_string(&ClientMessage::SendInput {
             thread_id: tid,
             text: "hi".into(),
+            attachments: Vec::new(),
         })
         .unwrap()
         .into(),
@@ -7620,6 +7637,7 @@ wire_api = "responses"
         serde_json::to_string(&ClientMessage::SendInput {
             thread_id: tid,
             text: "Hello".into(),
+            attachments: Vec::new(),
         })
         .unwrap()
         .into(),
@@ -7764,6 +7782,7 @@ async fn login_project_thread_message() {
     let send_input = serde_json::to_string(&ClientMessage::SendInput {
         thread_id: thread_id.parse().unwrap(),
         text: "Hello".into(),
+        attachments: Vec::new(),
     })
     .unwrap();
     ws.send(tokio_tungstenite::tungstenite::Message::Text(

@@ -325,6 +325,7 @@ async fn websocket_server_request_response_routes_to_harness() {
     ws.send(ws_text(&ClientMessage::SendInput {
         thread_id,
         text: "ask me".into(),
+        attachments: Vec::new(),
     }))
     .await
     .unwrap();
@@ -362,6 +363,7 @@ async fn websocket_server_request_error_response_routes_to_harness() {
     ws.send(ws_text(&ClientMessage::SendInput {
         thread_id,
         text: "ask me".into(),
+        attachments: Vec::new(),
     }))
     .await
     .unwrap();
@@ -398,6 +400,7 @@ async fn websocket_server_request_response_failure_can_be_retried() {
     ws.send(ws_text(&ClientMessage::SendInput {
         thread_id,
         text: "ask me".into(),
+        attachments: Vec::new(),
     }))
     .await
     .unwrap();
@@ -459,6 +462,7 @@ async fn websocket_subscribe_replays_pending_server_request_snapshot() {
     ws.send(ws_text(&ClientMessage::SendInput {
         thread_id,
         text: "ask me".into(),
+        attachments: Vec::new(),
     }))
     .await
     .unwrap();

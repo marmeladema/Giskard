@@ -385,7 +385,9 @@ impl PersistStore {
                     "skipping duplicate turn id in parsed history cache"
                 );
             } else {
-                turns.push(turn.clone());
+                let mut cached_turn = turn.clone();
+                cached_turn.user_input = cached_turn.user_input.without_attachment_data();
+                turns.push(cached_turn);
             }
         }
         *entry.meta.lock().await = meta_after;
@@ -1253,8 +1255,19 @@ mod tests {
         let entry = store.history_cache_entry(pid, tid).await.unwrap();
         assert_eq!(entry.turns.read().await.len(), 2);
 
-        let third = make_turn(TokenUsage::new(300, 30));
+        let mut third = make_turn(TokenUsage::new(300, 30));
+        third.user_input = giskard_core::UserInput::text_with_attachments(
+            "inspect",
+            vec![giskard_core::UserAttachment {
+                name: "diagram.png".into(),
+                mime_type: "image/png".into(),
+                size: 5,
+                kind: giskard_core::AttachmentKind::Image,
+                data_base64: "aW1hZ2U=".into(),
+            }],
+        );
         store.append_turn(pid, tid, &third).await.unwrap();
+        assert_eq!(third.user_input.attachments()[0].data_base64, "aW1hZ2U=");
         assert_eq!(
             entry
                 .turns
@@ -1264,6 +1277,11 @@ mod tests {
                 .map(|turn| turn.id)
                 .collect::<Vec<_>>(),
             vec![first.id, second.id, third.id]
+        );
+        assert!(
+            entry.turns.read().await[2].user_input.attachments()[0]
+                .data_base64
+                .is_empty()
         );
 
         let (tail, has_more) = store.load_history(pid, tid, None, 2).await.unwrap();

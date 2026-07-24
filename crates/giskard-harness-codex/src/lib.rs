@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use rand::RngCore;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -34,7 +35,7 @@ use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::text::trimmed_non_empty;
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
-use giskard_core::user_input::UserInput;
+use giskard_core::{AttachmentKind, UserAttachment, UserInput};
 use giskard_harness::{
     AgentEventStream, AgentHarness, HarnessCapabilities, HarnessNotice, OpenThreadOptions,
     ResumePolicy, ThreadHandle,
@@ -58,6 +59,7 @@ const WORKER_QUEUE_WARN_AFTER: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const WORKER_QUEUE_WARN_AFTER: Duration = Duration::from_millis(50);
 const THREAD_BACKGROUND_TERMINALS_TERMINATE: &str = "thread/backgroundTerminals/terminate";
+const CODEX_UPLOAD_DIR_NAME: &str = "giskard-codex-uploads";
 
 struct QueuedHarnessCommand {
     token: WorkerQueueToken,
@@ -984,12 +986,14 @@ async fn background_task<C>(
                                 );
                             }
                             StreamOutcome::Shutdown => {
+                                cleanup_all_active_turn_uploads(&mut client, &mut active_turns).await;
                                 shutdown_codex_transport(client).await;
                                 break;
                             }
                         }
                     }
                     Ok(None) => {
+                        cleanup_all_active_turn_uploads(&mut client, &mut active_turns).await;
                         emit_incomplete_active_turns(
                             &senders,
                             &mut mapper,
@@ -1021,6 +1025,7 @@ async fn background_task<C>(
                                 pending_compaction_states = ?pending_compaction_states(&pending_compactions),
                                 "Codex stream failed before all active turns completed: {message}"
                             );
+                            cleanup_all_active_turn_uploads(&mut client, &mut active_turns).await;
                             emit_incomplete_active_turns(
                                 &senders,
                                 &mut mapper,
@@ -1036,7 +1041,10 @@ async fn background_task<C>(
             queued = cmd_rx.recv() => {
                 let queued = match queued {
                     Some(queued) => queued,
-                    None => break,
+                    None => {
+                        cleanup_all_active_turn_uploads(&mut client, &mut active_turns).await;
+                        break;
+                    }
                 };
                 worker_queue.mark_started(queued.token);
 
@@ -1052,21 +1060,26 @@ async fn background_task<C>(
                         overrides,
                         response,
                     } => {
-                        let result = handle_start_turn(
+                        match handle_start_turn(
                             &mut client,
                             &mut mapper,
                             &thread,
                             &input,
                             &overrides,
                         )
-                        .await;
-                        let acknowledged_turn = result.as_ref().ok().copied();
-                        let _ = response.send(result);
-                        if let Some(acknowledged_turn) = acknowledged_turn {
+                        .await
+                        {
+                            Ok(started) => {
+                                let _ = response.send(Ok(started.turn));
                             active_turns.insert(
                                 thread.thread,
-                                ActiveTurn::new(thread, acknowledged_turn),
+                                    ActiveTurn::new(thread, started.turn)
+                                        .with_upload_dir(started.upload_dir),
                             );
+                            }
+                            Err(error) => {
+                                let _ = response.send(Err(error));
+                            }
                         }
                     }
                 }
@@ -1074,6 +1087,7 @@ async fn background_task<C>(
             }
             queued = control_rx.recv() => {
                 let Some(queued) = queued else {
+                    cleanup_all_active_turn_uploads(&mut client, &mut active_turns).await;
                     break;
                 };
                 worker_queue.mark_started(queued.token);
@@ -1090,6 +1104,7 @@ async fn background_task<C>(
                     .await;
                 worker_queue.mark_finished(token);
                 if matches!(outcome, StreamOutcome::Shutdown) {
+                    cleanup_all_active_turn_uploads(&mut client, &mut active_turns).await;
                     shutdown_codex_transport(client).await;
                     break;
                 }
@@ -1138,6 +1153,7 @@ struct ActiveTurn {
     started_at: Instant,
     saw_server_message: bool,
     warned_no_server_message: bool,
+    upload_dir: Option<PathBuf>,
 }
 
 impl ActiveTurn {
@@ -1149,7 +1165,13 @@ impl ActiveTurn {
             started_at: Instant::now(),
             saw_server_message: false,
             warned_no_server_message: false,
+            upload_dir: None,
         }
+    }
+
+    fn with_upload_dir(mut self, upload_dir: Option<PathBuf>) -> Self {
+        self.upload_dir = upload_dir;
+        self
     }
 
     fn mark_server_message(&mut self) {
@@ -1162,6 +1184,11 @@ impl ActiveTurn {
 }
 
 type ActiveTurns = HashMap<ThreadId, ActiveTurn>;
+
+struct StartedTurn {
+    turn: TurnId,
+    upload_dir: Option<PathBuf>,
+}
 
 fn should_poll_codex_messages(
     mapper: &CodexMapper,
@@ -1262,6 +1289,7 @@ async fn handle_background_server_message(
                 });
                 let _ = broadcast_event(senders, thread, || event).await;
                 if let Some(turn) = completed_active_turn {
+                    cleanup_active_turn_upload(client, active_turns, thread).await;
                     active_turns.remove(&thread);
                     mapper.clear_active_turn(thread);
                     debug!(
@@ -1273,6 +1301,7 @@ async fn handle_background_server_message(
                 } else if let Some((turn, message)) = fatal_completion
                     && emit_fatal_turn_completion(senders, thread, turn, message).await
                 {
+                    cleanup_active_turn_upload(client, active_turns, thread).await;
                     active_turns.remove(&thread);
                     mapper.clear_active_turn(thread);
                 }
@@ -1888,24 +1917,232 @@ async fn handle_start_turn(
     thread: &ThreadHandle,
     input: &UserInput,
     overrides: &TurnOverrides,
-) -> Result<TurnId, HarnessError> {
-    let params = build_turn_start_params(thread, input, overrides)?;
-    let resp: codex_codes::TurnStartResponse = codex_request(
+) -> Result<StartedTurn, HarnessError> {
+    let prepared = prepare_user_input_for_codex_uploads(client, thread, input).await?;
+    let params = match build_turn_start_params(thread, &prepared.input, overrides) {
+        Ok(params) => params,
+        Err(error) => {
+            cleanup_codex_upload_dir(client, thread, prepared.upload_dir.as_ref()).await;
+            return Err(error);
+        }
+    };
+    let resp: codex_codes::TurnStartResponse = match codex_request(
         client,
         CodexOperationContext::for_thread("turn_start", thread),
         codex_codes::protocol::methods::TURN_START,
         &params,
     )
-    .await?;
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            cleanup_codex_upload_dir(client, thread, prepared.upload_dir.as_ref()).await;
+            return Err(error);
+        }
+    };
 
     let turn = if let Some(model) = overrides.model.clone() {
         mapper.register_active_turn_with_model(thread.thread, &resp.turn.id, model)
     } else {
         mapper.register_active_turn(thread.thread, &resp.turn.id)
     };
-    turn.ok_or_else(|| {
-        HarnessError::Protocol("turn/start response did not include a turn id".into())
+    match turn {
+        Some(turn) => Ok(StartedTurn {
+            turn,
+            upload_dir: prepared.upload_dir,
+        }),
+        None => {
+            cleanup_codex_upload_dir(client, thread, prepared.upload_dir.as_ref()).await;
+            Err(HarnessError::Protocol(
+                "turn/start response did not include a turn id".into(),
+            ))
+        }
+    }
+}
+
+struct PreparedUserInput {
+    input: UserInput,
+    upload_dir: Option<PathBuf>,
+}
+
+async fn prepare_user_input_for_codex_uploads(
+    client: &mut dyn CodexTransport,
+    thread: &ThreadHandle,
+    input: &UserInput,
+) -> Result<PreparedUserInput, HarnessError> {
+    let UserInput::Text { text, attachments } = input;
+    if attachments.is_empty() {
+        return Ok(PreparedUserInput {
+            input: input.clone(),
+            upload_dir: None,
+        });
+    }
+
+    let mut prepared_text = text.clone();
+    let mut image_attachments = Vec::new();
+    let mut uploaded_files = Vec::new();
+    let upload_dir = codex_upload_dir(thread);
+    let mut ensured_upload_dir = false;
+
+    let upload_result: Result<(), HarnessError> = async {
+        for (index, attachment) in attachments.iter().enumerate() {
+            match attachment.kind {
+                AttachmentKind::Image => image_attachments.push(attachment.clone()),
+                AttachmentKind::File => {
+                    if !ensured_upload_dir {
+                        let params = codex_codes::FsCreateDirectoryParams {
+                            path: serde_json::json!(upload_dir.to_string_lossy()),
+                            recursive: Some(true),
+                        };
+                        let _: codex_codes::FsCreateDirectoryResponse = codex_request(
+                            client,
+                            CodexOperationContext::for_thread("upload_attachment_mkdir", thread),
+                            codex_codes::protocol::methods::FS_CREATEDIRECTORY,
+                            &params,
+                        )
+                        .await?;
+                        ensured_upload_dir = true;
+                    }
+                    let path = codex_upload_path(&upload_dir, index, attachment);
+                    let path_string = path.to_string_lossy().to_string();
+                    let params = codex_codes::FsWriteFileParams {
+                        data_base64: attachment.data_base64.clone(),
+                        path: serde_json::json!(path_string),
+                    };
+                    let _: codex_codes::FsWriteFileResponse = codex_request(
+                        client,
+                        CodexOperationContext::for_thread("upload_attachment_write", thread),
+                        codex_codes::protocol::methods::FS_WRITEFILE,
+                        &params,
+                    )
+                    .await?;
+                    uploaded_files.push((
+                        safe_upload_file_name(&attachment.name),
+                        path.to_string_lossy().to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = upload_result {
+        cleanup_codex_upload_dir(client, thread, Some(&upload_dir)).await;
+        return Err(error);
+    }
+
+    if !uploaded_files.is_empty() {
+        if !prepared_text.trim().is_empty() {
+            prepared_text.push_str("\n\n");
+        }
+        prepared_text.push_str("Attached files available on the harness host:\n");
+        for (name, path) in uploaded_files {
+            prepared_text.push_str("- ");
+            prepared_text.push_str(&name);
+            prepared_text.push_str(": ");
+            prepared_text.push_str(&path);
+            prepared_text.push('\n');
+        }
+    }
+
+    Ok(PreparedUserInput {
+        input: UserInput::text_with_attachments(prepared_text, image_attachments),
+        upload_dir: ensured_upload_dir.then_some(upload_dir),
     })
+}
+
+async fn cleanup_active_turn_upload(
+    client: &mut dyn CodexTransport,
+    active_turns: &mut ActiveTurns,
+    thread_id: ThreadId,
+) {
+    let Some(active) = active_turns.get_mut(&thread_id) else {
+        return;
+    };
+    let upload_dir = active.upload_dir.take();
+    cleanup_codex_upload_dir(client, &active.thread, upload_dir.as_ref()).await;
+}
+
+async fn cleanup_all_active_turn_uploads(
+    client: &mut dyn CodexTransport,
+    active_turns: &mut ActiveTurns,
+) {
+    let thread_ids: Vec<ThreadId> = active_turns.keys().copied().collect();
+    for thread_id in thread_ids {
+        cleanup_active_turn_upload(client, active_turns, thread_id).await;
+    }
+}
+
+async fn cleanup_codex_upload_dir(
+    client: &mut dyn CodexTransport,
+    thread: &ThreadHandle,
+    upload_dir: Option<&PathBuf>,
+) {
+    let Some(upload_dir) = upload_dir else {
+        return;
+    };
+    let params = codex_codes::FsRemoveParams {
+        path: serde_json::json!(upload_dir.to_string_lossy()),
+        recursive: Some(true),
+        force: Some(true),
+    };
+    if let Err(error) = codex_request::<_, codex_codes::FsRemoveResponse>(
+        client,
+        CodexOperationContext::for_thread("upload_attachment_cleanup", thread),
+        codex_codes::protocol::methods::FS_REMOVE,
+        &params,
+    )
+    .await
+    {
+        warn!(
+            thread_id = %thread.thread,
+            harness_thread_id = %thread.harness_thread_id,
+            path = %upload_dir.display(),
+            error = %error,
+            "failed to remove Codex attachment upload directory"
+        );
+    }
+}
+
+fn codex_upload_dir(thread: &ThreadHandle) -> PathBuf {
+    let mut rng = rand::thread_rng();
+    let nonce_high = rng.next_u64();
+    let nonce_low = rng.next_u64();
+    std::env::temp_dir()
+        .join(CODEX_UPLOAD_DIR_NAME)
+        .join(format!(
+            "{}-{:016x}{:016x}",
+            thread.thread, nonce_high, nonce_low
+        ))
+}
+
+fn codex_upload_path(dir: &std::path::Path, index: usize, attachment: &UserAttachment) -> PathBuf {
+    let mut nonce = [0_u8; 8];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    dir.join(format!(
+        "{index:02}-{}-{}",
+        u64::from_le_bytes(nonce),
+        safe_upload_file_name(&attachment.name)
+    ))
+}
+
+fn safe_upload_file_name(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = sanitized.trim_matches(|ch| ch == '.' || ch == '_').trim();
+    if trimmed.is_empty() {
+        "attachment".into()
+    } else {
+        trimmed.chars().take(96).collect()
+    }
 }
 
 fn build_turn_start_params(
@@ -2924,6 +3161,9 @@ mod tests {
                     | codex_codes::protocol::methods::THREAD_UNARCHIVE
                     | codex_codes::protocol::methods::THREAD_NAME_SET
                     | codex_codes::protocol::methods::CONFIG_MCPSERVER_RELOAD
+                    | codex_codes::protocol::methods::FS_CREATEDIRECTORY
+                    | codex_codes::protocol::methods::FS_WRITEFILE
+                    | codex_codes::protocol::methods::FS_REMOVE
                     | codex_codes::protocol::methods::TURN_INTERRUPT => Ok(json!({})),
                     codex_codes::protocol::methods::THREAD_DELETE => {
                         if let Some(message) = state.thread_delete_error.clone() {
@@ -3088,6 +3328,140 @@ mod tests {
         let harness = CodexHarness::spawn_harness(transport, PathBuf::from("/tmp"))
             .expect("fake harness should spawn");
         (harness, controller)
+    }
+
+    #[tokio::test]
+    async fn start_turn_maps_image_attachment_to_codex_data_url() {
+        let (mut transport, controller) = fake_codex();
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let thread = test_thread();
+        let input = UserInput::text_with_attachments(
+            "Inspect this",
+            vec![UserAttachment {
+                name: "diagram.png".into(),
+                mime_type: "image/png".into(),
+                size: 5,
+                kind: AttachmentKind::Image,
+                data_base64: "aW1hZ2U=".into(),
+            }],
+        );
+
+        handle_start_turn(
+            &mut transport,
+            &mut mapper,
+            &thread,
+            &input,
+            &build_turn_overrides(),
+        )
+        .await
+        .unwrap();
+
+        let requests = controller.requests().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].method,
+            codex_codes::protocol::methods::TURN_START
+        );
+        assert_eq!(requests[0].params["input"][0]["type"], "text");
+        assert_eq!(requests[0].params["input"][0]["text"], "Inspect this");
+        assert_eq!(requests[0].params["input"][1]["type"], "image");
+        assert_eq!(
+            requests[0].params["input"][1]["url"],
+            "data:image/png;base64,aW1hZ2U="
+        );
+    }
+
+    #[tokio::test]
+    async fn start_turn_uploads_and_removes_file_attachment() {
+        let (mut transport, controller) = fake_codex();
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let thread = test_thread();
+        let input = UserInput::text_with_attachments(
+            "Read this",
+            vec![UserAttachment {
+                name: "notes.pdf".into(),
+                mime_type: "application/pdf".into(),
+                size: 5,
+                kind: AttachmentKind::File,
+                data_base64: "ZmlsZQ==".into(),
+            }],
+        );
+
+        let started = handle_start_turn(
+            &mut transport,
+            &mut mapper,
+            &thread,
+            &input,
+            &build_turn_overrides(),
+        )
+        .await
+        .unwrap();
+
+        let mut active_turns = ActiveTurns::new();
+        active_turns.insert(
+            thread.thread,
+            ActiveTurn::new(thread.clone(), started.turn).with_upload_dir(started.upload_dir),
+        );
+        cleanup_active_turn_upload(&mut transport, &mut active_turns, thread.thread).await;
+
+        let requests = controller.requests().await;
+        assert_eq!(
+            requests
+                .iter()
+                .map(|r| r.method.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                codex_codes::protocol::methods::FS_CREATEDIRECTORY,
+                codex_codes::protocol::methods::FS_WRITEFILE,
+                codex_codes::protocol::methods::TURN_START,
+                codex_codes::protocol::methods::FS_REMOVE,
+            ]
+        );
+        assert_eq!(requests[1].params["dataBase64"], "ZmlsZQ==");
+        let upload_path = requests[1].params["path"].as_str().unwrap();
+        assert!(upload_path.contains("giskard-codex-uploads"));
+        assert!(upload_path.ends_with("notes.pdf"));
+        let turn_text = requests[2].params["input"][0]["text"].as_str().unwrap();
+        assert!(
+            turn_text.starts_with("Read this\n\nAttached files available on the harness host:")
+        );
+        assert!(turn_text.contains("notes.pdf: "));
+        assert!(turn_text.contains(upload_path));
+        assert_eq!(requests[3].params["path"], requests[0].params["path"]);
+        assert_eq!(requests[3].params["recursive"], true);
+        assert_eq!(requests[3].params["force"], true);
+    }
+
+    #[tokio::test]
+    async fn cleanup_all_active_turn_uploads_removes_every_directory() {
+        let (mut transport, controller) = fake_codex();
+        let first = test_thread();
+        let second = test_thread();
+        let mut active_turns = ActiveTurns::new();
+        active_turns.insert(
+            first.thread,
+            ActiveTurn::new(first, TurnId::new()).with_upload_dir(Some(PathBuf::from("/tmp/a"))),
+        );
+        active_turns.insert(
+            second.thread,
+            ActiveTurn::new(second, TurnId::new()).with_upload_dir(Some(PathBuf::from("/tmp/b"))),
+        );
+
+        cleanup_all_active_turn_uploads(&mut transport, &mut active_turns).await;
+
+        let requests = controller.requests().await;
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == codex_codes::protocol::methods::FS_REMOVE)
+                .count(),
+            2
+        );
+        assert!(
+            active_turns
+                .values()
+                .all(|active| active.upload_dir.is_none())
+        );
     }
 
     fn generic_user_input_request(
