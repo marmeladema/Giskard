@@ -717,10 +717,10 @@ impl PersistStore {
         {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if let Some(stem) = name.strip_suffix(".json") {
-                if let Ok(ulid) = stem.parse::<ulid::Ulid>() {
-                    ids.push(ThreadId(ulid));
-                }
+            if let Some(stem) = name.strip_suffix(".json")
+                && let Ok(ulid) = stem.parse::<ulid::Ulid>()
+            {
+                ids.push(ThreadId(ulid));
             }
         }
         Ok(ids)
