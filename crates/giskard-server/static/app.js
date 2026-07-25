@@ -43,7 +43,7 @@ let state = {
   currentRenderTurnId:null, newestPersistedTurnId:null,
   globalModels:[], models:[], modelsProject:null, modelsLoadingProject:null, pendingModelBeforeSelect:null, streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null,
   streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), renderedItemBodyByKey:new Map(), itemKindsByItemId:new Map(),
-  pendingApprovals:new Map(), answeredApprovals:new Map(), answeredApprovalsById:new Map(), renderedApprovalStateKeys:new Set(), pendingServerRequests:new Map(),
+  pendingApprovals:new Map(), answeredApprovals:new Map(), answeredApprovalsById:new Map(), renderedApprovalStateKeys:new Set(), pendingServerRequests:new Map(), answeredServerRequests:new Set(),
   runningCommands:new Map(), commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null,
   commandPayloadsByItemId:new Map(), endedCommandsByItemId:new Map(),
   toolPayloadsByItemId:new Map(), toolBodyElsByItemId:new Map(),
@@ -3045,6 +3045,12 @@ function renderLiveTurnSnapshot(snap) {
       state.answeredApprovalsById.set(String(answered.request_id), { decision: answered.decision });
     }
   }
+  // Same reasoning for server requests: `accumulated` replays every ServerRequestReceived, and a
+  // harness's resolved event may be late or never arrive, so without this an answered request
+  // renders actionable again and re-answering routes a stale id to the harness.
+  for (const answered of (snap.answered_server_requests || [])) {
+    if (answered !== undefined && answered !== null) state.answeredServerRequests.add(String(answered));
+  }
   for (const ev of (snap.accumulated||[])) handleEvent(ev);
   if (snap.pending_approval) {
     handleIncomingApprovalRequest(snap.pending_approval, snap.thread_id || state.threadId, {
@@ -3370,6 +3376,10 @@ function renderServerRequest(request) {
     renderUnsupportedServerRequest(body, id, request, "Giskard cannot generate client attestation tokens.");
   }
   else renderUnknownServerRequest(body, id, request);
+
+  // Built the card, now settle it: a request answered before this page load exists only as a
+  // replayed `ServerRequestReceived`, so it must not come back actionable.
+  if (state.answeredServerRequests.has(id)) resolveServerRequest(id);
 }
 function resolveServerRequest(id) {
   id = String(id || "");
@@ -5120,6 +5130,7 @@ function resetRenderState() {
   state.answeredApprovalsById = new Map();
   state.renderedApprovalStateKeys = new Set();
   state.pendingServerRequests = new Map();
+  state.answeredServerRequests = new Set();
   state.runningCommands = new Map();
   state.commandBodyElsByItemId = new Map();
   state.commandMsgElsByItemId = new Map();

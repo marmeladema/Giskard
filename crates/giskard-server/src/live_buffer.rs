@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tokio::sync::Mutex;
 
@@ -22,6 +22,14 @@ struct LiveTurn {
     /// otherwise recorded in `events` (there is no harness-emitted approval-resolved event), so
     /// without this the reconnect snapshot would replay every answered approval as still pending.
     resolved_approvals: HashMap<ApprovalId, ApprovalDecision>,
+    /// Server requests the user answered during this turn.
+    ///
+    /// Unlike approvals these *do* have a harness-emitted resolved event, but it arrives on the
+    /// harness's own schedule — and a harness may never send one. Until it lands the request is
+    /// still "received but not resolved" as far as `events` is concerned, so a reload in that window
+    /// would replay it as actionable and re-answering routes a stale id to the harness. The answer
+    /// is recorded here the moment it is routed, which closes that window.
+    resolved_server_requests: HashSet<ServerRequestId>,
 }
 
 pub struct LiveBufferStore {
@@ -62,6 +70,7 @@ impl LiveBufferStore {
                 user_input,
                 events: Vec::new(),
                 resolved_approvals: HashMap::new(),
+                resolved_server_requests: HashSet::new(),
             },
         );
     }
@@ -85,6 +94,7 @@ impl LiveBufferStore {
                     user_input,
                     events: Vec::new(),
                     resolved_approvals: HashMap::new(),
+                    resolved_server_requests: HashSet::new(),
                 });
                 Ok(())
             }
@@ -128,6 +138,16 @@ impl LiveBufferStore {
         let mut buffers = self.buffers.lock().await;
         if let Some(turn) = buffers.get_mut(&thread_id) {
             turn.resolved_approvals.insert(approval_id, decision);
+        }
+    }
+
+    /// Record that the user answered a server request in the thread's in-flight turn. Mirrors
+    /// [`Self::resolve_approval`]: the harness's own resolved event may be late or may never come,
+    /// and until then a reconnect would replay the request as actionable.
+    pub async fn resolve_server_request(&self, thread_id: ThreadId, request_id: ServerRequestId) {
+        let mut buffers = self.buffers.lock().await;
+        if let Some(turn) = buffers.get_mut(&thread_id) {
+            turn.resolved_server_requests.insert(request_id);
         }
     }
 
@@ -192,7 +212,24 @@ impl LiveBufferStore {
                 .collect();
             let accumulated: Vec<WireAgentEvent> =
                 turn.events.iter().cloned().map(Into::into).collect();
-            let pending_server_requests = pending_server_requests(&turn.events);
+            let mut pending_server_requests = pending_server_requests(&turn.events);
+            pending_server_requests
+                .retain(|request| !turn.resolved_server_requests.contains(&request.id));
+            // Answered requests still ride along in `accumulated` as `ServerRequestReceived`, and
+            // replaying that renders an actionable card. Naming them lets the client render those
+            // resolved instead, exactly as `answered_approvals` does.
+            let answered_server_requests: Vec<ServerRequestId> = turn
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::ServerRequestReceived { request, .. }
+                        if turn.resolved_server_requests.contains(&request.id) =>
+                    {
+                        Some(request.id.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
             LiveTurnSnapshot {
                 thread_id,
                 turn_id: turn.turn_id,
@@ -201,6 +238,7 @@ impl LiveBufferStore {
                 pending_approval,
                 pending_server_requests,
                 answered_approvals,
+                answered_server_requests,
             }
         })
     }
@@ -227,7 +265,9 @@ impl LiveBufferStore {
                         }
                         _ => None,
                     });
-                let server_requests = pending_server_requests(&turn.events);
+                let mut server_requests = pending_server_requests(&turn.events);
+                server_requests
+                    .retain(|request| !turn.resolved_server_requests.contains(&request.id));
                 if approval.is_none() && server_requests.is_empty() {
                     return None;
                 }

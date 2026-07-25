@@ -9,7 +9,7 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.58
+**Version:** 1.59
 
 > **Amendment — frontend approach (supersedes the Dioxus/WASM design below).**
 > This document was written targeting a **Dioxus fullstack / WebAssembly** frontend (`giskard-ui`),
@@ -22,6 +22,19 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.58 → 1.59), answered server requests survive a reload:**
+- **SR6:** Answering a server request recorded nothing server-side. A request leaves the pending set
+  only when the harness emits its resolved event, which arrives on the harness's own schedule and
+  may never arrive at all. Until then the replayed `ServerRequestReceived` still reads as
+  outstanding, so a reload rendered the request actionable again and answering it a second time
+  routed a stale id to the harness, which errors — the defect AR1 already fixed for approvals. The
+  answer is now recorded against the in-flight turn the moment it is routed.
+- **SR7:** `LiveTurnSnapshot` carries `answered_server_requests`, and answered requests are excluded
+  from both `pending_server_requests` and the SB5 connect bootstrap. The answered set is required
+  in addition to the exclusion: the request still rides along in `accumulated`, and replaying that
+  renders an actionable card unless the client is told it was answered — exactly as
+  `answered_approvals` works.
 
 **Changelog (1.57 → 1.58), replaying missed cross-thread activity:**
 - **SB5:** `ThreadActivity` is broadcast live and was never replayed, so a browser that was closed or
@@ -2801,12 +2814,14 @@ signal still shows what is blocked; a separate message so clients can tell a rep
 event and apply SB6's alert-once-per-session rule),
 `ThreadState { thread_id, state }` (persisted snapshot on subscribe/resync),
 `LiveTurnSnapshot { thread_id, turn_id, user_input?, accumulated, pending_approval?,
-pending_server_requests, answered_approvals }` (in-flight turn reconstruction on reconnect, carrying
+pending_server_requests, answered_approvals, answered_server_requests }` (in-flight turn
+reconstruction on reconnect, carrying
 the turn input when the server synthesized the turn context, `WireAgentEvent`s, the still-open
 `WireApprovalRequest`, unresolved `ServerRequest`s, and the `{ request_id, decision }` of approvals
 the user already answered this turn — approval resolution lives only in browser memory, so without
 this a reload would replay an answered approval as pending and answering it again routes a stale id
-to the harness, which errors),
+to the harness, which errors — and `answered_server_requests` for the same reason (SR6), since a
+harness's own resolved event may be late or absent),
 `RunningTasks { thread_id, tasks: [RunningTask] }` (commands and tool/MCP calls still known to be
 running, including commands that outlived an interrupted turn),
 `TokenUpdate { scope, thread_id?, ledger }`, `ApprovalRequest { thread_id, request }` (a
@@ -2827,6 +2842,12 @@ request id. After forwarding it to the harness, the server must broadcast `Appro
 thread subscribers; each browser must remove the pending actions and render the resolved decision
 card, and close only native browser notifications keyed to that request id. Duplicate/stale
 decisions for a removed request id remain protocol errors.
+
+**Server-request resolution invariant (SR6):** the same holds for server requests, with one
+difference: a harness emits its own resolved event, so the server does not synthesize one. It must
+still record the answer against the in-flight turn when it routes the response, because that event
+may be arbitrarily late or never sent, and until it lands a reconnect would replay the request as
+actionable.
 
 **Client rendering invariant (E6):** `ItemDelta { item_id }` and the later `ItemCompleted`
 for the same `Item.id` are one lifecycle. The UI must finalize or replace the streamed body in

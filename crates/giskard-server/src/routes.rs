@@ -3426,9 +3426,11 @@ async fn handle_client_msg(
         } => {
             let request_id_for_log = request_id.clone();
             let req_id = giskard_core::ids::ServerRequestId(request_id);
-            tokio::time::timeout(
+            let thread_id = tokio::time::timeout(
                 HARNESS_CONTROL_TIMEOUT,
-                state.registry.respond_server_request(req_id, response),
+                state
+                    .registry
+                    .respond_server_request(req_id.clone(), response),
             )
             .await
             .map_err(|_| {
@@ -3446,6 +3448,19 @@ async fn handle_client_msg(
                 )
             })?
             .map_err(|e| WsError::from_harness(e, "server_request_response", None))?;
+            // Record the answer against the in-flight turn. The harness emits its own resolved
+            // event, but on its own schedule and not guaranteed at all; until then the request
+            // still reads as outstanding in the replayed events, so a reload in that window would
+            // re-prompt and re-answering routes a stale id to the harness (spec §13.6).
+            state
+                .live_buffers
+                .resolve_server_request(thread_id, req_id)
+                .await;
+            debug!(
+                %thread_id,
+                request_id = %request_id_for_log,
+                "recorded server request resolution in live buffer for reconnect"
+            );
         }
         ClientMessage::Interrupt { thread_id } => {
             tokio::time::timeout(HARNESS_CONTROL_TIMEOUT, state.registry.interrupt(thread_id))

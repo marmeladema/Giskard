@@ -31,6 +31,10 @@ struct ServerRequestHarness {
     active: Mutex<Option<(ThreadId, TurnId)>>,
     responses: Mutex<Vec<(ServerRequestId, ServerRequestResponse)>>,
     fail_next_response: Mutex<Option<HarnessError>>,
+    /// When set, routing a response does not emit `ServerRequestResolved`/`TurnCompleted`. Real
+    /// harnesses resolve on their own schedule and may never resolve at all, and that window is
+    /// exactly what the reconnect snapshot has to survive.
+    suppress_resolution: Mutex<bool>,
 }
 
 impl ServerRequestHarness {
@@ -41,7 +45,12 @@ impl ServerRequestHarness {
             active: Mutex::new(None),
             responses: Mutex::new(Vec::new()),
             fail_next_response: Mutex::new(None),
+            suppress_resolution: Mutex::new(false),
         }
+    }
+
+    async fn suppress_resolution(&self) {
+        *self.suppress_resolution.lock().await = true;
     }
 
     async fn fail_next_response(&self, error: HarnessError) {
@@ -155,6 +164,9 @@ impl AgentHarness for ServerRequestHarness {
             .lock()
             .await
             .push((req.clone(), response.clone()));
+        if *self.suppress_resolution.lock().await {
+            return Ok(());
+        }
         let (thread, turn) = self.active.lock().await.take().unwrap_or_default();
         let _ = self.tx.send(AgentEvent::ServerRequestResolved {
             thread,
@@ -488,6 +500,71 @@ async fn websocket_subscribe_replays_pending_server_request_snapshot() {
     assert_eq!(
         snapshot.pending_server_requests[0].method,
         "item/tool/requestUserInput"
+    );
+}
+
+/// A server request the user answered must not come back actionable on reconnect, even when the
+/// harness has not (or will never) emit its resolved event. Nothing recorded the answer server-side
+/// before this, so the replayed `ServerRequestReceived` re-prompted and answering again routed a
+/// stale id to the harness, which errors — the same defect already fixed for approvals.
+#[tokio::test]
+async fn answered_server_request_is_not_pending_after_reconnect() {
+    let (_tmp, harness, addr, cookie, thread_id) = spawn_test_app().await;
+    harness.suppress_resolution().await;
+
+    let mut ws = connect_ws(addr, &cookie).await;
+    ws.send(ws_text(&ClientMessage::Subscribe {
+        thread_id,
+        since: None,
+    }))
+    .await
+    .unwrap();
+    ws.send(ws_text(&ClientMessage::SendInput {
+        thread_id,
+        text: "ask me".into(),
+        attachments: Vec::new(),
+    }))
+    .await
+    .unwrap();
+    wait_for_server_request(&mut ws).await;
+
+    ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+        request_id: "srv_1".into(),
+        response: ServerRequestResponse::result(serde_json::json!({ "answers": ["main"] })),
+    }))
+    .await
+    .unwrap();
+    // The harness confirms it received the answer; it deliberately never resolves it.
+    let (answered_id, _) = harness.wait_for_response().await;
+    assert_eq!(answered_id, ServerRequestId("srv_1".into()));
+
+    let mut reconnect = connect_ws(addr, &cookie).await;
+    reconnect
+        .send(ws_text(&ClientMessage::Subscribe {
+            thread_id,
+            since: None,
+        }))
+        .await
+        .unwrap();
+
+    let snapshot = wait_for_live_snapshot(&mut reconnect).await;
+    assert!(
+        snapshot.pending_server_requests.is_empty(),
+        "an answered request must not be replayed as pending, got {:?}",
+        snapshot.pending_server_requests
+    );
+    assert_eq!(
+        snapshot.answered_server_requests,
+        vec![ServerRequestId("srv_1".into())],
+        "the reconnect snapshot must name the answered request so its card renders resolved"
+    );
+    // It is still in the replayed events; naming it answered is what stops it re-prompting.
+    assert!(
+        snapshot.accumulated.iter().any(|event| matches!(
+            event,
+            giskard_proto::WireAgentEvent::ServerRequestReceived { .. }
+        )),
+        "the request should still appear in the accumulated events"
     );
 }
 
