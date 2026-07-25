@@ -4,8 +4,9 @@
 // constructor — notifications must be shown through `ServiceWorkerRegistration.showNotification()`,
 // and their clicks are delivered here rather than to an `onclick` handler on the page. This worker
 // activates immediately, then on a notification click focuses an existing Giskard tab (opening one
-// if none is around) and forwards the notification's `data` so the page can jump to the relevant
-// approval.
+// if none is around) and forwards the notification's `data` so the page can jump to whatever the
+// agent is waiting on — an approval or a server request. The payload is opaque here: the page sets
+// it and the page reads it back, so this worker never needs to know which kind it is.
 
 self.addEventListener("install", () => self.skipWaiting());
 

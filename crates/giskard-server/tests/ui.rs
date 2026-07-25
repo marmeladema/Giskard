@@ -126,8 +126,8 @@ async fn index_page_is_served_and_public() {
         body.contains("case \"approval_resolved\"")
             && body.contains("resolveApprovalRequest(msg.request_id, msg.decision)")
             && body.contains("function resolveApprovalRequest(id, decision)")
-            && body.contains("closeApprovalNotification(tid, id)")
-            && body.contains("const msg = entry ? entry.msg : approvalRowById(id)")
+            && body.contains("closeWaitingNotification(tid, id)")
+            && body.contains("const msg = entry ? entry.msg : waitingRequestRowById(id)")
             && body.contains("state.pendingApprovals.delete(id)"),
         "approval decisions broadcast from another tab resolve pending approval cards"
     );
@@ -650,19 +650,19 @@ async fn index_page_is_served_and_public() {
          so an approval is never masked by a merely-running thread"
     );
     assert!(
-        body.contains("function approvalNotificationLabel(meta, tid)")
-            && body.contains("\"Giskard: sub-agent approval needed\"")
+        body.contains("function waitingNotificationLabel(meta, tid)")
+            && body.contains("`Giskard: sub-agent ${needed} needed`")
             && body.contains("await refreshKnownThreadLists();"),
         "an approval notification names the sub-agent and its parent, and clicking it refreshes \
          a stale thread list rather than dead-ending"
     );
     assert!(
         body.contains("function subagentSubtreeState(threadId)")
-            && body.contains("if (other.kind === \"approval_requested\") needsApproval = true;")
-            && body.contains("\"Needs approval\"")
-            && body.contains(".subagent-card.needs-approval")
-            && body.contains(".subagents-btn.state-approval")
-            && body.contains(".subagent-card-state.approval"),
+            && body.contains("if (activityWaitsOnUser(other)) waitingOnUser = true;")
+            && body.contains("\"Waiting on you\"")
+            && body.contains(".subagent-card.waiting")
+            && body.contains(".subagents-btn.state-waiting")
+            && body.contains(".subagent-card-state.waiting"),
         "a sub-agent waiting on an approval is visually distinct from one that is merely running, \
          tracked as its own flag because an approval also marks the turn active"
     );
@@ -678,11 +678,11 @@ async fn index_page_is_served_and_public() {
         body.contains("msg.type === \"thread_activity_bootstrap\"")
             && body.contains("function handleThreadActivityBootstrap(msg)")
             && body.contains("{ source:\"connect_bootstrap\" }")
-            && body.contains("bootstrapNotifiedApprovals:new Set()")
+            && body.contains("bootstrapNotifiedRequests:new Set()")
             && body.contains(
-                "if (activity.source === \"connect_bootstrap\" && state.bootstrapNotifiedApprovals.has(notificationKey))"
+                "if (activity.source === \"connect_bootstrap\" && state.bootstrapNotifiedRequests.has(notificationKey))"
             )
-            && body.contains("function releaseApprovalNotificationClaim(notificationKey)"),
+            && body.contains("function releaseWaitingNotificationClaim(notificationKey)"),
         "activity the client missed while disconnected is replayed on connect and repaints the \
          badge, but alerts at most once per page session — the 15s dedup window cannot answer \
          \"have we ever alerted for this?\", so a resuming laptop would otherwise re-alert for the \
@@ -707,10 +707,10 @@ async fn index_page_is_served_and_public() {
     );
     assert!(
         body.contains(
-            "const { running, needsApproval, activity, origin } = subagentSubtreeState(thread.id);"
+            "const { running, waitingOnUser, activity, origin } = subagentSubtreeState(thread.id);"
         ) && body.contains("? threadActivityTooltip(activity, origin)"),
         "a sub-agent card's summary comes from the same subtree activity that sets its state, so \
-         a card reading \"Needs approval\" because a descendant is blocked describes that \
+         a card reading \"Waiting on you\" because a descendant is blocked describes that \
          descendant instead of its own unrelated activity — and both come from one walk of the \
          activity map rather than one per question asked"
     );
@@ -2463,10 +2463,13 @@ fn browser_diagnostics_panel_is_exposed_from_settings() {
     assert!(body.contains("BROWSER_DIAGNOSTIC_LIMIT"));
     assert!(body.contains("function browserDiagnosticsSnapshot()"));
     assert!(body.contains("function notificationDebugSnapshot()"));
-    assert!(body.contains("last_approval_decision: lastNotificationDiagnostic"));
-    assert!(body.contains("recent_approval_decisions: recentNotificationDiagnostics"));
-    assert!(body.contains("function isApprovalNotificationDecision(entry)"));
-    assert!(body.contains("detail.kind === \"approval\""));
+    assert!(body.contains("last_waiting_notification: lastNotificationDiagnostic"));
+    assert!(body.contains("recent_waiting_notifications: recentNotificationDiagnostics"));
+    assert!(body.contains("function isWaitingNotificationDiagnostic(entry)"));
+    // One prefix test, not an enumeration: a per-reason list silently omits whatever reason is
+    // added next, which is how several waiting diagnostics fell out of the panel.
+    assert!(body.contains("return reason.startsWith(\"waiting_notify_\") ||"));
+    assert!(body.contains("detail.kind === \"waiting_request\""));
     assert!(body.contains("function lastNotificationDiagnostic(predicate)"));
     assert!(body.contains("function recentNotificationDiagnostics(predicate, limit)"));
     assert!(body.contains("function recordBrowserDiagnostic(category, reason, detail)"));
@@ -2475,12 +2478,12 @@ fn browser_diagnostics_panel_is_exposed_from_settings() {
     assert!(body.contains("recordBrowserDiagnostic(\"notification\", reason, detail);"));
     assert!(body.contains("function renderBrowserDiagnosticsPanel(snapshot, reveal)"));
     assert!(body.contains("log.textContent = lines.join(\"\\n\");"));
-    assert!(body.contains("`lastApproval: ${lastApproval ? lastApproval.reason : \"none\"}`"));
+    assert!(body.contains("`lastRequest: ${lastWaiting ? lastWaiting.reason : \"none\"}`"));
     assert!(body.contains("`dedupMs: ${snapshot.dedup_window_ms}`"));
-    assert!(body.contains("recentApprovals:"));
+    assert!(body.contains("recentRequests:"));
     assert!(body.contains("recentBrowserEvents:"));
     assert!(body.contains("visible=${entry.visibility} focused=${entry.focused}"));
-    assert!(body.contains("`approvalSource: ${approvalDetail.source || \"none\"}`"));
+    assert!(body.contains("`requestSource: ${waitingDetail.source || \"none\"}`"));
     assert!(body.contains("window.giskardBrowserDiagnostics = browserDiagnosticsSnapshot;"));
     assert!(body.contains("window.giskardNotificationDebug = notificationDebugSnapshot;"));
     assert!(body.contains("function showBrowserDiagnostics()"));
@@ -2514,20 +2517,24 @@ fn sidebar_activity_notifications_target_approval_rows() {
     let body = app_js();
 
     assert!(body.contains("threadActivity:new Map()"));
-    assert!(body.contains("pendingApprovalFocus:null"));
-    assert!(body.contains("notifiedApprovals:new Map()"));
-    assert!(body.contains("approvalNotifications:new Map()"));
+    assert!(body.contains("pendingWaitingFocus:null"));
+    assert!(body.contains("notifiedRequests:new Map()"));
+    assert!(body.contains("waitingNotifications:new Map()"));
     assert!(body.contains("lastNotificationPromptNoticeAt:0"));
     assert!(body.contains("NOTIFICATION_DEDUP_MS"));
     assert!(body.contains("function handleThreadActivity(msg)"));
     assert!(body.contains("if (msg && msg.type === \"thread_activity\")"));
     assert!(body.contains("function renderThreadActivityIndicator(tid, hosts)"));
     assert!(body.contains("activity.kind === \"approval_requested\""));
-    assert!(body.contains(
-        "if (activity.kind === \"approval_requested\") maybeNotifyApproval(tid, activity);"
-    ));
+    assert!(
+        body.contains(
+            "if (activityWaitsOnUser(activity)) maybeNotifyWaitingRequest(tid, activity);"
+        )
+    );
     assert!(body.contains("server_request_id: msg.server_request_id || null"));
-    assert!(body.contains("activity.active_turn && activity.kind !== \"approval_requested\""));
+    // "Running" is now the complement of "waiting on the user", not of "approval" specifically —
+    // a thread waiting on a server request must not also read as merely running.
+    assert!(body.contains("activity.active_turn && !activityWaitsOnUser(activity)"));
     assert!(body.contains("else if (activity.active_turn) status.textContent = \"o\""));
     assert!(!body.contains("else if (activity.active_turn) status.textContent = \">\""));
     assert!(body.contains("function setActiveThreadActivity(kind, activeTurn, summary, extra)"));
@@ -2548,65 +2555,61 @@ fn sidebar_activity_notifications_target_approval_rows() {
     assert!(body.contains("await Notification.requestPermission()"));
     assert!(body.contains("Browser notifications require HTTPS or localhost."));
     assert!(body.contains("function refreshNotificationButton()"));
-    assert!(body.contains("label = \"Approval notifications enabled\""));
+    assert!(body.contains("label = \"Notifications enabled\""));
     assert!(body.contains("label = \"Notifications blocked by browser\""));
     assert!(body.contains("label = \"Notifications require HTTPS or localhost\""));
     assert!(body.contains("function maybeNoticeNotificationPermission()"));
     assert!(body.contains("Notification.permission !== \"default\""));
-    assert!(body.contains("Enable approval notifications from the sidebar alert button."));
+    assert!(body.contains("Enable notifications from the sidebar alert button."));
     assert!(body.contains(
-        "const notificationKey = approvalNotificationKey(tid, activity && activity.approval_id);"
+        "const notificationKey = waitingNotificationKey(tid, waitingRequestId(activity));"
     ));
     assert!(body.contains("pruneNotificationDedup(now);"));
-    assert!(body.contains("const notifiedAt = state.notifiedApprovals.get(notificationKey);"));
+    assert!(body.contains("const notifiedAt = state.notifiedRequests.get(notificationKey);"));
     assert!(body.contains("now - notifiedAt < NOTIFICATION_DEDUP_MS"));
-    assert!(body.contains("state.notifiedApprovals.set(notificationKey, now);"));
+    assert!(body.contains("state.notifiedRequests.set(notificationKey, now);"));
     // The dedup key is claimed before the thread-list refresh await, not after the notification is
     // shown: otherwise the live activity broadcast and the live-turn snapshot path can both clear
     // the gate while one is awaiting and notify twice for the same approval. Paths that return
     // without notifying release it again.
     assert!(body.contains(
-        "  state.notifiedApprovals.set(notificationKey, now);\n  state.bootstrapNotifiedApprovals.add(notificationKey);\n  // A sub-agent's very first approval"
+        "  state.notifiedRequests.set(notificationKey, now);\n  state.bootstrapNotifiedRequests.add(notificationKey);\n  // A sub-agent's very first approval"
     ));
     // Both paths that give up without showing anything must release the claim, or the approval is
     // silenced for the rest of the page session.
     assert!(
-        body.matches("releaseApprovalNotificationClaim(notificationKey);")
+        body.matches("releaseWaitingNotificationClaim(notificationKey);")
             .count()
             >= 2
     );
-    assert!(body.contains("trackApprovalNotification(notificationKey, result.notification);"));
+    assert!(body.contains("trackWaitingNotification(notificationKey, result.notification);"));
     assert!(body.contains("function pruneNotificationDedup(now)"));
-    assert!(body.contains("function approvalNotificationKey(tid, approvalId)"));
-    assert!(body.contains("const approvalKey = approvalId === undefined || approvalId === null"));
+    assert!(body.contains("function waitingNotificationKey(tid, requestId)"));
+    assert!(body.contains("const requestKey = requestId === undefined || requestId === null"));
     assert!(body.contains("String(approvalId)"));
-    assert!(body.contains("if (!threadKey || !approvalKey) return \"\";"));
-    assert!(body.contains("return `${threadKey}:${approvalKey}`;"));
-    assert!(body.contains("function trackApprovalNotification(key, notification)"));
+    assert!(body.contains("if (!threadKey || !requestKey) return \"\";"));
+    assert!(body.contains("return `${threadKey}:${requestKey}`;"));
+    assert!(body.contains("function trackWaitingNotification(key, notification)"));
     assert!(body.contains("notifications = new Set();"));
     assert!(body.contains("notifications.add(notification);"));
-    assert!(body.contains("function untrackApprovalNotification(key, notification)"));
+    assert!(body.contains("function untrackWaitingNotification(key, notification)"));
     assert!(body.contains("notifications.delete(notification);"));
-    assert!(
-        body.contains("if (notifications.size === 0) state.approvalNotifications.delete(key);")
-    );
-    assert!(body.contains("function closeApprovalNotification(tid, approvalId)"));
-    assert!(body.contains("const notifications = state.approvalNotifications.get(key);"));
-    assert!(body.contains("state.approvalNotifications.delete(key);"));
+    assert!(body.contains("if (notifications.size === 0) state.waitingNotifications.delete(key);"));
+    assert!(body.contains("function closeWaitingNotification(tid, requestId)"));
+    assert!(body.contains("const notifications = state.waitingNotifications.get(key);"));
+    assert!(body.contains("state.waitingNotifications.delete(key);"));
     assert!(body.contains("for (const notification of notifications)"));
-    assert!(body.contains("approval_notification_closed"));
+    assert!(body.contains("waiting_notify_closed"));
     assert!(!body.contains("closeAllApprovalNotifications"));
-    assert!(
-        body.contains(
-            "const notificationTag = approvalNotificationTag(tid, activity.approval_id);"
-        )
-    );
-    assert!(body.contains("return `giskard-approval-${tid}-${approvalId}`;"));
+    assert!(body.contains(
+        "const notificationTag = waitingNotificationTag(tid, waitingRequestId(activity));"
+    ));
+    assert!(body.contains("return `giskard-waiting-${tid}-${requestId}`;"));
     assert!(body.contains("tag: notificationTag"));
-    assert!(body.contains("function notifyApprovalRequest(request, tid, opts)"));
+    assert!(body.contains("function notifyIncomingApproval(request, tid, opts)"));
     assert!(body.contains("function handleIncomingApprovalRequest(request, tid, opts)"));
     assert!(body.contains(
-        "if (opts.notify !== false) notifyApprovalRequest(request, tid, { source: opts.source });"
+        "if (opts.notify !== false) notifyIncomingApproval(request, tid, { source: opts.source });"
     ));
     assert!(body.contains("source: \"agent_event_approval_requested\""));
     assert!(body.contains("source: \"server_message_approval_request\""));
@@ -2614,10 +2617,10 @@ fn sidebar_activity_notifications_target_approval_rows() {
     // Live events default to "thread_activity"; a connect replay overrides it so the notification
     // gate can tell the two apart.
     assert!(body.contains("source: msg.source || \"thread_activity\""));
-    assert!(body.contains("approval_notify_received"));
-    assert!(body.contains("approval_notify_suppressed_visible_current_thread"));
-    assert!(body.contains("approval_notify_constructor_failed"));
-    assert!(body.contains("approval_notify_created"));
+    assert!(body.contains("waiting_notify_received"));
+    assert!(body.contains("waiting_notify_suppressed_visible_current_thread"));
+    assert!(body.contains("waiting_notify_constructor_failed"));
+    assert!(body.contains("waiting_notify_created"));
     assert!(body.contains("async function showAppNotification(title, options, diagnosticDetail)"));
     // Prefer the service worker (works on Android); fall back to the Notification constructor.
     assert!(body.contains("const reg = await notificationRegistration();"));
@@ -2630,36 +2633,34 @@ fn sidebar_activity_notifications_target_approval_rows() {
     assert!(body.contains("notification.onshow = () => recordNotificationDiagnostic"));
     assert!(body.contains("notification.onerror = () => recordNotificationDiagnostic"));
     assert!(body.contains("notification.onclose = () => {"));
-    assert!(body.contains("diagnosticDetail.kind === \"approval\""));
+    assert!(body.contains("diagnosticDetail.kind === \"waiting_request\""));
     assert!(
-        body.contains(
-            "approvalNotificationKey(diagnosticDetail.tid, diagnosticDetail.approval_id),"
-        )
+        body.contains("waitingNotificationKey(diagnosticDetail.tid, diagnosticDetail.request_id),")
     );
-    assert!(body.contains("untrackApprovalNotification("));
+    assert!(body.contains("untrackWaitingNotification("));
     assert!(body.contains(
         "recordNotificationDiagnostic(\"browser_notification_close\", diagnosticDetail);"
     ));
-    assert!(body.contains("function isApprovalNotificationDecision(entry)"));
-    assert!(body.contains("detail.kind === \"approval\""));
-    assert!(body.contains("last_approval_decision: lastNotificationDiagnostic"));
-    assert!(body.contains("recent_approval_decisions: recentNotificationDiagnostics"));
-    assert!(body.contains("`lastApproval: ${lastApproval ? lastApproval.reason : \"none\"}`"));
+    assert!(body.contains("function isWaitingNotificationDiagnostic(entry)"));
+    assert!(body.contains("detail.kind === \"waiting_request\""));
+    assert!(body.contains("last_waiting_notification: lastNotificationDiagnostic"));
+    assert!(body.contains("recent_waiting_notifications: recentNotificationDiagnostics"));
+    assert!(body.contains("`lastRequest: ${lastWaiting ? lastWaiting.reason : \"none\"}`"));
     assert!(body.contains("function sendTestNotification()"));
     assert!(body.contains("Giskard test notification"));
     assert!(body.contains("test_notify_created"));
     assert!(body.contains("test_notify_constructor_failed"));
     assert!(body.contains("requireInteraction: true"));
-    assert!(!body.contains("approval_notify_skipped_invalid_activity"));
-    assert!(body.contains("approval_notify_skipped_invalid_call"));
-    assert!(body.contains("`lastApproval: ${lastApproval ? lastApproval.reason : \"none\"}`"));
-    assert!(!body.contains("notifyApprovalRequest(ev.request"));
-    assert!(!body.contains("notifyApprovalRequest(msg.request"));
-    assert!(!body.contains("notifyApprovalRequest(snap.pending_approval"));
+    assert!(!body.contains("waiting_notify_skipped_invalid_activity"));
+    assert!(body.contains("waiting_notify_skipped_invalid_call"));
+    assert!(body.contains("`lastRequest: ${lastWaiting ? lastWaiting.reason : \"none\"}`"));
+    assert!(!body.contains("notifyIncomingApproval(ev.request"));
+    assert!(!body.contains("notifyIncomingApproval(msg.request"));
+    assert!(!body.contains("notifyIncomingApproval(snap.pending_approval"));
     // A sub-agent's approval gets its own headline: it has no sidebar row, so the notification is
     // the only place the user learns a delegated thread — not this one — is blocked.
     assert!(body.contains(
-        "await showAppNotification(isSubagent ? \"Giskard: sub-agent approval needed\" : \"Giskard: approval needed\""
+        "const needed = activity.kind === \"approval_requested\" ? \"approval\" : \"input\";"
     ));
     assert!(body.contains("const focused = document.hasFocus ? document.hasFocus() : true;"));
     assert!(body.contains(
@@ -2667,19 +2668,19 @@ fn sidebar_activity_notifications_target_approval_rows() {
     ));
     // Desktop notifications wire their click; service-worker clicks arrive via the worker postMessage.
     assert!(body.contains(
-        "result.notification.onclick = () => handleNotificationClick({ threadId: tid, approvalId: activity.approval_id });"
+        "result.notification.onclick = () => handleNotificationClick({ threadId: tid, requestId: waitingRequestId(activity) });"
     ));
-    assert!(body.contains("closeApprovalNotification(data.threadId, data.approvalId);"));
-    assert!(body.contains("openThread(meta.pid, tid, meta.title, { focusApprovalId:approvalId })"));
-    assert!(body.contains("function approvalRowById(id)"));
+    assert!(body.contains("closeWaitingNotification(data.threadId, data.requestId);"));
+    assert!(body.contains("openThread(meta.pid, tid, meta.title, { focusRequestId:requestId })"));
+    assert!(body.contains("function waitingRequestRowById(id)"));
     assert!(body.contains("row.scrollIntoView({ block:\"center\", behavior:\"smooth\" });"));
-    assert!(body.contains("row.classList.add(\"approval-target\")"));
+    assert!(body.contains("row.classList.add(\"waiting-target\")"));
 
     let index = include_str!("../static/index.html");
     assert!(index.contains("id=\"notifyTopBtn\""));
     assert!(index.contains("class=\"notify-permission-btn\""));
     assert!(index.contains("id=\"notifyBtn\""));
-    assert!(index.contains("Enable approval notifications"));
+    assert!(index.contains("Enable notifications"));
 
     let css = include_str!("../static/app.css");
     assert!(css.contains(".sidebar-head"));
@@ -2717,7 +2718,7 @@ fn browser_uses_service_worker_for_android_notifications() {
     // Resolution closes service-worker notifications by tag (no Notification object is held).
     let close = between(
         body,
-        "function closeApprovalNotification(tid, approvalId) {",
+        "function closeWaitingNotification(tid, requestId) {",
         "function maybeNoticeNotificationPermission()",
     );
     assert!(close.contains("reg.getNotifications({ tag })"));

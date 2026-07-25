@@ -3638,7 +3638,7 @@ fn thread_activity_from_event(
                 server_request_id: request.id.to_string(),
             };
             activity.active_turn = true;
-            activity.summary = Some(format!("{} request", request.method));
+            activity.summary = Some("Waiting for your input".to_string());
         }
         AgentEvent::ServerRequestResolved { .. } => {
             activity.summary = Some("Request resolved".into());

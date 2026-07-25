@@ -9,7 +9,7 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.59
+**Version:** 1.60
 
 > **Amendment — frontend approach (supersedes the Dioxus/WASM design below).**
 > This document was written targeting a **Dioxus fullstack / WebAssembly** frontend (`giskard-ui`),
@@ -22,6 +22,21 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.59 → 1.60), one "waiting on the user" state:**
+- **SR8:** An approval and a server request both block a turn until the user answers, and the
+  browser must present them as one state. Previously only approvals were ranked and rendered as
+  blocked; a thread waiting on a server request fell through to the generic active-turn branch and
+  was indistinguishable from one that was merely busy, and fired no notification. Codex itself
+  already blurs the split — MCP tool approvals arrive as `requestUserInput` and are promoted to
+  approval cards — so the distinction is a protocol artifact, not something to surface. Activity
+  ranking, the sidebar glyph, the sub-agent monitor, and notifications now key off "waits on the
+  user" rather than "is an approval". Card rendering stays per-kind: a decision has fixed choices, a
+  server request has a per-method form.
+- **SR9:** The waiting state must clear as soon as the user acts, not when the harness confirms.
+  Answering an approval broadcasts `ApprovalResolved`, but a server request's resolved event comes
+  from the harness on its own schedule and may never come, so the browser clears its own waiting
+  state on send.
 
 **Changelog (1.58 → 1.59), answered server requests survive a reload:**
 - **SR6:** Answering a server request recorded nothing server-side. A request leaves the pending set

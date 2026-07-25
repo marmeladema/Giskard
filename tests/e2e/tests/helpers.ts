@@ -28,6 +28,7 @@ export const SCRIPTED_APPROVAL_TRIGGER = "Trigger a scripted approval request.";
  */
 export const SCRIPTED_SERVER_REQUEST_TRIGGER = "Trigger a scripted user input request.";
 export const SCRIPTED_SERVER_REQUEST_QUESTION = "Which branch should I use?";
+export const SCRIPTED_SERVER_REQUEST_ID = "scripted-server-request-1";
 
 /**
  * Prompt that spawns a linked child which raises an approval and then holds its turn open, while the
@@ -44,7 +45,8 @@ export type RecordedNotification = {
   title: string;
   body: string;
   tag: string;
-  data: { threadId?: string; approvalId?: string } | null;
+  /** `requestId` is whatever the thread is waiting on — an approval or a server request. */
+  data: { threadId?: string; requestId?: string } | null;
 };
 
 declare global {

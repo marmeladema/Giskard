@@ -96,10 +96,12 @@ report it:
   never masked by a busy parent. The row's tooltip names the child, and a marker distinguishes a
   hoisted state from the row's own. Walks up and down the ownership chain are bounded, so corrupted
   or cyclic metadata terminates rather than spinning.
-- **The header Sub-agents monitor.** An approval also marks the turn active, so "waiting for the
-  user" is tracked separately from "running": the button takes a distinct state and the child's card
-  reads `Needs approval`. A card covers its whole owned subtree, because nested grandchildren are
-  not listed separately.
+- **The header Sub-agents monitor.** Being asked for something also marks the turn active, so
+  "waiting on the user" is tracked separately from "running": the button takes a distinct state and
+  the child's card reads `Waiting on you`. That covers approvals *and* server requests — Codex
+  splits those, and already blurs the split itself by delivering MCP tool approvals as
+  `requestUserInput`, but to the person looking at the sidebar they are one state. A card covers its
+  whole owned subtree, because nested grandchildren are not listed separately.
 - **A browser notification**, naming the child and its owning thread rather than an id prefix, and
   saying a sub-agent is blocked. Clicking it opens the child with the approval focused.
 
