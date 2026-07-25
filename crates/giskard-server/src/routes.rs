@@ -2799,14 +2799,76 @@ fn harness_error_means_command_unmanaged(error: &HarnessError) -> bool {
         || message.contains("no active turn to interrupt")
 }
 
+/// Tell a just-connected client which threads are already waiting on it.
+///
+/// Cross-thread activity is broadcast live and never replayed, so a browser that was closed or
+/// disconnected when a sub-agent raised an approval has no way to learn the thread is blocked — the
+/// child has no sidebar row of its own, and the approval only reaches the transcript once that
+/// thread is opened. Sent to this client alone, before it subscribes to anything.
+async fn send_activity_bootstrap(
+    state: &AppState,
+    client_id: usize,
+    tx: &mpsc::Sender<ServerMessage>,
+) {
+    let pending = state.live_buffers.pending_attention().await;
+    if pending.is_empty() {
+        return;
+    }
+    let mut activities = Vec::new();
+    for entry in &pending {
+        if let Some(approval) = &entry.approval {
+            activities.push(ThreadActivity {
+                thread_id: entry.thread_id,
+                kind: ThreadActivityKind::ApprovalRequested {
+                    approval_id: approval.id.to_string(),
+                },
+                active_turn: true,
+                summary: Some("Approval requested".into()),
+            });
+        }
+        for request in &entry.server_requests {
+            activities.push(ThreadActivity {
+                thread_id: entry.thread_id,
+                kind: ThreadActivityKind::ServerRequestReceived {
+                    server_request_id: request.id.to_string(),
+                },
+                active_turn: true,
+                summary: Some(format!("{} request", request.method)),
+            });
+        }
+    }
+    if activities.is_empty() {
+        return;
+    }
+    debug!(
+        %client_id,
+        threads = pending.len(),
+        activities = activities.len(),
+        "replaying pending cross-thread activity to a connecting client"
+    );
+    let _ = tx
+        .send(ServerMessage::ThreadActivityBootstrap { activities })
+        .await;
+}
+
 async fn handle_ws(socket: WebSocket, state: AppState) {
     let (tx, mut rx) = mpsc::channel::<ServerMessage>(256);
     let client_id = state.hub.next_client_id();
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    state.hub.register_client(client_id, tx.clone()).await;
-
+    // Order matters, and is load-bearing in both directions:
+    //
+    // 1. Drain first. Registering publishes this channel to every broadcaster, and the bootstrap
+    //    below is an awaited send. With no receiver yet, a burst of concurrent broadcasts that
+    //    fills the queue would park that send forever and wedge the connection.
+    // 2. Register before computing the bootstrap, not after. Anything that changes between the
+    //    snapshot and its delivery then also reaches this client as a live event, so a badge cannot
+    //    be left showing state that resolved in the gap.
+    //
+    // A live broadcast can therefore land ahead of the bootstrap. That is harmless: the live event
+    // claims the notification dedup key, so the replay for the same approval is suppressed rather
+    // than alerting twice.
     let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             let json = match serde_json::to_string(&msg) {
@@ -2821,6 +2883,9 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
             }
         }
     });
+
+    state.hub.register_client(client_id, tx.clone()).await;
+    send_activity_bootstrap(&state, client_id, &tx).await;
 
     let hub = state.hub.clone();
 

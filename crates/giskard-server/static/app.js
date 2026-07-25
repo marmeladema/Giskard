@@ -55,7 +55,7 @@ let state = {
   threadReadOnly:false, readOnlyProvider:null, readOnlyMessage:null,
   pickerTypeahead:"", pickerTypeaheadTimer:null, pickerSelectedRow:null,
   currentPlan:null, planExpanded:localStorage.getItem("giskard.planExpanded")==="1",
-  threadActivity:new Map(), pendingApprovalFocus:null, notifiedApprovals:new Map(), approvalNotifications:new Map(), browserDiagnostics:[],
+  threadActivity:new Map(), pendingApprovalFocus:null, notifiedApprovals:new Map(), bootstrapNotifiedApprovals:new Set(), approvalNotifications:new Map(), browserDiagnostics:[],
   subagentImports:new Map(), projectThreads:new Map(), threadIndex:new Map(),
   lastNotificationPromptNoticeAt:0, swRegistration:null, pendingAttachments:[],
   attachmentGeneration:0, pendingAttachmentOperations:new Map(),
@@ -2102,6 +2102,10 @@ function isCurrentThreadServerMessage(msg) {
 }
 
 function handleServer(msg) {
+  if (msg && msg.type === "thread_activity_bootstrap") {
+    handleThreadActivityBootstrap(msg);
+    return;
+  }
   if (msg && msg.type === "thread_activity") {
     handleThreadActivity(msg);
     return;
@@ -2182,7 +2186,7 @@ function handleThreadActivity(msg) {
     approval_id: msg.approval_id || null,
     server_request_id: msg.server_request_id || null,
     summary: msg.summary || "",
-    source: "thread_activity",
+    source: msg.source || "thread_activity",
     unread: !current
   };
   if (activity.kind === "turn_completed") {
@@ -2202,6 +2206,26 @@ function handleThreadActivity(msg) {
   renderThreadActivityIndicator(tid);
   renderSubagentsButton();
   if (activity.kind === "approval_requested") maybeNotifyApproval(tid, activity);
+}
+
+// Cross-thread activity the server replayed because we were not connected when it happened. Paints
+// the badge exactly like a live event; notification is gated separately, because a reconnect is not
+// news — see `maybeNotifyApproval`.
+// Undo a notification claim when the notification did not actually reach the user. Both records
+// must be released together: leaving the session-scoped one set would silence every later replay of
+// an approval the user was never shown.
+function releaseApprovalNotificationClaim(notificationKey) {
+  state.notifiedApprovals.delete(notificationKey);
+  state.bootstrapNotifiedApprovals.delete(notificationKey);
+}
+
+function handleThreadActivityBootstrap(msg) {
+  const activities = (msg && Array.isArray(msg.activities)) ? msg.activities : [];
+  if (!activities.length) return;
+  recordNotificationDiagnostic("activity_bootstrap_received", { count: activities.length });
+  for (const entry of activities) {
+    handleThreadActivity(Object.assign({}, entry, { source:"connect_bootstrap" }));
+  }
 }
 
 async function maybeNotifyApproval(tid, activity) {
@@ -2242,6 +2266,17 @@ async function maybeNotifyApproval(tid, activity) {
     maybeNoticeNotificationPermission();
     return;
   }
+  // A replayed approval is not news. `notifiedApprovals` cannot answer "have we ever alerted for
+  // this?" because it is pruned on a 15s window, so a laptop resuming repeatedly would re-alert for
+  // the same blocked approval. Track bootstrap alerts separately and permanently for this page
+  // session: a reconnect stays silent, while a genuine reload starts a new session and re-alerts.
+  if (activity.source === "connect_bootstrap" && state.bootstrapNotifiedApprovals.has(notificationKey)) {
+    recordNotificationDiagnostic("approval_notify_suppressed_replay", {
+      tid,
+      approval_id: activity.approval_id
+    });
+    return;
+  }
   const now = Date.now();
   pruneNotificationDedup(now);
   const notifiedAt = state.notifiedApprovals.get(notificationKey);
@@ -2259,6 +2294,7 @@ async function maybeNotifyApproval(tid, activity) {
   // check above and the record after the notification, both would clear the gate and notify.
   // Every path that returns without notifying releases it again.
   state.notifiedApprovals.set(notificationKey, now);
+  state.bootstrapNotifiedApprovals.add(notificationKey);
   // A sub-agent's very first approval routinely arrives before the browser has listed the thread
   // the server just materialized. Resolve it now rather than shipping an unattributable id prefix —
   // this notification is the only signal the user gets for a thread with no sidebar row.
@@ -2285,7 +2321,7 @@ async function maybeNotifyApproval(tid, activity) {
       tag: notificationTag
     });
   } catch (e) {
-    state.notifiedApprovals.delete(notificationKey);
+    releaseApprovalNotificationClaim(notificationKey);
     recordNotificationDiagnostic("approval_notify_constructor_failed", {
       tid,
       approval_id: activity.approval_id,
@@ -2296,7 +2332,7 @@ async function maybeNotifyApproval(tid, activity) {
     return;
   }
   if (!result) {
-    state.notifiedApprovals.delete(notificationKey);
+    releaseApprovalNotificationClaim(notificationKey);
     return;
   }
   // Desktop (constructor) notifications are tracked so we can close them on resolution and dispatch

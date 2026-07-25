@@ -204,6 +204,49 @@ impl LiveBufferStore {
             }
         })
     }
+
+    /// Every thread currently waiting on the user, across all in-flight turns.
+    ///
+    /// `ThreadActivity` is broadcast the instant an approval is raised and is never replayed, so a
+    /// browser that was not connected at that moment learns nothing about it — no sidebar badge, no
+    /// notification — until it happens to open that thread. This is the state a connecting client
+    /// needs to catch up. A buffer exists exactly while a turn is in flight, so "has a live buffer
+    /// with an unanswered approval" is the same question as "is blocked right now". Answered
+    /// approvals are filtered out for the same reason `snapshot` filters them.
+    pub async fn pending_attention(&self) -> Vec<PendingAttention> {
+        let buffers = self.buffers.lock().await;
+        buffers
+            .iter()
+            .filter_map(|(thread_id, turn)| {
+                let approval: Option<WireApprovalRequest> =
+                    turn.events.iter().rev().find_map(|e| match e {
+                        AgentEvent::ApprovalRequested { request, .. }
+                            if !turn.resolved_approvals.contains_key(&request.id) =>
+                        {
+                            Some(request.clone().into())
+                        }
+                        _ => None,
+                    });
+                let server_requests = pending_server_requests(&turn.events);
+                if approval.is_none() && server_requests.is_empty() {
+                    return None;
+                }
+                Some(PendingAttention {
+                    thread_id: *thread_id,
+                    approval,
+                    server_requests,
+                })
+            })
+            .collect()
+    }
+}
+
+/// One thread's outstanding user-facing requests, as needed to rebuild a connecting client's
+/// cross-thread activity view.
+pub struct PendingAttention {
+    pub thread_id: ThreadId,
+    pub approval: Option<WireApprovalRequest>,
+    pub server_requests: Vec<ServerRequest>,
 }
 
 fn pending_server_requests(events: &[AgentEvent]) -> Vec<ServerRequest> {

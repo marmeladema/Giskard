@@ -148,6 +148,7 @@ fn server_message_kind(msg: &ServerMessage) -> &'static str {
     match msg {
         ServerMessage::Event { .. } => "event",
         ServerMessage::ThreadActivity(_) => "thread_activity",
+        ServerMessage::ThreadActivityBootstrap { .. } => "thread_activity_bootstrap",
         ServerMessage::ThreadState(_) => "thread_state",
         ServerMessage::HistoryPage { .. } => "history_page",
         ServerMessage::HistoryDelta { .. } => "history_delta",

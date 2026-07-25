@@ -30,6 +30,7 @@ type TestWs =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 const APPROVAL_ID: &str = "ap_reconnect_1";
+const SERVER_REQUEST_ID: &str = "req_reconnect_1";
 
 /// A harness that raises a single approval and keeps the turn in-flight forever (never sends
 /// `TurnCompleted`), so the live buffer is still present when the reconnect snapshot is taken.
@@ -111,6 +112,18 @@ impl AgentHarness for ApprovalHarness {
                 available: vec![ApprovalDecision::Accept, ApprovalDecision::Decline],
             },
         });
+        // A non-approval server request blocks the turn the same way an approval does, and is just
+        // as invisible to a browser that was not connected, so the connect replay carries both.
+        let _ = self.tx.send(AgentEvent::ServerRequestReceived {
+            thread: thread.thread,
+            turn: Some(turn),
+            request: giskard_core::server_request::ServerRequest {
+                id: giskard_core::ids::ServerRequestId(SERVER_REQUEST_ID.into()),
+                method: "requestUserInput".into(),
+                params: serde_json::json!({ "question": "Which branch?" }),
+                received_at: chrono::Utc::now(),
+            },
+        });
         Ok(turn)
     }
 
@@ -131,9 +144,18 @@ impl AgentHarness for ApprovalHarness {
 
     async fn respond_server_request(
         &self,
-        _req: giskard_core::ids::ServerRequestId,
+        req: giskard_core::ids::ServerRequestId,
         _response: giskard_core::server_request::ServerRequestResponse,
     ) -> Result<(), HarnessError> {
+        // Mirror a real harness: answering the request resolves it, which is what clears it from the
+        // live buffer. Without this it would stay outstanding and keep being replayed.
+        if let Some((thread, turn)) = *self.active.lock().await {
+            let _ = self.tx.send(AgentEvent::ServerRequestResolved {
+                thread,
+                turn: Some(turn),
+                request_id: req,
+            });
+        }
         Ok(())
     }
 
@@ -380,6 +402,164 @@ async fn wait_for_approval_resolved(ws: &mut TestWs) {
         }
     }
     panic!("approval resolved message not observed");
+}
+
+/// A browser that was not connected when an approval was raised must still learn the thread is
+/// blocked. Cross-thread `ThreadActivity` is broadcast live and never replayed, so before this the
+/// only way to discover a blocked thread was to open it — which for a managed sub-agent (no sidebar
+/// row) meant knowing to look in the first place. A connecting client now gets the pending set up
+/// front, without subscribing to anything.
+#[tokio::test]
+async fn pending_approval_is_replayed_to_a_client_that_connects_later() {
+    use futures_util::SinkExt;
+
+    let (_tmp, addr, cookie, thread_id) = spawn_test_app().await;
+    let mut ws = connect_ws(addr, &cookie).await;
+    ws.send(ws_text(&ClientMessage::Subscribe {
+        thread_id,
+        since: None,
+    }))
+    .await
+    .unwrap();
+    ws.send(ws_text(&ClientMessage::SendInput {
+        thread_id,
+        text: "please".into(),
+        attachments: vec![],
+    }))
+    .await
+    .unwrap();
+    wait_for_approval(&mut ws).await;
+
+    // A second browser connects while the approval is still outstanding, and never subscribes.
+    let mut latecomer = connect_ws(addr, &cookie).await;
+    let activities = wait_for_activity_bootstrap(&mut latecomer).await;
+    let mine: Vec<_> = activities
+        .iter()
+        .filter(|activity| activity.thread_id == thread_id)
+        .collect();
+    let approval = mine
+        .iter()
+        .find(|activity| {
+            matches!(
+                &activity.kind,
+                giskard_proto::ThreadActivityKind::ApprovalRequested { approval_id }
+                    if approval_id == APPROVAL_ID
+            )
+        })
+        .expect("the outstanding approval should appear in the bootstrap");
+    assert!(approval.active_turn);
+    // A non-approval server request blocks the turn just as invisibly, so it is replayed too.
+    let server_request = mine
+        .iter()
+        .find(|activity| {
+            matches!(
+                &activity.kind,
+                giskard_proto::ThreadActivityKind::ServerRequestReceived { server_request_id }
+                    if server_request_id == SERVER_REQUEST_ID
+            )
+        })
+        .expect("the outstanding server request should appear in the bootstrap");
+    assert!(server_request.active_turn);
+
+    // Answer both, then connect again: neither is outstanding any more, so neither may be replayed.
+    // Re-alerting for something the user already dealt with is worse than silence.
+    ws.send(ws_text(&ClientMessage::ApprovalDecision {
+        request_id: APPROVAL_ID.into(),
+        decision: ApprovalDecision::Accept,
+    }))
+    .await
+    .unwrap();
+    wait_for_approval_resolved(&mut ws).await;
+    ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+        request_id: SERVER_REQUEST_ID.into(),
+        response: giskard_proto::ServerRequestResponse::result(serde_json::json!("main")),
+    }))
+    .await
+    .unwrap();
+    wait_for_server_request_resolved(&mut ws).await;
+
+    let mut after_answer = connect_ws(addr, &cookie).await;
+    let replayed = collect_activity_bootstrap(&mut after_answer).await;
+    assert!(
+        !replayed
+            .iter()
+            .any(|activity| activity.thread_id == thread_id
+                && matches!(
+                    &activity.kind,
+                    giskard_proto::ThreadActivityKind::ApprovalRequested { .. }
+                )),
+        "an answered approval must not be replayed to a later client, got {replayed:?}"
+    );
+    assert!(
+        !replayed
+            .iter()
+            .any(|activity| activity.thread_id == thread_id
+                && matches!(
+                    &activity.kind,
+                    giskard_proto::ThreadActivityKind::ServerRequestReceived { .. }
+                )),
+        "an answered server request must not be replayed to a later client, got {replayed:?}"
+    );
+}
+
+async fn wait_for_server_request_resolved(ws: &mut TestWs) {
+    use futures_util::StreamExt;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                if let Ok(ServerMessage::Event { agent_event, .. }) = serde_json::from_str(&text)
+                    && matches!(*agent_event, WireAgentEvent::ServerRequestResolved { .. })
+                {
+                    return;
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => {}
+        }
+    }
+    panic!("server request resolved event not observed");
+}
+
+async fn wait_for_activity_bootstrap(ws: &mut TestWs) -> Vec<giskard_proto::ThreadActivity> {
+    use futures_util::StreamExt;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                if let Ok(ServerMessage::ThreadActivityBootstrap { activities }) =
+                    serde_json::from_str(&text)
+                {
+                    return activities;
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => {}
+        }
+    }
+    panic!("activity bootstrap not observed");
+}
+
+/// Like `wait_for_activity_bootstrap`, but tolerates the message being absent: with nothing
+/// outstanding the server sends no bootstrap at all, which is the expected result after answering.
+async fn collect_activity_bootstrap(ws: &mut TestWs) -> Vec<giskard_proto::ThreadActivity> {
+    use futures_util::StreamExt;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut seen = Vec::new();
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                if let Ok(ServerMessage::ThreadActivityBootstrap { activities }) =
+                    serde_json::from_str(&text)
+                {
+                    seen.extend(activities);
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => {}
+        }
+    }
+    seen
 }
 
 async fn wait_for_live_snapshot(ws: &mut TestWs) -> giskard_proto::LiveTurnSnapshot {
