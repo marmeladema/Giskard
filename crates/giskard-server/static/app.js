@@ -6,6 +6,42 @@ const WS_RECONNECT_MAX_MS = 8000;
 const WS_PROBLEM_NOTICE_INTERVAL_MS = 30000;
 const WS_BACKGROUND_CLOSE_GRACE_MS = 10000;
 const TRANSCRIPT_BOTTOM_STICKY_PX = 96;
+// Whether the composer is on a touch/coarse-pointer device (mobile keyboard). On touch there's no
+// Shift modifier reachable while typing, so the newline key fires a plain Enter; the composer must
+// let it insert a newline rather than sending the half-typed message. Detected once at load and
+// cached: it does not change mid-session.
+//
+// `pointer: coarse` is the standard media query for "no precise pointer" and is what a phone
+// reports. The maxTouchPoints fallback is only used when the primary pointer is not already known
+// to be fine+hover-capable, so a touch-enabled laptop (e.g. a Surface, which reports
+// maxTouchPoints > 0 but has a fine, hover-capable trackpad/mouse as the primary pointer) keeps
+// desktop Enter-sends behavior.
+const COMPOSER_IS_TOUCH = (() => {
+  try {
+    if (window.matchMedia && window.matchMedia("(pointer: coarse)").matches) return true;
+  } catch { /* matchMedia unsupported; fall through */ }
+  // Only fall back to maxTouchPoints when we don't have a positive desktop signal. A fine, hover-
+  // capable primary pointer means a desktop-class pointing device is present; treat it as desktop
+  // regardless of whether the screen also happens to accept touch.
+  let finePointer = false;
+  let hoverCapable = false;
+  try {
+    if (window.matchMedia) {
+      finePointer = window.matchMedia("(pointer: fine)").matches;
+      hoverCapable = window.matchMedia("(hover: hover)").matches;
+    }
+  } catch { /* matchMedia unsupported; assume unknown */ }
+  if (finePointer && hoverCapable) return false;
+  try {
+    if (navigator.maxTouchPoints && navigator.maxTouchPoints > 0) return true;
+  } catch { /* navigator.maxTouchPoints unavailable */ }
+  return false;
+})();
+// Hint text shown in the composer placeholder and the draft-empty state, adapting to touch vs
+// desktop so the user knows how Enter behaves on their keyboard.
+const COMPOSER_HINT = COMPOSER_IS_TOUCH
+  ? "Tap Send to send"
+  : "Enter to send, Shift+Enter for newline";
 // History is paginated by turn on the server, but a turn can hold an arbitrary number of items, so a
 // turn count is a poor proxy for screen height. On open we render the live turn first, then top up
 // persisted history in small batches until the transcript holds roughly this many viewports of
@@ -1679,7 +1715,11 @@ function renderDraftPlaceholder() {
     "<p class=\"draft-empty-text\">This is a <strong>draft</strong> — nothing is saved yet. " +
     "Type your first message in the composer below and send it to create the thread and start the conversation.</p>" +
     '<p class="draft-empty-hint">Pick a model and mode above the composer first. ' +
-    "<kbd>Enter</kbd> sends · <kbd>Shift</kbd>+<kbd>Enter</kbd> adds a newline.</p>" +
+    // The Enter behaviour adapts to touch vs desktop (see COMPOSER_HINT). On touch the newline
+    // key inserts a line and the Send button sends; on desktop Enter sends and Shift+Enter adds a line.
+    (COMPOSER_IS_TOUCH
+      ? "Tap <kbd>Send</kbd> to send · <kbd>Enter</kbd> adds a newline.</p>"
+      : "<kbd>Enter</kbd> sends · <kbd>Shift</kbd>+<kbd>Enter</kbd> adds a newline.</p>") +
     "</div></div>";
 }
 function openDraftThread(pid, defaultModel) {
@@ -2021,8 +2061,8 @@ function updateComposerControls() {
   $("input").placeholder =
     readOnly ? "Read-only thread — pick a model above to reactivate it." :
     state.activeTurn ? "Agent is running… draft the next message here." :
-    draft ? "Message the agent…  (Enter to send, Shift+Enter for newline)" :
-    state.wsStatus==="open" ? "Message the agent…  (Enter to send, Shift+Enter for newline)" :
+    draft ? `Message the agent…  (${COMPOSER_HINT})` :
+    state.wsStatus==="open" ? `Message the agent…  (${COMPOSER_HINT})` :
     state.wsStatus==="connecting" ? "Connecting to agent…" :
     state.wsStatus==="reconnecting" ? "Reconnecting to agent… keep drafting here." :
     "Disconnected from agent.";
@@ -6744,7 +6784,19 @@ function sendInput() {
   clearPendingAttachments();
 }
 $("sendBtn").onclick = sendInput;
-$("input").addEventListener("keydown", (e) => { if (e.key==="Enter" && !e.shiftKey) { e.preventDefault(); sendInput(); } });
+$("input").addEventListener("keydown", (e) => {
+  if (e.key !== "Enter") return;
+  // On a touch/mobile keyboard the newline key fires a plain Enter (no Shift reachable), so plain
+  // Enter must insert a newline rather than send — otherwise the user can never type a newline.
+  // Send with the Send button, or with Ctrl/Cmd+Enter (works for an external keyboard on a tablet).
+  // On desktop, plain Enter sends and Shift+Enter inserts a newline.
+  const isModifierSend = e.ctrlKey || e.metaKey;
+  if (COMPOSER_IS_TOUCH) {
+    if (isModifierSend) { e.preventDefault(); sendInput(); }
+    return;
+  }
+  if (!e.shiftKey || isModifierSend) { e.preventDefault(); sendInput(); }
+});
 $("input").addEventListener("input", saveComposerDraft);
 $("attachBtn").onclick = () => $("attachmentInput").click();
 $("attachmentInput").addEventListener("change", attachSelectedFiles);
