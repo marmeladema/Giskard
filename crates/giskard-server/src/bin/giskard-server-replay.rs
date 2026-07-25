@@ -18,6 +18,7 @@
 //! * `GISKARD_REPLAY_PASSWORD` — the app password (default `giskard`);
 //! * `GISKARD_REPLAY_WORKSPACE` — the demo project's workspace dir (created if missing).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -51,22 +52,43 @@ const SCRIPTED_SUBAGENT_PROMPT: &str = "Review the linked child task.";
 const SCRIPTED_SUBAGENT_REPLY: &str = "Child replay output";
 const SCRIPTED_SUBAGENT_PREFIX: &str = "scripted-subagent|";
 const SCRIPTED_NESTED_SUBAGENT_PREFIX: &str = "scripted-nested-subagent|";
+/// Prompt that spawns a linked child which raises an approval and then holds its turn open. The
+/// parent turn completes normally, so browser tests can observe a blocked sub-agent while sitting on
+/// the parent thread — the case where the child has no sidebar row of its own.
+const SCRIPTED_SUBAGENT_APPROVAL_TRIGGER: &str = "Spawn a sub-agent that needs approval.";
+const SCRIPTED_APPROVAL_SUBAGENT_PREFIX: &str = "scripted-approval-subagent|";
+const SCRIPTED_SUBAGENT_APPROVAL_ID: &str = "scripted-subagent-approval-1";
+const SCRIPTED_SUBAGENT_APPROVAL_COMMAND: &str = "rm -rf ./child-build";
+const SCRIPTED_SUBAGENT_AGENT_NAME: &str = "Replay child";
+const SCRIPTED_APPROVAL_SUBAGENT_AGENT_NAME: &str = "Approval child";
+/// How long the approval-blocked child waits before raising its approval, so the browser's
+/// WebSocket is attached and receives the live thread-activity broadcast.
+const SCRIPTED_SUBAGENT_APPROVAL_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(1500);
 /// Prompt that makes the harness raise an approval and then keep the turn in-flight (it never
 /// completes). This lets browser tests answer the approval and reload mid-turn to assert the
 /// answered card is not re-surfaced as actionable. The approval id is fixed so tests can target it.
 const SCRIPTED_APPROVAL_TRIGGER: &str = "Trigger a scripted approval request.";
 const SCRIPTED_APPROVAL_ID: &str = "scripted-approval-1";
+/// How long a scripted turn waits for the server's event forwarder to subscribe before giving up.
+const RECEIVER_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const RECEIVER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// A harness that speaks the neutral protocol but has no backend: every turn streams the same
 /// canned agent message, so the browser-visible transcript is fully deterministic.
 struct ScriptedHarness {
     capabilities: HarnessCapabilities,
     threads: tokio::sync::Mutex<Vec<(ThreadId, broadcast::Sender<AgentEvent>)>>,
-    /// The thread/turn of an in-flight scripted approval, so `respond_approval` can emit a
-    /// confirmation item on the still-open turn (used by the reload e2e test to know the server has
-    /// recorded the answer before it reconnects).
-    active_approval: tokio::sync::Mutex<Option<(ThreadId, TurnId)>>,
+    /// Where each in-flight scripted approval was raised, so `respond_approval` can emit its
+    /// confirmation item on the right still-open turn (the reload e2e test uses that ack to know the
+    /// server has recorded the answer before it reconnects). Keyed by approval id rather than held
+    /// as a single slot: a parent and a sub-agent can be blocked at the same time, and a shared slot
+    /// would let the later one overwrite the earlier and misattribute its ack. Shared, because a
+    /// sub-agent's approval is raised from the detached task that drives the child's turn.
+    active_approvals: ActiveApprovals,
 }
+
+type ActiveApprovals = Arc<tokio::sync::Mutex<HashMap<ApprovalId, (ThreadId, TurnId)>>>;
 
 impl ScriptedHarness {
     fn new() -> Self {
@@ -86,8 +108,18 @@ impl ScriptedHarness {
                 context_compaction: false,
             },
             threads: tokio::sync::Mutex::new(Vec::new()),
-            active_approval: tokio::sync::Mutex::new(None),
+            active_approvals: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Wait for the server's event forwarder to attach before scripting a turn. A `broadcast` sender
+    /// drops anything sent with no receivers, so every scripted turn must gate on this.
+    async fn wait_for_receiver(sender: &broadcast::Sender<AgentEvent>) -> bool {
+        let deadline = tokio::time::Instant::now() + RECEIVER_WAIT_TIMEOUT;
+        while sender.receiver_count() == 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(RECEIVER_POLL_INTERVAL).await;
+        }
+        sender.receiver_count() > 0
     }
 
     async fn sender_for(&self, thread: ThreadId) -> Option<broadcast::Sender<AgentEvent>> {
@@ -99,11 +131,62 @@ impl ScriptedHarness {
     }
 
     fn subagent_parent(native_thread_id: &str) -> Option<String> {
-        [SCRIPTED_SUBAGENT_PREFIX, SCRIPTED_NESTED_SUBAGENT_PREFIX]
-            .into_iter()
-            .find_map(|prefix| native_thread_id.strip_prefix(prefix))
-            .and_then(|value| value.rsplit_once('|'))
-            .map(|(parent, _)| parent.to_owned())
+        [
+            SCRIPTED_SUBAGENT_PREFIX,
+            SCRIPTED_NESTED_SUBAGENT_PREFIX,
+            SCRIPTED_APPROVAL_SUBAGENT_PREFIX,
+        ]
+        .into_iter()
+        .find_map(|prefix| native_thread_id.strip_prefix(prefix))
+        .and_then(|value| value.rsplit_once('|'))
+        .map(|(parent, _)| parent.to_owned())
+    }
+
+    /// Drive a child turn that blocks on an approval and never completes. The parent's own turn has
+    /// already finished by the time this runs, so the browser is left with a blocked thread that has
+    /// no sidebar row — the exact state the ancestor badge, the sub-agents button, and the approval
+    /// notification have to surface.
+    fn spawn_approval_subagent_turn(
+        sender: broadcast::Sender<AgentEvent>,
+        thread_id: ThreadId,
+        active_approvals: ActiveApprovals,
+    ) {
+        tokio::spawn(async move {
+            if !Self::wait_for_receiver(&sender).await {
+                return;
+            }
+
+            // The forwarder is listening, but the browser opens its WebSocket a few milliseconds
+            // after the HTTP call that started the parent turn. Thread activity is broadcast live
+            // and never replayed on connect, so firing immediately would race the client and the
+            // approval would be broadcast to nobody. Give the browser time to attach.
+            tokio::time::sleep(SCRIPTED_SUBAGENT_APPROVAL_DELAY).await;
+
+            let turn = TurnId::new();
+            active_approvals.lock().await.insert(
+                ApprovalId(SCRIPTED_SUBAGENT_APPROVAL_ID.into()),
+                (thread_id, turn),
+            );
+            let _ = sender.send(AgentEvent::TurnStarted {
+                thread: thread_id,
+                turn,
+            });
+            tokio::task::yield_now().await;
+            let _ = sender.send(AgentEvent::ApprovalRequested {
+                thread: thread_id,
+                turn,
+                request: ApprovalRequest {
+                    id: ApprovalId(SCRIPTED_SUBAGENT_APPROVAL_ID.into()),
+                    kind: ApprovalKind::CommandExecution {
+                        command: SCRIPTED_SUBAGENT_APPROVAL_COMMAND.into(),
+                        cwd: "/tmp/demo".into(),
+                    },
+                    reason: Some("The sub-agent wants to remove its build directory.".into()),
+                    metadata: vec![],
+                    available: vec![ApprovalDecision::Accept, ApprovalDecision::Decline],
+                },
+            });
+        });
     }
 
     fn spawn_nested_subagent_turn(
@@ -112,11 +195,7 @@ impl ScriptedHarness {
         parent_harness_thread_id: String,
     ) {
         tokio::spawn(async move {
-            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
-            while sender.receiver_count() == 0 && tokio::time::Instant::now() < deadline {
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            }
-            if sender.receiver_count() == 0 {
+            if !Self::wait_for_receiver(&sender).await {
                 return;
             }
 
@@ -193,11 +272,7 @@ impl ScriptedHarness {
         parent_harness_thread_id: String,
     ) {
         tokio::spawn(async move {
-            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
-            while sender.receiver_count() == 0 && tokio::time::Instant::now() < deadline {
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            }
-            if sender.receiver_count() == 0 {
+            if !Self::wait_for_receiver(&sender).await {
                 return;
             }
 
@@ -285,9 +360,12 @@ impl AgentHarness for ScriptedHarness {
         drop(threads);
 
         let parent_harness_thread_id = Self::subagent_parent(&harness_thread_id);
+        let blocks_on_approval = harness_thread_id.starts_with(SCRIPTED_APPROVAL_SUBAGENT_PREFIX);
         if is_new && let Some(parent) = parent_harness_thread_id.clone() {
             if harness_thread_id.starts_with(SCRIPTED_NESTED_SUBAGENT_PREFIX) {
                 Self::spawn_nested_subagent_turn(sender, thread, harness_thread_id.clone());
+            } else if blocks_on_approval {
+                Self::spawn_approval_subagent_turn(sender, thread, self.active_approvals.clone());
             } else {
                 Self::spawn_subagent_turn(sender, thread, parent);
             }
@@ -298,9 +376,13 @@ impl AgentHarness for ScriptedHarness {
             harness_thread_id,
             warning: None,
             resumed_model: Some(opts.initial_model),
-            agent_name: parent_harness_thread_id
-                .as_ref()
-                .map(|_| "Replay child".to_string()),
+            agent_name: parent_harness_thread_id.as_ref().map(|_| {
+                if blocks_on_approval {
+                    SCRIPTED_APPROVAL_SUBAGENT_AGENT_NAME.to_string()
+                } else {
+                    SCRIPTED_SUBAGENT_AGENT_NAME.to_string()
+                }
+            }),
             parent_harness_thread_id,
         })
     }
@@ -327,12 +409,19 @@ impl AgentHarness for ScriptedHarness {
                 "{SCRIPTED_NESTED_SUBAGENT_PREFIX}{}|{turn}",
                 thread.harness_thread_id
             )),
+            Some(SCRIPTED_SUBAGENT_APPROVAL_TRIGGER) => Some(format!(
+                "{SCRIPTED_APPROVAL_SUBAGENT_PREFIX}{}|{turn}",
+                thread.harness_thread_id
+            )),
             _ => None,
         };
 
         let raise_approval = input_text == Some(SCRIPTED_APPROVAL_TRIGGER);
         if raise_approval {
-            *self.active_approval.lock().await = Some((thread_id, turn));
+            self.active_approvals
+                .lock()
+                .await
+                .insert(ApprovalId(SCRIPTED_APPROVAL_ID.into()), (thread_id, turn));
         }
 
         // Stream the canned reply the way a real harness would: start, incremental deltas, then a
@@ -365,6 +454,12 @@ impl AgentHarness for ScriptedHarness {
             }
 
             if let Some(native_thread_id) = subagent_native_thread_id {
+                let child_name = if native_thread_id.starts_with(SCRIPTED_APPROVAL_SUBAGENT_PREFIX)
+                {
+                    SCRIPTED_APPROVAL_SUBAGENT_AGENT_NAME
+                } else {
+                    SCRIPTED_SUBAGENT_AGENT_NAME
+                };
                 let _ = sender.send(AgentEvent::TurnStarted {
                     thread: thread_id,
                     turn,
@@ -378,11 +473,11 @@ impl AgentHarness for ScriptedHarness {
                         harness_item_id: format!("scripted_subagent_link_{turn}"),
                         payload: ItemPayload::Activity {
                             title: "Sub-agent running".into(),
-                            detail: Some("Replay child".into()),
+                            detail: Some(child_name.into()),
                             metadata: None,
                             subagent: Some(SubagentLink {
                                 harness_thread_id: native_thread_id,
-                                path: Some("Replay child".into()),
+                                path: Some(child_name.into()),
                                 initial_prompt: Some(SCRIPTED_SUBAGENT_PROMPT.into()),
                                 action: SubagentAction::Started,
                                 status: None,
@@ -471,13 +566,15 @@ impl AgentHarness for ScriptedHarness {
 
     async fn respond_approval(
         &self,
-        _req: giskard_core::ids::ApprovalId,
+        req: giskard_core::ids::ApprovalId,
         decision: giskard_core::approval::ApprovalDecision,
     ) -> Result<(), HarnessError> {
         // Emit a confirmation item on the still-open turn so tests have a deterministic signal that
         // the answer was routed. The turn stays in-flight (no TurnCompleted) so a reconnect still
-        // replays the answered approval from the live buffer.
-        if let Some((thread_id, turn)) = *self.active_approval.lock().await
+        // replays the answered approval from the live buffer. Look the location up by the answered
+        // id: several approvals can be pending at once, on different threads.
+        let raised_at = self.active_approvals.lock().await.remove(&req);
+        if let Some((thread_id, turn)) = raised_at
             && let Some(sender) = self.sender_for(thread_id).await
         {
             let label = match decision {

@@ -19,6 +19,12 @@ const NOTIFICATION_PROMPT_NOTICE_INTERVAL_MS = 30000;
 const BROWSER_DIAGNOSTIC_LIMIT = 120;
 const NOTIFICATION_DEDUP_MS = 15000;
 const ACTIVE_THREAD_COMPLETED_MARK_MS = 2500;
+// Debounce for re-fetching thread lists after activity arrives for a thread the browser has never
+// seen (a sub-agent the server just materialized). Short enough that the sidebar catches up while
+// the child is still blocked, long enough that a burst of child events costs one refresh.
+const STALE_THREAD_LIST_REFRESH_MS = 400;
+// Refresh attempts spent on any one unresolved thread id before giving up on it.
+const STALE_THREAD_LIST_REFRESH_MAX_ATTEMPTS = 3;
 const BROWSER_DIAGNOSTIC_VERSION = "browser-diagnostics-v1";
 const MAX_ATTACHMENTS_PER_MESSAGE = 8;
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
@@ -50,7 +56,7 @@ let state = {
   pickerTypeahead:"", pickerTypeaheadTimer:null, pickerSelectedRow:null,
   currentPlan:null, planExpanded:localStorage.getItem("giskard.planExpanded")==="1",
   threadActivity:new Map(), pendingApprovalFocus:null, notifiedApprovals:new Map(), approvalNotifications:new Map(), browserDiagnostics:[],
-  subagentImports:new Map(), projectThreads:new Map(),
+  subagentImports:new Map(), projectThreads:new Map(), threadIndex:new Map(),
   lastNotificationPromptNoticeAt:0, swRegistration:null, pendingAttachments:[],
   attachmentGeneration:0, pendingAttachmentOperations:new Map(),
   collapsedProjects:new Set(loadCollapsedProjects()), pendingRemoveProject:null, projectDirs:{}
@@ -641,6 +647,11 @@ async function loadThreads(pid) {
       box.append(label);
       appendThreadRows(box, pid, archived);
     }
+    // Rebuilding the rows discards the selection highlight with the old DOM. Callers that reload as
+    // part of opening a thread re-derive it themselves, but a reload triggered by anything else
+    // (say, catching up on a sub-agent the server just materialized) would otherwise leave the list
+    // with no visibly selected thread.
+    syncActiveThreadHighlight();
   } catch {}
 }
 
@@ -653,6 +664,7 @@ function rememberProjectThreads(pid, threads) {
     spawned_by_turn_id:t.spawned_by_turn_id ? String(t.spawned_by_turn_id) : null
   }));
   state.projectThreads.set(projectId, normalized);
+  reindexProjectThreads(projectId, normalized);
 
   // Link results are browser-local accelerators only. Discard them when the authoritative thread
   // list reloads; a later click resolves the trusted item coordinates idempotently on the server.
@@ -666,6 +678,19 @@ function rememberProjectThreads(pid, threads) {
 
 function knownProjectThreads(pid) {
   return state.projectThreads.get(String(pid || state.projectId)) || [];
+}
+
+// Thread id → { pid, thread }, rebuilt whenever a project's list is remembered. Activity hoisting
+// resolves ids constantly — once per activity entry, then once per ancestor hop, then again for
+// every sidebar row — so scanning each project's array per lookup is quadratic in thread count for
+// a single repaint. The entries hold the same objects as `projectThreads`, so in-place edits (a
+// renamed thread) stay visible through both.
+function reindexProjectThreads(pid, threads) {
+  const projectId = String(pid);
+  for (const [tid, entry] of state.threadIndex) {
+    if (entry.pid === projectId) state.threadIndex.delete(tid);
+  }
+  for (const thread of threads) state.threadIndex.set(String(thread.id), { pid:projectId, thread });
 }
 
 function appendThreadRows(box, pid, threads) {
@@ -844,14 +869,123 @@ function threadRowForId(tid) {
   return document.querySelector(`.thread[data-tid="${tid}"]`);
 }
 
+// Resolve a thread's project, display title, and ownership. The sidebar row is the fast path, but
+// managed sub-agent threads are deliberately never rendered there, so fall back to the authoritative
+// per-project thread lists. Without that fallback anything keyed off a thread id — approval
+// notification naming, click-to-focus, the ancestor activity badge — silently no-ops for a
+// sub-agent, which is exactly the thread the user most needs to be told about.
 function threadMetaForId(tid) {
+  if (!tid) return null;
+  const known = knownThreadMeta(tid);
   const el = threadRowForId(tid);
-  if (!el) return null;
+  if (!el) return known;
   return {
-    pid: el.dataset.pid || "",
-    tid: el.dataset.tid || tid,
-    title: currentThreadTitle(el)
+    pid: el.dataset.pid || (known && known.pid) || "",
+    tid: el.dataset.tid || String(tid),
+    title: currentThreadTitle(el),
+    kind: (known && known.kind) || "primary",
+    parent_thread_id: (known && known.parent_thread_id) || null
   };
+}
+
+// Look a thread up across every cached project list. Managed sub-agents are present here even though
+// `loadThreads` filters them out of the sidebar.
+function knownThreadMeta(tid) {
+  const key = String(tid || "");
+  if (!key) return null;
+  const entry = state.threadIndex.get(key);
+  if (!entry) return null;
+  const thread = entry.thread;
+  return {
+    pid: entry.pid,
+    tid: key,
+    title: threadDisplayTitle(thread),
+    kind: thread.kind || "primary",
+    parent_thread_id: thread.parent_thread_id ? String(thread.parent_thread_id) : null
+  };
+}
+
+function threadDisplayTitle(thread) {
+  if (!thread) return "";
+  if (thread.kind === "subagent") return subagentDisplayName(thread);
+  const title = String(thread.title || "").trim();
+  return title || String(thread.id || "").slice(0,8);
+}
+
+// True when `tid` sits anywhere under `ancestorId` in the ownership tree. Bounded by a seen-set so
+// corrupted parent metadata (a cycle) cannot spin.
+function threadDescendsFrom(tid, ancestorId) {
+  const target = String(ancestorId || "");
+  if (!target) return false;
+  const seen = new Set([String(tid || "")]);
+  let meta = knownThreadMeta(tid);
+  while (meta && meta.parent_thread_id) {
+    const parentId = meta.parent_thread_id;
+    if (parentId === target) return true;
+    if (seen.has(parentId)) return false;
+    seen.add(parentId);
+    meta = knownThreadMeta(parentId);
+  }
+  return false;
+}
+
+// The sidebar row that must display `tid`'s activity. A managed sub-agent has no row of its own, so
+// its activity is hoisted to the nearest ancestor that does — otherwise a child blocked on an
+// approval produces no visible signal anywhere in the sidebar.
+function activityHostThreadId(tid) {
+  const key = String(tid || "");
+  if (!key) return null;
+  if (threadRowForId(key)) return key;
+  const seen = new Set([key]);
+  let meta = knownThreadMeta(key);
+  while (meta && meta.parent_thread_id) {
+    const parentId = meta.parent_thread_id;
+    if (seen.has(parentId)) return null;
+    seen.add(parentId);
+    if (threadRowForId(parentId)) return parentId;
+    meta = knownThreadMeta(parentId);
+  }
+  return null;
+}
+
+// The server materializes a sub-agent thread on its own, so activity can arrive for a thread the
+// browser has never listed. Refresh the cached lists once per burst so naming, ancestor badges, and
+// the sub-agents menu can resolve it; without this the first approval from a brand-new child is
+// still anonymous.
+let staleThreadListRefreshTimer = null;
+// Attempts already spent per unresolved thread id. Some ids never resolve — trailing activity from
+// a deleted thread, or one the server does not list — and an ungated retry would re-fetch every
+// project list on every event for the rest of that turn. A few attempts still cover the case this
+// exists for: a child whose activity beats its own persistence by a moment.
+const staleThreadRefreshAttempts = new Map();
+
+function noteUnresolvedThread(tid) {
+  const key = String(tid || "");
+  if (!key) return;
+  const attempts = staleThreadRefreshAttempts.get(key) || 0;
+  if (attempts >= STALE_THREAD_LIST_REFRESH_MAX_ATTEMPTS) return;
+  staleThreadRefreshAttempts.set(key, attempts + 1);
+  scheduleStaleThreadListRefresh();
+}
+
+function scheduleStaleThreadListRefresh() {
+  if (staleThreadListRefreshTimer) return;
+  staleThreadListRefreshTimer = setTimeout(() => {
+    staleThreadListRefreshTimer = null;
+    refreshKnownThreadLists();
+  }, STALE_THREAD_LIST_REFRESH_MS);
+}
+
+async function refreshKnownThreadLists() {
+  const ids = Array.from(state.projectThreads.keys());
+  await Promise.all(ids.map(pid => loadThreads(pid)));
+  // Ids this refresh resolved get their budget back, so a thread that later disappears and returns
+  // is not permanently barred from triggering one.
+  for (const tid of Array.from(staleThreadRefreshAttempts.keys())) {
+    if (knownThreadMeta(tid)) staleThreadRefreshAttempts.delete(tid);
+  }
+  renderAllThreadActivityIndicators();
+  renderSubagentsButton();
 }
 
 function knownThreadForId(pid, tid) {
@@ -913,17 +1047,69 @@ function clearThreadActivity(tid) {
   renderSubagentsButton();
 }
 
-function renderThreadActivityIndicator(tid) {
+// Urgency order used when one row has to represent both its own state and its hidden sub-agents'.
+// A blocked child must never be masked by a merely-running parent, so approval outranks error
+// outranks running.
+function threadActivityRank(activity) {
+  if (!activity) return -1;
+  if (activity.kind === "approval_requested") return 3;
+  if (activity.kind === "error") return 2;
+  return activity.active_turn ? 1 : 0;
+}
+
+// The activity a sidebar row must display: its own, or the most urgent one belonging to a hidden
+// managed sub-agent that resolves to this row. `origin` names the descendant when the winning state
+// came from one, so the row can say which sub-agent it is reporting.
+// Resolve every activity entry's host row once. Each resolution walks an ownership chain, so a full
+// repaint that re-resolves them per row costs rows × activities × depth; sharing this makes the
+// chain walking once-per-activity for the whole repaint.
+function activityHostIndex() {
+  const hosts = new Map();
+  for (const tid of state.threadActivity.keys()) hosts.set(tid, activityHostThreadId(tid));
+  return hosts;
+}
+
+function effectiveThreadActivity(tid, hosts) {
+  const key = String(tid);
+  let activity = state.threadActivity.get(key) || null;
+  let origin = null;
+  for (const [otherId, other] of state.threadActivity) {
+    if (otherId === key) continue;
+    if (threadActivityRank(other) <= threadActivityRank(activity)) continue;
+    const host = hosts ? hosts.get(otherId) : activityHostThreadId(otherId);
+    if (host !== key) continue;
+    activity = other;
+    origin = otherId;
+  }
+  return { activity, origin };
+}
+
+function threadActivityTooltip(activity, origin) {
+  const summary = (activity && activity.summary) || "Thread activity";
+  if (!origin) return summary;
+  const meta = threadMetaForId(origin);
+  const name = (meta && meta.title) || String(origin).slice(0,8);
+  return `${name}: ${summary}`;
+}
+
+function renderThreadActivityIndicator(tid, hosts) {
   const el = threadRowForId(tid);
-  if (!el) return;
+  if (!el) {
+    // A managed sub-agent has no row. Repaint the ancestor that stands in for it instead; that call
+    // takes the branch below, so this cannot recurse further.
+    const host = (hosts && hosts.get(String(tid))) || activityHostThreadId(tid);
+    if (host && host !== String(tid)) renderThreadActivityIndicator(host, hosts);
+    return;
+  }
   const status = el.querySelector(".thread-status");
   if (!status) return;
-  const activity = state.threadActivity.get(String(tid));
+  const { activity, origin } = effectiveThreadActivity(tid, hosts);
   const visible = !!activity && (activity.unread || activity.active_turn || activity.approval_id || activity.kind === "turn_completed" || activity.kind === "error");
   el.classList.toggle("has-activity", visible);
   el.classList.toggle("activity-approval", visible && activity && activity.kind === "approval_requested");
   el.classList.toggle("activity-error", visible && activity && activity.kind === "error");
   el.classList.toggle("activity-running", visible && activity && activity.active_turn && activity.kind !== "approval_requested");
+  el.classList.toggle("activity-subagent", visible && !!origin);
   if (!visible) {
     status.textContent = "";
     status.title = "";
@@ -933,11 +1119,12 @@ function renderThreadActivityIndicator(tid) {
   else if (activity.kind === "error") status.textContent = "x";
   else if (activity.active_turn) status.textContent = "o";
   else status.textContent = "*";
-  status.title = activity.summary || "Thread activity";
+  status.title = threadActivityTooltip(activity, origin);
 }
 
 function renderAllThreadActivityIndicators() {
-  document.querySelectorAll(".thread").forEach(el => renderThreadActivityIndicator(el.dataset.tid));
+  const hosts = activityHostIndex();
+  document.querySelectorAll(".thread").forEach(el => renderThreadActivityIndicator(el.dataset.tid, hosts));
 }
 
 // Mark a single thread row as the selected one (or not). `aria-current` mirrors the visual state for
@@ -2008,6 +2195,10 @@ function handleThreadActivity(msg) {
     activity.unread = true;
   }
   state.threadActivity.set(tid, activity);
+  // Activity for a thread we have never listed means the server materialized it after our last
+  // load — almost always a sub-agent. Catch the list up so this activity can be attributed and
+  // hoisted onto a visible ancestor.
+  if (!knownThreadMeta(tid)) noteUnresolvedThread(tid);
   renderThreadActivityIndicator(tid);
   renderSubagentsButton();
   if (activity.kind === "approval_requested") maybeNotifyApproval(tid, activity);
@@ -2063,14 +2254,24 @@ async function maybeNotifyApproval(tid, activity) {
     });
     return;
   }
+  // Claim the dedup key before any await. Two events can describe the same approval (the live
+  // activity broadcast and the live-turn snapshot path), and with the refresh below between the
+  // check above and the record after the notification, both would clear the gate and notify.
+  // Every path that returns without notifying releases it again.
+  state.notifiedApprovals.set(notificationKey, now);
+  // A sub-agent's very first approval routinely arrives before the browser has listed the thread
+  // the server just materialized. Resolve it now rather than shipping an unattributable id prefix —
+  // this notification is the only signal the user gets for a thread with no sidebar row.
+  if (!threadMetaForId(tid)) await refreshKnownThreadLists();
   const meta = threadMetaForId(tid);
-  const title = meta && meta.title ? meta.title : tid.slice(0,8);
+  const title = approvalNotificationLabel(meta, tid);
+  const isSubagent = !!meta && meta.kind === "subagent";
   // Stable per-approval tag: it dedups at the OS level and lets us close the notification by tag on
   // the service-worker path (where we never hold a Notification object) when the approval resolves.
   const notificationTag = approvalNotificationTag(tid, activity.approval_id);
   let result;
   try {
-    result = await showAppNotification("Giskard: approval needed", {
+    result = await showAppNotification(isSubagent ? "Giskard: sub-agent approval needed" : "Giskard: approval needed", {
       body: activity.summary ? `${title}: ${activity.summary}` : title,
       tag: notificationTag,
       renotify: true,
@@ -2084,6 +2285,7 @@ async function maybeNotifyApproval(tid, activity) {
       tag: notificationTag
     });
   } catch (e) {
+    state.notifiedApprovals.delete(notificationKey);
     recordNotificationDiagnostic("approval_notify_constructor_failed", {
       tid,
       approval_id: activity.approval_id,
@@ -2093,8 +2295,10 @@ async function maybeNotifyApproval(tid, activity) {
     console.warn("Giskard notification failed", e);
     return;
   }
-  if (!result) return;
-  state.notifiedApprovals.set(notificationKey, now);
+  if (!result) {
+    state.notifiedApprovals.delete(notificationKey);
+    return;
+  }
   // Desktop (constructor) notifications are tracked so we can close them on resolution and dispatch
   // their click; service-worker notifications are closed by tag and click via the worker postMessage.
   if (result.via === "constructor" && result.notification) {
@@ -2217,9 +2421,27 @@ function maybeNoticeNotificationPermission() {
   notice("Enable approval notifications from the sidebar alert button.", "warning");
 }
 
+// Name an approval's thread for a notification. A sub-agent's own title is often generic ("Sub-agent
+// #2"), and it has no sidebar row to fall back on, so qualify it with the owning thread — an
+// unattributable "3f2a91bc: Approval requested" tells the user nothing about what is blocked.
+function approvalNotificationLabel(meta, tid) {
+  const fallback = String(tid).slice(0,8);
+  if (!meta) return fallback;
+  const title = meta.title || fallback;
+  if (meta.kind !== "subagent" || !meta.parent_thread_id) return title;
+  const parent = threadMetaForId(meta.parent_thread_id);
+  return parent && parent.title ? `${title} (in ${parent.title})` : title;
+}
+
 async function focusApprovalTarget(tid, approvalId) {
   window.focus();
-  const meta = threadMetaForId(tid);
+  let meta = threadMetaForId(tid);
+  if (!meta || !meta.pid) {
+    // The thread may have been materialized after our last list load; one refresh is cheap and is
+    // the difference between navigating to the blocked sub-agent and a dead-end notification.
+    await refreshKnownThreadLists();
+    meta = threadMetaForId(tid);
+  }
   if (!meta || !meta.pid) {
     notice("Approval thread is not in the current project list.", "warning");
     return;
@@ -4272,32 +4494,58 @@ function subagentThreadsForActiveProject() {
   );
 }
 
-function subagentActivityForThread(threadId) {
-  return state.threadActivity.get(String(threadId || "")) || null;
-}
-
-function subagentIsRunning(thread) {
-  const activity = subagentActivityForThread(thread.id);
-  return !!(activity && activity.active_turn);
+// Everything a card reports about the subtree it owns, from one walk of the activity map. A card
+// stands for its whole subtree — a nested grandchild is not listed separately, since the menu lists
+// direct children of the open thread — so an unreported descendant is reported nowhere.
+//
+// `running` and `needsApproval` are separate flags rather than reads of the winning activity: an
+// approval also sets `active_turn`, so a blocked child would otherwise be indistinguishable from a
+// busy one, and an erroring descendant outranks a running sibling without cancelling it. `activity`
+// is the ranked winner that names the card's state, with `origin` set when it belongs to a
+// descendant, so the summary can describe that descendant rather than this thread.
+function subagentSubtreeState(threadId) {
+  const key = String(threadId);
+  let running = false;
+  let needsApproval = false;
+  let activity = null;
+  let origin = null;
+  for (const [otherId, other] of state.threadActivity) {
+    if (otherId !== key && !threadDescendsFrom(otherId, key)) continue;
+    if (other.active_turn) running = true;
+    if (other.kind === "approval_requested") needsApproval = true;
+    if (threadActivityRank(other) <= threadActivityRank(activity)) continue;
+    activity = other;
+    origin = otherId === key ? null : otherId;
+  }
+  return { running, needsApproval, activity, origin };
 }
 
 function subagentCounts() {
   const agents = subagentThreadsForActiveProject();
-  const running = agents.filter(subagentIsRunning).length;
-  return { total:agents.length, running };
+  let running = 0;
+  let awaitingApproval = 0;
+  for (const thread of agents) {
+    const subtree = subagentSubtreeState(thread.id);
+    if (subtree.running) running += 1;
+    if (subtree.needsApproval) awaitingApproval += 1;
+  }
+  return { total:agents.length, running, awaitingApproval };
 }
 
 function renderSubagentsButton() {
   const btn = $("subagentsBtn");
   if (!btn) return;
   const counts = subagentCounts();
-  const stateName = counts.running ? "running" : "idle";
+  const stateName = counts.awaitingApproval ? "approval" : (counts.running ? "running" : "idle");
   btn.className = `badge subagents-btn state-${stateName}`;
   btn.disabled = !state.projectId || (!counts.total && !counts.running);
+  const runningLabel = `${counts.running} running sub-agent${counts.running === 1 ? "" : "s"} · ${counts.total} total`;
   btn.title = counts.total
-    ? `${counts.running} running sub-agent${counts.running === 1 ? "" : "s"} · ${counts.total} total`
+    ? (counts.awaitingApproval
+        ? `${counts.awaitingApproval} sub-agent${counts.awaitingApproval === 1 ? "" : "s"} waiting for approval · ${runningLabel}`
+        : runningLabel)
     : "No sub-agents";
-  $("subagentsCount").textContent = String(counts.running || counts.total);
+  $("subagentsCount").textContent = String(counts.awaitingApproval || counts.running || counts.total);
   if (!$("subagentsMenu").hidden) renderSubagentsMenu();
 }
 
@@ -4306,8 +4554,9 @@ function renderSubagentsMenu() {
   const agents = subagentThreadsForActiveProject();
   const counts = subagentCounts();
   const rows = agents.map(renderSubagentCard).join("");
+  const approvalSummary = counts.awaitingApproval ? `${counts.awaitingApproval} waiting for approval · ` : "";
   const summary = agents.length
-    ? `<div class="subagents-summary">${counts.running} running · ${counts.total} total</div>`
+    ? `<div class="subagents-summary${counts.awaitingApproval ? " needs-approval" : ""}">${approvalSummary}${counts.running} running · ${counts.total} total</div>`
     : "";
   menu.innerHTML = `
     <div class="subagents-head">
@@ -4327,18 +4576,22 @@ function renderSubagentsMenu() {
 }
 
 function renderSubagentCard(thread) {
-  const activity = subagentActivityForThread(thread.id);
-  const running = !!(activity && activity.active_turn);
-  const stateLabel = running ? "Running" : (activity && activity.kind === "error" ? "Error" : "Idle");
+  const { running, needsApproval, activity, origin } = subagentSubtreeState(thread.id);
+  const stateLabel = needsApproval
+    ? "Needs approval"
+    : (running ? "Running" : (activity && activity.kind === "error" ? "Error" : "Idle"));
   const parent = thread.parent_thread_id ? knownProjectThreads(state.projectId).find(t => String(t.id) === String(thread.parent_thread_id)) : null;
   const parentLabel = parent && parent.title ? `Parent: ${parent.title}` : "Parent thread";
-  const summary = activity && activity.summary ? activity.summary : parentLabel;
+  const summary = activity && activity.summary
+    ? threadActivityTooltip(activity, origin)
+    : parentLabel;
   const active = state.threadId && String(state.threadId) === String(thread.id);
   const name = subagentDisplayName(thread);
-  return `<button type="button" class="subagent-card${active ? " active" : ""}" data-subagent-thread-id="${escapeAttr(thread.id)}">
+  const stateClass = needsApproval ? " approval" : (running ? " running" : "");
+  return `<button type="button" class="subagent-card${active ? " active" : ""}${needsApproval ? " needs-approval" : ""}" data-subagent-thread-id="${escapeAttr(thread.id)}">
     <span class="subagent-card-title">
       <span class="subagent-card-name">${escapeHtml(name)}</span>
-      <span class="subagent-card-state${running ? " running" : ""}">${stateLabel}</span>
+      <span class="subagent-card-state${stateClass}">${stateLabel}</span>
     </span>
     <span class="subagent-card-meta">${escapeHtml(summary)}</span>
   </button>`;

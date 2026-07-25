@@ -635,6 +635,81 @@ async fn index_page_is_served_and_public() {
         "sub-agent monitor has button and card styling for idle/running states"
     );
     assert!(
+        body.contains("function knownThreadMeta(tid)")
+            && body.contains("const known = knownThreadMeta(tid);")
+            && body.contains("if (!el) return known;"),
+        "thread metadata falls back to the cached project thread lists, so managed sub-agents \
+         (never rendered in the sidebar) can still be named and navigated to"
+    );
+    assert!(
+        body.contains("function activityHostThreadId(tid)")
+            && body.contains("function effectiveThreadActivity(tid, hosts)")
+            && body.contains("function threadActivityRank(activity)")
+            && body.contains("el.classList.toggle(\"activity-subagent\", visible && !!origin);"),
+        "a hidden sub-agent's activity is hoisted onto the nearest visible ancestor row, ranked \
+         so an approval is never masked by a merely-running thread"
+    );
+    assert!(
+        body.contains("function approvalNotificationLabel(meta, tid)")
+            && body.contains("\"Giskard: sub-agent approval needed\"")
+            && body.contains("await refreshKnownThreadLists();"),
+        "an approval notification names the sub-agent and its parent, and clicking it refreshes \
+         a stale thread list rather than dead-ending"
+    );
+    assert!(
+        body.contains("function subagentSubtreeState(threadId)")
+            && body.contains("if (other.kind === \"approval_requested\") needsApproval = true;")
+            && body.contains("\"Needs approval\"")
+            && body.contains(".subagent-card.needs-approval")
+            && body.contains(".subagents-btn.state-approval")
+            && body.contains(".subagent-card-state.approval"),
+        "a sub-agent waiting on an approval is visually distinct from one that is merely running, \
+         tracked as its own flag because an approval also marks the turn active"
+    );
+    assert!(
+        body.contains("if (!knownThreadMeta(tid)) noteUnresolvedThread(tid);")
+            && body.contains("function noteUnresolvedThread(tid)")
+            && body.contains("if (attempts >= STALE_THREAD_LIST_REFRESH_MAX_ATTEMPTS) return;")
+            && body.contains("if (knownThreadMeta(tid)) staleThreadRefreshAttempts.delete(tid);"),
+        "activity for a thread the browser has never listed (a just-materialized sub-agent) \
+         refreshes the cached lists so it can be attributed, but a permanently unresolvable id \
+         (say, trailing activity from a deleted thread) spends a bounded number of attempts \
+         instead of re-fetching every project list for the rest of the turn"
+    );
+    assert!(
+        body.contains("threadIndex:new Map()")
+            && body.contains("function reindexProjectThreads(pid, threads)")
+            && body.contains("const entry = state.threadIndex.get(key);"),
+        "thread ids resolve through an index rather than scanning every project's list, because \
+         hoisting resolves ids once per activity, per ancestor hop, and per sidebar row"
+    );
+    assert!(
+        body.contains(
+            "const { running, needsApproval, activity, origin } = subagentSubtreeState(thread.id);"
+        ) && body.contains("? threadActivityTooltip(activity, origin)"),
+        "a sub-agent card's summary comes from the same subtree activity that sets its state, so \
+         a card reading \"Needs approval\" because a descendant is blocked describes that \
+         descendant instead of its own unrelated activity — and both come from one walk of the \
+         activity map rather than one per question asked"
+    );
+    assert!(
+        body.contains("function activityHostIndex()")
+            && body.contains("const hosts = activityHostIndex();")
+            && body.contains(
+                "const host = hosts ? hosts.get(otherId) : activityHostThreadId(otherId);"
+            ),
+        "a full sidebar repaint resolves each activity's host row once instead of re-walking the \
+         ownership chain for every row"
+    );
+    assert!(
+        body.contains(
+            "      appendThreadRows(box, pid, archived);\n    }\n    // Rebuilding the rows discards \
+             the selection highlight"
+        ) && body.contains("    syncActiveThreadHighlight();\n  } catch {}"),
+        "reloading a project's threads re-derives the selection highlight, so a reload not driven \
+         by opening a thread cannot leave the sidebar with nothing selected"
+    );
+    assert!(
         body.contains("function renderTaskCards")
             && body.contains("renderTaskCards($(\"tasksCommandList\"), commandTasks")
             && body.contains("renderTaskCards($(\"tasksToolList\"), toolTasks"),
@@ -2424,7 +2499,7 @@ fn sidebar_activity_notifications_target_approval_rows() {
     assert!(body.contains("NOTIFICATION_DEDUP_MS"));
     assert!(body.contains("function handleThreadActivity(msg)"));
     assert!(body.contains("if (msg && msg.type === \"thread_activity\")"));
-    assert!(body.contains("function renderThreadActivityIndicator(tid)"));
+    assert!(body.contains("function renderThreadActivityIndicator(tid, hosts)"));
     assert!(body.contains("activity.kind === \"approval_requested\""));
     assert!(body.contains(
         "if (activity.kind === \"approval_requested\") maybeNotifyApproval(tid, activity);"
@@ -2464,6 +2539,18 @@ fn sidebar_activity_notifications_target_approval_rows() {
     assert!(body.contains("const notifiedAt = state.notifiedApprovals.get(notificationKey);"));
     assert!(body.contains("now - notifiedAt < NOTIFICATION_DEDUP_MS"));
     assert!(body.contains("state.notifiedApprovals.set(notificationKey, now);"));
+    // The dedup key is claimed before the thread-list refresh await, not after the notification is
+    // shown: otherwise the live activity broadcast and the live-turn snapshot path can both clear
+    // the gate while one is awaiting and notify twice for the same approval. Paths that return
+    // without notifying release it again.
+    assert!(body.contains(
+        "  state.notifiedApprovals.set(notificationKey, now);\n  // A sub-agent's very first approval"
+    ));
+    assert!(
+        body.matches("state.notifiedApprovals.delete(notificationKey);")
+            .count()
+            >= 2
+    );
     assert!(body.contains("trackApprovalNotification(notificationKey, result.notification);"));
     assert!(body.contains("function pruneNotificationDedup(now)"));
     assert!(body.contains("function approvalNotificationKey(tid, approvalId)"));
@@ -2543,7 +2630,11 @@ fn sidebar_activity_notifications_target_approval_rows() {
     assert!(!body.contains("notifyApprovalRequest(ev.request"));
     assert!(!body.contains("notifyApprovalRequest(msg.request"));
     assert!(!body.contains("notifyApprovalRequest(snap.pending_approval"));
-    assert!(body.contains("await showAppNotification(\"Giskard: approval needed\""));
+    // A sub-agent's approval gets its own headline: it has no sidebar row, so the notification is
+    // the only place the user learns a delegated thread — not this one — is blocked.
+    assert!(body.contains(
+        "await showAppNotification(isSubagent ? \"Giskard: sub-agent approval needed\" : \"Giskard: approval needed\""
+    ));
     assert!(body.contains("const focused = document.hasFocus ? document.hasFocus() : true;"));
     assert!(body.contains(
         "if (document.visibilityState === \"visible\" && focused && String(tid) === String(state.threadId))"

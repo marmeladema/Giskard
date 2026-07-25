@@ -1,8 +1,8 @@
 # End-to-end (Playwright) tests
 
 Browser tests that drive Giskard's real web UI — login, projects/threads, live message streaming,
-linked sub-agent navigation/reload/prompt ordering/cascade deletion, and settings — through a
-headless Chromium.
+linked sub-agent navigation/reload/prompt ordering/cascade deletion, how a sub-agent blocked on an
+approval is surfaced, and settings — through a headless Chromium.
 
 Everything runs **inside Docker**, so you don't need Node, npm, or the Playwright browsers on your
 host. The one thing you do need is Docker.
@@ -20,7 +20,10 @@ REST/WebSocket API as the real `giskard-server`, but:
   the tests can log in and drive a thread with zero host-side setup.
 
 The sub-agent trigger, prompt, and reply constants in `giskard-server-replay` are mirrored by
-`tests/helpers.ts`; update both locations together when changing that scenario.
+`tests/helpers.ts`; update both locations together when changing that scenario. That includes the
+approval-blocked sub-agent scenario (`SCRIPTED_SUBAGENT_APPROVAL_*`), whose child deliberately waits
+before raising its approval: thread activity is broadcast live and never replayed on connect, so
+firing immediately would race the browser's WebSocket and reach nobody.
 
 This keeps the suite hermetic: the production server needs a real, authenticated Codex CLI, which
 can't run unattended in CI.
