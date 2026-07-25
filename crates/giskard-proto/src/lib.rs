@@ -241,6 +241,16 @@ pub enum ServerMessage {
         agent_event: Box<WireAgentEvent>,
     },
     ThreadActivity(ThreadActivity),
+    /// Cross-thread activity a connecting client missed. `ThreadActivity` is a live signal that is
+    /// never replayed, so without this a browser that was closed (or disconnected) when an approval
+    /// was raised shows no sidebar badge and fires no notification for a thread that is blocked
+    /// right now. Sent once to the connecting client only, never broadcast. Entries reuse
+    /// `ThreadActivity` so clients can funnel them through the same rendering path, but the
+    /// separate message lets a client tell a replay from a live event — it must not re-alert for an
+    /// approval it has already notified about in this page session.
+    ThreadActivityBootstrap {
+        activities: Vec<ThreadActivity>,
+    },
     ThreadState(ThreadState),
     /// A page of persisted history (H6), oldest-first; `has_more` if older turns exist before it.
     HistoryPage {

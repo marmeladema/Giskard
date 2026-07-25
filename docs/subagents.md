@@ -107,9 +107,15 @@ Because the server can materialize a child on its own, the browser may see activ
 has never listed. It refreshes its cached thread lists before naming or navigating to such a thread,
 so the first approval from a brand-new child is still attributable.
 
-Thread activity is a live signal and is not replayed on connect. A browser that is not running when
-a child raises an approval finds it in the thread's live-turn snapshot the next time it opens that
-thread.
+A browser that was not connected when a child raised an approval is told on connect. The server
+replays the set of threads still waiting on the user — before the browser subscribes to anything —
+so the ancestor badge and the sub-agents monitor are correct immediately rather than only after the
+blocked thread happens to be opened. Answered approvals are excluded, so a resolved one is never
+re-surfaced.
+
+That replay repaints badges every time, but alerts at most once per page load: a reconnect (tab
+resume, network blip) stays silent for an approval already alerted, while a genuine reload starts a
+new page session and alerts again.
 
 ## Prompts and transcript persistence
 

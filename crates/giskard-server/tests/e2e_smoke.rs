@@ -2505,6 +2505,10 @@ async fn wait_for_thread_activity(
                             "approval request card should belong to subscribed thread"
                         );
                     }
+                    // Sent once on connect and carries only lightweight `ThreadActivity`, so it is
+                    // allowed to mention the unsubscribed thread — that is the point of it. It can
+                    // never carry transcript traffic, which is what this loop guards.
+                    ServerMessage::ThreadActivityBootstrap { .. } => {}
                     ServerMessage::ThreadState(_)
                     | ServerMessage::TokenUpdate { .. }
                     | ServerMessage::ApprovalResolved { .. }
@@ -3083,6 +3087,11 @@ async fn inactive_thread_progress_sends_activity_without_full_event_subscription
                             "inactive completed turn may update only lightweight token state"
                         );
                     }
+                    // Connect-time replay of lightweight activity. Unlike the live `ThreadActivity`
+                    // arm above it is not asserted against the inactive thread's turn lifecycle:
+                    // it reports only what is still outstanding, so a completed turn contributes
+                    // nothing to it.
+                    ServerMessage::ThreadActivityBootstrap { .. } => {}
                     ServerMessage::TokenUpdate {
                         thread_id: None, ..
                     }

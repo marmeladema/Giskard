@@ -9,7 +9,7 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.57
+**Version:** 1.58
 
 > **Amendment — frontend approach (supersedes the Dioxus/WASM design below).**
 > This document was written targeting a **Dioxus fullstack / WebAssembly** frontend (`giskard-ui`),
@@ -22,6 +22,20 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.57 → 1.58), replaying missed cross-thread activity:**
+- **SB5:** `ThreadActivity` is broadcast live and was never replayed, so a browser that was closed or
+  disconnected when a thread became blocked learned nothing about it: no sidebar badge and no
+  notification, until that thread happened to be opened. For a managed sub-agent, which has no
+  sidebar row, that meant knowing to look. On connect the server now sends the connecting client —
+  and only that client, before it subscribes to anything — the set of threads currently waiting on
+  the user, derived from the in-flight live buffers. Approvals the user already answered are
+  excluded, on the same reasoning that excludes them from the live-turn snapshot.
+- **SB6:** A connect replay is not a new event. Clients must repaint badges from it every time, but
+  must alert at most once per page session for a given approval: a reconnect (tab resume, network
+  blip) stays silent for one already alerted, while a genuine reload starts a new session and
+  alerts again. A time-windowed dedup cannot express this, since it cannot answer whether an alert
+  was ever shown.
 
 **Changelog (1.56 → 1.57), surfacing a blocked sub-agent:**
 - **SB1:** Approval requests already route correctly to a managed sub-agent thread, but that thread
@@ -2781,6 +2795,10 @@ interactive forwarder owns the turn gate, the passive subscriber yields before b
 `ThreadActivity { thread_id, kind, active_turn, summary?, ...kind_payload }`
 (lightweight cross-thread sidebar/notification signal; `approval_requested` carries
 `approval_id`, and `server_request_received` carries `server_request_id`),
+`ThreadActivityBootstrap { activities: [ThreadActivity] }` (SB5: the outstanding subset of the
+above, sent once to a connecting client only and never broadcast, so a browser that missed the live
+signal still shows what is blocked; a separate message so clients can tell a replay from a live
+event and apply SB6's alert-once-per-session rule),
 `ThreadState { thread_id, state }` (persisted snapshot on subscribe/resync),
 `LiveTurnSnapshot { thread_id, turn_id, user_input?, accumulated, pending_approval?,
 pending_server_requests, answered_approvals }` (in-flight turn reconstruction on reconnect, carrying
@@ -2884,9 +2902,8 @@ events through the same event handler used for live WebSocket events.
   corrupted or cyclic ownership terminates instead of spinning. A sub-agent's approval notification
   names the child and its owning thread; since the server materializes a child on its own, activity
   for an unlisted thread must trigger a thread-list refresh before naming or navigating to it.
-  `ThreadActivity` is a live signal and is not replayed on connect, so a browser that is not
-  connected when an approval is raised learns about it from the thread's live-turn snapshot when it
-  next opens that thread.
+  A client that connects later is not left blind (SB5): the server sends it the set of threads
+  currently waiting on the user, before it subscribes to anything.
 - **Backpressure:** per-connection bounded queue; if a client falls behind, coalesce deltas
   (keep latest) rather than unbounded buffering. Heartbeat ping/pong; auto-reconnect on the
   client with resubscribe + state resync. Browser disconnects caused by mobile/tab suspension are

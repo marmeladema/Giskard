@@ -667,6 +667,20 @@ async fn index_page_is_served_and_public() {
          tracked as its own flag because an approval also marks the turn active"
     );
     assert!(
+        body.contains("msg.type === \"thread_activity_bootstrap\"")
+            && body.contains("function handleThreadActivityBootstrap(msg)")
+            && body.contains("{ source:\"connect_bootstrap\" }")
+            && body.contains("bootstrapNotifiedApprovals:new Set()")
+            && body.contains(
+                "if (activity.source === \"connect_bootstrap\" && state.bootstrapNotifiedApprovals.has(notificationKey))"
+            )
+            && body.contains("function releaseApprovalNotificationClaim(notificationKey)"),
+        "activity the client missed while disconnected is replayed on connect and repaints the \
+         badge, but alerts at most once per page session — the 15s dedup window cannot answer \
+         \"have we ever alerted for this?\", so a resuming laptop would otherwise re-alert for the \
+         same blocked approval"
+    );
+    assert!(
         body.contains("if (!knownThreadMeta(tid)) noteUnresolvedThread(tid);")
             && body.contains("function noteUnresolvedThread(tid)")
             && body.contains("if (attempts >= STALE_THREAD_LIST_REFRESH_MAX_ATTEMPTS) return;")
@@ -2544,10 +2558,12 @@ fn sidebar_activity_notifications_target_approval_rows() {
     // the gate while one is awaiting and notify twice for the same approval. Paths that return
     // without notifying release it again.
     assert!(body.contains(
-        "  state.notifiedApprovals.set(notificationKey, now);\n  // A sub-agent's very first approval"
+        "  state.notifiedApprovals.set(notificationKey, now);\n  state.bootstrapNotifiedApprovals.add(notificationKey);\n  // A sub-agent's very first approval"
     ));
+    // Both paths that give up without showing anything must release the claim, or the approval is
+    // silenced for the rest of the page session.
     assert!(
-        body.matches("state.notifiedApprovals.delete(notificationKey);")
+        body.matches("releaseApprovalNotificationClaim(notificationKey);")
             .count()
             >= 2
     );
@@ -2587,7 +2603,9 @@ fn sidebar_activity_notifications_target_approval_rows() {
     assert!(body.contains("source: \"agent_event_approval_requested\""));
     assert!(body.contains("source: \"server_message_approval_request\""));
     assert!(body.contains("source: \"live_turn_snapshot_pending_approval\""));
-    assert!(body.contains("source: \"thread_activity\""));
+    // Live events default to "thread_activity"; a connect replay overrides it so the notification
+    // gate can tell the two apart.
+    assert!(body.contains("source: msg.source || \"thread_activity\""));
     assert!(body.contains("approval_notify_received"));
     assert!(body.contains("approval_notify_suppressed_visible_current_thread"));
     assert!(body.contains("approval_notify_constructor_failed"));

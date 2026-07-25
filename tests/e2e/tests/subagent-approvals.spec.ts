@@ -26,6 +26,21 @@ function childThreadId(page: Page, pid: string, parentTid: string): Promise<stri
   );
 }
 
+/**
+ * Notifications recorded for one specific child thread's approval.
+ *
+ * Scoping to the thread matters: the replay server is shared across the suite and every
+ * approval-blocked child holds its turn open forever, so earlier tests leave blocked threads behind
+ * — and they all reuse the same fixed approval id. A connecting client is now told about every
+ * outstanding approval, so counting by approval id alone would tally other tests' leftovers.
+ */
+async function approvalNotificationsFor(page: Page, childThread: string): Promise<number> {
+  const notifications = await recordedNotifications(page);
+  return notifications.filter(
+    (n) => n.data?.approvalId === SCRIPTED_SUBAGENT_APPROVAL_ID && n.data?.threadId === childThread,
+  ).length;
+}
+
 /** Start a thread on the seeded Demo project with `text` and return its `{ pid, tid }`. */
 async function startThreadWith(page: Page, text: string): Promise<{ pid: string; tid: string }> {
   const project = page.locator(".proj", { hasText: "Demo" });
@@ -88,7 +103,7 @@ test.describe("sub-agent blocked on an approval", () => {
     // 3. The notification names the child and its parent instead of a bare id prefix.
     await expect.poll(async () => (await recordedNotifications(page)).length).toBeGreaterThan(0);
     const approval = (await recordedNotifications(page)).find(
-      (n) => n.data?.approvalId === SCRIPTED_SUBAGENT_APPROVAL_ID,
+      (n) => n.data?.approvalId === SCRIPTED_SUBAGENT_APPROVAL_ID && n.data?.threadId === child,
     );
     expect(approval).toBeTruthy();
     expect(approval!.title).toBe("Giskard: sub-agent approval needed");
@@ -225,6 +240,30 @@ test.describe("sub-agent blocked on an approval", () => {
     expect(result.cycle.descends).toBe(false);
   });
 
+  // Thread activity is broadcast live and never replayed, so a browser that was not running when a
+  // sub-agent blocked used to come back to a completely silent sidebar — the child has no row of
+  // its own, and the approval only reaches the transcript once that thread is opened. A reload is
+  // the cleanest way to be "a browser that missed it": the page starts with empty activity state.
+  test("a reload learns about an approval it was not connected for", async ({ page }) => {
+    const parent = await startThreadWith(page, SCRIPTED_SUBAGENT_APPROVAL_TRIGGER);
+    const parentRow = page.locator(`.thread[data-tid="${parent.tid}"]`);
+    await expect(parentRow).toHaveClass(/\bactivity-approval\b/);
+    const child = await childThreadId(page, parent.pid, parent.tid);
+    expect(child).toBeTruthy();
+
+    // The scripted child holds its turn open forever, so the approval is still outstanding here.
+    await page.reload();
+    await expect(page.locator("#app")).toHaveClass(/open/);
+
+    // Rebuilt from nothing, the sidebar still reports the blocked descendant.
+    const reloadedRow = page.locator(`.thread[data-tid="${parent.tid}"]`);
+    await expect(reloadedRow).toHaveClass(/\bactivity-approval\b/);
+    await expect(reloadedRow).toHaveClass(/\bactivity-subagent\b/);
+    await expect(reloadedRow.locator(".thread-status")).toHaveText("!");
+    // A reload is a new page session, so the alert fires again rather than being suppressed.
+    await expect.poll(() => approvalNotificationsFor(page, child!)).toBe(1);
+  });
+
   // An id that no refresh can resolve — trailing activity from a deleted thread, say — must not
   // re-fetch every project list on every event for the rest of the turn.
   test("spends a bounded number of refreshes on an unresolvable thread", async ({ page }) => {
@@ -274,10 +313,7 @@ test.describe("sub-agent blocked on an approval", () => {
     // Without this the events below would fire with a null thread id, be ignored, and leave the
     // final count at 1 — green without ever reaching the dedup gate.
     expect(child).toBeTruthy();
-    const seen = (await recordedNotifications(page)).filter(
-      (n) => n.data?.approvalId === SCRIPTED_SUBAGENT_APPROVAL_ID,
-    ).length;
-    expect(seen).toBe(1);
+    expect(await approvalNotificationsFor(page, child!)).toBe(1);
 
     // Fire two more events for the same approval in the same tick, so both reach the dedup gate
     // before either records. Neither may notify again.
@@ -300,9 +336,6 @@ test.describe("sub-agent blocked on an approval", () => {
     );
     await page.waitForTimeout(1000);
 
-    const after = (await recordedNotifications(page)).filter(
-      (n) => n.data?.approvalId === SCRIPTED_SUBAGENT_APPROVAL_ID,
-    ).length;
-    expect(after).toBe(1);
+    expect(await approvalNotificationsFor(page, child!)).toBe(1);
   });
 });
