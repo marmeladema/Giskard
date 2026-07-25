@@ -9,7 +9,7 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.56
+**Version:** 1.57
 
 > **Amendment — frontend approach (supersedes the Dioxus/WASM design below).**
 > This document was written targeting a **Dioxus fullstack / WebAssembly** frontend (`giskard-ui`),
@@ -22,6 +22,25 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.56 → 1.57), surfacing a blocked sub-agent:**
+- **SB1:** Approval requests already route correctly to a managed sub-agent thread, but that thread
+  is deliberately absent from the sidebar, so every browser affordance keyed to a thread id used to
+  no-op for it. The browser must therefore resolve thread identity from the cached per-project
+  thread summaries — which include managed sub-agents — rather than from the rendered sidebar row.
+- **SB2:** A managed sub-agent's `ThreadActivity` must be hoisted onto the nearest ancestor that
+  does have a sidebar row, and that row displays the most urgent state among itself and its hidden
+  descendants: `approval_requested` outranks `error`, which outranks an active turn. The row's
+  tooltip names the originating descendant, and a distinct marker separates a hoisted state from
+  the row's own. Ancestor walks are bounded so corrupted or cyclic ownership terminates.
+- **SB3:** An approval notification for a sub-agent must name the child and its owning thread and
+  say that a sub-agent is blocked. Because the server materializes a child thread on its own, the
+  browser may receive activity for a thread it has never listed; it must refresh its cached thread
+  lists before naming or navigating to such a thread rather than falling back to an id prefix or
+  refusing to navigate.
+- **SB4:** An approval also marks a turn active, so a sub-agent waiting on the user must be visually
+  distinct from one that is merely running, both on the header sub-agent monitor and on its card.
+  A card represents its whole owned subtree, since nested descendants are not listed separately.
 
 **Changelog (1.55 → 1.56), image and file attachments:**
 - **A1:** User input may carry transient attachments. Browser requests include attachment metadata
@@ -2855,6 +2874,19 @@ events through the same event handler used for live WebSocket events.
   when the page is hidden or the browser window is not focused. The browser must deduplicate the
   lightweight activity path against the later full approval event for the same
   `(thread_id, approval_id)`.
+- **Activity for threads with no sidebar row (SB1–SB4):** managed sub-agent threads are hidden from
+  the sidebar but still produce `ThreadActivity`, so the browser must not derive thread identity
+  from the rendered row. It resolves the project, display title, kind, and parent from the cached
+  per-project thread summaries, and hoists a hidden thread's activity onto the nearest ancestor
+  that does have a row. That row shows the most urgent state among itself and its hidden
+  descendants — `approval_requested` > `error` > active turn — names the originating descendant in
+  its tooltip, and marks the state as hoisted. Ancestor and descendant walks are bounded so
+  corrupted or cyclic ownership terminates instead of spinning. A sub-agent's approval notification
+  names the child and its owning thread; since the server materializes a child on its own, activity
+  for an unlisted thread must trigger a thread-list refresh before naming or navigating to it.
+  `ThreadActivity` is a live signal and is not replayed on connect, so a browser that is not
+  connected when an approval is raised learns about it from the thread's live-turn snapshot when it
+  next opens that thread.
 - **Backpressure:** per-connection bounded queue; if a client falls behind, coalesce deltas
   (keep latest) rather than unbounded buffering. Heartbeat ping/pong; auto-reconnect on the
   client with resubscribe + state resync. Browser disconnects caused by mobile/tab suspension are

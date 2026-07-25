@@ -109,6 +109,9 @@
   .thread.activity-running .thread-status { color:#d29922; }
   .thread.activity-approval .thread-status { color:#f0d98c; }
   .thread.activity-error .thread-status { color:#f85149; }
+  /* Hoisted from a hidden sub-agent: same urgency colour, outlined so the row still reads as
+     "something under here" rather than "this thread". */
+  .thread.activity-subagent .thread-status { text-shadow:0 0 6px currentcolor; opacity:.9; }
   .thread-title-input { flex:1; min-width:0; height:28px; padding:4px 7px; font-size:13px; }
   .thread-menu-btn { width:28px; height:28px; padding:0; border-color:transparent; background:transparent; color:var(--muted); }
   /* Hover affordances only where a real hovering pointer exists. On touch, :hover "sticks" to the
@@ -201,6 +204,9 @@
   .subagents-btn { display:flex; align-items:center; gap:6px; }
   .subagents-btn.state-idle { color:var(--muted); }
   .subagents-btn.state-running { color:#f0d98c; border-color:#d29922; background:rgba(210,153,34,.08); }
+  /* A sub-agent blocked on an approval is waiting on the user, not on the model — it gets the
+     accent treatment so it separates from the merely-running state at a glance. */
+  .subagents-btn.state-approval { color:#ffd97d; border-color:#e3b341; background:rgba(227,179,65,.18); }
   .subagents-popover {
     position:absolute; left:0; top:34px; z-index:35; width:min(460px, calc(100vw - 24px));
     max-height:70vh; overflow:auto; padding:10px; border:1px solid var(--border);
@@ -219,6 +225,9 @@
   .subagent-card-name { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .subagent-card-state { font-size:11px; color:var(--muted); }
   .subagent-card-state.running { color:#f0d98c; }
+  .subagent-card-state.approval { color:#ffd97d; font-weight:600; }
+  .subagent-card.needs-approval { border-color:#e3b341; background:rgba(227,179,65,.12); }
+  .subagents-summary.needs-approval { color:#ffd97d; }
   .subagent-card-meta { color:var(--muted); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .usage-wrap { position:relative; margin-left:auto; }
   .usage-btn { display:flex; align-items:center; gap:6px; }

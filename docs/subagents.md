@@ -80,6 +80,37 @@ an absent or exited task. Linked evidence is processed in parent-event order, so
 observation cannot overtake an earlier active observation and leave a new idle monitor behind.
 Queued native child events take priority over terminal fallback output.
 
+## Approvals raised inside a child
+
+A child's approval routes like any other: the harness maps it to the child's Giskard thread, the
+passive monitor registers it, and answering it from the child transcript reaches the right harness.
+The child is resumable, so its pending approval also survives a browser reload through the live-turn
+snapshot.
+
+What needs care is telling the user, because a managed child has no sidebar row. Three surfaces
+report it:
+
+- **The nearest visible ancestor row.** A hidden child's activity is hoisted to the closest ancestor
+  that is actually rendered. That row shows the most urgent state among itself and its hidden
+  descendants — an approval outranks an error, which outranks an active turn — so a blocked child is
+  never masked by a busy parent. The row's tooltip names the child, and a marker distinguishes a
+  hoisted state from the row's own. Walks up and down the ownership chain are bounded, so corrupted
+  or cyclic metadata terminates rather than spinning.
+- **The header Sub-agents monitor.** An approval also marks the turn active, so "waiting for the
+  user" is tracked separately from "running": the button takes a distinct state and the child's card
+  reads `Needs approval`. A card covers its whole owned subtree, because nested grandchildren are
+  not listed separately.
+- **A browser notification**, naming the child and its owning thread rather than an id prefix, and
+  saying a sub-agent is blocked. Clicking it opens the child with the approval focused.
+
+Because the server can materialize a child on its own, the browser may see activity for a thread it
+has never listed. It refreshes its cached thread lists before naming or navigating to such a thread,
+so the first approval from a brand-new child is still attributable.
+
+Thread activity is a live signal and is not replayed on connect. A browser that is not running when
+a child raises an approval finds it in the thread's live-turn snapshot the next time it opens that
+thread.
+
 ## Prompts and transcript persistence
 
 When the delegated prompt is available, Giskard persists it as `Turn.user_input` and shows one
