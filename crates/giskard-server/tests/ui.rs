@@ -667,6 +667,14 @@ async fn index_page_is_served_and_public() {
          tracked as its own flag because an approval also marks the turn active"
     );
     assert!(
+        body.contains("answeredServerRequests:new Set()")
+            && body.contains("for (const answered of (snap.answered_server_requests || []))")
+            && body.contains("if (state.answeredServerRequests.has(id)) resolveServerRequest(id);"),
+        "an answered server request is seeded from the reconnect snapshot before the accumulated \
+         events replay, so the replayed ServerRequestReceived renders resolved instead of \
+         re-prompting — a harness resolved event may be late or never arrive"
+    );
+    assert!(
         body.contains("msg.type === \"thread_activity_bootstrap\"")
             && body.contains("function handleThreadActivityBootstrap(msg)")
             && body.contains("{ source:\"connect_bootstrap\" }")

@@ -24,7 +24,7 @@ pub use giskard_core::approval::{
 pub use giskard_core::diff::{DiffHunk, DiffLine};
 pub use giskard_core::error::HarnessError;
 pub use giskard_core::event::AgentEvent;
-pub use giskard_core::ids::{ApprovalId, ItemId};
+pub use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId};
 pub use giskard_core::item::{
     CommandExecutionStart, FileChangeEntry, FileChangeKind, ItemDelta, ItemKind, ItemStart,
     SubagentAction, SubagentLink, SubagentStatus,
@@ -161,6 +161,13 @@ pub struct LiveTurnSnapshot {
     /// cards in their resolved state instead of re-prompting.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub answered_approvals: Vec<AnsweredApproval>,
+    /// Server requests the user already answered during this in-flight turn.
+    ///
+    /// A harness emits its own resolved event for these, but on its own schedule and not
+    /// guaranteed at all. Until that lands the request looks outstanding in the replayed events, so
+    /// a reload would render it actionable again and re-answering routes a stale id to the harness.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answered_server_requests: Vec<ServerRequestId>,
 }
 
 /// An approval the user resolved during an in-flight turn (part of [`LiveTurnSnapshot`]).
@@ -988,6 +995,7 @@ mod tests {
                 received_at: chrono::Utc::now(),
             }],
             answered_approvals: vec![],
+            answered_server_requests: vec![],
         };
         let json = serde_json::to_value(&snapshot).unwrap();
         assert_eq!(json["thread_id"], tid.to_string());
@@ -1011,6 +1019,7 @@ mod tests {
                 request_id: ApprovalId("ap_1".into()),
                 decision: ApprovalDecision::Accept,
             }],
+            answered_server_requests: vec![ServerRequestId("req_1".into())],
         };
         let json = serde_json::to_value(&snapshot).unwrap();
         assert_eq!(json["answered_approvals"][0]["request_id"], "ap_1");

@@ -742,12 +742,13 @@ impl HarnessRegistry {
         Ok(thread_id)
     }
 
-    /// Route a non-approval server-request response to the harness that raised it.
+    /// Route a non-approval server-request response to the harness that raised it, returning the
+    /// thread it belonged to so the caller can record the answer against that thread's live turn.
     pub async fn respond_server_request(
         &self,
         request_id: ServerRequestId,
         response: ServerRequestResponse,
-    ) -> Result<(), HarnessError> {
+    ) -> Result<ThreadId, HarnessError> {
         let thread_id = self
             .shared
             .server_requests
@@ -777,7 +778,7 @@ impl HarnessRegistry {
             .respond_server_request(request_id.clone(), response)
             .await?;
         self.shared.server_requests.lock().await.remove(&request_id);
-        Ok(())
+        Ok(thread_id)
     }
 
     pub async fn interrupt(&self, thread_id: ThreadId) -> Result<(), HarnessError> {

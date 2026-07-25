@@ -70,6 +70,12 @@ const SCRIPTED_SUBAGENT_APPROVAL_DELAY: std::time::Duration =
 /// answered card is not re-surfaced as actionable. The approval id is fixed so tests can target it.
 const SCRIPTED_APPROVAL_TRIGGER: &str = "Trigger a scripted approval request.";
 const SCRIPTED_APPROVAL_ID: &str = "scripted-approval-1";
+/// Prompt that raises a `requestUserInput` server request and then keeps the turn in-flight. This
+/// harness deliberately never emits `ServerRequestResolved` when the answer is routed — modelling a
+/// harness whose resolved event is late or absent, which is the window a reload has to survive.
+const SCRIPTED_SERVER_REQUEST_TRIGGER: &str = "Trigger a scripted user input request.";
+const SCRIPTED_SERVER_REQUEST_ID: &str = "scripted-server-request-1";
+const SCRIPTED_SERVER_REQUEST_QUESTION: &str = "Which branch should I use?";
 /// How long a scripted turn waits for the server's event forwarder to subscribe before giving up.
 const RECEIVER_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const RECEIVER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
@@ -424,10 +430,45 @@ impl AgentHarness for ScriptedHarness {
                 .insert(ApprovalId(SCRIPTED_APPROVAL_ID.into()), (thread_id, turn));
         }
 
+        let raise_server_request = input_text == Some(SCRIPTED_SERVER_REQUEST_TRIGGER);
+
         // Stream the canned reply the way a real harness would: start, incremental deltas, then a
         // completed item and a turn-completed with token usage. Emitted off-task with yields so the
         // WebSocket layer observes distinct frames (the transcript renders progressively).
         tokio::spawn(async move {
+            if raise_server_request {
+                // Raise a user-input request and leave the turn in-flight. Answering it routes a
+                // response to `respond_server_request`, which deliberately stays silent: a browser
+                // reload must still render the card resolved, from the server's recorded answer
+                // rather than from a harness resolved event that never comes.
+                let _ = sender.send(AgentEvent::TurnStarted {
+                    thread: thread_id,
+                    turn,
+                });
+                tokio::task::yield_now().await;
+                let _ = sender.send(AgentEvent::ServerRequestReceived {
+                    thread: thread_id,
+                    turn: Some(turn),
+                    request: giskard_core::server_request::ServerRequest {
+                        id: giskard_core::ids::ServerRequestId(SCRIPTED_SERVER_REQUEST_ID.into()),
+                        method: "item/tool/requestUserInput".into(),
+                        params: serde_json::json!({
+                            "questions": [{
+                                "id": "branch",
+                                "header": "Branch",
+                                "question": SCRIPTED_SERVER_REQUEST_QUESTION,
+                                "options": [
+                                    { "label": "main", "description": "The default branch" },
+                                    { "label": "develop", "description": "The integration branch" }
+                                ]
+                            }]
+                        }),
+                        received_at: chrono::Utc::now(),
+                    },
+                });
+                return;
+            }
+
             if raise_approval {
                 // Raise an approval and deliberately leave the turn in-flight (no TurnCompleted), so
                 // the live buffer keeps the answered state for reconnect assertions.

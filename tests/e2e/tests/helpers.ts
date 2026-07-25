@@ -21,6 +21,15 @@ export const SCRIPTED_SUBAGENT_REPLY = "Child replay output";
 export const SCRIPTED_APPROVAL_TRIGGER = "Trigger a scripted approval request.";
 
 /**
+ * Prompt that raises a `requestUserInput` server request and holds the turn open. The scripted
+ * harness never emits a resolved event for it, modelling a harness whose resolved event is late or
+ * absent. Kept in sync with `SCRIPTED_SERVER_REQUEST_*` in
+ * `crates/giskard-server/src/bin/giskard-server-replay.rs`.
+ */
+export const SCRIPTED_SERVER_REQUEST_TRIGGER = "Trigger a scripted user input request.";
+export const SCRIPTED_SERVER_REQUEST_QUESTION = "Which branch should I use?";
+
+/**
  * Prompt that spawns a linked child which raises an approval and then holds its turn open, while the
  * parent turn completes normally. Kept in sync with `SCRIPTED_SUBAGENT_APPROVAL_TRIGGER` and friends
  * in `crates/giskard-server/src/bin/giskard-server-replay.rs`.
