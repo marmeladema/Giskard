@@ -55,7 +55,7 @@ let state = {
   threadReadOnly:false, readOnlyProvider:null, readOnlyMessage:null,
   pickerTypeahead:"", pickerTypeaheadTimer:null, pickerSelectedRow:null,
   currentPlan:null, planExpanded:localStorage.getItem("giskard.planExpanded")==="1",
-  threadActivity:new Map(), pendingApprovalFocus:null, notifiedApprovals:new Map(), bootstrapNotifiedApprovals:new Set(), approvalNotifications:new Map(), browserDiagnostics:[],
+  threadActivity:new Map(), pendingWaitingFocus:null, notifiedRequests:new Map(), bootstrapNotifiedRequests:new Set(), waitingNotifications:new Map(), browserDiagnostics:[],
   subagentImports:new Map(), projectThreads:new Map(), threadIndex:new Map(),
   lastNotificationPromptNoticeAt:0, swRegistration:null, pendingAttachments:[],
   attachmentGeneration:0, pendingAttachmentOperations:new Map(),
@@ -280,15 +280,16 @@ async function notificationRegistration() {
 }
 
 // A notification was clicked — delivered by the service worker as a postMessage, or by the desktop
-// Notification's onclick. Approval notifications jump to the pending approval.
+// Notification's onclick. The click jumps to whatever the thread is waiting on — an approval card
+// or a server-request card.
 function handleNotificationClick(data) {
-  if (data && data.threadId && data.approvalId) {
-    recordNotificationDiagnostic("approval_notification_clicked", {
+  if (data && data.threadId && data.requestId) {
+    recordNotificationDiagnostic("waiting_notify_clicked", {
       tid: data.threadId,
-      approval_id: data.approvalId
+      request_id: data.requestId
     });
-    closeApprovalNotification(data.threadId, data.approvalId);
-    focusApprovalTarget(data.threadId, data.approvalId);
+    closeWaitingNotification(data.threadId, data.requestId);
+    focusWaitingRequest(data.threadId, data.requestId);
   }
 }
 
@@ -323,7 +324,7 @@ function setNotificationButtonState(btn, label, disabled) {
     btn.textContent = "!";
     btn.title = label;
     btn.setAttribute("aria-label", label);
-    btn.hidden = label === "Approval notifications enabled" || label === "Notifications unavailable";
+    btn.hidden = label === "Notifications enabled" || label === "Notifications unavailable";
   } else {
     btn.textContent = label;
     btn.title = label;
@@ -334,13 +335,13 @@ function setNotificationButtonState(btn, label, disabled) {
 function refreshNotificationButton() {
   const buttons = notificationPermissionButtons();
   if (!buttons.length || !("Notification" in window)) return;
-  let label = "Enable approval notifications";
+  let label = "Enable notifications";
   let disabled = false;
   if (!window.isSecureContext) {
     label = "Notifications require HTTPS or localhost";
     disabled = true;
   } else if (Notification.permission === "granted") {
-    label = "Approval notifications enabled";
+    label = "Notifications enabled";
     disabled = true;
   } else if (Notification.permission === "denied") {
     label = "Notifications blocked by browser";
@@ -367,11 +368,11 @@ function browserDiagnosticsSnapshot() {
     focused: document.hasFocus ? document.hasFocus() : null,
     thread_id: state.threadId || null,
     ws_status: state.wsStatus,
-    notified_count: state.notifiedApprovals.size,
+    notified_count: state.notifiedRequests.size,
     dedup_window_ms: NOTIFICATION_DEDUP_MS,
     button_count: notificationPermissionButtons().length,
-    last_approval_decision: lastNotificationDiagnostic(isApprovalNotificationDecision),
-    recent_approval_decisions: recentNotificationDiagnostics(isApprovalNotificationDecision, 6),
+    last_waiting_notification: lastNotificationDiagnostic(isWaitingNotificationDiagnostic),
+    recent_waiting_notifications: recentNotificationDiagnostics(isWaitingNotificationDiagnostic, 6),
     diagnostics
   };
 }
@@ -380,15 +381,11 @@ function notificationDebugSnapshot() {
   return browserDiagnosticsSnapshot();
 }
 
-function isApprovalNotificationDecision(entry) {
+function isWaitingNotificationDiagnostic(entry) {
   const reason = entry && entry.reason ? entry.reason : "";
   const detail = entry && entry.detail ? entry.detail : {};
-  return reason === "approval_notify_received" ||
-    reason.startsWith("approval_notify_suppressed_") ||
-    reason === "approval_notify_constructor_failed" ||
-    reason === "approval_notify_created" ||
-    (reason === "browser_notification_created" && detail.kind === "approval") ||
-    (reason.startsWith("browser_notification_") && detail.kind === "approval");
+  return reason.startsWith("waiting_notify_") ||
+    (reason.startsWith("browser_notification_") && detail.kind === "waiting_request");
 }
 
 function lastNotificationDiagnostic(predicate) {
@@ -447,8 +444,8 @@ function renderBrowserDiagnosticsPanel(snapshot, reveal) {
   if (!log) return;
   snapshot = snapshot || browserDiagnosticsSnapshot();
   const last = snapshot.diagnostics[snapshot.diagnostics.length - 1];
-  const lastApproval = snapshot.last_approval_decision;
-  const approvalDetail = lastApproval && lastApproval.detail ? lastApproval.detail : {};
+  const lastWaiting = snapshot.last_waiting_notification;
+  const waitingDetail = lastWaiting && lastWaiting.detail ? lastWaiting.detail : {};
   const lines = [
     `version: ${snapshot.version}`,
     `permission: ${snapshot.permission}`,
@@ -458,18 +455,18 @@ function renderBrowserDiagnosticsPanel(snapshot, reveal) {
     `thread: ${snapshot.thread_id || "none"}`,
     `ws: ${snapshot.ws_status}`,
     `dedupMs: ${snapshot.dedup_window_ms}`,
-    `lastApproval: ${lastApproval ? lastApproval.reason : "none"}`,
-    `approvalSource: ${approvalDetail.source || "none"}`,
-    `approvalId: ${approvalDetail.approval_id || "none"}`,
+    `lastRequest: ${lastWaiting ? lastWaiting.reason : "none"}`,
+    `requestSource: ${waitingDetail.source || "none"}`,
+    `requestId: ${waitingDetail.request_id || "none"}`,
     `last: ${last ? last.reason : "none"}`
   ];
-  const recent = snapshot.recent_approval_decisions || [];
+  const recent = snapshot.recent_waiting_notifications || [];
   if (recent.length) {
-    lines.push("recentApprovals:");
+    lines.push("recentRequests:");
     for (const entry of recent) {
       const detail = entry.detail || {};
       const suffix = detail.age_ms !== undefined ? ` age=${detail.age_ms}ms` : "";
-      lines.push(`- ${entry.reason} source=${detail.source || "none"} id=${detail.approval_id || "none"} visible=${entry.visibility} focused=${entry.focused}${suffix}`);
+      lines.push(`- ${entry.reason} source=${detail.source || "none"} id=${detail.request_id || "none"} visible=${entry.visibility} focused=${entry.focused}${suffix}`);
     }
   }
   const latest = snapshot.diagnostics.slice(-20);
@@ -479,7 +476,7 @@ function renderBrowserDiagnosticsPanel(snapshot, reveal) {
       const detail = entry.detail || {};
       const fields = [];
       if (detail.source) fields.push(`source=${detail.source}`);
-      if (detail.approval_id !== undefined && detail.approval_id !== null) fields.push(`approval=${detail.approval_id}`);
+      if (detail.request_id !== undefined && detail.request_id !== null) fields.push(`request=${detail.request_id}`);
       if (detail.status) fields.push(`status=${detail.status}`);
       if (detail.error) fields.push(`error=${detail.error}`);
       lines.push(`- ${entry.at} ${entry.category}:${entry.reason} visible=${entry.visibility} focused=${entry.focused}${fields.length ? " " + fields.join(" ") : ""}`);
@@ -1047,12 +1044,27 @@ function clearThreadActivity(tid) {
   renderSubagentsButton();
 }
 
+// A thread is *waiting on the user* when it cannot proceed until the user answers something. Codex
+// splits that into approvals and server requests — and already blurs the line itself, since MCP tool
+// approvals arrive as `requestUserInput` and get promoted to approval cards — but to the person
+// looking at the sidebar they are one state: you are being asked for something.
+function activityWaitsOnUser(activity) {
+  if (!activity) return false;
+  return activity.kind === "approval_requested" || activity.kind === "server_request_received";
+}
+
+// The id of whatever the thread is waiting for, whichever kind it is.
+function waitingRequestId(activity) {
+  if (!activity) return null;
+  return activity.approval_id || activity.server_request_id || null;
+}
+
 // Urgency order used when one row has to represent both its own state and its hidden sub-agents'.
-// A blocked child must never be masked by a merely-running parent, so approval outranks error
-// outranks running.
+// A blocked child must never be masked by a merely-running parent, so waiting-on-the-user outranks
+// error outranks running.
 function threadActivityRank(activity) {
   if (!activity) return -1;
-  if (activity.kind === "approval_requested") return 3;
+  if (activityWaitsOnUser(activity)) return 3;
   if (activity.kind === "error") return 2;
   return activity.active_turn ? 1 : 0;
 }
@@ -1106,16 +1118,16 @@ function renderThreadActivityIndicator(tid, hosts) {
   const { activity, origin } = effectiveThreadActivity(tid, hosts);
   const visible = !!activity && (activity.unread || activity.active_turn || activity.approval_id || activity.kind === "turn_completed" || activity.kind === "error");
   el.classList.toggle("has-activity", visible);
-  el.classList.toggle("activity-approval", visible && activity && activity.kind === "approval_requested");
+  el.classList.toggle("activity-waiting", visible && activityWaitsOnUser(activity));
   el.classList.toggle("activity-error", visible && activity && activity.kind === "error");
-  el.classList.toggle("activity-running", visible && activity && activity.active_turn && activity.kind !== "approval_requested");
+  el.classList.toggle("activity-running", visible && activity && activity.active_turn && !activityWaitsOnUser(activity));
   el.classList.toggle("activity-subagent", visible && !!origin);
   if (!visible) {
     status.textContent = "";
     status.title = "";
     return;
   }
-  if (activity.kind === "approval_requested") status.textContent = "!";
+  if (activityWaitsOnUser(activity)) status.textContent = "!";
   else if (activity.kind === "error") status.textContent = "x";
   else if (activity.active_turn) status.textContent = "o";
   else status.textContent = "*";
@@ -1728,10 +1740,10 @@ async function openThread(pid, tid, title, opts) {
   opts = opts || {};
   saveComposerDraft();
   if (!opts.firstTurnStarting) state.firstTurnStartingThreadId = null;
-  if (opts.focusApprovalId) {
-    state.pendingApprovalFocus = {
+  if (opts.focusRequestId) {
+    state.pendingWaitingFocus = {
       threadId:String(tid),
-      approvalId:String(opts.focusApprovalId),
+      requestId:String(opts.focusRequestId),
       attempts:0
     };
   }
@@ -1801,7 +1813,7 @@ async function openThread(pid, tid, title, opts) {
     }
   }
   connectWs();
-  schedulePendingApprovalFocus();
+  schedulePendingWaitingFocus();
 }
 
 function clearWsReconnectTimer() {
@@ -2205,20 +2217,20 @@ function handleThreadActivity(msg) {
   if (!knownThreadMeta(tid)) noteUnresolvedThread(tid);
   renderThreadActivityIndicator(tid);
   renderSubagentsButton();
-  if (activity.kind === "approval_requested") maybeNotifyApproval(tid, activity);
+  if (activityWaitsOnUser(activity)) maybeNotifyWaitingRequest(tid, activity);
+}
+
+// Undo a notification claim when the notification did not actually reach the user. Both records
+// must be released together: leaving the session-scoped one set would silence every later replay of
+// a request the user was never shown.
+function releaseWaitingNotificationClaim(notificationKey) {
+  state.notifiedRequests.delete(notificationKey);
+  state.bootstrapNotifiedRequests.delete(notificationKey);
 }
 
 // Cross-thread activity the server replayed because we were not connected when it happened. Paints
 // the badge exactly like a live event; notification is gated separately, because a reconnect is not
-// news — see `maybeNotifyApproval`.
-// Undo a notification claim when the notification did not actually reach the user. Both records
-// must be released together: leaving the session-scoped one set would silence every later replay of
-// an approval the user was never shown.
-function releaseApprovalNotificationClaim(notificationKey) {
-  state.notifiedApprovals.delete(notificationKey);
-  state.bootstrapNotifiedApprovals.delete(notificationKey);
-}
-
+// news — see `maybeNotifyWaitingRequest`.
 function handleThreadActivityBootstrap(msg) {
   const activities = (msg && Array.isArray(msg.activities)) ? msg.activities : [];
   if (!activities.length) return;
@@ -2228,62 +2240,62 @@ function handleThreadActivityBootstrap(msg) {
   }
 }
 
-async function maybeNotifyApproval(tid, activity) {
-  const notificationKey = approvalNotificationKey(tid, activity && activity.approval_id);
-  if (!activity || activity.kind !== "approval_requested" || !notificationKey) {
-    recordNotificationDiagnostic("approval_notify_skipped_invalid_call", { tid, activity });
+async function maybeNotifyWaitingRequest(tid, activity) {
+  const notificationKey = waitingNotificationKey(tid, waitingRequestId(activity));
+  if (!activityWaitsOnUser(activity) || !notificationKey) {
+    recordNotificationDiagnostic("waiting_notify_skipped_invalid_call", { tid, activity });
     return;
   }
-  recordNotificationDiagnostic("approval_notify_received", {
+  recordNotificationDiagnostic("waiting_notify_received", {
     tid,
-    approval_id: activity.approval_id,
+    request_id: waitingRequestId(activity),
     source: activity.source || "unknown",
     summary: activity.summary || ""
   });
   const focused = document.hasFocus ? document.hasFocus() : true;
   if (document.visibilityState === "visible" && focused && String(tid) === String(state.threadId)) {
-    recordNotificationDiagnostic("approval_notify_suppressed_visible_current_thread", {
+    recordNotificationDiagnostic("waiting_notify_suppressed_visible_current_thread", {
       tid,
-      approval_id: activity.approval_id,
+      request_id: waitingRequestId(activity),
       source: activity.source || "unknown"
     });
     return;
   }
   if (!("Notification" in window)) {
-    recordNotificationDiagnostic("approval_notify_suppressed_unsupported", {
+    recordNotificationDiagnostic("waiting_notify_suppressed_unsupported", {
       tid,
-      approval_id: activity.approval_id,
+      request_id: waitingRequestId(activity),
       source: activity.source || "unknown"
     });
     return;
   }
   if (Notification.permission !== "granted") {
-    recordNotificationDiagnostic("approval_notify_suppressed_permission", {
+    recordNotificationDiagnostic("waiting_notify_suppressed_permission", {
       tid,
-      approval_id: activity.approval_id,
+      request_id: waitingRequestId(activity),
       source: activity.source || "unknown"
     });
     maybeNoticeNotificationPermission();
     return;
   }
-  // A replayed approval is not news. `notifiedApprovals` cannot answer "have we ever alerted for
+  // A replayed request is not news. `notifiedRequests` cannot answer "have we ever alerted for
   // this?" because it is pruned on a 15s window, so a laptop resuming repeatedly would re-alert for
   // the same blocked approval. Track bootstrap alerts separately and permanently for this page
   // session: a reconnect stays silent, while a genuine reload starts a new session and re-alerts.
-  if (activity.source === "connect_bootstrap" && state.bootstrapNotifiedApprovals.has(notificationKey)) {
-    recordNotificationDiagnostic("approval_notify_suppressed_replay", {
+  if (activity.source === "connect_bootstrap" && state.bootstrapNotifiedRequests.has(notificationKey)) {
+    recordNotificationDiagnostic("waiting_notify_suppressed_replay", {
       tid,
-      approval_id: activity.approval_id
+      request_id: waitingRequestId(activity)
     });
     return;
   }
   const now = Date.now();
   pruneNotificationDedup(now);
-  const notifiedAt = state.notifiedApprovals.get(notificationKey);
+  const notifiedAt = state.notifiedRequests.get(notificationKey);
   if (notifiedAt && now - notifiedAt < NOTIFICATION_DEDUP_MS) {
-    recordNotificationDiagnostic("approval_notify_suppressed_duplicate", {
+    recordNotificationDiagnostic("waiting_notify_suppressed_duplicate", {
       tid,
-      approval_id: activity.approval_id,
+      request_id: waitingRequestId(activity),
       source: activity.source || "unknown",
       age_ms: now - notifiedAt
     });
@@ -2293,38 +2305,42 @@ async function maybeNotifyApproval(tid, activity) {
   // activity broadcast and the live-turn snapshot path), and with the refresh below between the
   // check above and the record after the notification, both would clear the gate and notify.
   // Every path that returns without notifying releases it again.
-  state.notifiedApprovals.set(notificationKey, now);
-  state.bootstrapNotifiedApprovals.add(notificationKey);
+  state.notifiedRequests.set(notificationKey, now);
+  state.bootstrapNotifiedRequests.add(notificationKey);
   // A sub-agent's very first approval routinely arrives before the browser has listed the thread
   // the server just materialized. Resolve it now rather than shipping an unattributable id prefix —
   // this notification is the only signal the user gets for a thread with no sidebar row.
   if (!threadMetaForId(tid)) await refreshKnownThreadLists();
   const meta = threadMetaForId(tid);
-  const title = approvalNotificationLabel(meta, tid);
+  const title = waitingNotificationLabel(meta, tid);
   const isSubagent = !!meta && meta.kind === "subagent";
-  // Stable per-approval tag: it dedups at the OS level and lets us close the notification by tag on
-  // the service-worker path (where we never hold a Notification object) when the approval resolves.
-  const notificationTag = approvalNotificationTag(tid, activity.approval_id);
+  // Stable per-request tag: it dedups at the OS level and lets us close the notification by tag on
+  // the service-worker path (where we never hold a Notification object) when the request resolves.
+  const notificationTag = waitingNotificationTag(tid, waitingRequestId(activity));
+  // The two kinds share the *state*, not the wording: telling someone an approval is needed when
+  // the agent asked them a question sends them looking for a decision that does not exist.
+  const needed = activity.kind === "approval_requested" ? "approval" : "input";
+  const headline = isSubagent ? `Giskard: sub-agent ${needed} needed` : `Giskard: ${needed} needed`;
   let result;
   try {
-    result = await showAppNotification(isSubagent ? "Giskard: sub-agent approval needed" : "Giskard: approval needed", {
+    result = await showAppNotification(headline, {
       body: activity.summary ? `${title}: ${activity.summary}` : title,
       tag: notificationTag,
       renotify: true,
       requireInteraction: true,
-      data: { threadId:tid, approvalId:activity.approval_id }
+      data: { threadId:tid, requestId:waitingRequestId(activity) }
     }, {
-      kind: "approval",
+      kind: "waiting_request",
       tid,
-      approval_id: activity.approval_id,
+      request_id: waitingRequestId(activity),
       source: activity.source || "unknown",
       tag: notificationTag
     });
   } catch (e) {
-    releaseApprovalNotificationClaim(notificationKey);
-    recordNotificationDiagnostic("approval_notify_constructor_failed", {
+    releaseWaitingNotificationClaim(notificationKey);
+    recordNotificationDiagnostic("waiting_notify_constructor_failed", {
       tid,
-      approval_id: activity.approval_id,
+      request_id: waitingRequestId(activity),
       source: activity.source || "unknown",
       error: e && e.message ? e.message : String(e)
     });
@@ -2332,18 +2348,18 @@ async function maybeNotifyApproval(tid, activity) {
     return;
   }
   if (!result) {
-    releaseApprovalNotificationClaim(notificationKey);
+    releaseWaitingNotificationClaim(notificationKey);
     return;
   }
   // Desktop (constructor) notifications are tracked so we can close them on resolution and dispatch
   // their click; service-worker notifications are closed by tag and click via the worker postMessage.
   if (result.via === "constructor" && result.notification) {
-    trackApprovalNotification(notificationKey, result.notification);
-    result.notification.onclick = () => handleNotificationClick({ threadId: tid, approvalId: activity.approval_id });
+    trackWaitingNotification(notificationKey, result.notification);
+    result.notification.onclick = () => handleNotificationClick({ threadId: tid, requestId: waitingRequestId(activity) });
   }
-  recordNotificationDiagnostic("approval_notify_created", {
+  recordNotificationDiagnostic("waiting_notify_created", {
     tid,
-    approval_id: activity.approval_id,
+    request_id: waitingRequestId(activity),
     source: activity.source || "unknown",
     title,
     tag: notificationTag,
@@ -2369,9 +2385,9 @@ async function showAppNotification(title, options, diagnosticDetail) {
   notification.onshow = () => recordNotificationDiagnostic("browser_notification_show", diagnosticDetail);
   notification.onerror = () => recordNotificationDiagnostic("browser_notification_error", diagnosticDetail);
   notification.onclose = () => {
-    if (diagnosticDetail.kind === "approval") {
-      untrackApprovalNotification(
-        approvalNotificationKey(diagnosticDetail.tid, diagnosticDetail.approval_id),
+    if (diagnosticDetail.kind === "waiting_request") {
+      untrackWaitingNotification(
+        waitingNotificationKey(diagnosticDetail.tid, diagnosticDetail.request_id),
         notification
       );
     }
@@ -2382,67 +2398,67 @@ async function showAppNotification(title, options, diagnosticDetail) {
 
 function pruneNotificationDedup(now) {
   now = now || Date.now();
-  for (const [key, notifiedAt] of state.notifiedApprovals) {
-    if (now - notifiedAt >= NOTIFICATION_DEDUP_MS) state.notifiedApprovals.delete(key);
+  for (const [key, notifiedAt] of state.notifiedRequests) {
+    if (now - notifiedAt >= NOTIFICATION_DEDUP_MS) state.notifiedRequests.delete(key);
   }
 }
 
-function approvalNotificationKey(tid, approvalId) {
+function waitingNotificationKey(tid, requestId) {
   const threadKey = tid === undefined || tid === null ? "" : String(tid);
-  const approvalKey = approvalId === undefined || approvalId === null ? "" : String(approvalId);
-  if (!threadKey || !approvalKey) return "";
-  return `${threadKey}:${approvalKey}`;
+  const requestKey = requestId === undefined || requestId === null ? "" : String(requestId);
+  if (!threadKey || !requestKey) return "";
+  return `${threadKey}:${requestKey}`;
 }
 
 // Stable OS notification tag for an approval — used to show, dedup, and (on the service-worker
 // path) close the notification without holding a Notification object.
-function approvalNotificationTag(tid, approvalId) {
-  return `giskard-approval-${tid}-${approvalId}`;
+function waitingNotificationTag(tid, requestId) {
+  return `giskard-waiting-${tid}-${requestId}`;
 }
 
-function trackApprovalNotification(key, notification) {
+function trackWaitingNotification(key, notification) {
   if (!key || !notification) return;
-  let notifications = state.approvalNotifications.get(key);
+  let notifications = state.waitingNotifications.get(key);
   if (!notifications) {
     notifications = new Set();
-    state.approvalNotifications.set(key, notifications);
+    state.waitingNotifications.set(key, notifications);
   }
   notifications.add(notification);
 }
 
-function untrackApprovalNotification(key, notification) {
-  const notifications = state.approvalNotifications.get(key);
+function untrackWaitingNotification(key, notification) {
+  const notifications = state.waitingNotifications.get(key);
   if (!notifications) return;
   notifications.delete(notification);
-  if (notifications.size === 0) state.approvalNotifications.delete(key);
+  if (notifications.size === 0) state.waitingNotifications.delete(key);
 }
 
-function closeApprovalNotification(tid, approvalId) {
-  const key = approvalNotificationKey(tid, approvalId);
+function closeWaitingNotification(tid, requestId) {
+  const key = waitingNotificationKey(tid, requestId);
   if (!key) return;
   // Service-worker notifications aren't held as objects: fetch them back by tag and close them.
   const reg = state.swRegistration;
   if (reg && typeof reg.getNotifications === "function") {
-    const tag = approvalNotificationTag(tid, approvalId);
+    const tag = waitingNotificationTag(tid, requestId);
     reg.getNotifications({ tag })
       .then((ns) => ns.forEach((n) => { try { n.close(); } catch {} }))
       .catch(() => {});
   }
   // Desktop (constructor) notifications are tracked objects.
-  const notifications = state.approvalNotifications.get(key);
+  const notifications = state.waitingNotifications.get(key);
   if (!notifications) return;
-  state.approvalNotifications.delete(key);
+  state.waitingNotifications.delete(key);
   for (const notification of notifications) {
     try {
       notification.close();
-      recordNotificationDiagnostic("approval_notification_closed", {
+      recordNotificationDiagnostic("waiting_notify_closed", {
         tid,
-        approval_id: approvalId
+        request_id: requestId
       });
     } catch (e) {
-      recordNotificationDiagnostic("approval_notification_close_failed", {
+      recordNotificationDiagnostic("waiting_notify_close_failed", {
         tid,
-        approval_id: approvalId,
+        request_id: requestId,
         error: e && e.message ? e.message : String(e)
       });
     }
@@ -2454,13 +2470,14 @@ function maybeNoticeNotificationPermission() {
   const now = Date.now();
   if (now - state.lastNotificationPromptNoticeAt < NOTIFICATION_PROMPT_NOTICE_INTERVAL_MS) return;
   state.lastNotificationPromptNoticeAt = now;
-  notice("Enable approval notifications from the sidebar alert button.", "warning");
+  notice("Enable notifications from the sidebar alert button.", "warning");
 }
 
-// Name an approval's thread for a notification. A sub-agent's own title is often generic ("Sub-agent
-// #2"), and it has no sidebar row to fall back on, so qualify it with the owning thread — an
-// unattributable "3f2a91bc: Approval requested" tells the user nothing about what is blocked.
-function approvalNotificationLabel(meta, tid) {
+// Name the thread a notification is about, whichever kind it is waiting on. A sub-agent's own title
+// is often generic ("Sub-agent #2"), and it has no sidebar row to fall back on, so qualify it with
+// the owning thread — an unattributable "3f2a91bc: Approval requested" says nothing about what is
+// blocked.
+function waitingNotificationLabel(meta, tid) {
   const fallback = String(tid).slice(0,8);
   if (!meta) return fallback;
   const title = meta.title || fallback;
@@ -2469,7 +2486,7 @@ function approvalNotificationLabel(meta, tid) {
   return parent && parent.title ? `${title} (in ${parent.title})` : title;
 }
 
-async function focusApprovalTarget(tid, approvalId) {
+async function focusWaitingRequest(tid, requestId) {
   window.focus();
   let meta = threadMetaForId(tid);
   if (!meta || !meta.pid) {
@@ -2479,22 +2496,22 @@ async function focusApprovalTarget(tid, approvalId) {
     meta = threadMetaForId(tid);
   }
   if (!meta || !meta.pid) {
-    notice("Approval thread is not in the current project list.", "warning");
+    notice("That thread is not in the current project list.", "warning");
     return;
   }
   if (String(state.threadId) !== String(tid)) {
-    await openThread(meta.pid, tid, meta.title, { focusApprovalId:approvalId });
+    await openThread(meta.pid, tid, meta.title, { focusRequestId:requestId });
   } else {
-    state.pendingApprovalFocus = {
+    state.pendingWaitingFocus = {
       threadId:String(tid),
-      approvalId:String(approvalId),
+      requestId:String(requestId),
       attempts:0
     };
-    schedulePendingApprovalFocus();
+    schedulePendingWaitingFocus();
   }
 }
 
-function notifyApprovalRequest(request, tid, opts) {
+function notifyIncomingApproval(request, tid, opts) {
   opts = opts || {};
   if (!request || !request.id || !tid) {
     recordNotificationDiagnostic("incoming_approval_skipped_invalid_request", {
@@ -2503,7 +2520,7 @@ function notifyApprovalRequest(request, tid, opts) {
     });
     return;
   }
-  maybeNotifyApproval(String(tid), {
+  maybeNotifyWaitingRequest(String(tid), {
     kind:"approval_requested",
     active_turn:true,
     approval_id:String(request.id),
@@ -2528,7 +2545,7 @@ function isApprovalAnswered(request) {
 function handleIncomingApprovalRequest(request, tid, opts) {
   opts = opts || {};
   // A reconnect snapshot replays already-answered approvals so their cards can be redrawn in the
-  // resolved state. Those must not re-arm the "needs approval" sidebar activity or fire a
+  // resolved state. Those must not re-arm the waiting-on-you sidebar activity or fire a
   // notification — the user already answered them. Render the resolved card and stop.
   if (isApprovalAnswered(request)) {
     renderApprovalRequest(request);
@@ -2540,7 +2557,7 @@ function handleIncomingApprovalRequest(request, tid, opts) {
     source: opts.source || "unknown",
     notify: opts.notify !== false
   });
-  if (opts.notify !== false) notifyApprovalRequest(request, tid, { source: opts.source });
+  if (opts.notify !== false) notifyIncomingApproval(request, tid, { source: opts.source });
   setThreadActivity(tid, {
     kind:"approval_requested",
     active_turn:true,
@@ -2985,12 +3002,31 @@ function handleEvent(ev) {
         source: "agent_event_approval_requested"
       });
       break;
-    case "server_request_received":
-      setActiveThreadActivity("server_request_received", true, "Waiting for input", {
-        server_request_id:ev.request && ev.request.id ? String(ev.request.id) : null
+    case "server_request_received": {
+      const serverRequestId = ev.request && ev.request.id ? String(ev.request.id) : null;
+      // A reconnect snapshot replays every ServerRequestReceived, answered ones included. Those must
+      // not re-arm the waiting-on-you activity or fire a notification — the user already answered
+      // them. Mirrors the approval path's guard in `handleIncomingApprovalRequest`;
+      // `renderServerRequest` settles the card into its resolved state from the same answered set.
+      if (serverRequestId && state.answeredServerRequests.has(serverRequestId)) {
+        renderServerRequest(ev.request);
+        break;
+      }
+      setActiveThreadActivity("server_request_received", true, "Waiting for your input", {
+        server_request_id:serverRequestId
       });
       renderServerRequest(ev.request);
+      maybeNotifyWaitingRequest(String(ev.thread || state.threadId || ""), {
+        kind:"server_request_received",
+        active_turn:true,
+        approval_id:null,
+        server_request_id:serverRequestId,
+        summary:"Waiting for your input",
+        source:"agent_event_server_request_received",
+        unread:false
+      });
       break;
+    }
     case "server_request_resolved": resolveServerRequest(ev.request_id); break;
     // Render errors as a persistent transcript entry (tied to the turn/message that caused them)
     // rather than a toast that vanishes — so looking back at a thread explains why a message got
@@ -3058,7 +3094,7 @@ function renderLiveTurnSnapshot(snap) {
     });
   }
   for (const request of (snap.pending_server_requests || [])) {
-    setActiveThreadActivity("server_request_received", true, "Waiting for input", {
+    setActiveThreadActivity("server_request_received", true, "Waiting for your input", {
       server_request_id:request && request.id ? String(request.id) : null
     });
     renderServerRequest(request);
@@ -3149,37 +3185,38 @@ function renderApprovalRequest(request) {
   addApprovalButton(actions, id, "decline", "Decline", "danger", available);
   addApprovalButton(actions, id, "cancel", "Cancel", "", available);
   body.append(actions);
-  schedulePendingApprovalFocus();
+  schedulePendingWaitingFocus();
 }
 
-function approvalRowById(id) {
+// A notification click targets whatever the thread is waiting for, so look in both card kinds.
+function waitingRequestRowById(id) {
   if (!id) return null;
   const target = String(id);
-  return Array.from(document.querySelectorAll("[data-approval-id]"))
-    .find(el => String(el.dataset.approvalId) === target) || null;
+  return Array.from(document.querySelectorAll("[data-approval-id],[data-server-request-id]"))
+    .find(el => String(el.dataset.approvalId || el.dataset.serverRequestId) === target) || null;
 }
 
-function schedulePendingApprovalFocus() {
-  const pending = state.pendingApprovalFocus;
-  if (!pending || !pending.approvalId) return;
+function schedulePendingWaitingFocus() {
+  const pending = state.pendingWaitingFocus;
+  if (!pending || !pending.requestId) return;
   if (!state.threadId || String(state.threadId) !== String(pending.threadId)) return;
-  const row = approvalRowById(pending.approvalId);
+  const row = waitingRequestRowById(pending.requestId);
   if (row) {
-    state.pendingApprovalFocus = null;
+    state.pendingWaitingFocus = null;
     row.scrollIntoView({ block:"center", behavior:"smooth" });
-    row.classList.add("approval-target");
+    row.classList.add("waiting-target");
     row.setAttribute("tabindex", "-1");
     row.focus({ preventScroll:true });
-    setTimeout(() => row.classList.remove("approval-target"), 5000);
+    setTimeout(() => row.classList.remove("waiting-target"), 5000);
     return;
   }
   pending.attempts = (pending.attempts || 0) + 1;
   if (pending.attempts > 40) {
-    state.pendingApprovalFocus = null;
-    notice("Approval is no longer pending.", "warning");
+    state.pendingWaitingFocus = null;
+    notice("That request is no longer pending.", "warning");
     return;
   }
-  setTimeout(schedulePendingApprovalFocus, 150);
+  setTimeout(schedulePendingWaitingFocus, 150);
 }
 
 function approvalTitle(request) {
@@ -3278,11 +3315,11 @@ function resolveApprovalRequest(id, decision) {
   if (id === undefined || id === null || String(id) === "") return;
   id = String(id);
   const entry = state.pendingApprovals.get(id);
-  const msg = entry ? entry.msg : approvalRowById(id);
+  const msg = entry ? entry.msg : waitingRequestRowById(id);
   const tid = entry && entry.request && entry.request.thread_id
     ? entry.request.thread_id
     : (msg && msg.dataset.threadId ? msg.dataset.threadId : state.threadId);
-  closeApprovalNotification(tid, id);
+  closeWaitingNotification(tid, id);
   clearApprovalThreadActivity(tid, id);
   if (entry) {
     state.answeredApprovals.set(entry.stateKey || (msg && msg.dataset.approvalStateKey) || approvalStateKey(id), {
@@ -3692,6 +3729,13 @@ function respondServerRequest(id, response, label) {
   status.className = "meta server-request-sent";
   status.textContent = `Sent: ${label}`;
   if (body) body.append(status);
+  // Stop claiming the thread is waiting on the user the moment they act. An approval clears here
+  // because answering it broadcasts `ApprovalResolved`; a server request's resolved event comes from
+  // the harness on its own schedule and may never come, so waiting for it would leave the sidebar
+  // demanding attention for something already answered.
+  const tid = entry.msg.dataset.threadId || state.threadId;
+  clearServerRequestThreadActivity(tid, String(id));
+  closeWaitingNotification(tid, String(id));
 }
 function objectValue(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : null;
@@ -4544,54 +4588,55 @@ function subagentThreadsForActiveProject() {
 // stands for its whole subtree — a nested grandchild is not listed separately, since the menu lists
 // direct children of the open thread — so an unreported descendant is reported nowhere.
 //
-// `running` and `needsApproval` are separate flags rather than reads of the winning activity: an
-// approval also sets `active_turn`, so a blocked child would otherwise be indistinguishable from a
-// busy one, and an erroring descendant outranks a running sibling without cancelling it. `activity`
+// `running` and `waitingOnUser` are separate flags rather than reads of the winning activity: a
+// request for the user also sets `active_turn`, so a blocked child would otherwise be
+// indistinguishable from a busy one, and an erroring descendant outranks a running sibling without
+// cancelling it. `activity`
 // is the ranked winner that names the card's state, with `origin` set when it belongs to a
 // descendant, so the summary can describe that descendant rather than this thread.
 function subagentSubtreeState(threadId) {
   const key = String(threadId);
   let running = false;
-  let needsApproval = false;
+  let waitingOnUser = false;
   let activity = null;
   let origin = null;
   for (const [otherId, other] of state.threadActivity) {
     if (otherId !== key && !threadDescendsFrom(otherId, key)) continue;
     if (other.active_turn) running = true;
-    if (other.kind === "approval_requested") needsApproval = true;
+    if (activityWaitsOnUser(other)) waitingOnUser = true;
     if (threadActivityRank(other) <= threadActivityRank(activity)) continue;
     activity = other;
     origin = otherId === key ? null : otherId;
   }
-  return { running, needsApproval, activity, origin };
+  return { running, waitingOnUser, activity, origin };
 }
 
 function subagentCounts() {
   const agents = subagentThreadsForActiveProject();
   let running = 0;
-  let awaitingApproval = 0;
+  let waitingOnUser = 0;
   for (const thread of agents) {
     const subtree = subagentSubtreeState(thread.id);
     if (subtree.running) running += 1;
-    if (subtree.needsApproval) awaitingApproval += 1;
+    if (subtree.waitingOnUser) waitingOnUser += 1;
   }
-  return { total:agents.length, running, awaitingApproval };
+  return { total:agents.length, running, waitingOnUser };
 }
 
 function renderSubagentsButton() {
   const btn = $("subagentsBtn");
   if (!btn) return;
   const counts = subagentCounts();
-  const stateName = counts.awaitingApproval ? "approval" : (counts.running ? "running" : "idle");
+  const stateName = counts.waitingOnUser ? "waiting" : (counts.running ? "running" : "idle");
   btn.className = `badge subagents-btn state-${stateName}`;
   btn.disabled = !state.projectId || (!counts.total && !counts.running);
   const runningLabel = `${counts.running} running sub-agent${counts.running === 1 ? "" : "s"} · ${counts.total} total`;
   btn.title = counts.total
-    ? (counts.awaitingApproval
-        ? `${counts.awaitingApproval} sub-agent${counts.awaitingApproval === 1 ? "" : "s"} waiting for approval · ${runningLabel}`
+    ? (counts.waitingOnUser
+        ? `${counts.waitingOnUser} sub-agent${counts.waitingOnUser === 1 ? "" : "s"} waiting on you · ${runningLabel}`
         : runningLabel)
     : "No sub-agents";
-  $("subagentsCount").textContent = String(counts.awaitingApproval || counts.running || counts.total);
+  $("subagentsCount").textContent = String(counts.waitingOnUser || counts.running || counts.total);
   if (!$("subagentsMenu").hidden) renderSubagentsMenu();
 }
 
@@ -4600,9 +4645,9 @@ function renderSubagentsMenu() {
   const agents = subagentThreadsForActiveProject();
   const counts = subagentCounts();
   const rows = agents.map(renderSubagentCard).join("");
-  const approvalSummary = counts.awaitingApproval ? `${counts.awaitingApproval} waiting for approval · ` : "";
+  const waitingSummary = counts.waitingOnUser ? `${counts.waitingOnUser} waiting on you · ` : "";
   const summary = agents.length
-    ? `<div class="subagents-summary${counts.awaitingApproval ? " needs-approval" : ""}">${approvalSummary}${counts.running} running · ${counts.total} total</div>`
+    ? `<div class="subagents-summary${counts.waitingOnUser ? " waiting" : ""}">${waitingSummary}${counts.running} running · ${counts.total} total</div>`
     : "";
   menu.innerHTML = `
     <div class="subagents-head">
@@ -4622,9 +4667,9 @@ function renderSubagentsMenu() {
 }
 
 function renderSubagentCard(thread) {
-  const { running, needsApproval, activity, origin } = subagentSubtreeState(thread.id);
-  const stateLabel = needsApproval
-    ? "Needs approval"
+  const { running, waitingOnUser, activity, origin } = subagentSubtreeState(thread.id);
+  const stateLabel = waitingOnUser
+    ? "Waiting on you"
     : (running ? "Running" : (activity && activity.kind === "error" ? "Error" : "Idle"));
   const parent = thread.parent_thread_id ? knownProjectThreads(state.projectId).find(t => String(t.id) === String(thread.parent_thread_id)) : null;
   const parentLabel = parent && parent.title ? `Parent: ${parent.title}` : "Parent thread";
@@ -4633,8 +4678,8 @@ function renderSubagentCard(thread) {
     : parentLabel;
   const active = state.threadId && String(state.threadId) === String(thread.id);
   const name = subagentDisplayName(thread);
-  const stateClass = needsApproval ? " approval" : (running ? " running" : "");
-  return `<button type="button" class="subagent-card${active ? " active" : ""}${needsApproval ? " needs-approval" : ""}" data-subagent-thread-id="${escapeAttr(thread.id)}">
+  const stateClass = waitingOnUser ? " waiting" : (running ? " running" : "");
+  return `<button type="button" class="subagent-card${active ? " active" : ""}${waitingOnUser ? " waiting" : ""}" data-subagent-thread-id="${escapeAttr(thread.id)}">
     <span class="subagent-card-title">
       <span class="subagent-card-name">${escapeHtml(name)}</span>
       <span class="subagent-card-state${stateClass}">${stateLabel}</span>

@@ -23,6 +23,13 @@ test.describe("approval persistence across reload", () => {
     const approval = transcript.locator(".msg.approval");
     await expect(approval).toBeVisible();
 
+    // Hold on to this thread's row: `activity-waiting` now covers server requests too, so a
+    // page-wide assertion would fail on any unrelated thread that happens to be waiting.
+    const row = page.locator(".thread.active");
+    await expect(row).toHaveCount(1);
+    const tid = await row.getAttribute("data-tid");
+    expect(tid).toBeTruthy();
+
     // The card is actionable before it is answered.
     const acceptBtn = approval.getByRole("button", { name: "Accept", exact: true });
     await expect(acceptBtn).toBeVisible();
@@ -53,8 +60,8 @@ test.describe("approval persistence across reload", () => {
     ).toHaveCount(0);
     await expect(page.locator("#transcript .msg.error")).toHaveCount(0);
 
-    // The sidebar must not nag that the thread still needs an approval: an answered approval
-    // replayed from the snapshot must not re-arm the "approval needed" thread indicator.
-    await expect(page.locator(".thread.activity-approval")).toHaveCount(0);
+    // The sidebar must not nag that this thread still needs an approval: an answered approval
+    // replayed from the snapshot must not re-arm its waiting indicator.
+    await expect(page.locator(`.thread[data-tid="${tid}"]`)).not.toHaveClass(/\bactivity-waiting\b/);
   });
 });

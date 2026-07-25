@@ -107,7 +107,8 @@
   .thread-title { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .thread.has-activity .thread-title { color:var(--fg); }
   .thread.activity-running .thread-status { color:#d29922; }
-  .thread.activity-approval .thread-status { color:#f0d98c; }
+  /* "Waiting on you" — an approval or a server request; to the reader they are one state. */
+  .thread.activity-waiting .thread-status { color:#f0d98c; }
   .thread.activity-error .thread-status { color:#f85149; }
   /* Hoisted from a hidden sub-agent: same urgency colour, outlined so the row still reads as
      "something under here" rather than "this thread". */
@@ -204,9 +205,9 @@
   .subagents-btn { display:flex; align-items:center; gap:6px; }
   .subagents-btn.state-idle { color:var(--muted); }
   .subagents-btn.state-running { color:#f0d98c; border-color:#d29922; background:rgba(210,153,34,.08); }
-  /* A sub-agent blocked on an approval is waiting on the user, not on the model — it gets the
-     accent treatment so it separates from the merely-running state at a glance. */
-  .subagents-btn.state-approval { color:#ffd97d; border-color:#e3b341; background:rgba(227,179,65,.18); }
+  /* A sub-agent waiting on the user — for an approval or an answer — is not waiting on the model,
+     so it gets the accent treatment to separate it from merely-running at a glance. */
+  .subagents-btn.state-waiting { color:#ffd97d; border-color:#e3b341; background:rgba(227,179,65,.18); }
   .subagents-popover {
     position:absolute; left:0; top:34px; z-index:35; width:min(460px, calc(100vw - 24px));
     max-height:70vh; overflow:auto; padding:10px; border:1px solid var(--border);
@@ -225,9 +226,9 @@
   .subagent-card-name { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .subagent-card-state { font-size:11px; color:var(--muted); }
   .subagent-card-state.running { color:#f0d98c; }
-  .subagent-card-state.approval { color:#ffd97d; font-weight:600; }
-  .subagent-card.needs-approval { border-color:#e3b341; background:rgba(227,179,65,.12); }
-  .subagents-summary.needs-approval { color:#ffd97d; }
+  .subagent-card-state.waiting { color:#ffd97d; font-weight:600; }
+  .subagent-card.waiting { border-color:#e3b341; background:rgba(227,179,65,.12); }
+  .subagents-summary.waiting { color:#ffd97d; }
   .subagent-card-meta { color:var(--muted); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .usage-wrap { position:relative; margin-left:auto; }
   .usage-btn { display:flex; align-items:center; gap:6px; }
@@ -341,7 +342,8 @@
   .plan-card-body[hidden] { display:none; }
   .plan-card-body .plan-explanation { margin-bottom:8px; }
   .msg.approval { background:#241d10; border:1px solid #d29922; max-width:100%; }
-  .msg.approval-target { outline:2px solid #f0d98c; outline-offset:3px; }
+  /* Focus highlight for a notification click — lands on an approval or a server-request card. */
+  .msg.waiting-target { outline:2px solid #f0d98c; outline-offset:3px; }
   .msg.approval.resolved.decision-accept,
   .msg.approval.resolved.decision-session { background:#172217; border-color:#3fb950; }
   .msg.approval.resolved.decision-decline { background:#2b1618; border-color:#f85149; }

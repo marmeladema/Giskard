@@ -37,7 +37,7 @@ function childThreadId(page: Page, pid: string, parentTid: string): Promise<stri
 async function approvalNotificationsFor(page: Page, childThread: string): Promise<number> {
   const notifications = await recordedNotifications(page);
   return notifications.filter(
-    (n) => n.data?.approvalId === SCRIPTED_SUBAGENT_APPROVAL_ID && n.data?.threadId === childThread,
+    (n) => n.data?.requestId === SCRIPTED_SUBAGENT_APPROVAL_ID && n.data?.threadId === childThread,
   ).length;
 }
 
@@ -71,7 +71,7 @@ test.describe("sub-agent blocked on an approval", () => {
 
     // 1. The parent row carries the child's state: `!`, the approval colour, and the marker saying
     //    the state was hoisted from a descendant rather than being the row's own.
-    await expect(parentRow).toHaveClass(/\bactivity-approval\b/);
+    await expect(parentRow).toHaveClass(/\bactivity-waiting\b/);
     await expect(parentRow).toHaveClass(/\bactivity-subagent\b/);
     const status = parentRow.locator(".thread-status");
     await expect(status).toHaveText("!");
@@ -88,22 +88,22 @@ test.describe("sub-agent blocked on an approval", () => {
 
     // 2. The header monitor separates "waiting on the user" from "busy".
     const subagentsBtn = page.locator("#subagentsBtn");
-    await expect(subagentsBtn).toHaveClass(/\bstate-approval\b/);
-    await expect(subagentsBtn).toHaveAttribute("title", /waiting for approval/);
+    await expect(subagentsBtn).toHaveClass(/\bstate-waiting\b/);
+    await expect(subagentsBtn).toHaveAttribute("title", /waiting on you/);
     await subagentsBtn.click();
     const card = page.locator("#subagentsMenu .subagent-card");
     await expect(card).toHaveCount(1);
-    await expect(card).toHaveClass(/\bneeds-approval\b/);
-    await expect(card.locator(".subagent-card-state")).toHaveText("Needs approval");
+    await expect(card).toHaveClass(/\bwaiting\b/);
+    await expect(card.locator(".subagent-card-state")).toHaveText("Waiting on you");
     await expect(page.locator("#subagentsMenu .subagents-summary")).toHaveText(
-      /1 waiting for approval/,
+      /1 waiting on you/,
     );
     await page.locator("#subagentsClose").click();
 
     // 3. The notification names the child and its parent instead of a bare id prefix.
     await expect.poll(async () => (await recordedNotifications(page)).length).toBeGreaterThan(0);
     const approval = (await recordedNotifications(page)).find(
-      (n) => n.data?.approvalId === SCRIPTED_SUBAGENT_APPROVAL_ID && n.data?.threadId === child,
+      (n) => n.data?.requestId === SCRIPTED_SUBAGENT_APPROVAL_ID && n.data?.threadId === child,
     );
     expect(approval).toBeTruthy();
     expect(approval!.title).toBe("Giskard: sub-agent approval needed");
@@ -115,7 +115,7 @@ test.describe("sub-agent blocked on an approval", () => {
   test("clicking the notification opens the child and the approval is answerable", async ({ page }) => {
     const parent = await startThreadWith(page, SCRIPTED_SUBAGENT_APPROVAL_TRIGGER);
     const parentRow = page.locator(`.thread[data-tid="${parent.tid}"]`);
-    await expect(parentRow).toHaveClass(/\bactivity-approval\b/);
+    await expect(parentRow).toHaveClass(/\bactivity-waiting\b/);
     const child = await childThreadId(page, parent.pid, parent.tid);
     expect(child).toBeTruthy();
 
@@ -124,8 +124,8 @@ test.describe("sub-agent blocked on an approval", () => {
     await page.evaluate(
       ({ child, approvalId }) =>
         (window as unknown as {
-          handleNotificationClick: (data: { threadId: string; approvalId: string }) => void;
-        }).handleNotificationClick({ threadId: child, approvalId }),
+          handleNotificationClick: (data: { threadId: string; requestId: string }) => void;
+        }).handleNotificationClick({ threadId: child, requestId: approvalId }),
       { child: child!, approvalId: SCRIPTED_SUBAGENT_APPROVAL_ID },
     );
 
@@ -147,8 +147,8 @@ test.describe("sub-agent blocked on an approval", () => {
 
     // Opening the child clears the escalation from its ancestor: the row may still report the child
     // as running, but it must stop demanding attention.
-    await expect(parentRow).not.toHaveClass(/\bactivity-approval\b/);
-    await expect(page.locator("#subagentsBtn")).not.toHaveClass(/\bstate-approval\b/);
+    await expect(parentRow).not.toHaveClass(/\bactivity-waiting\b/);
+    await expect(page.locator("#subagentsBtn")).not.toHaveClass(/\bstate-waiting\b/);
   });
 
   // The hoisting rules decide which of several states one row shows. Drive them through the app's
@@ -225,7 +225,7 @@ test.describe("sub-agent blocked on an approval", () => {
     expect(result.hoisted.winner).toBe("approval_requested");
     expect(result.hoisted.origin).toBe("grandchild");
     expect(result.hoisted.statusText).toBe("!");
-    expect(result.hoisted.rowClass).toContain("activity-approval");
+    expect(result.hoisted.rowClass).toContain("activity-waiting");
     expect(result.hoisted.rowClass).toContain("activity-subagent");
     // Named after the blocked descendant, not the row it is displayed on.
     expect(result.hoisted.title).toBe("Grandchild: Approval requested");
@@ -233,7 +233,7 @@ test.describe("sub-agent blocked on an approval", () => {
     expect(result.hoisted.unrelated).toBe(false);
 
     expect(result.afterAnswer.statusText).toBe("o");
-    expect(result.afterAnswer.rowClass).not.toContain("activity-approval");
+    expect(result.afterAnswer.rowClass).not.toContain("activity-waiting");
     expect(result.afterAnswer.rowClass).not.toContain("activity-subagent");
 
     expect(result.cycle.host).toBeNull();
@@ -247,7 +247,7 @@ test.describe("sub-agent blocked on an approval", () => {
   test("a reload learns about an approval it was not connected for", async ({ page }) => {
     const parent = await startThreadWith(page, SCRIPTED_SUBAGENT_APPROVAL_TRIGGER);
     const parentRow = page.locator(`.thread[data-tid="${parent.tid}"]`);
-    await expect(parentRow).toHaveClass(/\bactivity-approval\b/);
+    await expect(parentRow).toHaveClass(/\bactivity-waiting\b/);
     const child = await childThreadId(page, parent.pid, parent.tid);
     expect(child).toBeTruthy();
 
@@ -257,7 +257,7 @@ test.describe("sub-agent blocked on an approval", () => {
 
     // Rebuilt from nothing, the sidebar still reports the blocked descendant.
     const reloadedRow = page.locator(`.thread[data-tid="${parent.tid}"]`);
-    await expect(reloadedRow).toHaveClass(/\bactivity-approval\b/);
+    await expect(reloadedRow).toHaveClass(/\bactivity-waiting\b/);
     await expect(reloadedRow).toHaveClass(/\bactivity-subagent\b/);
     await expect(reloadedRow.locator(".thread-status")).toHaveText("!");
     // A reload is a new page session, so the alert fires again rather than being suppressed.
@@ -307,7 +307,7 @@ test.describe("sub-agent blocked on an approval", () => {
   test("notifies once when two events describe the same approval", async ({ page }) => {
     const parent = await startThreadWith(page, SCRIPTED_SUBAGENT_APPROVAL_TRIGGER);
     await expect(page.locator(`.thread[data-tid="${parent.tid}"]`)).toHaveClass(
-      /\bactivity-approval\b/,
+      /\bactivity-waiting\b/,
     );
     const child = await childThreadId(page, parent.pid, parent.tid);
     // Without this the events below would fire with a null thread id, be ignored, and leave the

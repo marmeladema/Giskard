@@ -2833,7 +2833,7 @@ async fn send_activity_bootstrap(
                     server_request_id: request.id.to_string(),
                 },
                 active_turn: true,
-                summary: Some(format!("{} request", request.method)),
+                summary: Some("Waiting for your input".to_string()),
             });
         }
     }
