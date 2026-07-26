@@ -430,8 +430,44 @@
 
   .composer { display:flex; gap:8px; padding:12px; border-top:1px solid var(--border); background:var(--panel); }
   .composer.drag-over { outline:2px solid var(--accent); outline-offset:-4px; background:var(--panel2); }
-  .composer #attachBtn { width:34px; min-width:34px; height:34px; align-self:flex-end; padding:0; font-size:18px; line-height:1; }
-  .composer textarea { flex:1; resize:none; height:52px; }
+  .composer #attachBtn {
+    width:40px; min-width:40px; height:40px;
+    padding:0; font-size:20px; line-height:1; display:flex; align-items:center; justify-content:center;
+  }
+  .composer textarea { flex:1; resize:none; height:40px; }
+  /* Send (up-pointing paper-plane arrow) and Stop (red filled square) are flex siblings; only one
+     is ever visible (the other has [hidden]), so they occupy the same 40px slot. Both match the
+     textarea height, mirroring the ＋ attach button on the left for a symmetric composer. */
+  .composer #sendBtn,
+  .composer #stopBtn {
+    width:40px; min-width:40px; height:40px; margin:0; padding:0;
+    display:flex; align-items:center; justify-content:center; border-radius:6px; line-height:1;
+  }
+  /* The [hidden] attribute's default display:none is overridden by the display:flex above, so
+     re-assert display:none for hidden buttons — otherwise the send arrow stays visible alongside
+     the stop square during a running turn. */
+  .composer #sendBtn[hidden],
+  .composer #stopBtn[hidden] { display:none; }
+  /* Both icon buttons render a Unicode glyph at the same size, matching the ＋ attach button. */
+  .composer #sendBtn,
+  .composer #stopBtn { font-size:18px; }
+  .composer #sendBtn {
+    border:1px solid var(--accent); background:var(--accent); color:#fff;
+  }
+  .composer #sendBtn:hover:not(:disabled) { background:#3d7af0; border-color:#3d7af0; }
+  .composer #sendBtn:disabled { opacity:.5; cursor:not-allowed; }
+  /* The send glyph is a Unicode black right-pointing pointer (U+25BA) rotated to point up. The
+     span is inline-block so transform applies (inline text can't be transformed). */
+  .composer #sendBtn .send-glyph { display:inline-block; transform:rotate(-90deg); }
+  .composer #stopBtn {
+    border:1px solid #f85149; background:#f85149; color:#fff;
+  }
+  .composer #stopBtn:hover:not(:disabled) { background:#da3b34; border-color:#da3b34; }
+  .composer #stopBtn:disabled { opacity:.55; cursor:not-allowed; }
+  /* The stop glyph is a Unicode black square (U+25A0). */
+  /* The legacy .primary/.danger classes should not restyle the new icon buttons. */
+  .composer #sendBtn.primary { background:var(--panel2); border-color:var(--border); color:var(--fg); }
+  .composer #stopBtn.danger { background:#f85149; border-color:#f85149; color:#fff; }
   .attachment-tray {
     display:flex; flex-wrap:wrap; gap:6px; padding:0 12px 10px; background:var(--panel);
     border-top:0;
