@@ -70,6 +70,13 @@ const SCRIPTED_SUBAGENT_APPROVAL_DELAY: std::time::Duration =
 /// answered card is not re-surfaced as actionable. The approval id is fixed so tests can target it.
 const SCRIPTED_APPROVAL_TRIGGER: &str = "Trigger a scripted approval request.";
 const SCRIPTED_APPROVAL_ID: &str = "scripted-approval-1";
+/// Raises an approval and then streams a harness error in the same still-open turn. The error is
+/// the last activity-bearing event, so a reconnect that took the replayed events at face value
+/// would land on "errored, no active turn" and lose the fact that the turn is still blocked on the
+/// user. Re-asserting the outstanding set after the replay is what restores it.
+const SCRIPTED_APPROVAL_THEN_ERROR_TRIGGER: &str = "Trigger an approval followed by an error.";
+const SCRIPTED_APPROVAL_THEN_ERROR_MESSAGE: &str = "Scripted non-fatal harness error.";
+
 /// Prompt that raises a `requestUserInput` server request and then keeps the turn in-flight. This
 /// harness deliberately never emits `ServerRequestResolved` when the answer is routed — modelling a
 /// harness whose resolved event is late or absent, which is the window a reload has to survive.
@@ -422,7 +429,9 @@ impl AgentHarness for ScriptedHarness {
             _ => None,
         };
 
-        let raise_approval = input_text == Some(SCRIPTED_APPROVAL_TRIGGER);
+        let raise_approval_then_error = input_text == Some(SCRIPTED_APPROVAL_THEN_ERROR_TRIGGER);
+        let raise_approval =
+            input_text == Some(SCRIPTED_APPROVAL_TRIGGER) || raise_approval_then_error;
         if raise_approval {
             self.active_approvals
                 .lock()
@@ -491,6 +500,16 @@ impl AgentHarness for ScriptedHarness {
                         available: vec![ApprovalDecision::Accept, ApprovalDecision::Decline],
                     },
                 });
+                if raise_approval_then_error {
+                    tokio::task::yield_now().await;
+                    let _ = sender.send(AgentEvent::Error {
+                        thread: thread_id,
+                        turn: Some(turn),
+                        error: giskard_core::error::HarnessError::Protocol(
+                            SCRIPTED_APPROVAL_THEN_ERROR_MESSAGE.into(),
+                        ),
+                    });
+                }
                 return;
             }
 

@@ -1,5 +1,10 @@
 import { test, expect } from "@playwright/test";
-import { SCRIPTED_APPROVAL_TRIGGER, login } from "./helpers";
+import {
+  SCRIPTED_APPROVAL_THEN_ERROR_MESSAGE,
+  SCRIPTED_APPROVAL_THEN_ERROR_TRIGGER,
+  SCRIPTED_APPROVAL_TRIGGER,
+  login,
+} from "./helpers";
 
 // Regression: an approval answered during an in-flight turn must stay resolved after a browser
 // reload. Approval resolution used to live only in browser memory, so a reload re-surfaced the
@@ -63,5 +68,49 @@ test.describe("approval persistence across reload", () => {
     // The sidebar must not nag that this thread still needs an approval: an answered approval
     // replayed from the snapshot must not re-arm its waiting indicator.
     await expect(page.locator(`.thread[data-tid="${tid}"]`)).not.toHaveClass(/\bactivity-waiting\b/);
+  });
+});
+
+// The reconnect snapshot re-asserts what the turn is still waiting on *after* replaying the
+// accumulated events. That order is load-bearing: later events speak for the thread too, and an
+// `error` declares the turn inactive, so a turn blocked on an approval that then errored would
+// come back reading "errored, idle" — no sidebar glyph, no waiting rank, no sub-agent hoist —
+// while the approval sits in the transcript with nothing pointing at it. Re-asserting the
+// outstanding approvals last gives the waiting state the last word, so it outranks the error.
+test.describe("a still-blocked turn survives a reload that replays a later error", () => {
+  test.beforeEach(async ({ page }) => {
+    await login(page);
+  });
+
+  test("a thread blocked on an approval still reads as waiting after an error", async ({ page }) => {
+    const project = page.locator(".proj", { hasText: "Demo" });
+    await project.locator(".project-add").click();
+
+    const input = page.locator("#input");
+    await expect(input).toBeVisible();
+    await input.fill(SCRIPTED_APPROVAL_THEN_ERROR_TRIGGER);
+    await page.locator("#sendBtn").click();
+
+    // Both arrive in the same still-open turn, the error last.
+    await expect(page.locator("#transcript .msg.approval")).toBeVisible();
+    await expect(page.locator("#transcript .msg.error")).toContainText(
+      SCRIPTED_APPROVAL_THEN_ERROR_MESSAGE,
+    );
+
+    await page.reload();
+    await expect(page.locator("#app")).toHaveClass(/open/);
+
+    // The error is replayed and still shown — it happened, and the transcript is the record.
+    await expect(page.locator("#transcript .msg.error")).toContainText(
+      SCRIPTED_APPROVAL_THEN_ERROR_MESSAGE,
+    );
+    // But the turn is still blocked on the user, and that outranks the error in the sidebar.
+    const row = page.locator(".thread.active");
+    await expect(row).toHaveClass(/\bactivity-waiting\b/);
+    await expect(row.locator(".thread-status")).toHaveText("!");
+    // And the approval is still answerable, not stranded in a thread that reads as finished.
+    await expect(
+      page.locator("#transcript .msg.approval").getByRole("button", { name: "Accept", exact: true }),
+    ).toBeEnabled();
   });
 });

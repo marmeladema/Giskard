@@ -3128,9 +3128,15 @@ function renderLiveTurnSnapshot(snap) {
     if (answered !== undefined && answered !== null) state.answeredServerRequests.add(String(answered));
   }
   for (const ev of (snap.accumulated||[])) handleEvent(ev);
-  if (snap.pending_approval) {
-    handleIncomingApprovalRequest(snap.pending_approval, snap.thread_id || state.threadId, {
-      source: "live_turn_snapshot_pending_approval"
+  // Then re-assert what the turn is still waiting on the user for, approvals first. The replay
+  // above already drew these cards, but later events speak for the thread too — an `error` in
+  // particular overwrites the thread's activity and clears the active turn. Whatever is still
+  // outstanding gets the last word, so a turn blocked on an approval that then errored still reads
+  // as waiting on the user rather than "errored, idle". A turn can be blocked on several approvals
+  // at once, so every unanswered approval is re-armed, not just one.
+  for (const approval of outstandingApprovals(snap)) {
+    handleIncomingApprovalRequest(approval, snap.thread_id || state.threadId, {
+      source: "live_turn_snapshot_outstanding_approval"
     });
   }
   for (const request of (snap.pending_server_requests || [])) {
@@ -3139,6 +3145,30 @@ function renderLiveTurnSnapshot(snap) {
     });
     renderServerRequest(request);
   }
+}
+
+// Every approval the replayed turn is still waiting on the user for, oldest first. An approval is
+// outstanding unless the user already answered it (named in `snap.answered_approvals`). A re-sent
+// id is the same approval with a fresher payload, so the latest occurrence wins and the order is
+// the first occurrence of each id.
+function outstandingApprovals(snap) {
+  const answered = new Set();
+  for (const a of (snap.answered_approvals || [])) {
+    if (a && a.request_id !== undefined && a.request_id !== null) answered.add(String(a.request_id));
+  }
+  const order = [];
+  const latest = new Map();
+  for (const ev of (snap.accumulated || [])) {
+    if (!ev || ev.kind !== "approval_requested") continue;
+    const request = ev.request;
+    const id = request && request.id !== undefined && request.id !== null ? String(request.id) : null;
+    if (!id) continue;
+    if (!latest.has(id)) order.push(id);
+    latest.set(id, request);
+  }
+  return order
+    .map(id => latest.get(id))
+    .filter(request => request && !answered.has(String(request.id)));
 }
 
 function renderLiveTurnUserInput(turnId, userInput) {

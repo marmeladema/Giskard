@@ -339,11 +339,26 @@ async fn answered_approval_is_not_pending_after_reconnect() {
 
     let snapshot = wait_for_live_snapshot(&mut reconnect).await;
     assert_eq!(snapshot.thread_id, thread_id);
-    // The answered approval must NOT be re-surfaced as actionable.
+    // The answered approval must NOT be re-surfaced as actionable. The client derives the
+    // outstanding set from `accumulated` plus `answered_approvals`, so the answered approval is
+    // present in `accumulated` (so its resolved card can be drawn) but not in the outstanding set.
+    let outstanding: Vec<ApprovalId> = snapshot
+        .accumulated
+        .iter()
+        .filter_map(|e| match e {
+            WireAgentEvent::ApprovalRequested { request, .. } => Some(request.id.clone()),
+            _ => None,
+        })
+        .filter(|id| {
+            !snapshot
+                .answered_approvals
+                .iter()
+                .any(|a| a.request_id == *id)
+        })
+        .collect();
     assert!(
-        snapshot.pending_approval.is_none(),
-        "answered approval should not be pending after reconnect, got {:?}",
-        snapshot.pending_approval
+        outstanding.is_empty(),
+        "answered approval should not be outstanding after reconnect, got {outstanding:?}",
     );
     // It is reported as answered so the reconnecting client renders it in its resolved state.
     assert_eq!(snapshot.answered_approvals.len(), 1);

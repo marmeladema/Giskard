@@ -21,6 +21,14 @@ export const SCRIPTED_SUBAGENT_REPLY = "Child replay output";
 export const SCRIPTED_APPROVAL_TRIGGER = "Trigger a scripted approval request.";
 
 /**
+ * Prompt that raises an approval and then streams a harness error in the same still-open turn, so
+ * the error is the last activity-bearing event of the turn. Kept in sync with
+ * `SCRIPTED_APPROVAL_THEN_ERROR_*` in `crates/giskard-server/src/bin/giskard-server-replay.rs`.
+ */
+export const SCRIPTED_APPROVAL_THEN_ERROR_TRIGGER = "Trigger an approval followed by an error.";
+export const SCRIPTED_APPROVAL_THEN_ERROR_MESSAGE = "Scripted non-fatal harness error.";
+
+/**
  * Prompt that raises a `requestUserInput` server request and holds the turn open. The scripted
  * harness never emits a resolved event for it, modelling a harness whose resolved event is late or
  * absent. Kept in sync with `SCRIPTED_SERVER_REQUEST_*` in

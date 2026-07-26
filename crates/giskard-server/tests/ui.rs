@@ -2613,7 +2613,7 @@ fn sidebar_activity_notifications_target_approval_rows() {
     ));
     assert!(body.contains("source: \"agent_event_approval_requested\""));
     assert!(body.contains("source: \"server_message_approval_request\""));
-    assert!(body.contains("source: \"live_turn_snapshot_pending_approval\""));
+    assert!(body.contains("source: \"live_turn_snapshot_outstanding_approval\""));
     // Live events default to "thread_activity"; a connect replay overrides it so the notification
     // gate can tell the two apart.
     assert!(body.contains("source: msg.source || \"thread_activity\""));
@@ -2656,7 +2656,15 @@ fn sidebar_activity_notifications_target_approval_rows() {
     assert!(body.contains("`lastRequest: ${lastWaiting ? lastWaiting.reason : \"none\"}`"));
     assert!(!body.contains("notifyIncomingApproval(ev.request"));
     assert!(!body.contains("notifyIncomingApproval(msg.request"));
-    assert!(!body.contains("notifyIncomingApproval(snap.pending_approval"));
+    // `notifyIncomingApproval` is called from exactly one place: inside
+    // `handleIncomingApprovalRequest`. The reconnect re-arm must route through it rather than
+    // notifying directly, so a reload does not fire a notification for an approval the user already
+    // answered (or just raised in a thread they are already watching).
+    assert_eq!(
+        body.matches("notifyIncomingApproval").count(),
+        2,
+        "`notifyIncomingApproval` should appear only as the definition plus one call site"
+    );
     // A sub-agent's approval gets its own headline: it has no sidebar row, so the notification is
     // the only place the user learns a delegated thread — not this one — is blocked.
     assert!(body.contains(
