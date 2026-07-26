@@ -125,9 +125,18 @@
       <div class="composer" id="composer" style="display:none">
         <input id="attachmentInput" type="file" multiple hidden />
         <button id="attachBtn" type="button" title="Attach files" aria-label="Attach files">＋</button>
-        <textarea id="input" placeholder="Message the agent…  (Enter to send, Shift+Enter for newline)"></textarea>
-        <button class="primary" id="sendBtn">Send</button>
-        <button class="danger" id="stopBtn" title="Interrupt the running turn" hidden>Stop</button>
+        <textarea id="input" placeholder="Ask Giskard…  (Enter to send, Shift+Enter for newline)"></textarea>
+        <!-- The send and stop buttons occupy the same slot (only one is visible at a time): an
+             up-pointing paper-plane arrow to send, morphing into a red filled square to interrupt a
+            running turn. Both are square buttons sized to match the textarea height, mirroring the
+            ＋ attach button on the left side. -->
+        <button class="send-arrow" id="sendBtn" type="button" title="Send" aria-label="Send">
+          <!-- A black right-pointing pointer (U+25BA) rotated -90deg so it points up (north),
+               matching the weight of the ＋ attach button on the other side. The glyph is wrapped
+               in a span so CSS transform can rotate it (inline text can't be transformed). -->
+          <span class="send-glyph">►</span>
+        </button>
+        <button class="stop-square" id="stopBtn" type="button" title="Interrupt the running turn" aria-label="Interrupt the running turn" hidden>■</button>
       </div>
       <div class="attachment-tray" id="attachmentTray" role="status" aria-live="polite" hidden></div>
       <!-- Turn settings sit below the composer, split left/right: the turn's "how" (mode +

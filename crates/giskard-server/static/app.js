@@ -2042,11 +2042,20 @@ function updateComposerControls() {
   const attachmentsLoading = pendingAttachmentOperationCount() > 0;
   const attachmentInputAllowed = hasThreadSurface && !readOnly && !(draft && state.activeTurn);
   $("sendBtn").disabled = readOnly || state.activeTurn || attachmentsLoading || (!ready && !draft);
+  // The send arrow and the stop square share one slot: hide the arrow while a turn is running so
+  // only the red stop square is visible (no disabled send button alongside it).
+  $("sendBtn").hidden = state.activeTurn && !draft;
   $("sendBtn").title = readOnly ? "Read-only thread — pick a model from a configured provider to reactivate it." :
-    attachmentsLoading ? "Wait for attached files to finish loading." : "";
+    attachmentsLoading ? "Wait for attached files to finish loading." : "Send";
   $("stopBtn").hidden = !state.activeTurn || draft;
   $("stopBtn").disabled = !ready || state.interruptPending;
-  $("stopBtn").textContent = state.interruptPending ? "Stopping…" : "Stop";
+  // The stop button shows a Unicode black square (■) glyph; the "stopping" state is conveyed via
+  // the disabled state + tooltip since the glyph itself carries no text to swap out.
+  const stopLabel = state.interruptPending ? "Stopping the current turn…" : "Interrupt the running turn";
+  $("stopBtn").title = stopLabel;
+  // Keep the accessible name in sync with the title so assistive tech announces "Stopping…"
+  // rather than the static markup label while an interrupt is pending.
+  $("stopBtn").setAttribute("aria-label", stopLabel);
   $("attachBtn").disabled = !attachmentInputAllowed;
   const modelCatalogReady = projectModelCatalogReady();
   $("modelSel").disabled = !hasThreadSurface || !modelCatalogReady || (!ready && !draft);
@@ -2060,11 +2069,11 @@ function updateComposerControls() {
   $("input").disabled = !hasThreadSurface || readOnly;
   $("input").placeholder =
     readOnly ? "Read-only thread — pick a model above to reactivate it." :
-    state.activeTurn ? "Agent is running… draft the next message here." :
-    draft ? `Message the agent…  (${COMPOSER_HINT})` :
-    state.wsStatus==="open" ? `Message the agent…  (${COMPOSER_HINT})` :
+    state.activeTurn ? "Draft your next message…" :
+    draft ? `Ask Giskard…  (${COMPOSER_HINT})` :
+    state.wsStatus==="open" ? `Ask Giskard…  (${COMPOSER_HINT})` :
     state.wsStatus==="connecting" ? "Connecting to agent…" :
-    state.wsStatus==="reconnecting" ? "Reconnecting to agent… keep drafting here." :
+    state.wsStatus==="reconnecting" ? "Reconnecting… keep drafting here." :
     "Disconnected from agent.";
   $("approvalSel").disabled = !hasThreadSurface || (!ready && !draft);
   $("modeSel").disabled = !hasThreadSurface || (!ready && !draft);
