@@ -651,6 +651,7 @@ dependencies = [
  "giskard-persist",
  "giskard-proto",
  "hmac",
+ "indexmap",
  "pulldown-cmark",
  "rand 0.8.6",
  "regex",

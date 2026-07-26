@@ -287,8 +287,10 @@ async fn index_page_is_served_and_public() {
         "UI consumes server request resolution events"
     );
     assert!(
-        body.contains("pending_server_requests"),
-        "UI replays pending server requests from live snapshots"
+        body.contains("function outstandingServerRequests(snap)")
+            && body.contains("for (const request of outstandingServerRequests(snap))"),
+        "the UI derives outstanding server requests from the replayed rows, which carry their \
+         own answers, rather than from a companion list"
     );
     assert!(
         body.contains("type:\"server_request_response\""),

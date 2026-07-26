@@ -157,8 +157,6 @@ pub struct LiveTurnSnapshot {
     /// approvals at once (three commands proposed together, say), and a single field would name
     /// only the most recently raised one and silently drop the rest.
     pub accumulated: Vec<WireAgentEvent>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pending_server_requests: Vec<ServerRequest>,
     /// Approvals the user already answered during this in-flight turn, with the decision they made.
     ///
     /// Approval resolution lives only in browser memory, so a reload would otherwise re-surface an
@@ -985,28 +983,32 @@ mod tests {
     }
 
     #[test]
-    fn live_turn_snapshot_includes_pending_server_requests() {
-        let tid = ThreadId::new();
+    fn live_turn_snapshot_replays_server_requests_from_accumulated() {
         let turn = TurnId::new();
+        let thread = ThreadId::new();
         let snapshot = LiveTurnSnapshot {
-            thread_id: tid,
+            thread_id: thread,
             turn_id: turn,
             user_input: None,
-            accumulated: vec![],
-            pending_server_requests: vec![ServerRequest {
-                id: giskard_core::ids::ServerRequestId("req_1".into()),
-                method: "item/tool/call".into(),
-                params: serde_json::json!({ "tool": "example" }),
-                received_at: chrono::Utc::now(),
+            accumulated: vec![WireAgentEvent::ServerRequestReceived {
+                thread,
+                turn: Some(turn),
+                request: ServerRequest {
+                    id: giskard_core::ids::ServerRequestId("req_1".into()),
+                    method: "item/tool/call".into(),
+                    params: serde_json::json!({ "tool": "example" }),
+                    received_at: chrono::Utc::now(),
+                },
             }],
             answered_approvals: vec![],
             answered_server_requests: vec![],
         };
         let json = serde_json::to_value(&snapshot).unwrap();
-        assert_eq!(json["thread_id"], tid.to_string());
-        assert_eq!(json["pending_server_requests"][0]["id"], "req_1");
+        assert_eq!(json["thread_id"], thread.to_string());
+        assert_eq!(json["accumulated"][0]["kind"], "server_request_received");
+        assert_eq!(json["accumulated"][0]["request"]["id"], "req_1");
         assert_eq!(
-            json["pending_server_requests"][0]["method"],
+            json["accumulated"][0]["request"]["method"],
             "item/tool/call"
         );
     }
@@ -1018,7 +1020,6 @@ mod tests {
             turn_id: TurnId::new(),
             user_input: None,
             accumulated: vec![],
-            pending_server_requests: vec![],
             answered_approvals: vec![AnsweredApproval {
                 request_id: ApprovalId("ap_1".into()),
                 decision: ApprovalDecision::Accept,

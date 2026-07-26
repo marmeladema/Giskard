@@ -9,7 +9,7 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.61
+**Version:** 1.62
 
 > **Amendment — frontend approach (supersedes the Dioxus/WASM design below).**
 > This document was written targeting a **Dioxus fullstack / WebAssembly** frontend (`giskard-ui`),
@@ -22,6 +22,26 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.61 → 1.62), drop `pending_server_requests`:**
+- **SR11a:** `LiveTurnSnapshot` no longer carries `pending_server_requests: Vec<ServerRequest>`.
+  It was a precomputed outstanding set that duplicated a derivation already available on both ends:
+  the outstanding server requests are the rows in `accumulated` whose latest event is a
+  `server_request_received` and which are neither in `answered_server_requests` (the user answered)
+  nor closed by a `server_request_resolved` later in `accumulated` (the harness closed it). They
+  are reported in arrival order: a `server_request_received` appends the id (or updates its payload
+  in place), a `server_request_resolved` drops it, and a re-sent id after a resolution re-appends
+  at the end — so a reopen moves to the back, it does not restore its first-seen position. The
+  client derives this with `outstandingServerRequests`, exactly as it already derives
+  `outstandingApprovals`; the server's `pending_attention` derives it for the SB5 connect bootstrap.
+  `answered_server_requests` is kept: it is the only record of a user's answer before/without the
+  harness's own resolved event, so dropping it would replay an answered request as actionable and
+  re-answering routes a stale id to the harness (SR6).
+- **SR11b:** The client re-asserts the outstanding server requests *after* replaying `accumulated`,
+  mirroring the approval path (SR10b): a later `error` overwrites the thread's activity and clears
+  the active turn, so re-asserting last gives the waiting state the last word and keeps a turn
+  blocked on a server request that then errored reading as waiting on the user rather than
+  "errored, idle".
 
 **Changelog (1.60 → 1.61), drop the single `pending_approval`:**
 - **SR10a:** `LiveTurnSnapshot` no longer carries `pending_approval: Option<WireApprovalRequest>`.
@@ -2845,18 +2865,19 @@ above, sent once to a connecting client only and never broadcast, so a browser t
 signal still shows what is blocked; a separate message so clients can tell a replay from a live
 event and apply SB6's alert-once-per-session rule),
 `ThreadState { thread_id, state }` (persisted snapshot on subscribe/resync),
-`LiveTurnSnapshot { thread_id, turn_id, user_input?, accumulated, pending_server_requests,
+`LiveTurnSnapshot { thread_id, turn_id, user_input?, accumulated,
 answered_approvals, answered_server_requests }` (in-flight turn reconstruction on reconnect,
 carrying the turn input when the server synthesized the turn context, the `WireAgentEvent`s of the
-turn so far, unresolved `ServerRequest`s, and the `{ request_id, decision }` of approvals the user
-already answered this turn. Every `ApprovalRequested` rides along in `accumulated`, answered ones
-included; the client renders answered ones resolved using `answered_approvals` and treats the rest
-as actionable. There is no separate "pending approval" field: a turn can be blocked on several
-approvals at once, and a single field would name only the most recently raised one and silently drop
-the rest. Approval resolution lives only in browser memory, so without `answered_approvals` a reload
-would replay an answered approval as pending and answering it again routes a stale id to the
-harness, which errors — and `answered_server_requests` for the same reason (SR6), since a harness's
-own resolved event may be late or absent),
+turn so far. Every `ApprovalRequested` and `ServerRequestReceived` rides along in `accumulated`,
+answered ones included; the client derives what is still outstanding while replaying, with no
+companion pending list. A request is outstanding unless the user answered it (named in
+`answered_approvals` / `answered_server_requests`) or, for server requests, the harness closed it
+(`server_request_resolved` later in `accumulated`). There is no separate "pending" field for either
+kind: a turn can be blocked on several at once, and a precomputed list would duplicate a derivation
+already available on both ends. Approval resolution lives only in browser memory, so without
+`answered_approvals` a reload would replay an answered approval as pending and answering it again
+routes a stale id to the harness, which errors — and `answered_server_requests` for the same reason
+(SR6), since a harness's own resolved event may be late or absent),
 `RunningTasks { thread_id, tasks: [RunningTask] }` (commands and tool/MCP calls still known to be
 running, including commands that outlived an interrupted turn),
 `TokenUpdate { scope, thread_id?, ledger }`, `ApprovalRequest { thread_id, request }` (a

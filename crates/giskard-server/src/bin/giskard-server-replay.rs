@@ -83,6 +83,13 @@ const SCRIPTED_APPROVAL_THEN_ERROR_MESSAGE: &str = "Scripted non-fatal harness e
 const SCRIPTED_SERVER_REQUEST_TRIGGER: &str = "Trigger a scripted user input request.";
 const SCRIPTED_SERVER_REQUEST_ID: &str = "scripted-server-request-1";
 const SCRIPTED_SERVER_REQUEST_QUESTION: &str = "Which branch should I use?";
+/// Raises a server request and then streams a harness error in the same still-open turn. The error
+/// is the last activity-bearing event, so a reconnect that took the replayed events at face value
+/// would land on "errored, no active turn" and lose the fact that the turn is still blocked on the
+/// user. Re-asserting the outstanding set after the replay is what restores it (SR11b).
+const SCRIPTED_SERVER_REQUEST_THEN_ERROR_TRIGGER: &str =
+    "Trigger a server request followed by an error.";
+const SCRIPTED_SERVER_REQUEST_THEN_ERROR_MESSAGE: &str = "Scripted non-fatal harness error.";
 /// How long a scripted turn waits for the server's event forwarder to subscribe before giving up.
 const RECEIVER_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const RECEIVER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
@@ -439,7 +446,10 @@ impl AgentHarness for ScriptedHarness {
                 .insert(ApprovalId(SCRIPTED_APPROVAL_ID.into()), (thread_id, turn));
         }
 
-        let raise_server_request = input_text == Some(SCRIPTED_SERVER_REQUEST_TRIGGER);
+        let raise_server_request_then_error =
+            input_text == Some(SCRIPTED_SERVER_REQUEST_THEN_ERROR_TRIGGER);
+        let raise_server_request =
+            input_text == Some(SCRIPTED_SERVER_REQUEST_TRIGGER) || raise_server_request_then_error;
 
         // Stream the canned reply the way a real harness would: start, incremental deltas, then a
         // completed item and a turn-completed with token usage. Emitted off-task with yields so the
@@ -475,6 +485,16 @@ impl AgentHarness for ScriptedHarness {
                         received_at: chrono::Utc::now(),
                     },
                 });
+                if raise_server_request_then_error {
+                    tokio::task::yield_now().await;
+                    let _ = sender.send(AgentEvent::Error {
+                        thread: thread_id,
+                        turn: Some(turn),
+                        error: giskard_core::error::HarnessError::Protocol(
+                            SCRIPTED_SERVER_REQUEST_THEN_ERROR_MESSAGE.into(),
+                        ),
+                    });
+                }
                 return;
             }
 

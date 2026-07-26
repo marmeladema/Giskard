@@ -3139,7 +3139,7 @@ function renderLiveTurnSnapshot(snap) {
       source: "live_turn_snapshot_outstanding_approval"
     });
   }
-  for (const request of (snap.pending_server_requests || [])) {
+  for (const request of outstandingServerRequests(snap)) {
     setActiveThreadActivity("server_request_received", true, "Waiting for your input", {
       server_request_id:request && request.id ? String(request.id) : null
     });
@@ -3168,6 +3168,38 @@ function outstandingApprovals(snap) {
   }
   return order
     .map(id => latest.get(id))
+    .filter(request => request && !answered.has(String(request.id)));
+}
+
+// Every server request the replayed turn is still waiting on the user for, oldest first. A
+// request leaves the outstanding set when the user answered it (named in
+// `snap.answered_server_requests`) or when the harness closed it (`server_request_resolved` in
+// `accumulated`). A re-sent id is the same request with a fresher payload, so the latest
+// `server_request_received` wins and the order is the first occurrence of each id.
+function outstandingServerRequests(snap) {
+  const answered = new Set();
+  for (const id of (snap.answered_server_requests || [])) {
+    if (id !== undefined && id !== null) answered.add(String(id));
+  }
+  // A `Map` keeps arrival order (iterating a Map yields entries in insertion order). `set` on
+  // receive updates the payload in place when the id is already present, or appends it when it is
+  // new; `delete` on resolve drops it. A re-sent id after a resolution re-inserts at the end, so a
+  // reopen moves to the back rather than keeping its first-seen position. Mirrors
+  // `pending_server_requests` on the server.
+  const pending = new Map();
+  for (const ev of (snap.accumulated || [])) {
+    if (!ev || !ev.kind) continue;
+    if (ev.kind === "server_request_received") {
+      const request = ev.request;
+      const id = request && request.id !== undefined && request.id !== null ? String(request.id) : null;
+      if (!id) continue;
+      pending.set(id, request);
+    } else if (ev.kind === "server_request_resolved") {
+      const id = ev.request_id !== undefined && ev.request_id !== null ? String(ev.request_id) : null;
+      if (id) pending.delete(id);
+    }
+  }
+  return Array.from(pending.values())
     .filter(request => request && !answered.has(String(request.id)));
 }
 
