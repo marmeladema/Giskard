@@ -2816,7 +2816,7 @@ async fn send_activity_bootstrap(
     }
     let mut activities = Vec::new();
     for entry in &pending {
-        if let Some(approval) = &entry.approval {
+        for approval in &entry.approvals {
             activities.push(ThreadActivity {
                 thread_id: entry.thread_id,
                 kind: ThreadActivityKind::ApprovalRequested {

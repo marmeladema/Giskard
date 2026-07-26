@@ -9,7 +9,7 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.60
+**Version:** 1.61
 
 > **Amendment — frontend approach (supersedes the Dioxus/WASM design below).**
 > This document was written targeting a **Dioxus fullstack / WebAssembly** frontend (`giskard-ui`),
@@ -22,6 +22,23 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.60 → 1.61), drop the single `pending_approval`:**
+- **SR10a:** `LiveTurnSnapshot` no longer carries `pending_approval: Option<WireApprovalRequest>`.
+  It was derived with `.iter().rev().find_map(...)`, so it named only the most recently raised
+  approval and silently dropped the rest when a turn was blocked on several at once (three commands
+  proposed together, say). The outstanding approvals are now derived on both sides from
+  `accumulated` plus `answered_approvals`: every `ApprovalRequested` rides along in `accumulated`,
+  answered ones included, and the client renders answered ones resolved and treats the rest as
+  actionable. `PendingAttention.approval: Option` becomes `approvals: Vec`, so the SB5 connect
+  bootstrap reports every approval that is still blocking the thread, not just one.
+- **SR10b:** The client re-asserts the outstanding approvals *after* replaying `accumulated`, not
+  before. That order is load-bearing: later events speak for the thread too, and an `error` in
+  particular declares the turn inactive, so a turn blocked on an approval that then errored would
+  come back reading "errored, idle" — no sidebar glyph, no waiting rank, no sub-agent hoist — while
+  the approval sat in the transcript with nothing pointing at it. Re-asserting last gives the
+  waiting state the last word, so it outranks the error. (The server-request side of this rule and
+  the further unification of approvals and server requests into one request model are follow-ups.)
 
 **Changelog (1.59 → 1.60), one "waiting on the user" state:**
 - **SR8:** An approval and a server request both block a turn until the user answers, and the
@@ -2828,15 +2845,18 @@ above, sent once to a connecting client only and never broadcast, so a browser t
 signal still shows what is blocked; a separate message so clients can tell a replay from a live
 event and apply SB6's alert-once-per-session rule),
 `ThreadState { thread_id, state }` (persisted snapshot on subscribe/resync),
-`LiveTurnSnapshot { thread_id, turn_id, user_input?, accumulated, pending_approval?,
-pending_server_requests, answered_approvals, answered_server_requests }` (in-flight turn
-reconstruction on reconnect, carrying
-the turn input when the server synthesized the turn context, `WireAgentEvent`s, the still-open
-`WireApprovalRequest`, unresolved `ServerRequest`s, and the `{ request_id, decision }` of approvals
-the user already answered this turn — approval resolution lives only in browser memory, so without
-this a reload would replay an answered approval as pending and answering it again routes a stale id
-to the harness, which errors — and `answered_server_requests` for the same reason (SR6), since a
-harness's own resolved event may be late or absent),
+`LiveTurnSnapshot { thread_id, turn_id, user_input?, accumulated, pending_server_requests,
+answered_approvals, answered_server_requests }` (in-flight turn reconstruction on reconnect,
+carrying the turn input when the server synthesized the turn context, the `WireAgentEvent`s of the
+turn so far, unresolved `ServerRequest`s, and the `{ request_id, decision }` of approvals the user
+already answered this turn. Every `ApprovalRequested` rides along in `accumulated`, answered ones
+included; the client renders answered ones resolved using `answered_approvals` and treats the rest
+as actionable. There is no separate "pending approval" field: a turn can be blocked on several
+approvals at once, and a single field would name only the most recently raised one and silently drop
+the rest. Approval resolution lives only in browser memory, so without `answered_approvals` a reload
+would replay an answered approval as pending and answering it again routes a stale id to the
+harness, which errors — and `answered_server_requests` for the same reason (SR6), since a harness's
+own resolved event may be late or absent),
 `RunningTasks { thread_id, tasks: [RunningTask] }` (commands and tool/MCP calls still known to be
 running, including commands that outlived an interrupted turn),
 `TokenUpdate { scope, thread_id?, ledger }`, `ApprovalRequest { thread_id, request }` (a

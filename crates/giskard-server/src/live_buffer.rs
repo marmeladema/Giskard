@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use tokio::sync::Mutex;
 
-use giskard_core::approval::ApprovalDecision;
+use giskard_core::approval::{ApprovalDecision, ApprovalRequest};
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{ItemDelta, ItemPayload};
@@ -183,17 +183,6 @@ impl LiveBufferStore {
         let buffers = self.buffers.lock().await;
         buffers.get(&thread_id).map(|turn| {
             // C1/§3.5: the snapshot crosses the wire, so narrow core → wire here too.
-            // Skip approvals the user already answered: re-surfacing an answered approval as pending
-            // lets the client re-answer it, which routes a stale id to the harness and errors.
-            let pending_approval: Option<WireApprovalRequest> =
-                turn.events.iter().rev().find_map(|e| match e {
-                    AgentEvent::ApprovalRequested { request, .. }
-                        if !turn.resolved_approvals.contains_key(&request.id) =>
-                    {
-                        Some(request.clone().into())
-                    }
-                    _ => None,
-                });
             // Answered approvals still ride along in `accumulated`; the client renders them resolved
             // from this list rather than re-prompting.
             let answered_approvals: Vec<AnsweredApproval> = turn
@@ -235,7 +224,6 @@ impl LiveBufferStore {
                 turn_id: turn.turn_id,
                 user_input: turn.user_input.clone(),
                 accumulated,
-                pending_approval,
                 pending_server_requests,
                 answered_approvals,
                 answered_server_requests,
@@ -256,24 +244,16 @@ impl LiveBufferStore {
         buffers
             .iter()
             .filter_map(|(thread_id, turn)| {
-                let approval: Option<WireApprovalRequest> =
-                    turn.events.iter().rev().find_map(|e| match e {
-                        AgentEvent::ApprovalRequested { request, .. }
-                            if !turn.resolved_approvals.contains_key(&request.id) =>
-                        {
-                            Some(request.clone().into())
-                        }
-                        _ => None,
-                    });
+                let approvals = pending_approvals(&turn.events, &turn.resolved_approvals);
                 let mut server_requests = pending_server_requests(&turn.events);
                 server_requests
                     .retain(|request| !turn.resolved_server_requests.contains(&request.id));
-                if approval.is_none() && server_requests.is_empty() {
+                if approvals.is_empty() && server_requests.is_empty() {
                     return None;
                 }
                 Some(PendingAttention {
                     thread_id: *thread_id,
-                    approval,
+                    approvals,
                     server_requests,
                 })
             })
@@ -283,10 +263,39 @@ impl LiveBufferStore {
 
 /// One thread's outstanding user-facing requests, as needed to rebuild a connecting client's
 /// cross-thread activity view.
+#[derive(Debug)]
 pub struct PendingAttention {
     pub thread_id: ThreadId,
-    pub approval: Option<WireApprovalRequest>,
+    pub approvals: Vec<WireApprovalRequest>,
     pub server_requests: Vec<ServerRequest>,
+}
+
+/// Every approval the turn is still waiting on the user for, oldest first.
+///
+/// A turn can be blocked on several approvals at once (three commands proposed together, say), so
+/// this is a list, not a single value. A re-sent id is the same approval with a fresher payload, so
+/// the latest occurrence wins and the order is the first occurrence of each id. Approvals have no
+/// harness-emitted resolved event, so "still waiting" is exactly "not in `resolved_approvals`".
+fn pending_approvals(
+    events: &[AgentEvent],
+    resolved_approvals: &HashMap<ApprovalId, ApprovalDecision>,
+) -> Vec<WireApprovalRequest> {
+    let mut order: Vec<ApprovalId> = Vec::new();
+    let mut latest: HashMap<ApprovalId, &ApprovalRequest> = HashMap::new();
+    for event in events {
+        if let AgentEvent::ApprovalRequested { request, .. } = event
+            && !resolved_approvals.contains_key(&request.id)
+        {
+            if !latest.contains_key(&request.id) {
+                order.push(request.id.clone());
+            }
+            latest.insert(request.id.clone(), request);
+        }
+    }
+    order
+        .into_iter()
+        .map(|id| latest.remove(&id).expect("seen").clone().into())
+        .collect()
 }
 
 fn pending_server_requests(events: &[AgentEvent]) -> Vec<ServerRequest> {
@@ -422,10 +431,10 @@ impl Default for LiveBufferStore {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use chrono::Utc;
-    use giskard_core::approval::{
-        ApprovalDecision, ApprovalKind, ApprovalMetadata, ApprovalRequest,
-    };
+    use giskard_core::approval::{ApprovalKind, ApprovalMetadata};
     use giskard_core::ids::ApprovalId;
     use giskard_core::ids::{ItemId, ServerRequestId, ThreadId, TurnId};
     use giskard_core::item::{CommandExecutionStart, Item, ItemKind, ItemStart};
@@ -433,6 +442,28 @@ mod tests {
     use giskard_proto::{WireApprovalMetadata, WireItemPayload};
 
     use super::*;
+
+    /// The approvals a reconnecting client would still treat as actionable, in arrival order.
+    /// Mirrors `outstandingApprovals` in the browser so a server-side test can assert what the
+    /// client will derive from the snapshot.
+    fn outstanding_approvals(snapshot: &LiveTurnSnapshot) -> Vec<ApprovalId> {
+        let answered: HashSet<ApprovalId> = snapshot
+            .answered_approvals
+            .iter()
+            .map(|a| a.request_id.clone())
+            .collect();
+        let mut order: Vec<ApprovalId> = Vec::new();
+        let mut seen: HashSet<ApprovalId> = HashSet::new();
+        for event in &snapshot.accumulated {
+            if let WireAgentEvent::ApprovalRequested { request, .. } = event
+                && !answered.contains(&request.id)
+                && seen.insert(request.id.clone())
+            {
+                order.push(request.id.clone());
+            }
+        }
+        order
+    }
 
     fn command_start(item_id: ItemId) -> ItemStart {
         ItemStart {
@@ -707,7 +738,14 @@ mod tests {
             .await;
 
         let snapshot = store.snapshot(thread).await.expect("snapshot");
-        let pending = snapshot.pending_approval.expect("pending approval");
+        let pending = snapshot
+            .accumulated
+            .iter()
+            .find_map(|e| match e {
+                WireAgentEvent::ApprovalRequested { request, .. } => Some(request.clone()),
+                _ => None,
+            })
+            .expect("the approval request should be present in the accumulated events");
         assert!(pending.metadata.iter().any(|metadata| {
             matches!(
                 metadata,
@@ -776,7 +814,7 @@ mod tests {
         let snapshot = store.snapshot(thread).await.expect("snapshot");
         // The answered approval must not come back as actionable — re-answering a stale id errors.
         assert!(
-            snapshot.pending_approval.is_none(),
+            outstanding_approvals(&snapshot).is_empty(),
             "answered approval should not be pending after a reload"
         );
         // But it is reported as answered so the reconnecting client renders it in its resolved state.
@@ -816,14 +854,69 @@ mod tests {
             .await;
 
         let snapshot = store.snapshot(thread).await.expect("snapshot");
-        let pending = snapshot
-            .pending_approval
-            .expect("the still-open approval should remain pending");
-        assert_eq!(pending.id, ApprovalId("ap_open".into()));
+        // Only the still-open approval is actionable; the answered one is not, even though both
+        // ride along in `accumulated`.
+        assert_eq!(
+            outstanding_approvals(&snapshot),
+            vec![ApprovalId("ap_open".into())]
+        );
         assert_eq!(snapshot.answered_approvals.len(), 1);
         assert_eq!(
             snapshot.answered_approvals[0].request_id,
             ApprovalId("ap_answered".into())
+        );
+    }
+
+    // A turn really can be blocked on several approvals at once — three commands proposed together,
+    // for instance. The snapshot used to carry a single `pending_approval`, so it named only the
+    // most recently raised one and quietly dropped the rest. The outstanding set is now derived
+    // from `accumulated`, so every unanswered approval is reported.
+    #[tokio::test]
+    async fn every_unanswered_approval_is_reported_as_pending() {
+        let store = LiveBufferStore::new();
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+
+        store.start_turn(thread).await;
+        store
+            .append(thread, AgentEvent::TurnStarted { thread, turn })
+            .await;
+        for id in ["ap_first", "ap_second", "ap_third"] {
+            store
+                .append(thread, approval_requested(thread, turn, id))
+                .await;
+        }
+
+        let snapshot = store.snapshot(thread).await.expect("snapshot");
+        assert_eq!(
+            outstanding_approvals(&snapshot),
+            vec![
+                ApprovalId("ap_first".into()),
+                ApprovalId("ap_second".into()),
+                ApprovalId("ap_third".into()),
+            ]
+        );
+
+        // The SB5 connect bootstrap reports all of them too, not just one.
+        let [attention] = store
+            .pending_attention()
+            .await
+            .into_iter()
+            .filter(|entry| entry.thread_id == thread)
+            .collect::<Vec<_>>()
+            .try_into()
+            .expect("one pending-attention entry for the thread");
+        assert_eq!(
+            attention
+                .approvals
+                .iter()
+                .map(|approval| approval.id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                ApprovalId("ap_first".into()),
+                ApprovalId("ap_second".into()),
+                ApprovalId("ap_third".into()),
+            ]
         );
     }
 

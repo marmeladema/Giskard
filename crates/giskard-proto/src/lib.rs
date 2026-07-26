@@ -149,8 +149,14 @@ pub struct LiveTurnSnapshot {
     pub turn_id: TurnId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_input: Option<UserInput>,
+    /// The turn as the browser should see it, including what it is still waiting on the user for.
+    ///
+    /// Every `ApprovalRequested` rides along here, answered ones included; the client renders
+    /// answered ones resolved using [`Self::answered_approvals`] and treats the rest as
+    /// actionable. There is no separate "pending approval" field: a turn can be blocked on several
+    /// approvals at once (three commands proposed together, say), and a single field would name
+    /// only the most recently raised one and silently drop the rest.
     pub accumulated: Vec<WireAgentEvent>,
-    pub pending_approval: Option<WireApprovalRequest>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_server_requests: Vec<ServerRequest>,
     /// Approvals the user already answered during this in-flight turn, with the decision they made.
@@ -987,7 +993,6 @@ mod tests {
             turn_id: turn,
             user_input: None,
             accumulated: vec![],
-            pending_approval: None,
             pending_server_requests: vec![ServerRequest {
                 id: giskard_core::ids::ServerRequestId("req_1".into()),
                 method: "item/tool/call".into(),
@@ -1013,7 +1018,6 @@ mod tests {
             turn_id: TurnId::new(),
             user_input: None,
             accumulated: vec![],
-            pending_approval: None,
             pending_server_requests: vec![],
             answered_approvals: vec![AnsweredApproval {
                 request_id: ApprovalId("ap_1".into()),
