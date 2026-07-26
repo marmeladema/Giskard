@@ -1,3 +1,4 @@
+use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
 use tokio::sync::Mutex;
@@ -201,9 +202,6 @@ impl LiveBufferStore {
                 .collect();
             let accumulated: Vec<WireAgentEvent> =
                 turn.events.iter().cloned().map(Into::into).collect();
-            let mut pending_server_requests = pending_server_requests(&turn.events);
-            pending_server_requests
-                .retain(|request| !turn.resolved_server_requests.contains(&request.id));
             // Answered requests still ride along in `accumulated` as `ServerRequestReceived`, and
             // replaying that renders an actionable card. Naming them lets the client render those
             // resolved instead, exactly as `answered_approvals` does.
@@ -224,7 +222,6 @@ impl LiveBufferStore {
                 turn_id: turn.turn_id,
                 user_input: turn.user_input.clone(),
                 accumulated,
-                pending_server_requests,
                 answered_approvals,
                 answered_server_requests,
             }
@@ -245,9 +242,8 @@ impl LiveBufferStore {
             .iter()
             .filter_map(|(thread_id, turn)| {
                 let approvals = pending_approvals(&turn.events, &turn.resolved_approvals);
-                let mut server_requests = pending_server_requests(&turn.events);
-                server_requests
-                    .retain(|request| !turn.resolved_server_requests.contains(&request.id));
+                let server_requests =
+                    pending_server_requests(&turn.events, &turn.resolved_server_requests);
                 if approvals.is_empty() && server_requests.is_empty() {
                     return None;
                 }
@@ -298,20 +294,34 @@ fn pending_approvals(
         .collect()
 }
 
-fn pending_server_requests(events: &[AgentEvent]) -> Vec<ServerRequest> {
-    let mut requests: HashMap<ServerRequestId, ServerRequest> = HashMap::new();
+fn pending_server_requests(
+    events: &[AgentEvent],
+    resolved_server_requests: &HashSet<ServerRequestId>,
+) -> Vec<ServerRequest> {
+    // An `IndexMap` keeps arrival order deterministically (unlike `HashMap::into_values`, which
+    // iterated by hash bucket) so the bootstrap names the same request in the sidebar every reload.
+    // `insert` on receive updates the payload in place when the id is already present, or appends
+    // it when it is new; `shift_remove` on resolve drops it. A re-sent id after a resolution
+    // re-inserts at the end, so a reopen moves to the back rather than keeping its first-seen
+    // position — the reopened request is the newest thing demanding attention. Mirrors
+    // `outstandingServerRequests` in the browser.
+    let mut pending: IndexMap<ServerRequestId, &ServerRequest> = IndexMap::new();
     for event in events {
         match event {
             AgentEvent::ServerRequestReceived { request, .. } => {
-                requests.insert(request.id.clone(), request.clone());
+                pending.insert(request.id.clone(), request);
             }
             AgentEvent::ServerRequestResolved { request_id, .. } => {
-                requests.remove(request_id);
+                pending.shift_remove(request_id);
             }
             _ => {}
         }
     }
-    requests.into_values().collect()
+    pending
+        .into_iter()
+        .filter(|(id, _)| !resolved_server_requests.contains(id))
+        .map(|(_, request)| request.clone())
+        .collect()
 }
 
 fn completed_command_item_id(event: &AgentEvent) -> Option<ItemId> {
@@ -463,6 +473,35 @@ mod tests {
             }
         }
         order
+    }
+
+    /// The server requests a reconnecting client would still treat as actionable, in arrival
+    /// order. Mirrors `outstandingServerRequests` in the browser so a server-side test can assert
+    /// what the client will derive from the snapshot.
+    fn outstanding_server_requests(snapshot: &LiveTurnSnapshot) -> Vec<ServerRequestId> {
+        let answered: HashSet<ServerRequestId> =
+            snapshot.answered_server_requests.iter().cloned().collect();
+        // An `IndexSet` keeps arrival order deterministically. `insert` on receive updates in place
+        // when the id is already present, or appends it when it is new; `shift_remove` on resolve
+        // drops it. A re-sent id after a resolution re-inserts at the end, so a reopen moves to the
+        // back rather than keeping its first-seen position. Mirrors `outstandingServerRequests` in
+        // the browser and `pending_server_requests` on the server.
+        let mut pending: indexmap::IndexSet<ServerRequestId> = indexmap::IndexSet::new();
+        for event in &snapshot.accumulated {
+            match event {
+                WireAgentEvent::ServerRequestReceived { request, .. } => {
+                    pending.insert(request.id.clone());
+                }
+                WireAgentEvent::ServerRequestResolved { request_id, .. } => {
+                    pending.shift_remove(request_id);
+                }
+                _ => {}
+            }
+        }
+        pending
+            .into_iter()
+            .filter(|id| !answered.contains(id))
+            .collect()
     }
 
     fn command_start(item_id: ItemId) -> ItemStart {
@@ -694,8 +733,99 @@ mod tests {
             .await;
 
         let snapshot = store.snapshot(thread).await.expect("snapshot");
-        assert_eq!(snapshot.pending_server_requests.len(), 1);
-        assert_eq!(snapshot.pending_server_requests[0].id, pending);
+        // The harness resolved one with its own event, the other is still open. The outstanding
+        // server requests are derived from `accumulated` plus `answered_server_requests`, so only
+        // the still-open one is reported as pending.
+        assert_eq!(
+            outstanding_server_requests(&snapshot),
+            vec![pending.clone()]
+        );
+    }
+
+    // A harness may resolve a server request and then re-raise the same id with a fresher payload
+    // (a re-send). The outstanding derivation must reopen it, not keep it hidden behind the earlier
+    // resolution — a reconnected user has to be able to answer it.
+    #[tokio::test]
+    async fn a_server_request_reopened_after_resolution_is_outstanding_again() {
+        let store = LiveBufferStore::new();
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let id = ServerRequestId("srv".into());
+
+        store.start_turn(thread).await;
+        store
+            .append(thread, AgentEvent::TurnStarted { thread, turn })
+            .await;
+        store
+            .append(thread, server_request_received(thread, turn, &id))
+            .await;
+        store
+            .append(
+                thread,
+                AgentEvent::ServerRequestResolved {
+                    thread,
+                    turn: Some(turn),
+                    request_id: id.clone(),
+                },
+            )
+            .await;
+        // The harness re-raises the same id after resolving it.
+        store
+            .append(thread, server_request_received(thread, turn, &id))
+            .await;
+
+        let snapshot = store.snapshot(thread).await.expect("snapshot");
+        assert_eq!(
+            outstanding_server_requests(&snapshot),
+            vec![id],
+            "a re-sent id after resolution must reopen the request"
+        );
+    }
+
+    // A reopen moves the request to the end of the arrival order, not back to its first-seen
+    // position. The sequence received(A), received(B), resolved(A), received(A) yields [B, A]:
+    // the second receive(A) re-inserts A at the back, so the reopened request is the newest thing
+    // demanding attention. Mirrors `pending_server_requests` on the server and
+    // `outstandingServerRequests` in the browser.
+    #[tokio::test]
+    async fn a_reopened_server_request_moves_to_the_end_of_arrival_order() {
+        let store = LiveBufferStore::new();
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let a = ServerRequestId("a".into());
+        let b = ServerRequestId("b".into());
+
+        store.start_turn(thread).await;
+        store
+            .append(thread, AgentEvent::TurnStarted { thread, turn })
+            .await;
+        store
+            .append(thread, server_request_received(thread, turn, &a))
+            .await;
+        store
+            .append(thread, server_request_received(thread, turn, &b))
+            .await;
+        store
+            .append(
+                thread,
+                AgentEvent::ServerRequestResolved {
+                    thread,
+                    turn: Some(turn),
+                    request_id: a.clone(),
+                },
+            )
+            .await;
+        // A re-opens after being resolved.
+        store
+            .append(thread, server_request_received(thread, turn, &a))
+            .await;
+
+        let snapshot = store.snapshot(thread).await.expect("snapshot");
+        assert_eq!(
+            outstanding_server_requests(&snapshot),
+            vec![b.clone(), a.clone()],
+            "a reopen moves the request to the end, it does not restore its first-seen position"
+        );
     }
 
     #[tokio::test]
@@ -786,6 +916,19 @@ mod tests {
                 reason: None,
                 metadata: vec![],
                 available: vec![ApprovalDecision::Accept, ApprovalDecision::Decline],
+            },
+        }
+    }
+
+    fn server_request_received(thread: ThreadId, turn: TurnId, id: &ServerRequestId) -> AgentEvent {
+        AgentEvent::ServerRequestReceived {
+            thread,
+            turn: Some(turn),
+            request: ServerRequest {
+                id: id.clone(),
+                method: "item/tool/call".into(),
+                params: serde_json::json!({ "tool": "example" }),
+                received_at: Utc::now(),
             },
         }
     }
@@ -917,6 +1060,57 @@ mod tests {
                 ApprovalId("ap_second".into()),
                 ApprovalId("ap_third".into()),
             ]
+        );
+    }
+
+    // A turn blocked on several server requests must report all of them in first-seen order, both
+    // in the reconnect snapshot and the SB5 connect bootstrap. The bootstrap feeds the sidebar's
+    // "what is this thread waiting on" and notification-click focus, so its order must be
+    // deterministic, not decided by hash iteration.
+    #[tokio::test]
+    async fn every_unanswered_server_request_is_reported_in_arrival_order() {
+        let store = LiveBufferStore::new();
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let ids: Vec<ServerRequestId> = ["sr_first", "sr_second", "sr_third"]
+            .into_iter()
+            .map(|s| ServerRequestId(s.into()))
+            .collect();
+
+        store.start_turn(thread).await;
+        store
+            .append(thread, AgentEvent::TurnStarted { thread, turn })
+            .await;
+        for id in &ids {
+            store
+                .append(thread, server_request_received(thread, turn, id))
+                .await;
+        }
+
+        let snapshot = store.snapshot(thread).await.expect("snapshot");
+        assert_eq!(
+            outstanding_server_requests(&snapshot),
+            ids,
+            "the snapshot derivation is first-seen ordered"
+        );
+
+        // The SB5 connect bootstrap (the production `pending_attention`) is first-seen ordered too.
+        let [attention] = store
+            .pending_attention()
+            .await
+            .into_iter()
+            .filter(|entry| entry.thread_id == thread)
+            .collect::<Vec<_>>()
+            .try_into()
+            .expect("one pending-attention entry for the thread");
+        assert_eq!(
+            attention
+                .server_requests
+                .iter()
+                .map(|request| request.id.clone())
+                .collect::<Vec<_>>(),
+            ids,
+            "the connect bootstrap must preserve first-seen order, not hash iteration order"
         );
     }
 

@@ -18,7 +18,7 @@ use giskard_harness::{
     AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
 };
 use giskard_persist::store::ProjectConfig;
-use giskard_proto::{ClientMessage, ServerMessage, WireAgentEvent};
+use giskard_proto::{ClientMessage, LiveTurnSnapshot, ServerMessage, WireAgentEvent};
 use giskard_server::{AppState, HarnessFactory, build_app};
 use tokio::sync::{Mutex, broadcast};
 use tokio::time::{Duration, Instant};
@@ -492,14 +492,17 @@ async fn websocket_subscribe_replays_pending_server_request_snapshot() {
 
     let snapshot = wait_for_live_snapshot(&mut reconnect).await;
     assert_eq!(snapshot.thread_id, thread_id);
-    assert_eq!(snapshot.pending_server_requests.len(), 1);
-    assert_eq!(
-        snapshot.pending_server_requests[0].id,
-        ServerRequestId("srv_1".into())
-    );
-    assert_eq!(
-        snapshot.pending_server_requests[0].method,
-        "item/tool/requestUserInput"
+    // The outstanding server request is derived from `accumulated` plus
+    // `answered_server_requests`, so the still-open one is reported as pending.
+    let rows = server_request_rows(&snapshot);
+    let [(request, resolved)] = &rows[..] else {
+        panic!("expected exactly one server request row, got {rows:?}");
+    };
+    assert_eq!(request.id, ServerRequestId("srv_1".into()));
+    assert_eq!(request.method, "item/tool/requestUserInput");
+    assert!(
+        !resolved,
+        "nobody answered it, so its row must still read open"
     );
 }
 
@@ -548,10 +551,16 @@ async fn answered_server_request_is_not_pending_after_reconnect() {
         .unwrap();
 
     let snapshot = wait_for_live_snapshot(&mut reconnect).await;
+    // The request is still replayed — its own row is what says it was answered, so the card renders
+    // resolved instead of re-prompting.
+    let rows = server_request_rows(&snapshot);
+    let [(request, resolved)] = &rows[..] else {
+        panic!("expected exactly one server request row, got {rows:?}");
+    };
+    assert_eq!(request.id, ServerRequestId("srv_1".into()));
     assert!(
-        snapshot.pending_server_requests.is_empty(),
-        "an answered request must not be replayed as pending, got {:?}",
-        snapshot.pending_server_requests
+        resolved,
+        "an answered request's row must be stamped resolved so it is not replayed as actionable"
     );
     assert_eq!(
         snapshot.answered_server_requests,
@@ -623,6 +632,31 @@ async fn wait_for_ws_error(ws: &mut TestWs) -> giskard_proto::ErrorInfo {
         }
     }
     panic!("error message not observed");
+}
+
+/// Every server-request row in the snapshot, paired with whether a reconnecting client would
+/// render it resolved (answered by the user or closed by the harness). Mirrors the client's
+/// `outstandingServerRequests` derivation.
+fn server_request_rows(snapshot: &LiveTurnSnapshot) -> Vec<(ServerRequest, bool)> {
+    let answered: std::collections::HashSet<ServerRequestId> =
+        snapshot.answered_server_requests.iter().cloned().collect();
+    let mut closed = std::collections::HashSet::new();
+    for ev in &snapshot.accumulated {
+        if let WireAgentEvent::ServerRequestResolved { request_id, .. } = ev {
+            closed.insert(request_id.clone());
+        }
+    }
+    snapshot
+        .accumulated
+        .iter()
+        .filter_map(|event| match event {
+            WireAgentEvent::ServerRequestReceived { request, .. } => Some((
+                request.clone(),
+                answered.contains(&request.id) || closed.contains(&request.id),
+            )),
+            _ => None,
+        })
+        .collect()
 }
 
 async fn wait_for_live_snapshot(ws: &mut TestWs) -> giskard_proto::LiveTurnSnapshot {

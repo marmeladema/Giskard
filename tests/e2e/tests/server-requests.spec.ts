@@ -3,6 +3,8 @@ import {
   SCRIPTED_SERVER_REQUEST_ID,
   SCRIPTED_SERVER_REQUEST_QUESTION,
   SCRIPTED_SERVER_REQUEST_TRIGGER,
+  SCRIPTED_SERVER_REQUEST_THEN_ERROR_MESSAGE,
+  SCRIPTED_SERVER_REQUEST_THEN_ERROR_TRIGGER,
   login,
   recordedNotifications,
   stubNotifications,
@@ -185,5 +187,49 @@ test.describe("server requests", () => {
     await expect(after).not.toHaveClass(/\bresolved\b/);
     await expect(after.getByRole("button", { name: "Continue", exact: true })).toBeEnabled();
     await expect(after.locator("select.server-request-answer")).toBeEnabled();
+  });
+});
+
+// The reconnect snapshot re-asserts what the turn is still waiting on *after* replaying the
+// accumulated events, mirroring the approval path. An `error` declares the turn inactive, so a
+// turn blocked on a server request that then errored would come back reading "errored, idle" —
+// no sidebar glyph, no waiting rank — while the request sat in the transcript with nothing
+// pointing at it. Re-asserting the outstanding server requests last gives the waiting state the
+// last word, so it outranks the error.
+test.describe("a still-blocked turn survives a reload that replays a later error", () => {
+  test.beforeEach(async ({ page }) => {
+    await login(page);
+  });
+
+  test("a thread blocked on a server request still reads as waiting after an error", async ({ page }) => {
+    const project = page.locator(".proj", { hasText: "Demo" });
+    await project.locator(".project-add").click();
+
+    const input = page.locator("#input");
+    await expect(input).toBeVisible();
+    await input.fill(SCRIPTED_SERVER_REQUEST_THEN_ERROR_TRIGGER);
+    await page.locator("#sendBtn").click();
+
+    // Both arrive in the same still-open turn, the error last.
+    await expect(page.locator("#transcript .msg.server-request")).toBeVisible();
+    await expect(page.locator("#transcript .msg.error")).toContainText(
+      SCRIPTED_SERVER_REQUEST_THEN_ERROR_MESSAGE,
+    );
+
+    await page.reload();
+    await expect(page.locator("#app")).toHaveClass(/open/);
+
+    // The error is replayed and still shown — it happened, and the transcript is the record.
+    await expect(page.locator("#transcript .msg.error")).toContainText(
+      SCRIPTED_SERVER_REQUEST_THEN_ERROR_MESSAGE,
+    );
+    // But the turn is still blocked on the user, and that outranks the error in the sidebar.
+    const row = page.locator(".thread.active");
+    await expect(row).toHaveClass(/\bactivity-waiting\b/);
+    await expect(row.locator(".thread-status")).toHaveText("!");
+    // And the request is still answerable, not stranded in a thread that reads as finished.
+    await expect(
+      page.locator("#transcript .msg.server-request").getByRole("button", { name: "Continue", exact: true }),
+    ).toBeEnabled();
   });
 });

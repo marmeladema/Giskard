@@ -37,6 +37,15 @@ export const SCRIPTED_APPROVAL_THEN_ERROR_MESSAGE = "Scripted non-fatal harness 
 export const SCRIPTED_SERVER_REQUEST_TRIGGER = "Trigger a scripted user input request.";
 export const SCRIPTED_SERVER_REQUEST_QUESTION = "Which branch should I use?";
 export const SCRIPTED_SERVER_REQUEST_ID = "scripted-server-request-1";
+/**
+ * Prompt that raises a server request and then streams a harness error in the same still-open
+ * turn, so the error is the last activity-bearing event of the turn. Kept in sync with
+ * `SCRIPTED_SERVER_REQUEST_THEN_ERROR_*` in
+ * `crates/giskard-server/src/bin/giskard-server-replay.rs`.
+ */
+export const SCRIPTED_SERVER_REQUEST_THEN_ERROR_TRIGGER =
+  "Trigger a server request followed by an error.";
+export const SCRIPTED_SERVER_REQUEST_THEN_ERROR_MESSAGE = "Scripted non-fatal harness error.";
 
 /**
  * Prompt that spawns a linked child which raises an approval and then holds its turn open, while the
