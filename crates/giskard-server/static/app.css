@@ -131,7 +131,18 @@
   .thread-section-label { margin:8px 0 3px 8px; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:0; }
   .subagent-open-btn { margin-top:8px; padding:4px 8px; font-size:12px; }
 
-  header.thr { display:flex; gap:12px; align-items:center; padding:10px 14px; border-bottom:1px solid var(--border); background:var(--panel); flex-wrap:wrap; }
+  /* The thread header sticks to the top of the scrolling center column so the status badges (WS
+     state, tasks, sub-agents, MCP, context) stay visible while the transcript scrolls, and so the
+     mobile on-screen keyboard — which shrinks the viewport and pushes content up — can't scroll
+     them out of view. z-index stays below the drawer (60), backdrop (55), and header popovers
+     (z-index:35). On desktop the mobile bar is hidden, so the header sticks at the very top
+     (top:0). On mobile the #mobileBar sits above it, so the header sticks at the mobile bar's
+     height (43px, set in the @media block) so the two bars stack without overlapping. */
+  header.thr {
+    display:flex; gap:12px; align-items:center; padding:10px 14px;
+    border-bottom:1px solid var(--border); background:var(--panel); flex-wrap:wrap;
+    position:sticky; top:0; z-index:30;
+  }
   /* Header controls are chrome, not content: keep their type a step smaller than the body so the
      transcript stays the focal point. */
   header.thr .badge { font-size:11px; padding:2px 8px; border:1px solid var(--border); border-radius:20px; }
@@ -768,7 +779,14 @@
   /* =================== Mobile / responsive ===================
      The same page adapts to the viewport (no separate mobile build). On narrow screens the
      sidebar becomes a slide-in drawer reached from a top bar. Desktop (>820px) is unchanged. */
-  #mobileBar { align-items:center; gap:10px; padding:8px 12px; border-bottom:1px solid var(--border); background:var(--panel); }
+  /* The mobile top bar (hamburger + title) sticks to the top of the scrolling center column so
+     it stays visible when the on-screen keyboard appears and shrinks the viewport (without this
+     the keyboard pushes it up off-screen). z-index is below the thread header (30) so the status
+     badges stack above it, and below the drawer/backdrop. */
+  #mobileBar {
+    align-items:center; gap:10px; padding:8px 12px; border-bottom:1px solid var(--border);
+    background:var(--panel); position:sticky; top:0; z-index:20;
+  }
   #mobileBar button { font-size:18px; line-height:1; padding:3px 11px; }
   #mobileBar .mbTitle { flex:1; min-width:0; text-align:center; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   #mobileBar .mbTitle .crumb { color:var(--muted); font-weight:500; }
@@ -780,8 +798,9 @@
     .resizer { display:none; }
     .center { border:0; height:100vh; height:100dvh; }
     #mobileBar { display:flex; }
-    /* Tighten the header on phones; with only the status badges left it stays on one line. */
-    header.thr { gap:7px 6px; padding:7px 10px; }
+    /* The mobile bar is 43px tall (measured at the 390px viewport); the thread header sticks
+       directly below it so the two bars stack without overlapping as the transcript scrolls. */
+    header.thr { top:43px; gap:7px 6px; padding:7px 10px; }
     header.thr .badge { padding:3px 7px; }
     /* The context gauge ("12.3k / 272k") is the widest element in the bar. Hide the inline number
        on phones — the full breakdown is one tap away in the Context card — so the row packs. */
