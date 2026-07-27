@@ -9,7 +9,7 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.62
+**Version:** 1.63
 
 > **Amendment — frontend approach (supersedes the Dioxus/WASM design below).**
 > This document was written targeting a **Dioxus fullstack / WebAssembly** frontend (`giskard-ui`),
@@ -22,6 +22,41 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.62 → 1.63), the draft opens before the project is fetched:**
+- **LT6:** The project `+` action must switch to the draft thread *synchronously*. It previously
+  awaited `GET /api/projects/{id}` for the project's default model and only then opened the draft,
+  which left the previously selected thread on screen — composer visible and editable — for the
+  length of that round-trip. Anything typed in that window was destroyed when the draft finally
+  opened and reset the composer, and the send that followed found an empty box and returned with no
+  message and no error, so the click read as "nothing happened". Nothing about drawing a draft needs
+  the project record; only the model default does.
+- **LT7:** A draft's model must never be a stand-in. Mode and permission preset default locally and
+  the composer is editable at once, but the model is server-derived, so until the project's default
+  arrives the draft holds *no* model: `state.currentModel` is null and the draft carries explicit
+  `modelLoading` / `modelError` state, which the picker shows. The first send is unavailable for
+  that window — the Send control is disabled, and the keyboard path refuses with the same reason,
+  since it does not go through the control. `threads/start` may therefore never carry a fallback
+  `model_ref`. This is a correctness rule, not a cosmetic one: a thread's provider is fixed once its
+  first turn starts (LT5), and switching a started thread across providers is rejected, so a turn
+  begun on a fallback binds the thread to the wrong provider permanently. When resolution fails, or
+  the project has no valid default, the draft stays uncommittable until the user picks a model
+  rather than falling back to one. An explicit model or reasoning effort chosen while resolution is
+  in flight pins the draft: it resolves the draft, and a later-arriving default must not replace it.
+  The default applies only to the draft it was requested for, never one the user has since sent,
+  switched away from, or replaced.
+- **LT8:** A draft send is identified by the draft it was issued for, not by its composer key. Two
+  successive drafts in the same project share the key `draft:<project_id>`, so a slow
+  `threads/start` for the first could otherwise return after the user opened a second one and clear
+  its composer, open over it, or mark its rows failed — losing text typed in the meantime, the same
+  class of loss as LT6. The continuation touches nothing unless the draft it was started for is
+  still the one on screen.
+- **LT9:** The project's model *catalog* (`GET /api/projects/{id}/models`) is a separate fetch from
+  its default model, and failing it does not block the draft: the default is what `threads/start`
+  carries, and the catalog only governs what else could be picked. The failure is surfaced anyway —
+  it leaves the picker with no options at all, so without a message it reads as a project with no
+  models rather than a list that could not be loaded. This applies to any active project, not just a
+  draft; per-source discovery *warnings* stay gated on an explicit reload, where they are not noise.
 
 **Changelog (1.61 → 1.62), drop `pending_server_requests`:**
 - **SR11a:** `LiveTurnSnapshot` no longer carries `pending_server_requests: Vec<ServerRequest>`.
@@ -2077,7 +2112,9 @@ Flow: user clicks "New project" → names it → picks a directory via the file 
 ### 7.1 Thread lifecycle
 
 - **Draft new thread:** user starts a new thread in a project; the browser opens an unpersisted
-  draft with project defaults for model, mode, and permission preset. There is no local
+  draft immediately, with mode and permission preset defaulted synchronously and the composer
+  editable. The model is resolved asynchronously (LT6/LT7): until it lands the draft has no model
+  and the first send is unavailable, so the turn can never start on a stand-in. There is no local
   `<thread_id>.json` and no native Codex thread yet.
 - **Create + first send:** user submits the first message; the browser calls
   `POST /api/projects/{id}/threads/start` with text, model/provider, mode, and permission preset.
@@ -2729,7 +2766,9 @@ sessions, so clarity and low visual noise beat flourish. Explicitly avoid the ge
 - **Composer drafts:** unsent text is browser-local and scoped to the active persisted thread id.
   A new-thread draft uses a per-project draft key until the first message creates the thread.
   Switching threads saves the previous draft and restores the target draft; sending successfully
-  clears only that draft.
+  clears only that draft. A view switch must not discard text typed while it is in progress (LT6):
+  the composer belongs to the thread on screen, so a switch that leaves the old composer editable
+  while it waits on the network can silently eat a message.
 - **Approval buttons:** `accept_for_session` uses a distinct secondary treatment so it does not
   read like the neutral/default Cancel action.
 - Source/code previews and downloads open as overlays from linkified transcript paths rather than

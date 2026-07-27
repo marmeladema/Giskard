@@ -1035,7 +1035,7 @@ async fn index_page_is_served_and_public() {
     assert!(
         body.contains("const attachmentsLoading = pendingAttachmentOperationCount() > 0")
             && body.contains(
-                "$(\"sendBtn\").disabled = readOnly || state.activeTurn || attachmentsLoading"
+                "readOnly || state.activeTurn || attachmentsLoading || modelUnresolved || (!ready && !draft)"
             )
             && body.contains("if (isDraftThread()) {")
             && body.contains("startDraftThread(text, attachments);"),
@@ -1612,12 +1612,15 @@ fn browser_isolates_global_and_project_model_catalogs() {
 
     let open_draft = between(
         body,
-        "function openDraftThread(pid, defaultModel) {",
+        "function openDraftThread(pid) {",
         "/* ---------- thread view + websocket ---------- */",
     );
+    // The draft opens with no model at all (LT7) — the project's default is resolved afterwards —
+    // and that has to be settled before the catalog work, which would otherwise repaint the picker
+    // from a model this draft has not chosen yet.
     assert_order(
         open_draft,
-        "state.currentModel = normalizeDraftModel(defaultModel);",
+        "state.currentModel = null;",
         "prepareProjectModelCatalog(pid);",
     );
     assert_order(
@@ -1847,7 +1850,7 @@ fn browser_scopes_unsent_composer_text_to_thread() {
 
     let open_draft = between(
         body,
-        "function openDraftThread(pid, defaultModel) {",
+        "function openDraftThread(pid) {",
         "/* ---------- thread view + websocket ---------- */",
     );
     assert_order(open_draft, "saveComposerDraft();", "state.projectId = pid;");
