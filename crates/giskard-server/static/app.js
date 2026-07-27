@@ -308,7 +308,13 @@ async function loadProjectModels(pid, opts) {
       for (const w of res.warnings) notice(`Model discovery — ${w.source}: ${w.message}`, "warning");
     }
   } catch (e) {
-    if (opts.announce && pid === state.projectId) notice("Could not reload models: "+e.message, "warning");
+    // Always surfaced for the active project, unlike the per-source discovery warnings above: those
+    // are noise outside an explicit reload, but a hard failure leaves the picker with no options at
+    // all. On a draft that means the project's default model is the only one available, and the
+    // user cannot pick another — they need to know why rather than find an empty list.
+    if (pid === state.projectId) {
+      notice("Could not load this project's models: " + e.message, "warning");
+    }
   } finally {
     _loadingProjectModels = false;
     if (state.modelsLoadingProject === pid) state.modelsLoadingProject = null;
@@ -1803,30 +1809,85 @@ $("removeProjectConfirm").onclick = async () => {
   }
 };
 
-async function newThread(pid) {
+// Open the draft immediately, then resolve the project's default model in the background.
+//
+// Fetching the project first left the *previous* thread on screen for a network round-trip, with
+// its composer visible and editable. Anything typed in that window was destroyed when
+// `openDraftThread` finally ran and reset the composer, and the Send that followed found an empty
+// box and returned silently — so the click read as "nothing happened" and the message was gone.
+// Nothing about drawing a draft needs the project record; only the model does.
+function newThread(pid) {
+  openDraftThread(pid);
+  applyProjectDefaultModel(pid, state.draftThread);
+}
+
+async function applyProjectDefaultModel(pid, draft) {
+  let project = null;
+  let failure = null;
   try {
-    const project = await api("GET", `/api/projects/${pid}`);
-    openDraftThread(pid, project && project.default_model);
-  } catch (e) { alert("New thread failed: "+e.message); }
-}
-
-function fallbackDraftModel() {
-  const first = state.models && state.models[0];
-  if (first && first.provider && first.model) {
-    return { provider:first.provider, model:first.model, reasoning_effort:null };
+    project = await api("GET", `/api/projects/${pid}`);
+  } catch (e) {
+    failure = "the project could not be loaded: " + e.message;
   }
-  return { provider:"openai", model:"gpt-5.5", reasoning_effort:null };
+  // Only apply the default if this is still the same untouched draft. The draft is interactive from
+  // the moment it opens, so while this was in flight the user may have sent it, switched away,
+  // opened another one — or picked a model themselves. Their choice wins: the project default is a
+  // starting point, not an override, and replacing it would run the turn on a model they did not
+  // pick. A pinned draft already left `modelLoading` false, so there is nothing to settle here.
+  if (!draft || state.draftThread !== draft || draft.modelPinned) return;
+
+  const model = project && project.default_model;
+  if (!failure && (!model || !model.provider || !model.model)) {
+    failure = "this project has no default model";
+  }
+  draft.modelLoading = false;
+  draft.modelError = failure;
+  if (!failure) state.currentModel = normalizeDraftModel(model);
+  syncModelControls();
+  updateComposerControls();
+  if (failure) notice("Cannot start a thread here — " + failure + ".", "error");
 }
 
+// Remember that the user chose this draft's model, so a late project default cannot replace it —
+// and that the draft now has an authoritative model, so it can be sent.
+function pinDraftModel() {
+  if (!state.draftThread) return;
+  state.draftThread.modelPinned = true;
+  state.draftThread.modelLoading = false;
+  state.draftThread.modelError = null;
+  // Picking a model is what resolves a draft that was waiting on — or failed to get — its default,
+  // so the Send control has to be re-evaluated here; nothing else on this path does it.
+  updateComposerControls();
+}
+
+// A draft cannot send until its model has resolved to a real one.
+//
+// While the project's default is in flight `state.currentModel` is null rather than a placeholder:
+// starting the first turn on a fallback would bind the thread to the wrong provider, and switching
+// a started thread across providers is not allowed, so it is not recoverable (LT7).
+function draftModelUnresolved() {
+  if (!isDraftThread()) return false;
+  return !state.currentModel || !state.currentModel.provider || !state.currentModel.model;
+}
+
+// Why the first send is unavailable: still resolving, or resolved to nothing usable.
+function draftModelUnavailableReason() {
+  const draft = state.draftThread;
+  if (draft && draft.modelError) {
+    return `Cannot start a thread here — ${draft.modelError}. Pick a model to continue.`;
+  }
+  return "Loading this project's model…";
+}
+
+// Null for anything that is not a real model, never a stand-in. A draft with no model simply
+// cannot be sent (LT7); inventing one here is how a thread ends up bound to the wrong provider.
 function normalizeDraftModel(model) {
-  if (model && model.provider && model.model) {
-    return {
-      provider:String(model.provider),
-      model:String(model.model),
-      reasoning_effort:model.reasoning_effort || null
-    };
-  }
-  return fallbackDraftModel();
+  if (!model || !model.provider || !model.model) return null;
+  return {
+    provider:String(model.provider),
+    model:String(model.model),
+    reasoning_effort:model.reasoning_effort || null
+  };
 }
 
 function isDraftThread() {
@@ -1882,7 +1943,7 @@ function renderDraftPlaceholder() {
       : "<kbd>Enter</kbd> sends · <kbd>Shift</kbd>+<kbd>Enter</kbd> adds a newline.</p>") +
     "</div></div>";
 }
-function openDraftThread(pid, defaultModel) {
+function openDraftThread(pid) {
   saveComposerDraft();
   clearWsReconnectTimer();
   const oldWs = state.ws;
@@ -1895,12 +1956,14 @@ function openDraftThread(pid, defaultModel) {
   state.projectId = pid;
   state.threadId = null;
   renderParentThreadButton();
-  state.draftThread = { projectId:pid, title:"New thread" };
+  // `modelLoading` until the project's default arrives; `currentModel` stays null until then so a
+  // placeholder can never reach `threads/start` (LT7).
+  state.draftThread = { projectId:pid, title:"New thread", modelLoading:true, modelError:null };
   state.firstTurnStartingThreadId = null;
   state.pendingUserEl = null;
   state.pendingUserText = null;
   state.compactPending = false;
-  state.currentModel = normalizeDraftModel(defaultModel);
+  state.currentModel = null;
   prepareProjectModelCatalog(pid);
   state.mcpServers = []; state.mcpError = null; state.expandedMcps = new Set();
   state.mcpCapabilities = { status:false, reload:false, oauth_login:false };
@@ -2201,12 +2264,15 @@ function updateComposerControls() {
   const readOnly = state.threadReadOnly && !draft;
   const attachmentsLoading = pendingAttachmentOperationCount() > 0;
   const attachmentInputAllowed = hasThreadSurface && !readOnly && !(draft && state.activeTurn);
-  $("sendBtn").disabled = readOnly || state.activeTurn || attachmentsLoading || (!ready && !draft);
+  const modelUnresolved = draftModelUnresolved();
+  $("sendBtn").disabled =
+    readOnly || state.activeTurn || attachmentsLoading || modelUnresolved || (!ready && !draft);
   // The send arrow and the stop square share one slot: hide the arrow while a turn is running so
   // only the red stop square is visible (no disabled send button alongside it).
   $("sendBtn").hidden = state.activeTurn && !draft;
   $("sendBtn").title = readOnly ? "Read-only thread — pick a model from a configured provider to reactivate it." :
-    attachmentsLoading ? "Wait for attached files to finish loading." : "Send";
+    attachmentsLoading ? "Wait for attached files to finish loading." :
+    modelUnresolved ? draftModelUnavailableReason() : "Send";
   $("stopBtn").hidden = !state.activeTurn || draft;
   $("stopBtn").disabled = !ready || state.interruptPending;
   // The stop button shows a Unicode black square (■) glyph; the "stopping" state is conveyed via
@@ -7046,15 +7112,33 @@ $("attachBtn").onclick = () => $("attachmentInput").click();
 $("attachmentInput").addEventListener("change", attachSelectedFiles);
 initComposerFileDrop();
 
+// Whether the draft this send was issued for is no longer the one on screen: the user has since
+// opened another draft (same project or not), switched to a persisted thread, or changed projects.
+// The continuation must then touch nothing, or it acts on someone else's composer.
+function staleDraftContinuation(draft, draftKey, pid) {
+  return state.draftThread !== draft ||
+    composerDraftKey() !== draftKey ||
+    !isDraftThread() ||
+    state.projectId !== pid;
+}
+
 async function startDraftThread(text, attachments) {
   const pid = state.projectId;
   if (!pid || !isDraftThread()) return;
-  if (!state.currentModel || !state.currentModel.provider || !state.currentModel.model) {
-    notice("Choose a model before sending the first message.", "error");
+
+  // The Send button is disabled while this is true, but Enter reaches here directly, so the refusal
+  // lives here too. Nothing is drawn yet, so there is no optimistic row to unwind.
+  if (draftModelUnresolved()) {
+    notice(draftModelUnavailableReason(), "error");
     return;
   }
 
   const draftKey = composerDraftKey();
+  // The draft object itself, not just its key: two successive drafts in the same project share
+  // `draft:<pid>`, so the key cannot tell them apart. Without this a slow `threads/start` for the
+  // first draft would come back after the user opened a second one and clear its composer, open
+  // over it, or mark its rows failed — losing whatever they had typed in the meantime.
+  const draft = state.draftThread;
   $("transcript").innerHTML = "";   // drop the draft placeholder before the first real row
   const body = bubble("user pending","you");
   body.textContent = pendingUserDisplayText(text, attachments);
@@ -7074,7 +7158,7 @@ async function startDraftThread(text, attachments) {
     });
     const tid = res && res.thread_id;
     if (!tid) throw new Error("new thread response did not include thread_id");
-    if (composerDraftKey() !== draftKey || !isDraftThread() || state.projectId !== pid) {
+    if (staleDraftContinuation(draft, draftKey, pid)) {
       await loadThreads(pid);
       return;
     }
@@ -7088,7 +7172,7 @@ async function startDraftThread(text, attachments) {
     setTurnActive(true);
     if (res.warning) notice(res.warning.message || "warning", res.warning.severity || "warning");
   } catch (e) {
-    if (composerDraftKey() !== draftKey || !isDraftThread() || state.projectId !== pid) return;
+    if (staleDraftContinuation(draft, draftKey, pid)) return;
     msgEl.classList.remove("pending");
     msgEl.classList.add("failed");
     state.pendingUserEl = null;
@@ -7508,7 +7592,13 @@ function updateModelButton() {
   const btn = $("modelPickerBtn"); if (!btn) return;
   const label = btn.querySelector(".mp-label");
   const m = state.currentModel;
-  if (!m || !m.model) { label.textContent = "Model"; return; }
+  if (!m || !m.model) {
+    const draft = isDraftThread() ? state.draftThread : null;
+    label.textContent = draft
+      ? (draft.modelError ? "Model unavailable" : "Loading model…")
+      : "Model";
+    return;
+  }
   const desc = findModelDescriptor(m.provider, m.model);
   let txt = modelOptionLabel(desc || m);
   // Models that support reasoning effort always show it — "Default" when left unset — so the chip
@@ -7566,6 +7656,7 @@ function sendSelectedModel() {
   }
   const next = { provider:model.provider, model:model.model, reasoning_effort:null };
   state.currentModel = next;
+  pinDraftModel();
   syncEffortControl();
   if (isDraftThread()) return;
   if (!state.threadId) return;
@@ -7584,6 +7675,7 @@ function sendSelectedEffort() {
   const effort = $("effortSel").value || null;
   const next = { provider:model.provider, model:model.model, reasoning_effort:effort };
   state.currentModel = next;
+  pinDraftModel();
   syncEffortControl();
   if (isDraftThread()) return;
   if (!state.threadId) return;
