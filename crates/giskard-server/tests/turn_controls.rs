@@ -1,4 +1,4 @@
-//! Per-turn control integration tests: modes, model selection, approval policy, and plan dump.
+//! Per-turn control integration tests: modes, model selection, permission preset, and plan dump.
 
 use std::sync::Arc;
 

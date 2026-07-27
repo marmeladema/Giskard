@@ -15,23 +15,23 @@ pub enum Mode {
     Build,
 }
 
-impl Mode {
-    /// Returns the Codex sandbox policy for this mode.
-    pub fn sandbox_policy(&self) -> &'static str {
-        match self {
-            Self::Plan => "read-only",
-            Self::Build => "workspace-write",
-        }
-    }
-}
-
-/// Approval policy (spec §9.1).
+/// Permission preset (spec §9.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ApprovalPolicy {
-    ReadOnly,
-    Ask,
-    Auto,
+pub enum PermissionPreset {
+    AskFirst,
+    AutoApprove,
+    FullAccess,
+}
+
+impl PermissionPreset {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AskFirst => "ask_first",
+            Self::AutoApprove => "auto_approve",
+            Self::FullAccess => "full_access",
+        }
+    }
 }
 
 /// Per-turn overrides sent to the harness (spec §7.5, P1).
@@ -39,14 +39,14 @@ pub enum ApprovalPolicy {
 /// A **resolved snapshot**, not a delta. The server constructs it at `start_turn` from the
 /// thread's persisted state. `model = None` means "reuse the thread's current model."
 /// Effort lives only in `ModelRef.reasoning_effort` (no standalone field).
-/// `approval_policy` is the thread's persisted policy, included in the snapshot so the harness
+/// `permission_preset` is the thread's persisted preset, included in the snapshot so the harness
 /// can pass it to `turn/start`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelRef>,
     pub mode: Mode,
-    pub approval_policy: ApprovalPolicy,
+    pub permission_preset: PermissionPreset,
 }
 
 /// Outcome of a completed turn (spec §4.5).
@@ -102,12 +102,6 @@ mod tests {
     use crate::model::Effort;
 
     #[test]
-    fn mode_sandbox_mapping() {
-        assert_eq!(Mode::Plan.sandbox_policy(), "read-only");
-        assert_eq!(Mode::Build.sandbox_policy(), "workspace-write");
-    }
-
-    #[test]
     fn mode_serde() {
         let json = serde_json::to_string(&Mode::Build).unwrap();
         assert_eq!(json, "\"build\"");
@@ -116,9 +110,11 @@ mod tests {
     }
 
     #[test]
-    fn approval_policy_serde() {
-        let json = serde_json::to_string(&ApprovalPolicy::ReadOnly).unwrap();
-        assert_eq!(json, "\"read_only\"");
+    fn permission_preset_serde() {
+        let json = serde_json::to_string(&PermissionPreset::AskFirst).unwrap();
+        assert_eq!(json, "\"ask_first\"");
+        assert!(serde_json::from_str::<PermissionPreset>("\"read_only\"").is_err());
+        assert!(serde_json::from_str::<PermissionPreset>("\"auto\"").is_err());
     }
 
     #[test]
@@ -130,10 +126,21 @@ mod tests {
                 reasoning_effort: Some(Effort::new("high")),
             }),
             mode: Mode::Build,
-            approval_policy: ApprovalPolicy::Ask,
+            permission_preset: PermissionPreset::AskFirst,
         };
         let json = serde_json::to_string(&overrides).unwrap();
         let back: TurnOverrides = serde_json::from_str(&json).unwrap();
         assert_eq!(overrides, back);
+
+        let legacy = serde_json::from_value::<TurnOverrides>(serde_json::json!({
+            "model": {
+                "provider": "openai",
+                "model": "gpt-5.5",
+                "reasoning_effort": "high"
+            },
+            "mode": "build",
+            "approval_policy": "auto"
+        }));
+        assert!(legacy.is_err());
     }
 }

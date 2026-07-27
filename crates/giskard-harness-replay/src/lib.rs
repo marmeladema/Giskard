@@ -493,7 +493,7 @@ mod tests {
                 TurnOverrides {
                     model: None,
                     mode: Mode::Build,
-                    approval_policy: giskard_core::turn::ApprovalPolicy::Auto,
+                    permission_preset: giskard_core::turn::PermissionPreset::AutoApprove,
                 },
             )
             .await
@@ -555,7 +555,7 @@ mod tests {
                 TurnOverrides {
                     model: None,
                     mode: Mode::Build,
-                    approval_policy: giskard_core::turn::ApprovalPolicy::Auto,
+                    permission_preset: giskard_core::turn::PermissionPreset::AutoApprove,
                 },
             )
             .await

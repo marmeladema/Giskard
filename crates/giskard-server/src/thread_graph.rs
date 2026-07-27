@@ -165,7 +165,7 @@ mod tests {
     use chrono::Utc;
     use giskard_core::model::ModelRef;
     use giskard_core::token::TokenLedger;
-    use giskard_core::turn::{ApprovalPolicy, Mode};
+    use giskard_core::turn::{Mode, PermissionPreset};
 
     use super::*;
 
@@ -187,7 +187,7 @@ mod tests {
             },
             context_window: 1,
             model_context_windows: HashMap::new(),
-            approval_policy: ApprovalPolicy::Ask,
+            permission_preset: PermissionPreset::AskFirst,
             model_efforts: HashMap::new(),
             tokens: TokenLedger::default(),
             created_at: Utc::now(),

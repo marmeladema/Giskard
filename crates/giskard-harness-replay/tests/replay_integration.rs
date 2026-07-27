@@ -10,7 +10,7 @@ use giskard_core::ids::{ItemId, ThreadId, TurnId};
 use giskard_core::item::{Item, ItemDelta, ItemKind, ItemPayload, ItemStart};
 use giskard_core::model::ModelRef;
 use giskard_core::token::TokenUsage;
-use giskard_core::turn::{ApprovalPolicy, Mode, TurnStatus, TurnStatusKind};
+use giskard_core::turn::{Mode, PermissionPreset, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{AgentHarness, OpenThreadOptions};
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
@@ -142,7 +142,7 @@ async fn open_thread_one_turn_assert_state() {
                     reasoning_effort: None,
                 }),
                 mode: Mode::Build,
-                approval_policy: ApprovalPolicy::Auto,
+                permission_preset: PermissionPreset::AutoApprove,
             },
         )
         .await
@@ -268,7 +268,7 @@ async fn replay_persisted_state_roundtrip() {
             giskard_core::turn::TurnOverrides {
                 model: None,
                 mode: Mode::Plan,
-                approval_policy: ApprovalPolicy::ReadOnly,
+                permission_preset: PermissionPreset::AskFirst,
             },
         )
         .await
@@ -324,7 +324,7 @@ async fn replay_persisted_state_roundtrip() {
         },
         context_window: 262_144,
         model_context_windows: Default::default(),
-        approval_policy: ApprovalPolicy::Ask,
+        permission_preset: PermissionPreset::AskFirst,
         model_efforts: std::collections::HashMap::new(),
         tokens: giskard_core::token::TokenLedger {
             total: usage,
@@ -341,6 +341,7 @@ async fn replay_persisted_state_roundtrip() {
     let loaded = store.load_thread(pid, thread_id).await.unwrap().unwrap();
     assert_eq!(loaded.title, "Fix auth");
     assert_eq!(loaded.mode, Mode::Plan);
+    assert_eq!(loaded.permission_preset, PermissionPreset::AskFirst);
     assert_eq!(loaded.tokens.total.input, 1200);
     assert_eq!(loaded.tokens.total.output, 340);
 }

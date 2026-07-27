@@ -139,14 +139,12 @@
         <button class="stop-square" id="stopBtn" type="button" title="Interrupt the running turn" aria-label="Interrupt the running turn" hidden>■</button>
       </div>
       <div class="attachment-tray" id="attachmentTray" role="status" aria-live="polite" hidden></div>
-      <!-- Turn settings sit below the composer, split left/right: the turn's "how" (mode +
-           approvals) on the left, the model it runs on (model + effort) on the right. Each is a
-           compact chip opening a two-column popover. The selects keep their ids so the existing
-           mode / approval / model / effort logic is unchanged. -->
+      <!-- Turn settings sit below the composer, split left/right: mode and permissions on the
+           left, model and effort on the right. Each chip opens a two-column popover. -->
       <div class="picker-bar" id="pickerBar" style="display:none">
         <div class="picker picker-left" id="turnPicker">
           <button id="turnPickerBtn" class="mp-btn" type="button" aria-haspopup="true"
-                  title="Mode & approval policy for this thread">
+                  title="Mode & permission preset for this thread">
             <span class="mp-label">Build · Ask first</span><span class="mp-caret">▾</span>
           </button>
           <div id="turnPickerMenu" class="mp-popover" hidden>
@@ -158,11 +156,11 @@
               </select>
             </div>
             <div class="mp-field">
-              <label for="approvalSel">Approvals</label>
-              <select id="approvalSel" aria-label="Approval policy">
-                <option value="ask">Ask first</option>
-                <option value="auto">Auto approve</option>
-                <option value="read_only">Read only</option>
+              <label for="permissionPresetSel">Permissions</label>
+              <select id="permissionPresetSel" aria-label="Permission preset">
+                <option value="ask_first">Ask first</option>
+                <option value="auto_approve">Auto approve</option>
+                <option value="full_access">⚠ Full Access</option>
               </select>
             </div>
           </div>

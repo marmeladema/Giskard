@@ -273,7 +273,7 @@ test.describe("cross-project thread deletion", () => {
               text,
               model_ref: { provider: "replay", model: "replay-model" },
               mode: "build",
-              approval_policy: "ask",
+              permission_preset: "ask_first",
             }),
           });
           return (await res.json()).thread_id as string;

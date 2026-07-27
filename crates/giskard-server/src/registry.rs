@@ -1801,7 +1801,7 @@ async fn materialize_subagent_thread(
     let mode = parent_file.mode;
     let context_window = parent_file.context_window;
     let model_context_windows = parent_file.model_context_windows.clone();
-    let approval_policy = parent_file.approval_policy;
+    let permission_preset = parent_file.permission_preset;
     let model_efforts = parent_file.model_efforts.clone();
 
     let harness = shared
@@ -1873,7 +1873,7 @@ async fn materialize_subagent_thread(
         current_model: current_model.clone(),
         context_window,
         model_context_windows,
-        approval_policy,
+        permission_preset,
         model_efforts,
         tokens: giskard_core::token::TokenLedger::default(),
         created_at: now,
@@ -4100,7 +4100,7 @@ mod tests {
     use giskard_core::model::ModelRef;
     use giskard_core::server_request::ServerRequest;
     use giskard_core::token::{TokenLedger, TokenUsage};
-    use giskard_core::turn::{ApprovalPolicy, Mode, Turn, TurnStatus, TurnStatusKind};
+    use giskard_core::turn::{Mode, PermissionPreset, Turn, TurnStatus, TurnStatusKind};
     use giskard_core::user_input::UserInput;
     use giskard_harness::{AgentEventStream, ThreadHandle};
     use giskard_persist::PersistStore;
@@ -4404,7 +4404,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
-                    approval_policy: ApprovalPolicy::Ask,
+                    permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
                     created_at: now,
@@ -4792,7 +4792,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
-                    approval_policy: ApprovalPolicy::Ask,
+                    permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
                     created_at: now,
@@ -4907,7 +4907,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
-                    approval_policy: ApprovalPolicy::Ask,
+                    permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
                     created_at: now,
@@ -5036,7 +5036,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
-                    approval_policy: ApprovalPolicy::Ask,
+                    permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
                     created_at: now,
@@ -5159,7 +5159,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
-                    approval_policy: ApprovalPolicy::Ask,
+                    permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
                     created_at: now,
@@ -5312,7 +5312,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
-                    approval_policy: ApprovalPolicy::Ask,
+                    permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
                     created_at: now,
@@ -5436,7 +5436,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
-                    approval_policy: ApprovalPolicy::Ask,
+                    permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
                     created_at: now,
@@ -5568,7 +5568,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
-                    approval_policy: ApprovalPolicy::Ask,
+                    permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
                     created_at: now,
@@ -5666,7 +5666,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
-                    approval_policy: ApprovalPolicy::Ask,
+                    permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
                     created_at: now,
@@ -5834,7 +5834,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
-                    approval_policy: ApprovalPolicy::Ask,
+                    permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
                     created_at: now,
@@ -6060,7 +6060,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
-                    approval_policy: ApprovalPolicy::Ask,
+                    permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
                     created_at: now,
@@ -6173,7 +6173,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
-                    approval_policy: ApprovalPolicy::Ask,
+                    permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
                     created_at: now,
@@ -6432,7 +6432,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
-                    approval_policy: ApprovalPolicy::Ask,
+                    permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
                     created_at: now,
@@ -6630,7 +6630,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
-                    approval_policy: ApprovalPolicy::Ask,
+                    permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
                     created_at: now,
@@ -6838,7 +6838,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
-                    approval_policy: ApprovalPolicy::Ask,
+                    permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
                     created_at: now,

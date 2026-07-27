@@ -6,7 +6,7 @@ use giskard_core::ids::{ProjectId, ThreadId};
 use giskard_core::model::ModelRef;
 use giskard_core::thread::ThreadKind;
 use giskard_core::token::TokenLedger;
-use giskard_core::turn::{ApprovalPolicy, Mode};
+use giskard_core::turn::{Mode, PermissionPreset};
 use giskard_persist::PersistStore;
 use giskard_persist::store::ThreadFile;
 
@@ -39,7 +39,7 @@ fn test_thread(
         current_model: test_model(),
         context_window: 262_144,
         model_context_windows: Default::default(),
-        approval_policy: ApprovalPolicy::Ask,
+        permission_preset: PermissionPreset::AskFirst,
         model_efforts: HashMap::new(),
         tokens: TokenLedger::default(),
         created_at: now,

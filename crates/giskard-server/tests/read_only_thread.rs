@@ -11,7 +11,7 @@ use giskard_core::ids::{ItemId, ProjectId, ThreadId, TurnId};
 use giskard_core::item::{Item, ItemPayload};
 use giskard_core::model::ModelRef;
 use giskard_core::token::{TokenLedger, TokenUsage};
-use giskard_core::turn::{ApprovalPolicy, Mode, Turn, TurnStatus, TurnStatusKind};
+use giskard_core::turn::{Mode, PermissionPreset, Turn, TurnStatus, TurnStatusKind};
 use giskard_persist::store::{ProjectConfig, ThreadFile};
 use giskard_proto::ClientMessage;
 use giskard_server::{AppState, HarnessFactory, build_app};
@@ -93,7 +93,7 @@ fn seeded_thread(project_id: ProjectId, thread_id: ThreadId) -> ThreadFile {
         current_model: orphaned_model(),
         context_window: 131_072,
         model_context_windows: Default::default(),
-        approval_policy: ApprovalPolicy::Ask,
+        permission_preset: PermissionPreset::AskFirst,
         model_efforts: HashMap::new(),
         tokens: TokenLedger::default(),
         created_at: now,

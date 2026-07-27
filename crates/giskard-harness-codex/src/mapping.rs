@@ -21,7 +21,7 @@ use giskard_core::model::ModelRef;
 use giskard_core::server_request::ServerRequest as GiskardServerRequest;
 use giskard_core::text::trimmed_non_empty;
 use giskard_core::token::TokenUsage;
-use giskard_core::turn::{ApprovalPolicy, Mode, TurnStatus, TurnStatusKind};
+use giskard_core::turn::{Mode, PermissionPreset, TurnStatus, TurnStatusKind};
 
 use codex_codes::jsonrpc::RequestId;
 use codex_codes::messages::{Notification, ServerRequest as CodexServerRequest};
@@ -1373,20 +1373,6 @@ pub fn map_user_input(input: &giskard_core::user_input::UserInput) -> Vec<codex_
     }
 }
 
-pub fn map_mode_to_sandbox(mode: Mode) -> codex_codes::SandboxPolicy {
-    match mode {
-        Mode::Plan => codex_codes::SandboxPolicy::ReadOnly {
-            network_access: Some(true),
-        },
-        Mode::Build => codex_codes::SandboxPolicy::WorkspaceWrite {
-            exclude_slash_tmp: None,
-            exclude_tmpdir_env_var: None,
-            network_access: Some(true),
-            writable_roots: None,
-        },
-    }
-}
-
 pub fn map_mode_to_collaboration_mode(mode: Mode) -> codex_codes::ModeKind {
     match mode {
         Mode::Plan => codex_codes::ModeKind::Plan,
@@ -1394,11 +1380,21 @@ pub fn map_mode_to_collaboration_mode(mode: Mode) -> codex_codes::ModeKind {
     }
 }
 
-pub fn map_approval_policy(policy: ApprovalPolicy) -> codex_codes::AskForApproval {
-    match policy {
-        ApprovalPolicy::ReadOnly => codex_codes::AskForApproval::Never,
-        ApprovalPolicy::Ask => codex_codes::AskForApproval::OnRequest,
-        ApprovalPolicy::Auto => codex_codes::AskForApproval::Never,
+pub fn map_permission_preset_to_codex_approval(
+    preset: PermissionPreset,
+) -> codex_codes::AskForApproval {
+    match preset {
+        PermissionPreset::AskFirst => codex_codes::AskForApproval::OnRequest,
+        PermissionPreset::AutoApprove => codex_codes::AskForApproval::OnRequest,
+        PermissionPreset::FullAccess => codex_codes::AskForApproval::Never,
+    }
+}
+
+pub fn map_permission_preset_to_codex_permissions(preset: PermissionPreset) -> &'static str {
+    match preset {
+        PermissionPreset::AskFirst => ":read-only",
+        PermissionPreset::AutoApprove => ":workspace",
+        PermissionPreset::FullAccess => ":danger-full-access",
     }
 }
 
@@ -3359,26 +3355,6 @@ mod tests {
     }
 
     #[test]
-    fn build_mode_enables_workspace_network_access() {
-        match map_mode_to_sandbox(Mode::Build) {
-            codex_codes::SandboxPolicy::WorkspaceWrite { network_access, .. } => {
-                assert_eq!(network_access, Some(true));
-            }
-            other => panic!("expected workspace-write sandbox, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn plan_mode_enables_read_only_network_access() {
-        match map_mode_to_sandbox(Mode::Plan) {
-            codex_codes::SandboxPolicy::ReadOnly { network_access } => {
-                assert_eq!(network_access, Some(true));
-            }
-            other => panic!("expected read-only sandbox, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn mode_maps_to_matching_codex_collaboration_mode() {
         assert_eq!(
             map_mode_to_collaboration_mode(Mode::Plan),
@@ -3388,6 +3364,35 @@ mod tests {
             map_mode_to_collaboration_mode(Mode::Build),
             codex_codes::ModeKind::Default
         );
+    }
+
+    #[test]
+    fn permission_presets_map_to_codex_approval_and_permissions() {
+        let cases = [
+            (
+                PermissionPreset::AskFirst,
+                codex_codes::AskForApproval::OnRequest,
+                ":read-only",
+            ),
+            (
+                PermissionPreset::AutoApprove,
+                codex_codes::AskForApproval::OnRequest,
+                ":workspace",
+            ),
+            (
+                PermissionPreset::FullAccess,
+                codex_codes::AskForApproval::Never,
+                ":danger-full-access",
+            ),
+        ];
+
+        for (preset, approval, permissions) in cases {
+            assert_eq!(map_permission_preset_to_codex_approval(preset), approval);
+            assert_eq!(
+                map_permission_preset_to_codex_permissions(preset),
+                permissions
+            );
+        }
     }
 
     #[test]

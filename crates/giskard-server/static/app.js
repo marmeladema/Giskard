@@ -86,7 +86,7 @@ let state = {
   activeTaskGroup:null, taskGroupSeq:0, taskItemSeq:0, taskGroupsById:new Map(), taskGroupsByItemId:new Map(),
   expandedTaskGroups:new Set(), manuallyToggledTaskGroups:new Set(), expandedTaskDetails:new Map(),
   linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, codeOverlaySource:null, outputOverlay:null, activeTurn:false, interruptPending:false, compactPending:false,
-  awaitingInitialThreadState:false, awaitingThreadResync:false, awaitingIncrementalResync:false, resyncStickBottom:false, contextWindow:0, contextUsed:null, tokenLedger:null, approvalPolicy:"ask", currentModel:null,
+  awaitingInitialThreadState:false, awaitingThreadResync:false, awaitingIncrementalResync:false, resyncStickBottom:false, contextWindow:0, contextUsed:null, permissionPreset:"ask_first", currentModel:null,
   mcpServers:[], mcpCapabilities:{ status:false, reload:false, oauth_login:false }, mcpLoading:false, mcpError:null, expandedMcps:new Set(),
   threadReadOnly:false, readOnlyProvider:null, readOnlyMessage:null,
   pickerTypeahead:"", pickerTypeaheadTimer:null, pickerSelectedRow:null,
@@ -1752,7 +1752,7 @@ function openDraftThread(pid, defaultModel) {
   renderSubagentsButton();
   loadProjectModels(pid);   // load this project's model list (config + discovery + Codex names)
   setMode("build");
-  setApprovalPolicy("ask");
+  setPermissionPreset("ask_first");
   setTurnActive(false);
   state.historyLoaded = false; state.oldestTurnId = null; state.hasMoreHistory = false;
   state.loadingHistory = false; state.pendingOlder = false; state.autoFilledTurns = 0;
@@ -2075,7 +2075,7 @@ function updateComposerControls() {
     state.wsStatus==="connecting" ? "Connecting to agent…" :
     state.wsStatus==="reconnecting" ? "Reconnecting… keep drafting here." :
     "Disconnected from agent.";
-  $("approvalSel").disabled = !hasThreadSurface || (!ready && !draft);
+  $("permissionPresetSel").disabled = !hasThreadSurface || (!ready && !draft);
   $("modeSel").disabled = !hasThreadSurface || (!ready && !draft);
   $("turnPickerBtn").disabled = !hasThreadSurface || (!ready && !draft);
 }
@@ -2628,7 +2628,7 @@ function renderThreadState(s) {
   state.awaitingInitialThreadState = false;
   state.awaitingThreadResync = false;
   setMode(s.mode || "build");
-  setApprovalPolicy(s.approval_policy || "ask");
+  setPermissionPreset(s.permission_preset || "ask_first");
   if (s.current_model) {
     state.currentModel = s.current_model;
     state.pendingModelBeforeSelect = null;
@@ -2685,22 +2685,35 @@ function resetTranscriptForAuthoritativeSnapshot() {
   else setTurnActive(false);
 }
 const MODE_LABELS = { build:"Build", plan:"Plan" };
-const APPROVAL_LABELS = { ask:"Ask first", auto:"Auto approve", read_only:"Read only" };
-// Summarise "mode · approvals" on the turn chip below the composer.
+const PERMISSION_PRESET_LABELS = {
+  ask:"Ask first",
+  read_only:"Ask first",
+  ask_first:"Ask first",
+  auto:"Auto approve",
+  auto_approve:"Auto approve",
+  full_access:"⚠ Full Access"
+};
+function normalizePermissionPreset(preset) {
+  if (preset === "ask" || preset === "read_only") return "ask_first";
+  if (preset === "auto") return "auto_approve";
+  if (preset === "full_access") return "full_access";
+  return preset || "ask_first";
+}
+// Summarise "mode · permissions" on the turn chip below the composer.
 function updateTurnButton() {
   const btn = $("turnPickerBtn"); if (!btn) return;
   const mode = MODE_LABELS[state.mode] || "Build";
-  const appr = APPROVAL_LABELS[state.approvalPolicy] || "Ask first";
-  btn.querySelector(".mp-label").textContent = `${mode} · ${appr}`;
+  const preset = PERMISSION_PRESET_LABELS[state.permissionPreset] || "Ask first";
+  btn.querySelector(".mp-label").textContent = `${mode} · ${preset}`;
 }
 function setMode(mode) {
   state.mode = mode === "plan" ? "plan" : "build";
   $("modeSel").value = state.mode;
   updateTurnButton();
 }
-function setApprovalPolicy(policy) {
-  state.approvalPolicy = policy || "ask";
-  $("approvalSel").value = state.approvalPolicy;
+function setPermissionPreset(preset) {
+  state.permissionPreset = normalizePermissionPreset(preset);
+  $("permissionPresetSel").value = state.permissionPreset;
   updateTurnButton();
 }
 
@@ -6897,7 +6910,7 @@ async function startDraftThread(text, attachments) {
       attachments,
       model_ref: state.currentModel,
       mode: state.mode || "build",
-      approval_policy: state.approvalPolicy || "ask"
+      permission_preset: state.permissionPreset || "ask_first"
     });
     const tid = res && res.thread_id;
     if (!tid) throw new Error("new thread response did not include thread_id");
@@ -7235,22 +7248,22 @@ $("modeSel").onchange = () => {
   }
 };
 
-$("approvalSel").onchange = () => {
-  const previous = state.approvalPolicy || "ask";
-  const policy = $("approvalSel").value || "ask";
+$("permissionPresetSel").onchange = () => {
+  const previous = state.permissionPreset || "ask_first";
+  const preset = $("permissionPresetSel").value || "ask_first";
   if (isDraftThread()) {
-    setApprovalPolicy(policy);
+    setPermissionPreset(preset);
     return;
   }
   if (!state.threadId) {
-    setApprovalPolicy(previous);
+    setPermissionPreset(previous);
     return;
   }
-  if (send({ type:"set_approval_policy", thread_id: state.threadId, policy })) {
-    setApprovalPolicy(policy);
+  if (send({ type:"set_permission_preset", thread_id: state.threadId, preset })) {
+    setPermissionPreset(preset);
   } else {
-    setApprovalPolicy(previous);
-    notice(`Approval policy not changed: WebSocket is ${state.wsStatus}.`, "error");
+    setPermissionPreset(previous);
+    notice(`Permission preset not changed: WebSocket is ${state.wsStatus}.`, "error");
   }
 };
 

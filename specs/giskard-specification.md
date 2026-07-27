@@ -450,7 +450,7 @@
 - **LT1:** The browser's project `+` action opens an unpersisted draft thread. No local
   `ThreadFile` and no native Codex thread are created until the user sends the first message.
 - **LT2:** New thread creation uses `POST /api/projects/{id}/threads/start` with initial text,
-  model/provider, reasoning effort, mode, and approval policy. The server creates the native Codex
+  model/provider, reasoning effort, mode, and permission preset. The server creates the native Codex
   thread with `thread/start`, persists the Giskard thread, and starts the first turn as one
   server-owned operation.
 - **LT3:** Blank `POST /api/projects/{id}/threads` creation is rejected. That endpoint opens
@@ -707,22 +707,22 @@
   archive/delete while a turn or command is active.
 
 **Changelog (1.17 → 1.18), Codex collaboration mode alignment:**
-- **CM1:** Giskard Plan/Build mode now maps to both Codex sandbox policy and Codex
-  `collaborationMode` on `turn/start`: Plan sends `collaborationMode.mode = "plan"` and Build
-  sends `collaborationMode.mode = "default"`. This keeps Codex-only tool availability, including
-  `request_user_input` / `item/tool/requestUserInput`, aligned with the visible Giskard mode and
-  resets the app-server after a plan turn.
+- **CM1:** Giskard Plan/Build mode maps to Codex `collaborationMode` on `turn/start`: Plan sends
+  `collaborationMode.mode = "plan"` and Build sends `collaborationMode.mode = "default"`. This
+  keeps Codex-only tool availability, including `request_user_input` /
+  `item/tool/requestUserInput`, aligned with the visible Giskard mode and resets the app-server
+  after a plan turn. Codex permissions are selected by the thread's permission preset (§9).
 - **CM2:** The Codex harness initializes app-server with `capabilities.experimentalApi = true`,
   matching the current app-server contract needed for experimental interaction APIs such as
   collaboration modes and `request_user_input`.
 
-**Changelog (1.16 → 1.17), thread-scoped approval policy:**
-- **AP1:** Approval policy is now a concrete thread setting stored in
-  `<thread_id>.json`. Project creation no longer asks for policy, and `project.json` no longer owns
-  an effective policy. New threads start with `ask`.
-- **AP2:** `SetApprovalPolicy` is thread-scoped: `SetApprovalPolicy { thread_id, policy }` persists
-  the selected thread's policy and broadcasts `ThreadState`. Threads in the same project can
-  therefore run with different approval policies.
+**Changelog (1.16 → 1.17), thread-scoped permission preset:**
+- **AP1:** The permission preset is now a concrete thread setting stored in
+  `<thread_id>.json`. Project creation no longer asks for it, and `project.json` no longer owns
+  an effective preset. New threads start with `ask_first`.
+- **AP2:** `SetPermissionPreset` is thread-scoped: `SetPermissionPreset { thread_id, preset }` persists
+  the selected thread's preset and broadcasts `ThreadState`. Threads in the same project can
+  therefore run with different permission presets.
 
 **Changelog (1.15 → 1.16), approval metadata:**
 - **A3:** `ApprovalRequest` carries structured, card-facing `metadata` entries in addition to the
@@ -860,8 +860,8 @@
   (superseded by the 1.56 attachment contract above).
 - Defined "session" for `accept_for_session` = harness-process lifetime, fail-closed on respawn (§9.2.1).
 - Defined reconnect/live-turn resync via a per-turn in-memory live buffer + snapshot (§13.6).
-- Clarified Plan mode × approval policy: orthogonal but read-only makes policy moot; policy value
-  preserved (§9.1).
+- Clarified Plan mode × permission preset: collaboration mode and permissions are orthogonal; the
+  preset value is preserved (§9.1).
 - Made `tokens-global.json` a single-writer **ledger actor** (cross-project hot file) (§5.4).
 - Pinned **Dioxus 0.7** and forbade the auto-Tailwind path (no-npm) (§13.1).
 - Named candidate Codex context-usage fields + selection order (§10.3).
@@ -923,17 +923,17 @@
 - **P1:** Removed the effort double-home: `TurnOverrides.reasoning_effort` is dropped — effort
   lives only in `ModelRef.reasoning_effort` (§8.1). `TurnOverrides` is now a **resolved snapshot**
   (not a delta): the server builds it at `start_turn` from the thread's current mode, current model
-  (which carries effort), and effective approval policy. `TurnOverrides.model = None` means "reuse
-  the thread's current model." `TurnOverrides.approval_policy` remains in the struct but is now the
-  policy snapshot (read from durable state or coerced), not a per-turn override — see P3/AP1
+  (which carries effort), and effective permission preset. `TurnOverrides.model = None` means "reuse
+  the thread's current model." `TurnOverrides.permission_preset` remains in the struct but is now the
+  preset snapshot (read from durable state or coerced), not a per-turn override — see P3/AP1
   (§7.5).
 - **P2:** `SwitchMode` and `SelectModel` now **persist immediately** and echo state: the new
   mode/current_model is written to `<thread_id>.json` before the server returns, then a
   `ThreadState` is broadcast to all connected tabs so they stay in sync. The sandbox/model effect
   still takes hold at the next turn; only the stored intent is now durable (§7.4, §13.6).
 - **P3 (superseded by v1.17 AP1/AP2):** Downgraded the "overridable per turn"
-  approval-policy claim. `TurnOverrides.approval_policy` is no longer a per-turn override — it is
-  the policy snapshot the server reads from durable state and includes so the harness can pass it to
+  permission-preset claim. `TurnOverrides.permission_preset` is no longer a per-turn override — it is
+  the preset snapshot the server reads from durable state and includes so the harness can pass it to
   `turn/start` (§9.1, §13.6).
 - **P4:** The plan-dump write path (§7.4.1) now explicitly cross-references §6.2's path-confinement:
   the resolved path is canonicalized and anything escaping the workspace root is rejected before
@@ -944,12 +944,12 @@
   value; switching back restores it. The effort param is never sent when the active model doesn't
   support it (§8.5 already handles the send-side) (§8.4).
 - **C8:** Policy coercion for degraded harnesses: on harness attach, if the harness lacks
-  `live_approvals` and the stored policy is `ask`, the effective policy is coerced to `read_only`
-  for that session without overwriting the stored value, and a notice is surfaced (§9.4).
+  `live_approvals` and the stored preset needs live approval support, the effective preset is
+  coerced for that session without overwriting the stored value, and a notice is surfaced (§9.4).
 - **S6:** Approval diff preview in Phase 3 uses the **raw diff string** from the harness; structured
   `FileDiff` parsing is deferred to Phase 4 (§9.2, §15).
-- **S7:** When `plan_build_modes = false`, `Mode` resolves to the Build-equivalent (workspace-write)
-  single mode, so `TurnOverrides` is well-defined for every harness (§7.5, §13.5).
+- **S7:** When `plan_build_modes = false`, `Mode` resolves to the Build-equivalent single mode, so
+  `TurnOverrides` is well-defined for every harness (§7.5, §13.5).
 
 **Changelog (1.4 → 1.5), from usability/debugging pass:**
 - **E1:** Added structured, flattened server errors with stable `code`, `severity`, `message`,
@@ -1103,8 +1103,8 @@ Robot series). The Cargo workspace uses `giskard-*` crate names throughout (see 
 | **Thread** | A durable conversation within a project (maps to a Codex *Thread*). Contains an ordered sequence of turns. Resumable across restarts. |
 | **Turn** | One unit of agent work initiated by a single user input (maps to a Codex *Turn*). Produces a sequence of items and ends with a completion carrying token usage. |
 | **Item** | The atomic unit of agent input/output within a turn: a user message, an agent message, a reasoning note, a command execution, a file change, an approval request, a diff. Has a lifecycle: `started` → optional `delta`s → `completed`. |
-| **Mode** | A thread-level state: **Plan** (read-only; the agent analyzes and proposes) or **Build** (read-write; the agent implements). Switchable within a thread (§7.4). |
-| **Approval** | A server-initiated request from the harness asking the user to allow or deny a command execution or file change. Handled per the thread's approval policy (§9). |
+| **Mode** | A thread-level collaboration state: **Plan** (the agent analyzes and proposes) or **Build** (the agent implements). Switchable within a thread (§7.4). |
+| **Approval** | A server-initiated request from the harness asking the user to allow or deny a command execution or file change. Handled per the thread's permission preset (§9). |
 | **AgentEvent** | Giskard's internal, harness-neutral representation of everything streamed from a harness. Codex protocol messages are mapped into `AgentEvent`s. |
 | **Replay** | A recorded sequence of harness transport messages, played back through a mock harness for deterministic testing (§14). |
 
@@ -1115,7 +1115,7 @@ Config (global)
 └── Project (1 directory, 1 harness process)
     ├── ProjectConfig (workspace root, default model, harness kind, …)
     └── Thread (durable conversation)
-        ├── ThreadState (mode, current model, approval policy, token totals, context window)
+        ├── ThreadState (mode, current model, permission preset, token totals, context window)
         └── Turn (one user input → agent work)
             └── Item (message / reasoning / command / file-change / diff / approval)
 ```
@@ -1186,7 +1186,7 @@ A single Cargo workspace with focused crates. Names are prefixed `giskard-`.
 > **`giskard-core` is authoritative and native-facing** (it holds `PathBuf` and `serde_json::Value`
 > internally). The browser never consumes `giskard-core` directly; it consumes `giskard-proto`.
 > `giskard-proto` re-exports the pure, path-free `giskard-core` types (ids, `ModelRef`, `TokenUsage`,
-> `Mode`, `ApprovalPolicy`, `ApprovalDecision`, `Effort`, `TurnStatus`, `DiffHunk`/`DiffLine`,
+> `Mode`, `PermissionPreset`, `ApprovalDecision`, `Effort`, `TurnStatus`, `DiffHunk`/`DiffLine`,
 > `HarnessError`) — these are trivial serde structs that compile to `wasm32` cleanly — and defines
 > its own `Wire*` mirrors for the path-bearing streamed tree (§3.5). This keeps `giskard-core` clean
 > and its persisted/internal path representation lossless, while the wire representation is UTF-8
@@ -1260,7 +1260,7 @@ and approval requests. Two of the core types are hostile to a naïve shared-crat
 **Decision.** `giskard-proto` is the single wire vocabulary and the **only** crate `giskard-ui` links:
 
 1. **Path-free domain types stay in `giskard-core` and are re-exported by `giskard-proto`.** IDs,
-   `ModelRef`/`Effort`, `TokenUsage`, `Mode`, `ApprovalPolicy`, `ApprovalDecision`, `TurnStatus`,
+   `ModelRef`/`Effort`, `TokenUsage`, `Mode`, `PermissionPreset`, `ApprovalDecision`, `TurnStatus`,
    `DiffHunk`/`DiffLine`, `FileChangeKind`, `HarnessError`. They contain no `PathBuf`, so there is no
    lossiness and no reason to duplicate them.
 2. **Path-bearing streamed types are mirrored in `giskard-proto` as `Wire*` types with `String`
@@ -1786,7 +1786,7 @@ The `CodexHarness` maps the Codex app-server JSON-RPC protocol onto the above. K
 |------------------|---------|
 | `initialize` + `initialized` handshake | **once per process** (per project), during process spawn — not per thread (S1) |
 | `thread/start`, `thread/resume` | `open_thread` (S1: this is the per-thread call, distinct from the handshake) |
-| `turn/start` (with model/effort/sandbox per turn) | `start_turn` + `TurnOverrides` (P1: effort lives in `ModelRef`, not `TurnOverrides`) |
+| `turn/start` (with model/effort/permissions per turn) | `start_turn` + `TurnOverrides` (P1: effort lives in `ModelRef`, not `TurnOverrides`) |
 | `item/started`, `item/*/delta`, `item/completed` | `ItemStarted` / `ItemDelta` / `ItemCompleted` |
 | `turn/diff/updated` | `DiffUpdated` |
 | `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval` | `ApprovalRequested` |
@@ -1795,9 +1795,9 @@ The `CodexHarness` maps the Codex app-server JSON-RPC protocol onto the above. K
 | `turn/interrupt` | `interrupt` |
 | JSON-RPC error `-32001` "overloaded" | retry with exponential backoff + jitter, surfaced as transient `Error` only if retries exhausted |
 
-Plan vs build maps to the Codex per-turn sandbox policy: **Plan → `readOnly` with
-`networkAccess: true`**, **Build → `workspaceWrite` with `networkAccess: true`**. Approval policy
-maps to Codex's approval configuration (§9).
+Plan vs build maps to Codex collaboration mode only: **Plan → `plan`**, **Build → `default`**.
+The thread permission preset maps to Codex's built-in `permissions` profile and approval
+configuration (§9).
 
 ### 4.7 Process lifecycle (Codex)
 
@@ -1861,7 +1861,7 @@ giskard/
 │       ├── project.json        # ProjectConfig: workspace root, default model,
 │       │                       #   provider defaults, harness kind
 │       ├── threads/
-│       │   ├── <thread_id>.json        # thread metadata, approval policy, token cache — no history
+│       │   ├── <thread_id>.json        # thread metadata, permission preset, token cache — no history
 │       │   └── <thread_id>.jsonl       # authoritative turn history, one Turn per line (§5.4)
 │       └── tokens.json         # per-project token ledger (aggregates + daily buckets)
 └── tokens-global.json          # global token ledger (daily/weekly/monthly/total)
@@ -1920,7 +1920,7 @@ All defined in `giskard-core`, serialized by `giskard-persist`. Illustrative sha
   "model_context_windows": {             // C8: harness-reported effective windows retained by
     "openai": { "gpt-5.5": 258400 }      //   exact provider/model for reloads and model switches.
   },
-  "approval_policy": "ask",              // "ask" | "auto" | "read_only" (§9)
+  "permission_preset": "ask_first",        // permission preset (§9)
   "archived": false,                     // hidden from the active thread group when true
   "model_efforts": {                     // C7: per-model effort retention. Maps "provider/model"
     "openai/gpt-5.5": "high"             //   → stored Effort, so switching back to a reasoning model
@@ -2077,10 +2077,10 @@ Flow: user clicks "New project" → names it → picks a directory via the file 
 ### 7.1 Thread lifecycle
 
 - **Draft new thread:** user starts a new thread in a project; the browser opens an unpersisted
-  draft with project defaults for model, mode, and approval policy. There is no local
+  draft with project defaults for model, mode, and permission preset. There is no local
   `<thread_id>.json` and no native Codex thread yet.
 - **Create + first send:** user submits the first message; the browser calls
-  `POST /api/projects/{id}/threads/start` with text, model/provider, mode, and approval policy.
+  `POST /api/projects/{id}/threads/start` with text, model/provider, mode, and permission preset.
   The server calls `open_thread` (Codex `thread/start`) with that provider/model, stores the
   returned `harness_thread_id`, writes `<thread_id>.json`, and immediately calls `start_turn`.
   If native creation fails, nothing is persisted. If persistence or synchronous `turn/start` fails
@@ -2143,17 +2143,17 @@ Auto-generate an initial title from the first user message (truncated); user-edi
 
 - **Mode is thread state**, persisted, and **switchable at any time within the thread**
   (requires `capabilities.plan_build_modes`).
-- **Plan mode** ⇒ harness runs **read-only with network access**; the agent analyzes and proposes
-  an implementation plan without modifying files or performing mutating network actions.
-- **Build mode** ⇒ harness runs **workspace-write**; the agent implements, subject to the
-  approval policy (§9).
+- **Plan mode** ⇒ harness runs in planning collaboration mode; the agent analyzes and proposes an
+  implementation plan. File and command permissions still come from the thread's permission preset
+  (§9).
+- **Build mode** ⇒ harness runs in default collaboration mode; the agent implements, subject to the
+  thread's permission preset (§9).
 - For the Codex harness, this same thread mode also drives Codex's app-server
   `collaborationMode`: Plan sends `plan`, Build sends `default`. This is distinct from sandboxing
   but must stay synchronized because Codex gates some interaction tools, such as
   `request_user_input` / `item/tool/requestUserInput`, on collaboration mode.
-- The mode applied to a turn is the thread's mode **at the moment `start_turn` is called**
-  (Codex takes sandbox per turn). Switching mode takes effect on the next turn; the UI makes
-  this explicit ("Plan mode — next message will be read-only").
+- The mode applied to a turn is the thread's mode **at the moment `start_turn` is called**.
+  Switching mode takes effect on the next turn; the UI makes this explicit.
 - **Durable switch (P2).** `SwitchMode` and `SelectModel` **persist immediately**: the new
   `mode` / `current_model` is written to `<thread_id>.json` before the server acknowledges, then
   a `ThreadState` is broadcast to all connected tabs so they stay in sync. This satisfies the §5
@@ -2189,8 +2189,8 @@ Auto-generate an initial title from the first user message (truncated); user-edi
 ```rust
 pub struct TurnOverrides {
     pub model: Option<ModelRef>,          // None ⇒ reuse the thread's current model
-    pub mode: Mode,                       // plan | build → sandbox policy
-    pub approval_policy: ApprovalPolicy,  // thread policy snapshot
+    pub mode: Mode,                       // plan | build → Codex collaboration mode
+    pub permission_preset: PermissionPreset,  // thread permission preset snapshot
 }
 ```
 
@@ -2203,18 +2203,18 @@ pub struct TurnOverrides {
   to the harness, so there is exactly one home for effort. A non-`None` value would override the
   thread's model for this turn only (not persisted); in practice the UI persists model changes via
   `SelectModel` (P2) and sends `None` here.
-- **`approval_policy`** — read from `thread.approval_policy`. This is **not** a per-turn override
+- **`permission_preset`** — read from `thread.permission_preset`. This is **not** a per-turn override
   (P3/AP1): the user changes the thread's durable setting, not a single message. It appears in the
-  snapshot because the harness needs it to pass to `turn/start`. It is set persistently via
-  `SetApprovalPolicy` (§13.6).
+  snapshot because the harness needs it to pass permissions to `turn/start`. It is set persistently via
+  `SetPermissionPreset` (§13.6).
 
 **Effort lives only in `ModelRef.reasoning_effort`** (P1). There is no standalone
 `TurnOverrides.reasoning_effort` field — it was removed to eliminate the double-home. The
 effective effort is read from `current_model.reasoning_effort` and is sent to the harness only when
 the active model advertises `supports_reasoning_effort` (§8.5).
 
-**When `plan_build_modes = false`** (S7): `Mode` resolves to `Build` (the workspace-write
-single mode), so `TurnOverrides` is well-defined for every harness regardless of capability.
+**When `plan_build_modes = false`** (S7): `Mode` resolves to `Build` (the default collaboration
+mode), so `TurnOverrides` is well-defined for every harness regardless of capability.
 The Plan/Build toggle is hidden in the UI (§13.5) and `Mode::Build` is always used.
 
 ---
@@ -2366,28 +2366,30 @@ LiteLLM gateway fronting Cloudflare Workers AI.
 
 > "Permissions" here = **agent action approvals**, not user roles. There is exactly one user.
 
-### 9.1 Policy per thread
+### 9.1 Permission preset per thread
 
-`ApprovalPolicy` is stored in each thread's `<thread_id>.json`:
+`PermissionPreset` is stored in each thread's `<thread_id>.json`, but its values are permission
+presets:
 
-- **`read_only`** — strictly no writes/exec (natural companion to Plan mode).
-- **`ask`** — the agent must request approval for each command execution and file change;
-  the UI prompts the user.
-- **`auto`** — approvals are granted automatically (full-auto within the workspace sandbox).
+- **`ask_first`** — starts from Codex's built-in `:read-only` permissions profile and `on-request`
+  permission preset. Reads can proceed; writes, commands, network, and other escalations require
+  approval.
+- **`auto_approve`** — uses Codex's built-in `:workspace` permissions profile and `on-request`
+  permission preset. Workspace work can proceed automatically; outside-workspace or other escalations
+  still require approval.
+- **`full_access`** — uses Codex's built-in `:danger-full-access` permissions profile and `never`
+  permission preset. The UI labels it with a warning marker.
 
-Policy is a **thread-level** setting, **not** a per-project or per-turn override (P3/AP1). Project
-creation does not ask for policy. New thread drafts default to `ask`, and the selected draft policy
-is persisted when the first message creates the thread. On existing threads, policy is settable via
-the `SetApprovalPolicy` client message (§13.6), which persists immediately and echoes a
+The preset is a **thread-level** setting, **not** a per-project or per-turn override (P3/AP1). Project
+creation does not ask for it. New thread drafts default to `ask_first`, and the selected draft preset
+is persisted when the first message creates the thread. On existing threads, the preset is settable via
+the `SetPermissionPreset` client message (§13.6), which persists immediately and echoes a
 `ThreadState` to all connected tabs — the same durable-switch pattern as
-`SwitchMode`/`SelectModel` (P2). The `ask` policy is only offered when the active harness advertises
-`live_approvals` (§9.4); otherwise it is coerced at attach time.
+`SwitchMode`/`SelectModel` (P2).
 
-**Interaction with Plan mode.** Mode (Plan/Build) and approval policy are **orthogonal
-settings**, but Plan mode changes what the sandbox permits: file writes remain blocked while
-network reads are allowed. Therefore in Plan mode an `ask` policy can still matter for commands or
-permission escalations, and those approvals must be surfaced normally. Plan mode does **not**
-overwrite the thread's `approval_policy`.
+**Interaction with Plan mode.** Mode (Plan/Build) and permission preset are **orthogonal
+settings**. Plan mode changes Codex collaboration behavior (`plan` vs `default`) but does not force
+read-only sandboxing. The selected permission preset controls what the agent may do without asking.
 
 ### 9.2 Live approval flow (requires `capabilities.live_approvals`)
 
@@ -2456,19 +2458,8 @@ Concretely:
 
 ### 9.4 Degraded harness
 
-If the active harness lacks `live_approvals`, the UI hides live prompts and the thread must
-run in `auto` or `read_only` (the selector disables `ask`). This keeps the experience coherent
-across harnesses.
-
-**Policy coercion (C8).** `approval_policy` is persisted per thread, so a thread created under
-Codex (which supports `live_approvals`) may store `ask`, then later be opened under a degraded
-harness that lacks `live_approvals`. On harness attach, if the harness lacks `live_approvals` and
-the stored policy is `ask`, the server coerces the **effective** policy to `read_only` for that
-session **without overwriting the stored value**, and surfaces a notice to the UI ("Approval policy
-'ask' is not supported by this harness — running as read-only for this session"). If the harness
-later regains the capability (e.g. after a reconnect to a full-capability harness), the stored
-`ask` policy takes effect again. This is latent under v1 (Codex only) but is specified now while
-the approvals design is fresh.
+If the active harness lacks `live_approvals`, the UI hides live prompts and should disable presets
+that require user approval to become useful. This keeps the experience coherent across harnesses.
 
 
 ---
@@ -2688,7 +2679,7 @@ sessions, so clarity and low visual noise beat flourish. Explicitly avoid the ge
 - **Typography:** a clean, slightly technical UI face for chrome; a real **monospace** for
   code, command output, diffs, and paths (these are the substance of the app). Paths and
   model names are always monospace so they read as "things you can click / act on".
-- **Structure encodes state,** not decoration: mode (Plan/Build), model, and approval policy
+- **Structure encodes state,** not decoration: mode (Plan/Build), model, and permission preset
   are always visible and legible at a glance in the thread header; a running turn has a clear
   live indicator. Running commands are shown both inline in the transcript and in the header
   `Tasks` menu; selecting a summary entry scrolls to the transcript command row.
@@ -2703,8 +2694,8 @@ sessions, so clarity and low visual noise beat flourish. Explicitly avoid the ge
 - Copy is plain and action-named (§ frontend writing guidance): buttons say exactly what
   happens ("Save plan to project", "Switch to Build", "Interrupt"). Empty states invite
   action ("No projects yet — create one to start."). Thread setting controls use visible labels
-  and action-oriented option text; for example, the approval policy selector is labeled
-  "Approvals" and shows "Ask first", "Auto approve", and "Read only" rather than raw enum names.
+  and action-oriented option text; for example, the permission preset selector is labeled
+  "Permissions" and shows "Ask first", "Auto approve", and "⚠ Full Access" rather than raw enum names.
 
 > The design plan above is a starting brief for the implementer, not a locked visual spec.
 > The implementer should produce a small token system (4–6 named colors, the 2–3 typefaces,
@@ -2715,7 +2706,7 @@ sessions, so clarity and low visual noise beat flourish. Explicitly avoid the ge
 
 ```
 ┌───────────┬───────────────────────────────────────────────┐
-│ Projects  │  Thread header: mode · model · approval ·      │
+│ Projects  │  Thread header: mode · model · permissions ·   │
 │ + threads │  tasks · MCP · context usage                   │
 │ (sidebar) ├───────────────────────────────────────────────┤
 │           │                                               │
@@ -2733,7 +2724,7 @@ sessions, so clarity and low visual noise beat flourish. Explicitly avoid the ge
   or expand each project's threads, "new project" / per-project "new thread" actions, and a
   bottom-pinned **Settings** menu for durable client UI preferences such as Appearance. Project
   collapse state is browser-local and persists across reloads.
-- **Center:** thread header (mode, model, approval policy, tasks menu, MCP menu, context usage menu
+- **Center:** thread header (mode, model, permission preset, tasks menu, MCP menu, context usage menu
   with manual compact action, plan-dump & interrupt actions) + transcript + composer.
 - **Composer drafts:** unsent text is browser-local and scoped to the active persisted thread id.
   A new-thread draft uses a per-project draft key until the first message creates the thread.
@@ -2759,10 +2750,10 @@ sessions, so clarity and low visual noise beat flourish. Explicitly avoid the ge
 
 The UI reads `HarnessCapabilities` for the active harness and adapts:
 
-- No `live_approvals` ⇒ hide approval prompts; approval-policy picker offers only
-  "Auto approve" / "Read only" (`auto` / `read_only` on the wire).
+- No `live_approvals` ⇒ hide approval prompts; presets that depend on live approval routing should
+  be disabled or coerced.
 - No `plan_build_modes` ⇒ hide the Plan/Build toggle (thread is single-mode). `Mode` resolves to
-  `Build` (workspace-write) so `TurnOverrides` is always well-defined (S7).
+  `Build` (default collaboration mode) so `TurnOverrides` is always well-defined (S7).
 - No `per_turn_model` ⇒ model is fixed at thread creation (picker disabled mid-thread).
 - No `reasoning_effort` or model doesn't support it ⇒ hide the effort selector.
 - No `structured_diffs` ⇒ hide the Diffs tab (or show a plain textual change summary).
@@ -2782,7 +2773,7 @@ This guarantees a coherent experience when a future, less-capable harness is plu
   native resume/import flows. Unknown fields are rejected, so this endpoint cannot fabricate
   linked ownership or lifecycle evidence. Blank creation is rejected. New first-message creation uses
   `POST /api/projects/{project_id}/threads/start` with
-  `{ text, attachments?, model_ref, mode, approval_policy }` and returns
+  `{ text, attachments?, model_ref, mode, permission_preset }` and returns
   `{ thread_id, harness_thread_id, turn_id, warning? }`.
 
   A transcript link is opened through
@@ -2806,7 +2797,7 @@ deletion; all other native deletion errors stop the cascade before deleting that
 **Client → server** (examples): `Subscribe { thread_id, since? }` (`since` is the incremental-resync
 cursor, H8), `Unsubscribe { thread_id }`,
 `SendInput { thread_id, text, attachments? }`, `SwitchMode { thread_id, mode }`,
-`SelectModel { thread_id, model_ref }`, `SetApprovalPolicy { thread_id, policy }`,
+`SelectModel { thread_id, model_ref }`, `SetPermissionPreset { thread_id, preset }`,
 `Interrupt { thread_id }`, `CompactContext { thread_id }`,
 `TerminateCommand { thread_id, process_id }`,
 `ApprovalDecision { request_id, decision }`, `SavePlan { thread_id, path }`.
@@ -2834,11 +2825,11 @@ after delegated work becomes idle; it never changes parentage or implicitly forw
 the parent. Passive and interactive subscribers do not both rebroadcast turnless events: when the
 interactive forwarder owns the turn gate, the passive subscriber yields before broadcasting.
 
-> **Durable settings switches (P2/P3).** `SwitchMode`, `SelectModel`, and `SetApprovalPolicy`
+> **Durable settings switches (P2/P3).** `SwitchMode`, `SelectModel`, and `SetPermissionPreset`
 > persist immediately to `<thread_id>.json` before the server acknowledges, then broadcast a
 > `ThreadState` to all connected tabs. This guarantees the §5 "same state after restart"
 > requirement: a switch is not lost if the app restarts before the user sends the next message.
-> The sandbox/model/policy *effect* still takes hold at the next turn; only the stored *intent* is
+> The permissions/model/mode *effect* still takes hold at the next turn; only the stored *intent* is
 > durable now. Draft-thread setting changes are local until the first message creates the thread;
 > they become durable as part of `POST /threads/start`.
 
@@ -3122,9 +3113,9 @@ assert persisted state (replay-driven).
 multiplexed WebSocket + fan-out; Dioxus shell; project list + create + filesystem picker;
 open thread; send input; streamed transcript. E2E smoke: login → project → thread → message.
 
-**Phase 3 — Modes, models, approvals.** Plan/Build toggle + per-turn sandbox mapping; plan
+**Phase 3 — Modes, models, approvals.** Plan/Build toggle + Codex collaboration-mode mapping; plan
 dump to markdown; model picker (static list) + per-turn model change + reasoning effort;
-approval policy + live approval prompts + decision routing. Approval diff preview uses the raw
+permission presets + live approval prompts + decision routing. Approval diff preview uses the raw
 diff string (S6); structured `FileDiff` parsing is deferred to Phase 4. Tests for each via replay.
 
 **Phase 4 — Visualization.** Side-by-side diff viewer from `DiffUpdated`; path linkification;
@@ -3188,14 +3179,18 @@ codex app-server generate-ts          --out schemas/   # reference only; not use
 ```
 Artifacts are version-pinned to the Codex binary that produced them; regenerate on upgrade.
 
-> Sandbox/mode mapping: **Plan ⇒ `read-only`**, **Build ⇒ `workspace-write`**. Codex
-> collaboration-mode mapping is sent on every turn too: **Plan ⇒ `plan`**, **Build ⇒ `default`**.
+> Permission preset mapping: **Ask first ⇒ `permissions: ":read-only"`, `approvalPolicy:
+> "on-request"`**, **Auto approve ⇒ `permissions: ":workspace"`, `approvalPolicy:
+> "on-request"`**, **Full Access ⇒ `permissions: ":danger-full-access"`, `approvalPolicy:
+> "never"`**. Codex collaboration-mode mapping is sent on every turn too: **Plan ⇒ `plan`**,
+> **Build ⇒ `default`**.
 > The Build/default send is intentional because Codex app-server collaboration mode is sticky after
-> a plan turn. Approval policy maps to Codex's approval configuration. `TurnOverrides.model` maps
+> a plan turn. Plan/Build does not select the Codex sandbox; the permission preset does.
+> `TurnOverrides.model` maps
 > to the per-turn `turn/start` model field, but Codex has no per-turn `modelProvider` override;
 > provider changes are handled at the native-thread boundary (§8.2). Reasoning effort is carried
 > inside `ModelRef.reasoning_effort` (P1: no standalone effort field on `TurnOverrides`).
-> `TurnOverrides.approval_policy` is the thread policy snapshot (P3/AP1: not a per-turn override).
+> `TurnOverrides.permission_preset` is the thread preset snapshot (P3/AP1: not a per-turn override).
 
 **Client library:** use `codex-codes` (v0.143.0, tested against Codex CLI 0.143.0) with the
 `async-client` feature — its `AsyncClient` API (`spawn`, `initialize`, `thread_start`, generic
@@ -3221,7 +3216,7 @@ supports, including `collaborationMode` and `item/tool/requestUserInput`.
 { "type": "SelectModel", "thread_id": "01J…",
   "model_ref": { "provider": "cloudflare-litellm", "model": "@cf/z-ai/glm-4.7",
                  "reasoning_effort": null } }
-{ "type": "SetApprovalPolicy", "thread_id": "01J…", "policy": "auto" }
+{ "type": "SetPermissionPreset", "thread_id": "01J…", "preset": "auto_approve" }
 { "type": "ApprovalDecision", "request_id": "ap_7", "decision": "accept_for_session" }
 { "type": "SavePlan", "thread_id": "01J…", "path": "docs/plan-auth-20260706-1030.md" }
 

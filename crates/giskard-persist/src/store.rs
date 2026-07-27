@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -13,7 +13,7 @@ use giskard_core::ids::{ProjectId, ThreadId, TurnId};
 use giskard_core::model::{Effort, ModelRef};
 use giskard_core::thread::ThreadKind;
 use giskard_core::token::{DailyTokenLedger, TokenLedger};
-use giskard_core::turn::{ApprovalPolicy, Mode, Turn};
+use giskard_core::turn::{Mode, PermissionPreset, Turn};
 
 use crate::PersistError;
 use crate::atomic::{atomic_write_json, read_json, read_json_or_quarantine};
@@ -80,8 +80,12 @@ pub struct ThreadFile {
     /// model switches without making Giskard maintain model-specific built-in metadata.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub model_context_windows: HashMap<String, HashMap<String, u32>>,
-    /// Per-thread approval policy (P3).
-    pub approval_policy: ApprovalPolicy,
+    /// Per-thread permission preset (P3).
+    #[serde(
+        alias = "approval_policy",
+        deserialize_with = "deserialize_persisted_permission_preset"
+    )]
+    pub permission_preset: PermissionPreset,
     /// Per-model effort retention (C7): maps `"provider/model"` → stored `Effort`, so switching
     /// back to a reasoning model restores the user's last effort choice.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -101,6 +105,31 @@ fn is_false(value: &bool) -> bool {
 
 fn is_primary_thread(value: &ThreadKind) -> bool {
     *value == ThreadKind::Primary
+}
+
+fn deserialize_persisted_permission_preset<'de, D>(
+    deserializer: D,
+) -> Result<PermissionPreset, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    match value.as_str() {
+        "ask_first" | "ask" | "read_only" => Ok(PermissionPreset::AskFirst),
+        "auto_approve" | "auto" => Ok(PermissionPreset::AutoApprove),
+        "full_access" => Ok(PermissionPreset::FullAccess),
+        other => Err(serde::de::Error::unknown_variant(
+            other,
+            &[
+                "ask_first",
+                "auto_approve",
+                "full_access",
+                "ask",
+                "auto",
+                "read_only",
+            ],
+        )),
+    }
 }
 
 fn parse_turn_history(path: &Path, data: &str) -> Result<Vec<Turn>, PersistError> {
@@ -515,7 +544,7 @@ impl PersistStore {
     /// Atomically read-modify-write a thread file under its per-thread lock (spec §5.4
     /// single-writer discipline). `f` mutates the loaded [`ThreadFile`]; the result is written
     /// back atomically before the lock is released, so concurrent mutations (a turn completing
-    /// while the user switches model/mode/policy) cannot lose each other's updates.
+    /// while the user switches model/mode/preset) cannot lose each other's updates.
     ///
     /// Returns the updated file, or `Ok(None)` if the thread file does not exist.
     pub async fn update_thread<F>(
@@ -858,7 +887,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_project_rejects_obsolete_approval_policy() {
+    async fn load_project_rejects_obsolete_permission_preset() {
         let (_tmp, store) = make_store();
         let id = ProjectId::new();
         let project = store
@@ -870,7 +899,7 @@ mod tests {
         value
             .as_object_mut()
             .unwrap()
-            .insert("approval_policy".into(), serde_json::json!("auto"));
+            .insert("permission_preset".into(), serde_json::json!("auto"));
         tokio::fs::write(
             store.project_json_path(id),
             serde_json::to_vec_pretty(&value).unwrap(),
@@ -922,7 +951,7 @@ mod tests {
             current_model: test_model(),
             context_window: 262_144,
             model_context_windows: HashMap::new(),
-            approval_policy: ApprovalPolicy::Ask,
+            permission_preset: PermissionPreset::AskFirst,
             model_efforts: HashMap::new(),
             tokens: TokenLedger::default(),
             created_at: now,
@@ -935,10 +964,16 @@ mod tests {
         assert_eq!(loaded.title, "Fix auth");
         assert_eq!(loaded.harness_thread_id, "th_abc");
         assert_eq!(loaded.mode, Mode::Build);
+
+        let raw = tokio::fs::read_to_string(store.thread_json_path(pid, tid))
+            .await
+            .unwrap();
+        assert!(raw.contains("\"permission_preset\""));
+        assert!(!raw.contains("\"approval_policy\""));
     }
 
     #[tokio::test]
-    async fn load_thread_requires_approval_policy() {
+    async fn load_thread_accepts_legacy_approval_policy_field() {
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
         store
@@ -961,7 +996,7 @@ mod tests {
             current_model: test_model(),
             context_window: 262_144,
             model_context_windows: HashMap::new(),
-            approval_policy: ApprovalPolicy::Ask,
+            permission_preset: PermissionPreset::AskFirst,
             model_efforts: HashMap::new(),
             tokens: TokenLedger::default(),
             created_at: now,
@@ -969,7 +1004,62 @@ mod tests {
             archived: false,
         };
         let mut value = serde_json::to_value(&thread).unwrap();
-        value.as_object_mut().unwrap().remove("approval_policy");
+        let object = value.as_object_mut().unwrap();
+        object.remove("permission_preset");
+        object.insert("approval_policy".into(), serde_json::json!("read_only"));
+
+        tokio::fs::create_dir_all(store.threads_dir(pid))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            store.thread_json_path(pid, tid),
+            serde_json::to_vec_pretty(&value).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let loaded = store.load_thread(pid, tid).await.unwrap().unwrap();
+        assert_eq!(loaded.permission_preset, PermissionPreset::AskFirst);
+
+        let legacy_auto =
+            deserialize_persisted_permission_preset(serde_json::Value::String("auto".into()))
+                .unwrap();
+        assert_eq!(legacy_auto, PermissionPreset::AutoApprove);
+    }
+
+    #[tokio::test]
+    async fn load_thread_requires_permission_preset() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        store
+            .create_project(pid, "proj", "/tmp/test", test_model())
+            .await
+            .unwrap();
+
+        let tid = ThreadId::new();
+        let now = Utc::now();
+        let thread = ThreadFile {
+            version: SCHEMA_VERSION,
+            id: tid,
+            project_id: pid,
+            title: "Fix auth".into(),
+            harness_thread_id: "th_abc".into(),
+            parent_thread_id: None,
+            spawned_by_turn_id: None,
+            kind: ThreadKind::Primary,
+            mode: Mode::Build,
+            current_model: test_model(),
+            context_window: 262_144,
+            model_context_windows: HashMap::new(),
+            permission_preset: PermissionPreset::AskFirst,
+            model_efforts: HashMap::new(),
+            tokens: TokenLedger::default(),
+            created_at: now,
+            updated_at: now,
+            archived: false,
+        };
+        let mut value = serde_json::to_value(&thread).unwrap();
+        value.as_object_mut().unwrap().remove("permission_preset");
         tokio::fs::create_dir_all(store.threads_dir(pid))
             .await
             .unwrap();
@@ -1010,7 +1100,7 @@ mod tests {
                 current_model: test_model(),
                 context_window: 128_000,
                 model_context_windows: HashMap::new(),
-                approval_policy: ApprovalPolicy::Ask,
+                permission_preset: PermissionPreset::AskFirst,
                 model_efforts: HashMap::new(),
                 tokens: TokenLedger::default(),
                 created_at: now,
@@ -1185,7 +1275,7 @@ mod tests {
                     current_model: test_model(),
                     context_window: 0,
                     model_context_windows: HashMap::new(),
-                    approval_policy: ApprovalPolicy::Ask,
+                    permission_preset: PermissionPreset::AskFirst,
                     model_efforts: HashMap::new(),
                     tokens: TokenLedger::default(),
                     created_at: Utc::now(),
@@ -1365,7 +1455,7 @@ mod tests {
                     current_model: test_model(),
                     context_window: 0,
                     model_context_windows: HashMap::new(),
-                    approval_policy: ApprovalPolicy::Ask,
+                    permission_preset: PermissionPreset::AskFirst,
                     model_efforts: HashMap::new(),
                     tokens: TokenLedger::default(),
                     created_at: Utc::now(),
@@ -1407,7 +1497,7 @@ mod tests {
                     current_model: test_model(),
                     context_window: 0,
                     model_context_windows: HashMap::new(),
-                    approval_policy: ApprovalPolicy::Ask,
+                    permission_preset: PermissionPreset::AskFirst,
                     model_efforts: HashMap::new(),
                     tokens: TokenLedger::default(),
                     created_at: now,

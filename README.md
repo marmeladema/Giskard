@@ -114,7 +114,7 @@ Then open **http://127.0.0.1:8787**, log in, and:
 1. **+** next to *Projects* → name it and give an **absolute directory path** that exists on the
    server machine (the agent's workspace).
 2. **+** on the project → draft a new thread. No Codex thread is created until the first message is
-   sent, so choose the **Plan/Build** mode, **approval policy**, and **model** first if needed.
+   sent, so choose the **Plan/Build** mode, **permission preset**, and **model** first if needed.
 3. Type in the composer (Enter to send). Use the attachment button or drop files onto the composer
    to include images, PDFs, or other files with the message. A message accepts up to eight files
    and 25 MiB total. The first send creates the Codex thread with the selected
@@ -291,7 +291,7 @@ $GISKARD_DATA_DIR/
 ├── projects/<project_id>/
 │   ├── project.json             # workspace root, default model, harness kind
 │   ├── threads/
-│   │   ├── <thread_id>.json      # thread metadata, approval policy, token cache
+│   │   ├── <thread_id>.json      # thread metadata, permission preset, token cache
 │   │   └── <thread_id>.jsonl     # authoritative turn history — one Turn per line, append-only
 │   └── tokens.json               # per-project token ledger (total, by_day, by_model)
 └── tokens-global.json            # cross-project token ledger

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use giskard_core::ids::{ProjectId, ThreadId};
 use giskard_core::model::ModelRef;
-use giskard_core::turn::{ApprovalPolicy, Mode};
+use giskard_core::turn::{Mode, PermissionPreset};
 use giskard_harness::AgentHarness;
 use giskard_persist::store::{ProjectConfig, ThreadFile};
 use giskard_server::{AppState, HarnessFactory, build_app};
@@ -170,7 +170,7 @@ async fn thread_lifecycle_native_failure_preserves_local_thread() {
                 },
                 context_window: 262_144,
                 model_context_windows: Default::default(),
-                approval_policy: ApprovalPolicy::Ask,
+                permission_preset: PermissionPreset::AskFirst,
                 model_efforts: Default::default(),
                 tokens: Default::default(),
                 created_at: now,

@@ -276,6 +276,22 @@ Cleanup failures are logged but do not replace the turn result. Giskard omits
 raw attachment bytes from persisted history and the parsed in-memory history
 cache.
 
+## Permission presets
+
+Giskard sends Codex `turn/start` overrides for every turn. Plan/Build mode maps
+only to Codex collaboration mode (`plan` or `default`); it does not select the
+sandbox. The thread permission preset selects Codex's built-in permission
+profile and permission preset:
+
+| Giskard preset | Codex `permissions` | Codex `approvalPolicy` |
+| --- | --- | --- |
+| `ask_first` | `:read-only` | `on-request` |
+| `auto_approve` | `:workspace` | `on-request` |
+| `full_access` | `:danger-full-access` | `never` |
+
+`turn/start` must not include `sandboxPolicy` when it includes `permissions`;
+Codex treats those fields as mutually exclusive.
+
 ## Model catalog (`model/list`)
 
 The adapter advertises the `model_listing` capability and implements

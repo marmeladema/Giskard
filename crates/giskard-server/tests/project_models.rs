@@ -337,7 +337,7 @@ async fn catalog_effort_survives_new_thread_creation() {
                 "reasoning_effort": "high"
             },
             "mode": "build",
-            "approval_policy": "ask"
+            "permission_preset": "ask_first"
         }))
         .send()
         .await
