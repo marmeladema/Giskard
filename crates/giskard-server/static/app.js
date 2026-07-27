@@ -42,6 +42,49 @@ const COMPOSER_IS_TOUCH = (() => {
 const COMPOSER_HINT = COMPOSER_IS_TOUCH
   ? "Tap Send to send"
   : "Enter to send, Shift+Enter for newline";
+// Keep the app shell sized to the visible area above the on-screen keyboard.
+//
+// The bars (`#mobileBar`, `header.thr`) and the transcript are flex children of `.center`, a
+// column sized to 100vh / 100dvh. On Android and Firefox the `interactive-widget=resizes-content`
+// viewport meta (see index.html) makes 100dvh shrink when the keyboard opens, so the flex reflows
+// and the bars stay pinned with no JS. But iOS Safari does NOT support interactive-widget: it
+// overlays the keyboard without resizing the layout, then offsets the layout viewport to reveal
+// the focused composer — a visual-viewport scroll that pushes the top bars off-screen, which
+// position:sticky cannot counter (sticky sticks within a scroll container, not against a
+// layout-viewport shift).
+//
+// The portable fix is to drive the shell height from window.visualViewport.height (the visible
+// region above the keyboard) via a --app-height CSS variable: the whole app fits the visible area,
+// so Safari has nothing to scroll away and the bars stay put. visualViewport exists on all modern
+// mobile browsers (including iOS Safari 13+); where it's missing we leave the 100vh/100dvh CSS as
+// the fallback. We listen on the visualViewport (not window) resize because the keyboard shrinks
+// the visual viewport without firing a window resize on iOS.
+//
+// The visual viewport can also PAN: when iOS Safari shifts the layout viewport to reveal the
+// focused composer, visualViewport.offsetTop becomes non-zero (the layout viewport's top edge
+// moves down relative to the visible region). The shell is anchored to the layout-viewport top
+// (top:0), so without compensation the bars would sit above the visible area and get clipped.
+// We mirror offsetTop into --app-top and the CSS translates the shell by it, keeping the bars
+// aligned with the visible region's top edge. (resize alone doesn't cover the pan; the scroll
+// event is what fires when offsetTop changes, so both events run apply.)
+(function syncAppHeight() {
+  const vv = window.visualViewport;
+  if (!vv) return; // older browser; fall back to the 100vh/100dvh CSS
+  const apply = () => {
+    // Use px (not vh) so it tracks the live visual viewport, not the layout viewport. Round to
+    // avoid sub-pixel jitter from the fractional heights visualViewport reports. offsetTop is
+    // the layout-viewport top's offset from the visual-viewport top (the pan); 0 when the
+    // layout viewport isn't shifted (the common case, including desktop and Android).
+    document.documentElement.style.setProperty("--app-height", Math.round(vv.height) + "px");
+    document.documentElement.style.setProperty("--app-top", Math.round(vv.offsetTop) + "px");
+  };
+  apply();
+  vv.addEventListener("resize", apply);
+  // The layout can change (scroll bar appearing, orientation) without a resize; scroll is the
+  // reliable signal that the visible region moved — and, crucially, the event that fires when
+  // visualViewport.offsetTop changes (the iOS layout-viewport pan).
+  vv.addEventListener("scroll", apply);
+})();
 // History is paginated by turn on the server, but a turn can hold an arbitrary number of items, so a
 // turn count is a poor proxy for screen height. On open we render the live turn first, then top up
 // persisted history in small batches until the transcript holds roughly this many viewports of
