@@ -67,6 +67,7 @@ const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const MAX_TOTAL_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const MAX_ATTACHMENT_NAME_BYTES = 255;
 const MAX_ATTACHMENT_MIME_BYTES = 127;
+const THREAD_DELETE_TIMEOUT_MS = 30000;
 let state = {
   projectId:null, threadId:null, mode:"build", ws:null, wsStatus:"closed", wsConnectId:0,
   wsReconnectTimer:null, wsReconnectAttempt:0, wsStatusDetail:"WebSocket disconnected",
@@ -95,7 +96,8 @@ let state = {
   subagentImports:new Map(), projectThreads:new Map(), threadIndex:new Map(),
   lastNotificationPromptNoticeAt:0, swRegistration:null, pendingAttachments:[],
   attachmentGeneration:0, pendingAttachmentOperations:new Map(),
-  collapsedProjects:new Set(loadCollapsedProjects()), pendingRemoveProject:null, projectDirs:{}
+  collapsedProjects:new Set(loadCollapsedProjects()), pendingRemoveProject:null,
+  pendingRemoveThread:null, removeThreadRequestSeq:0, projectDirs:{}
 };
 let attachmentIngestQueue = Promise.resolve();
 const activeAttachmentReaders = new Set();
@@ -114,17 +116,45 @@ const EFFORT_OPTIONS = [
 ];
 setInterval(updateRunningCommandDurations, 1000);
 
-async function api(method, path, body) {
+async function api(method, path, body, options) {
   const opts = { method, headers:{} };
+  const timeoutMs = options && Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 0;
+  let timeoutId = null;
+  let timedOut = false;
+  let timeoutPromise = null;
   if (body !== undefined) { opts.headers["Content-Type"]="application/json"; opts.body=JSON.stringify(body); }
-  const r = await fetch(path, opts);
-  if (!r.ok) {
-    const err = new Error((await r.text()) || `HTTP ${r.status}`);
-    err.status = r.status;
-    throw err;
+  if (timeoutMs && typeof AbortController === "function") {
+    const controller = new AbortController();
+    opts.signal = controller.signal;
+    timeoutId = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+  } else if (timeoutMs) {
+    timeoutPromise = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => {
+        timedOut = true;
+        reject(new Error(`Request timed out after ${Math.round(timeoutMs / 1000)} seconds.`));
+      }, timeoutMs);
+    });
   }
-  const ct = r.headers.get("content-type")||"";
-  return ct.includes("json") ? r.json() : r.text();
+  try {
+    const fetchPromise = fetch(path, opts);
+    if (timeoutPromise) fetchPromise.catch(() => {});
+    const r = timeoutPromise ? await Promise.race([fetchPromise, timeoutPromise]) : await fetchPromise;
+    if (!r.ok) {
+      const err = new Error((await r.text()) || `HTTP ${r.status}`);
+      err.status = r.status;
+      throw err;
+    }
+    const ct = r.headers.get("content-type")||"";
+    return ct.includes("json") ? r.json() : r.text();
+  } catch (e) {
+    if (timedOut) throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)} seconds.`);
+    throw e;
+  } finally {
+    if (timeoutId !== null) clearTimeout(timeoutId);
+  }
 }
 function apiFailureMessage(e) {
   const msg = e && e.message ? e.message : String(e);
@@ -1386,9 +1416,87 @@ async function deleteThread(pid, tid, title) {
   const cascade = descendants.length
     ? `, its ${descendants.length} linked sub-agent thread${descendants.length === 1 ? "" : "s"}, and all corresponding Codex threads`
     : " and its corresponding Codex thread";
-  if (!confirm(`Permanently delete thread "${title}"${cascade}? This cannot be undone.`)) return;
+  // Open the modal instead of a native confirm() so the user gets the same confirmation card
+  // style as project removal. The cascade description is mirrored into the dialog content.
+  openRemoveThreadModal(pid, tid, title, cascade);
+}
+
+function openRemoveThreadModal(pid, tid, title, cascade) {
+  const opener = threadRowForId(tid)?.closest(".thread-row")?.querySelector(".thread-menu-btn")
+    || (document.activeElement instanceof HTMLElement ? document.activeElement : null);
+  closeDrawers();
+  closeThreadMenus();
+  state.pendingRemoveThread = {
+    pid,
+    tid,
+    title,
+    descendants: threadDescendantIds(pid, tid),
+    opener,
+    deleting:false,
+    requestSeq:0,
+  };
+  setRemoveThreadDeleting(false);
+  $("removeThreadErr").textContent = "";
+  $("removeThreadName").textContent = title || "this thread";
+  $("removeThreadCascade").textContent = cascade || "";
+  $("removeThreadModal").classList.add("open");
+  $("removeThreadConfirm").focus();
+}
+
+function setRemoveThreadDeleting(deleting) {
+  const modal = $("removeThreadModal");
+  $("removeThreadConfirm").disabled = deleting;
+  $("removeThreadCancel").disabled = deleting;
+  modal.setAttribute("aria-busy", deleting ? "true" : "false");
+}
+
+function removeThreadFallbackFocus(pending) {
+  const rowButton = pending && pending.tid
+    ? threadRowForId(pending.tid)?.closest(".thread-row")?.querySelector(".thread-menu-btn")
+    : null;
+  return rowButton
+    || (state.threadId && threadRowForId(state.threadId)?.closest(".thread-row")?.querySelector(".thread-menu-btn"))
+    || $("newProj")
+    || $("btnMenu");
+}
+
+function restoreRemoveThreadFocus(pending) {
+  const target = pending && pending.opener && pending.opener.isConnected
+    ? pending.opener
+    : removeThreadFallbackFocus(pending);
+  if (target && target.isConnected && typeof target.focus === "function") target.focus();
+}
+
+function closeRemoveThreadModal(options) {
+  const force = options && options.force;
+  const restoreFocus = !options || options.restoreFocus !== false;
+  const pending = state.pendingRemoveThread;
+  if (pending && pending.deleting && !force) return false;
+  $("removeThreadModal").classList.remove("open");
+  setRemoveThreadDeleting(false);
+  state.pendingRemoveThread = null;
+  if (restoreFocus) restoreRemoveThreadFocus(pending);
+  return true;
+}
+
+$("removeThreadCancel").onclick = closeRemoveThreadModal;
+$("removeThreadModal").addEventListener("click", (e) => {
+  if (e.target === $("removeThreadModal")) closeRemoveThreadModal();
+});
+
+$("removeThreadConfirm").onclick = async () => {
+  const pending = state.pendingRemoveThread;
+  if (!pending || !pending.pid || !pending.tid) return;
+  const { pid, tid, descendants } = pending;
+  pending.deleting = true;
+  pending.requestSeq = ++state.removeThreadRequestSeq;
+  const requestSeq = pending.requestSeq;
+  setRemoveThreadDeleting(true);
+  $("removeThreadErr").textContent = "";
   try {
-    await api("DELETE", `/api/projects/${pid}/threads/${tid}`);
+    await api("DELETE", `/api/projects/${pid}/threads/${tid}`, undefined, {
+      timeoutMs: THREAD_DELETE_TIMEOUT_MS,
+    });
     // The server cascades to descendants it discovered itself, which can include children this
     // client never listed. Decide from the refreshed authoritative list whether the active view
     // was deleted; keep the pre-request set as a fallback in case the sidebar reload fails
@@ -1405,8 +1513,17 @@ async function deleteThread(pid, tid, title) {
     ) {
       clearThreadView(activeThread);
     }
+    pending.deleting = false;
+    closeRemoveThreadModal({ force:true });
   } catch (e) {
-    notice("Delete thread failed: " + e.message, "error");
+    if (state.pendingRemoveThread === pending && pending.requestSeq === requestSeq) {
+      $("removeThreadErr").textContent = "Delete thread failed: " + apiFailureMessage(e);
+    }
+  } finally {
+    if (state.pendingRemoveThread === pending && pending.requestSeq === requestSeq) {
+      pending.deleting = false;
+      setRemoveThreadDeleting(false);
+    }
   }
 }
 
@@ -7455,7 +7572,8 @@ $("btnMenu").onclick = () => toggleDrawer("left");
 $("backdrop").onclick = closeDrawers;
 document.addEventListener("keydown", (e) => {
   if (e.key!=="Escape") return;
-  if ($("codeOverlay").classList.contains("open")) closeCodeOverlay();
+  if ($("removeThreadModal").classList.contains("open")) closeRemoveThreadModal();
+  else if ($("codeOverlay").classList.contains("open")) closeCodeOverlay();
   else {
     closeSettingsMenu();
     closeModelPicker();

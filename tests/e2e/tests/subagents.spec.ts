@@ -99,14 +99,12 @@ test.describe("linked sub-agent threads", () => {
 
     const parentRowContainer = parentRow.locator("xpath=..");
     await parentRowContainer.locator(".thread-menu-btn").click();
-    const dialogPromise = page.waitForEvent("dialog");
-    const deleteClick = parentRowContainer.locator(".thread-menu .danger").click();
-    const dialog = await dialogPromise;
-    expect(dialog.message()).toContain("1 linked sub-agent thread");
-    expect(dialog.message()).toContain("all corresponding Codex threads");
-    expect(dialog.message()).toContain("cannot be undone");
-    await dialog.accept();
-    await deleteClick;
+    await parentRowContainer.locator(".thread-menu .danger").click();
+    await expect(page.locator("#removeThreadModal")).toHaveClass(/open/);
+    await expect(page.locator("#removeThreadCascade")).toContainText("1 linked sub-agent thread");
+    await expect(page.locator("#removeThreadCascade")).toContainText("all corresponding Codex threads");
+    await expect(page.locator("#removeThreadModal")).toContainText("cannot be undone");
+    await page.locator("#removeThreadConfirm").click();
     await expect(parentRow).toHaveCount(0);
 
     const remainingIds = await page.evaluate(async (pid) => {
@@ -314,11 +312,9 @@ test.describe("cross-project thread deletion", () => {
       // Delete project A's thread via its row menu while project B's thread is the active view.
       const otherRowContainer = otherRow.locator("xpath=..");
       await otherRowContainer.locator(".thread-menu-btn").click();
-      const dialogPromise = page.waitForEvent("dialog");
-      const deleteClick = otherRowContainer.locator(".thread-menu .danger").click();
-      const dialog = await dialogPromise;
-      await dialog.accept();
-      await deleteClick;
+      await otherRowContainer.locator(".thread-menu .danger").click();
+      await expect(page.locator("#removeThreadModal")).toHaveClass(/open/);
+      await page.locator("#removeThreadConfirm").click();
       await expect(otherRow).toHaveCount(0);
 
       // The active view is unaffected: its selection persists (a non-scoped clear would null it
@@ -329,6 +325,178 @@ test.describe("cross-project thread deletion", () => {
     } finally {
       await deleteProject(otherProjectId);
       await deleteProject(activeProjectId);
+    }
+  });
+});
+
+test.describe("delete-thread confirmation card", () => {
+  test.beforeEach(async ({ page }) => {
+    await login(page);
+  });
+
+  // Shared seeding helpers: create an isolated project + persisted thread server-side so the
+  // tests below drive only the modal without depending on the shared composer/WebSocket timing.
+  const createProject = (page: import("@playwright/test").Page, name: string): Promise<string> =>
+    page.evaluate(async (projectName) => {
+      const res = await fetch("/api/projects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: projectName,
+          dir: "/tmp",
+          default_model: { provider: "replay", model: "replay-model" },
+        }),
+      });
+      if (!res.ok) {
+        throw new Error(`create project failed: ${res.status} ${await res.text()}`);
+      }
+      return (await res.json()).id as string;
+    }, name);
+  const startThread = (page: import("@playwright/test").Page, pid: string, text: string): Promise<string> =>
+    page.evaluate(
+      async ({ pid, text }) => {
+        const res = await fetch(`/api/projects/${pid}/threads/start`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text,
+            model_ref: { provider: "replay", model: "replay-model" },
+            mode: "build",
+            permission_preset: "ask_first",
+          }),
+        });
+        if (!res.ok) {
+          throw new Error(`start thread failed: ${res.status} ${await res.text()}`);
+        }
+        return (await res.json()).thread_id as string;
+      },
+      { pid, text },
+    );
+  const deleteProject = (page: import("@playwright/test").Page, id: string): Promise<void> =>
+    page.evaluate(async (projectId) => {
+      await fetch(`/api/projects/${projectId}`, { method: "DELETE" });
+    }, id);
+  // Open the delete-thread card for `tid` via its sidebar row menu.
+  async function openDeleteCard(page: import("@playwright/test").Page, tid: string) {
+    const row = page.locator(`.thread[data-tid="${tid}"]`);
+    const rowContainer = row.locator("xpath=..");
+    const menuButton = rowContainer.locator(".thread-menu-btn");
+    await menuButton.click();
+    await rowContainer.locator(".thread-menu .danger").click();
+    await expect(page.locator("#removeThreadModal")).toHaveClass(/open/);
+    await expect(page.locator("#removeThreadConfirm")).toBeFocused();
+    return menuButton;
+  }
+
+  test("Cancel dismisses the card without deleting", async ({ page }) => {
+    const projectId = await createProject(page, "Card cancel project");
+    try {
+      const tid = await startThread(page, projectId, "survives cancel");
+      await page.evaluate(() =>
+        (window as unknown as { loadProjects: () => Promise<void> }).loadProjects(),
+      );
+      const row = page.locator(`.thread[data-tid="${tid}"]`);
+      await expect(row).toBeVisible();
+
+      const menuButton = await openDeleteCard(page, tid);
+      await page.locator("#removeThreadCancel").click();
+      await expect(page.locator("#removeThreadModal")).not.toHaveClass(/open/);
+      await expect(menuButton).toBeFocused();
+      // The thread is still listed: no DELETE was issued.
+      await expect(row).toBeVisible();
+      const stillThere = await page.evaluate(async (pid) => {
+        const res = await fetch(`/api/projects/${pid}/threads`);
+        const body = await res.json();
+        return body.threads.map((t: { id: string }) => t.id);
+      }, projectId);
+      expect(stillThere).toContain(tid);
+    } finally {
+      await deleteProject(page, projectId);
+    }
+  });
+
+  test("Escape and outside-click dismiss without deleting", async ({ page }) => {
+    const projectId = await createProject(page, "Card escape project");
+    try {
+      const tid = await startThread(page, projectId, "survives escape");
+      await page.evaluate(() =>
+        (window as unknown as { loadProjects: () => Promise<void> }).loadProjects(),
+      );
+      const row = page.locator(`.thread[data-tid="${tid}"]`);
+      await expect(row).toBeVisible();
+
+      // Escape closes the card.
+      const escapeMenuButton = await openDeleteCard(page, tid);
+      await page.keyboard.press("Escape");
+      await expect(page.locator("#removeThreadModal")).not.toHaveClass(/open/);
+      await expect(escapeMenuButton).toBeFocused();
+      await expect(row).toBeVisible();
+
+      // Reopen and dismiss by clicking the overlay backdrop (outside the dialog). Click a corner
+      // of the full-screen overlay rather than its center, which would hit the dialog card.
+      const backdropMenuButton = await openDeleteCard(page, tid);
+      await page.locator("#removeThreadModal").click({ position: { x: 4, y: 4 } });
+      await expect(page.locator("#removeThreadModal")).not.toHaveClass(/open/);
+      await expect(backdropMenuButton).toBeFocused();
+      await expect(row).toBeVisible();
+    } finally {
+      await deleteProject(page, projectId);
+    }
+  });
+
+  test("a failed DELETE surfaces an inline error and keeps the card open", async ({ page }) => {
+    const projectId = await createProject(page, "Card error project");
+    try {
+      const tid = await startThread(page, projectId, "delete failure");
+      await page.evaluate(() =>
+        (window as unknown as { loadProjects: () => Promise<void> }).loadProjects(),
+      );
+      const row = page.locator(`.thread[data-tid="${tid}"]`);
+      await expect(row).toBeVisible();
+
+      let resolveDeleteStarted: (() => void) | null = null;
+      let releaseDelete: (() => void) | null = null;
+      const deleteStarted = new Promise<void>((resolve) => {
+        resolveDeleteStarted = resolve;
+      });
+      const deleteReleased = new Promise<void>((resolve) => {
+        releaseDelete = resolve;
+      });
+
+      // Make the single DELETE for this thread fail with a 500 so the handler surfaces the inline
+      // error instead of closing the card. `times: 1` lets the route auto-unregister after it
+      // fires, so a later retry (or teardown) reaches the real endpoint.
+      await page.route(`**/api/projects/${projectId}/threads/${tid}`, async (route) => {
+        if (route.request().method() !== "DELETE") {
+          await route.continue();
+          return;
+        }
+        resolveDeleteStarted?.();
+        await deleteReleased;
+        await route.fulfill({ status: 500, body: "scripted delete failure" });
+      }, { times: 1 });
+
+      await openDeleteCard(page, tid);
+      const confirm = page.locator("#removeThreadConfirm");
+      const cancel = page.locator("#removeThreadCancel");
+      await confirm.click();
+      await deleteStarted;
+      await expect(confirm).toBeDisabled();
+      await expect(cancel).toBeDisabled();
+      await page.keyboard.press("Escape");
+      await expect(page.locator("#removeThreadModal")).toHaveClass(/open/);
+      await page.locator("#removeThreadModal").click({ position: { x: 4, y: 4 } });
+      await expect(page.locator("#removeThreadModal")).toHaveClass(/open/);
+      releaseDelete?.();
+      // The card stays open with an inline error message, not a closed-and-toasted failure.
+      await expect(page.locator("#removeThreadErr")).toContainText("Delete thread failed");
+      await expect(page.locator("#removeThreadModal")).toHaveClass(/open/);
+      // Confirm is re-enabled after the failure so the user can dismiss or retry.
+      await expect(confirm).not.toBeDisabled();
+      // The DELETE was intercepted before reaching the backend, so the thread is still listed.
+      await expect(row).toBeVisible();
+    } finally {
+      await deleteProject(page, projectId);
     }
   });
 });

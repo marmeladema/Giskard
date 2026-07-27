@@ -45,6 +45,11 @@ tests/e2e/run.sh --reporter=line
 
 The HTML report lands in `tests/e2e/playwright-report/` on your host.
 
+If your local network intercepts TLS, put any additional host CA certificates as `.crt` files in
+`tests/e2e/.host-ca-certificates/` before running the Docker-based tests. The directory is optional:
+CI and ordinary local environments build with only the committed `.gitkeep`, while any local
+certificates in that hidden directory are copied into the e2e image trust store and ignored by git.
+
 ## Run it without Docker (optional, for UI development)
 
 If you already have Node and the matching Playwright browsers, you can iterate faster by pointing

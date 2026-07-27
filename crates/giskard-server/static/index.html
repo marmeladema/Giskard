@@ -226,9 +226,9 @@
 
   <!-- Remove-project confirmation. This removes only Giskard's saved project lifecycle data; it
        never touches the source/workspace directory. -->
-  <div class="overlay" id="removeProjectModal">
+  <div class="overlay" id="removeProjectModal" role="dialog" aria-modal="true" aria-labelledby="removeProjectTitle">
     <div class="dialog remove-project-dialog">
-      <h2>Remove project from Giskard?</h2>
+      <h2 id="removeProjectTitle">Remove project from Giskard?</h2>
       <div class="content">
         <p>
           This removes <strong id="removeProjectName">this project</strong> from Giskard, including
@@ -238,9 +238,28 @@
         <div class="remove-project-path mono" id="removeProjectDir"></div>
       </div>
       <div class="foot">
-        <span class="err" id="removeProjectErr"></span>
+        <span class="err" id="removeProjectErr" role="alert" aria-live="assertive"></span>
         <button id="removeProjectCancel">Cancel</button>
         <button class="danger" id="removeProjectConfirm">Remove from Giskard</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Delete-thread confirmation. Deleting a thread cascades to its linked sub-agent threads and
+       the corresponding Codex threads managed by the harness; this cannot be undone. -->
+  <div class="overlay" id="removeThreadModal" role="dialog" aria-modal="true" aria-labelledby="removeThreadTitle">
+    <div class="dialog remove-thread-dialog">
+      <h2 id="removeThreadTitle">Delete thread?</h2>
+      <div class="content">
+        <p>
+          Permanently delete thread <strong id="removeThreadName">this thread</strong><span id="removeThreadCascade"></span>?
+        </p>
+        <p class="muted">This cannot be undone.</p>
+      </div>
+      <div class="foot">
+        <span class="err" id="removeThreadErr" role="alert" aria-live="assertive"></span>
+        <button id="removeThreadCancel">Cancel</button>
+        <button class="danger" id="removeThreadConfirm">Delete thread</button>
       </div>
     </div>
   </div>
