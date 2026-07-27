@@ -4,7 +4,22 @@
     --scroll-track:#111720; --scroll-thumb:#344154; --scroll-thumb-hover:#5b8def;
   }
   * { box-sizing:border-box; }
-  body { margin:0; font:14px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--fg); height:100vh; overflow:hidden; }
+  /* --app-height and --app-top are driven by window.visualViewport in app.js (syncAppHeight), so
+     the shell tracks the visible area above the on-screen keyboard on iOS Safari (which overlays
+     the keyboard and shifts the layout viewport instead of resizing it). --app-height is the
+     visible height; --app-top is the layout-viewport pan (visualViewport.offsetTop) — when iOS
+     shifts the layout viewport to reveal the focused composer, the shell translates down by
+     --app-top to stay aligned with the visible region's top edge. The 100vh / 0 fallbacks apply
+     before the JS runs and on browsers without visualViewport. */
+  :root { --app-height:100vh; --app-top:0px; }
+  /* html gets the same background as body so the strip above a translated shell (when iOS pans
+     the layout viewport down by --app-top) doesn't show a lighter default background. The
+     transform on body also makes it the containing block for position:fixed descendants
+     (#notices toasts, .overlay dialogs, #backdrop, the mobile drawer); at the default
+     --app-top:0 body's box equals the viewport, so their anchoring is unchanged, and when the
+     keyboard pans they translate with the shell so they stay in the visible region. */
+  html { background:var(--bg); }
+  body { margin:0; font:14px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--fg); height:100vh; height:var(--app-height); overflow:hidden; transform:translateY(var(--app-top)); }
   button { font:inherit; color:var(--fg); background:var(--panel2); border:1px solid var(--border); border-radius:6px; padding:6px 10px; cursor:pointer; }
   button:hover { border-color:var(--accent); }
   button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
@@ -17,17 +32,17 @@
   .muted { color:var(--muted); }
 
   /* login */
-  #login { display:flex; height:100vh; align-items:center; justify-content:center; }
+  #login { display:flex; height:100vh; height:var(--app-height); align-items:center; justify-content:center; }
   #login .card { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:28px; width:320px; }
   #login h1 { margin:0 0 4px; }
 
   /* app grid — flanking column widths are user-resizable (persisted) via CSS vars.
      Display is toggled via `.open` (not inline style) so the mobile media query can override it. */
-  #app { display:none; grid-template-columns:var(--col-left,260px) 6px minmax(360px,1fr); height:100vh; }
+  #app { display:none; grid-template-columns:var(--col-left,260px) 6px minmax(360px,1fr); height:100vh; height:var(--app-height); }
   #app.open { display:grid; }
   #mobileBar { display:none; }
   #backdrop { display:none; }
-  .col { height:100vh; overflow-y:auto; }
+  .col { height:100vh; height:var(--app-height); overflow-y:auto; }
   .resizer { cursor:col-resize; background:transparent; transition:background .12s; }
   .resizer:hover, .resizer.active { background:var(--accent); }
   .sidebar {
@@ -131,17 +146,23 @@
   .thread-section-label { margin:8px 0 3px 8px; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:0; }
   .subagent-open-btn { margin-top:8px; padding:4px 8px; font-size:12px; }
 
-  /* The thread header sticks to the top of the scrolling center column so the status badges (WS
-     state, tasks, sub-agents, MCP, context) stay visible while the transcript scrolls, and so the
-     mobile on-screen keyboard — which shrinks the viewport and pushes content up — can't scroll
-     them out of view. z-index stays below the drawer (60), backdrop (55), and header popovers
-     (z-index:35). On desktop the mobile bar is hidden, so the header sticks at the very top
-     (top:0). On mobile the #mobileBar sits above it, so the header sticks at the mobile bar's
-     height (43px, set in the @media block) so the two bars stack without overlapping. */
+  /* The thread header (WS state, tasks, sub-agents, MCP, context badges) sits directly above the
+     transcript as a non-scrolling flex child of .center. .center is a flex column pinned to the
+     viewport height (--app-height / 100dvh / 100vh); only #transcript (flex:1, overflow-y:auto)
+     scrolls, so the header is inherently pinned at the top of the column and never scrolls away.
+     The on-screen keyboard is handled by sizing the shell to the visible area (--app-height, set
+     from window.visualViewport in app.js, plus interactive-widget=resizes-content in the viewport
+     meta) so the column shrinks above the keyboard rather than being scrolled by the layout
+     viewport — see app.js syncAppHeight. (An earlier attempt used position:sticky here, but
+     .center itself never scrolls — its scrollHeight equals its clientHeight — so sticky had no
+     scroll container to stick against and was a dead no-op; the bars stayed put only because of
+     the flex layout below.) The header's popovers (z-index:35) anchor to their
+     .tasks-wrap/.mcp-wrap/.usage-wrap parents and paint above the static transcript; the mobile
+     drawer (60) and backdrop (55) still layer above the header. */
   header.thr {
     display:flex; gap:12px; align-items:center; padding:10px 14px;
     border-bottom:1px solid var(--border); background:var(--panel); flex-wrap:wrap;
-    position:sticky; top:0; z-index:30;
+    flex:none;
   }
   /* Header controls are chrome, not content: keep their type a step smaller than the body so the
      transcript stays the focal point. */
@@ -781,13 +802,17 @@
   /* =================== Mobile / responsive ===================
      The same page adapts to the viewport (no separate mobile build). On narrow screens the
      sidebar becomes a slide-in drawer reached from a top bar. Desktop (>820px) is unchanged. */
-  /* The mobile top bar (hamburger + title) sticks to the top of the scrolling center column so
-     it stays visible when the on-screen keyboard appears and shrinks the viewport (without this
-     the keyboard pushes it up off-screen). z-index is below the thread header (30) so the status
-     badges stack above it, and below the drawer/backdrop. */
+  /* The mobile top bar (hamburger + title) is the first child of the .center flex column, so it
+     is inherently pinned at the top — .center never scrolls (its height is fixed to the visible
+     viewport via --app-height, and only #transcript scrolls internally), so the bar can't be
+     scrolled away by the transcript or by the keyboard. The keyboard is handled by sizing the
+     shell to the visible area (see app.js syncAppHeight + the interactive-widget viewport meta),
+     so the column shrinks above the keyboard rather than being scrolled by the layout viewport.
+     (An earlier position:sticky here was a no-op: sticky needs a scrolling ancestor, and .center
+     doesn't scroll.) The drawer (z-index:60) and backdrop (55) layer above it. */
   #mobileBar {
     align-items:center; gap:10px; padding:8px 12px; border-bottom:1px solid var(--border);
-    background:var(--panel); position:sticky; top:0; z-index:20;
+    background:var(--panel); flex:none;
   }
   #mobileBar button { font-size:18px; line-height:1; padding:3px 11px; }
   #mobileBar .mbTitle { flex:1; min-width:0; text-align:center; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -798,11 +823,11 @@
     #login .card { max-width:90vw; }
     #app.open { display:block; }
     .resizer { display:none; }
-    .center { border:0; height:100vh; height:100dvh; }
+    .center { border:0; height:100vh; height:100dvh; height:var(--app-height); }
     #mobileBar { display:flex; }
-    /* The mobile bar is 43px tall (measured at the 390px viewport); the thread header sticks
-       directly below it so the two bars stack without overlapping as the transcript scrolls. */
-    header.thr { top:43px; gap:7px 6px; padding:7px 10px; }
+    /* Tighten the header on phones; with only the status badges left it stays on one line. The
+       header stacks directly below the mobile bar as the next flex child — no offset needed. */
+    header.thr { gap:7px 6px; padding:7px 10px; }
     header.thr .badge { padding:3px 7px; }
     /* The context gauge ("12.3k / 272k") is the widest element in the bar. Hide the inline number
        on phones — the full breakdown is one tap away in the Context card — so the row packs. */

@@ -2,7 +2,12 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content" />
+<!-- `interactive-widget=resizes-content` asks browsers that support it (Chrome 108+, Firefox 132+)
+     to resize the layout viewport when the virtual keyboard opens, so 100dvh tracks the visible
+     area and the composer stays clear without JS. iOS Safari ignores it and overlays the keyboard
+     instead; the visualViewport sync in app.js (sets --app-height) is the fallback that makes the
+     app fit the visible area there too. -->
 <meta name="giskard-version" content="__GISKARD_VERSION__" />
 <title>Giskard</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
