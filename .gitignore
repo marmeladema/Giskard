@@ -1,1 +1,3 @@
 /target
+tests/e2e/.host-ca-certificates/*
+!tests/e2e/.host-ca-certificates/.gitkeep

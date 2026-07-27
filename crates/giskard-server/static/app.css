@@ -661,6 +661,8 @@
   .remove-project-dialog { width:min(520px,92vw); }
   .remove-project-dialog p { margin:0 0 10px; }
   .remove-project-path { padding:8px 10px; border:1px solid var(--border); border-radius:8px; background:var(--panel2); font-size:12px; word-break:break-all; }
+  .remove-thread-dialog { width:min(520px,92vw); }
+  .remove-thread-dialog p { margin:0 0 10px; }
   .code-dialog { width:min(1120px,94vw); height:min(860px,90vh); }
   .code-head { padding:14px 18px; border-bottom:1px solid var(--border); display:flex; gap:10px; align-items:flex-start; }
   .code-head-main { flex:1; min-width:0; }

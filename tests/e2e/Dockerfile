@@ -13,11 +13,15 @@ FROM rust:1-slim-bookworm AS builder
 WORKDIR /src
 
 # ring (via rustls) needs a C toolchain and perl to build.
+COPY tests/e2e/.host-ca-certificates/ /usr/local/share/ca-certificates/giskard-host/
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential pkg-config perl \
+    && apt-get install -y --no-install-recommends build-essential ca-certificates pkg-config perl \
+    && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY . .
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENV CARGO_HTTP_CAINFO=/etc/ssl/certs/ca-certificates.crt
 RUN cargo build --release -p giskard-server --bin giskard-server-replay
 
 # ---- Stage 2: run Playwright ----
@@ -25,6 +29,11 @@ RUN cargo build --release -p giskard-server --bin giskard-server-replay
 # line up. Bump both together.
 FROM mcr.microsoft.com/playwright:v1.56.0-jammy
 WORKDIR /e2e
+
+COPY tests/e2e/.host-ca-certificates/ /usr/local/share/ca-certificates/giskard-host/
+RUN update-ca-certificates
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
 
 COPY --from=builder /src/target/release/giskard-server-replay /usr/local/bin/giskard-server-replay
 
