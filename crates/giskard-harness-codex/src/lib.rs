@@ -443,7 +443,9 @@ trait CodexTransport: Send {
         params: serde_json::Value,
     ) -> Result<serde_json::Value, HarnessError>;
 
-    async fn next_message(&mut self) -> Result<Option<codex_codes::ServerMessage>, HarnessError>;
+    async fn next_message(
+        &mut self,
+    ) -> Result<Option<codex_codes::ServerMessage>, CodexStreamError>;
 
     async fn respond_json(
         &mut self,
@@ -463,6 +465,59 @@ trait CodexTransport: Send {
         Self: Sized;
 }
 
+#[derive(Debug)]
+enum CodexStreamError {
+    /// A non-JSON line was consumed from app-server stdout. Since JSON-RPC is
+    /// newline-delimited, the next read starts at a fresh frame boundary.
+    NonJsonStdout {
+        parse_error: String,
+        raw_preview: String,
+        raw_bytes: usize,
+    },
+    Fatal(HarnessError),
+}
+
+const NON_JSON_STDOUT_PREVIEW_BYTES: usize = 4 * 1024;
+
+fn bounded_utf8_preview(value: &str, max_bytes: usize) -> String {
+    let mut end = value.len().min(max_bytes);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
+fn classify_codex_stream_error(error: codex_codes::Error) -> CodexStreamError {
+    match error {
+        codex_codes::Error::Deserialization(parse_error)
+            if parse_error.method.is_none()
+                && parse_error.raw_json.is_none()
+                && !parse_error.raw_line.trim_start().starts_with('{') =>
+        {
+            CodexStreamError::NonJsonStdout {
+                raw_preview: bounded_utf8_preview(
+                    &parse_error.raw_line,
+                    NON_JSON_STDOUT_PREVIEW_BYTES,
+                ),
+                raw_bytes: parse_error.raw_line.len(),
+                parse_error: parse_error.error_message,
+            }
+        }
+        codex_codes::Error::Deserialization(parse_error) => {
+            let raw_preview =
+                bounded_utf8_preview(&parse_error.raw_line, NON_JSON_STDOUT_PREVIEW_BYTES);
+            let method = parse_error.method.as_deref().unwrap_or("unknown");
+            CodexStreamError::Fatal(HarnessError::Transport(format!(
+                "Codex JSON-RPC deserialization error for method {method}: {} \
+                 (raw_bytes: {}, raw_preview: {raw_preview:?})",
+                parse_error.error_message,
+                parse_error.raw_line.len(),
+            )))
+        }
+        error => CodexStreamError::Fatal(HarnessError::Transport(error.to_string())),
+    }
+}
+
 #[async_trait]
 impl CodexTransport for codex_codes::AsyncClient {
     async fn request_json(
@@ -475,10 +530,12 @@ impl CodexTransport for codex_codes::AsyncClient {
             .map_err(|e| HarnessError::Transport(e.to_string()))
     }
 
-    async fn next_message(&mut self) -> Result<Option<codex_codes::ServerMessage>, HarnessError> {
+    async fn next_message(
+        &mut self,
+    ) -> Result<Option<codex_codes::ServerMessage>, CodexStreamError> {
         self.next_message()
             .await
-            .map_err(|e| HarnessError::Transport(e.to_string()))
+            .map_err(classify_codex_stream_error)
     }
 
     async fn respond_json(
@@ -956,7 +1013,7 @@ async fn background_task<C>(
 ) where
     C: CodexTransport,
 {
-    let mut mapper = CodexMapper::new(workspace_root);
+    let mut mapper = CodexMapper::new(workspace_root.clone());
     let mut pending_compactions: HashMap<ThreadId, PendingCompaction> = HashMap::new();
     let mut active_turns: ActiveTurns = HashMap::new();
     let mut first_event_warn_tick = tokio::time::interval(Duration::from_secs(1));
@@ -1010,12 +1067,29 @@ async fn background_task<C>(
                         }
                         break;
                     }
-                    Err(e) => {
+                    Err(CodexStreamError::NonJsonStdout {
+                        parse_error,
+                        raw_preview,
+                        raw_bytes,
+                    }) => {
+                        warn!(
+                            active_turns = active_turns.len(),
+                            pending_compactions = pending_compactions.len(),
+                            pending_compaction_states = ?pending_compaction_states(&pending_compactions),
+                            workspace_root = %workspace_root.display(),
+                            error = %parse_error,
+                            raw_bytes,
+                            raw_preview = ?raw_preview,
+                            "Ignoring non-JSON line from Codex app-server stdout"
+                        );
+                    }
+                    Err(CodexStreamError::Fatal(e)) => {
                         let message = e.to_string();
                         if active_turns.is_empty() {
                             warn!(
                                 pending_compactions = pending_compactions.len(),
                                 pending_compaction_states = ?pending_compaction_states(&pending_compactions),
+                                workspace_root = %workspace_root.display(),
                                 "Codex idle stream failed while background work was running: {message}"
                             );
                         } else {
@@ -1023,6 +1097,7 @@ async fn background_task<C>(
                                 active_turns = active_turns.len(),
                                 pending_compactions = pending_compactions.len(),
                                 pending_compaction_states = ?pending_compaction_states(&pending_compactions),
+                                workspace_root = %workspace_root.display(),
                                 "Codex stream failed before all active turns completed: {message}"
                             );
                             cleanup_all_active_turn_uploads(&mut client, &mut active_turns).await;
@@ -1033,8 +1108,8 @@ async fn background_task<C>(
                                 format!("Codex stream failed before turn completion: {message}"),
                             )
                             .await;
-                            break;
                         }
+                        break;
                     }
                 }
             }
@@ -3005,19 +3080,26 @@ mod tests {
 
     struct FakeCodexTransport {
         state: Arc<Mutex<FakeCodexState>>,
-        events_rx: mpsc::Receiver<codex_codes::ServerMessage>,
+        events_rx: mpsc::Receiver<Result<codex_codes::ServerMessage, CodexStreamError>>,
     }
 
     #[derive(Clone)]
     struct FakeCodexController {
         state: Arc<Mutex<FakeCodexState>>,
-        events_tx: mpsc::Sender<codex_codes::ServerMessage>,
+        events_tx: mpsc::Sender<Result<codex_codes::ServerMessage, CodexStreamError>>,
     }
 
     impl FakeCodexController {
         async fn send_server_message(&self, msg: codex_codes::ServerMessage) {
             self.events_tx
-                .send(msg)
+                .send(Ok(msg))
+                .await
+                .expect("fake Codex event receiver should be open");
+        }
+
+        async fn send_stream_error(&self, error: CodexStreamError) {
+            self.events_tx
+                .send(Err(error))
                 .await
                 .expect("fake Codex event receiver should be open");
         }
@@ -3244,8 +3326,8 @@ mod tests {
 
         async fn next_message(
             &mut self,
-        ) -> Result<Option<codex_codes::ServerMessage>, HarnessError> {
-            Ok(self.events_rx.recv().await)
+        ) -> Result<Option<codex_codes::ServerMessage>, CodexStreamError> {
+            self.events_rx.recv().await.transpose()
         }
 
         async fn respond_json(
@@ -3558,6 +3640,74 @@ mod tests {
     }
 
     #[test]
+    fn bare_non_json_stream_error_is_recoverable() {
+        let serde_error = serde_json::from_str::<Value>("not JSON").unwrap_err();
+        let parse_error = codex_codes::ParseError::from_line("not JSON", serde_error);
+
+        assert!(matches!(
+            classify_codex_stream_error(codex_codes::Error::Deserialization(parse_error)),
+            CodexStreamError::NonJsonStdout { .. }
+        ));
+    }
+
+    #[test]
+    fn non_json_stdout_preview_is_bounded_on_a_utf8_boundary() {
+        let raw = format!("{}é", "x".repeat(NON_JSON_STDOUT_PREVIEW_BYTES - 1));
+        let serde_error = serde_json::from_str::<Value>(&raw).unwrap_err();
+        let parse_error = codex_codes::ParseError::from_line(&raw, serde_error);
+
+        let CodexStreamError::NonJsonStdout {
+            raw_preview,
+            raw_bytes,
+            ..
+        } = classify_codex_stream_error(codex_codes::Error::Deserialization(parse_error))
+        else {
+            panic!("expected recoverable non-JSON stdout");
+        };
+        assert_eq!(raw_preview.len(), NON_JSON_STDOUT_PREVIEW_BYTES - 1);
+        assert_eq!(raw_bytes, raw.len());
+    }
+
+    #[test]
+    fn parseable_json_stream_error_remains_fatal() {
+        let raw = r#"{"unexpected":true}"#;
+        let serde_error = serde_json::from_str::<i32>(raw).unwrap_err();
+        let parse_error = codex_codes::ParseError::from_line(raw, serde_error);
+
+        assert!(matches!(
+            classify_codex_stream_error(codex_codes::Error::Deserialization(parse_error)),
+            CodexStreamError::Fatal(HarnessError::Transport(_))
+        ));
+    }
+
+    #[test]
+    fn truncated_json_rpc_object_remains_fatal() {
+        let raw = r#"{"method":"turn/completed""#;
+        let serde_error = serde_json::from_str::<Value>(raw).unwrap_err();
+        let parse_error = codex_codes::ParseError::from_line(raw, serde_error);
+
+        assert!(matches!(
+            classify_codex_stream_error(codex_codes::Error::Deserialization(parse_error)),
+            CodexStreamError::Fatal(HarnessError::Transport(_))
+        ));
+    }
+
+    #[test]
+    fn typed_json_rpc_decode_error_remains_fatal() {
+        let serde_error = serde_json::from_value::<i32>(json!({"unexpected": true})).unwrap_err();
+        let parse_error = codex_codes::ParseError::from_envelope(
+            "turn/completed",
+            Some(json!({"unexpected": true})),
+            serde_error,
+        );
+
+        assert!(matches!(
+            classify_codex_stream_error(codex_codes::Error::Deserialization(parse_error)),
+            CodexStreamError::Fatal(HarnessError::Transport(_))
+        ));
+    }
+
+    #[test]
     fn foreign_turn_completion_does_not_end_live_stream() {
         let stream_thread = ThreadId::new();
         let foreign_thread = ThreadId::new();
@@ -3709,6 +3859,90 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn codex_worker_ignores_non_json_stdout_during_an_active_turn() {
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
+        harness
+            .start_turn(
+                &thread,
+                UserInput::text("keep running"),
+                build_turn_overrides(),
+            )
+            .await
+            .unwrap();
+        let native_turn = controller.started_turns().await[0].native_turn_id.clone();
+        let mut stream = harness.subscribe(&thread);
+
+        controller
+            .send_stream_error(CodexStreamError::NonJsonStdout {
+                parse_error: "expected value at line 1 column 1".into(),
+                raw_preview: "leaked command output".into(),
+                raw_bytes: 21,
+            })
+            .await;
+        controller
+            .send_server_message(codex_codes::ServerMessage::Notification(
+                codex_codes::messages::Notification::TurnCompleted(
+                    serde_json::from_value(json!({
+                        "threadId": thread.harness_thread_id,
+                        "turn": { "id": native_turn, "status": "completed" }
+                    }))
+                    .expect("test completion should deserialize"),
+                ),
+            ))
+            .await;
+        recv_matching_event(
+            &mut stream,
+            "turn completion after non-JSON stdout",
+            |event| {
+                matches!(event, AgentEvent::TurnCompleted { status, .. }
+                if status.kind == TurnStatusKind::Completed)
+            },
+        )
+        .await;
+
+        let models = timeout(Duration::from_secs(1), harness.list_models())
+            .await
+            .expect("a consumed non-JSON line must not close the worker")
+            .unwrap();
+        assert_eq!(models.len(), 2);
+
+        let second = timeout(
+            Duration::from_secs(1),
+            harness.open_thread(open_opts(None, None)),
+        )
+        .await
+        .expect("the worker must continue accepting thread operations")
+        .unwrap();
+        assert_eq!(second.harness_thread_id, "native-thread-2");
+    }
+
+    #[tokio::test]
+    async fn fatal_stream_error_closes_worker_with_only_pending_compaction() {
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
+        controller
+            .send_stream_error(CodexStreamError::Fatal(HarnessError::Transport(
+                "connection lost".into(),
+            )))
+            .await;
+
+        harness.compact_thread(&thread).await.unwrap();
+        timeout(Duration::from_secs(1), async {
+            while !harness.worker_queue.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fatal stream error must close the worker");
+
+        assert!(matches!(
+            harness.list_models().await,
+            Err(HarnessError::Transport(message)) if message == "background task closed"
+        ));
     }
 
     #[tokio::test]
