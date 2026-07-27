@@ -14,7 +14,7 @@ use giskard_core::item::{
 use giskard_core::model::ModelRef;
 use giskard_core::server_request::{ServerRequest, ServerRequestResponse};
 use giskard_core::token::TokenUsage;
-use giskard_core::turn::{ApprovalPolicy, Mode, TurnOverrides, TurnStatus, TurnStatusKind};
+use giskard_core::turn::{Mode, PermissionPreset, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
     AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ResumePolicy,
@@ -3614,7 +3614,7 @@ async fn importing_subagent_thread_records_parent_and_reuses_native_child() {
             TurnOverrides {
                 model: Some(parent_file.current_model.clone()),
                 mode: parent_file.mode,
-                approval_policy: parent_file.approval_policy,
+                permission_preset: parent_file.permission_preset,
             },
             parent_file.current_model.clone(),
         )
@@ -3781,7 +3781,7 @@ async fn route_and_forwarder_import_same_native_child_once() {
             TurnOverrides {
                 model: Some(parent_file.current_model.clone()),
                 mode: parent_file.mode,
-                approval_policy: parent_file.approval_policy,
+                permission_preset: parent_file.permission_preset,
             },
             parent_file.current_model,
         )
@@ -3896,7 +3896,7 @@ async fn passive_subagent_command_start_streams_before_completion() {
             TurnOverrides {
                 model: Some(parent_file.current_model.clone()),
                 mode: parent_file.mode,
-                approval_policy: parent_file.approval_policy,
+                permission_preset: parent_file.permission_preset,
             },
             parent_file.current_model.clone(),
         )
@@ -4070,7 +4070,7 @@ async fn collab_agent_spawn_start_imports_subagent_thread() {
             TurnOverrides {
                 model: Some(parent_file.current_model.clone()),
                 mode: parent_file.mode,
-                approval_policy: parent_file.approval_policy,
+                permission_preset: parent_file.permission_preset,
             },
             parent_file.current_model.clone(),
         )
@@ -4168,7 +4168,7 @@ async fn collab_agent_spawn_uses_tool_input_prompt_when_link_prompt_is_missing()
             TurnOverrides {
                 model: Some(parent_file.current_model.clone()),
                 mode: parent_file.mode,
-                approval_policy: parent_file.approval_policy,
+                permission_preset: parent_file.permission_preset,
             },
             parent_file.current_model.clone(),
         )
@@ -4283,7 +4283,7 @@ async fn passive_subagent_prompt_updates_when_spawn_metadata_arrives_late() {
             TurnOverrides {
                 model: Some(parent_file.current_model.clone()),
                 mode: parent_file.mode,
-                approval_policy: parent_file.approval_policy,
+                permission_preset: parent_file.permission_preset,
             },
             parent_file.current_model.clone(),
         )
@@ -4385,7 +4385,7 @@ async fn server_resolved_subagent_link_uses_agent_name_prompt_and_turn() {
             TurnOverrides {
                 model: Some(parent_file.current_model.clone()),
                 mode: parent_file.mode,
-                approval_policy: parent_file.approval_policy,
+                permission_preset: parent_file.permission_preset,
             },
             parent_file.current_model,
         )
@@ -4514,7 +4514,7 @@ async fn subagent_link_open_rejects_unknown_and_non_link_items() {
             TurnOverrides {
                 model: Some(parent_file.current_model.clone()),
                 mode: parent_file.mode,
-                approval_policy: parent_file.approval_policy,
+                permission_preset: parent_file.permission_preset,
             },
             parent_file.current_model,
         )
@@ -4581,7 +4581,7 @@ async fn terminal_subagent_link_recovers_fallback_without_starting_monitor() {
             TurnOverrides {
                 model: Some(parent_file.current_model.clone()),
                 mode: parent_file.mode,
-                approval_policy: parent_file.approval_policy,
+                permission_preset: parent_file.permission_preset,
             },
             parent_file.current_model,
         )
@@ -4689,7 +4689,7 @@ async fn persisted_or_interrupted_subagent_does_not_restart_passive_monitor() {
             TurnOverrides {
                 model: Some(parent_file.current_model.clone()),
                 mode: parent_file.mode,
-                approval_policy: parent_file.approval_policy,
+                permission_preset: parent_file.permission_preset,
             },
             parent_file.current_model.clone(),
         )
@@ -4773,7 +4773,7 @@ async fn persisted_or_interrupted_subagent_does_not_restart_passive_monitor() {
             TurnOverrides {
                 model: Some(parent_file.current_model.clone()),
                 mode: parent_file.mode,
-                approval_policy: parent_file.approval_policy,
+                permission_preset: parent_file.permission_preset,
             },
             parent_file.current_model,
         )
@@ -4868,7 +4868,7 @@ async fn reverse_subagent_activity_preserves_parent_and_uses_one_forwarder() {
             TurnOverrides {
                 model: Some(parent_file.current_model.clone()),
                 mode: parent_file.mode,
-                approval_policy: parent_file.approval_policy,
+                permission_preset: parent_file.permission_preset,
             },
             parent_file.current_model.clone(),
         )
@@ -4927,7 +4927,7 @@ async fn reverse_subagent_activity_preserves_parent_and_uses_one_forwarder() {
             TurnOverrides {
                 model: Some(child.current_model.clone()),
                 mode: child.mode,
-                approval_policy: child.approval_policy,
+                permission_preset: child.permission_preset,
             },
         )
         .await
@@ -5087,7 +5087,7 @@ async fn route_rejects_native_child_with_a_different_parent() {
             TurnOverrides {
                 model: Some(parent_file.current_model.clone()),
                 mode: parent_file.mode,
-                approval_policy: parent_file.approval_policy,
+                permission_preset: parent_file.permission_preset,
             },
             parent_file.current_model,
         )
@@ -5137,7 +5137,7 @@ async fn parent_deletion_cascades_to_all_descendants_leaf_first() {
             TurnOverrides {
                 model: Some(parent_file.current_model.clone()),
                 mode: parent_file.mode,
-                approval_policy: parent_file.approval_policy,
+                permission_preset: parent_file.permission_preset,
             },
             parent_file.current_model,
         )
@@ -5158,7 +5158,7 @@ async fn parent_deletion_cascades_to_all_descendants_leaf_first() {
             TurnOverrides {
                 model: Some(child.current_model.clone()),
                 mode: child.mode,
-                approval_policy: child.approval_policy,
+                permission_preset: child.permission_preset,
             },
         )
         .await
@@ -5261,7 +5261,7 @@ async fn parent_deletion_rejects_active_descendant_before_deleting_anything() {
             TurnOverrides {
                 model: Some(parent_file.current_model.clone()),
                 mode: parent_file.mode,
-                approval_policy: parent_file.approval_policy,
+                permission_preset: parent_file.permission_preset,
             },
             parent_file.current_model,
         )
@@ -5290,7 +5290,7 @@ async fn parent_deletion_rejects_active_descendant_before_deleting_anything() {
             TurnOverrides {
                 model: Some(child_file.current_model.clone()),
                 mode: child_file.mode,
-                approval_policy: child_file.approval_policy,
+                permission_preset: child_file.permission_preset,
             },
         )
         .await
@@ -5331,7 +5331,7 @@ async fn starting_thread_generates_title_from_first_prompt() {
             "text": "Task:\n\n- [ ] Investigate thread title generation. Keep the rest as context.",
             "model_ref": {"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null},
             "mode": "build",
-            "approval_policy": "ask",
+            "permission_preset": "ask_first",
         }))
         .send()
         .await
@@ -5663,10 +5663,10 @@ async fn project_remove_rejects_running_commands() {
     );
 }
 
-/// AP2: approval policy is thread-scoped, so two threads in the same project keep independent
-/// policies. Setting one thread's policy must not disturb the other's.
+/// AP2: permission preset is thread-scoped, so two threads in the same project keep independent
+/// presets. Setting one thread's preset must not disturb the other's.
 #[tokio::test]
-async fn threads_in_a_project_keep_independent_approval_policies() {
+async fn threads_in_a_project_keep_independent_permission_presets() {
     let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
     let base = format!("http://127.0.0.1:{port}");
     let ws_base = format!("ws://127.0.0.1:{port}");
@@ -5678,14 +5678,14 @@ async fn threads_in_a_project_keep_independent_approval_policies() {
     let thread_b =
         open_thread_with_resume(&client, &base, &cookie, project_id, "th_policy_b").await;
 
-    // New threads default to `ask`.
+    // New threads default to `ask_first`.
     assert_eq!(
         load_policy(&state, project_id, thread_a).await,
-        ApprovalPolicy::Ask
+        PermissionPreset::AskFirst
     );
     assert_eq!(
         load_policy(&state, project_id, thread_b).await,
-        ApprovalPolicy::Ask
+        PermissionPreset::AskFirst
     );
 
     use tokio_tungstenite::tungstenite::http::Request;
@@ -5703,24 +5703,30 @@ async fn threads_in_a_project_keep_independent_approval_policies() {
         .await
         .expect("WS connect");
 
-    // Give the two threads different policies.
+    // Give the two threads different presets.
     for (thread_id, policy) in [
-        (thread_a, ApprovalPolicy::ReadOnly),
-        (thread_b, ApprovalPolicy::Auto),
+        (thread_a, PermissionPreset::AskFirst),
+        (thread_b, PermissionPreset::AutoApprove),
     ] {
         ws.send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::to_string(&ClientMessage::SetApprovalPolicy { thread_id, policy })
-                .unwrap()
-                .into(),
+            serde_json::to_string(&ClientMessage::SetPermissionPreset {
+                thread_id,
+                preset: policy,
+            })
+            .unwrap()
+            .into(),
         ))
         .await
         .unwrap();
     }
 
-    // Each thread retains its own policy; setting B did not overwrite A (which a project-scoped
-    // policy would have done).
-    wait_for_policy(&state, project_id, thread_a, ApprovalPolicy::ReadOnly).await;
-    wait_for_policy(&state, project_id, thread_b, ApprovalPolicy::Auto).await;
+    // Each thread retains its own preset; setting B did not overwrite A (which a project-scoped
+    // preset would have done).
+    wait_for_policy(&state, project_id, thread_b, PermissionPreset::AutoApprove).await;
+    assert_eq!(
+        load_policy(&state, project_id, thread_a).await,
+        PermissionPreset::AskFirst
+    );
 }
 
 async fn open_thread_with_resume(
@@ -5749,21 +5755,21 @@ async fn load_policy(
     state: &AppState,
     project_id: ProjectId,
     thread_id: ThreadId,
-) -> ApprovalPolicy {
+) -> PermissionPreset {
     state
         .store
         .load_thread(project_id, thread_id)
         .await
         .unwrap()
         .unwrap()
-        .approval_policy
+        .permission_preset
 }
 
 async fn wait_for_policy(
     state: &AppState,
     project_id: ProjectId,
     thread_id: ThreadId,
-    expected: ApprovalPolicy,
+    expected: PermissionPreset,
 ) {
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     loop {
@@ -5771,7 +5777,7 @@ async fn wait_for_policy(
             return;
         }
         if tokio::time::Instant::now() >= deadline {
-            panic!("thread {thread_id} approval policy did not become {expected:?}");
+            panic!("thread {thread_id} permission preset did not become {expected:?}");
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
     }
@@ -6133,7 +6139,7 @@ async fn subscribe_reopens_persisted_thread() {
                     "openai".into(),
                     HashMap::from([("gpt-5.5".into(), 258_400)]),
                 )]),
-                approval_policy: ApprovalPolicy::Ask,
+                permission_preset: PermissionPreset::AskFirst,
                 model_efforts: Default::default(),
                 tokens: Default::default(),
                 created_at: now,
@@ -6268,7 +6274,7 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
                 current_model: model.clone(),
                 context_window: 128_000,
                 model_context_windows: Default::default(),
-                approval_policy: ApprovalPolicy::Ask,
+                permission_preset: PermissionPreset::AskFirst,
                 model_efforts: Default::default(),
                 tokens: Default::default(),
                 created_at: now,
@@ -6426,7 +6432,7 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
                 current_model: model.clone(),
                 context_window: 128_000,
                 model_context_windows: Default::default(),
-                approval_policy: ApprovalPolicy::Ask,
+                permission_preset: PermissionPreset::AskFirst,
                 model_efforts: Default::default(),
                 tokens: Default::default(),
                 created_at: now,
@@ -6655,7 +6661,7 @@ async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
                 current_model: model.clone(),
                 context_window: 128_000,
                 model_context_windows: Default::default(),
-                approval_policy: ApprovalPolicy::Ask,
+                permission_preset: PermissionPreset::AskFirst,
                 model_efforts: Default::default(),
                 tokens: Default::default(),
                 created_at: now,
@@ -7150,7 +7156,7 @@ wire_api = "responses"
                 },
                 context_window: 128_000,
                 model_context_windows: Default::default(),
-                approval_policy: ApprovalPolicy::Ask,
+                permission_preset: PermissionPreset::AskFirst,
                 model_efforts: Default::default(),
                 tokens: Default::default(),
                 created_at: now,
@@ -7253,7 +7259,7 @@ wire_api = "responses"
                 current_model: stale_model.clone(),
                 context_window: 128_000,
                 model_context_windows: Default::default(),
-                approval_policy: ApprovalPolicy::Ask,
+                permission_preset: PermissionPreset::AskFirst,
                 model_efforts: Default::default(),
                 tokens: Default::default(),
                 created_at: now,
@@ -7384,7 +7390,7 @@ wire_api = "responses"
             "text": "Hello",
             "model_ref": proxy_model,
             "mode": "plan",
-            "approval_policy": "read_only",
+            "permission_preset": "ask_first",
         }))
         .send()
         .await
@@ -7407,7 +7413,7 @@ wire_api = "responses"
     assert_eq!(saved_thread.current_model.provider, "proxy");
     assert_eq!(saved_thread.current_model.model, "glm-5.2-workers-ai");
     assert_eq!(saved_thread.mode, Mode::Plan);
-    assert_eq!(saved_thread.approval_policy, ApprovalPolicy::ReadOnly);
+    assert_eq!(saved_thread.permission_preset, PermissionPreset::AskFirst);
     assert_eq!(
         saved_thread.harness_thread_id,
         body["harness_thread_id"].as_str().unwrap()
@@ -7444,7 +7450,7 @@ async fn start_thread_turn_rejection_cleans_up_new_thread() {
             "text": "Hello",
             "model_ref": {"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null},
             "mode": "build",
-            "approval_policy": "ask",
+            "permission_preset": "ask_first",
         }))
         .send()
         .await

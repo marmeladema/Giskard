@@ -1,7 +1,7 @@
 //! Regression test for the turn-override snapshot the server hands the harness.
 //!
 //! Guards two fixes: (1) the thread's current model + reasoning effort must reach `start_turn`
-//! so mid-thread model/effort changes take effect (§8.4/§8.5); (2) the thread's approval policy
+//! so mid-thread model/effort changes take effect (§8.4/§8.5); (2) the thread's permission preset
 //! must reach the harness (§9). A capturing harness records every `TurnOverrides` it is handed.
 
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use giskard_core::ids::{ApprovalId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::model::{Effort, ModelDescriptor, ModelRef};
 use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::token::TokenUsage;
-use giskard_core::turn::{ApprovalPolicy, Mode, TurnOverrides, TurnStatus, TurnStatusKind};
+use giskard_core::turn::{Mode, PermissionPreset, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
     AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
@@ -159,7 +159,7 @@ fn ws_text(msg: &ClientMessage) -> tokio_tungstenite::tungstenite::Message {
 }
 
 #[tokio::test]
-async fn send_input_snapshot_carries_model_effort_and_thread_policy() {
+async fn send_input_snapshot_carries_model_effort_and_permission_preset() {
     let port = 19100;
     let captured = Arc::new(TokioMutex::new(Vec::<TurnOverrides>::new()));
 
@@ -313,15 +313,15 @@ wire_api = "responses"
     );
     assert_eq!(first.mode, Mode::Plan);
     assert_eq!(
-        first.approval_policy,
-        ApprovalPolicy::Ask,
-        "new threads default to ask"
+        first.permission_preset,
+        PermissionPreset::AskFirst,
+        "new threads default to ask first"
     );
 
-    // Now set the thread approval policy and send again.
-    ws.send(ws_text(&ClientMessage::SetApprovalPolicy {
+    // Now set the thread permission preset and send again.
+    ws.send(ws_text(&ClientMessage::SetPermissionPreset {
         thread_id,
-        policy: ApprovalPolicy::ReadOnly,
+        preset: PermissionPreset::FullAccess,
     }))
     .await
     .unwrap();
@@ -333,11 +333,11 @@ wire_api = "responses"
             .await
             .unwrap()
             .unwrap();
-        if tf.approval_policy == ApprovalPolicy::ReadOnly {
+        if tf.permission_preset == PermissionPreset::FullAccess {
             break;
         }
         if tokio::time::Instant::now() >= deadline {
-            panic!("thread approval policy was not persisted");
+            panic!("thread permission preset was not persisted");
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
     }
@@ -351,9 +351,9 @@ wire_api = "responses"
 
     let second = wait_for_capture(&captured, 2).await;
     assert_eq!(
-        second.approval_policy,
-        ApprovalPolicy::ReadOnly,
-        "thread approval policy changes must reach the harness"
+        second.permission_preset,
+        PermissionPreset::FullAccess,
+        "thread permission preset changes must reach the harness"
     );
 
     // Clearing effort on the same model should mean "model default", not "restore the previous

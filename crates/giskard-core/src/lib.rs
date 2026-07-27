@@ -35,5 +35,5 @@ pub use model::{Effort, ModelDescriptor, ModelRef};
 pub use server_request::{ServerRequest, ServerRequestResponse};
 pub use thread::ThreadKind;
 pub use token::{ByModel, DailyTokenLedger, TokenLedger, TokenUsage};
-pub use turn::{ApprovalPolicy, Mode, Turn, TurnOverrides, TurnStatus, TurnStatusKind};
+pub use turn::{Mode, PermissionPreset, Turn, TurnOverrides, TurnStatus, TurnStatusKind};
 pub use user_input::{AttachmentKind, UserAttachment, UserInput};

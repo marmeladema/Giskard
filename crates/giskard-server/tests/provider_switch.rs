@@ -13,7 +13,7 @@ use giskard_core::ids::{ItemId, ProjectId, ThreadId, TurnId};
 use giskard_core::item::{Item, ItemPayload};
 use giskard_core::model::{ModelDescriptor, ModelRef};
 use giskard_core::token::{TokenLedger, TokenUsage};
-use giskard_core::turn::{ApprovalPolicy, Mode, Turn, TurnStatus, TurnStatusKind};
+use giskard_core::turn::{Mode, PermissionPreset, Turn, TurnStatus, TurnStatusKind};
 use giskard_harness::{
     AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
 };
@@ -186,7 +186,7 @@ fn seeded_thread(project_id: ProjectId, thread_id: ThreadId) -> ThreadFile {
         current_model: dead_model(),
         context_window: 131_072,
         model_context_windows: Default::default(),
-        approval_policy: ApprovalPolicy::Ask,
+        permission_preset: PermissionPreset::AskFirst,
         model_efforts: HashMap::new(),
         tokens: TokenLedger::default(),
         created_at: now,

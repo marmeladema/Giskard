@@ -36,7 +36,7 @@ pub use giskard_core::mcp::{
 pub use giskard_core::model::{Effort, ModelDescriptor, ModelRef};
 pub use giskard_core::server_request::{ServerRequest, ServerRequestResponse};
 pub use giskard_core::token::{ByModel, DailyTokenLedger, TokenLedger, TokenUsage};
-pub use giskard_core::turn::{ApprovalPolicy, Mode, TurnStatus, TurnStatusKind};
+pub use giskard_core::turn::{Mode, PermissionPreset, TurnStatus, TurnStatusKind};
 pub use giskard_core::user_input::{AttachmentKind, UserAttachment};
 
 // ---- Client → Server ----
@@ -70,9 +70,9 @@ pub enum ClientMessage {
         thread_id: ThreadId,
         model_ref: ModelRef,
     },
-    SetApprovalPolicy {
+    SetPermissionPreset {
         thread_id: ThreadId,
-        policy: ApprovalPolicy,
+        preset: PermissionPreset,
     },
     Interrupt {
         thread_id: ThreadId,
@@ -410,7 +410,7 @@ pub struct StartThreadRequest {
     pub attachments: Vec<UserAttachment>,
     pub model_ref: ModelRef,
     pub mode: Mode,
-    pub approval_policy: ApprovalPolicy,
+    pub permission_preset: PermissionPreset,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -687,26 +687,48 @@ mod tests {
     }
 
     #[test]
-    fn client_message_set_approval_policy_is_thread_scoped() {
+    fn client_message_set_permission_preset_is_thread_scoped() {
         let tid = ThreadId::new();
-        let msg = ClientMessage::SetApprovalPolicy {
+        let msg = ClientMessage::SetPermissionPreset {
             thread_id: tid,
-            policy: ApprovalPolicy::ReadOnly,
+            preset: PermissionPreset::AskFirst,
         };
         let json = serde_json::to_value(&msg).unwrap();
-        assert_eq!(json["type"], "set_approval_policy");
+        assert_eq!(json["type"], "set_permission_preset");
         assert_eq!(json["thread_id"], tid.to_string());
-        assert_eq!(json["policy"], "read_only");
+        assert_eq!(json["preset"], "ask_first");
         assert!(json.get("project_id").is_none());
 
         let back: ClientMessage = serde_json::from_value(json).unwrap();
         match back {
-            ClientMessage::SetApprovalPolicy { thread_id, policy } => {
+            ClientMessage::SetPermissionPreset { thread_id, preset } => {
                 assert_eq!(thread_id, tid);
-                assert_eq!(policy, ApprovalPolicy::ReadOnly);
+                assert_eq!(preset, PermissionPreset::AskFirst);
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn live_apis_reject_legacy_permission_names() {
+        let thread_id = ThreadId::new();
+        let legacy_ws = serde_json::json!({
+            "type": "set_permission_preset",
+            "thread_id": thread_id,
+            "preset": "auto"
+        });
+        assert!(serde_json::from_value::<ClientMessage>(legacy_ws).is_err());
+
+        let legacy_http = serde_json::json!({
+            "text": "hello",
+            "model_ref": {
+                "provider": "openai",
+                "model": "gpt-5.5"
+            },
+            "mode": "build",
+            "approval_policy": "ask"
+        });
+        assert!(serde_json::from_value::<StartThreadRequest>(legacy_http).is_err());
     }
 
     #[test]

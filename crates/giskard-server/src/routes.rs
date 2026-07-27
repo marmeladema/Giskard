@@ -24,7 +24,7 @@ use giskard_core::ids::{ProjectId, ThreadId};
 use giskard_core::model::{ModelDescriptor, ModelRef};
 use giskard_core::text::trimmed_non_empty;
 use giskard_core::thread::ThreadKind;
-use giskard_core::turn::{ApprovalPolicy, Mode, TurnOverrides};
+use giskard_core::turn::{Mode, PermissionPreset, TurnOverrides};
 use giskard_core::user_input::UserInput;
 use giskard_persist::Config;
 use giskard_persist::store::{ProjectConfig, ThreadFile};
@@ -761,7 +761,7 @@ async fn open_thread(
         current_model: current_model.clone(),
         context_window,
         model_context_windows: std::collections::HashMap::new(),
-        approval_policy: ApprovalPolicy::Ask,
+        permission_preset: PermissionPreset::AskFirst,
         model_efforts: std::collections::HashMap::new(),
         tokens: giskard_core::token::TokenLedger::default(),
         created_at: now,
@@ -864,7 +864,7 @@ async fn start_thread_with_message(
         provider = %model_ref.provider,
         model = %model_ref.model,
         mode = ?req.mode,
-        approval_policy = ?req.approval_policy,
+        permission_preset = ?req.permission_preset,
         "starting new thread from initial user message"
     );
 
@@ -916,7 +916,7 @@ async fn start_thread_with_message(
         current_model: model_ref.clone(),
         context_window: model_descriptor.context_window,
         model_context_windows: std::collections::HashMap::new(),
-        approval_policy: req.approval_policy,
+        permission_preset: req.permission_preset,
         model_efforts: std::collections::HashMap::new(),
         tokens: giskard_core::token::TokenLedger::default(),
         created_at: now,
@@ -940,7 +940,7 @@ async fn start_thread_with_message(
     let overrides = TurnOverrides {
         model: Some(model_ref.clone()),
         mode: req.mode,
-        approval_policy: req.approval_policy,
+        permission_preset: req.permission_preset,
     };
     let turn_id = match state
         .registry
@@ -3192,11 +3192,11 @@ async fn handle_client_msg(
             //  - the thread's current model (carrying its reasoning effort), so a mid-thread
             //    model/effort change actually reaches the agent. Passing `None` here would leave
             //    Codex on whatever model was set at `thread/start`.
-            //  - the thread's persisted approval policy (§9).
+            //  - the thread's persisted permission preset (§9).
             let overrides = TurnOverrides {
                 model: Some(effective_model.clone()),
                 mode: tf.mode,
-                approval_policy: tf.approval_policy,
+                permission_preset: tf.permission_preset,
             };
 
             state
@@ -3361,16 +3361,16 @@ async fn handle_client_msg(
                 })?;
             broadcast_thread_state(state, thread_id, &tf).await;
         }
-        ClientMessage::SetApprovalPolicy { thread_id, policy } => {
-            let project_id = project_for(state, thread_id, "set_approval_policy").await?;
+        ClientMessage::SetPermissionPreset { thread_id, preset } => {
+            let project_id = project_for(state, thread_id, "set_permission_preset").await?;
             let tf = state
                 .store
                 .update_thread(project_id, thread_id, |tf| {
-                    tf.approval_policy = policy;
+                    tf.permission_preset = preset;
                     tf.updated_at = chrono::Utc::now();
                 })
                 .await
-                .map_err(|e| WsError::from_persist(e, "set_approval_policy", Some(thread_id)))?
+                .map_err(|e| WsError::from_persist(e, "set_permission_preset", Some(thread_id)))?
                 .ok_or_else(|| {
                     WsError::new(
                         "thread_not_found",
@@ -3378,7 +3378,7 @@ async fn handle_client_msg(
                         "Thread not found.",
                     )
                     .thread(thread_id)
-                    .action("set_approval_policy")
+                    .action("set_permission_preset")
                 })?;
             broadcast_thread_state(state, thread_id, &tf).await;
         }

@@ -2226,8 +2226,10 @@ fn build_turn_start_params(
     overrides: &TurnOverrides,
 ) -> Result<serde_json::Value, HarnessError> {
     let codex_input = mapping::map_user_input(input);
-    let sandbox_policy = mapping::map_mode_to_sandbox(overrides.mode);
-    let approval_policy = mapping::map_approval_policy(overrides.approval_policy);
+    let codex_approval_policy =
+        mapping::map_permission_preset_to_codex_approval(overrides.permission_preset);
+    let permissions =
+        mapping::map_permission_preset_to_codex_permissions(overrides.permission_preset);
     let effort = overrides
         .model
         .as_ref()
@@ -2237,8 +2239,8 @@ fn build_turn_start_params(
     let mut params = serde_json::json!({
         "threadId": thread.harness_thread_id,
         "input": codex_input,
-        "sandboxPolicy": sandbox_policy,
-        "approvalPolicy": approval_policy,
+        "approvalPolicy": codex_approval_policy,
+        "permissions": permissions,
     });
     let Some(map) = params.as_object_mut() else {
         return Err(HarnessError::Protocol(
@@ -3001,7 +3003,7 @@ mod tests {
     use giskard_core::ids::ItemId;
     use giskard_core::item::{Item, ItemPayload};
     use giskard_core::model::{Effort, ModelRef};
-    use giskard_core::turn::{ApprovalPolicy, Mode};
+    use giskard_core::turn::{Mode, PermissionPreset};
     use serde_json::{Value, json};
     use std::collections::HashSet;
     use tokio::sync::Mutex;
@@ -3030,7 +3032,7 @@ mod tests {
         TurnOverrides {
             model: Some(test_model(effort)),
             mode,
-            approval_policy: ApprovalPolicy::Ask,
+            permission_preset: PermissionPreset::AskFirst,
         }
     }
 
@@ -4964,6 +4966,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(params["threadId"], "native-thread");
+        assert!(params.get("sandboxPolicy").is_none());
+        assert_eq!(params["approvalPolicy"], "on-request");
+        assert_eq!(params["permissions"], ":read-only");
         assert_eq!(params["model"], "gpt-5.5");
         assert_eq!(params["effort"], "medium");
         assert_eq!(params["collaborationMode"]["mode"], "plan");
@@ -4985,8 +4990,25 @@ mod tests {
         .unwrap();
 
         assert_eq!(params["collaborationMode"]["mode"], "default");
+        assert!(params.get("sandboxPolicy").is_none());
+        assert_eq!(params["approvalPolicy"], "on-request");
+        assert_eq!(params["permissions"], ":read-only");
         assert_eq!(params["collaborationMode"]["settings"]["model"], "gpt-5.5");
         assert!(params.get("effort").is_none());
         assert!(params["collaborationMode"]["settings"]["reasoning_effort"].is_null());
+    }
+
+    #[test]
+    fn full_access_turn_start_params_disable_codex_approval_and_sandbox() {
+        let mut overrides = turn_overrides(Mode::Build, None);
+        overrides.permission_preset = PermissionPreset::FullAccess;
+
+        let params =
+            build_turn_start_params(&test_thread(), &UserInput::text("implement it"), &overrides)
+                .unwrap();
+
+        assert!(params.get("sandboxPolicy").is_none());
+        assert_eq!(params["approvalPolicy"], "never");
+        assert_eq!(params["permissions"], ":danger-full-access");
     }
 }

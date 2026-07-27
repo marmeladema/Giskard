@@ -146,28 +146,30 @@ async fn index_page_is_served_and_public() {
         "approval cards style session separately from the default cancel button"
     );
     assert!(
-        body.contains("id=\"approvalSel\""),
-        "approval policy is exposed as a selector"
+        body.contains("id=\"permissionPresetSel\""),
+        "permission preset is exposed as a selector"
     );
     assert!(
-        body.contains("<label for=\"approvalSel\">Approvals</label>"),
-        "approval policy selector has a visible label"
+        body.contains("<label for=\"permissionPresetSel\">Permissions</label>"),
+        "permission preset selector has a visible label"
     );
     assert!(
-        body.contains(">Ask first</option>") && body.contains(">Auto approve</option>"),
-        "approval policy selector uses action-oriented option labels"
+        body.contains("<option value=\"ask_first\">Ask first</option>")
+            && body.contains("<option value=\"auto_approve\">Auto approve</option>")
+            && body.contains("<option value=\"full_access\">⚠ Full Access</option>"),
+        "permission preset selector uses the wire values and action-oriented labels"
     );
     assert!(
-        body.contains("type:\"set_approval_policy\", thread_id: state.threadId, policy"),
-        "approval policy changes target the active thread"
+        body.contains("type:\"set_permission_preset\", thread_id: state.threadId, preset"),
+        "permission preset changes target the active thread"
     );
     assert!(
-        body.contains("setApprovalPolicy(s.approval_policy || \"ask\")"),
-        "thread state hydrates the approval policy selector"
+        body.contains("setPermissionPreset(s.permission_preset || \"ask_first\")"),
+        "thread state hydrates the permission preset selector"
     );
     assert!(
         !body.contains("id=\"pmApproval\""),
-        "approval policy is not configured at project creation"
+        "permission preset is not configured at project creation"
     );
     assert!(
         body.contains("pendingApprovals"),

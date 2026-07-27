@@ -169,7 +169,7 @@ provider/model.
 
 Giskard now avoids the empty-native-thread case for normal UI creation. Clicking project `+` opens
 an unpersisted browser draft. The first send calls Giskard's `POST /api/projects/{id}/threads/start`
-with the selected model/provider, mode, approval policy, and initial text. The server then calls
+with the selected model/provider, mode, permission preset, and initial text. The server then calls
 Codex `thread/start` with that provider/model and immediately starts the first turn.
 
 This is better than creating an empty native thread and later replacing it: the selected provider is
