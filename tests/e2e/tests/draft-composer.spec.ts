@@ -1,6 +1,24 @@
 import { test, expect, type Page } from "@playwright/test";
 import { SCRIPTED_REPLY, login } from "./helpers";
 
+/**
+ * Hold matching requests until the returned `release` is called, so a window that is normally a few
+ * milliseconds becomes wide and deterministic instead of a race the test has to win.
+ */
+async function holdRoute(page: Page, url: RegExp, method: string): Promise<() => void> {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  await page.route(url, async (route) => {
+    if (route.request().method() !== method) return route.fallback();
+    await held;
+    return route.fallback();
+  });
+  return () => release();
+}
+
+/** `GET /api/projects/{id}` — the project record, not its `/models` catalog. */
+const PROJECT_GET = /\/api\/projects\/[^/?]+$/;
+
 // Clicking "+" used to fetch the project before switching to the draft. For the length of that
 // round-trip the *previous* thread stayed on screen with its composer visible and editable, so
 // anything typed landed in the old composer and was destroyed when the draft finally opened and
@@ -19,23 +37,12 @@ test.describe("draft composer", () => {
     await login(page);
   });
 
-  /** Hold the single-project GET (the one `newThread` used to await) until the caller releases it. */
-  async function holdProjectFetch(page: Page): Promise<() => void> {
-    let release!: () => void;
-    const held = new Promise<void>((resolve) => { release = resolve; });
-    await page.route(/\/api\/projects\/[^/?]+$/, async (route) => {
-      if (route.request().method() !== "GET") return route.fallback();
-      await held;
-      return route.fallback();
-    });
-    return () => release();
-  }
+  /** The single-project GET that `newThread` used to await before opening the draft. */
+  const holdProjectFetch = (page: Page) => holdRoute(page, PROJECT_GET, "GET");
 
   function projectFetched(page: Page) {
     return page.waitForResponse(
-      (r) =>
-        r.request().method() === "GET" &&
-        /\/api\/projects\/[^/?]+$/.test(new URL(r.url()).pathname),
+      (r) => r.request().method() === "GET" && PROJECT_GET.test(new URL(r.url()).pathname),
     );
   }
 
@@ -144,10 +151,9 @@ test.describe("draft composer", () => {
   // uncommittable rather than falling back. The keyboard path is checked too: Enter reaches
   // `sendInput` directly and cannot be gated by the button's disabled state.
   test("keeps the first send unavailable when the project's model never resolved", async ({ page }) => {
-    await page.route(/\/api\/projects\/[^/?]+$/, async (route) => {
-      if (route.request().method() !== "GET") return route.fallback();
-      return route.abort();
-    });
+    await page.route(PROJECT_GET, async (route) =>
+      route.request().method() === "GET" ? route.abort() : route.fallback(),
+    );
     let started = false;
     page.on("request", (r) => {
       if (r.method() === "POST" && r.url().endsWith("/threads/start")) started = true;
@@ -203,13 +209,7 @@ test.describe("draft composer", () => {
   // act on the second: clearing its composer, opening over it, or failing its rows would lose text
   // the user typed after the send. The send is identified by the draft object it was issued for.
   test("a slow first send does not clobber a newer draft in the same project", async ({ page }) => {
-    let release!: () => void;
-    const held = new Promise<void>((resolve) => { release = resolve; });
-    await page.route(/\/threads\/start$/, async (route) => {
-      if (route.request().method() !== "POST") return route.fallback();
-      await held;
-      return route.fallback();
-    });
+    const release = await holdRoute(page, /\/threads\/start$/, "POST");
 
     const newDraft = () => page.locator(".proj", { hasText: "Demo" }).locator(".project-add").click();
 
@@ -239,5 +239,59 @@ test.describe("draft composer", () => {
     await expect(page.locator("#input")).toHaveValue("Draft B, typed while A was in flight");
     await expect(page.locator("#transcript")).toContainText("Start a new thread");
     await expect(page.locator(".thread.active")).toHaveCount(0);
+  });
+});
+
+// `openThread` has the same save/await/restore shape as the draft opening that lost a message, and
+// reads like the same defect. It is not: `saveComposerDraft` is bound to the composer's `input`
+// event, so every keystroke is filed under the key derived from `state.threadId`, which still names
+// the thread being left until the switch completes. Text typed mid-switch stays with that thread
+// and comes back on returning to it — it is not carried into the arriving thread, and not lost.
+//
+// Pinned because the shape invites a "fix" that would carry it across, which is not where it was
+// written.
+test.describe("composer across a thread switch", () => {
+  test.beforeEach(async ({ page }) => {
+    await login(page);
+  });
+
+  test("files text typed mid-switch against the thread it was typed in", async ({ page }) => {
+    const project = page.locator(".proj", { hasText: "Demo" });
+
+    // Two threads to switch between.
+    const create = async (message: string) => {
+      await project.locator(".project-add").click();
+      await expect(page.locator("#sendBtn")).toBeEnabled();
+      await page.locator("#input").fill(message);
+      await page.locator("#sendBtn").click();
+      await expect(
+        page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY }),
+      ).toBeVisible();
+      const tid = await page.locator(".thread.active").getAttribute("data-tid");
+      expect(tid).toBeTruthy();
+      return tid as string;
+    };
+    const first = await create("First thread for the switch test");
+    const second = await create("Second thread for the switch test");
+
+    // Hold the open request. `/threads` opens an existing thread; `/threads/start` creates one, and
+    // the anchored pattern keeps the two apart.
+    const release = await holdRoute(page, /\/api\/projects\/[^/?]+\/threads$/, "POST");
+
+    const typed = "Typed while the other thread was opening";
+    await page.locator(`.thread[data-tid="${first}"]`).click();
+    await page.locator("#input").fill(typed);
+    release();
+    await expect(page.locator(`.thread[data-tid="${first}"]`)).toHaveClass(/\bactive\b/);
+
+    // The composer now belongs to the thread that was opened, and the text was not carried across.
+    // `openThread` sets the highlight before restoring the composer, so the assertion above does not
+    // by itself mean the restore has run — this one retries until it has, and would time out if the
+    // text had been carried over. It was filed against the thread it was typed in, and comes back on
+    // returning there: not lost, just where it was written.
+    await expect(page.locator("#input")).toHaveValue("");
+    await page.locator(`.thread[data-tid="${second}"]`).click();
+    await expect(page.locator(`.thread[data-tid="${second}"]`)).toHaveClass(/\bactive\b/);
+    await expect(page.locator("#input")).toHaveValue(typed);
   });
 });
