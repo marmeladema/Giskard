@@ -328,6 +328,16 @@ Giskard's ledgers or context-window metadata.
 
 ## Restart and unload behavior
 
+The stdio transport is newline-delimited. If app-server stdout contains a
+syntactically non-JSON line that does not begin like a JSON-RPC object, the
+adapter logs the parse diagnostic, payload byte length, and an escaped preview
+of up to 4 KiB. It then discards that single consumed line and continues
+reading at the next frame boundary. This keeps obvious stdout contamination
+from terminating every active turn and closing the project's worker while
+retaining evidence for upstream diagnosis. Malformed object-like JSON,
+parseable JSON with an invalid JSON-RPC envelope, and typed payload errors
+remain fatal because discarding them could lose a real lifecycle event.
+
 Unified-exec process entries are in memory and belong to the loaded Codex thread
 session. Their process IDs:
 
