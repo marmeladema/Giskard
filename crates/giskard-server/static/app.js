@@ -745,7 +745,7 @@ function restoreLastThread() {
 }
 
 async function loadThreads(pid) {
-  const box = $("threads-"+pid); if (!box) return;
+  const box = $("threads-"+pid); if (!box) return false;
   try {
     const { threads } = await api("GET",`/api/projects/${pid}/threads`);
     rememberProjectThreads(pid, threads);
@@ -764,7 +764,10 @@ async function loadThreads(pid) {
     // (say, catching up on a sub-agent the server just materialized) would otherwise leave the list
     // with no visibly selected thread.
     syncActiveThreadHighlight();
-  } catch {}
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function rememberProjectThreads(pid, threads) {
@@ -1551,19 +1554,35 @@ $("removeThreadConfirm").onclick = async () => {
     // was deleted; keep the pre-request set as a fallback in case the sidebar reload fails
     // (loadThreads swallows its own errors and leaves the cached list stale).
     const deletedIds = new Set([String(tid), ...descendants]);
-    await loadThreads(pid);
+    const threadsRefreshed = await loadThreads(pid);
     // Read the live view only after the awaits: the user may have navigated to another thread
     // or another project meanwhile, and an unrelated active view must never be cleared.
     const activeThread = state.threadId ? String(state.threadId) : null;
     const sameProject = String(state.projectId || "") === String(pid);
+    let openedDraft = false;
     if (
       activeThread && sameProject &&
-      (deletedIds.has(activeThread) || !knownThreadForId(pid, activeThread))
+      (deletedIds.has(activeThread) ||
+        (threadsRefreshed && !knownThreadForId(pid, activeThread)))
     ) {
-      clearThreadView(activeThread);
+      // The active thread was just deleted (or cascaded away). Rather than leave the user staring
+      // at an empty view still titled with the deleted thread's name, drop into a fresh draft in
+      // the same project so the composer is ready for the next conversation. `openDraftThread`
+      // tears down the WebSocket, clears `state.threadId`, and resets the title to "New thread".
+      // The explicit `giskard.lastThread` removal above prevents a reload from resurrecting the
+      // deleted thread (`openDraftThread` itself never touches that key; without this, reload
+      // would self-heal via `restoreLastThread` failing to find the thread, but clearing it now
+      // avoids the transient stale entry).
+      try { localStorage.removeItem("giskard.lastThread"); } catch {}
+      openDraftThread(pid);
+      applyProjectDefaultModel(pid, state.draftThread);
+      openedDraft = true;
     }
     pending.deleting = false;
-    closeRemoveThreadModal({ force:true });
+    // Skip focus restoration only when we just opened a draft: `openDraftThread` already focuses
+    // the composer input, and restoring focus to the deleted thread's row button would yank it
+    // away from the input the user is now expected to type into.
+    closeRemoveThreadModal({ force:true, restoreFocus: !openedDraft });
   } catch (e) {
     if (state.pendingRemoveThread === pending && pending.requestSeq === requestSeq) {
       $("removeThreadErr").textContent = "Delete thread failed: " + apiFailureMessage(e);
