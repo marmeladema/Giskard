@@ -328,49 +328,10 @@ From the checkout without installing, use
 
 ## HTTP / WebSocket API
 
-The browser (and any client) drives everything through a small REST surface plus one multiplexed
-WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticket`, `GET /api/ws`,
-`GET/POST /api/projects`, `GET/DELETE /api/projects/{id}`, `GET/POST
-/api/projects/{id}/threads`, `POST /api/projects/{id}/threads/start`, `DELETE
-/api/projects/{id}/threads/{thread_id}`, `POST
-/api/projects/{id}/threads/{parent_thread_id}/subagent-links/{item_id}/open`, `PATCH
-/api/projects/{id}/threads/{thread_id}/title`,
-`POST /api/projects/{id}/threads/{thread_id}/archive`, `GET /api/models`, `POST
-/api/models/refresh`, `GET /api/projects/{id}/models`,
-`GET /api/tokens`, `GET /api/projects/{id}/tokens`,
-`GET /api/projects/{id}/highlight|raw|image`, `POST
-/api/projects/{id}/linkify`, `POST /api/projects/{id}/render`, `GET /api/browse`, `POST
-/api/browse/mkdir`, `GET /api/projects/{id}/mcp`, `POST /api/projects/{id}/mcp/reload`, and `POST
-/api/projects/{id}/mcp/oauth-login`. Wire types are defined once in `giskard-proto`. See
-[§13.6](specs/giskard-specification.md) for the message protocol.
-
-`POST /api/projects/{id}/threads/start` creates the durable thread from the first user message or
-attachment set, persists a deterministic title generated from the prompt or first attachment name,
-and returns the title with the new thread and turn identifiers. The request accepts optional
-transient attachment payloads; Giskard validates them and does not persist raw attachment bytes.
-Image MIME types must match PNG, JPEG, GIF, or WebP file signatures. Raw bytes are also redacted
-before turns enter the parsed in-memory history cache. The Codex adapter transfers non-image files
-into a randomized per-turn directory under the harness host's temporary directory. It removes the
-directory after turn completion, upload/start failure, stream loss, channel closure, or shutdown;
-it never writes uploads into the project workspace.
-
-`POST /api/projects/{id}/threads` opens an existing local thread when `thread_id` is provided, or
-imports/resumes a native harness thread when `resume` is provided. Linked transcript items use the
-dedicated parent/item endpoint above; the server resolves native routing, ownership, provenance,
-prompt, and lifecycle evidence from its authoritative item rather than accepting those fields from
-the browser. Thread summaries and browser-facing sub-agent payloads omit native harness thread IDs.
-See [Sub-agent threads](docs/subagents.md) for the full contract.
-
-If you open a thread whose agent can no longer be started — most often because its
-**provider was removed from config** (e.g. you swapped one proxy provider id for another) — the
-thread still opens **read-only**: its history loads, a persistent banner above the composer names
-the missing provider, and the composer is disabled. To rescue such a thread, pick a model from a
-configured provider in the model picker (it
-is unlocked for read-only threads): Giskard re-resumes the native thread under the new provider,
-verifies the agent actually applied the switch before persisting it, and the thread becomes live
-again with its history intact. The same verified switch works for any thread that hasn't been
-opened since the server started; threads with a live agent session stay bound to their provider
-(create a new thread to change providers there).
+The browser (and any client) drives everything through a small REST surface plus one
+multiplexed WebSocket; the full endpoint inventory and behavior notes live in
+[`docs/api-endpoints.md`](docs/api-endpoints.md). Wire types are defined once in
+`giskard-proto`; see [§13.6](specs/giskard-specification.md) for the message protocol.
 
 ---
 
