@@ -494,13 +494,26 @@ async fn index_page_is_served_and_public() {
             && body.contains("querySelectorAll(\".thread-menu, .project-menu\")"),
         "project rows expose a remove action with source-directory-safe confirmation"
     );
+    let remove_thread_confirm = between(
+        &body,
+        "$(\"removeThreadConfirm\").onclick = async () => {",
+        "function clearThreadView",
+    );
     assert!(
         body.contains("function threadDescendantIds(pid, tid)")
-            && body.contains("linked sub-agent thread")
-            && body.contains("all corresponding Codex threads")
-            && body.contains("This cannot be undone")
-            && body.contains("clearThreadView(activeThread)"),
-        "thread deletion warns about and clears recursively deleted sub-agent threads"
+           && body.contains("linked sub-agent thread")
+           && body.contains("all corresponding Codex threads")
+           && body.contains("This cannot be undone")
+           // Deleting the active thread now drops into a fresh draft in the same project instead
+           // of leaving an empty view titled with the deleted thread's name.
+           && remove_thread_confirm.contains("const threadsRefreshed = await loadThreads(pid)")
+           && remove_thread_confirm.contains(
+               "threadsRefreshed && !knownThreadForId(pid, activeThread)"
+           )
+           && remove_thread_confirm.contains("openDraftThread(pid)")
+           && remove_thread_confirm.contains("applyProjectDefaultModel(pid, state.draftThread)")
+           && !remove_thread_confirm.contains("clearThreadView("),
+        "thread deletion warns about and lands on a draft in the same project"
     );
     assert!(
         body.contains("overflow:visible")
@@ -611,7 +624,9 @@ async fn index_page_is_served_and_public() {
          dropping them"
     );
     assert!(
-        body.contains("deletedIds.has(activeThread) || !knownThreadForId(pid, activeThread)")
+        remove_thread_confirm.contains("deletedIds.has(activeThread) ||")
+            && remove_thread_confirm
+                .contains("threadsRefreshed && !knownThreadForId(pid, activeThread)")
             && body.contains("String(state.projectId || \"\") === String(pid)"),
         "cascade delete clears the active view from the refreshed thread list, scoped to the \
          deleted thread's project so unrelated views survive"
@@ -731,7 +746,9 @@ async fn index_page_is_served_and_public() {
         body.contains(
             "      appendThreadRows(box, pid, archived);\n    }\n    // Rebuilding the rows discards \
              the selection highlight"
-        ) && body.contains("    syncActiveThreadHighlight();\n  } catch {}"),
+        ) && body.contains(
+            "    syncActiveThreadHighlight();\n    return true;\n  } catch {\n    return false;"
+        ),
         "reloading a project's threads re-derives the selection highlight, so a reload not driven \
          by opening a thread cannot leave the sidebar with nothing selected"
     );

@@ -329,6 +329,109 @@ test.describe("cross-project thread deletion", () => {
   });
 });
 
+// Deleting the thread that is currently open used to leave the view titled with the deleted
+// thread's name and an empty transcript ("No thread selected"). It now drops into a fresh draft
+// in the same project so the composer is ready for the next conversation, and clears the persisted
+// last-thread so a reload no longer resurrects the deleted thread.
+test.describe("active-thread deletion lands on a draft", () => {
+  test.beforeEach(async ({ page }) => {
+    await login(page);
+  });
+
+  // Shared seeding helpers: create an isolated project + persisted thread server-side so the
+  // test below drives only the deletion without depending on the shared composer/WebSocket
+  // timing. Mirrors the helpers in the "delete-thread confirmation card" block below.
+  const createProject = (page: import("@playwright/test").Page, name: string): Promise<string> =>
+    page.evaluate(async (projectName) => {
+      const res = await fetch("/api/projects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: projectName,
+          dir: "/tmp",
+          default_model: { provider: "replay", model: "replay-model" },
+        }),
+      });
+      if (!res.ok) {
+        throw new Error(`create project failed: ${res.status} ${await res.text()}`);
+      }
+      return (await res.json()).id as string;
+    }, name);
+  const startThread = (page: import("@playwright/test").Page, pid: string, text: string): Promise<string> =>
+    page.evaluate(
+      async ({ pid, text }) => {
+        const res = await fetch(`/api/projects/${pid}/threads/start`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text,
+            model_ref: { provider: "replay", model: "replay-model" },
+            mode: "build",
+            permission_preset: "ask_first",
+          }),
+        });
+        if (!res.ok) {
+          throw new Error(`start thread failed: ${res.status} ${await res.text()}`);
+        }
+        return (await res.json()).thread_id as string;
+      },
+      { pid, text },
+    );
+  const deleteProject = (page: import("@playwright/test").Page, id: string): Promise<void> =>
+    page.evaluate(async (projectId) => {
+      await fetch(`/api/projects/${projectId}`, { method: "DELETE" });
+    }, id);
+
+  test("deleting the open thread opens a draft in the same project", async ({ page }) => {
+    const projectId = await createProject(page, "Draft-after-delete project");
+    try {
+      const tid = await startThread(page, projectId, "delete me while open");
+      await page.evaluate(() =>
+        (window as unknown as { loadProjects: () => Promise<void> }).loadProjects(),
+      );
+      const row = page.locator(`.thread[data-tid="${tid}"]`);
+      await expect(row).toBeVisible();
+
+      // Open the thread so it is unambiguously the active view.
+      await row.click();
+      await expect.poll(async () =>
+        page.evaluate(() =>
+          JSON.parse(localStorage.getItem("giskard.lastThread") || "null"),
+        ),
+      ).toEqual({ pid: projectId, tid });
+
+      // Delete the active thread via its row menu.
+      const rowContainer = row.locator("xpath=..");
+      await rowContainer.locator(".thread-menu-btn").click();
+      await rowContainer.locator(".thread-menu .danger").click();
+      await expect(page.locator("#removeThreadModal")).toHaveClass(/open/);
+      await page.locator("#removeThreadConfirm").click();
+      await expect(row).toHaveCount(0);
+
+      // The view is now a draft in the same project: the composer is visible and ready, the
+      // title bar shows "New thread" (not the deleted thread's name), and the transcript shows
+      // the draft explainer rather than the stale thread or an empty "No thread selected" view.
+      await expect(page.locator("#composer")).toBeVisible();
+      await expect(page.locator("#input")).toBeVisible();
+      // The composer keeps focus after the deletion: the modal skips focus restoration so it
+      // does not yank focus back to the deleted thread's row button.
+      await expect(page.locator("#input")).toBeFocused();
+      await expect(page.locator("#mbTitle")).toContainText("New thread");
+      await expect(page.locator("#transcript .draft-empty")).toBeVisible();
+      await expect(page.locator("#transcript")).not.toContainText("No thread selected");
+
+      // The deleted thread is no longer the persisted last-thread, so a reload does not
+      // resurrect it; the draft view is what reload would land on (no lastThread entry).
+      const lastAfter = await page.evaluate(() =>
+        JSON.parse(localStorage.getItem("giskard.lastThread") || "null"),
+      );
+      expect(lastAfter).toBeNull();
+    } finally {
+      await deleteProject(page, projectId);
+    }
+  });
+});
+
 test.describe("delete-thread confirmation card", () => {
   test.beforeEach(async ({ page }) => {
     await login(page);
