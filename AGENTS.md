@@ -20,6 +20,11 @@ When modifying `giskard-harness-codex`, read
 `crates/giskard-harness-codex/README.md` first and keep it synchronized with changes to native
 identifier mappings, lifecycle behavior, protocol routing, process control, and restart semantics.
 
+The HTTP/WS endpoint inventory and behavior notes live in `docs/api-endpoints.md`, linked from the
+README. Update that file in the same change whenever you add, remove, or change an HTTP or WebSocket
+route in `crates/giskard-server/src/routes.rs` (path, method, request/response shape, or documented
+behavior) so it never drifts from the code.
+
 ## Build & Test
 
 ```bash
