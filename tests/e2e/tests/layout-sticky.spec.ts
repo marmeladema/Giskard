@@ -60,6 +60,14 @@ function barTops(page: Page) {
   });
 }
 
+/** Distance between the transcript's current viewport and its latest content. */
+function transcriptBottomGap(page: Page) {
+  return page.evaluate(() => {
+    const t = document.getElementById("transcript")!;
+    return Math.round(t.scrollHeight - t.scrollTop - t.clientHeight);
+  });
+}
+
 /** Simulate the iOS Safari keyboard: shrink the visual viewport without resizing the layout, and
  *  dispatch the visualViewport resize/scroll events that syncAppHeight listens for. The layout
  *  viewport (window.innerHeight) stays at the full 844px, modelling Safari overlaying the keyboard
@@ -127,6 +135,14 @@ test.describe("mobile title + status bars stay pinned at the top", () => {
     await openDraft(page);
     await fillTallTranscript(page);
 
+    // A conversation normally follows its newest row. The keyboard resize must preserve that
+    // bottom anchor, otherwise the shortened transcript hides its latest content below the fold.
+    await page.evaluate(() => {
+      const el = document.getElementById("transcript")!;
+      el.scrollTop = el.scrollHeight;
+    });
+    expect(await transcriptBottomGap(page)).toBeLessThanOrEqual(1);
+
     // Content-resize regime: the keyboard shrinks the layout viewport (Android + Firefox with
     // interactive-widget=resizes-content). 100dvh / --app-height track it, so the column reflows
     // above the keyboard and the bars stay at top:0. Focus the composer (as opening the keyboard
@@ -137,6 +153,7 @@ test.describe("mobile title + status bars stay pinned at the top", () => {
     await expect.poll(async () => (await barTops(page)).mbTop).toBe(0);
     const before = await barTops(page);
     expect(before.mbTop).toBe(0);
+    await expect.poll(async () => transcriptBottomGap(page)).toBeLessThanOrEqual(1);
 
     // Scroll the now-shorter transcript and re-check.
     await page.evaluate(() => {
@@ -151,6 +168,12 @@ test.describe("mobile title + status bars stay pinned at the top", () => {
   test("bars stay at the top when the keyboard OVERLAYS the viewport (iOS Safari)", async ({ page }) => {
     await openDraft(page);
     await fillTallTranscript(page);
+
+    await page.evaluate(() => {
+      const el = document.getElementById("transcript")!;
+      el.scrollTop = el.scrollHeight;
+    });
+    expect(await transcriptBottomGap(page)).toBeLessThanOrEqual(1);
 
     // iOS Safari regime: the keyboard overlays WITHOUT resizing the layout (window.innerHeight
     // stays 844). Without the fix, Safari shifts the layout viewport to reveal the focused
@@ -178,6 +201,9 @@ test.describe("mobile title + status bars stay pinned at the top", () => {
     expect(shell.innerHeight).toBe(844); // layout viewport NOT resized (iOS overlay regime)
     expect(shell.centerHeight).toBeLessThan(500); // shell shrank to the visible area
     expect(shell.appHeightVar).toBe("400px");
+    // The latest transcript rows move up with the shortened scrollport instead of remaining below
+    // it where the overlaid keyboard would hide them.
+    await expect.poll(async () => transcriptBottomGap(page)).toBeLessThanOrEqual(1);
 
     // The bars stay pinned at the top of the now-shorter visible region.
     const after = await barTops(page);
