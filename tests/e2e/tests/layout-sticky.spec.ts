@@ -64,7 +64,7 @@ function barTops(page: Page) {
 function transcriptBottomGap(page: Page) {
   return page.evaluate(() => {
     const t = document.getElementById("transcript")!;
-    return Math.round(t.scrollHeight - t.scrollTop - t.clientHeight);
+    return t.scrollHeight - t.scrollTop - t.clientHeight;
   });
 }
 
@@ -248,6 +248,32 @@ test.describe("mobile title + status bars stay pinned at the top", () => {
     const tops = await barTops(page);
     expect(tops.mbTop).toBe(120);
     expect(tops.thTop).toBe(120 + tops.mbHeight);
+  });
+
+  test("an intervening reader scroll overrides the queued bottom restoration", async ({ page }) => {
+    await openDraft(page);
+    await fillTallTranscript(page);
+
+    const readerPosition = await page.evaluate(() => {
+      const transcript = document.getElementById("transcript")!;
+      transcript.scrollTop = transcript.scrollHeight;
+
+      // Dispatch the keyboard resize and move the transcript before syncAppHeight's animation
+      // frame runs. The queued restoration must not overwrite this newer reader position.
+      const vv = window.visualViewport!;
+      Object.defineProperty(vv, "height", { configurable: true, get: () => 400 });
+      Object.defineProperty(vv, "offsetTop", { configurable: true, get: () => 0 });
+      vv.dispatchEvent(new Event("resize"));
+      transcript.dispatchEvent(new WheelEvent("wheel"));
+      transcript.scrollTop = 500;
+      return transcript.scrollTop;
+    });
+
+    await page.evaluate(() => new Promise<void>((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+    }));
+    expect(await page.locator("#transcript").evaluate((el) => el.scrollTop)).toBe(readerPosition);
+    expect(await transcriptBottomGap(page)).toBeGreaterThan(96);
   });
 
   test(".center never becomes a scroll container (sticky has nothing to stick to)", async ({ page }) => {

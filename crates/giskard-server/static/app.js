@@ -70,6 +70,17 @@ const COMPOSER_HINT = COMPOSER_IS_TOUCH
 (function syncAppHeight() {
   const vv = window.visualViewport;
   if (!vv) return; // older browser; fall back to the 100vh/100dvh CSS
+  const transcript = document.getElementById("transcript");
+  let transcriptScrollIntent = 0;
+  if (transcript) {
+    const recordScrollIntent = () => { transcriptScrollIntent += 1; };
+    // scrollTop can change as a consequence of the flex reflow itself, so it cannot distinguish a
+    // reader gesture from browser layout. Record the input events that initiate manual scrolling.
+    transcript.addEventListener("wheel", recordScrollIntent, { passive:true });
+    transcript.addEventListener("touchmove", recordScrollIntent, { passive:true });
+    transcript.addEventListener("pointerdown", recordScrollIntent, { passive:true });
+    transcript.addEventListener("keydown", recordScrollIntent);
+  }
   const apply = () => {
     // Resizing the shell also shrinks #transcript, which is its own scroll container. Browsers
     // preserve that element's scrollTop, not its distance from the bottom, so a transcript that
@@ -77,10 +88,10 @@ const COMPOSER_HINT = COMPOSER_IS_TOUCH
     // opened: the newest rows remain below the shortened scrollport and look keyboard-covered.
     // Capture the existing bottom-following intent before changing the height and restore it after
     // flex layout has reflowed. Leave readers who deliberately scrolled up exactly where they are.
-    const transcript = document.getElementById("transcript");
     const followTranscriptBottom = !!(transcript
       && transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight
         <= TRANSCRIPT_BOTTOM_STICKY_PX);
+    const scrollIntentAtResize = transcriptScrollIntent;
     // Use px (not vh) so it tracks the live visual viewport, not the layout viewport. Round to
     // avoid sub-pixel jitter from the fractional heights visualViewport reports. offsetTop is
     // the layout-viewport top's offset from the visual-viewport top (the pan); 0 when the
@@ -89,7 +100,11 @@ const COMPOSER_HINT = COMPOSER_IS_TOUCH
     document.documentElement.style.setProperty("--app-top", Math.round(vv.offsetTop) + "px");
     if (followTranscriptBottom) {
       requestAnimationFrame(() => {
-        transcript.scrollTop = transcript.scrollHeight;
+        // A reader can scroll between the viewport event and this frame. Only restore the bottom
+        // anchor if no newer manual scroll began in the meantime.
+        if (transcriptScrollIntent === scrollIntentAtResize) {
+          transcript.scrollTop = transcript.scrollHeight;
+        }
       });
     }
   };
