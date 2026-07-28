@@ -71,12 +71,27 @@ const COMPOSER_HINT = COMPOSER_IS_TOUCH
   const vv = window.visualViewport;
   if (!vv) return; // older browser; fall back to the 100vh/100dvh CSS
   const apply = () => {
+    // Resizing the shell also shrinks #transcript, which is its own scroll container. Browsers
+    // preserve that element's scrollTop, not its distance from the bottom, so a transcript that
+    // was following the latest row would otherwise appear to jump backwards as the keyboard
+    // opened: the newest rows remain below the shortened scrollport and look keyboard-covered.
+    // Capture the existing bottom-following intent before changing the height and restore it after
+    // flex layout has reflowed. Leave readers who deliberately scrolled up exactly where they are.
+    const transcript = document.getElementById("transcript");
+    const followTranscriptBottom = !!(transcript
+      && transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight
+        <= TRANSCRIPT_BOTTOM_STICKY_PX);
     // Use px (not vh) so it tracks the live visual viewport, not the layout viewport. Round to
     // avoid sub-pixel jitter from the fractional heights visualViewport reports. offsetTop is
     // the layout-viewport top's offset from the visual-viewport top (the pan); 0 when the
     // layout viewport isn't shifted (the common case, including desktop and Android).
     document.documentElement.style.setProperty("--app-height", Math.round(vv.height) + "px");
     document.documentElement.style.setProperty("--app-top", Math.round(vv.offsetTop) + "px");
+    if (followTranscriptBottom) {
+      requestAnimationFrame(() => {
+        transcript.scrollTop = transcript.scrollHeight;
+      });
+    }
   };
   apply();
   vv.addEventListener("resize", apply);
