@@ -48,6 +48,30 @@ test.describe("draft composer", () => {
 
   const modelButton = (page: Page) => page.locator("#modelPickerBtn");
 
+  test("highlights the project that owns the current draft", async ({ page }) => {
+    const project = page.locator(".proj", { hasText: "Demo" });
+    const projectName = project.locator(".project-name");
+
+    await project.locator(".project-add").click();
+
+    await expect(page.locator("#transcript")).toContainText("Start a new thread");
+    await expect(projectName).toHaveClass(/\bactive\b/);
+    await expect(projectName).toHaveAttribute("aria-current", "true");
+    await expect(page.locator(".thread.active")).toHaveCount(0);
+
+    const shadow = await projectName.evaluate((el) => getComputedStyle(el).boxShadow);
+    expect(shadow).not.toBe("none");
+
+    await page.locator("#input").fill("Create the highlighted draft's thread");
+    await page.locator("#sendBtn").click();
+    await expect(
+      page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY }),
+    ).toBeVisible();
+
+    await expect(projectName).not.toHaveClass(/\bactive\b/);
+    await expect(page.locator(".thread.active")).toHaveCount(1);
+  });
+
   test("keeps a message typed while the new thread is still opening", async ({ page }) => {
     const message = "Typed before the draft finished opening";
     const release = await holdProjectFetch(page);

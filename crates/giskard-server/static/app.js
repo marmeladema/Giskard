@@ -1003,7 +1003,7 @@ function threadRow(pid, t) {
   const title = t.title || t.id.slice(0,8);
   const el = document.createElement("div"); el.className="thread mono";
   applyThreadTitleToElement(el, pid, t.id, title);
-  markThreadRowActive(el, !!state.threadId && String(t.id) === String(state.threadId));
+  markSidebarRowActive(el, !!state.threadId && String(t.id) === String(state.threadId));
 
   const menuBtn = document.createElement("button");
   menuBtn.type = "button"; menuBtn.className = "thread-menu-btn";
@@ -1364,23 +1364,28 @@ function renderAllThreadActivityIndicators() {
   document.querySelectorAll(".thread").forEach(el => renderThreadActivityIndicator(el.dataset.tid, hosts));
 }
 
-// Mark a single thread row as the selected one (or not). `aria-current` mirrors the visual state for
+// Mark a sidebar row as the selected one (or not). `aria-current` mirrors the visual state for
 // assistive tech and gives the CSS a stable hook.
-function markThreadRowActive(el, active) {
+function markSidebarRowActive(el, active) {
   if (!el) return;
   el.classList.toggle("active", active);
   if (active) el.setAttribute("aria-current", "true");
   else el.removeAttribute("aria-current");
 }
 
-// Derive the sidebar selection from `state.threadId` rather than tracking it imperatively. Thread
-// rows are rebuilt whenever the list reloads, so any highlight set by hand goes stale on the next
-// re-render (leaving a previously selected row looking selected); recomputing from the single source
-// of truth keeps exactly one row active.
+// Derive the sidebar selection from thread/draft state rather than tracking it imperatively.
+// Rows are rebuilt whenever the list reloads, so any highlight set by hand goes stale on the next
+// re-render; recomputing from the single source of truth keeps persisted threads and draft project
+// rows mutually exclusive.
 function syncActiveThreadHighlight() {
   const tid = state.threadId ? String(state.threadId) : null;
+  const draftPid = isDraftThread() && state.projectId ? String(state.projectId) : null;
   document.querySelectorAll(".thread").forEach(el =>
-    markThreadRowActive(el, tid !== null && String(el.dataset.tid) === tid));
+    markSidebarRowActive(el, tid !== null && String(el.dataset.tid) === tid));
+  document.querySelectorAll(".project-name").forEach(el => {
+    const project = el.closest(".proj");
+    markSidebarRowActive(el, draftPid !== null && project && String(project.dataset.pid) === draftPid);
+  });
 }
 
 function setThreadActivity(tid, activity) {
