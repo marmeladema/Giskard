@@ -49,7 +49,12 @@
     position:relative; z-index:40; background:var(--panel); padding:12px;
     display:flex; flex-direction:column; min-height:0; overflow:visible;
   }
-  #projects { flex:1; min-height:0; overflow-y:auto; }
+  #projects {
+    flex:1; min-height:0; overflow-y:auto;
+    padding-right:6px;
+    scrollbar-width:thin; scrollbar-color:var(--scroll-thumb) var(--scroll-track);
+    scrollbar-gutter:stable;
+  }
   .sidebar-head { align-items:center; gap:6px; margin-bottom:6px; }
   .sidebar-logo { width:24px; height:24px; min-width:24px; max-width:24px; min-height:24px; max-height:24px; flex:0 0 24px; display:block; object-fit:contain; border-radius:6px; }
   .sidebar-title { flex:1; min-width:0; }
@@ -287,12 +292,17 @@
     scrollbar-width:thin; scrollbar-color:var(--scroll-thumb) var(--scroll-track);
     scrollbar-gutter:stable;
   }
+  #projects::-webkit-scrollbar,
   #transcript::-webkit-scrollbar { width:10px; height:10px; }
+  #projects::-webkit-scrollbar-track,
   #transcript::-webkit-scrollbar-track { background:var(--scroll-track); }
+  #projects::-webkit-scrollbar-thumb,
   #transcript::-webkit-scrollbar-thumb {
     background:var(--scroll-thumb); border:2px solid var(--scroll-track); border-radius:999px;
   }
+  #projects::-webkit-scrollbar-thumb:hover,
   #transcript::-webkit-scrollbar-thumb:hover { background:var(--scroll-thumb-hover); }
+  #projects::-webkit-scrollbar-corner,
   #transcript::-webkit-scrollbar-corner { background:var(--scroll-track); }
   /* Empty-state explainer shown in the transcript of an unsent draft thread. */
   .draft-empty { min-height:100%; display:flex; align-items:center; justify-content:center; padding:32px 20px; }
