@@ -6532,9 +6532,10 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
     .unwrap();
 
     let mut seen_old = false;
-    let mut seen_new = false;
+    let mut seen_new_answer = false;
+    let mut seen_new_completion = false;
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
-    while tokio::time::Instant::now() < deadline && !seen_new {
+    while tokio::time::Instant::now() < deadline && !seen_new_completion {
         match tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
                 let server_msg: ServerMessage = serde_json::from_str(&t).unwrap();
@@ -6547,13 +6548,13 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
                                     seen_old = true;
                                 }
                                 if text == "new answer" {
-                                    seen_new = true;
+                                    seen_new_answer = true;
                                 }
                             }
                             _ => {}
                         },
                         WireAgentEvent::TurnCompleted { turn, .. } if turn == new_turn => {
-                            seen_new = true;
+                            seen_new_completion = true;
                         }
                         _ => {}
                     }
@@ -6568,7 +6569,8 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
         !seen_old,
         "persisted replay items should not be rebroadcast"
     );
-    assert!(seen_new, "new turn should still be streamed");
+    assert!(seen_new_answer, "new turn should still be streamed");
+    assert!(seen_new_completion, "new turn should complete");
 
     let saved = state.store.load_all_turns(pid, tid).await.unwrap();
     assert_eq!(saved.len(), 2);

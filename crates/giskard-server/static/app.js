@@ -5,6 +5,7 @@ const WS_RECONNECT_BASE_MS = 600;
 const WS_RECONNECT_MAX_MS = 8000;
 const WS_PROBLEM_NOTICE_INTERVAL_MS = 30000;
 const WS_BACKGROUND_CLOSE_GRACE_MS = 10000;
+const WS_FOREGROUND_PROBE_TIMEOUT_MS = 1200;
 const TRANSCRIPT_BOTTOM_STICKY_PX = 96;
 // Whether the composer is on a touch/coarse-pointer device (mobile keyboard). On touch there's no
 // Shift modifier reachable while typing, so the newline key fires a plain Enter; the composer must
@@ -145,6 +146,7 @@ let state = {
   projectId:null, threadId:null, mode:"build", ws:null, wsStatus:"closed", wsConnectId:0,
   wsReconnectTimer:null, wsReconnectAttempt:0, wsStatusDetail:"WebSocket disconnected",
   wsLastProblem:"", wsLastProblemNotice:"", wsLastProblemNoticeAt:0,
+  wsProbeTimer:null, wsProbeToken:0, wsProbeSocket:null,
   draftThread:null, firstTurnStartingThreadId:null, inputDrafts:new Map(),
   // Per-turn DOM identity (foundation for incremental reconnect): `currentRenderTurnId` is the turn
   // whose rows are being stamped right now (a persisted turn being rendered, or the live turn being
@@ -1630,6 +1632,7 @@ function clearThreadView(tid) {
   saveComposerDraft();
   try { localStorage.removeItem("giskard.lastThread"); } catch {}
   clearWsReconnectTimer();
+  clearWsProbeTimer();
   const ws = state.ws;
   state.ws = null;
   if (ws) {
@@ -1995,6 +1998,7 @@ function renderDraftPlaceholder() {
 function openDraftThread(pid) {
   saveComposerDraft();
   clearWsReconnectTimer();
+  clearWsProbeTimer();
   const oldWs = state.ws;
   state.ws = null;
   if (oldWs) {
@@ -2134,8 +2138,28 @@ function clearWsReconnectTimer() {
     state.wsReconnectTimer = null;
   }
 }
+function clearWsProbeTimer() {
+  if (state.wsProbeTimer) {
+    clearTimeout(state.wsProbeTimer);
+    state.wsProbeTimer = null;
+  }
+  state.wsProbeSocket = null;
+}
 function wsIsOpen() {
   return !!(state.ws && state.ws.readyState === WebSocket.OPEN);
+}
+function wsCanSend() {
+  return wsIsOpen() && !state.wsProbeTimer;
+}
+function wsReadyStateLabel(ws) {
+  if (!ws) return "none";
+  switch (ws.readyState) {
+    case WebSocket.CONNECTING: return "connecting";
+    case WebSocket.OPEN: return "open";
+    case WebSocket.CLOSING: return "closing";
+    case WebSocket.CLOSED: return "closed";
+    default: return String(ws.readyState);
+  }
 }
 function wsStatusLabel(status) {
   switch (status) {
@@ -2203,6 +2227,8 @@ async function connectWs(opts) {
     return;
   }
   clearWsReconnectTimer();
+  clearWsProbeTimer();
+  state.wsProbeToken++;
   const oldWs = state.ws;
   state.ws = null;
   if (oldWs) {
@@ -2257,7 +2283,7 @@ async function connectWs(opts) {
     if (state.ws !== ws) return;
     markWsForegroundRecovered(ws);
     try {
-      handleServer(JSON.parse(m.data));
+      handleServer(JSON.parse(m.data), ws);
     } catch (e) {
       notice("Invalid WebSocket message from server: "+e.message, "error");
     }
@@ -2269,6 +2295,7 @@ async function connectWs(opts) {
   };
   ws.onclose = (ev) => {
     if (state.ws !== ws) return;
+    clearWsProbeTimer();
     state.ws = null;
     if (ws._giskardExpectedClose) return;
     const reason = ev.reason ? ` ${ev.reason}` : "";
@@ -2360,7 +2387,7 @@ function setTurnActive(active) {
   updateComposerControls();
 }
 function send(obj) {
-  if (wsIsOpen()) {
+  if (wsCanSend()) {
     state.ws.send(JSON.stringify(obj));
     return true;
   }
@@ -2371,6 +2398,58 @@ function reconnectIfNeeded(reason) {
   state.wsReconnectAttempt = 0;
   connectWs({ reconnect:true, reason });
 }
+function probeWsBeforeReconnect(reason) {
+  if (!state.threadId) return;
+  const ws = state.ws;
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    reconnectIfNeeded(reason);
+    return;
+  }
+  clearWsProbeTimer();
+  const token = ++state.wsProbeToken;
+  state.wsProbeSocket = ws;
+  const backgroundedAt = Number(ws._giskardBackgroundedAt) || 0;
+  setWsStatus("reconnecting", "Checking connection...");
+  recordBrowserDiagnostic("websocket", "ws_probe_started", {
+    reason:reason || "probe requested",
+    ready_state:wsReadyStateLabel(ws),
+    timeout_ms:WS_FOREGROUND_PROBE_TIMEOUT_MS,
+    backgrounded_ms:backgroundedAt ? Math.max(0, Date.now() - backgroundedAt) : null
+  });
+  try {
+    ws.send(JSON.stringify({ type:"ping" }));
+  } catch (e) {
+    recordBrowserDiagnostic("websocket", "ws_probe_send_failed", {
+      reason:reason || "probe requested",
+      error:e && e.message ? e.message : String(e)
+    });
+    connectWs({ reconnect:true, reason });
+    return;
+  }
+  state.wsProbeTimer = setTimeout(() => {
+    if (state.ws !== ws || state.wsProbeToken !== token) return;
+    clearWsProbeTimer();
+    recordBrowserDiagnostic("websocket", "ws_probe_timeout", {
+      reason:reason || "probe requested",
+      timeout_ms:WS_FOREGROUND_PROBE_TIMEOUT_MS,
+      ready_state:wsReadyStateLabel(ws)
+    });
+    state.wsReconnectAttempt = 0;
+    connectWs({ reconnect:true, reason });
+  }, WS_FOREGROUND_PROBE_TIMEOUT_MS);
+}
+function finishWsProbe(ws, reason) {
+  if (!state.wsProbeTimer || state.wsProbeSocket !== ws) return;
+  recordBrowserDiagnostic("websocket", reason, {
+    ready_state:wsReadyStateLabel(ws)
+  });
+  clearWsProbeTimer();
+  markWsForegroundRecovered(ws);
+  setWsStatus("open", "Connected to agent.");
+}
+function handleWsPong(ws) {
+  finishWsProbe(ws, "ws_probe_pong");
+}
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") {
     if (state.ws) state.ws._giskardBackgroundedAt = Date.now();
@@ -2378,15 +2457,18 @@ document.addEventListener("visibilitychange", () => {
   }
   if (state.ws && state.ws._giskardBackgroundedAt) {
     state.ws._giskardResumedAt = Date.now();
+    probeWsBeforeReconnect("tab visible");
+    return;
   }
   reconnectIfNeeded("tab visible");
 });
 window.addEventListener("online", () => {
-  reconnectIfNeeded("network online");
+  probeWsBeforeReconnect("network online");
 });
 window.addEventListener("offline", () => {
   if (!state.threadId || state.wsStatus === "closed") return;
   clearWsReconnectTimer();
+  clearWsProbeTimer();
   setWsStatus("reconnecting", "Network is offline. Reconnect will resume when the network returns.");
   surfaceWsProblem("Network is offline. Reconnect will resume when the network returns.", "warning");
 });
@@ -2437,7 +2519,12 @@ function isCurrentThreadServerMessage(msg) {
   return messageThreadId === String(state.threadId);
 }
 
-function handleServer(msg) {
+function handleServer(msg, ws) {
+  if (msg && msg.type === "pong") {
+    handleWsPong(ws);
+    return;
+  }
+  finishWsProbe(ws, "ws_probe_message");
   if (msg && msg.type === "thread_activity_bootstrap") {
     handleThreadActivityBootstrap(msg);
     return;
@@ -7120,7 +7207,7 @@ function sendInput() {
     startDraftThread(text, attachments);
     return;
   }
-  if (!wsIsOpen()) {
+  if (!wsCanSend()) {
     notice(`Message not sent: WebSocket is ${state.wsStatus}.`, "warning");
     reconnectIfNeeded("send requested while disconnected");
     return;
