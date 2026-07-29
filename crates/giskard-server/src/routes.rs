@@ -3010,7 +3010,9 @@ async fn handle_client_msg(
             //   `HistoryDelta` of the turns after the cursor when we can resolve it, or a full
             //   `HistoryPage` when we can't (stale cursor) — *before* the live turn and tasks. The
             //   client reconciles or rebuilds the transcript while it still owns it, then the live
-            //   turn appends on top; nothing needs mid-transcript insertion.
+            //   turn appends on top. The browser may keep a stale live DOM block visible until the
+            //   replacement snapshot arrives, so delta rows still need to be inserted before that
+            //   retained live block on the UI side.
             // * Fresh (`since` absent): live-first ordering. The in-flight turn (H5) isn't in the
             //   JSONL yet, so reconstruct it from the live buffer and send it — with its tasks —
             //   before the history page, for the fastest first paint. The browser prepends older
@@ -3058,8 +3060,9 @@ async fn handle_client_msg(
             // The live turn (H5) isn't in the JSONL yet — reconstruct it from the live buffer — and
             // its running tasks. On a fresh open (`since` absent) these go first, for the fastest
             // first paint. On a resync (`since` present, delta or stale-cursor rebuild) the history
-            // goes first so the client reconciles/rebuilds the transcript before the live turn
-            // appends on top; that ordering needs no mid-transcript insertion.
+            // goes first so the client can reconcile or rebuild before handling the live turn. The
+            // browser may still insert delta rows before a retained stale live block to avoid a
+            // visible gap before the replacement live snapshot arrives.
             let live_snapshot = state.live_buffers.snapshot(thread_id).await;
             let tasks = state.running_commands.snapshot(thread_id).await;
             let running_tasks = ServerMessage::RunningTasks { thread_id, tasks };
