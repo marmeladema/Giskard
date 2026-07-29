@@ -2211,7 +2211,8 @@ fn browser_incremental_resync_reconciles_in_flight_turn() {
     ));
     assert!(onopen.contains("state.awaitingIncrementalResync = true;"));
 
-    // A delta keeps the transcript: repaint the in-flight turn, append new turns, advance the cursor.
+    // A delta keeps the old live turn visible until the live snapshot arrives, appending any
+    // completed turns before that live block so the transcript never goes blank between messages.
     let delta = between(
         body,
         "function renderHistoryDelta(msg) {",
@@ -2219,11 +2220,35 @@ fn browser_incremental_resync_reconciles_in_flight_turn() {
     );
     assert_order(
         delta,
-        "reconcileInFlightTurn();",
+        "const completedLiveTurn =",
+        "const completedPendingTurn =",
+    );
+    assert_order(
+        delta,
+        "const completedPendingTurn =",
         "for (const turn of turns) renderPersistedTurn(turn);",
     );
+    assert!(delta.contains("!liveId && !!state.pendingUserEl && turns.length > 0"));
+    assert!(delta.contains("if (completedLiveTurn || completedPendingTurn)"));
+    assert!(
+        delta.contains("state.pendingLiveSnapshotReconcile = !!liveId || !!state.pendingUserEl;")
+    );
+    assert!(delta.contains("const anchor = !completedLiveTurn ? firstLiveTurnRow(liveId) : null;"));
     assert!(delta.contains("state.newestPersistedTurnId = turns[turns.length - 1].id;"));
-    assert!(delta.contains("t.appendChild(container.firstChild)"));
+    assert!(delta.contains("t.insertBefore(container.firstChild, anchor)"));
+    assert!(
+        body.contains("if (state.pendingLiveSnapshotReconcile) {\n    state.pendingLiveSnapshotReconcile = false;\n    reconcileInFlightTurn();"),
+        "live snapshot should reconcile the stale live block synchronously just before replay"
+    );
+    let turn_started = between(
+        body,
+        "case \"turn_started\":",
+        "case \"context_window_updated\":",
+    );
+    assert!(
+        turn_started.contains("state.pendingLiveSnapshotReconcile = false;"),
+        "a normal live stream taking over must clear deferred snapshot reconciliation"
+    );
 
     // Reconcile removes only the in-flight turn's rows (by data-turn) and the optimistic pending rows.
     let reconcile = between(
@@ -2241,6 +2266,13 @@ fn browser_incremental_resync_reconciles_in_flight_turn() {
     assert!(reconcile.contains("state.pendingUserEl = null;"));
     assert!(reconcile.contains("state.pendingUserText = null;"));
     assert!(reconcile.contains("setTurnActive(false);"));
+    let first_live = between(
+        body,
+        "function firstLiveTurnRow(liveId) {",
+        "function rebuildRenderTrackingFromDom()",
+    );
+    assert!(first_live.contains("el.dataset.turn === \"pending\""));
+    assert!(first_live.contains("el.dataset.turn === liveId"));
     let remove = between(
         body,
         "function removeTurnRows(turnId) {",

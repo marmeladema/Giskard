@@ -163,6 +163,7 @@ let state = {
   expandedTaskGroups:new Set(), manuallyToggledTaskGroups:new Set(), expandedTaskDetails:new Map(),
   linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, codeOverlaySource:null, outputOverlay:null, activeTurn:false, interruptPending:false, compactPending:false,
   awaitingInitialThreadState:false, awaitingThreadResync:false, awaitingIncrementalResync:false, resyncStickBottom:false, contextWindow:0, contextUsed:null, permissionPreset:"ask_first", currentModel:null,
+  pendingLiveSnapshotReconcile:false,
   mcpServers:[], mcpCapabilities:{ status:false, reload:false, oauth_login:false }, mcpLoading:false, mcpError:null, expandedMcps:new Set(),
   threadReadOnly:false, readOnlyProvider:null, readOnlyMessage:null,
   pickerTypeahead:"", pickerTypeaheadTimer:null, pickerSelectedRow:null,
@@ -1650,6 +1651,9 @@ function clearThreadView(tid) {
   setTurnActive(false);
   state.awaitingInitialThreadState = false;
   state.awaitingThreadResync = false;
+  state.awaitingIncrementalResync = false;
+  state.resyncStickBottom = false;
+  state.pendingLiveSnapshotReconcile = false;
   resetRenderState();
   $("thrHeader").style.display="none"; $("composer").style.display="none";
   $("pickerBar").style.display="none"; closeModelPicker(); closeTurnPicker();
@@ -2037,6 +2041,9 @@ function openDraftThread(pid) {
   updateGauge(null, 0);
   state.awaitingInitialThreadState = false;
   state.awaitingThreadResync = false;
+  state.awaitingIncrementalResync = false;
+  state.resyncStickBottom = false;
+  state.pendingLiveSnapshotReconcile = false;
   resetRenderState();
   syncActiveThreadHighlight();   // state.threadId is null for a draft, so this clears any selection
   $("thrHeader").style.display="flex"; $("composer").style.display="flex";
@@ -2105,6 +2112,7 @@ async function openThread(pid, tid, title, opts) {
   state.awaitingInitialThreadState = true;
   state.awaitingThreadResync = false;
   state.awaitingIncrementalResync = false; state.resyncStickBottom = false;
+  state.pendingLiveSnapshotReconcile = false;
   resetRenderState();
   syncActiveThreadHighlight();
   renderAllThreadActivityIndicators();
@@ -2267,8 +2275,9 @@ async function connectWs(opts) {
     markWsForegroundRecovered(ws);
     // Incremental resync: if we already have persisted history rendered, ask only for the turns
     // after our newest one (`since`). The server replies with a HistoryDelta and we keep the
-    // immutable completed-turn DOM, repainting only the in-flight turn. Without a cursor (nothing
-    // rendered yet) fall back to a full resync that rewrites the transcript.
+    // immutable completed-turn DOM. If a live snapshot follows, the stale live DOM stays visible
+    // until the snapshot handler replaces it. Without a cursor (nothing rendered yet) fall back to
+    // a full resync that rewrites the transcript.
     if (state.newestPersistedTurnId) {
       state.awaitingIncrementalResync = true;
       state.awaitingThreadResync = false;
@@ -3042,6 +3051,7 @@ function resetTranscriptForAuthoritativeSnapshot() {
   state.currentRenderTurnId = null;
   state.interruptPending = false;
   state.compactPending = false;
+  state.pendingLiveSnapshotReconcile = false;
   resetRenderState();
   if (keepFirstTurnActive) updateComposerControls();
   else setTurnActive(false);
@@ -3089,6 +3099,7 @@ function renderHistoryPage(msg) {
   if (state.awaitingIncrementalResync) {
     state.awaitingIncrementalResync = false;
     state.resyncStickBottom = false;
+    state.pendingLiveSnapshotReconcile = false;
     resetTranscriptForAuthoritativeSnapshot();
   }
   // `older` marks a page fetched *above* what's already shown: a scroll-up LoadHistory or an
@@ -3135,18 +3146,31 @@ function renderHistoryPage(msg) {
 
 // Incremental resync: the server sent only the turns that completed while we were disconnected
 // (history-first, before the live snapshot). Completed turns are immutable, so we keep the existing
-// transcript, repaint just the in-flight turn, and append these new turns at the bottom.
+// transcript and append these new turns. If a live turn is still running, keep its old DOM visible
+// until the live snapshot arrives; the snapshot handler removes and recreates the live block
+// synchronously, avoiding a visible blank gap between the history-delta and live-snapshot messages.
 function renderHistoryDelta(msg) {
   state.awaitingIncrementalResync = false;
   const turns = msg.turns || [];
+  const liveId = state.activeTurn && state.currentRenderTurnId != null
+    ? String(state.currentRenderTurnId)
+    : null;
+  const completedLiveTurn = !!(liveId && turns.some(turn => String(turn.id) === liveId));
+  const completedPendingTurn = !liveId && !!state.pendingUserEl && turns.length > 0;
 
-  // Repaint the in-flight turn: remove the rows of the turn that was still running when we
-  // disconnected (and any optimistic pre-turn rows). The live snapshot that follows re-renders its
-  // current state; a turn that completed while we were away arrives below as a delta turn instead.
-  reconcileInFlightTurn();
+  if (completedLiveTurn || completedPendingTurn) {
+    // The turn that was live, or still an optimistic pending row, completed while we were
+    // disconnected, so there will be no live snapshot to replace it. Remove the stale live rows
+    // before appending the persisted turn.
+    reconcileInFlightTurn();
+    state.pendingLiveSnapshotReconcile = false;
+  } else {
+    state.pendingLiveSnapshotReconcile = !!liveId || !!state.pendingUserEl;
+  }
 
-  // Append the completed-since turns at the bottom — they are newer than everything we kept, and no
-  // live turn is in the DOM yet (it arrives next).
+  // Append completed-since turns. If the old live turn is still visible, insert the persisted turns
+  // immediately before that live block so transcript chronology stays correct until the snapshot
+  // atomically replaces the live block.
   if (turns.length) {
     const container = document.createElement("div");
     const prev = state.renderTarget;
@@ -3157,7 +3181,8 @@ function renderHistoryDelta(msg) {
     state.renderTarget = prev;
     state.activeTaskGroup = prevTaskGroup;
     const t = $("transcript");
-    while (container.firstChild) t.appendChild(container.firstChild);
+    const anchor = !completedLiveTurn ? firstLiveTurnRow(liveId) : null;
+    while (container.firstChild) t.insertBefore(container.firstChild, anchor);
     state.newestPersistedTurnId = turns[turns.length - 1].id;   // advance the resume cursor
     updateGaugeFromTurns(turns);   // a live snapshot, if any, overrides this next
   }
@@ -3189,6 +3214,15 @@ function reconcileInFlightTurn() {
   state.streamEl = null;
   state.streamItemId = null;
   breakTaskGroup();
+}
+function firstLiveTurnRow(liveId) {
+  const t = $("transcript");
+  if (!t) return null;
+  for (const el of Array.from(t.children)) {
+    if (!el.classList || !el.classList.contains("msg")) continue;
+    if (el.dataset.turn === "pending" || (liveId && el.dataset.turn === liveId)) return el;
+  }
+  return null;
 }
 function rebuildRenderTrackingFromDom() {
   const t = $("transcript");
@@ -3352,6 +3386,7 @@ function handleEvent(ev) {
   switch (ev.kind) {
     case "turn_started":
       state.firstTurnStartingThreadId = null;
+      state.pendingLiveSnapshotReconcile = false;
       breakTaskGroup();
       state.streamEl = null;
       state.streamItemId = null;
@@ -3488,6 +3523,10 @@ function errorText(e) {
 }
 
 function renderLiveTurnSnapshot(snap) {
+  if (state.pendingLiveSnapshotReconcile) {
+    state.pendingLiveSnapshotReconcile = false;
+    reconcileInFlightTurn();
+  }
   if (snap && snap.turn_id) {
     state.firstTurnStartingThreadId = null;
     // Adopt the live turn id so its rows stamp correctly even if the accumulated events don't lead
