@@ -2440,7 +2440,7 @@ fn browser_websocket_lifecycle_errors_are_not_toasted_directly() {
     assert_order(
         visibility,
         "state.ws._giskardResumedAt = Date.now();",
-        "reconnectIfNeeded(\"tab visible\");",
+        "probeWsBeforeReconnect(\"tab visible\");",
     );
 }
 
@@ -2473,7 +2473,7 @@ fn browser_backgrounded_socket_recovery_restores_foreground_errors() {
     assert_order(
         onmessage,
         "markWsForegroundRecovered(ws);",
-        "handleServer(JSON.parse(m.data));",
+        "handleServer(JSON.parse(m.data), ws);",
     );
 }
 

@@ -35,6 +35,135 @@ test.describe("projects and threads", () => {
     await expect(page.locator(".thread").first()).toBeVisible();
   });
 
+  test("foregrounding a stale open websocket reconnects after probe timeout", async ({ page }) => {
+    const project = page.locator(".proj", { hasText: "Demo" });
+    await project.locator(".project-add").click();
+
+    const input = page.locator("#input");
+    await expect(input).toBeVisible();
+    await input.fill("Exercise mobile websocket reconnect.");
+    await page.locator("#sendBtn").click();
+    await expect(page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY })).toBeVisible();
+    await page.reload();
+    await expect(page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY })).toBeVisible();
+    await expect(page.locator("#wsStatusBadge")).toHaveText("Connected");
+    await expect(page.locator("#sendBtn")).toBeEnabled();
+
+    await page.evaluate(() => {
+      const originalSend = WebSocket.prototype.send;
+      WebSocket.prototype.send = function(data: string | ArrayBufferLike | Blob | ArrayBufferView) {
+        if (typeof data === "string" && data.includes('"type":"ping"')) return;
+        return originalSend.call(this, data);
+      };
+      let visibility = "hidden";
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        get: () => visibility,
+      });
+      document.dispatchEvent(new Event("visibilitychange"));
+      visibility = "visible";
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await expect(page.locator("#sendBtn")).toBeDisabled();
+
+    await page.waitForFunction(() => {
+      const snapshot = (window as any).browserDiagnosticsSnapshot?.();
+      return !!snapshot?.diagnostics?.some((entry: any) =>
+        entry.category === "websocket" &&
+        entry.reason === "ws_probe_timeout" &&
+        entry.detail?.reason === "tab visible"
+      );
+    });
+    await expect(page.locator("#wsStatusBadge")).toHaveText("Connected");
+  });
+
+  test("foregrounding a healthy open websocket keeps it after pong", async ({ page }) => {
+    const project = page.locator(".proj", { hasText: "Demo" });
+    await project.locator(".project-add").click();
+
+    const input = page.locator("#input");
+    await expect(input).toBeVisible();
+    await input.fill("Exercise healthy websocket probe.");
+    await page.locator("#sendBtn").click();
+    await expect(page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY })).toBeVisible();
+    await page.reload();
+    await expect(page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY })).toBeVisible();
+    await expect(page.locator("#wsStatusBadge")).toHaveText("Connected");
+    await expect(page.locator("#sendBtn")).toBeEnabled();
+
+    await page.evaluate(() => {
+      let visibility = "hidden";
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        get: () => visibility,
+      });
+      document.dispatchEvent(new Event("visibilitychange"));
+      visibility = "visible";
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+
+    await page.waitForFunction(() => {
+      const snapshot = (window as any).browserDiagnosticsSnapshot?.();
+      const diagnostics = snapshot?.diagnostics || [];
+      return diagnostics.some((entry: any) =>
+        entry.category === "websocket" &&
+        entry.reason === "ws_probe_pong" &&
+        entry.detail?.ready_state === "open"
+      ) && !diagnostics.some((entry: any) =>
+        entry.category === "websocket" &&
+        entry.reason === "ws_probe_timeout" &&
+        entry.detail?.reason === "tab visible"
+      );
+    });
+    await expect(page.locator("#wsStatusBadge")).toHaveText("Connected");
+    await expect(page.locator("#sendBtn")).toBeEnabled();
+  });
+
+  test("going offline during a foreground probe cancels the probe timeout", async ({ page }) => {
+    const project = page.locator(".proj", { hasText: "Demo" });
+    await project.locator(".project-add").click();
+
+    const input = page.locator("#input");
+    await expect(input).toBeVisible();
+    await input.fill("Exercise offline probe cancellation.");
+    await page.locator("#sendBtn").click();
+    await expect(page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY })).toBeVisible();
+    await page.reload();
+    await expect(page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY })).toBeVisible();
+    await expect(page.locator("#wsStatusBadge")).toHaveText("Connected");
+    await expect(page.locator("#sendBtn")).toBeEnabled();
+
+    await page.evaluate(() => {
+      const originalSend = WebSocket.prototype.send;
+      WebSocket.prototype.send = function(data: string | ArrayBufferLike | Blob | ArrayBufferView) {
+        if (typeof data === "string" && data.includes('"type":"ping"')) return;
+        return originalSend.call(this, data);
+      };
+      let visibility = "hidden";
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        get: () => visibility,
+      });
+      document.dispatchEvent(new Event("visibilitychange"));
+      visibility = "visible";
+      document.dispatchEvent(new Event("visibilitychange"));
+      window.dispatchEvent(new Event("offline"));
+    });
+
+    const startedAt = Date.now();
+    await page.waitForFunction((start) => Date.now() - start > 1400, startedAt);
+    const sawTimeout = await page.evaluate(() => {
+      const snapshot = (window as any).browserDiagnosticsSnapshot?.();
+      const diagnostics = snapshot?.diagnostics || [];
+      return diagnostics.some((entry: any) =>
+        entry.category === "websocket" &&
+        entry.reason === "ws_probe_timeout" &&
+        entry.detail?.reason === "tab visible"
+      );
+    });
+    expect(sawTimeout).toBe(false);
+  });
+
   test("starts an attachment-only thread with image bytes", async ({ page }) => {
     const project = page.locator(".proj", { hasText: "Demo" });
     await project.locator(".project-add").click();
