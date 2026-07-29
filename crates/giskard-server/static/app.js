@@ -578,6 +578,69 @@ function recordNotificationDiagnostic(reason, detail) {
   recordBrowserDiagnostic("notification", reason, detail);
 }
 
+function browserNowMs() {
+  return (window.performance && typeof window.performance.now === "function")
+    ? window.performance.now()
+    : Date.now();
+}
+function elapsedMsSince(startMs) {
+  return Number.isFinite(startMs) ? Math.max(0, Math.round(browserNowMs() - startMs)) : null;
+}
+function wsReconnectDiagnostics(ws) {
+  return ws && ws._giskardReconnectDiagnostics ? ws._giskardReconnectDiagnostics : null;
+}
+function reconnectDiagnosticBase(metrics) {
+  if (!metrics) return {};
+  return {
+    connect_id: metrics.connectId,
+    reconnect: !!metrics.reconnect,
+    reason: metrics.reason || null,
+    cursor: metrics.cursor || null,
+    elapsed_ms: elapsedMsSince(metrics.startedAtMs)
+  };
+}
+function recordReconnectDiagnostic(ws, reason, detail) {
+  const metrics = wsReconnectDiagnostics(ws);
+  if (!metrics) return;
+  recordBrowserDiagnostic("websocket", reason, {
+    ...reconnectDiagnosticBase(metrics),
+    ...(detail || {})
+  });
+}
+function recordReconnectMessageReceived(ws, msgType) {
+  const metrics = wsReconnectDiagnostics(ws);
+  if (!metrics) return;
+  if (metrics.resyncComplete) return;
+  if (!metrics.firstMessageAtMs) {
+    metrics.firstMessageAtMs = browserNowMs();
+    recordReconnectDiagnostic(ws, "ws_resync_first_message", { message_type:msgType });
+  }
+  recordReconnectDiagnostic(ws, "ws_resync_message_received", { message_type:msgType });
+}
+function recordReconnectMessageRendered(ws, msgType, startedAtMs, msg) {
+  const metrics = wsReconnectDiagnostics(ws);
+  if (!metrics) return;
+  if (metrics.resyncComplete) return;
+  const detail = {
+    message_type:msgType,
+    duration_ms: elapsedMsSince(startedAtMs)
+  };
+  if (msg && Array.isArray(msg.turns)) detail.turn_count = msg.turns.length;
+  if (msgType === "live_turn_snapshot" && msg) {
+    detail.accumulated_events = Array.isArray(msg.accumulated) ? msg.accumulated.length : 0;
+  }
+  if (msgType === "running_tasks" && msg) {
+    detail.task_count = Array.isArray(msg.tasks) ? msg.tasks.length : 0;
+  }
+  recordReconnectDiagnostic(ws, "ws_resync_message_rendered", detail);
+}
+function reconnectResyncComplete(metrics, msgType) {
+  if (!metrics) return false;
+  if (metrics.subscribeMode === "incremental") return msgType === "running_tasks";
+  if (metrics.subscribeMode === "full") return msgType === "history_page";
+  return false;
+}
+
 function showBrowserDiagnostics() {
   const snapshot = browserDiagnosticsSnapshot();
   console.info("[Giskard browser diagnostics] snapshot", snapshot);
@@ -624,8 +687,19 @@ function renderBrowserDiagnosticsPanel(snapshot, reveal) {
       const detail = entry.detail || {};
       const fields = [];
       if (detail.source) fields.push(`source=${detail.source}`);
+      if (detail.reason) fields.push(`reason=${detail.reason}`);
       if (detail.request_id !== undefined && detail.request_id !== null) fields.push(`request=${detail.request_id}`);
       if (detail.status) fields.push(`status=${detail.status}`);
+      if (detail.mode) fields.push(`mode=${detail.mode}`);
+      if (detail.message_type) fields.push(`message=${detail.message_type}`);
+      if (detail.elapsed_ms !== undefined && detail.elapsed_ms !== null) fields.push(`elapsed=${detail.elapsed_ms}ms`);
+      if (detail.duration_ms !== undefined && detail.duration_ms !== null) fields.push(`duration=${detail.duration_ms}ms`);
+      if (detail.backgrounded !== undefined && detail.backgrounded !== null) fields.push(`backgrounded=${detail.backgrounded}`);
+      if (detail.backgrounded_ms !== undefined && detail.backgrounded_ms !== null) fields.push(`backgrounded=${detail.backgrounded_ms}ms`);
+      if (detail.timeout_ms !== undefined && detail.timeout_ms !== null) fields.push(`timeout=${detail.timeout_ms}ms`);
+      if (detail.turn_count !== undefined && detail.turn_count !== null) fields.push(`turns=${detail.turn_count}`);
+      if (detail.accumulated_events !== undefined && detail.accumulated_events !== null) fields.push(`events=${detail.accumulated_events}`);
+      if (detail.task_count !== undefined && detail.task_count !== null) fields.push(`tasks=${detail.task_count}`);
       if (detail.error) fields.push(`error=${detail.error}`);
       lines.push(`- ${entry.at} ${entry.category}:${entry.reason} visible=${entry.visibility} focused=${entry.focused}${fields.length ? " " + fields.join(" ") : ""}`);
     }
@@ -2225,7 +2299,7 @@ function scheduleWsReconnect(reason) {
   setWsStatus("reconnecting", message);
   state.wsReconnectTimer = setTimeout(() => {
     state.wsReconnectTimer = null;
-    connectWs({ reconnect:true });
+    connectWs({ reconnect:true, reason:message });
   }, delay + jitter);
 }
 async function connectWs(opts) {
@@ -2252,11 +2326,25 @@ async function connectWs(opts) {
   }
   setWsStatus(opts.reconnect ? "reconnecting" : "connecting", opts.reconnect ? "Reconnecting to agent..." : "Connecting to agent...");
   const proto = location.protocol==="https:" ? "wss" : "ws";
+  const connectStartedAtMs = browserNowMs();
+  const reconnectMetrics = {
+    connectId,
+    reconnect: !!opts.reconnect,
+    reason: opts.reason || null,
+    cursor: state.newestPersistedTurnId || null,
+    startedAtMs: connectStartedAtMs,
+    firstMessageAtMs: 0
+  };
+  recordBrowserDiagnostic("websocket", "ws_connect_started", reconnectDiagnosticBase(reconnectMetrics));
   let ticket;
   try {
     ticket = (await api("GET","/api/ws-ticket")).ticket;
   } catch (e) {
     if (connectId !== state.wsConnectId) return;
+    recordBrowserDiagnostic("websocket", "ws_ticket_failed", {
+      ...reconnectDiagnosticBase(reconnectMetrics),
+      error:e && e.message ? e.message : String(e)
+    });
     const message = "WebSocket authorization failed: "+e.message;
     setWsStatus("reconnecting", message);
     surfaceWsProblem(message, "error");
@@ -2264,15 +2352,19 @@ async function connectWs(opts) {
     return;
   }
   if (connectId !== state.wsConnectId) return;
+  recordBrowserDiagnostic("websocket", "ws_ticket_received", reconnectDiagnosticBase(reconnectMetrics));
   const ws = new WebSocket(`${proto}://${location.host}/api/ws?ticket=${encodeURIComponent(ticket)}`);
   state.ws = ws;
+  ws._giskardReconnectDiagnostics = reconnectMetrics;
   ws._giskardBackgroundedAt = document.visibilityState === "hidden" ? Date.now() : 0;
+  recordReconnectDiagnostic(ws, "ws_socket_created", { ready_state:wsReadyStateLabel(ws) });
   ws.onopen = () => {
     if (state.ws !== ws) return;
     state.wsReconnectAttempt = 0;
     state.wsLastProblem = "";
     setWsStatus("open", "Connected to agent.");
     markWsForegroundRecovered(ws);
+    recordReconnectDiagnostic(ws, "ws_socket_open", { ready_state:wsReadyStateLabel(ws) });
     // Incremental resync: if we already have persisted history rendered, ask only for the turns
     // after our newest one (`since`). The server replies with a HistoryDelta and we keep the
     // immutable completed-turn DOM. If a live snapshot follows, the stale live DOM stays visible
@@ -2281,11 +2373,15 @@ async function connectWs(opts) {
     if (state.newestPersistedTurnId) {
       state.awaitingIncrementalResync = true;
       state.awaitingThreadResync = false;
-      send({ type:"subscribe", thread_id: state.threadId, since: state.newestPersistedTurnId });
+      const sent = send({ type:"subscribe", thread_id: state.threadId, since: state.newestPersistedTurnId });
+      reconnectMetrics.subscribeMode = "incremental";
+      recordReconnectDiagnostic(ws, "ws_subscribe_sent", { mode:"incremental", sent });
     } else {
       state.awaitingThreadResync = true;
       state.awaitingIncrementalResync = false;
-      send({ type:"subscribe", thread_id: state.threadId });
+      const sent = send({ type:"subscribe", thread_id: state.threadId });
+      reconnectMetrics.subscribeMode = "full";
+      recordReconnectDiagnostic(ws, "ws_subscribe_sent", { mode:"full", sent });
     }
   };
   ws.onmessage = (m) => {
@@ -2300,6 +2396,7 @@ async function connectWs(opts) {
   ws.onerror = () => {
     if (state.ws !== ws) return;
     ws._giskardHadError = true;
+    recordReconnectDiagnostic(ws, "ws_socket_error", { ready_state:wsReadyStateLabel(ws) });
     recordWsProblem("WebSocket connection failed. Reconnecting...");
   };
   ws.onclose = (ev) => {
@@ -2322,6 +2419,13 @@ async function connectWs(opts) {
     if (!backgrounded && (ws._giskardHadError || abnormalForegroundClose)) {
       surfaceWsProblem(message, "warning");
     }
+    recordReconnectDiagnostic(ws, "ws_socket_closed", {
+      code:ev.code || null,
+      reason:ev.reason || null,
+      had_error:!!ws._giskardHadError,
+      backgrounded,
+      backgrounded_ms:backgroundedAt ? Math.max(0, Date.now() - backgroundedAt) : null
+    });
     scheduleWsReconnect(message);
   };
 }
@@ -2417,6 +2521,7 @@ function probeWsBeforeReconnect(reason) {
   clearWsProbeTimer();
   const token = ++state.wsProbeToken;
   state.wsProbeSocket = ws;
+  ws._giskardProbeStartedAtMs = browserNowMs();
   const backgroundedAt = Number(ws._giskardBackgroundedAt) || 0;
   setWsStatus("reconnecting", "Checking connection...");
   recordBrowserDiagnostic("websocket", "ws_probe_started", {
@@ -2430,6 +2535,7 @@ function probeWsBeforeReconnect(reason) {
   } catch (e) {
     recordBrowserDiagnostic("websocket", "ws_probe_send_failed", {
       reason:reason || "probe requested",
+      elapsed_ms: elapsedMsSince(ws._giskardProbeStartedAtMs),
       error:e && e.message ? e.message : String(e)
     });
     connectWs({ reconnect:true, reason });
@@ -2441,6 +2547,7 @@ function probeWsBeforeReconnect(reason) {
     recordBrowserDiagnostic("websocket", "ws_probe_timeout", {
       reason:reason || "probe requested",
       timeout_ms:WS_FOREGROUND_PROBE_TIMEOUT_MS,
+      elapsed_ms: elapsedMsSince(ws._giskardProbeStartedAtMs),
       ready_state:wsReadyStateLabel(ws)
     });
     state.wsReconnectAttempt = 0;
@@ -2450,6 +2557,7 @@ function probeWsBeforeReconnect(reason) {
 function finishWsProbe(ws, reason) {
   if (!state.wsProbeTimer || state.wsProbeSocket !== ws) return;
   recordBrowserDiagnostic("websocket", reason, {
+    elapsed_ms: elapsedMsSince(ws._giskardProbeStartedAtMs),
     ready_state:wsReadyStateLabel(ws)
   });
   clearWsProbeTimer();
@@ -2543,6 +2651,9 @@ function handleServer(msg, ws) {
     return;
   }
   if (!isCurrentThreadServerMessage(msg)) return;
+  const messageType = msg && msg.type ? msg.type : "unknown";
+  const renderStartedAtMs = browserNowMs();
+  recordReconnectMessageReceived(ws, messageType);
   switch (msg.type) {
     case "thread_state": renderThreadState(msg.state); break;
     case "history_page": renderHistoryPage(msg); break;
@@ -2604,6 +2715,12 @@ function handleServer(msg, ws) {
       if (msg.action==="server_request_response") resetResolvingServerRequests();
       notice(msg.message||"error", msg.severity||"error");
       break;
+  }
+  recordReconnectMessageRendered(ws, messageType, renderStartedAtMs, msg);
+  const metrics = wsReconnectDiagnostics(ws);
+  if (reconnectResyncComplete(metrics, messageType)) {
+    recordReconnectDiagnostic(ws, "ws_resync_complete", {});
+    metrics.resyncComplete = true;
   }
 }
 

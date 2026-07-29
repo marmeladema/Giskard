@@ -1071,8 +1071,12 @@ async fn index_page_is_served_and_public() {
     );
     assert!(
         body.contains(
-            "state.awaitingIncrementalResync = true;\n      state.awaitingThreadResync = false;\n      send({ type:\"subscribe\", thread_id: state.threadId, since: state.newestPersistedTurnId });"
-        ) && body.contains("state.awaitingThreadResync = true;\n      state.awaitingIncrementalResync = false;\n      send({ type:\"subscribe\", thread_id: state.threadId });")
+            "state.awaitingIncrementalResync = true;\n      state.awaitingThreadResync = false;"
+        ) && body.contains("send({ type:\"subscribe\", thread_id: state.threadId, since: state.newestPersistedTurnId });")
+            && body.contains("recordReconnectDiagnostic(ws, \"ws_subscribe_sent\", { mode:\"incremental\", sent });")
+            && body.contains("state.awaitingThreadResync = true;\n      state.awaitingIncrementalResync = false;")
+            && body.contains("send({ type:\"subscribe\", thread_id: state.threadId });")
+            && body.contains("recordReconnectDiagnostic(ws, \"ws_subscribe_sent\", { mode:\"full\", sent });")
             && body.contains("awaitingThreadResync:false")
             && body.contains("awaitingIncrementalResync:false"),
         "reconnect asks for an incremental delta when it has a cursor, else a full authoritative resync"
@@ -1101,6 +1105,7 @@ async fn index_page_is_served_and_public() {
             && !onerror.contains("surfaceWsProblem"),
         "websocket onerror updates status without directly emitting a notice"
     );
+    assert!(onerror.contains("recordReconnectDiagnostic(ws, \"ws_socket_error\""));
     assert!(
         body.contains("surfaceWsProblem(message, \"warning\")")
             && body.contains("abnormalForegroundClose"),
@@ -2456,6 +2461,7 @@ fn browser_websocket_lifecycle_errors_are_not_toasted_directly() {
         "surfaceWsProblem(message, \"warning\");",
         "scheduleWsReconnect(message);",
     );
+    assert!(onclose.contains("recordReconnectDiagnostic(ws, \"ws_socket_closed\""));
 
     let visibility = between(
         body,
@@ -2532,6 +2538,36 @@ fn browser_diagnostics_panel_is_exposed_from_settings() {
     assert!(body.contains("category: category || \"browser\""));
     assert!(body.contains("function recordNotificationDiagnostic(reason, detail)"));
     assert!(body.contains("recordBrowserDiagnostic(\"notification\", reason, detail);"));
+    assert!(body.contains("function browserNowMs()"));
+    assert!(body.contains("function elapsedMsSince(startMs)"));
+    assert!(body.contains("function reconnectDiagnosticBase(metrics)"));
+    assert!(body.contains("function recordReconnectDiagnostic(ws, reason, detail)"));
+    assert!(body.contains("function recordReconnectMessageReceived(ws, msgType)"));
+    assert!(
+        body.contains("function recordReconnectMessageRendered(ws, msgType, startedAtMs, msg)")
+    );
+    assert!(body.contains("function reconnectResyncComplete(metrics, msgType)"));
+    assert!(
+        body.contains(
+            "if (metrics.subscribeMode === \"incremental\") return msgType === \"running_tasks\";"
+        ),
+        "incremental reconnect diagnostics should complete after the server's final resync message"
+    );
+    assert!(
+        body.contains(
+            "if (metrics.subscribeMode === \"full\") return msgType === \"history_page\";"
+        ),
+        "full reconnect diagnostics should complete after the server's final snapshot message"
+    );
+    assert!(body.contains("ws_connect_started"));
+    assert!(body.contains("ws_ticket_received"));
+    assert!(body.contains("ws_socket_open"));
+    assert!(body.contains("ws_resync_first_message"));
+    assert!(body.contains("ws_resync_message_rendered"));
+    assert!(body.contains("ws_resync_complete"));
+    assert!(body.contains("metrics.resyncComplete"));
+    assert!(body.contains("reconnectMetrics.subscribeMode = \"incremental\""));
+    assert!(body.contains("reconnectMetrics.subscribeMode = \"full\""));
     assert!(body.contains("function renderBrowserDiagnosticsPanel(snapshot, reveal)"));
     assert!(body.contains("log.textContent = lines.join(\"\\n\");"));
     assert!(body.contains("`lastRequest: ${lastWaiting ? lastWaiting.reason : \"none\"}`"));
@@ -2539,6 +2575,12 @@ fn browser_diagnostics_panel_is_exposed_from_settings() {
     assert!(body.contains("recentRequests:"));
     assert!(body.contains("recentBrowserEvents:"));
     assert!(body.contains("visible=${entry.visibility} focused=${entry.focused}"));
+    assert!(body.contains("fields.push(`mode=${detail.mode}`)"));
+    assert!(body.contains("fields.push(`elapsed=${detail.elapsed_ms}ms`)"));
+    assert!(body.contains("fields.push(`duration=${detail.duration_ms}ms`)"));
+    assert!(body.contains("fields.push(`backgrounded=${detail.backgrounded}`)"));
+    assert!(body.contains("fields.push(`backgrounded=${detail.backgrounded_ms}ms`)"));
+    assert!(body.contains("fields.push(`message=${detail.message_type}`)"));
     assert!(body.contains("`requestSource: ${waitingDetail.source || \"none\"}`"));
     assert!(body.contains("window.giskardBrowserDiagnostics = browserDiagnosticsSnapshot;"));
     assert!(body.contains("window.giskardNotificationDebug = notificationDebugSnapshot;"));
