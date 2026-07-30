@@ -1899,9 +1899,14 @@ $("pmCreate").onclick = async () => {
     ? { provider: opt.dataset.provider, model: opt.dataset.model, reasoning_effort:null }
     : { provider:"openai", model:"gpt-5.5", reasoning_effort:null };
   try {
-    await api("POST","/api/projects",{ name, dir, default_model:model });
+    const { id } = await api("POST","/api/projects",{ name, dir, default_model:model });
     closeProjectModal();
     await loadProjects();
+    // Land on the new project's draft view rather than leaving the previously
+    // selected thread on screen. `newThread` opens the draft synchronously and
+    // resolves the project's default model in the background (LT6–LT9), the same
+    // path the per-project "+" button uses.
+    newThread(id);
   } catch (e) { $("pmErr").textContent = "Create project failed: "+apiFailureMessage(e); }
 };
 
