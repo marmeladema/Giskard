@@ -5167,13 +5167,13 @@ function renderRunningCommandSnapshot(commands) {
   for (const [id, cmd] of Array.from(state.runningCommands.entries())) {
     if (seen.has(id)) continue;
     state.runningCommands.delete(id);
-    // Tool transcript rows are owned by the item stream; only command rows get the ended-body
-    // rewrite when a stop was requested.
+    // Tool transcript rows are owned by the item stream; only commands with an explicit stop
+    // request get a fallback ended-body rewrite when task tracking disappears.
     if (cmd.kind !== "tool") {
       const body = commandBodyFor(id);
       const stopRequested = cmd.terminating || state.commandStopRequestedByItemId.has(id);
       if (body && stopRequested) {
-        renderEndedCommandBody(body, cmd, "unknown", { stopRequested:true });
+        renderEndedCommandBody(body, cmd, "unknown", { stopRequested });
       }
     }
     state.commandStopRequestedByItemId.delete(id);

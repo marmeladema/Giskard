@@ -2700,10 +2700,22 @@ async fn forward_events(
                 {
                     let command_state_changed =
                         apply_seen_turn_running_command_event(&running_commands, &event).await;
-                    if command_state_changed {
-                        if is_terminal_command_completion(&event) {
-                            hub.broadcast_event(thread_id, event).await;
+                    if is_terminal_command_completion(&event) {
+                        if !command_state_changed
+                            && let AgentEvent::ItemCompleted { turn, item, .. } = &event
+                        {
+                            warn!(
+                                %project_id,
+                                %thread_id,
+                                %turn,
+                                item_id = %item.id,
+                                harness_item_id = %item.harness_item_id,
+                                "broadcasting terminal command completion for a persisted turn without matching running-task state"
+                            );
                         }
+                        hub.broadcast_event(thread_id, event).await;
+                    }
+                    if command_state_changed {
                         broadcast_running_commands(&hub, &running_commands, thread_id).await;
                     }
                     if owned_turn_completed
@@ -5128,7 +5140,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_turn_forwarder_exits_after_after_turn_command_completion() {
+    async fn completed_turn_forwarder_drains_processless_command_completion() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
         let project_id = ProjectId::new();
@@ -5210,7 +5222,7 @@ mod tests {
                     command: "sleep 600".into(),
                     cwd: "/tmp/test".into(),
                     status: Some("running".into()),
-                    process_id: Some("proc_after_turn".into()),
+                    process_id: None,
                     started_at_ms: Some(1),
                 }),
                 tool: None,
@@ -5229,7 +5241,7 @@ mod tests {
                     output: "still running".into(),
                     exit_code: None,
                     status: Some("running".into()),
-                    process_id: Some("proc_after_turn".into()),
+                    process_id: None,
                     duration_ms: None,
                 },
                 created_at: Utc::now(),
@@ -5251,6 +5263,7 @@ mod tests {
         let tasks = running_commands.snapshot(thread_id).await;
         assert_eq!(tasks.len(), 1);
         assert!(tasks[0].after_turn);
+        assert!(tasks[0].process_id.is_none());
 
         tx.send(AgentEvent::ItemCompleted {
             thread: thread_id,
@@ -5264,7 +5277,7 @@ mod tests {
                     output: "done".into(),
                     exit_code: Some(0),
                     status: Some("completed".into()),
-                    process_id: Some("proc_after_turn".into()),
+                    process_id: None,
                     duration_ms: Some(60_000),
                 },
                 created_at: Utc::now(),
@@ -5533,6 +5546,160 @@ mod tests {
             running_commands.snapshot(thread_id).await.is_empty(),
             "historical starts for already-persisted turns must not create stale running tasks"
         );
+    }
+
+    #[tokio::test]
+    async fn persisted_turn_terminal_command_completion_is_broadcast_without_running_task() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: None,
+        };
+        store
+            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .await
+            .unwrap();
+        let now = Utc::now();
+        store
+            .save_thread(
+                project_id,
+                &ThreadFile {
+                    version: 1,
+                    id: thread_id,
+                    project_id,
+                    title: "target".into(),
+                    harness_thread_id: "th_target".into(),
+                    parent_thread_id: None,
+                    spawned_by_turn_id: None,
+                    kind: giskard_core::ThreadKind::Primary,
+                    mode: Mode::Build,
+                    current_model: model.clone(),
+                    context_window: 128_000,
+                    model_context_windows: Default::default(),
+                    permission_preset: PermissionPreset::AskFirst,
+                    model_efforts: Default::default(),
+                    tokens: TokenLedger::default(),
+                    created_at: now,
+                    updated_at: now,
+                    archived: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let turn = TurnId::new();
+        let item_id = ItemId::new();
+        let harness_item_id = "cmd_late".to_string();
+        store
+            .append_turn(
+                project_id,
+                thread_id,
+                &Turn {
+                    id: turn,
+                    user_input: UserInput::text("already persisted"),
+                    items: vec![Item {
+                        id: item_id,
+                        harness_item_id: harness_item_id.clone(),
+                        payload: ItemPayload::CommandExecution {
+                            command: "<command included NUL byte>".into(),
+                            cwd: "/tmp/test".into(),
+                            output: String::new(),
+                            exit_code: None,
+                            status: Some("in_progress".into()),
+                            process_id: None,
+                            duration_ms: None,
+                        },
+                        created_at: now,
+                    }],
+                    model: model.clone(),
+                    mode: Mode::Build,
+                    status: TurnStatus {
+                        kind: TurnStatusKind::Completed,
+                        message: None,
+                    },
+                    usage: TokenUsage::default(),
+                    diffs: Vec::new(),
+                    started_at: now,
+                    completed_at: Some(now),
+                },
+            )
+            .await
+            .unwrap();
+
+        let (tx, _) = broadcast::channel(16);
+        let hub = Arc::new(Hub::new());
+        let (client_tx, mut client_rx) = mpsc::channel(16);
+        hub.subscribe(thread_id, 1, client_tx).await;
+        let live_buffers = Arc::new(LiveBufferStore::new());
+        let running_commands = Arc::new(RunningTaskStore::new());
+        let approvals = Arc::new(Mutex::new(Default::default()));
+        let server_requests = Arc::new(Mutex::new(Default::default()));
+        let ledger = ledger::spawn(store.clone());
+
+        spawn_forwarder(
+            thread_id,
+            project_id,
+            AgentEventStream::new(tx.subscribe()),
+            hub,
+            live_buffers,
+            running_commands.clone(),
+            store,
+            approvals,
+            server_requests,
+            ledger,
+            model,
+            "next",
+        );
+
+        assert!(running_commands.snapshot(thread_id).await.is_empty());
+        tx.send(AgentEvent::ItemCompleted {
+            thread: thread_id,
+            turn,
+            item: Item {
+                id: item_id,
+                harness_item_id,
+                payload: ItemPayload::CommandExecution {
+                    command: "<command included NUL byte>".into(),
+                    cwd: "/tmp/test".into(),
+                    output: "failed before spawn".into(),
+                    exit_code: Some(1),
+                    status: Some("failed".into()),
+                    process_id: None,
+                    duration_ms: Some(10),
+                },
+                created_at: now,
+            },
+        })
+        .unwrap();
+
+        let message = tokio::time::timeout(tokio::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(message) = client_rx.recv().await
+                    && matches!(
+                        &message,
+                        ServerMessage::Event {
+                            agent_event,
+                            ..
+                        } if matches!(**agent_event, WireAgentEvent::ItemCompleted { .. })
+                    )
+                {
+                    break message;
+                }
+            }
+        })
+        .await
+        .expect("late terminal command completion should be broadcast");
+        let ServerMessage::Event { agent_event, .. } = message else {
+            panic!("expected event");
+        };
+        let WireAgentEvent::ItemCompleted { item, .. } = *agent_event else {
+            panic!("expected item completion");
+        };
+        assert_eq!(item.id, item_id);
     }
 
     #[tokio::test]

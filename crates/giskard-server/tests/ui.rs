@@ -2415,6 +2415,8 @@ fn browser_scopes_running_command_completion_identity_to_turn() {
             "running task snapshots must keep scoped DOM identity: `{expected}`"
         );
     }
+    assert!(snapshot.contains("if (body && stopRequested) {"));
+    assert!(!snapshot.contains("cmd.afterTurn || !cmd.processId"));
 
     let start = between(
         body,
