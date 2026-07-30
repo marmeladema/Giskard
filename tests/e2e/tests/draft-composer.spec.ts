@@ -145,6 +145,9 @@ test.describe("draft composer", () => {
 
     await page.locator(".proj", { hasText: "Demo" }).locator(".project-add").click();
     await expect(page.locator("#input")).toBeVisible();
+    // Fill first, so the send-availability assertions below turn only on the model resolving and
+    // not on whether there is anything to send.
+    await page.locator("#input").fill("Sent on an explicitly chosen effort");
     await expect(page.locator("#sendBtn")).toBeDisabled();
 
     // The catalog is a separate fetch and has already landed, so the controls are usable here.
@@ -161,7 +164,6 @@ test.describe("draft composer", () => {
     await expect(modelButton(page)).toContainText("High");
 
     await page.keyboard.press("Escape");   // the picker popover overlays the composer
-    await page.locator("#input").fill("Sent on an explicitly chosen effort");
     await page.locator("#sendBtn").click();
     const body = (await started).postDataJSON();
     expect(body.model_ref).toMatchObject({
@@ -239,15 +241,15 @@ test.describe("draft composer", () => {
 
     // Draft A: send it, and leave the POST hanging.
     await newDraft();
-    await expect(page.locator("#sendBtn")).toBeEnabled();
     await page.locator("#input").fill("Draft A, sent first");
+    await expect(page.locator("#sendBtn")).toBeEnabled();
     await page.locator("#sendBtn").click();
     await expect(page.locator("#transcript .msg.user")).toBeVisible();
 
     // Draft B: opened and typed into while A's request is still in flight.
     await newDraft();
-    await expect(page.locator("#sendBtn")).toBeEnabled();
     await page.locator("#input").fill("Draft B, typed while A was in flight");
+    await expect(page.locator("#sendBtn")).toBeEnabled();
 
     const startedResponse = page.waitForResponse(
       (r) => r.request().method() === "POST" && r.url().endsWith("/threads/start"),
@@ -285,8 +287,8 @@ test.describe("composer across a thread switch", () => {
     // Two threads to switch between.
     const create = async (message: string) => {
       await project.locator(".project-add").click();
-      await expect(page.locator("#sendBtn")).toBeEnabled();
       await page.locator("#input").fill(message);
+      await expect(page.locator("#sendBtn")).toBeEnabled();
       await page.locator("#sendBtn").click();
       await expect(
         page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY }),
@@ -317,5 +319,97 @@ test.describe("composer across a thread switch", () => {
     await page.locator(`.thread[data-tid="${second}"]`).click();
     await expect(page.locator(`.thread[data-tid="${second}"]`)).toHaveClass(/\bactive\b/);
     await expect(page.locator("#input")).toHaveValue(typed);
+    // Restored text is text to send: coming back must not leave the button reading empty.
+    await expect(page.locator("#sendBtn")).toBeEnabled();
+  });
+});
+
+// Send used to be enabled with nothing to send, and `sendInput` returned early without a word. A
+// composer that was unexpectedly empty — as one used to be when a draft opened mid-typing — then
+// read as a dead button: the click did nothing and nothing said why. The emptiness is now on the
+// button itself.
+test.describe("composer send availability", () => {
+  test.beforeEach(async ({ page }) => {
+    await login(page);
+  });
+
+  test("offers Send only when there is something to send", async ({ page }) => {
+    let started = false;
+    page.on("request", (r) => {
+      if (r.method() === "POST" && r.url().endsWith("/threads/start")) started = true;
+    });
+
+    await page.locator(".proj", { hasText: "Demo" }).locator(".project-add").click();
+    const input = page.locator("#input");
+    const send = page.locator("#sendBtn");
+    await expect(input).toBeVisible();
+
+    // Nothing typed: unavailable, and the button says why rather than swallowing the click.
+    await expect(send).toBeDisabled();
+    await expect(send).toHaveAttribute("title", /Type a message/);
+
+    // The button cannot be clicked while disabled, so Enter is the only way to reach `sendInput`
+    // with an empty composer — the path that keeps its own silent guard. Without this the
+    // no-request assertion at the end would hold vacuously.
+    await input.press("Enter");
+    await expect(input).toHaveValue("");
+    await expect(send).toBeDisabled();
+
+    await input.fill("Something to send");
+    await expect(send).toBeEnabled();
+    await expect(send).toHaveAttribute("title", "Send");
+
+    // Emptying it again takes the offer away — this is the state that used to look like a dead
+    // button, and the one a future regression would land in.
+    await input.fill("");
+    await expect(send).toBeDisabled();
+
+    // Whitespace is not a message.
+    await input.fill("   ");
+    await expect(send).toBeDisabled();
+
+    // An attachment alone is enough, with no text at all.
+    await input.fill("");
+    await page.locator("#attachmentInput").setInputFiles({
+      name: "note.txt",
+      mimeType: "text/plain",
+      buffer: Buffer.from("attached without a message"),
+    });
+    await expect(page.locator(".attachment-chip")).toHaveCount(1);
+    await expect(send).toBeEnabled();
+
+    // Nothing was routed to the server while the composer was empty.
+    expect(started, "an empty composer must not start a turn").toBe(false);
+  });
+
+  // Now that Send tracks emptiness, every path that puts text back in the composer has to refresh
+  // it. Restoring a draft is the one that does not go through the input event.
+  test("offers Send again when a draft's text comes back", async ({ page }) => {
+    const project = page.locator(".proj", { hasText: "Demo" });
+    const input = page.locator("#input");
+    const send = page.locator("#sendBtn");
+
+    // An existing thread to leave the draft for.
+    await project.locator(".project-add").click();
+    await input.fill("A thread to switch to");
+    await send.click();
+    await expect(
+      page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY }),
+    ).toBeVisible();
+    const tid = await page.locator(".thread.active").getAttribute("data-tid");
+
+    const text = "Draft text left behind";
+    await project.locator(".project-add").click();
+    await input.fill(text);
+    await expect(send).toBeEnabled();
+
+    await page.locator(`.thread[data-tid="${tid}"]`).click();
+    await expect(page.locator(`.thread[data-tid="${tid}"]`)).toHaveClass(/\bactive\b/);
+    await expect(input).toHaveValue("");
+
+    await project.locator(".project-add").click();
+    await expect(input).toHaveValue(text);
+    await expect(send).toBeEnabled();
+    await expect(send).toHaveAttribute("title", "Send");
   });
 });
