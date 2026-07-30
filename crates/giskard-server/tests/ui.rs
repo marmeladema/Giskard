@@ -1052,8 +1052,9 @@ async fn index_page_is_served_and_public() {
     assert!(
         body.contains("const attachmentsLoading = pendingAttachmentOperationCount() > 0")
             && body.contains(
-                "readOnly || state.activeTurn || attachmentsLoading || modelUnresolved || (!ready && !draft)"
+                "readOnly || state.activeTurn || attachmentsLoading || modelUnresolved || nothingToSend ||"
             )
+            && body.contains("!hasThreadSurface || (!ready && !draft)")
             && body.contains("if (isDraftThread()) {")
             && body.contains("startDraftThread(text, attachments);"),
         "UI allows draft first sends without a WebSocket, blocks existing-thread sends until open, \
@@ -1066,7 +1067,8 @@ async fn index_page_is_served_and_public() {
             && body.contains("return `draft:${state.draftThread.projectId}`")
             && body.contains("function saveComposerDraft()")
             && body.contains("function restoreComposerDraft()")
-            && body.contains("$(\"input\").addEventListener(\"input\", saveComposerDraft);"),
+            && body.contains("$(\"input\").addEventListener(\"input\", () => {")
+            && body.contains("  saveComposerDraft();"),
         "pending composer text is cached per existing thread and per project draft"
     );
     assert!(
@@ -1896,6 +1898,20 @@ fn browser_scopes_unsent_composer_text_to_thread() {
         open_thread,
         "state.draftThread = null;",
         "restoreComposerDraft();",
+    );
+
+    // `clearPendingAttachments` refreshes the Send button, which reads the composer's text, so the
+    // restore has to write the text first — otherwise the button is evaluated against the outgoing
+    // thread's composer. Callers refresh again afterwards, so only the source order records this.
+    let restore_draft = between(
+        body,
+        "function restoreComposerDraft() {",
+        "function clearComposerDraft(key) {",
+    );
+    assert_order(
+        restore_draft,
+        "input.value = key ? (state.inputDrafts.get(key) || \"\") : \"\";",
+        "clearPendingAttachments();",
     );
 
     let send_input = between(

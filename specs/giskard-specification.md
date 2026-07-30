@@ -9,7 +9,7 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.63
+**Version:** 1.64
 
 > **Amendment — frontend approach (supersedes the Dioxus/WASM design below).**
 > This document was written targeting a **Dioxus fullstack / WebAssembly** frontend (`giskard-ui`),
@@ -22,6 +22,19 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.63 → 1.64), Send offers only what it can do:**
+- **LT10:** Send is unavailable when there is nothing to send — no non-whitespace composer text and
+  no attachment; a composer holding only whitespace counts as empty.
+  It was previously offered in that state and `sendInput` returned early with no notice, so the
+  click did nothing and said nothing. That is fine when the user simply clicked an empty composer,
+  but it also silently absorbed a composer that was empty unexpectedly (LT6), which then read as a
+  dead button. The condition belongs on the control, alongside the other reasons a send cannot
+  happen: read-only, a turn already running, attachments still loading, an unresolved draft model.
+  The keyboard path keeps a matching guard, since it does not go through the control, and stays
+  silent there: an empty composer is not an error worth reporting. Because the button now depends
+  on the composer's contents, every path that changes them refreshes it: the input event, the
+  attachment render, and the per-thread draft restore.
 
 **Changelog (1.62 → 1.63), the draft opens before the project is fetched:**
 - **LT6:** The project `+` action must switch to the draft thread *synchronously*. It previously

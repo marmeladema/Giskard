@@ -47,6 +47,9 @@ test.describe("projects and threads", () => {
     await page.reload();
     await expect(page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY })).toBeVisible();
     await expect(page.locator("#wsStatusBadge")).toHaveText("Connected");
+    // Send is this test's read on the socket, so give it something to send: the reload left the
+    // composer empty, and an empty composer disables the button for its own reason.
+    await input.fill("Something to send while the socket is probed.");
     await expect(page.locator("#sendBtn")).toBeEnabled();
 
     await page.evaluate(() => {
@@ -89,6 +92,9 @@ test.describe("projects and threads", () => {
     await page.reload();
     await expect(page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY })).toBeVisible();
     await expect(page.locator("#wsStatusBadge")).toHaveText("Connected");
+    // Send is this test's read on the socket, so give it something to send: the reload left the
+    // composer empty, and an empty composer disables the button for its own reason.
+    await input.fill("Something to send while the socket is probed.");
     await expect(page.locator("#sendBtn")).toBeEnabled();
 
     await page.evaluate(() => {
@@ -131,6 +137,9 @@ test.describe("projects and threads", () => {
     await page.reload();
     await expect(page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY })).toBeVisible();
     await expect(page.locator("#wsStatusBadge")).toHaveText("Connected");
+    // Send is this test's read on the socket, so give it something to send: the reload left the
+    // composer empty, and an empty composer disables the button for its own reason.
+    await input.fill("Something to send while the socket is probed.");
     await expect(page.locator("#sendBtn")).toBeEnabled();
 
     await page.evaluate(() => {
@@ -396,6 +405,10 @@ test.describe("projects and threads", () => {
     await expect(page.locator("#notices .notice.err", {
       hasText: "Could not attach slow.txt",
     })).toHaveCount(0);
+    // The composer must not be left stuck from the abandoned read. Send is also gated on having
+    // something to send, so give it something: an empty composer disables the button for a reason
+    // that has nothing to do with the stale attachment.
+    await page.locator("#input").fill("Composer is usable after the stale read");
     await expect(page.locator("#sendBtn")).toBeEnabled();
     await expect(page.locator("#transcript .msg.user", { hasText: baselineMessage })).toBeVisible();
   });

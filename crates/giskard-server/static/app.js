@@ -2053,9 +2053,13 @@ function saveComposerDraft() {
 function restoreComposerDraft() {
   const input = $("input");
   if (!input) return;
-  clearPendingAttachments();
   const key = composerDraftKey();
   input.value = key ? (state.inputDrafts.get(key) || "") : "";
+  // Last: clearing the attachments refreshes the Send button, and it has to see the restored text
+  // rather than the outgoing thread's. Callers happen to refresh again afterwards (a draft when its
+  // project's default model lands, a thread when its socket reports status), so the order here is
+  // not currently observable — but the button's answer should not depend on that.
+  clearPendingAttachments();
 }
 
 function clearComposerDraft(key) {
@@ -2464,14 +2468,21 @@ function updateComposerControls() {
   const attachmentsLoading = pendingAttachmentOperationCount() > 0;
   const attachmentInputAllowed = hasThreadSurface && !readOnly && !(draft && state.activeTurn);
   const modelUnresolved = draftModelUnresolved();
+  // An empty composer with nothing attached has nothing to send. That was previously a silent
+  // early return in `sendInput`: the button looked live, the click did nothing, and no message
+  // said why — so a composer emptied unexpectedly (as one used to be by a draft opening mid-typing)
+  // read as a dead button. Disabling it puts the state on screen instead.
+  const nothingToSend = !$("input").value.trim() && state.pendingAttachments.length === 0;
   $("sendBtn").disabled =
-    readOnly || state.activeTurn || attachmentsLoading || modelUnresolved || (!ready && !draft);
+    readOnly || state.activeTurn || attachmentsLoading || modelUnresolved || nothingToSend ||
+    !hasThreadSurface || (!ready && !draft);
   // The send arrow and the stop square share one slot: hide the arrow while a turn is running so
   // only the red stop square is visible (no disabled send button alongside it).
   $("sendBtn").hidden = state.activeTurn && !draft;
   $("sendBtn").title = readOnly ? "Read-only thread — pick a model from a configured provider to reactivate it." :
     attachmentsLoading ? "Wait for attached files to finish loading." :
-    modelUnresolved ? draftModelUnavailableReason() : "Send";
+    modelUnresolved ? draftModelUnavailableReason() :
+    nothingToSend ? "Type a message, or attach a file, to send." : "Send";
   $("stopBtn").hidden = !state.activeTurn || draft;
   $("stopBtn").disabled = !ready || state.interruptPending;
   // The stop button shows a Unicode black square (■) glyph; the "stopping" state is conveyed via
@@ -7364,7 +7375,14 @@ function sendInput() {
     notice("Wait for attached files to finish loading.", "warning");
     return;
   }
-  if ((!text && attachments.length === 0) || (!state.threadId && !isDraftThread())) return;
+  // Nothing to send. The Send button is disabled in this state, so this only catches Enter, where
+  // doing nothing is the right answer — an empty composer is not an error to report.
+  if (!text && attachments.length === 0) return;
+  // No thread surface at all. The composer is hidden until a thread or draft is open, so this is
+  // unreachable in practice; it stays as a guard rather than a case worth explaining to the user.
+  // The Send control carries the same condition, so reaching it by clicking is not possible either
+  // — no title is set for it, since a hidden button's tooltip is not something a user can read.
+  if (!state.threadId && !isDraftThread()) return;
   if (state.activeTurn) {
     notice("Wait for the current turn to finish, or stop it first.", "warning");
     return;
@@ -7409,7 +7427,10 @@ $("input").addEventListener("keydown", (e) => {
   }
   if (!e.shiftKey || isModifierSend) { e.preventDefault(); sendInput(); }
 });
-$("input").addEventListener("input", saveComposerDraft);
+$("input").addEventListener("input", () => {
+  saveComposerDraft();
+  updateComposerControls();   // the Send button tracks whether there is anything to send
+});
 $("attachBtn").onclick = () => $("attachmentInput").click();
 $("attachmentInput").addEventListener("change", attachSelectedFiles);
 initComposerFileDrop();
@@ -7671,6 +7692,9 @@ function normalizedAttachmentMime(value) {
 }
 
 function renderPendingAttachments() {
+  // Every attachment mutation routes through here, and attachments are half of "is there anything
+  // to send", so this is where the Send button learns about them.
+  updateComposerControls();
   const tray = $("attachmentTray");
   tray.innerHTML = "";
   const loading = pendingAttachmentOperationCount() > 0;

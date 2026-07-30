@@ -86,13 +86,15 @@ test.describe("new-project modal", () => {
 
       // The draft's default model resolves from the new project's record, so the picker shows the
       // configured model and Send becomes available — the same end state as the per-project "+".
+      // Type first: an empty composer disables Send for its own reason, which would mask whether
+      // the model resolved.
       await expect(page.locator("#modelPickerBtn")).toContainText("Replay Model");
+      const message = "First message in the modal-created project";
+      await page.locator("#input").fill(message);
       await expect(page.locator("#sendBtn")).toBeEnabled();
 
       // A message can actually be sent from this draft, proving the composer is live and the
       // project is usable, not just drawn.
-      const message = "First message in the modal-created project";
-      await page.locator("#input").fill(message);
       await page.locator("#sendBtn").click();
       await expect(
         page.locator("#transcript .msg.user", { hasText: message }),
