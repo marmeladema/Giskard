@@ -201,7 +201,8 @@ impl RunningTaskStore {
                     }
                     !drop
                 });
-                // Commands can outlive an interrupted turn; keep them, marked `after_turn`.
+                // A process id enables per-command control, but its absence does not prove that
+                // execution ended. Keep every running command until its terminal item arrives.
                 for task in thread_tasks.values_mut() {
                     if task.turn_id == *turn
                         && task.kind == TaskKind::Command
@@ -630,6 +631,55 @@ mod tests {
         assert_eq!(snapshot[0].output, "started");
         assert_eq!(snapshot[0].started_at_ms, 1_785_000_000_000);
         assert!(snapshot[0].after_turn);
+    }
+
+    #[tokio::test]
+    async fn running_command_without_process_id_is_kept_when_turn_ends() {
+        let store = RunningTaskStore::new();
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let item_id = ItemId::new();
+
+        assert!(
+            store
+                .apply_event(&AgentEvent::ItemStarted {
+                    thread,
+                    turn,
+                    item: ItemStart {
+                        id: item_id,
+                        harness_item_id: "cmd_without_process".into(),
+                        kind: ItemKind::CommandExecution,
+                        command: Some(CommandExecutionStart {
+                            command: "<command included NUL byte>".into(),
+                            cwd: "/tmp/project".into(),
+                            status: Some("in_progress".into()),
+                            process_id: None,
+                            started_at_ms: Some(1_785_000_000_000),
+                        }),
+                        tool: None,
+                    },
+                })
+                .await
+        );
+
+        assert!(
+            store
+                .apply_event(&AgentEvent::TurnCompleted {
+                    thread,
+                    turn,
+                    usage: TokenUsage::default(),
+                    status: TurnStatus {
+                        kind: TurnStatusKind::Completed,
+                        message: None,
+                    },
+                })
+                .await
+        );
+
+        let snapshot = store.snapshot(thread).await;
+        assert_eq!(snapshot.len(), 1);
+        assert!(snapshot[0].after_turn);
+        assert!(snapshot[0].process_id.is_none());
     }
 
     #[tokio::test]
