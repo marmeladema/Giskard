@@ -14,6 +14,25 @@
 <link rel="stylesheet" href="__APP_CSS__" />
 </head>
 <body>
+  <!-- Icon sprite. Inlined rather than fetched so the UI stays a single self-contained binary. -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+    <symbol id="gi-branch" viewBox="0 0 16 16">
+      <path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+            d="M4.5 3.6v8.8M4.5 5.2c0 2.2 1.4 2.9 3.4 3.2 1.7.3 3.6.6 3.6 2.8" />
+      <circle cx="4.5" cy="2.6" r="1.5" fill="currentColor" />
+      <circle cx="4.5" cy="13.4" r="1.5" fill="currentColor" />
+      <circle cx="11.5" cy="13.4" r="1.5" fill="currentColor" />
+    </symbol>
+    <symbol id="gi-detached" viewBox="0 0 16 16">
+      <path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+            d="M6.2 9.8 9.8 6.2M6.6 4.2l1-1a2.7 2.7 0 0 1 3.8 3.8l-1 1M6.6 11.8l-1 1a2.7 2.7 0 0 1-3.8-3.8l1-1" />
+    </symbol>
+    <symbol id="gi-refresh" viewBox="0 0 16 16">
+      <path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+            d="M13.2 8a5.2 5.2 0 1 1-1.6-3.7M13.4 2.4v3.2h-3.2" />
+    </symbol>
+  </svg>
+
   <div id="login">
     <form class="card" id="loginForm">
       <h1>Giskard</h1>
@@ -126,6 +145,34 @@
           <span class="plan-card-current" id="planCardCurrent"></span>
         </button>
         <div class="plan-card-body" id="planCardBody" hidden></div>
+      </div>
+      <!-- Git status: a one-line summary of the project's working tree pinned above the composer,
+           which expands in place into the changed-file list (same disclosure shape as the plan card
+           above it). Collapsed it answers the common questions outright — branch, divergence, how
+           many files, how big — so the list stays the exception rather than the route. The row is
+           absent entirely for workspaces that aren't Git repositories. -->
+      <div class="git-line" id="gitLine" hidden>
+        <div class="git-line-head">
+          <button type="button" class="git-line-toggle" id="gitLineToggle"
+                  aria-expanded="false" aria-controls="gitLineBody">
+            <span class="git-caret" id="gitCaret" aria-hidden="true">▸</span>
+            <svg class="git-icon" id="gitIcon" viewBox="0 0 16 16" aria-hidden="true"><use href="#gi-branch" /></svg>
+            <span class="git-branch mono" id="gitBranch"></span>
+            <span class="git-sync mono" id="gitSync" hidden></span>
+            <span class="git-sep" id="gitSep" aria-hidden="true" hidden></span>
+            <span class="git-count mono" id="gitCount"></span>
+            <span class="git-diffstat mono" id="gitDiffstat" hidden></span>
+          </button>
+          <div class="git-line-actions">
+            <button type="button" class="git-act" id="gitReviewAll" hidden
+                    title="Open the whole working-tree diff">Review all</button>
+            <button type="button" class="git-act git-act-icon" id="gitRefresh"
+                    title="Refresh Git status" aria-label="Refresh Git status">
+              <svg class="git-icon" viewBox="0 0 16 16" aria-hidden="true"><use href="#gi-refresh" /></svg>
+            </button>
+          </div>
+        </div>
+        <div class="git-line-body" id="gitLineBody" hidden></div>
       </div>
       <div class="composer" id="composer" style="display:none">
         <input id="attachmentInput" type="file" multiple hidden />

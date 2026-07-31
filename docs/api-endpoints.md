@@ -11,7 +11,8 @@ WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticke
 /api/models/refresh`, `GET /api/projects/{id}/models`,
 `GET /api/tokens`, `GET /api/projects/{id}/tokens`,
 `GET /api/projects/{id}/highlight|raw|image`, `POST
-/api/projects/{id}/linkify`, `POST /api/projects/{id}/render`, `GET /api/browse`, `POST
+/api/projects/{id}/linkify`, `POST /api/projects/{id}/render`,
+`GET /api/projects/{id}/git/status`, `GET /api/projects/{id}/git/diff`, `GET /api/browse`, `POST
 /api/browse/mkdir`, `GET /api/projects/{id}/mcp`, `POST /api/projects/{id}/mcp/reload`, and `POST
 /api/projects/{id}/mcp/oauth-login`. Wire types are defined once in `giskard-proto`. See
 [§13.6](../specs/giskard-specification.md) for the message protocol.
@@ -43,3 +44,24 @@ verifies the agent actually applied the switch before persisting it, and the thr
 again with its history intact. The same verified switch works for any thread that hasn't been
 opened since the server started; threads with a live agent session stay bound to their provider
 (create a new thread to change providers there).
+
+`GET /api/projects/{id}/git/status` returns best-effort, read-only Git metadata for the project's
+effective workspace root: current branch or detached head (resolved to a short commit when Git
+reports no branch name), ahead/behind counts when Git reports them, staged/unstaged/untracked and
+conflicted counts, and the changed file list. Each file carries `staged_added`/`staged_deleted` and
+`unstaged_added`/`unstaged_deleted` line counts from `git diff --numstat`, kept apart so a file that
+is both staged and modified reports each side accurately, with `added_total`/`deleted_total`
+summing them on the response. The counts are omitted for the side with no changes and for untracked
+and binary files, and the numstat calls are skipped entirely for a clean tree. A numstat failure is
+non-fatal — the status is returned without line counts. Non-Git workspaces return
+`is_repository: false` with no `error`: git's own "not a git repository" is logged rather than
+reported, so `error` means only that the status could not be determined (git could not be run, or
+timed out).
+
+`GET /api/projects/{id}/git/diff` returns the combined staged and unstaged diff for the whole
+working tree; with `?path=...` it returns that diff for one workspace-relative path, and the
+response echoes the path back. `?side=staged` or `?side=unstaged` narrows it to the index or the
+worktree, so a path that is both staged and modified again can be diffed one side at a time; any
+other value is rejected. The path is lexical workspace-relative only: absolute paths and `..`
+escapes are rejected, so deleted files can still be diffed without allowing access outside the
+workspace.

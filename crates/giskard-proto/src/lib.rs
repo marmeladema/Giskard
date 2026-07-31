@@ -340,6 +340,60 @@ pub struct ProjectSummary {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct GitFileStatus {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    pub index_status: String,
+    pub worktree_status: String,
+    pub kind: String,
+    /// Added/deleted line counts from `git diff --numstat`, kept separate for the index and the
+    /// worktree so a file that is both staged and modified reports each side accurately instead of
+    /// showing one combined figure twice. `None` where there is no countable diff: the side that
+    /// has no changes, untracked files, and binary files (which numstat reports as `-`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_added: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_deleted: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unstaged_added: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unstaged_deleted: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GitStatusResponse {
+    pub is_repository: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    pub detached: bool,
+    pub ahead: u32,
+    pub behind: u32,
+    pub dirty: bool,
+    pub staged_count: usize,
+    pub unstaged_count: usize,
+    pub untracked_count: usize,
+    pub conflicted_count: usize,
+    /// Totals across `files`; binary and untracked files contribute nothing.
+    pub added_total: u32,
+    pub deleted_total: u32,
+    pub files: Vec<GitFileStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GitDiffResponse {
+    /// The workspace-relative path that was diffed, or `None` for the whole working tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub diff: String,
+    pub is_empty: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ListProjectsResponse {
     pub projects: Vec<ProjectSummary>,
 }

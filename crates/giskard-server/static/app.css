@@ -472,7 +472,101 @@
   .md th { background:var(--panel2); }
   .md del { opacity:.7; }
 
+  /* Git status line above the composer. It carries the same left padding as the composer so it
+     aligns to the ＋ button's edge, and it collapses to a single 27px row of chrome: the branch is
+     the only flexible item, so it gets the whole row before anything truncates. */
+  .git-line { flex:none; border-top:1px solid var(--border); background:var(--panel); }
+  .git-line[hidden] { display:none; }
+  .git-line-head { display:flex; align-items:center; gap:4px; padding:0 8px 0 12px; min-height:27px; }
+  .git-line-toggle {
+    display:flex; align-items:center; gap:8px; flex:1; min-width:0; padding:3px 6px 3px 0;
+    border:0; border-radius:6px; background:transparent; color:var(--muted);
+    font:inherit; font-size:11.5px; text-align:left; cursor:pointer;
+  }
+  .git-line-toggle:hover:not(:disabled) { color:var(--fg); }
+  .git-line-toggle:disabled { cursor:default; }
+  .git-icon { width:12px; height:12px; flex:none; }
+  .git-caret { flex:none; width:9px; font-size:9px; line-height:1; color:var(--muted); transition:transform .12s; }
+  .git-caret[hidden] { display:none; }
+  .git-line.expanded .git-caret { transform:rotate(90deg); }
+  .git-branch { min-width:0; overflow:hidden; white-space:nowrap; color:var(--fg); }
+  /* The leading path of a branch (`feature/`, `dependabot/cargo/`) is context you skip, so it is
+     dimmed — which also makes dropping it under width pressure feel like losing nothing. */
+  .git-branch-prefix { color:var(--muted); }
+  .git-branch-note { margin-left:6px; color:var(--muted); }
+  .git-sync { flex:none; display:inline-flex; gap:5px; font-variant-numeric:tabular-nums; }
+  .git-sync[hidden] { display:none; }
+  .git-ahead { color:#7ee787; }
+  .git-behind { color:#f0d98c; }
+  .git-sep { flex:none; width:1px; height:11px; background:var(--border); }
+  .git-sep[hidden] { display:none; }
+  .git-count { flex:none; font-variant-numeric:tabular-nums; }
+  .git-diffstat { flex:none; display:inline-flex; gap:5px; font-size:11px; font-variant-numeric:tabular-nums; }
+  .git-diffstat[hidden] { display:none; }
+  .git-added { color:#3fb950; }
+  .git-deleted { color:#f85149; }
+  /* A zero side of a diffstat is alignment, not information — keep the column but drop the colour
+     so a list of pure additions doesn't read as half red. Declared last so it wins on equal
+     specificity. */
+  .git-zero { color:var(--muted); }
+  .git-skeleton {
+    display:inline-block; height:9px; border-radius:3px; background:var(--panel2);
+    border:1px solid var(--border);
+  }
+  .git-line.state-clean .git-count { color:#7ee787; }
+  .git-line.state-dirty .git-count { color:#f0d98c; }
+  .git-line.state-conflicted .git-count { color:#ffb4ae; }
+  .git-line.state-conflicted .git-branch, .git-line.state-conflicted .git-icon { color:#ffb4ae; }
+  .git-line.state-error .git-icon { color:#ffb4ae; }
+  .git-line-actions { display:flex; align-items:center; gap:4px; flex:none; }
+  .git-act {
+    padding:2px 7px; border:1px solid transparent; border-radius:5px; background:transparent;
+    color:var(--muted); font-size:11px; line-height:1.5;
+  }
+  .git-act:hover { border-color:var(--border); background:var(--panel2); color:var(--fg); }
+  .git-act[hidden] { display:none; }
+  .git-act-icon { display:inline-flex; align-items:center; padding:3px 5px; }
+
+  .git-line-body {
+    max-height:min(40vh, 320px); overflow-y:auto; padding:2px 12px 8px;
+    border-top:1px solid var(--border);
+    scrollbar-width:thin; scrollbar-color:var(--scroll-thumb) var(--scroll-track);
+  }
+  .git-line-body[hidden] { display:none; }
+  .git-section-title {
+    display:flex; align-items:center; gap:6px; margin:9px 0 3px;
+    color:var(--muted); font-size:10px; font-weight:600; letter-spacing:.07em; text-transform:uppercase;
+  }
+  .git-section-title:first-child { margin-top:7px; }
+  .git-section-title .git-section-rule { flex:1; height:1px; background:var(--border); }
+  .git-file {
+    display:grid; grid-template-columns:12px minmax(0,1fr) auto; gap:8px; align-items:center;
+    width:100%; padding:3px 6px; border:0; border-radius:6px; background:transparent;
+    color:var(--fg); font:inherit; font-size:11.5px; text-align:left; cursor:pointer;
+  }
+  .git-file:hover, .git-file:focus-visible { background:var(--panel2); }
+  .git-file[disabled] { cursor:default; opacity:.75; }
+  .git-file[disabled]:hover { background:transparent; }
+  .git-file-status { font-family:var(--mono); font-weight:600; text-align:center; }
+  .git-file-status.status-modified { color:#d29922; }
+  .git-file-status.status-added { color:#3fb950; }
+  .git-file-status.status-deleted { color:#f85149; }
+  /* Renames and copies read as moves rather than edits, so they take the accent instead of one of
+     the add/modify/delete colours. Without a rule of their own they inherited full-strength
+     foreground and outweighed every other letter in the column. */
+  .git-file-status.status-renamed,
+  .git-file-status.status-copied,
+  .git-file-status.status-typechange { color:#79c0ff; }
+  .git-file-status.status-unmerged { color:#ff9d96; }
+  .git-file-status.status-untracked { color:var(--muted); }
+  .git-file-path { min-width:0; font-family:var(--mono); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .git-file-dir { color:var(--muted); }
+  .git-file-name { color:var(--fg); }
+  .git-file-stat { flex:none; display:inline-flex; gap:5px; color:var(--muted); font-family:var(--mono); font-size:10.5px; font-variant-numeric:tabular-nums; }
+  .git-empty { padding:8px 6px; color:var(--muted); font-size:12px; }
+
   .composer { display:flex; gap:8px; padding:12px; border-top:1px solid var(--border); background:var(--panel); }
+  .git-line:not([hidden]) + .composer { border-top:0; padding-top:8px; }
   .composer.drag-over { outline:2px solid var(--accent); outline-offset:-4px; background:var(--panel2); }
   .composer #attachBtn {
     width:40px; min-width:40px; height:40px;
@@ -845,6 +939,12 @@
        on phones — the full breakdown is one tap away in the Context card — so the row packs. */
     header.thr #gauge { display:none; }
 
+    /* The Git line sheds its widest segments before it starts eating into the branch name: the
+       total diffstat first, then the ahead/behind counts. Both are still in the expanded list. */
+    .git-line .git-diffstat { display:none; }
+    .git-line-head { padding-left:10px; }
+    .git-line-body { padding-left:10px; padding-right:10px; }
+
     /* Header menus anchor to their button (right-aligned). Tasks/MCP sit near the left edge, so on
        phones their wide popovers spilled off the left of the screen. Pin all three below the header
        spanning the viewport width, so they open fully on-screen regardless of which button. */
@@ -891,4 +991,12 @@
     /* Full-screen dialog on phones. */
     .dialog { width:100%; max-width:100%; height:100vh; height:100dvh; max-height:none; border-radius:0; }
     #notices { left:8px; right:8px; bottom:8px; width:auto; }
+  }
+
+  /* Last segment to go before the branch itself starts shrinking. The threshold matches
+     `gitBranchBudget` in app.js, which tightens the branch to its narrowest budget below the same
+     width — set them together, or the branch starts losing characters while this is still shown.
+     The counts stay: "is it dirty" is the question the line exists to answer. */
+  @media (max-width:480px) {
+    .git-line .git-sync, .git-line .git-sep { display:none; }
   }

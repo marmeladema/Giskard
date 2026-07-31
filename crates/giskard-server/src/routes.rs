@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -29,6 +30,7 @@ use giskard_core::user_input::UserInput;
 use giskard_persist::Config;
 use giskard_persist::store::{ProjectConfig, ThreadFile};
 use giskard_proto::*;
+use tokio::process::Command as TokioCommand;
 use tokio::sync::mpsc;
 
 use crate::AppState;
@@ -52,6 +54,7 @@ const MAX_ATTACHMENT_HTTP_BODY_BYTES: usize = 40 * 1024 * 1024;
 const MAX_WS_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ATTACHMENT_NAME_BYTES: usize = 255;
 const MAX_ATTACHMENT_MIME_BYTES: usize = 127;
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub fn protected_routes(state: AppState) -> Router<AppState> {
     Router::new()
@@ -88,6 +91,8 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
         .route("/api/projects/{id}/highlight", get(highlight_file))
         .route("/api/projects/{id}/raw", get(download_file))
         .route("/api/projects/{id}/image", get(image_file))
+        .route("/api/projects/{id}/git/status", get(git_status))
+        .route("/api/projects/{id}/git/diff", get(git_diff))
         .route("/api/projects/{id}/linkify", post(linkify))
         .route("/api/projects/{id}/render", post(render_markdown))
         .route("/api/browse", get(browse))
@@ -1808,6 +1813,276 @@ mod tests {
     }
 
     #[test]
+    fn parses_git_status_porcelain_z_records() {
+        let status = parse_git_status(
+            b"## main...origin/main [ahead 2, behind 1]\0 M src/lib.rs\0A  src/new.rs\0?? notes.txt\0",
+        );
+
+        assert!(status.is_repository);
+        assert_eq!(status.branch.as_deref(), Some("main"));
+        assert_eq!(status.ahead, 2);
+        assert_eq!(status.behind, 1);
+        assert!(status.dirty);
+        assert_eq!(status.staged_count, 1);
+        assert_eq!(status.unstaged_count, 1);
+        assert_eq!(status.untracked_count, 1);
+        assert_eq!(status.files[0].path, "src/lib.rs");
+        assert_eq!(status.files[0].index_status, "unmodified");
+        assert_eq!(status.files[0].worktree_status, "modified");
+        assert_eq!(status.files[1].kind, "added");
+        assert_eq!(status.files[2].kind, "untracked");
+    }
+
+    #[test]
+    fn parses_git_status_rename_and_detached_head() {
+        let status =
+            parse_git_status(b"## HEAD (detached at abc1234)\0R  new name.txt\0old name.txt\0");
+
+        assert!(status.detached);
+        assert_eq!(status.head.as_deref(), Some("abc1234"));
+        assert_eq!(status.files.len(), 1);
+        assert_eq!(status.files[0].kind, "renamed");
+        assert_eq!(status.files[0].path, "new name.txt");
+        assert_eq!(status.files[0].old_path.as_deref(), Some("old name.txt"));
+    }
+
+    /// The header form that leaves `head` unset, which is what makes `git_status_for_workspace`
+    /// resolve the short commit separately.
+    #[test]
+    fn detached_head_without_a_revision_leaves_head_unset() {
+        let status = parse_git_status(b"## HEAD (no branch)\0 M src/lib.rs\0");
+
+        assert!(status.detached);
+        assert_eq!(status.head, None);
+        assert_eq!(status.branch, None);
+        assert_eq!(status.files[0].path, "src/lib.rs");
+    }
+
+    /// A file swapped for a symlink is neither an add nor an edit; without a name of its own it
+    /// reached the client as an unknown status.
+    #[test]
+    fn names_the_typechange_status() {
+        let status = parse_git_status(b"## main\0T  swapped.txt\0 T other.txt\0");
+
+        assert_eq!(status.files[0].kind, "typechange");
+        assert_eq!(status.files[0].index_status, "typechange");
+        assert_eq!(status.files[1].kind, "typechange");
+        assert_eq!(status.files[1].worktree_status, "typechange");
+    }
+
+    #[test]
+    fn counts_unmerged_paths_separately_from_staged_and_unstaged() {
+        let status = parse_git_status(b"## main\0UU src/conflict.rs\0M  src/staged.rs\0");
+
+        assert_eq!(status.conflicted_count, 1);
+        assert_eq!(status.staged_count, 1);
+        assert_eq!(status.unstaged_count, 0);
+        assert_eq!(status.files[0].kind, "unmerged");
+    }
+
+    #[test]
+    fn treats_every_unmerged_porcelain_pair_as_a_conflict() {
+        // `AA` and `DD` carry no `U`, so they only read as conflicts if matched as pairs.
+        let status =
+            parse_git_status(b"## main\0AA both-added.txt\0DD both-deleted.txt\0AU ours.txt\0");
+
+        assert_eq!(status.conflicted_count, 3);
+        assert_eq!(status.staged_count, 0);
+        assert_eq!(status.unstaged_count, 0);
+        for file in &status.files {
+            assert_eq!(file.kind, "unmerged", "{} misclassified", file.path);
+        }
+    }
+
+    #[test]
+    fn keeps_plain_adds_and_deletes_out_of_the_conflict_bucket() {
+        let status = parse_git_status(b"## main\0A  added.txt\0 D deleted.txt\0AM mixed.txt\0");
+
+        assert_eq!(status.conflicted_count, 0);
+        assert_eq!(status.files[0].kind, "added");
+        assert_eq!(status.files[1].kind, "deleted");
+        assert_eq!(status.files[2].kind, "added");
+    }
+
+    #[test]
+    fn parses_numstat_records_including_renames_and_binaries() {
+        // NULs are written as `\x00`: a `\0` sitting directly before a digit reads as an octal
+        // escape, which Rust does not support.
+        let entries = parse_git_numstat(
+            b"12\t3\tsrc/lib.rs\x00-\t-\tlogo.png\x004\t0\t\x00old.rs\x00new.rs\x00",
+        );
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].path, "src/lib.rs");
+        assert_eq!(entries[0].added, Some(12));
+        assert_eq!(entries[0].deleted, Some(3));
+        assert_eq!(entries[1].path, "logo.png");
+        assert_eq!(entries[1].added, None);
+        assert_eq!(entries[1].deleted, None);
+        // A rename reports the counts once, then the old and new paths; the new path is the one
+        // `git status` uses for the same entry.
+        assert_eq!(entries[2].path, "new.rs");
+        assert_eq!(entries[2].added, Some(4));
+    }
+
+    /// A workspace that isn't a repository is an expected answer, not a failure: `error` stays
+    /// empty so clients don't report git's "fatal: not a git repository" as a broken status.
+    #[tokio::test]
+    async fn non_repository_workspace_reports_no_error() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+
+        let status = git_status_for_workspace(workspace.path()).await;
+
+        assert!(!status.is_repository);
+        assert_eq!(status.error, None);
+        assert!(!status.dirty);
+        assert!(status.files.is_empty());
+    }
+
+    /// A repository git refuses to read is degraded, not absent: the reason has to reach the client
+    /// so it can say something rather than silently showing nothing.
+    #[test]
+    fn unreadable_repository_is_reported_as_an_error() {
+        let workspace = Path::new("/tmp/example");
+
+        let absent = git_status_failure(
+            workspace,
+            "fatal: not a git repository (or any of the parent directories): .git",
+        );
+        let unreadable = git_status_failure(
+            workspace,
+            "fatal: detected dubious ownership in repository at '/tmp/example'",
+        );
+
+        assert_eq!(absent.error, None);
+        assert_eq!(
+            unreadable.error.as_deref(),
+            Some("fatal: detected dubious ownership in repository at '/tmp/example'")
+        );
+        assert!(!absent.is_repository && !unreadable.is_repository);
+    }
+
+    /// git diffs an unmerged path against each merge stage, so numstat emits several records for
+    /// the same path. Reporting any one of them would put a number on the row that nobody wrote.
+    #[test]
+    fn conflicted_files_carry_no_line_counts() {
+        let mut status = parse_git_status(b"## main\0UU c.txt\0M  clean.txt\0");
+        let counts = numstat_map([("c.txt", Some(8), Some(0)), ("clean.txt", Some(3), Some(1))]);
+
+        apply_numstat_counts(&mut status, &counts, &HashMap::new());
+
+        let conflicted = &status.files[0];
+        assert_eq!(conflicted.kind, "unmerged");
+        assert_eq!(conflicted.staged_added, None);
+        assert_eq!(conflicted.unstaged_added, None);
+        assert_eq!(status.files[1].staged_added, Some(3));
+        // Totals cover the real change only, not the conflict's per-stage artifact.
+        assert_eq!(status.added_total, 3);
+        assert_eq!(status.deleted_total, 1);
+    }
+
+    /// The point of keeping the two numstats apart: a path staged and then modified again is two
+    /// changes, and each side has to report its own count rather than one combined figure twice.
+    #[test]
+    fn keeps_index_and_worktree_line_counts_apart() {
+        let mut status = parse_git_status(b"## main\0MM both.txt\0");
+        let staged = numstat_map([("both.txt", Some(2), Some(0))]);
+        let unstaged = numstat_map([("both.txt", Some(3), Some(1))]);
+
+        apply_numstat_counts(&mut status, &staged, &unstaged);
+
+        let file = &status.files[0];
+        assert_eq!(file.staged_added, Some(2));
+        assert_eq!(file.staged_deleted, Some(0));
+        assert_eq!(file.unstaged_added, Some(3));
+        assert_eq!(file.unstaged_deleted, Some(1));
+        // The totals still cover the whole working tree, so both sides count once.
+        assert_eq!(status.added_total, 5);
+        assert_eq!(status.deleted_total, 1);
+    }
+
+    /// A binary file reports `-` on the side that changed; the other side is simply absent. Neither
+    /// may be reported as zero, which would claim the file has no changed lines.
+    #[test]
+    fn binary_files_report_no_line_counts() {
+        let mut status = parse_git_status(b"## main\0M  logo.png\0");
+        let staged = numstat_map([("logo.png", None, None)]);
+
+        apply_numstat_counts(&mut status, &staged, &HashMap::new());
+
+        assert_eq!(status.files[0].staged_added, None);
+        assert_eq!(status.files[0].staged_deleted, None);
+        assert_eq!(status.added_total, 0);
+    }
+
+    #[test]
+    fn parses_the_diff_side_selector() {
+        assert!(matches!(GitDiffSide::parse(None), Ok(GitDiffSide::Both)));
+        assert!(matches!(
+            GitDiffSide::parse(Some("")),
+            Ok(GitDiffSide::Both)
+        ));
+        assert!(matches!(
+            GitDiffSide::parse(Some("staged")),
+            Ok(GitDiffSide::Staged)
+        ));
+        assert!(matches!(
+            GitDiffSide::parse(Some("unstaged")),
+            Ok(GitDiffSide::Unstaged)
+        ));
+        // An unrecognized side is a client bug, not a silent fallback to the combined diff.
+        assert!(GitDiffSide::parse(Some("cached")).is_err());
+
+        assert!(GitDiffSide::Staged.includes_staged() && !GitDiffSide::Staged.includes_unstaged());
+        assert!(
+            GitDiffSide::Unstaged.includes_unstaged() && !GitDiffSide::Unstaged.includes_staged()
+        );
+        assert!(GitDiffSide::Both.includes_staged() && GitDiffSide::Both.includes_unstaged());
+    }
+
+    fn numstat_map<const N: usize>(
+        entries: [(&str, Option<u32>, Option<u32>); N],
+    ) -> HashMap<String, GitNumstatEntry> {
+        entries
+            .into_iter()
+            .map(|(path, added, deleted)| {
+                (
+                    path.to_string(),
+                    GitNumstatEntry {
+                        path: path.to_string(),
+                        added,
+                        deleted,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parses_the_unborn_branch_header() {
+        let status = parse_git_status(b"## No commits yet on main\0?? first.txt\0");
+
+        assert_eq!(status.branch.as_deref(), Some("main"));
+        assert!(!status.detached);
+        assert_eq!(status.untracked_count, 1);
+    }
+
+    #[test]
+    fn git_diff_path_rejects_workspace_escape() {
+        assert_eq!(
+            safe_git_relative_path("src/lib.rs").as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            safe_git_relative_path("./src/lib.rs").as_deref(),
+            Some("src/lib.rs")
+        );
+        assert!(safe_git_relative_path("../secrets").is_none());
+        assert!(safe_git_relative_path("/tmp/file").is_none());
+        assert!(safe_git_relative_path("").is_none());
+    }
+
+    #[test]
     fn thread_title_uses_first_meaningful_prompt_line() {
         let title = thread_title_from_first_prompt(
             r#"
@@ -2279,6 +2554,647 @@ fn resolve_confined_path(workspace_root: &Path, requested: &str) -> Option<PathB
     } else {
         None
     }
+}
+
+async fn git_status(
+    State(state): State<AppState>,
+    AxumPath(project_id): AxumPath<ProjectId>,
+) -> Result<Json<GitStatusResponse>, ApiError> {
+    let project = state
+        .store
+        .load_project(project_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let workspace_root = PathBuf::from(project.workspace_root.as_deref().unwrap_or(&project.dir));
+    Ok(Json(git_status_for_workspace(&workspace_root).await))
+}
+
+#[derive(Deserialize)]
+struct GitDiffQuery {
+    /// Omitted for the whole working tree; present to diff a single workspace-relative path.
+    path: Option<String>,
+    /// Which side to diff: `staged` (index against HEAD) or `unstaged` (worktree against index).
+    /// Omitted for both concatenated, which is what the whole-working-tree review uses.
+    ///
+    /// A path staged and then modified again is genuinely two diffs, and the UI lists it once per
+    /// side; without this the row would open a combined diff that does not match the row's own
+    /// line counts.
+    side: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum GitDiffSide {
+    Staged,
+    Unstaged,
+    Both,
+}
+
+impl GitDiffSide {
+    fn parse(raw: Option<&str>) -> Result<Self, ApiError> {
+        match raw.map(str::trim).filter(|side| !side.is_empty()) {
+            None => Ok(Self::Both),
+            Some("staged") => Ok(Self::Staged),
+            Some("unstaged") => Ok(Self::Unstaged),
+            Some(other) => Err(ApiError::BadRequest(format!(
+                "unknown diff side {other:?}; expected \"staged\" or \"unstaged\""
+            ))),
+        }
+    }
+
+    fn includes_staged(self) -> bool {
+        matches!(self, Self::Staged | Self::Both)
+    }
+
+    fn includes_unstaged(self) -> bool {
+        matches!(self, Self::Unstaged | Self::Both)
+    }
+}
+
+async fn git_diff(
+    State(state): State<AppState>,
+    AxumPath(project_id): AxumPath<ProjectId>,
+    Query(q): Query<GitDiffQuery>,
+) -> Result<Json<GitDiffResponse>, ApiError> {
+    let project = state
+        .store
+        .load_project(project_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let workspace_root = PathBuf::from(project.workspace_root.as_deref().unwrap_or(&project.dir));
+    let relative_path = match q.path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        Some(requested) => Some(
+            safe_git_relative_path(requested)
+                .ok_or_else(|| ApiError::Forbidden("path escapes workspace root".into()))?,
+        ),
+        None => None,
+    };
+    let side = GitDiffSide::parse(q.side.as_deref())?;
+    // With a path we pass it as an explicit pathspec after `--`; without one we diff the whole
+    // working tree, so there is no pathspec and no `--` separator to add.
+    let pathspec: &[&str] = match relative_path.as_deref() {
+        Some(path) => &[path],
+        None => &[],
+    };
+
+    let staged_args: &[&str] = if relative_path.is_some() {
+        &["diff", "--cached", "--no-ext-diff", "--"]
+    } else {
+        &["diff", "--cached", "--no-ext-diff"]
+    };
+    let unstaged_args: &[&str] = if relative_path.is_some() {
+        &["diff", "--no-ext-diff", "--"]
+    } else {
+        &["diff", "--no-ext-diff"]
+    };
+    // The two sides are independent and each carries the full git timeout, so the combined diff
+    // runs them together rather than paying both in series on a large repository.
+    let (staged, unstaged) = tokio::join!(
+        async {
+            match side.includes_staged() {
+                true => Some(run_git(&workspace_root, staged_args, pathspec).await),
+                false => None,
+            }
+        },
+        async {
+            match side.includes_unstaged() {
+                true => Some(run_git(&workspace_root, unstaged_args, pathspec).await),
+                false => None,
+            }
+        },
+    );
+
+    // Staged first, so the combined diff reads index-then-worktree in the order git applies them.
+    let mut outputs = Vec::new();
+    for output in [staged, unstaged].into_iter().flatten() {
+        outputs.push(output?);
+    }
+
+    if outputs.iter().any(|output| !output.status.success()) {
+        let borrowed: Vec<&std::process::Output> = outputs.iter().collect();
+        let stderr = first_non_empty_stderr(&borrowed).unwrap_or_else(|| "git diff failed".into());
+        warn!(
+            %project_id,
+            workspace = %workspace_root.display(),
+            action = "git_diff",
+            path = relative_path.as_deref().unwrap_or("<working tree>"),
+            stderr = %stderr,
+            "git diff failed"
+        );
+        return Err(ApiError::BadRequest(stderr));
+    }
+
+    let mut diff = String::new();
+    for output in &outputs {
+        let text = String::from_utf8_lossy(&output.stdout);
+        if text.trim().is_empty() {
+            continue;
+        }
+        diff.push_str(&text);
+        if !diff.ends_with('\n') {
+            diff.push('\n');
+        }
+    }
+    let is_empty = diff.trim().is_empty();
+    Ok(Json(GitDiffResponse {
+        path: relative_path,
+        diff,
+        is_empty,
+    }))
+}
+
+/// Merge `git diff --numstat` line counts (index and worktree) into an already-parsed status.
+///
+/// Numstat failures are non-fatal: the status is still useful without line counts, so a failed or
+/// timed-out call just leaves every `added`/`deleted` as `None` and the totals at zero.
+async fn apply_git_numstat(workspace_root: &Path, status: &mut GitStatusResponse) {
+    // The index and worktree numstats are independent, and each carries the full git timeout, so
+    // they run concurrently rather than making a large repository pay both in series.
+    let (staged, unstaged) = tokio::join!(
+        run_git_numstat(
+            workspace_root,
+            &["diff", "--cached", "--numstat", "--no-ext-diff", "-z"]
+        ),
+        run_git_numstat(
+            workspace_root,
+            &["diff", "--numstat", "--no-ext-diff", "-z"]
+        ),
+    );
+    apply_numstat_counts(status, &index_numstat(staged), &index_numstat(unstaged));
+}
+
+fn index_numstat(entries: Vec<GitNumstatEntry>) -> HashMap<String, GitNumstatEntry> {
+    entries
+        .into_iter()
+        .map(|entry| (entry.path.clone(), entry))
+        .collect()
+}
+
+fn apply_numstat_counts(
+    status: &mut GitStatusResponse,
+    staged: &HashMap<String, GitNumstatEntry>,
+    unstaged: &HashMap<String, GitNumstatEntry>,
+) {
+    let mut added_total = 0u32;
+    let mut deleted_total = 0u32;
+    for file in &mut status.files {
+        // An unmerged path has no single line count to report: git diffs it against each merge
+        // stage, so numstat emits one record per stage for the same path and any one of them is an
+        // artifact of the conflict rather than a change someone made. Such a file keeps `None` on
+        // both sides and contributes nothing to the totals — the UI shows the conflict itself.
+        if file.kind == "unmerged" {
+            continue;
+        }
+        if let Some(entry) = staged.get(&file.path) {
+            file.staged_added = entry.added;
+            file.staged_deleted = entry.deleted;
+        }
+        if let Some(entry) = unstaged.get(&file.path) {
+            file.unstaged_added = entry.added;
+            file.unstaged_deleted = entry.deleted;
+        }
+        // Binary files contribute nothing to the totals: numstat reports `-` for them, so there is
+        // no line count to add.
+        for value in [file.staged_added, file.unstaged_added] {
+            added_total = added_total.saturating_add(value.unwrap_or(0));
+        }
+        for value in [file.staged_deleted, file.unstaged_deleted] {
+            deleted_total = deleted_total.saturating_add(value.unwrap_or(0));
+        }
+    }
+    status.added_total = added_total;
+    status.deleted_total = deleted_total;
+}
+
+/// Run one `git diff --numstat` and parse it, treating any failure as "no counts available": the
+/// status is still worth returning without line counts.
+async fn run_git_numstat(workspace_root: &Path, args: &[&str]) -> Vec<GitNumstatEntry> {
+    match run_git(workspace_root, args, &[]).await {
+        Ok(output) if output.status.success() => parse_git_numstat(&output.stdout),
+        Ok(output) => {
+            warn!(
+                workspace = %workspace_root.display(),
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "git numstat failed; line counts omitted"
+            );
+            Vec::new()
+        }
+        Err(error) => {
+            warn!(
+                workspace = %workspace_root.display(),
+                %error,
+                "could not run git numstat; line counts omitted"
+            );
+            Vec::new()
+        }
+    }
+}
+
+struct GitNumstatEntry {
+    path: String,
+    added: Option<u32>,
+    deleted: Option<u32>,
+}
+
+/// Parse `git diff --numstat -z` output.
+///
+/// Records are NUL-separated. A plain entry is `added\tdeleted\tpath`; a rename or copy emits the
+/// counts with an empty path field and follows them with two more records, the old path then the
+/// new one. Binary files report `-` for both counts.
+fn parse_git_numstat(output: &[u8]) -> Vec<GitNumstatEntry> {
+    let mut entries = Vec::new();
+    let mut records = output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty());
+    while let Some(record) = records.next() {
+        let text = String::from_utf8_lossy(record);
+        let mut fields = text.splitn(3, '\t');
+        let (Some(added), Some(deleted), Some(rest)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let path = if rest.is_empty() {
+            // Rename or copy: the old path is emitted first, then the new one, which is the path
+            // `git status` reports for the entry.
+            let _old_path = records.next();
+            match records.next() {
+                Some(new_path) => String::from_utf8_lossy(new_path).to_string(),
+                None => continue,
+            }
+        } else {
+            rest.to_string()
+        };
+        entries.push(GitNumstatEntry {
+            path,
+            added: parse_numstat_count(added),
+            deleted: parse_numstat_count(deleted),
+        });
+    }
+    entries
+}
+
+fn parse_numstat_count(field: &str) -> Option<u32> {
+    if field == "-" {
+        return None;
+    }
+    field.parse().ok()
+}
+
+async fn git_status_for_workspace(workspace_root: &Path) -> GitStatusResponse {
+    let status = match run_git(
+        workspace_root,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "-b",
+            "--untracked-files=all",
+            "--",
+        ],
+        &["."],
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            warn!(
+                workspace = %workspace_root.display(),
+                %error,
+                "could not run git status for workspace"
+            );
+            return git_status_unavailable(Some(error.to_string()));
+        }
+    };
+
+    if !status.status.success() {
+        let message = String::from_utf8_lossy(&status.stderr).trim().to_string();
+        return git_status_failure(workspace_root, &message);
+    }
+
+    let mut parsed = parse_git_status(&status.stdout);
+    // `git status -b` reports a detached HEAD as `## HEAD (no branch)` with no revision, so the
+    // commit has to be asked for separately — without it the UI has nothing to name the state by.
+    if parsed.detached && parsed.head.is_none() {
+        parsed.head = git_short_head(workspace_root).await;
+    }
+    if parsed.dirty {
+        apply_git_numstat(workspace_root, &mut parsed).await;
+    }
+    parsed
+}
+
+async fn git_short_head(workspace_root: &Path) -> Option<String> {
+    let output = match run_git(workspace_root, &["rev-parse", "--short", "HEAD"], &[]).await {
+        Ok(output) => output,
+        Err(error) => {
+            warn!(
+                workspace = %workspace_root.display(),
+                action = "git_short_head",
+                %error,
+                "could not run git rev-parse; detached head reported without a revision"
+            );
+            return None;
+        }
+    };
+    if !output.status.success() {
+        debug!(
+            workspace = %workspace_root.display(),
+            action = "git_short_head",
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "git rev-parse could not resolve HEAD; detached head reported without a revision"
+        );
+        return None;
+    }
+    let head = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!head.is_empty()).then_some(head)
+}
+
+/// Classify a non-zero `git status` exit.
+///
+/// A workspace that simply isn't a repository is the expected case and reports
+/// `is_repository: false` with no `error` — git's own "not a git repository" would otherwise be
+/// surfaced by clients as a failure for every non-Git project. Anything else means the workspace
+/// may well be a repository that git refused to read (dubious ownership, a locked or corrupt index,
+/// an unreadable `.git`), which is degraded rather than absent: it is logged at `warn` and the
+/// reason is passed to the client so it can say so instead of silently showing nothing.
+///
+/// `run_git` pins `LC_ALL=C`, so the message being matched is not localized.
+fn git_status_failure(workspace_root: &Path, stderr: &str) -> GitStatusResponse {
+    if stderr.contains("not a git repository") {
+        debug!(
+            workspace = %workspace_root.display(),
+            action = "git_status",
+            stderr = %stderr,
+            "workspace is not a git repository"
+        );
+        return git_status_unavailable(None);
+    }
+    warn!(
+        workspace = %workspace_root.display(),
+        action = "git_status",
+        stderr = %stderr,
+        "git status failed for workspace"
+    );
+    git_status_unavailable(Some(if stderr.is_empty() {
+        "git status failed".into()
+    } else {
+        stderr.to_string()
+    }))
+}
+
+fn git_status_unavailable(error: Option<String>) -> GitStatusResponse {
+    GitStatusResponse {
+        is_repository: false,
+        branch: None,
+        head: None,
+        detached: false,
+        ahead: 0,
+        behind: 0,
+        dirty: false,
+        staged_count: 0,
+        unstaged_count: 0,
+        untracked_count: 0,
+        conflicted_count: 0,
+        added_total: 0,
+        deleted_total: 0,
+        files: Vec::new(),
+        error,
+    }
+}
+
+async fn run_git(
+    workspace_root: &Path,
+    args: &[&str],
+    paths: &[&str],
+) -> Result<std::process::Output, ApiError> {
+    let mut cmd = TokioCommand::new("git");
+    cmd.current_dir(workspace_root)
+        .args(args)
+        .args(paths)
+        // Tokio leaves a child running when the future that owns it is dropped, so without this a
+        // timed-out git would outlive its request and accumulate across polls.
+        .kill_on_drop(true)
+        // Porcelain output is locale-independent, but the `fatal:` messages are not, and
+        // `git_status_failure` has to tell "not a repository" apart from a repository it could not
+        // read.
+        .env("LC_ALL", "C")
+        // Status can refresh the on-disk index, which takes the index lock. These calls are polls
+        // against a workspace an agent may be working in, so they stay strictly read-only.
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    tokio::time::timeout(GIT_COMMAND_TIMEOUT, cmd.output())
+        .await
+        .map_err(|_| ApiError::Unavailable("git command timed out".into()))?
+        .map_err(|e| ApiError::Unavailable(format!("failed to run git: {e}")))
+}
+
+fn first_non_empty_stderr(outputs: &[&std::process::Output]) -> Option<String> {
+    outputs.iter().find_map(|output| {
+        let text = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if text.is_empty() { None } else { Some(text) }
+    })
+}
+
+fn safe_git_relative_path(path: &str) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || Path::new(trimmed).is_absolute() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for component in Path::new(trimmed).components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_string_lossy().to_string()),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+fn parse_git_status(output: &[u8]) -> GitStatusResponse {
+    let mut branch = None;
+    let mut head = None;
+    let mut detached = false;
+    let mut ahead = 0;
+    let mut behind = 0;
+    let mut files = Vec::new();
+    let mut records = output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty());
+    while let Some(record) = records.next() {
+        if let Some(raw) = record.strip_prefix(b"## ") {
+            let header = String::from_utf8_lossy(raw);
+            let parsed = parse_git_status_header(&header);
+            branch = parsed.branch;
+            head = parsed.head;
+            detached = parsed.detached;
+            ahead = parsed.ahead;
+            behind = parsed.behind;
+            continue;
+        }
+        if record.len() < 4 {
+            continue;
+        }
+        let index = record[0] as char;
+        let worktree = record[1] as char;
+        let path = String::from_utf8_lossy(&record[3..]).to_string();
+        let old_path = if matches!(index, 'R' | 'C') || matches!(worktree, 'R' | 'C') {
+            records
+                .next()
+                .map(|old| String::from_utf8_lossy(old).to_string())
+        } else {
+            None
+        };
+        files.push(GitFileStatus {
+            kind: git_file_kind(index, worktree).into(),
+            path,
+            old_path,
+            index_status: git_status_name(index).into(),
+            worktree_status: git_status_name(worktree).into(),
+            staged_added: None,
+            staged_deleted: None,
+            unstaged_added: None,
+            unstaged_deleted: None,
+        });
+    }
+
+    // Conflicted paths are counted on their own and excluded from the staged/unstaged tallies: an
+    // unmerged entry is not a change you staged, and the UI lists it in its own section.
+    let conflicted_count = files.iter().filter(|file| file.kind == "unmerged").count();
+    let staged_count = files
+        .iter()
+        .filter(|file| {
+            file.kind != "unmerged"
+                && file.index_status != "unmodified"
+                && file.index_status != "untracked"
+        })
+        .count();
+    let unstaged_count = files
+        .iter()
+        .filter(|file| {
+            file.kind != "unmerged"
+                && file.worktree_status != "unmodified"
+                && file.worktree_status != "untracked"
+        })
+        .count();
+    let untracked_count = files.iter().filter(|file| file.kind == "untracked").count();
+    GitStatusResponse {
+        is_repository: true,
+        branch,
+        head,
+        detached,
+        ahead,
+        behind,
+        dirty: !files.is_empty(),
+        staged_count,
+        unstaged_count,
+        untracked_count,
+        conflicted_count,
+        added_total: 0,
+        deleted_total: 0,
+        files,
+        error: None,
+    }
+}
+
+#[derive(Default)]
+struct ParsedGitHeader {
+    branch: Option<String>,
+    head: Option<String>,
+    detached: bool,
+    ahead: u32,
+    behind: u32,
+}
+
+fn parse_git_status_header(header: &str) -> ParsedGitHeader {
+    let mut parsed = ParsedGitHeader::default();
+    let (name_part, tracking_part) = header
+        .split_once(" [")
+        .map(|(name, rest)| (name, Some(rest.trim_end_matches(']'))))
+        .unwrap_or((header, None));
+    let local = name_part.split("...").next().unwrap_or(name_part).trim();
+    // A repository with no commits reports `## No commits yet on <branch>`. The branch is real and
+    // checked out — it just has nothing on it yet — so only the prefix is dropped.
+    let local = local.strip_prefix("No commits yet on ").unwrap_or(local);
+    if local.starts_with("HEAD (no branch)") {
+        parsed.detached = true;
+    } else if let Some(detached_head) = local
+        .strip_prefix("HEAD (detached at ")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        parsed.detached = true;
+        parsed.head = Some(detached_head.into());
+    } else if let Some(detached_head) = local
+        .strip_prefix("HEAD (detached from ")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        parsed.detached = true;
+        parsed.head = Some(detached_head.into());
+    } else if !local.is_empty() {
+        parsed.branch = Some(local.into());
+    }
+    if let Some(tracking) = tracking_part {
+        for part in tracking.split(',').map(str::trim) {
+            if let Some(value) = part.strip_prefix("ahead ") {
+                parsed.ahead = value.parse().unwrap_or(0);
+            } else if let Some(value) = part.strip_prefix("behind ") {
+                parsed.behind = value.parse().unwrap_or(0);
+            }
+        }
+    }
+    parsed
+}
+
+fn git_status_name(status: char) -> &'static str {
+    match status {
+        ' ' => "unmodified",
+        'M' => "modified",
+        'A' => "added",
+        'D' => "deleted",
+        'R' => "renamed",
+        'C' => "copied",
+        // Git reports `T` when the entry's type changes — a file replaced by a symlink, say. It is
+        // neither an add nor a plain edit, and without a name of its own it reached the UI as an
+        // unknown status.
+        'T' => "typechange",
+        'U' => "unmerged",
+        '?' => "untracked",
+        '!' => "ignored",
+        _ => "unknown",
+    }
+}
+
+fn git_file_kind(index: char, worktree: char) -> &'static str {
+    if index == '?' && worktree == '?' {
+        "untracked"
+    } else if is_unmerged_pair(index, worktree) {
+        "unmerged"
+    } else if matches!(index, 'R' | 'C' | 'T') {
+        git_status_name(index)
+    } else if matches!(worktree, 'R' | 'C' | 'T') {
+        git_status_name(worktree)
+    } else if index == 'D' || worktree == 'D' {
+        "deleted"
+    } else if index == 'A' || worktree == 'A' {
+        "added"
+    } else {
+        "modified"
+    }
+}
+
+/// Git's unmerged porcelain states: `DD`, `AU`, `UD`, `UA`, `DU`, `AA`, `UU`.
+///
+/// The both-added and both-deleted pairs carry no `U` at all, so they have to be matched as pairs —
+/// and this has to run before the plain add/delete checks, or an add/add conflict reads as a
+/// staged add.
+fn is_unmerged_pair(index: char, worktree: char) -> bool {
+    index == 'U'
+        || worktree == 'U'
+        || (index == 'A' && worktree == 'A')
+        || (index == 'D' && worktree == 'D')
 }
 
 async fn list_models(State(state): State<AppState>) -> Result<Json<ListModelsResponse>, ApiError> {
