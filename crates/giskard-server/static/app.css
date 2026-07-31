@@ -486,6 +486,10 @@
   .git-line-toggle:hover:not(:disabled) { color:var(--fg); }
   .git-line-toggle:disabled { cursor:default; }
   .git-icon { width:12px; height:12px; flex:none; }
+  /* The branch glyph takes the appearance theme's accent, so it tracks whatever the theme sets
+     (blue in IDE and Bubbles, green in Terminal) instead of being another grey mark in the row.
+     Scoped to the toggle: the refresh control beside it is an action, and stays muted. */
+  .git-line-toggle .git-icon { color:var(--accent); }
   .git-caret { flex:none; width:9px; font-size:9px; line-height:1; color:var(--muted); transition:transform .12s; }
   .git-caret[hidden] { display:none; }
   .git-line.expanded .git-caret { transform:rotate(90deg); }
@@ -566,7 +570,6 @@
   .git-empty { padding:8px 6px; color:var(--muted); font-size:12px; }
 
   .composer { display:flex; gap:8px; padding:12px; border-top:1px solid var(--border); background:var(--panel); }
-  .git-line:not([hidden]) + .composer { border-top:0; padding-top:8px; }
   .composer.drag-over { outline:2px solid var(--accent); outline-offset:-4px; background:var(--panel2); }
   .composer #attachBtn {
     width:40px; min-width:40px; height:40px;
