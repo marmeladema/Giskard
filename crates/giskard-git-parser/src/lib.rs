@@ -74,20 +74,27 @@ pub fn parse_git_status(output: &[u8]) -> GitStatusResponse {
             }),
             // `2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score> <path>` then the original path as
             // its own record.
-            '2' => parse_git_entry_fields(&text, 10).and_then(|(xy, path)| {
-                let old_path = records.next()?;
-                Some(GitFileStatus {
-                    kind: git_file_kind(xy.0, xy.1).into(),
-                    path,
-                    old_path: Some(String::from_utf8_lossy(old_path).to_string()),
-                    index_status: git_status_name(xy.0).into(),
-                    worktree_status: git_status_name(xy.1).into(),
-                    staged_added: None,
-                    staged_deleted: None,
-                    unstaged_added: None,
-                    unstaged_deleted: None,
-                })
-            }),
+            '2' => {
+                // The original path is always the next record, so it is consumed even when this
+                // entry is malformed and produces nothing. Leaving it in the stream would let the
+                // loop read it as a record of its own — a path such as `? sneaky.txt` would then
+                // become an untracked file that does not exist.
+                let entry = parse_git_entry_fields(&text, 10);
+                let old_path = records.next();
+                entry
+                    .zip(old_path)
+                    .map(|((xy, path), old_path)| GitFileStatus {
+                        kind: git_file_kind(xy.0, xy.1).into(),
+                        path,
+                        old_path: Some(String::from_utf8_lossy(old_path).to_string()),
+                        index_status: git_status_name(xy.0).into(),
+                        worktree_status: git_status_name(xy.1).into(),
+                        staged_added: None,
+                        staged_deleted: None,
+                        unstaged_added: None,
+                        unstaged_deleted: None,
+                    })
+            }
             // `u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>`. The record type alone says
             // it is a conflict, so the `AA` and `DD` pairs need no special handling.
             'u' => parse_git_entry_fields(&text, 11).map(|(xy, path)| GitFileStatus {
@@ -694,6 +701,21 @@ mod tests {
 
         assert_eq!(status.files.len(), 1);
         assert_eq!(status.files[0].path, "good.txt");
+    }
+
+    /// A `2` record owns the record after it. If a malformed one left that record behind, the loop
+    /// would read the original path as an entry — and a path that looks like a record would become
+    /// a file nobody has.
+    #[test]
+    fn a_malformed_rename_still_consumes_its_original_path() {
+        let status = parse_git_status(
+            b"# branch.head main\x002 R. N... truncated\x00? sneaky.txt\x00\
+              1 .M N... 100644 100644 100644 aaa bbb real.txt\x00",
+        );
+
+        assert_eq!(status.files.len(), 1);
+        assert_eq!(status.files[0].path, "real.txt");
+        assert_eq!(status.untracked_count, 0);
     }
 
     #[test]

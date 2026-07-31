@@ -118,7 +118,27 @@ test.describe("git status line", () => {
     ).toHaveCount(2);
 
     await expect.poll(() => statusRequests, { timeout: 10_000 }).toBeGreaterThan(0);
-    // The refresh is debounced, so a turn costs one request rather than one per file.
+    // `expect.poll` returns on the first request, so a second one arriving a moment later would go
+    // unseen — wait past a debounce window before pinning the count.
+    await page.waitForTimeout(2_000);
+    expect(statusRequests).toBe(1);
+  });
+
+  // The turn above triggers a single refresh, so it cannot show that several triggers coalesce.
+  // A turn that edits twenty files fires the scheduler twenty times, and that is the case the
+  // debounce exists for, so it is driven directly.
+  test("coalesces a burst of refreshes into one request", async ({ page }) => {
+    let statusRequests = 0;
+    page.on("request", (request) => {
+      if (request.url().includes("/git/status")) statusRequests += 1;
+    });
+
+    await page.evaluate(() => {
+      const schedule = (window as never as { scheduleGitRefresh: () => void }).scheduleGitRefresh;
+      for (let i = 0; i < 20; i += 1) schedule();
+    });
+    await expect.poll(() => statusRequests, { timeout: 10_000 }).toBeGreaterThan(0);
+    await page.waitForTimeout(2_000);
     expect(statusRequests).toBe(1);
   });
 
