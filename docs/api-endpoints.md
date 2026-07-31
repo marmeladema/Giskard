@@ -46,14 +46,20 @@ opened since the server started; threads with a live agent session stay bound to
 (create a new thread to change providers there).
 
 `GET /api/projects/{id}/git/status` returns best-effort, read-only Git metadata for the project's
-effective workspace root: current branch or detached head (resolved to a short commit when Git
-reports no branch name), ahead/behind counts when Git reports them, staged/unstaged/untracked and
-conflicted counts, and the changed file list. Each file carries `staged_added`/`staged_deleted` and
-`unstaged_added`/`unstaged_deleted` line counts from `git diff --numstat`, kept apart so a file that
-is both staged and modified reports each side accurately, with `added_total`/`deleted_total`
-summing them on the response. The counts are omitted for the side with no changes and for untracked
-and binary files, and the numstat calls are skipped entirely for a clean tree. A numstat failure is
-non-fatal — the status is returned without line counts. Non-Git workspaces return
+effective workspace root, parsed from `git status --porcelain=v2 -z`: the current branch (reported
+even on an unborn one), `detached` with the short commit in `head`, ahead/behind counts when Git
+reports an upstream, staged/unstaged/untracked and conflicted counts, and the changed file list.
+
+An untracked directory is reported as a single entry with a trailing slash rather than one entry
+per file beneath it, matching what `git status` reports to a person.
+
+Each file carries `staged_added`/`staged_deleted` and `unstaged_added`/`unstaged_deleted` line
+counts from `git diff --numstat`, kept apart so a file that is both staged and modified reports each
+side accurately, with `added_total`/`deleted_total` summing them on the response. The counts are
+omitted for the side with no changes, for untracked and binary files, and for conflicted files —
+git diffs an unmerged path against each merge stage, so no single count describes it. The numstat
+calls are skipped entirely for a clean tree, and a numstat failure is non-fatal — the status is
+returned without line counts. Non-Git workspaces return
 `is_repository: false` with no `error`: git's own "not a git repository" is logged rather than
 reported, so `error` means only that the status could not be determined (git could not be run, or
 timed out).
