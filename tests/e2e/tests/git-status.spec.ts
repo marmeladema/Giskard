@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { login } from "./helpers";
+import { SCRIPTED_REPLY, login } from "./helpers";
 
 // The Git status line above the composer. The replay server seeds its demo workspace as a real
 // repository on `main` with one modified tracked file (`src/main.rs`), so the line has a branch, a
@@ -87,6 +87,39 @@ test.describe("git status line", () => {
     expect(await shorten("feature/a-very-long-single-branch-name", 1)).toBe("…ranch-name");
     // No prefix to shed.
     expect(await shorten("main", 60)).toBe("main");
+  });
+
+  // The working tree changes while the agent works, so a line that only reflects the moment the
+  // thread was opened is decoration. A finished turn has to refresh it — and once, however many
+  // files the turn touched.
+  test("refreshes itself when a turn finishes", async ({ page }) => {
+    // Two things make the first send the wrong turn to measure: opening a thread loads status by
+    // itself, and creating a thread starts its turn over HTTP before the socket is attached, so
+    // the completion never reaches the client. Create the thread, re-open it from the sidebar so
+    // the socket is live, and measure the turn after that.
+    await page.locator("#input").fill("First turn, which creates the thread");
+    await page.locator("#sendBtn").click();
+    await expect(page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY })).toBeVisible();
+
+    await page.locator(".thread").first().click();
+    await expect(page.locator("#gitLine")).toBeVisible();
+    await expect(page.locator("#sendBtn")).toBeVisible();
+    await page.waitForTimeout(2_000); // let the thread-open load and its debounce settle
+
+    let statusRequests = 0;
+    page.on("request", (request) => {
+      if (request.url().includes("/git/status")) statusRequests += 1;
+    });
+
+    await page.locator("#input").fill("Second turn, in a thread that is already open");
+    await page.locator("#sendBtn").click();
+    await expect(
+      page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY }),
+    ).toHaveCount(2);
+
+    await expect.poll(() => statusRequests, { timeout: 10_000 }).toBeGreaterThan(0);
+    // The refresh is debounced, so a turn costs one request rather than one per file.
+    expect(statusRequests).toBe(1);
   });
 
   // The line sits between the transcript and the composer, and has to read as its own band rather

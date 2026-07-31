@@ -165,7 +165,7 @@ let state = {
   awaitingInitialThreadState:false, awaitingThreadResync:false, awaitingIncrementalResync:false, resyncStickBottom:false, contextWindow:0, contextUsed:null, permissionPreset:"ask_first", currentModel:null,
   pendingLiveSnapshotReconcile:false,
   gitStatus:null, gitLoading:false, gitError:null, gitRequestSeq:0,
-  gitExpanded:false, gitRepoByProject:new Map(), gitResizeTimer:null, gitBodyHtml:null, gitDiffPending:false,
+  gitExpanded:false, gitRepoByProject:new Map(), gitResizeTimer:null, gitBodyHtml:null, gitDiffPending:false, gitRefreshTimer:null,
   mcpServers:[], mcpCapabilities:{ status:false, reload:false, oauth_login:false }, mcpLoading:false, mcpError:null, expandedMcps:new Set(),
   threadReadOnly:false, readOnlyProvider:null, readOnlyMessage:null,
   pickerTypeahead:"", pickerTypeaheadTimer:null, pickerSelectedRow:null,
@@ -3583,6 +3583,8 @@ function handleEvent(ev) {
     case "item_completed":
       if (!finalizeStreamedItem(ev.item, ev.turn)) addItem(ev.item, ev.turn);
       if (isContextCompactionItem(ev.item)) finishCompactPending();
+      // Only the live path: replaying history must not poll git for changes long since made.
+      if (ev.item && ((ev.item.payload || ev.item).kind) === "file_change") scheduleGitRefresh();
       break;
     case "turn_completed":
       state.firstTurnStartingThreadId = null;
@@ -3600,6 +3602,8 @@ function handleEvent(ev) {
       setTurnActive(false);
       setActiveThreadActivity("turn_completed", false, "Turn completed");
       breakTaskGroup();
+      // Shell edits leave no file-change item, so the end of the turn is the catch-all.
+      scheduleGitRefresh();
       break;
     case "approval_requested":
       handleIncomingApprovalRequest(ev.request, ev.thread || state.threadId, {
@@ -5255,6 +5259,7 @@ const GIT_BRANCH_MIN_CHARS = 10;
 const GIT_PATH_DIR_MAX = 34;
 
 function resetGitState() {
+  clearTimeout(state.gitRefreshTimer);
   state.gitStatus = null;
   state.gitBodyHtml = null;
   state.gitLoading = false;
@@ -5560,6 +5565,21 @@ async function loadGitStatus(pid) {
       renderGitLine();
     }
   }
+}
+
+/* The working tree moves while the agent works, so the line follows it rather than showing what
+   was true when the thread was opened. A completed turn always schedules a refresh; a file-change
+   item schedules one too, so the counts move during the turn instead of only at the end. Both are
+   coalesced, so a turn touching twenty files still costs one request, and nothing is scheduled for
+   a project whose workspace is not a repository. */
+const GIT_REFRESH_DEBOUNCE_MS = 1200;
+
+function scheduleGitRefresh() {
+  if (!state.projectId || $("gitLine").hidden) return;
+  clearTimeout(state.gitRefreshTimer);
+  state.gitRefreshTimer = setTimeout(() => {
+    if (state.projectId && !$("gitLine").hidden) loadGitStatus(state.projectId);
+  }, GIT_REFRESH_DEBOUNCE_MS);
 }
 
 function setGitExpanded(expanded, opts) {
