@@ -2581,12 +2581,17 @@ alongside raw token counts. Off by default; raw token counts are the primary met
 
 ### 11.1 Diff viewer (side-by-side)
 
-- **Visualization only** in v1 (no accept/reject of individual hunks, no git ops).
+- **Visualization only** in v1 (no accept/reject of individual hunks, no mutating git ops).
 - Fed by `AgentEvent::DiffUpdated` (Codex `turn/diff/updated`), per file.
 - Rendered **side-by-side, in a panel next to the thread** on desktop. On mobile it becomes a
   full-screen tab/drawer (unified inline diff if side-by-side doesn't fit; §13.4).
 - Shows the set of files changed in the current turn, selectable; each file shows old vs new
   with additions/deletions highlighted. Large diffs are virtualized (§11.3).
+- The active project surface may expose a compact read-only Git status line above the composer:
+  current branch or detached head, ahead/behind, conflicted and changed counts, and the working
+  tree's diffstat. It expands in place into the changed files, grouped by conflicted/staged/
+  unstaged/untracked, each opening its own diff, plus the combined working-tree diff. Staging,
+  committing, branch creation/switching, and hunk mutation stay out of scope.
 
 ### 11.2 Code overlay for referenced paths
 

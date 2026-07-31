@@ -164,6 +164,8 @@ let state = {
   linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, codeOverlaySource:null, outputOverlay:null, activeTurn:false, interruptPending:false, compactPending:false,
   awaitingInitialThreadState:false, awaitingThreadResync:false, awaitingIncrementalResync:false, resyncStickBottom:false, contextWindow:0, contextUsed:null, permissionPreset:"ask_first", currentModel:null,
   pendingLiveSnapshotReconcile:false,
+  gitStatus:null, gitLoading:false, gitError:null, gitRequestSeq:0,
+  gitExpanded:false, gitRepoByProject:new Map(), gitResizeTimer:null, gitBodyHtml:null, gitDiffPending:false,
   mcpServers:[], mcpCapabilities:{ status:false, reload:false, oauth_login:false }, mcpLoading:false, mcpError:null, expandedMcps:new Set(),
   threadReadOnly:false, readOnlyProvider:null, readOnlyMessage:null,
   pickerTypeahead:"", pickerTypeaheadTimer:null, pickerSelectedRow:null,
@@ -1733,6 +1735,7 @@ function clearThreadView(tid) {
   state.awaitingIncrementalResync = false;
   state.resyncStickBottom = false;
   state.pendingLiveSnapshotReconcile = false;
+  resetGitState();
   resetRenderState();
   $("thrHeader").style.display="none"; $("composer").style.display="none";
   $("pickerBar").style.display="none"; closeModelPicker(); closeTurnPicker();
@@ -2110,6 +2113,7 @@ function openDraftThread(pid) {
   state.compactPending = false;
   state.currentModel = null;
   prepareProjectModelCatalog(pid);
+  resetGitState();
   state.mcpServers = []; state.mcpError = null; state.expandedMcps = new Set();
   state.mcpCapabilities = { status:false, reload:false, oauth_login:false };
   $("tasksMenu").hidden = true;
@@ -2140,6 +2144,7 @@ function openDraftThread(pid) {
   $("transcript").className=""; $("notices").innerHTML="";
   renderDraftPlaceholder();
   setWsStatus("draft", "Draft thread. Send a message to create it.");
+  loadGitStatus(pid);
   syncModelControls();
   closeDrawers();
   restoreComposerDraft();
@@ -2181,6 +2186,7 @@ async function openThread(pid, tid, title, opts) {
   state.currentModel = null;
   prepareProjectModelCatalog(pid);
   $("effortControl").hidden = true;
+  resetGitState();
   state.mcpServers = []; state.mcpError = null; state.expandedMcps = new Set();
   state.mcpCapabilities = { status:false, reload:false, oauth_login:false };
   $("tasksMenu").hidden = true;
@@ -2189,6 +2195,7 @@ async function openThread(pid, tid, title, opts) {
   $("usageMenu").hidden = true;
   renderMcpButton();
   renderSubagentsButton();
+  loadGitStatus(pid);
   loadMcpServers({ announce:false });
   loadProjectModels(pid);   // load this project's model list (config + discovery + Codex names)
   setTurnActive(false);
@@ -5228,6 +5235,391 @@ function renderRunningCommands() {
   renderTasksButton(cmds);
   if (!$("tasksMenu").hidden) renderTasksMenu(cmds);
 }
+
+/* Git status line (above the composer).
+ *
+ * Status is fetched per thread open, so `gitRepoByProject` remembers only whether a project's
+ * workspace is a repository at all: that is what decides whether the row exists, and caching just
+ * that much keeps the composer from shifting down when you move between threads of a project
+ * already known to be one. The status itself is always refetched. */
+const GIT_SECTIONS = [
+  { key:"conflicted", label:"Conflicts" },
+  { key:"staged", label:"Staged" },
+  { key:"unstaged", label:"Not staged" },
+  { key:"untracked", label:"Untracked" }
+];
+/* Below this many characters a branch name is more confusing than absent, so the line stops
+   shrinking it and drops whole segments instead. */
+const GIT_BRANCH_MIN_CHARS = 10;
+/* Directory length in a file row past which leading path segments are dropped. */
+const GIT_PATH_DIR_MAX = 34;
+
+function resetGitState() {
+  state.gitStatus = null;
+  state.gitBodyHtml = null;
+  state.gitLoading = false;
+  state.gitError = null;
+  state.gitExpanded = false;
+  state.gitRequestSeq += 1;
+  renderGitLine();
+}
+
+function gitDirtyCount(status) {
+  return status && Array.isArray(status.files) ? status.files.length : 0;
+}
+
+function gitBranchName(status) {
+  if (!status || !status.is_repository) return "";
+  if (status.branch) return status.branch;
+  if (status.head) return status.head;
+  return status.detached ? "detached" : "HEAD";
+}
+
+/* Split a branch name into a dimmable leading path and the segment that identifies it, shortening
+   to fit `budget` characters. Segments are shed in order — the prefix first, then the head of the
+   tail — because the tail is what distinguishes one branch from another. */
+function gitBranchParts(name, budget) {
+  name = String(name || "");
+  const cut = name.lastIndexOf("/");
+  const prefix = cut >= 0 ? name.slice(0, cut + 1) : "";
+  const tail = cut >= 0 ? name.slice(cut + 1) : name;
+  if (name.length <= budget) return { prefix, tail };
+  if (tail.length <= budget) return { prefix: prefix ? "…/" : "", tail };
+  const keep = Math.max(GIT_BRANCH_MIN_CHARS, budget - 1);
+  return { prefix:"", tail: "…" + tail.slice(tail.length - keep) };
+}
+
+/* Character budget for the branch, by viewport tier. The row's real width also depends on the
+   sidebar, so this is an approximation with `overflow:hidden` on .git-branch as the backstop —
+   deliberately preferred over measuring, which would need a layout pass on every render. */
+function gitBranchBudget() {
+  const width = window.innerWidth || 1024;
+  if (width < 480) return 22;
+  if (width < 820) return 34;
+  return 60;
+}
+
+function gitLineState() {
+  if (state.gitError) return "error";
+  const status = state.gitStatus;
+  if (!status || !status.is_repository) return state.gitLoading ? "loading" : "unavailable";
+  if (status.conflicted_count) return "conflicted";
+  return status.dirty ? "dirty" : "clean";
+}
+
+function gitFileSections(status) {
+  const files = status && Array.isArray(status.files) ? status.files : [];
+  const sections = { conflicted:[], staged:[], unstaged:[], untracked:[] };
+  for (const file of files) {
+    if (!file) continue;
+    if (file.kind === "unmerged") { sections.conflicted.push(file); continue; }
+    if (file.kind === "untracked") { sections.untracked.push(file); continue; }
+    // A file edited both in the index and in the worktree is genuinely in two states, so it is
+    // listed under each — the same way `git status` reports it twice.
+    if (file.index_status && file.index_status !== "unmodified") sections.staged.push(file);
+    if (file.worktree_status && file.worktree_status !== "unmodified") sections.unstaged.push(file);
+  }
+  return sections;
+}
+
+/* The line is hidden until the project is known to be a repository, so it never appears and then
+   vanishes on a workspace that isn't one. A project already seen this session is known before its
+   fetch returns, so from the second thread open onward the row renders at its final height and the
+   composer doesn't move. */
+function gitLineVisible(stateName) {
+  if (!state.projectId) return false;
+  if (stateName === "error") return true;
+  if (stateName === "unavailable") return false;
+  if (stateName === "loading") return state.gitRepoByProject.get(state.projectId) === true;
+  return true;
+}
+
+function renderGitLine() {
+  const line = $("gitLine");
+  if (!line) return;
+  const status = state.gitStatus;
+  const stateName = gitLineState();
+  const visible = gitLineVisible(stateName);
+  line.hidden = !visible;
+  if (!visible) { setGitExpanded(false, { skipRender:true }); return; }
+
+  line.className = `git-line state-${stateName}${state.gitExpanded ? " expanded" : ""}`;
+  const loadingFirst = stateName === "loading";
+  const expandable = stateName === "dirty" || stateName === "conflicted";
+  const dirty = gitDirtyCount(status);
+
+  $("gitIcon").firstElementChild.setAttribute("href", status && status.detached ? "#gi-detached" : "#gi-branch");
+  $("gitCaret").hidden = !expandable;
+
+  const branch = $("gitBranch");
+  if (loadingFirst) {
+    branch.innerHTML = `<span class="git-skeleton" style="width:104px"></span>`;
+    branch.removeAttribute("title");
+  } else if (stateName === "error") {
+    branch.textContent = "Git status unavailable";
+    branch.title = state.gitError || "";
+  } else {
+    const name = gitBranchName(status);
+    const parts = gitBranchParts(name, gitBranchBudget());
+    // A detached HEAD is named by its commit, with the state itself as a dim note after it — so it
+    // reads as "this revision, detached" rather than as a branch called "detached".
+    const note = status && status.detached ? `<span class="git-branch-note">detached</span>` : "";
+    branch.innerHTML = `${parts.prefix ? `<span class="git-branch-prefix">${escapeHtml(parts.prefix)}</span>` : ""}${escapeHtml(parts.tail)}${note}`;
+    branch.title = status && status.detached ? `Detached HEAD at ${name}` : name;
+  }
+
+  const sync = $("gitSync");
+  const ahead = status && status.ahead ? status.ahead : 0;
+  const behind = status && status.behind ? status.behind : 0;
+  sync.hidden = loadingFirst || (!ahead && !behind);
+  if (!sync.hidden) {
+    sync.innerHTML = [
+      ahead ? `<span class="git-ahead">↑${ahead}</span>` : "",
+      behind ? `<span class="git-behind">↓${behind}</span>` : ""
+    ].join("");
+    sync.title = [
+      ahead ? `${ahead} commit${ahead === 1 ? "" : "s"} ahead of upstream` : "",
+      behind ? `${behind} commit${behind === 1 ? "" : "s"} behind upstream` : ""
+    ].filter(Boolean).join(" · ");
+  }
+
+  const count = $("gitCount");
+  const countLabel = gitCountLabel(status, stateName, dirty);
+  $("gitSep").hidden = stateName === "error" || !countLabel;
+  if (loadingFirst) count.innerHTML = `<span class="git-skeleton" style="width:26px"></span>`;
+  else count.textContent = countLabel;
+
+  const diffstat = $("gitDiffstat");
+  const added = status && status.added_total ? status.added_total : 0;
+  const deleted = status && status.deleted_total ? status.deleted_total : 0;
+  diffstat.hidden = !expandable || (!added && !deleted);
+  if (!diffstat.hidden) {
+    diffstat.innerHTML = gitDiffstatHtml(added, deleted);
+    diffstat.title = `${added} line${added === 1 ? "" : "s"} added, ${deleted} removed across the working tree`;
+  }
+
+  const toggle = $("gitLineToggle");
+  toggle.disabled = !expandable;
+  toggle.setAttribute("aria-expanded", state.gitExpanded && expandable ? "true" : "false");
+  toggle.title = gitLineTitle(status, stateName, dirty);
+  $("gitReviewAll").hidden = !expandable;
+  $("gitRefresh").hidden = false;
+
+  if (!expandable && state.gitExpanded) setGitExpanded(false, { skipRender:true });
+  $("gitLineBody").hidden = !state.gitExpanded;
+  if (state.gitExpanded) renderGitLineBody();
+}
+
+function gitCountLabel(status, stateName, dirty) {
+  if (stateName === "loading") return "…";
+  if (stateName === "error") return "";
+  if (stateName === "conflicted") {
+    const conflicts = status.conflicted_count;
+    const label = `${conflicts} conflict${conflicts === 1 ? "" : "s"}`;
+    // The total is only worth showing when there is something beyond the conflicts.
+    return conflicts === dirty ? label : `${label} · ${dirty}`;
+  }
+  return status && status.dirty ? String(dirty) : "clean";
+}
+
+function gitLineTitle(status, stateName, dirty) {
+  if (stateName === "loading") return "Loading Git status…";
+  if (stateName === "error") return "Git status unavailable: " + (state.gitError || "");
+  if (stateName === "conflicted") return `${status.conflicted_count} conflicted file${status.conflicted_count === 1 ? "" : "s"} — click to list the changes`;
+  if (!status || !status.dirty) return "Working tree clean";
+  return `${dirty} changed file${dirty === 1 ? "" : "s"} — click to list them`;
+}
+
+function renderGitLineBody() {
+  const body = $("gitLineBody");
+  const status = state.gitStatus;
+  if (!status || !status.is_repository) { body.innerHTML = ""; state.gitBodyHtml = null; return; }
+  const sections = gitFileSections(status);
+  const html = (GIT_SECTIONS
+    .filter(section => sections[section.key].length)
+    .map(section => renderGitSection(section, sections[section.key]))
+    .join("")) || `<div class="git-empty">No changed files.</div>`;
+  // The collapsed line re-renders on refresh and on every viewport tier change, and rebuilding an
+  // unchanged list would throw away the reader's scroll position in it.
+  if (state.gitBodyHtml === html) return;
+  state.gitBodyHtml = html;
+  body.innerHTML = html;
+  body.querySelectorAll("[data-git-diff]").forEach(row => {
+    row.onclick = () => openGitDiff(row.dataset.gitDiff, row.dataset.gitSide);
+  });
+}
+
+function renderGitSection(section, files) {
+  const rows = files.map(file => renderGitFileRow(file, section.key)).join("");
+  return `<div class="git-section-title">${escapeHtml(section.label)} <span class="muted">${files.length}</span><span class="git-section-rule"></span></div>${rows}`;
+}
+
+function renderGitFileRow(file, sectionKey) {
+  const path = String(file.path || "");
+  const status = gitRowStatus(file, sectionKey);
+  // Untracked files have nothing to diff against, so the row stays inert rather than opening an
+  // overlay that would report an empty diff.
+  const canDiff = sectionKey !== "untracked";
+  const title = file.old_path ? `${file.old_path} → ${path}` : path;
+  // The row carries its own side, so a path listed under both Staged and Not staged opens the diff
+  // that matches the row's line counts rather than the two concatenated.
+  const side = gitSectionSide(sectionKey);
+  return `<button type="button" class="git-file" title="${escapeAttr(title)}"${canDiff ? ` data-git-diff="${escapeAttr(path)}" data-git-side="${escapeAttr(side)}"` : " disabled"}>
+    <span class="git-file-status status-${escapeAttr(status.kind)}">${escapeHtml(status.code)}</span>
+    <span class="git-file-path">${renderGitPath(path)}</span>
+    <span class="git-file-stat">${renderGitFileStat(file, sectionKey, canDiff)}</span>
+  </button>`;
+}
+
+/* A conflict lives in the worktree, so it reads the unstaged side — same as its line counts. */
+function gitSectionSide(sectionKey) {
+  return sectionKey === "staged" ? "staged" : "unstaged";
+}
+
+/* The basename is the identifier and the directory is context, so the directory is dimmed and
+   shortened from the left when it is long — the tail of a path is what you are reading. */
+function renderGitPath(path) {
+  const cut = path.lastIndexOf("/");
+  if (cut < 0) return `<span class="git-file-name">${escapeHtml(path)}</span>`;
+  let dir = path.slice(0, cut + 1);
+  if (dir.length > GIT_PATH_DIR_MAX) {
+    const segments = dir.split("/").filter(Boolean);
+    while (segments.length > 1 && segments.join("/").length + 2 > GIT_PATH_DIR_MAX) segments.shift();
+    const shortened = "…/" + segments.join("/") + "/";
+    // A single long directory name can't be shortened by dropping segments — prefixing it would
+    // only make it longer — so it is left to the row's own overflow handling.
+    if (shortened.length < dir.length) dir = shortened;
+  }
+  return `<span class="git-file-dir">${escapeHtml(dir)}</span><span class="git-file-name">${escapeHtml(path.slice(cut + 1))}</span>`;
+}
+
+/* Line counts for the side of the file this row represents — a file staged and then modified again
+   appears in two sections, and each row reports only its own side rather than repeating a combined
+   figure. A conflict lives in the worktree, so it reads the unstaged side. */
+function renderGitFileStat(file, sectionKey, canDiff) {
+  if (!canDiff) return `<span class="muted">new</span>`;
+  // A conflict is diffed against each merge stage, so there is no single count to show; the row's
+  // `U` and its section already say what it is.
+  if (sectionKey === "conflicted") return "";
+  const staged = sectionKey === "staged";
+  const added = staged ? file.staged_added : file.unstaged_added;
+  const deleted = staged ? file.staged_deleted : file.unstaged_deleted;
+  if (typeof added !== "number" && typeof deleted !== "number") return `<span class="muted">bin</span>`;
+  return gitDiffstatHtml(added || 0, deleted || 0);
+}
+
+function gitDiffstatHtml(added, deleted) {
+  return `<span class="git-added${added ? "" : " git-zero"}">+${added}</span><span class="git-deleted${deleted ? "" : " git-zero"}">−${deleted}</span>`;
+}
+
+function gitRowStatus(file, sectionKey) {
+  if (sectionKey === "untracked") return { code:"?", kind:"untracked" };
+  if (sectionKey === "conflicted") return { code:"U", kind:"unmerged" };
+  const name = sectionKey === "staged" ? file.index_status : file.worktree_status;
+  return { code:gitStatusCode(name), kind:name || "modified" };
+}
+
+function gitStatusCode(status) {
+  if (status === "modified") return "M";
+  if (status === "added") return "A";
+  if (status === "deleted") return "D";
+  if (status === "renamed") return "R";
+  if (status === "copied") return "C";
+  if (status === "typechange") return "T";
+  if (status === "unmerged") return "U";
+  if (status === "untracked") return "?";
+  return "•";
+}
+
+async function loadGitStatus(pid) {
+  pid = pid || state.projectId;
+  if (!pid) return;
+  const requestSeq = ++state.gitRequestSeq;
+  state.gitLoading = true;
+  state.gitError = null;
+  renderGitLine();
+  try {
+    const res = await api("GET", `/api/projects/${pid}/git/status`);
+    if (requestSeq !== state.gitRequestSeq || state.projectId !== pid) return;
+    state.gitStatus = res;
+    state.gitError = res && res.error ? res.error : null;
+    state.gitRepoByProject.set(pid, !!(res && res.is_repository));
+  } catch (e) {
+    if (requestSeq !== state.gitRequestSeq || state.projectId !== pid) return;
+    state.gitStatus = null;
+    state.gitError = apiFailureMessage(e) || "Could not load git status.";
+  } finally {
+    if (requestSeq === state.gitRequestSeq && state.projectId === pid) {
+      state.gitLoading = false;
+      renderGitLine();
+    }
+  }
+}
+
+function setGitExpanded(expanded, opts) {
+  expanded = !!expanded;
+  if (state.gitExpanded === expanded) {
+    if (!(opts && opts.skipRender)) renderGitLine();
+    return;
+  }
+  state.gitExpanded = expanded;
+  if (!(opts && opts.skipRender)) renderGitLine();
+}
+
+/* Both diff openers capture the project up front and drop the response if the user has moved on,
+   the same guard `loadGitStatus` uses — otherwise switching projects mid-request opens an overlay
+   holding the previous project's diff. */
+async function openGitDiff(path, side) {
+  const pid = state.projectId;
+  if (!pid || !path || state.gitDiffPending) return;
+  const query = `path=${encodeURIComponent(path)}${side ? `&side=${encodeURIComponent(side)}` : ""}`;
+  state.gitDiffPending = true;
+  try {
+    const res = await api("GET", `/api/projects/${pid}/git/diff?${query}`);
+    if (state.projectId !== pid) return;
+    if (!res || res.is_empty || !String(res.diff || "").trim()) {
+      notice(`No ${side === "staged" ? "staged " : ""}diff available for ${path}.`, "warning");
+      return;
+    }
+    openDiffOverlay(side === "staged" ? `${path} (staged)` : path, res.diff);
+  } catch (e) {
+    if (state.projectId !== pid) return;
+    notice("Could not load git diff: " + apiFailureMessage(e), "error");
+  } finally {
+    state.gitDiffPending = false;
+  }
+}
+
+async function openGitWorkingDiff() {
+  const pid = state.projectId;
+  if (!pid || state.gitDiffPending) return;
+  state.gitDiffPending = true;
+  try {
+    const res = await api("GET", `/api/projects/${pid}/git/diff`);
+    if (state.projectId !== pid) return;
+    if (!res || res.is_empty || !String(res.diff || "").trim()) {
+      notice("No tracked changes to review.", "warning");
+      return;
+    }
+    openDiffOverlay("Working tree", res.diff);
+  } catch (e) {
+    if (state.projectId !== pid) return;
+    notice("Could not load git diff: " + apiFailureMessage(e), "error");
+  } finally {
+    state.gitDiffPending = false;
+  }
+}
+
+$("gitLineToggle").onclick = () => setGitExpanded(!state.gitExpanded);
+$("gitRefresh").onclick = () => loadGitStatus(state.projectId);
+$("gitReviewAll").onclick = () => openGitWorkingDiff();
+/* The branch's character budget is width-tiered, so re-render the collapsed line when the viewport
+   crosses a tier. Debounced because this also fires continuously while dragging a window edge. */
+window.addEventListener("resize", () => {
+  clearTimeout(state.gitResizeTimer);
+  state.gitResizeTimer = setTimeout(() => { if (!$("gitLine").hidden) renderGitLine(); }, 150);
+});
+
 function renderTasksButton(cmds) {
   cmds = cmds || Array.from(state.runningCommands.values());
   const btn = $("tasksBtn");

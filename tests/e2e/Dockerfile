@@ -31,7 +31,10 @@ FROM mcr.microsoft.com/playwright:v1.56.0-jammy
 WORKDIR /e2e
 
 COPY tests/e2e/.host-ca-certificates/ /usr/local/share/ca-certificates/giskard-host/
-RUN update-ca-certificates
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && update-ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
 
