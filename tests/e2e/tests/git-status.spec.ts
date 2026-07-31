@@ -89,6 +89,51 @@ test.describe("git status line", () => {
     expect(await shorten("main", 60)).toBe("main");
   });
 
+  // The line sits between the transcript and the composer, and has to read as its own band rather
+  // than as part of either. That means a rule on each boundary — including below the file list when
+  // it is open, which is the edge that is easy to lose.
+  test("keeps a separator on every edge, collapsed and expanded", async ({ page }) => {
+    const borderTop = (selector: string) =>
+      page.locator(selector).evaluate((node) => getComputedStyle(node).borderTopWidth);
+
+    expect(await borderTop("#gitLine")).toBe("1px");
+    expect(await borderTop("#composer")).toBe("1px");
+
+    await page.locator("#gitLineToggle").click();
+    await expect(page.locator("#gitLineBody")).toBeVisible();
+    // Head from list, and list from composer.
+    expect(await borderTop("#gitLineBody")).toBe("1px");
+    expect(await borderTop("#composer")).toBe("1px");
+  });
+
+  // The branch glyph carries the appearance theme's accent, so it belongs to the theme rather than
+  // being another grey mark in the row.
+  test("tints the branch glyph with the theme accent", async ({ page }) => {
+    const iconColor = async (theme: string) => {
+      await page.evaluate((t) => document.documentElement.setAttribute("data-appearance", t), theme);
+      return page.locator("#gitIcon").evaluate((node) => getComputedStyle(node).color);
+    };
+    const accent = async () =>
+      page.evaluate(() =>
+        getComputedStyle(document.documentElement).getPropertyValue("--accent").trim(),
+      );
+
+    for (const theme of ["ide", "bubbles", "terminal"]) {
+      const [color, themeAccent] = [await iconColor(theme), await accent()];
+      expect(themeAccent).not.toBe("");
+      // Compare through a canvas-free parse: the computed colour is rgb(), the token is a hex.
+      const expected = await page.evaluate((hex) => {
+        const probe = document.createElement("span");
+        probe.style.color = hex;
+        document.body.append(probe);
+        const value = getComputedStyle(probe).color;
+        probe.remove();
+        return value;
+      }, themeAccent);
+      expect(color, `branch glyph should match the ${theme} accent`).toBe(expected);
+    }
+  });
+
   // An untracked directory is reported collapsed, with a trailing slash. Its own name is what the
   // reader is looking for, so it has to end up in the bold segment rather than leaving the row
   // dimmed with an empty filename.
