@@ -5479,9 +5479,15 @@ function gitSectionSide(sectionKey) {
 /* The basename is the identifier and the directory is context, so the directory is dimmed and
    shortened from the left when it is long — the tail of a path is what you are reading. */
 function renderGitPath(path) {
-  const cut = path.lastIndexOf("/");
-  if (cut < 0) return `<span class="git-file-name">${escapeHtml(path)}</span>`;
-  let dir = path.slice(0, cut + 1);
+  // An untracked directory is reported collapsed, with a trailing slash. Its own name is the
+  // identifier, so the slash is set aside before splitting and put back on the name — otherwise
+  // the whole entry reads as a directory with no file in it.
+  const isDirectory = path.endsWith("/");
+  const bare = isDirectory ? path.slice(0, -1) : path;
+  const cut = bare.lastIndexOf("/");
+  const name = escapeHtml((cut < 0 ? bare : bare.slice(cut + 1)) + (isDirectory ? "/" : ""));
+  if (cut < 0) return `<span class="git-file-name">${name}</span>`;
+  let dir = bare.slice(0, cut + 1);
   if (dir.length > GIT_PATH_DIR_MAX) {
     const segments = dir.split("/").filter(Boolean);
     while (segments.length > 1 && segments.join("/").length + 2 > GIT_PATH_DIR_MAX) segments.shift();
@@ -5490,7 +5496,7 @@ function renderGitPath(path) {
     // only make it longer — so it is left to the row's own overflow handling.
     if (shortened.length < dir.length) dir = shortened;
   }
-  return `<span class="git-file-dir">${escapeHtml(dir)}</span><span class="git-file-name">${escapeHtml(path.slice(cut + 1))}</span>`;
+  return `<span class="git-file-dir">${escapeHtml(dir)}</span><span class="git-file-name">${name}</span>`;
 }
 
 /* Line counts for the side of the file this row represents — a file staged and then modified again

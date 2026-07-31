@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 giskard-core = { workspace = true }
+giskard-git-parser = { workspace = true }
 giskard-harness = { workspace = true }
 giskard-harness-codex = { workspace = true }
 giskard-harness-replay = { workspace = true }

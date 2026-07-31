@@ -560,6 +560,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "giskard-git-parser"
+version = "0.1.0"
+dependencies = [
+ "giskard-proto",
+]
+
+[[package]]
 name = "giskard-harness"
 version = "0.1.0"
 dependencies = [
@@ -645,6 +652,7 @@ dependencies = [
  "futures",
  "futures-util",
  "giskard-core",
+ "giskard-git-parser",
  "giskard-harness",
  "giskard-harness-codex",
  "giskard-harness-replay",

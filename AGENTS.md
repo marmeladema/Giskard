@@ -56,8 +56,9 @@ change, so the README never shows a stale UI. (No regeneration needed for change
 effect, e.g. backend-only or copy-only edits.)
 
 ## Architecture
-Cargo workspace with 7 crates under `crates/`:
+Cargo workspace with 8 crates under `crates/`:
 - `giskard-core` — pure domain types (no I/O)
+- `giskard-git-parser` — parsers for `git` command output (pure, no I/O)
 - `giskard-harness` — `AgentHarness` trait + capabilities
 - `giskard-harness-codex` — Codex CLI adapter
 - `giskard-harness-replay` — deterministic replay harness for tests
