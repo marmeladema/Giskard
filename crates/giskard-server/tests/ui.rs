@@ -1165,9 +1165,13 @@ async fn index_page_is_served_and_public() {
     assert!(
         body.contains("openDiffOverlay")
             && body.contains("diff-open")
-            && body.contains("markdownCodeFence(\"diff\", diff)")
-            && body.contains("/render"),
-        "UI opens file-change diffs in the server-rendered source overlay"
+            && body.contains("parseUnifiedDiff")
+            && body.contains("renderDiffRows")
+            && body.contains("diff-line-nos")
+            // The diff is laid out directly rather than wrapped in a fence and sent to the
+            // markdown renderer, so no code block and no round trip.
+            && !body.contains("markdownCodeFence"),
+        "UI opens file-change diffs in the diff overlay, rendered as source"
     );
     assert!(
         body.contains("renderToolBody"),

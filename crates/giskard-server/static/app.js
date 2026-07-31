@@ -164,6 +164,7 @@ let state = {
   linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, codeOverlaySource:null, outputOverlay:null, activeTurn:false, interruptPending:false, compactPending:false,
   awaitingInitialThreadState:false, awaitingThreadResync:false, awaitingIncrementalResync:false, resyncStickBottom:false, contextWindow:0, contextUsed:null, permissionPreset:"ask_first", currentModel:null,
   pendingLiveSnapshotReconcile:false,
+  diffOverlayText:null,
   gitStatus:null, gitLoading:false, gitError:null, gitRequestSeq:0,
   gitExpanded:false, gitRepoByProject:new Map(), gitResizeTimer:null, gitBodyHtml:null, gitDiffPending:false, gitRefreshTimer:null,
   mcpServers:[], mcpCapabilities:{ status:false, reload:false, oauth_login:false }, mcpLoading:false, mcpError:null, expandedMcps:new Set(),
@@ -7343,12 +7344,6 @@ function diffStats(diff) {
   }
   return { added, removed, lines: lines.length };
 }
-function markdownCodeFence(language, text) {
-  text = String(text || "");
-  const longest = (text.match(/`+/g) || []).reduce((max, run) => Math.max(max, run.length), 0);
-  const fence = "`".repeat(Math.max(3, longest + 1));
-  return `${fence}${language || ""}\n${text}${text.endsWith("\n") ? "" : "\n"}${fence}`;
-}
 function isMarkdownSourcePath(path, language) {
   const lower = String(path || "").toLowerCase();
   return lower.endsWith(".md") || lower.endsWith(".markdown") || String(language || "").toLowerCase() === "markdown";
@@ -7377,6 +7372,12 @@ async function openCodeOverlay(path, line) {
   $("codeView").innerHTML = `<div class="code-empty">Loading source…</div>`;
   $("codeDownload").disabled = false;
   setCodeSourceToggle(false);
+  setCodeCopyDiff(false);
+  state.diffOverlayText = null;
+  // Taking over the shared overlay also means dropping the output view's state: a command still
+  // streaming would otherwise repaint its output over this file on the next delta.
+  state.outputOverlay = null;
+  cancelOutputOverlayRefresh();
 
   const projectId = state.projectId;
   try {
@@ -7458,47 +7459,137 @@ function showSourceCodeOverlay() {
   renderCodeHtml(source.highlightRes, source.line);
   setCodeSourceToggle(true, "Rendered");
 }
-async function openDiffOverlay(path, diff) {
+/* Split a unified diff into rows the overlay can lay out.
+ *
+ * Each row carries the file line numbers it belongs to on either side: a hunk header resets both
+ * counters, an added line advances only the new side, a removed line only the old, and context
+ * advances both. File headers and the "\ No newline" marker belong to neither side and get no
+ * number. Combined diffs (`@@@`, from a conflicted path) use two columns of markers rather than
+ * one; leading `+`/`-` still classifies them correctly, which is enough to read them by. */
+/* Beyond this many lines the diff stops being something anyone scrolls, and building three DOM
+   nodes per line starts to block the tab — a regenerated lockfile can run to six figures. The rows
+   are capped and the shortfall is stated; Copy diff still hands back the whole thing. */
+const DIFF_MAX_ROWS = 20000;
+
+function parseUnifiedDiff(diff) {
+  const lines = String(diff || "").split(/\r?\n/);
+  // `split` leaves an empty final element for the trailing newline every diff ends with.
+  if (lines.length && lines[lines.length - 1] === "") lines.pop();
+  const rows = [];
+  let oldNo = 0;
+  let newNo = 0;
+  let inHunk = false;
+  // How many marker columns each line carries. A plain diff has one; a combined diff — which is
+  // what `git diff` gives for a conflicted path — has one per parent, so `@@@` means two.
+  let markers = 1;
+  for (const text of lines) {
+    if (rows.length >= DIFF_MAX_ROWS) {
+      rows.push({ kind:"meta", text:`… ${(lines.length - rows.length).toLocaleString()} more lines not shown. Use Copy diff for the whole patch.` });
+      break;
+    }
+    // `@@ -old +new @@`, or `@@@ -p1 -p2 +result @@@` with one range per parent plus the result.
+    const hunk = /^(@{2,}) (.+?) \1/.exec(text);
+    if (hunk) {
+      markers = hunk[1].length - 1;
+      const ranges = hunk[2].split(" ");
+      // With several parents there is no single "old" side to number, so only the result is
+      // counted and the old gutter stays blank.
+      oldNo = markers === 1 ? Number(/^-(\d+)/.exec(ranges[0])?.[1] ?? 0) : 0;
+      newNo = Number(/^\+(\d+)/.exec(ranges[ranges.length - 1])?.[1] ?? 0);
+      inHunk = true;
+      rows.push({ kind:"hunk", text });
+      continue;
+    }
+    if (text.startsWith("\\")) {
+      // "\ No newline at end of file" belongs to the line above, not to either side.
+      rows.push({ kind:"meta", text });
+      continue;
+    }
+    if (!inHunk) {
+      // Before the first hunk comes the file header, where `---` and `+++` are filenames rather
+      // than changes. An agent can also hand over a diff with no `@@` at all, though: colour those
+      // lines by their marker rather than greying out the whole thing, without inventing line
+      // numbers we have no header to count from.
+      if (text.startsWith("---") || text.startsWith("+++")) rows.push({ kind:"meta", text });
+      else if (text.startsWith("+")) rows.push({ kind:"add", text });
+      else if (text.startsWith("-")) rows.push({ kind:"del", text });
+      else rows.push({ kind:"meta", text });
+      continue;
+    }
+    // A combined diff marks a line against each parent, so the line is an addition if any column
+    // says so — `+ SIDE` is a change brought in by one side, not context.
+    const marks = text.slice(0, markers);
+    if (marks.includes("+")) rows.push({ kind:"add", text, newNo: newNo++ });
+    else if (marks.includes("-")) rows.push({ kind:"del", text, oldNo: markers === 1 ? oldNo++ : 0 });
+    else {
+      rows.push({ kind:"context", text, oldNo: markers === 1 ? oldNo++ : 0, newNo: newNo++ });
+    }
+  }
+  return rows;
+}
+
+/* Lay the rows out the way the source view lays out a file: a column per gutter and a column of
+   lines, so the gutters keep their own background and the line heights stay locked together. */
+function renderDiffRows(rows) {
+  const table = document.createElement("div");
+  table.className = "code-table diff-table";
+
+  const oldNos = document.createElement("div");
+  oldNos.className = "code-line-nos diff-line-nos";
+  const newNos = document.createElement("div");
+  newNos.className = "code-line-nos diff-line-nos";
+  const source = document.createElement("div");
+  source.className = "diff-source";
+
+  for (const row of rows) {
+    const oldCell = document.createElement("div");
+    oldCell.className = "code-line-no";
+    if (row.oldNo) oldCell.textContent = String(row.oldNo);
+    const newCell = document.createElement("div");
+    newCell.className = "code-line-no";
+    if (row.newNo) newCell.textContent = String(row.newNo);
+    const line = document.createElement("div");
+    line.className = `diff-line diff-${row.kind}`;
+    // textContent, so a diff of HTML is shown rather than interpreted.
+    line.textContent = row.text || " ";
+    oldNos.append(oldCell);
+    newNos.append(newCell);
+    source.append(line);
+  }
+
+  table.append(oldNos, newNos, source);
+  return table;
+}
+
+/* The diff is rendered directly, like source: line numbers down the side and one row per line,
+   rather than a markdown code block nested in the overlay. That also drops a server round trip —
+   the colouring is by line kind, which is all the previous markdown rendering gave it. */
+function openDiffOverlay(path, diff) {
   diff = String(diff || "");
   if (!state.projectId || !diff.trim()) return;
   state.codePath = null;
   state.codeLine = null;
   state.codeOverlaySource = null;
+  state.outputOverlay = null;
+  cancelOutputOverlayRefresh();
+  state.diffOverlayText = diff;
   $("codeOverlay").classList.add("open");
+  delete $("codeOverlay").dataset.requestId;
   setCodeSourceToggle(false);
+  setCodeCopyDiff(true);
   $("codePath").textContent = `Diff: ${path || "File change"}`;
-  const requestId = Math.random().toString(36).slice(2);
-  $("codeOverlay").dataset.requestId = requestId;
   const stats = diffStats(diff);
-  $("codeMeta").textContent = `Rendering diff... +${stats.added} -${stats.removed} · ${stats.lines.toLocaleString()} lines`;
-  $("codeView").innerHTML = `<div class="code-empty">Rendering diff...</div>`;
+  $("codeMeta").textContent = `+${stats.added} −${stats.removed} · ${stats.lines.toLocaleString()} lines`;
   $("codeDownload").disabled = true;
+  $("codeView").replaceChildren(renderDiffRows(parseUnifiedDiff(diff)));
+  $("codeView").scrollTop = 0;
+}
 
-  const projectId = state.projectId;
-  const markdown = markdownCodeFence("diff", diff);
-  const cacheKey = projectId + "\n" + markdown;
-  const apply = (html) => {
-    if (!$("codeOverlay").classList.contains("open") || $("codeOverlay").dataset.requestId !== requestId || state.codePath !== null || state.projectId !== projectId) return;
-    $("codeMeta").textContent = `Rendered diff · +${stats.added} -${stats.removed} · ${stats.lines.toLocaleString()} lines`;
-    $("codeView").innerHTML = `<div class="diff-overlay md">${html}</div>`;
-    wireCodeCopy($("codeView"));
-  };
-
-  try {
-    if (state.markdownCache.has(cacheKey)) {
-      apply(state.markdownCache.get(cacheKey));
-      return;
-    }
-    const res = await api("POST", `/api/projects/${projectId}/render`, { text: markdown });
-    const html = res && typeof res.html === "string" ? res.html : "";
-    state.markdownCache.set(cacheKey, html);
-    apply(html);
-  } catch (e) {
-    if (!$("codeOverlay").classList.contains("open") || $("codeOverlay").dataset.requestId !== requestId || state.codePath !== null || state.projectId !== projectId) return;
-    console.warn("Giskard diff render failed; hiding raw diff preview.", e);
-    $("codeMeta").textContent = "Could not render diff";
-    $("codeView").innerHTML = `<div class="code-empty">Could not render diff preview.</div>`;
-  }
+function setCodeCopyDiff(visible) {
+  const btn = $("codeCopyDiff");
+  btn.hidden = !visible;
+  btn.disabled = !visible;
+  if (!visible) btn.textContent = "Copy diff";
 }
 function closeCodeOverlay() {
   $("codeOverlay").classList.remove("open");
@@ -7507,9 +7598,21 @@ function closeCodeOverlay() {
   state.codeLine = null;
   state.codeOverlaySource = null;
   state.outputOverlay = null;
+  state.diffOverlayText = null;
   setCodeSourceToggle(false);
+  setCodeCopyDiff(false);
   cancelOutputOverlayRefresh();
 }
+
+/* The rendered diff is a grid of separate cells, so selecting it by hand would drag the line
+   numbers in with the text; the button hands back exactly what git produced. */
+$("codeCopyDiff").onclick = async () => {
+  const btn = $("codeCopyDiff");
+  if (!state.diffOverlayText) return;
+  const ok = await copyToClipboard(state.diffOverlayText);
+  btn.textContent = ok ? "Copied" : "Copy failed";
+  setTimeout(() => { if (!btn.hidden) btn.textContent = "Copy diff"; }, 1500);
+};
 
 /* ---------- command / tool output overlay ----------
    Reuses the #codeOverlay modal (same head/close/escape/backdrop plumbing as the source and diff
@@ -7608,6 +7711,8 @@ function openOutputOverlay(itemId, kind) {
   $("codeOverlay").classList.add("open");
   $("codeDownload").disabled = false;
   setCodeSourceToggle(false);
+  setCodeCopyDiff(false);
+  state.diffOverlayText = null;
   // Clear any leftover source/diff content so the first render's scroll-pin check starts from an
   // empty view (and a running command opens scrolled to its streaming tail).
   $("codeView").replaceChildren();
