@@ -345,6 +345,7 @@ Cargo workspace under `crates/`:
 | Crate | Responsibility |
 |-------|----------------|
 | `giskard-core` | Harness-neutral domain types (no I/O). |
+| `giskard-git-parser` | Parsers for `git` porcelain v2 and numstat output (no I/O). |
 | `giskard-harness` | The `AgentHarness` trait + capabilities. |
 | `giskard-harness-codex` | Codex CLI adapter (spawns/speaks to `codex app-server`). |
 | `giskard-harness-replay` | Deterministic replay harness for tests. |

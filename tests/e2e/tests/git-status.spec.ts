@@ -88,6 +88,35 @@ test.describe("git status line", () => {
     // No prefix to shed.
     expect(await shorten("main", 60)).toBe("main");
   });
+
+  // An untracked directory is reported collapsed, with a trailing slash. Its own name is what the
+  // reader is looking for, so it has to end up in the bold segment rather than leaving the row
+  // dimmed with an empty filename.
+  test("renders a collapsed untracked directory as its own name", async ({ page }) => {
+    const parts = (path: string) =>
+      page.evaluate(
+        (p) => {
+          const html = (window as never as { renderGitPath: typeof renderGitPath }).renderGitPath(p);
+          const host = document.createElement("div");
+          host.innerHTML = html;
+          return {
+            dir: host.querySelector(".git-file-dir")?.textContent ?? "",
+            name: host.querySelector(".git-file-name")?.textContent ?? "",
+          };
+        },
+        path,
+      );
+
+    expect(await parts("node_modules/")).toEqual({ dir: "", name: "node_modules/" });
+    expect(await parts("crates/giskard-server/target/")).toEqual({
+      dir: "crates/giskard-server/",
+      name: "target/",
+    });
+    // Ordinary files are unaffected: directory dimmed, basename bold.
+    expect(await parts("src/main.rs")).toEqual({ dir: "src/", name: "main.rs" });
+    expect(await parts("README.md")).toEqual({ dir: "", name: "README.md" });
+  });
 });
 
 declare function gitBranchParts(name: string, budget: number): { prefix: string; tail: string };
+declare function renderGitPath(path: string): string;
