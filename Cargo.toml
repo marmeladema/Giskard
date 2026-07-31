@@ -9,12 +9,6 @@ members = [
     "crates/giskard-server",
     "crates/giskard-proto",
 ]
-default-members = [
-    "crates/giskard-core",
-    "crates/giskard-harness",
-    "crates/giskard-persist",
-    "crates/giskard-proto",
-]
 
 [workspace.package]
 version = "0.1.0"
