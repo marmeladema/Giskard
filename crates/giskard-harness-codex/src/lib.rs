@@ -34,7 +34,7 @@ use giskard_core::model::ModelDescriptor;
 use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::text::trimmed_non_empty;
 use giskard_core::token::TokenUsage;
-use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
+use giskard_core::turn::{PermissionPreset, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::{AttachmentKind, UserAttachment, UserInput};
 use giskard_harness::{
     AgentEventStream, AgentHarness, HarnessCapabilities, HarnessNotice, OpenThreadOptions,
@@ -60,6 +60,29 @@ const WORKER_QUEUE_WARN_AFTER: Duration = Duration::from_secs(10);
 const WORKER_QUEUE_WARN_AFTER: Duration = Duration::from_millis(50);
 const THREAD_BACKGROUND_TERMINALS_TERMINATE: &str = "thread/backgroundTerminals/terminate";
 const CODEX_UPLOAD_DIR_NAME: &str = "giskard-codex-uploads";
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigReadParams {
+    include_layers: bool,
+    cwd: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigReadResponse {
+    config: CodexConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexConfig {
+    sandbox_workspace_write: Option<SandboxWorkspaceWrite>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SandboxWorkspaceWrite {
+    #[serde(default)]
+    writable_roots: Vec<PathBuf>,
+}
 
 struct QueuedHarnessCommand {
     token: WorkerQueueToken,
@@ -651,20 +674,28 @@ pub struct CodexHarness {
 
 impl CodexHarness {
     pub async fn start(workspace_root: PathBuf) -> Result<Arc<Self>, HarnessError> {
-        let client = start_codex_client(codex_codes::AppServerBuilder::new()).await?;
-        Self::spawn_harness(client, workspace_root)
+        let workspace_root = normalize_workspace_root(workspace_root)?;
+        let mut client = start_codex_client(codex_codes::AppServerBuilder::new()).await?;
+        let writable_roots = configured_workspace_write_roots(&mut client, &workspace_root).await;
+        Self::spawn_harness(client, workspace_root, writable_roots)
     }
 
     pub async fn start_with(
         workspace_root: PathBuf,
         codex_path: PathBuf,
     ) -> Result<Arc<Self>, HarnessError> {
+        let workspace_root = normalize_workspace_root(workspace_root)?;
         let builder = codex_codes::cli::AppServerBuilder::new().command(codex_path);
-        let client = start_codex_client(builder).await?;
-        Self::spawn_harness(client, workspace_root)
+        let mut client = start_codex_client(builder).await?;
+        let writable_roots = configured_workspace_write_roots(&mut client, &workspace_root).await;
+        Self::spawn_harness(client, workspace_root, writable_roots)
     }
 
-    fn spawn_harness<C>(client: C, workspace_root: PathBuf) -> Result<Arc<Self>, HarnessError>
+    fn spawn_harness<C>(
+        client: C,
+        workspace_root: PathBuf,
+        writable_roots: Vec<PathBuf>,
+    ) -> Result<Arc<Self>, HarnessError>
     where
         C: CodexTransport + 'static,
     {
@@ -703,6 +734,7 @@ impl CodexHarness {
             senders,
             worker_queue,
             workspace_root,
+            writable_roots,
         ));
         Ok(harness)
     }
@@ -738,6 +770,20 @@ impl CodexHarness {
     }
 }
 
+fn normalize_workspace_root(workspace_root: PathBuf) -> Result<PathBuf, HarnessError> {
+    std::path::absolute(&workspace_root).map_err(|error| {
+        warn!(
+            workspace_root = %workspace_root.display(),
+            error = %error,
+            "Rejecting Codex project workspace root that could not be made absolute"
+        );
+        HarnessError::Protocol(format!(
+            "could not make Codex project workspace root {} absolute: {error}",
+            workspace_root.display()
+        ))
+    })
+}
+
 async fn start_codex_client(
     builder: codex_codes::AppServerBuilder,
 ) -> Result<codex_codes::AsyncClient, HarnessError> {
@@ -764,6 +810,53 @@ fn build_initialize_params() -> codex_codes::InitializeParams {
             opt_out_notification_methods: None,
             request_attestation: None,
         }),
+    }
+}
+
+async fn configured_workspace_write_roots(
+    client: &mut dyn CodexTransport,
+    workspace_root: &std::path::Path,
+) -> Vec<PathBuf> {
+    let params = ConfigReadParams {
+        include_layers: false,
+        cwd: workspace_root.to_string_lossy().into_owned(),
+    };
+    let response: Result<ConfigReadResponse, HarnessError> = codex_request(
+        client,
+        CodexOperationContext::new("config_read_workspace_roots"),
+        "config/read",
+        &params,
+    )
+    .await;
+
+    match response {
+        Ok(response) => {
+            let mut roots = vec![workspace_root.to_path_buf()];
+            if let Some(sandbox) = response.config.sandbox_workspace_write {
+                for root in sandbox.writable_roots {
+                    if root.is_absolute() {
+                        roots.push(root);
+                    } else {
+                        warn!(
+                            workspace_root = %workspace_root.display(),
+                            configured_root = %root.display(),
+                            "Ignoring relative Codex configured workspace-write root"
+                        );
+                    }
+                }
+            }
+            roots.sort();
+            roots.dedup();
+            roots
+        }
+        Err(error) => {
+            warn!(
+                workspace_root = %workspace_root.display(),
+                error = %error,
+                "Could not read Codex workspace-write roots; omitting runtimeWorkspaceRoots override and leaving Codex root selection unchanged"
+            );
+            Vec::new()
+        }
     }
 }
 
@@ -1010,6 +1103,7 @@ async fn background_task<C>(
     senders: SenderMap,
     worker_queue: Arc<WorkerQueueWatchdog>,
     workspace_root: PathBuf,
+    writable_roots: Vec<PathBuf>,
 ) where
     C: CodexTransport,
 {
@@ -1141,6 +1235,7 @@ async fn background_task<C>(
                             &thread,
                             &input,
                             &overrides,
+                            &writable_roots,
                         )
                         .await
                         {
@@ -1992,9 +2087,10 @@ async fn handle_start_turn(
     thread: &ThreadHandle,
     input: &UserInput,
     overrides: &TurnOverrides,
+    writable_roots: &[PathBuf],
 ) -> Result<StartedTurn, HarnessError> {
     let prepared = prepare_user_input_for_codex_uploads(client, thread, input).await?;
-    let params = match build_turn_start_params(thread, &prepared.input, overrides) {
+    let params = match build_turn_start_params(thread, &prepared.input, overrides, writable_roots) {
         Ok(params) => params,
         Err(error) => {
             cleanup_codex_upload_dir(client, thread, prepared.upload_dir.as_ref()).await;
@@ -2224,6 +2320,7 @@ fn build_turn_start_params(
     thread: &ThreadHandle,
     input: &UserInput,
     overrides: &TurnOverrides,
+    writable_roots: &[PathBuf],
 ) -> Result<serde_json::Value, HarnessError> {
     let codex_input = mapping::map_user_input(input);
     let codex_approval_policy =
@@ -2247,6 +2344,14 @@ fn build_turn_start_params(
             "turn/start params must serialize as an object".into(),
         ));
     };
+
+    if overrides.permission_preset == PermissionPreset::AutoApprove && !writable_roots.is_empty() {
+        map.insert(
+            "runtimeWorkspaceRoots".into(),
+            serde_json::to_value(writable_roots)
+                .map_err(|error| HarnessError::Protocol(error.to_string()))?,
+        );
+    }
 
     if let Some(model) = overrides.model.as_ref() {
         map.insert("model".into(), serde_json::json!(model.model));
@@ -3071,6 +3176,7 @@ mod tests {
         thread_delete_error: Option<String>,
         thread_resume_missing_rollout_failures: usize,
         model_list_error: Option<String>,
+        config_read_error: Option<String>,
         hang_response_json: bool,
         hang_shutdown: bool,
         requests: Vec<FakeRequest>,
@@ -3155,6 +3261,10 @@ mod tests {
 
         async fn fail_model_list(&self, message: &str) {
             self.state.lock().await.model_list_error = Some(message.into());
+        }
+
+        async fn fail_config_read(&self, message: &str) {
+            self.state.lock().await.config_read_error = Some(message.into());
         }
 
         async fn hang_json_responses(&self) {
@@ -3271,6 +3381,23 @@ mod tests {
                         "data": [],
                         "nextCursor": null
                     })),
+                    "config/read" => {
+                        if let Some(message) = state.config_read_error.clone() {
+                            Err(HarnessError::Transport(message))
+                        } else {
+                            Ok(json!({
+                                "config": {
+                                    "sandbox_workspace_write": {
+                                        "writable_roots": [
+                                            "/home/test/.cache/sccache",
+                                            "relative/cache"
+                                        ]
+                                    }
+                                },
+                                "origins": {}
+                            }))
+                        }
+                    }
                     codex_codes::protocol::methods::MODEL_LIST
                         if state.model_list_error.is_some() =>
                     {
@@ -3409,7 +3536,7 @@ mod tests {
 
     fn spawn_fake_harness() -> (Arc<CodexHarness>, FakeCodexController) {
         let (transport, controller) = fake_codex();
-        let harness = CodexHarness::spawn_harness(transport, PathBuf::from("/tmp"))
+        let harness = CodexHarness::spawn_harness(transport, PathBuf::from("/tmp"), Vec::new())
             .expect("fake harness should spawn");
         (harness, controller)
     }
@@ -3436,6 +3563,7 @@ mod tests {
             &thread,
             &input,
             &build_turn_overrides(),
+            &[],
         )
         .await
         .unwrap();
@@ -3477,6 +3605,7 @@ mod tests {
             &thread,
             &input,
             &build_turn_overrides(),
+            &[],
         )
         .await
         .unwrap();
@@ -4957,11 +5086,110 @@ mod tests {
     }
 
     #[test]
+    fn relative_project_workspace_root_is_normalized() {
+        let relative = PathBuf::from("relative/project");
+        let expected = std::path::absolute(&relative).unwrap();
+
+        assert_eq!(normalize_workspace_root(relative).unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn config_read_resolves_absolute_workspace_write_roots_for_project_cwd() {
+        let (mut transport, controller) = fake_codex();
+        let workspace = PathBuf::from("/tmp/project");
+
+        let roots = configured_workspace_write_roots(&mut transport, &workspace).await;
+
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("/home/test/.cache/sccache"),
+                PathBuf::from("/tmp/project")
+            ]
+        );
+        let requests = controller.requests().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "config/read");
+        assert_eq!(requests[0].params["cwd"], "/tmp/project");
+        assert_eq!(requests[0].params["includeLayers"], false);
+    }
+
+    #[tokio::test]
+    async fn config_read_failure_omits_runtime_workspace_override() {
+        let (mut transport, controller) = fake_codex();
+        controller.fail_config_read("unsupported method").await;
+
+        let roots =
+            configured_workspace_write_roots(&mut transport, std::path::Path::new("/tmp/project"))
+                .await;
+
+        assert!(roots.is_empty());
+    }
+
+    #[test]
+    fn auto_approve_turn_includes_configured_workspace_roots() {
+        let roots = [
+            PathBuf::from("/home/test/.cache/cargo"),
+            PathBuf::from("/home/test/.cache/sccache"),
+        ];
+        let mut overrides = turn_overrides(Mode::Build, None);
+        overrides.permission_preset = PermissionPreset::AutoApprove;
+
+        let params = build_turn_start_params(
+            &test_thread(),
+            &UserInput::text("implement it"),
+            &overrides,
+            &roots,
+        )
+        .unwrap();
+
+        assert_eq!(params["permissions"], ":workspace");
+        assert_eq!(
+            params["runtimeWorkspaceRoots"],
+            json!(["/home/test/.cache/cargo", "/home/test/.cache/sccache"])
+        );
+
+        overrides.permission_preset = PermissionPreset::AskFirst;
+        let params = build_turn_start_params(
+            &test_thread(),
+            &UserInput::text("inspect it"),
+            &overrides,
+            &roots,
+        )
+        .unwrap();
+        assert!(params.get("runtimeWorkspaceRoots").is_none());
+
+        overrides.permission_preset = PermissionPreset::FullAccess;
+        let params = build_turn_start_params(
+            &test_thread(),
+            &UserInput::text("run it"),
+            &overrides,
+            &roots,
+        )
+        .unwrap();
+        assert!(params.get("runtimeWorkspaceRoots").is_none());
+
+        overrides.permission_preset = PermissionPreset::AutoApprove;
+        let params = build_turn_start_params(
+            &test_thread(),
+            &UserInput::text("continue"),
+            &overrides,
+            &roots,
+        )
+        .unwrap();
+        assert_eq!(
+            params["runtimeWorkspaceRoots"],
+            json!(["/home/test/.cache/cargo", "/home/test/.cache/sccache"])
+        );
+    }
+
+    #[test]
     fn plan_turn_start_params_include_plan_collaboration_mode() {
         let params = build_turn_start_params(
             &test_thread(),
             &UserInput::text("make a plan"),
             &turn_overrides(Mode::Plan, Some(Effort::new("medium"))),
+            &[],
         )
         .unwrap();
 
@@ -4986,6 +5214,7 @@ mod tests {
             &test_thread(),
             &UserInput::text("implement it"),
             &turn_overrides(Mode::Build, None),
+            &[],
         )
         .unwrap();
 
@@ -5003,9 +5232,13 @@ mod tests {
         let mut overrides = turn_overrides(Mode::Build, None);
         overrides.permission_preset = PermissionPreset::FullAccess;
 
-        let params =
-            build_turn_start_params(&test_thread(), &UserInput::text("implement it"), &overrides)
-                .unwrap();
+        let params = build_turn_start_params(
+            &test_thread(),
+            &UserInput::text("implement it"),
+            &overrides,
+            &[],
+        )
+        .unwrap();
 
         assert!(params.get("sandboxPolicy").is_none());
         assert_eq!(params["approvalPolicy"], "never");
