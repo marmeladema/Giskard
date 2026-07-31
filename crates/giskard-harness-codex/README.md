@@ -292,6 +292,17 @@ profile and permission preset:
 `turn/start` must not include `sandboxPolicy` when it includes `permissions`;
 Codex treats those fields as mutually exclusive.
 
+After initialization, the adapter calls `config/read` with the project's
+effective working directory and caches
+`sandbox_workspace_write.writable_roots` for that app-server process. Auto
+Approve turns send those paths as `runtimeWorkspaceRoots` alongside
+`permissions: ":workspace"`, so configured Cargo, sccache, Docker, and similar
+external workspace roots remain writable. The project working directory is
+included explicitly because `runtimeWorkspaceRoots` replaces Codex's runtime
+root set. A failed or unsupported config read is logged as a warning and omits
+the override, leaving Codex's current thread roots unchanged. Ask First remains
+read-only, and Full Access does not need additional roots.
+
 ## Model catalog (`model/list`)
 
 The adapter advertises the `model_listing` capability and implements

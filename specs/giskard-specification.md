@@ -3236,6 +3236,12 @@ Artifacts are version-pinned to the Codex binary that produced them; regenerate 
 > "on-request"`**, **Full Access ⇒ `permissions: ":danger-full-access"`, `approvalPolicy:
 > "never"`**. Codex collaboration-mode mapping is sent on every turn too: **Plan ⇒ `plan`**,
 > **Build ⇒ `default`**.
+> After app-server initialization, the Codex adapter resolves the effective
+> `sandbox_workspace_write.writable_roots` with `config/read` for the project working directory.
+> Auto Approve sends the project working directory plus those cached absolute paths as
+> `runtimeWorkspaceRoots` on `turn/start`, so replacing Codex's runtime root set retains both the
+> project and configured external build caches. A failed config read omits the override with a
+> warning, leaving Codex's current thread roots unchanged.
 > The Build/default send is intentional because Codex app-server collaboration mode is sticky after
 > a plan turn. Plan/Build does not select the Codex sandbox; the permission preset does.
 > `TurnOverrides.model` maps
