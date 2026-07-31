@@ -25,7 +25,7 @@ use std::sync::Arc;
 use argon2::PasswordHasher;
 use async_trait::async_trait;
 use tokio::sync::broadcast;
-use tracing::info;
+use tracing::{info, warn};
 
 use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalRequest};
 use giskard_core::error::HarnessError;
@@ -800,6 +800,9 @@ async fn run() -> Result<(), String> {
         env_path("GISKARD_REPLAY_WORKSPACE").unwrap_or_else(|| data_dir.join("demo-workspace"));
     std::fs::create_dir_all(&workspace)
         .map_err(|e| format!("cannot create workspace {}: {e}", workspace.display()))?;
+    if let Err(error) = seed_git_workspace(&workspace) {
+        warn!(workspace = %workspace.display(), %error, "could not seed replay workspace git repository");
+    }
 
     let projects = store
         .load_project_index()
@@ -842,4 +845,53 @@ async fn run() -> Result<(), String> {
         .await
         .map_err(|e| format!("server error: {e}"))?;
     Ok(())
+}
+
+fn seed_git_workspace(workspace: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(workspace.join("src"))
+        .map_err(|e| format!("cannot create demo source dir: {e}"))?;
+    std::fs::write(
+        workspace.join("README.md"),
+        "# Demo workspace\n\nSeeded for Giskard screenshots.\n",
+    )
+    .map_err(|e| format!("cannot write demo README: {e}"))?;
+    std::fs::write(
+        workspace.join("src/main.rs"),
+        "fn main() {\n    println!(\"hello from demo\");\n}\n",
+    )
+    .map_err(|e| format!("cannot write demo source: {e}"))?;
+
+    run_git_seed(workspace, ["init"])?;
+    run_git_seed(workspace, ["checkout", "-B", "main"])?;
+    run_git_seed(
+        workspace,
+        ["config", "user.email", "giskard-replay@example.invalid"],
+    )?;
+    run_git_seed(workspace, ["config", "user.name", "Giskard Replay"])?;
+    run_git_seed(workspace, ["add", "README.md", "src/main.rs"])?;
+    run_git_seed(workspace, ["commit", "-m", "Seed demo workspace"])?;
+
+    std::fs::write(
+        workspace.join("src/main.rs"),
+        "fn main() {\n    println!(\"hello from demo\");\n    println!(\"edited for status\");\n}\n",
+    )
+    .map_err(|e| format!("cannot modify demo source: {e}"))?;
+    Ok(())
+}
+
+fn run_git_seed<const N: usize>(workspace: &Path, args: [&str; N]) -> Result<(), String> {
+    let output = std::process::Command::new("git")
+        .current_dir(workspace)
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(if stderr.is_empty() {
+        "git command failed".into()
+    } else {
+        stderr
+    })
 }

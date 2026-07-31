@@ -119,8 +119,8 @@ Then open **http://127.0.0.1:8787**, log in, and:
    to include images, PDFs, or other files with the message. A message accepts up to eight files
    and 25 MiB total. The first send creates the Codex thread with the selected
    provider/model and starts the turn. Existing threads show the **Tasks** menu for running
-   commands/tools, **Sub-agents** monitor, **MCP** status menu, and **Context** usage button;
-   scrolling the transcript to the top lazy-loads older history.
+   commands/tools, **Git** branch/status menu, **Sub-agents** monitor, **MCP** status menu, and
+   **Context** usage button; scrolling the transcript to the top lazy-loads older history.
 4. Linked child threads appear in the **Sub-agents** monitor and can be opened from their activity
    rows; their header **Parent** button returns to the owning thread. See
    [Sub-agent threads](docs/subagents.md) for spawning protocols, monitoring, prompts, direct

@@ -127,6 +127,16 @@
         </button>
         <div class="plan-card-body" id="planCardBody" hidden></div>
       </div>
+      <div class="git-row" id="gitRow" hidden>
+        <div class="git-wrap">
+          <button id="gitBtn" class="git-btn state-unavailable" title="Git status" aria-label="Git status">
+            <span class="git-label">Git</span>
+            <span id="gitBranch" class="git-branch mono">-</span>
+            <span id="gitCount" class="git-status-badge">No repo</span>
+          </button>
+          <div id="gitMenu" class="git-popover" hidden></div>
+        </div>
+      </div>
       <div class="composer" id="composer" style="display:none">
         <input id="attachmentInput" type="file" multiple hidden />
         <button id="attachBtn" type="button" title="Attach files" aria-label="Attach files">＋</button>

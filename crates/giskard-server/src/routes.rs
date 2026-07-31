@@ -1,5 +1,5 @@
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -29,6 +29,7 @@ use giskard_core::user_input::UserInput;
 use giskard_persist::Config;
 use giskard_persist::store::{ProjectConfig, ThreadFile};
 use giskard_proto::*;
+use tokio::process::Command as TokioCommand;
 use tokio::sync::mpsc;
 
 use crate::AppState;
@@ -52,6 +53,7 @@ const MAX_ATTACHMENT_HTTP_BODY_BYTES: usize = 40 * 1024 * 1024;
 const MAX_WS_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ATTACHMENT_NAME_BYTES: usize = 255;
 const MAX_ATTACHMENT_MIME_BYTES: usize = 127;
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub fn protected_routes(state: AppState) -> Router<AppState> {
     Router::new()
@@ -88,6 +90,8 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
         .route("/api/projects/{id}/highlight", get(highlight_file))
         .route("/api/projects/{id}/raw", get(download_file))
         .route("/api/projects/{id}/image", get(image_file))
+        .route("/api/projects/{id}/git/status", get(git_status))
+        .route("/api/projects/{id}/git/diff", get(git_diff))
         .route("/api/projects/{id}/linkify", post(linkify))
         .route("/api/projects/{id}/render", post(render_markdown))
         .route("/api/browse", get(browse))
@@ -1808,6 +1812,55 @@ mod tests {
     }
 
     #[test]
+    fn parses_git_status_porcelain_z_records() {
+        let status = parse_git_status(
+            b"## main...origin/main [ahead 2, behind 1]\0 M src/lib.rs\0A  src/new.rs\0?? notes.txt\0",
+        );
+
+        assert!(status.is_repository);
+        assert_eq!(status.branch.as_deref(), Some("main"));
+        assert_eq!(status.ahead, 2);
+        assert_eq!(status.behind, 1);
+        assert!(status.dirty);
+        assert_eq!(status.staged_count, 1);
+        assert_eq!(status.unstaged_count, 1);
+        assert_eq!(status.untracked_count, 1);
+        assert_eq!(status.files[0].path, "src/lib.rs");
+        assert_eq!(status.files[0].index_status, "unmodified");
+        assert_eq!(status.files[0].worktree_status, "modified");
+        assert_eq!(status.files[1].kind, "added");
+        assert_eq!(status.files[2].kind, "untracked");
+    }
+
+    #[test]
+    fn parses_git_status_rename_and_detached_head() {
+        let status =
+            parse_git_status(b"## HEAD (detached at abc1234)\0R  new name.txt\0old name.txt\0");
+
+        assert!(status.detached);
+        assert_eq!(status.head.as_deref(), Some("abc1234"));
+        assert_eq!(status.files.len(), 1);
+        assert_eq!(status.files[0].kind, "renamed");
+        assert_eq!(status.files[0].path, "new name.txt");
+        assert_eq!(status.files[0].old_path.as_deref(), Some("old name.txt"));
+    }
+
+    #[test]
+    fn git_diff_path_rejects_workspace_escape() {
+        assert_eq!(
+            safe_git_relative_path("src/lib.rs").as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            safe_git_relative_path("./src/lib.rs").as_deref(),
+            Some("src/lib.rs")
+        );
+        assert!(safe_git_relative_path("../secrets").is_none());
+        assert!(safe_git_relative_path("/tmp/file").is_none());
+        assert!(safe_git_relative_path("").is_none());
+    }
+
+    #[test]
     fn thread_title_uses_first_meaningful_prompt_line() {
         let title = thread_title_from_first_prompt(
             r#"
@@ -2278,6 +2331,321 @@ fn resolve_confined_path(workspace_root: &Path, requested: &str) -> Option<PathB
         Some(canonical)
     } else {
         None
+    }
+}
+
+async fn git_status(
+    State(state): State<AppState>,
+    AxumPath(project_id): AxumPath<ProjectId>,
+) -> Result<Json<GitStatusResponse>, ApiError> {
+    let project = state
+        .store
+        .load_project(project_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let workspace_root = PathBuf::from(project.workspace_root.as_deref().unwrap_or(&project.dir));
+    Ok(Json(git_status_for_workspace(&workspace_root).await))
+}
+
+#[derive(Deserialize)]
+struct GitDiffQuery {
+    path: String,
+}
+
+async fn git_diff(
+    State(state): State<AppState>,
+    AxumPath(project_id): AxumPath<ProjectId>,
+    Query(q): Query<GitDiffQuery>,
+) -> Result<Json<GitDiffResponse>, ApiError> {
+    let project = state
+        .store
+        .load_project(project_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let workspace_root = PathBuf::from(project.workspace_root.as_deref().unwrap_or(&project.dir));
+    let relative_path = safe_git_relative_path(&q.path)
+        .ok_or_else(|| ApiError::Forbidden("path escapes workspace root".into()))?;
+
+    let staged = run_git(
+        &workspace_root,
+        ["diff", "--cached", "--no-ext-diff", "--"],
+        [relative_path.as_str()],
+    )
+    .await?;
+    let unstaged = run_git(
+        &workspace_root,
+        ["diff", "--no-ext-diff", "--"],
+        [relative_path.as_str()],
+    )
+    .await?;
+    if !staged.status.success() || !unstaged.status.success() {
+        let stderr = first_non_empty_stderr(&[&staged, &unstaged])
+            .unwrap_or_else(|| "git diff failed".into());
+        return Err(ApiError::BadRequest(stderr));
+    }
+
+    let mut diff = String::new();
+    let staged_text = String::from_utf8_lossy(&staged.stdout);
+    let unstaged_text = String::from_utf8_lossy(&unstaged.stdout);
+    if !staged_text.trim().is_empty() {
+        diff.push_str(&staged_text);
+        if !diff.ends_with('\n') {
+            diff.push('\n');
+        }
+    }
+    if !unstaged_text.trim().is_empty() {
+        diff.push_str(&unstaged_text);
+    }
+    let is_empty = diff.trim().is_empty();
+    Ok(Json(GitDiffResponse {
+        path: relative_path,
+        diff,
+        is_empty,
+    }))
+}
+
+async fn git_status_for_workspace(workspace_root: &Path) -> GitStatusResponse {
+    let status = match run_git(
+        workspace_root,
+        [
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "-b",
+            "--untracked-files=all",
+            "--",
+        ],
+        ["."],
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            return GitStatusResponse {
+                is_repository: false,
+                branch: None,
+                head: None,
+                detached: false,
+                ahead: 0,
+                behind: 0,
+                dirty: false,
+                staged_count: 0,
+                unstaged_count: 0,
+                untracked_count: 0,
+                files: Vec::new(),
+                error: Some(error.to_string()),
+            };
+        }
+    };
+
+    if !status.status.success() {
+        let message = String::from_utf8_lossy(&status.stderr).trim().to_string();
+        return GitStatusResponse {
+            is_repository: false,
+            branch: None,
+            head: None,
+            detached: false,
+            ahead: 0,
+            behind: 0,
+            dirty: false,
+            staged_count: 0,
+            unstaged_count: 0,
+            untracked_count: 0,
+            files: Vec::new(),
+            error: if message.is_empty() {
+                None
+            } else {
+                Some(message)
+            },
+        };
+    }
+
+    parse_git_status(&status.stdout)
+}
+
+async fn run_git<const A: usize, const P: usize>(
+    workspace_root: &Path,
+    args: [&str; A],
+    paths: [&str; P],
+) -> Result<std::process::Output, ApiError> {
+    let mut cmd = TokioCommand::new("git");
+    cmd.current_dir(workspace_root).args(args).args(paths);
+    tokio::time::timeout(GIT_COMMAND_TIMEOUT, cmd.output())
+        .await
+        .map_err(|_| ApiError::Unavailable("git command timed out".into()))?
+        .map_err(|e| ApiError::Unavailable(format!("failed to run git: {e}")))
+}
+
+fn first_non_empty_stderr(outputs: &[&std::process::Output]) -> Option<String> {
+    outputs.iter().find_map(|output| {
+        let text = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if text.is_empty() { None } else { Some(text) }
+    })
+}
+
+fn safe_git_relative_path(path: &str) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || Path::new(trimmed).is_absolute() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for component in Path::new(trimmed).components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_string_lossy().to_string()),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+fn parse_git_status(output: &[u8]) -> GitStatusResponse {
+    let mut branch = None;
+    let mut head = None;
+    let mut detached = false;
+    let mut ahead = 0;
+    let mut behind = 0;
+    let mut files = Vec::new();
+    let mut records = output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty());
+    while let Some(record) = records.next() {
+        if let Some(raw) = record.strip_prefix(b"## ") {
+            let header = String::from_utf8_lossy(raw);
+            let parsed = parse_git_status_header(&header);
+            branch = parsed.branch;
+            head = parsed.head;
+            detached = parsed.detached;
+            ahead = parsed.ahead;
+            behind = parsed.behind;
+            continue;
+        }
+        if record.len() < 4 {
+            continue;
+        }
+        let index = record[0] as char;
+        let worktree = record[1] as char;
+        let path = String::from_utf8_lossy(&record[3..]).to_string();
+        let old_path = if matches!(index, 'R' | 'C') || matches!(worktree, 'R' | 'C') {
+            records
+                .next()
+                .map(|old| String::from_utf8_lossy(old).to_string())
+        } else {
+            None
+        };
+        files.push(GitFileStatus {
+            kind: git_file_kind(index, worktree).into(),
+            path,
+            old_path,
+            index_status: git_status_name(index).into(),
+            worktree_status: git_status_name(worktree).into(),
+        });
+    }
+
+    let staged_count = files
+        .iter()
+        .filter(|file| file.index_status != "unmodified" && file.index_status != "untracked")
+        .count();
+    let unstaged_count = files
+        .iter()
+        .filter(|file| file.worktree_status != "unmodified" && file.worktree_status != "untracked")
+        .count();
+    let untracked_count = files.iter().filter(|file| file.kind == "untracked").count();
+    GitStatusResponse {
+        is_repository: true,
+        branch,
+        head,
+        detached,
+        ahead,
+        behind,
+        dirty: !files.is_empty(),
+        staged_count,
+        unstaged_count,
+        untracked_count,
+        files,
+        error: None,
+    }
+}
+
+#[derive(Default)]
+struct ParsedGitHeader {
+    branch: Option<String>,
+    head: Option<String>,
+    detached: bool,
+    ahead: u32,
+    behind: u32,
+}
+
+fn parse_git_status_header(header: &str) -> ParsedGitHeader {
+    let mut parsed = ParsedGitHeader::default();
+    let (name_part, tracking_part) = header
+        .split_once(" [")
+        .map(|(name, rest)| (name, Some(rest.trim_end_matches(']'))))
+        .unwrap_or((header, None));
+    let local = name_part.split("...").next().unwrap_or(name_part).trim();
+    if local.starts_with("HEAD (no branch)") {
+        parsed.detached = true;
+    } else if let Some(detached_head) = local
+        .strip_prefix("HEAD (detached at ")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        parsed.detached = true;
+        parsed.head = Some(detached_head.into());
+    } else if let Some(detached_head) = local
+        .strip_prefix("HEAD (detached from ")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        parsed.detached = true;
+        parsed.head = Some(detached_head.into());
+    } else if !local.is_empty() {
+        parsed.branch = Some(local.into());
+    }
+    if let Some(tracking) = tracking_part {
+        for part in tracking.split(',').map(str::trim) {
+            if let Some(value) = part.strip_prefix("ahead ") {
+                parsed.ahead = value.parse().unwrap_or(0);
+            } else if let Some(value) = part.strip_prefix("behind ") {
+                parsed.behind = value.parse().unwrap_or(0);
+            }
+        }
+    }
+    parsed
+}
+
+fn git_status_name(status: char) -> &'static str {
+    match status {
+        ' ' => "unmodified",
+        'M' => "modified",
+        'A' => "added",
+        'D' => "deleted",
+        'R' => "renamed",
+        'C' => "copied",
+        'U' => "unmerged",
+        '?' => "untracked",
+        '!' => "ignored",
+        _ => "unknown",
+    }
+}
+
+fn git_file_kind(index: char, worktree: char) -> &'static str {
+    if index == '?' && worktree == '?' {
+        "untracked"
+    } else if matches!(index, 'R' | 'C') {
+        git_status_name(index)
+    } else if matches!(worktree, 'R' | 'C') {
+        git_status_name(worktree)
+    } else if index == 'D' || worktree == 'D' {
+        "deleted"
+    } else if index == 'A' || worktree == 'A' {
+        "added"
+    } else if index == 'U' || worktree == 'U' {
+        "unmerged"
+    } else {
+        "modified"
     }
 }
 

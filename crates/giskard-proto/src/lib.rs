@@ -340,6 +340,42 @@ pub struct ProjectSummary {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct GitFileStatus {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    pub index_status: String,
+    pub worktree_status: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GitStatusResponse {
+    pub is_repository: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    pub detached: bool,
+    pub ahead: u32,
+    pub behind: u32,
+    pub dirty: bool,
+    pub staged_count: usize,
+    pub unstaged_count: usize,
+    pub untracked_count: usize,
+    pub files: Vec<GitFileStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GitDiffResponse {
+    pub path: String,
+    pub diff: String,
+    pub is_empty: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ListProjectsResponse {
     pub projects: Vec<ProjectSummary>,
 }

@@ -164,6 +164,7 @@ let state = {
   linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, codeOverlaySource:null, outputOverlay:null, activeTurn:false, interruptPending:false, compactPending:false,
   awaitingInitialThreadState:false, awaitingThreadResync:false, awaitingIncrementalResync:false, resyncStickBottom:false, contextWindow:0, contextUsed:null, permissionPreset:"ask_first", currentModel:null,
   pendingLiveSnapshotReconcile:false,
+  gitStatus:null, gitProjectId:null, gitLoading:false, gitError:null, gitRequestSeq:0,
   mcpServers:[], mcpCapabilities:{ status:false, reload:false, oauth_login:false }, mcpLoading:false, mcpError:null, expandedMcps:new Set(),
   threadReadOnly:false, readOnlyProvider:null, readOnlyMessage:null,
   pickerTypeahead:"", pickerTypeaheadTimer:null, pickerSelectedRow:null,
@@ -1733,8 +1734,10 @@ function clearThreadView(tid) {
   state.awaitingIncrementalResync = false;
   state.resyncStickBottom = false;
   state.pendingLiveSnapshotReconcile = false;
+  resetGitState();
   resetRenderState();
   $("thrHeader").style.display="none"; $("composer").style.display="none";
+  $("gitRow").hidden = true;
   $("pickerBar").style.display="none"; closeModelPicker(); closeTurnPicker();
   $("transcript").innerHTML="";
   restoreComposerDraft();
@@ -2110,8 +2113,10 @@ function openDraftThread(pid) {
   state.compactPending = false;
   state.currentModel = null;
   prepareProjectModelCatalog(pid);
+  resetGitState(pid);
   state.mcpServers = []; state.mcpError = null; state.expandedMcps = new Set();
   state.mcpCapabilities = { status:false, reload:false, oauth_login:false };
+  $("gitMenu").hidden = true;
   $("tasksMenu").hidden = true;
   $("subagentsMenu").hidden = true;
   $("mcpMenu").hidden = true;
@@ -2140,6 +2145,7 @@ function openDraftThread(pid) {
   $("transcript").className=""; $("notices").innerHTML="";
   renderDraftPlaceholder();
   setWsStatus("draft", "Draft thread. Send a message to create it.");
+  loadGitStatus(pid);
   syncModelControls();
   closeDrawers();
   restoreComposerDraft();
@@ -2181,14 +2187,17 @@ async function openThread(pid, tid, title, opts) {
   state.currentModel = null;
   prepareProjectModelCatalog(pid);
   $("effortControl").hidden = true;
+  resetGitState(pid);
   state.mcpServers = []; state.mcpError = null; state.expandedMcps = new Set();
   state.mcpCapabilities = { status:false, reload:false, oauth_login:false };
+  $("gitMenu").hidden = true;
   $("tasksMenu").hidden = true;
   $("subagentsMenu").hidden = true;
   $("mcpMenu").hidden = true;
   $("usageMenu").hidden = true;
   renderMcpButton();
   renderSubagentsButton();
+  loadGitStatus(pid);
   loadMcpServers({ announce:false });
   loadProjectModels(pid);   // load this project's model list (config + discovery + Codex names)
   setTurnActive(false);
@@ -5228,6 +5237,205 @@ function renderRunningCommands() {
   renderTasksButton(cmds);
   if (!$("tasksMenu").hidden) renderTasksMenu(cmds);
 }
+
+function resetGitState(pid) {
+  state.gitStatus = null;
+  state.gitProjectId = pid || null;
+  state.gitLoading = false;
+  state.gitError = null;
+  state.gitRequestSeq += 1;
+  renderGitButton();
+}
+
+function gitDirtyCount(status) {
+  return status && Array.isArray(status.files) ? status.files.length : 0;
+}
+
+function gitBranchLabel(status) {
+  if (!status || !status.is_repository) return "-";
+  if (status.branch) return status.branch;
+  if (status.head) return status.head;
+  return status.detached ? "detached" : "HEAD";
+}
+
+function gitButtonState() {
+  if (state.gitLoading) return "loading";
+  if (state.gitError) return "error";
+  const status = state.gitStatus;
+  if (!status || !status.is_repository) return "unavailable";
+  return status.dirty ? "dirty" : "clean";
+}
+
+function renderGitButton() {
+  const btn = $("gitBtn");
+  if (!btn) return;
+  const row = $("gitRow");
+  const status = state.gitStatus;
+  const stateName = gitButtonState();
+  if (row) {
+    row.hidden = !state.projectId || !status || !status.is_repository || !!state.gitError;
+  }
+  if (row && row.hidden) $("gitMenu").hidden = true;
+  btn.className = `git-btn state-${stateName}`;
+  const dirty = gitDirtyCount(status);
+  $("gitBranch").textContent = state.gitLoading && !status ? "..." : gitBranchLabel(status);
+  $("gitCount").textContent = gitStatusBadgeLabel(status, stateName, dirty);
+  btn.disabled = !state.projectId;
+  if (state.gitError) btn.title = "Git status unavailable: " + state.gitError;
+  else if (status && status.is_repository) btn.title = dirty ? `${dirty} changed file${dirty === 1 ? "" : "s"}` : "Working tree clean";
+  else btn.title = "No Git repository detected";
+  if (!$("gitMenu").hidden) renderGitMenu();
+}
+
+function gitStatusBadgeLabel(status, stateName, dirty) {
+  if (stateName === "loading") return "Loading";
+  if (stateName === "error") return "Error";
+  if (!status || !status.is_repository) return "No repo";
+  return dirty ? `${dirty} changed` : "Clean";
+}
+
+async function loadGitStatus(pid) {
+  pid = pid || state.projectId;
+  if (!pid) return;
+  const requestSeq = ++state.gitRequestSeq;
+  state.gitProjectId = pid;
+  state.gitLoading = true;
+  state.gitError = null;
+  renderGitButton();
+  try {
+    const res = await api("GET", `/api/projects/${pid}/git/status`);
+    if (requestSeq !== state.gitRequestSeq || state.projectId !== pid) return;
+    state.gitStatus = res;
+    state.gitError = res && res.error ? res.error : null;
+  } catch (e) {
+    if (requestSeq !== state.gitRequestSeq || state.projectId !== pid) return;
+    state.gitStatus = null;
+    state.gitError = e.message || "Could not load git status.";
+  } finally {
+    if (requestSeq === state.gitRequestSeq && state.projectId === pid) {
+      state.gitLoading = false;
+      renderGitButton();
+    }
+  }
+}
+
+function toggleGitMenu() {
+  const menu = $("gitMenu");
+  menu.hidden = !menu.hidden;
+  if (!menu.hidden) {
+    $("tasksMenu").hidden = true;
+    $("subagentsMenu").hidden = true;
+    $("mcpMenu").hidden = true;
+    $("usageMenu").hidden = true;
+    renderGitMenu();
+    loadGitStatus(state.projectId);
+  }
+}
+
+function renderGitMenu() {
+  const menu = $("gitMenu");
+  const status = state.gitStatus;
+  const branch = gitBranchLabel(status);
+  const body = state.gitError
+    ? `<div class="meta">Error: ${escapeHtml(state.gitError)}</div>`
+    : state.gitLoading && !status
+      ? `<div class="muted">Loading git status...</div>`
+      : !status || !status.is_repository
+        ? `<div class="muted">No Git repository detected for this project workspace.</div>`
+        : renderGitStatusBody(status);
+  menu.innerHTML = `
+    <div class="git-head">
+      <strong>Git: <span class="mono">${escapeHtml(branch)}</span></strong>
+      <button id="gitRefresh" type="button">Refresh</button>
+      <button id="gitClose" type="button">Close</button>
+    </div>
+    ${body}`;
+  $("gitRefresh").onclick = () => loadGitStatus(state.projectId);
+  $("gitClose").onclick = () => { $("gitMenu").hidden = true; };
+  menu.querySelectorAll("[data-git-diff]").forEach(btn => {
+    btn.onclick = () => openGitDiff(btn.dataset.gitDiff);
+  });
+}
+
+function renderGitStatusBody(status) {
+  const dirty = gitDirtyCount(status);
+  const aheadBehind = [
+    status.ahead ? `${status.ahead} ahead` : "",
+    status.behind ? `${status.behind} behind` : ""
+  ].filter(Boolean).join(" · ");
+  const summary = [
+    dirty ? `${dirty} changed` : "Working tree clean",
+    status.staged_count ? `${status.staged_count} staged` : "",
+    status.unstaged_count ? `${status.unstaged_count} unstaged` : "",
+    status.untracked_count ? `${status.untracked_count} untracked` : "",
+    aheadBehind
+  ].filter(Boolean).join(" · ");
+  const files = Array.isArray(status.files) ? status.files : [];
+  const rows = files.map(renderGitFileRow).join("");
+  return `
+    <div class="git-summary">${escapeHtml(summary)}</div>
+    <div class="git-list">${rows || `<div class="muted">No changed files.</div>`}</div>`;
+}
+
+function renderGitFileRow(file) {
+  const path = String((file && file.path) || "");
+  const oldPath = file && file.old_path ? String(file.old_path) : "";
+  const status = gitFileStatusLabel(file);
+  const meta = oldPath ? `${oldPath} -> ${path}` : (file.kind || "");
+  const canDiff = file && file.kind !== "untracked";
+  const diff = canDiff
+    ? `<button type="button" data-git-diff="${escapeAttr(path)}">View diff</button>`
+    : `<span class="muted">No diff</span>`;
+  return `<div class="git-file">
+    <span class="git-file-status mono">${escapeHtml(status)}</span>
+    <span class="git-file-path mono" title="${escapeAttr(path)}">${escapeHtml(path)}${meta ? `<span class="git-file-meta">${escapeHtml(meta)}</span>` : ""}</span>
+    ${diff}
+  </div>`;
+}
+
+function gitFileStatusLabel(file) {
+  if (!file) return "";
+  if (file.kind === "untracked") return "??";
+  const index = gitStatusCode(file.index_status);
+  const worktree = gitStatusCode(file.worktree_status);
+  return `${index}${worktree}`;
+}
+
+function gitStatusCode(status) {
+  if (status === "unmodified") return " ";
+  if (status === "modified") return "M";
+  if (status === "added") return "A";
+  if (status === "deleted") return "D";
+  if (status === "renamed") return "R";
+  if (status === "copied") return "C";
+  if (status === "unmerged") return "U";
+  if (status === "untracked") return "?";
+  return "?";
+}
+
+async function openGitDiff(path) {
+  if (!state.projectId || !path) return;
+  try {
+    const res = await api("GET", `/api/projects/${state.projectId}/git/diff?path=${encodeURIComponent(path)}`);
+    if (!res || res.is_empty || !String(res.diff || "").trim()) {
+      notice(`No diff available for ${path}.`, "warning");
+      return;
+    }
+    openDiffOverlay(path, res.diff);
+  } catch (e) {
+    notice("Could not load git diff: " + apiFailureMessage(e), "error");
+  }
+}
+
+$("gitBtn").onclick = (e) => { e.stopPropagation(); toggleGitMenu(); };
+$("gitMenu").onclick = (e) => e.stopPropagation();
+document.addEventListener("click", (e) => {
+  const menu = $("gitMenu");
+  if (menu.hidden) return;
+  if (e.target.closest && e.target.closest(".git-wrap")) return;
+  menu.hidden = true;
+});
+
 function renderTasksButton(cmds) {
   cmds = cmds || Array.from(state.runningCommands.values());
   const btn = $("tasksBtn");
@@ -5365,6 +5573,7 @@ function toggleSubagentsMenu() {
   const menu = $("subagentsMenu");
   menu.hidden = !menu.hidden;
   if (!menu.hidden) {
+    $("gitMenu").hidden = true;
     $("tasksMenu").hidden = true;
     $("mcpMenu").hidden = true;
     $("usageMenu").hidden = true;
@@ -5453,6 +5662,7 @@ function toggleTasksMenu() {
   const menu = $("tasksMenu");
   menu.hidden = !menu.hidden;
   if (!menu.hidden) {
+    $("gitMenu").hidden = true;
     $("subagentsMenu").hidden = true;
     $("mcpMenu").hidden = true;
     $("usageMenu").hidden = true;
@@ -6800,6 +7010,7 @@ function toggleMcpMenu() {
   const menu = $("mcpMenu");
   menu.hidden = !menu.hidden;
   if (!menu.hidden) {
+    $("gitMenu").hidden = true;
     $("tasksMenu").hidden = true;
     $("subagentsMenu").hidden = true;
     $("usageMenu").hidden = true;
@@ -8039,6 +8250,7 @@ document.addEventListener("keydown", (e) => {
     closeSettingsMenu();
     closeModelPicker();
     closeTurnPicker();
+    $("gitMenu").hidden = true;
     closeDrawers();
   }
 });
@@ -8089,6 +8301,7 @@ function toggleUsageMenu() {
   const menu = $("usageMenu");
   menu.hidden = !menu.hidden;
   if (!menu.hidden) {
+    $("gitMenu").hidden = true;
     $("tasksMenu").hidden = true;
     $("subagentsMenu").hidden = true;
     $("mcpMenu").hidden = true;

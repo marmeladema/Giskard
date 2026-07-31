@@ -11,7 +11,8 @@ WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticke
 /api/models/refresh`, `GET /api/projects/{id}/models`,
 `GET /api/tokens`, `GET /api/projects/{id}/tokens`,
 `GET /api/projects/{id}/highlight|raw|image`, `POST
-/api/projects/{id}/linkify`, `POST /api/projects/{id}/render`, `GET /api/browse`, `POST
+/api/projects/{id}/linkify`, `POST /api/projects/{id}/render`,
+`GET /api/projects/{id}/git/status`, `GET /api/projects/{id}/git/diff`, `GET /api/browse`, `POST
 /api/browse/mkdir`, `GET /api/projects/{id}/mcp`, `POST /api/projects/{id}/mcp/reload`, and `POST
 /api/projects/{id}/mcp/oauth-login`. Wire types are defined once in `giskard-proto`. See
 [§13.6](../specs/giskard-specification.md) for the message protocol.
@@ -43,3 +44,11 @@ verifies the agent actually applied the switch before persisting it, and the thr
 again with its history intact. The same verified switch works for any thread that hasn't been
 opened since the server started; threads with a live agent session stay bound to their provider
 (create a new thread to change providers there).
+
+`GET /api/projects/{id}/git/status` returns best-effort, read-only Git metadata for the project's
+effective workspace root: current branch or detached head, ahead/behind counts when Git reports
+them, dirty counts, and the changed file list. Non-Git workspaces return `is_repository: false`
+rather than failing the project. `GET /api/projects/{id}/git/diff?path=...` returns the staged and
+unstaged diff for one workspace-relative path. The path is lexical workspace-relative only:
+absolute paths and `..` escapes are rejected, so deleted files can still be diffed without allowing
+access outside the workspace.
