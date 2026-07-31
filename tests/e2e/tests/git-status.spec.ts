@@ -40,6 +40,200 @@ test.describe("git status line", () => {
     await expect(page.locator("#codePath")).toHaveText("Diff: src/main.rs");
   });
 
+  // The diff is laid out like a source file — two gutters and one row per line — rather than as a
+  // markdown code block nested inside the overlay.
+  test("renders a diff as source, with a line number on each side", async ({ page }) => {
+    await page.locator("#gitLineToggle").click();
+    await page.locator('.git-file[data-git-diff="src/main.rs"]').click();
+    await expect(page.locator("#codeOverlay")).toHaveClass(/\bopen\b/);
+
+    // No markdown code block, and no nested box for it to sit in.
+    await expect(page.locator("#codeView .code-block")).toHaveCount(0);
+    await expect(page.locator("#codeView .diff-table")).toHaveCount(1);
+    await expect(page.locator("#codeView .diff-line-nos")).toHaveCount(2);
+
+    const rows = await page.evaluate(() => {
+      const gutters = document.querySelectorAll("#codeView .diff-line-nos");
+      const old = [...gutters[0].children].map((cell) => cell.textContent ?? "");
+      const fresh = [...gutters[1].children].map((cell) => cell.textContent ?? "");
+      return [...document.querySelectorAll("#codeView .diff-line")].map((line, i) => ({
+        kind: (line.className.match(/diff-(add|del|hunk|meta|context)/) ?? [])[1] ?? "",
+        text: line.textContent ?? "",
+        old: old[i] ?? "",
+        new: fresh[i] ?? "",
+      }));
+    });
+
+    // Every line has a row, and the three columns stay in step.
+    expect(rows.length).toBeGreaterThan(4);
+    // The file header carries no line number on either side.
+    expect(rows[0]).toMatchObject({ kind: "meta", old: "", new: "" });
+    expect(rows.some((r) => r.kind === "hunk" && r.old === "" && r.new === "")).toBe(true);
+
+    // The seed adds one line to a three-line file, so the two sides diverge after it:
+    //
+    //   1  1   fn main() {
+    //   2  2       println!("hello from demo");
+    //      3   +   println!("edited for status");
+    //   3  4   }
+    //
+    // The line after the addition is the assertion that matters — old 3 against new 4 is what
+    // shows the gutters counting independently rather than one number printed twice.
+    const addedAt = rows.findIndex((r) => r.kind === "add");
+    expect(addedAt, "the seeded workspace has an added line").toBeGreaterThan(0);
+    expect(rows[addedAt].text.startsWith("+")).toBe(true);
+    expect(rows[addedAt]).toMatchObject({ old: "", new: "3" });
+
+    const after = rows[addedAt + 1];
+    expect(after).toMatchObject({ kind: "context", old: "3", new: "4" });
+
+    // And before it, the sides agree.
+    expect(rows[addedAt - 1]).toMatchObject({ kind: "context", old: "2", new: "2" });
+  });
+
+  // The same overlay renders the diffs on transcript file-change rows, and those come from the
+  // agent rather than from `git`: the Codex adapter passes through a bare hunk with no `diff --git`
+  // header at all. The replay harness emits no file-change items, so the renderer is driven
+  // directly with the shapes that path produces.
+  test("renders an agent's headerless diff", async ({ page }) => {
+    const render = async (diff: string) => {
+      await page.evaluate((d) => openDiffOverlay("agent.rs", d), diff);
+      return page.evaluate(() => {
+        const gutters = document.querySelectorAll("#codeView .diff-line-nos");
+        const old = [...gutters[0].children].map((c) => c.textContent ?? "");
+        const fresh = [...gutters[1].children].map((c) => c.textContent ?? "");
+        return [...document.querySelectorAll("#codeView .diff-line")].map((line, i) => ({
+          kind: (line.className.match(/diff-(add|del|hunk|meta|context)/) ?? [])[1] ?? "",
+          old: old[i] ?? "",
+          new: fresh[i] ?? "",
+        }));
+      });
+    };
+
+    // What the Codex adapter actually sends: a hunk header and nothing above it.
+    expect(await render("@@ -1 +1 @@\n-old\n+new")).toEqual([
+      { kind: "hunk", old: "", new: "" },
+      { kind: "del", old: "1", new: "" },
+      { kind: "add", old: "", new: "1" },
+    ]);
+
+    // Several hunks, each restarting both counters from its own header.
+    const multi = await render("@@ -1,2 +1,2 @@\n ctx\n-gone\n+added\n@@ -20,2 +21,2 @@\n ctx2\n-x\n+y");
+    expect(multi[5]).toEqual({ kind: "context", old: "20", new: "21" });
+    expect(multi[7]).toEqual({ kind: "add", old: "", new: "22" });
+
+    // With no header there is nothing to count from, but the markers still say what changed —
+    // greying the whole thing out would be worse than the code block this replaced.
+    expect(await render("-just a removal\n+just an addition")).toEqual([
+      { kind: "del", old: "", new: "" },
+      { kind: "add", old: "", new: "" },
+    ]);
+
+    // `---` and `+++` in a file header stay filenames rather than becoming changes.
+    const headed = await render("diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n+x");
+    expect(headed.slice(0, 3).map((r) => r.kind)).toEqual(["meta", "meta", "meta"]);
+  });
+
+  // `git diff` on a conflicted path returns a combined diff: `@@@` with one range per parent, and
+  // one marker column per parent. Read as a plain diff, a line brought in by one side (` +MAIN`)
+  // looks like context while a conflict marker (`++=======`) looks like an addition.
+  test("reads a combined diff from a conflicted path", async ({ page }) => {
+    const rows = await page.evaluate(() => {
+      openDiffOverlay(
+        "f.txt",
+        "diff --cc f.txt\n@@@ -1,3 -1,3 +1,7 @@@\n  a\n++<<<<<<< HEAD\n +MAIN\n++=======\n+ SIDE\n++>>>>>>> side\n  c\n",
+      );
+      const gutters = document.querySelectorAll("#codeView .diff-line-nos");
+      const old = [...gutters[0].children].map((c) => c.textContent ?? "");
+      const fresh = [...gutters[1].children].map((c) => c.textContent ?? "");
+      return [...document.querySelectorAll("#codeView .diff-line")].map((line, i) => ({
+        kind: (line.className.match(/diff-(add|del|hunk|meta|context)/) ?? [])[1] ?? "",
+        old: old[i] ?? "",
+        new: fresh[i] ?? "",
+      }));
+    });
+
+    expect(rows[1].kind, "the `@@@` header is a hunk header").toBe("hunk");
+    // The line one side contributed is an addition, not context.
+    expect(rows[4]).toMatchObject({ kind: "add", new: "3" });
+    // Numbering follows the result range (`+1,7`); with two parents there is no single old side.
+    expect(rows.map((r) => r.new).filter(Boolean)).toEqual(["1", "2", "3", "4", "5", "6", "7"]);
+    expect(rows.every((r) => r.old === "")).toBe(true);
+  });
+
+  // A regenerated lockfile can run to six figures, and three DOM nodes per line would block the
+  // tab. The rows are capped and the shortfall stated; the copy still carries the whole patch.
+  test("caps a very large diff without losing it", async ({ page }) => {
+    const total = 60_000;
+    const result = await page.evaluate((n) => {
+      const body = Array.from({ length: n }, (_, i) => (i % 2 ? "+" : "-") + "line " + i);
+      const diff = ["diff --git a/big b/big", `@@ -1,${n} +1,${n} @@`, ...body].join("\n");
+      openDiffOverlay("big", diff);
+      const lines = [...document.querySelectorAll("#codeView .diff-line")];
+      return {
+        rendered: lines.length,
+        last: lines[lines.length - 1].textContent ?? "",
+        copiedLines: (state.diffOverlayText ?? "").split("\n").length,
+      };
+    }, total);
+
+    expect(result.rendered).toBeLessThan(total);
+    expect(result.last).toContain("more lines not shown");
+    // Nothing is lost — only what is drawn is bounded.
+    expect(result.copiedLines).toBe(total + 2);
+  });
+
+  test("offers the raw diff for copying", async ({ page }) => {
+    await expect(page.locator("#codeCopyDiff")).toBeHidden();
+    await page.locator("#gitLineToggle").click();
+    await page.locator('.git-file[data-git-diff="src/main.rs"]').click();
+    await expect(page.locator("#codeCopyDiff")).toBeVisible();
+
+    // The rendered rows are separate cells, so the button hands back what git produced rather than
+    // whatever a manual selection would drag in.
+    // `state` is a top-level `let`, so it lives in script scope rather than on `window`.
+    const copied = await page.evaluate(() => state.diffOverlayText);
+    expect(copied).toContain("diff --git");
+    expect(copied).toContain("+");
+
+    // It belongs to the diff view only.
+    await page.locator("#codeClose").click();
+    await expect(page.locator("#codeCopyDiff")).toBeHidden();
+  });
+
+  // The overlay is shared, so a view that takes it over has to hand back what the previous one
+  // put there — including when the takeover happens without closing first.
+  test("drops the diff state when a source file takes over the overlay", async ({ page }) => {
+    await page.locator("#gitLineToggle").click();
+    await page.locator('.git-file[data-git-diff="src/main.rs"]').click();
+    await expect(page.locator("#codeCopyDiff")).toBeVisible();
+
+    // Straight from the diff into a source file, with the overlay still open.
+    await page.evaluate(() => openCodeOverlay("src/main.rs"));
+    await expect(page.locator("#codeCopyDiff")).toBeHidden();
+    await expect.poll(() => page.evaluate(() => state.diffOverlayText)).toBeNull();
+    // And the view really is the source one now, not the diff left behind.
+    await expect(page.locator("#codeView .diff-table")).toHaveCount(0);
+  });
+
+  test("says so when the clipboard refuses the diff", async ({ page }) => {
+    await page.locator("#gitLineToggle").click();
+    await page.locator('.git-file[data-git-diff="src/main.rs"]').click();
+    await expect(page.locator("#codeCopyDiff")).toBeVisible();
+
+    // `copyToClipboard` is a function declaration, so it is replaceable on `window`; the fallback
+    // path it wraps can fail for real when the app is served over plain HTTP.
+    await page.evaluate(() => {
+      (window as never as { copyToClipboard: () => Promise<boolean> }).copyToClipboard =
+        async () => false;
+    });
+    await page.locator("#codeCopyDiff").click();
+    await expect(page.locator("#codeCopyDiff")).toHaveText("Copy failed");
+
+    // The label goes back so the button is usable again rather than stuck on the error.
+    await expect(page.locator("#codeCopyDiff")).toHaveText("Copy diff", { timeout: 5_000 });
+  });
+
   test("re-rendering an unchanged list keeps its rows", async ({ page }) => {
     await page.locator("#gitLineToggle").click();
     await expect(page.locator("#gitLineBody")).toBeVisible();
@@ -218,3 +412,6 @@ test.describe("git status line", () => {
 
 declare function gitBranchParts(name: string, budget: number): { prefix: string; tail: string };
 declare function renderGitPath(path: string): string;
+declare const state: { diffOverlayText: string | null };
+declare function openDiffOverlay(path: string, diff: string): void;
+declare function openCodeOverlay(path: string, line?: number): Promise<void>;
