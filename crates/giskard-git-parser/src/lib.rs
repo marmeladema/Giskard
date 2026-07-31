@@ -102,17 +102,20 @@ pub fn parse_git_status(output: &[u8]) -> GitStatusResponse {
                 unstaged_deleted: None,
             }),
             // `? <path>`; a collapsed untracked directory keeps its trailing slash.
-            '?' => text.strip_prefix("? ").map(|path| GitFileStatus {
-                kind: "untracked".into(),
-                path: path.to_string(),
-                old_path: None,
-                index_status: "untracked".into(),
-                worktree_status: "untracked".into(),
-                staged_added: None,
-                staged_deleted: None,
-                unstaged_added: None,
-                unstaged_deleted: None,
-            }),
+            '?' => text
+                .strip_prefix("? ")
+                .filter(|path| !path.is_empty())
+                .map(|path| GitFileStatus {
+                    kind: "untracked".into(),
+                    path: path.to_string(),
+                    old_path: None,
+                    index_status: "untracked".into(),
+                    worktree_status: "untracked".into(),
+                    staged_added: None,
+                    staged_deleted: None,
+                    unstaged_added: None,
+                    unstaged_deleted: None,
+                }),
             // `!` ignored entries are never requested.
             _ => None,
         };
@@ -685,7 +688,7 @@ mod tests {
     #[test]
     fn survives_truncated_and_unknown_records() {
         let status = parse_git_status(
-            b"# branch.head main\x001\x001 M\x001 M. N...\x00x nonsense\x00\x00\
+            b"# branch.head main\x001\x001 M\x001 M. N...\x00x nonsense\x00\x00? \x00\
               1 .M N... 100644 100644 100644 aaa bbb good.txt\x00",
         );
 

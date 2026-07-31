@@ -123,7 +123,7 @@ Then open **http://127.0.0.1:8787**, log in, and:
    scrolling the transcript to the top lazy-loads older history. When the project's workspace is a
    Git repository, a one-line **Git status** sits just above the composer — branch, ahead/behind,
    changed-file count and total diffstat — and expands in place into the changed files, each
-   opening its diff.
+   opening its diff. It refreshes as the agent changes the tree, so it stays current during a turn.
 4. Linked child threads appear in the **Sub-agents** monitor and can be opened from their activity
    rows; their header **Parent** button returns to the owning thread. See
    [Sub-agent threads](docs/subagents.md) for spawning protocols, monitoring, prompts, direct
