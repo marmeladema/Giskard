@@ -115,6 +115,17 @@ pub enum ClientMessage {
 pub struct ThreadState {
     pub thread_id: ThreadId,
     pub state: serde_json::Value,
+    /// Whether a turn is in flight for this thread *right now*, answered from the server's turn
+    /// gate rather than from anything persisted in `state`.
+    ///
+    /// A turn can be started over HTTP (`POST /threads/start`) before the browser's socket for that
+    /// thread exists, so the client cannot always learn a turn's liveness from the event stream: if
+    /// such a turn finishes before the socket attaches, its `TurnCompleted` was addressed to nobody
+    /// and no [`LiveTurnSnapshot`] follows it. This flag closes that gap. The gate is held for the
+    /// whole turn — reserved before the start request returns, released when the turn ends — so it
+    /// also covers the window before the harness emits its first event, where the live buffer is
+    /// still empty but the turn is very much running.
+    pub active_turn: bool,
 }
 
 /// Lightweight cross-thread activity update for sidebar badges and browser notifications. This is

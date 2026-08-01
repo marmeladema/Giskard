@@ -1698,7 +1698,7 @@ fn browser_isolates_global_and_project_model_catalogs() {
 
     let thread_state = between(
         body,
-        "function renderThreadState(s) {",
+        "function renderThreadState(s, activeTurn) {",
         "function resetTranscriptForAuthoritativeSnapshot()",
     );
     assert!(
@@ -1793,7 +1793,7 @@ fn browser_resubscribe_replaces_transient_transcript_state() {
 
     let render_thread_state = between(
         body,
-        "function renderThreadState(s) {",
+        "function renderThreadState(s, activeTurn) {",
         "function resetTranscriptForAuthoritativeSnapshot() {",
     );
     assert!(render_thread_state.contains(
