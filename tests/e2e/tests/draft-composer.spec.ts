@@ -266,6 +266,36 @@ test.describe("draft composer", () => {
     await expect(page.locator("#transcript")).toContainText("Start a new thread");
     await expect(page.locator(".thread.active")).toHaveCount(0);
   });
+
+  // A draft's first turn is started over HTTP, before the thread has a socket, so the composer
+  // locks with nothing on the wire yet to confirm the turn. Against a fast harness that turn is
+  // usually over before the socket attaches: its `turn_completed` was addressed to nobody, and a
+  // finished turn leaves no live snapshot to follow, so nothing ever contradicted the optimistic
+  // lock. The composer stayed disabled — Stop showing, Send gone — with the agent's reply sitting
+  // right there on screen, until the thread was re-opened from the sidebar.
+  test("unlocks the composer when the first turn ends before the socket attaches", async ({ page }) => {
+    await page.locator(".proj", { hasText: "Demo" }).locator(".project-add").click();
+    await page.locator("#input").fill("First turn of a brand new thread");
+    await expect(page.locator("#sendBtn")).toBeEnabled();
+    await page.locator("#sendBtn").click();
+
+    await expect(
+      page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY }),
+    ).toBeVisible();
+
+    // No re-open, no reload: this same view has to come back to life on its own.
+    await expect(page.locator("#stopBtn")).toBeHidden();
+    await expect(page.locator("#sendBtn")).toBeVisible();
+
+    // And the thread is genuinely usable, not merely repainted: a second turn sends over the
+    // socket that is now attached, and answers.
+    await page.locator("#input").fill("Second turn, same thread");
+    await expect(page.locator("#sendBtn")).toBeEnabled();
+    await page.locator("#sendBtn").click();
+    await expect(
+      page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY }),
+    ).toHaveCount(2);
+  });
 });
 
 // `openThread` has the same save/await/restore shape as the draft opening that lost a message, and

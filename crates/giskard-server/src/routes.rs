@@ -3388,6 +3388,11 @@ async fn handle_client_msg(
                     )
                 }
             };
+            // Registering before the snapshot below is built is what makes the snapshot's
+            // `active_turn` safe to act on: a turn that ends after this line broadcasts its
+            // `TurnCompleted` to this client, and one that ended before it is already out of the
+            // turn gate. Build the snapshot first and a turn ending in between would be reported
+            // live by a client that then never hears it finish.
             state.hub.subscribe(thread_id, client_id, tx.clone()).await;
 
             if let Some(warning) = notice {
@@ -3422,6 +3427,7 @@ async fn handle_client_msg(
                 .send(ServerMessage::ThreadState(giskard_proto::ThreadState {
                     thread_id,
                     state: thread_state,
+                    active_turn: state.registry.thread_has_active_turn(thread_id).await,
                 }))
                 .await;
 
@@ -4627,6 +4633,7 @@ async fn broadcast_thread_state(
             return;
         }
     };
+    let active_turn = state.registry.thread_has_active_turn(thread_id).await;
     state
         .hub
         .broadcast(
@@ -4634,6 +4641,7 @@ async fn broadcast_thread_state(
             ServerMessage::ThreadState(giskard_proto::ThreadState {
                 thread_id,
                 state: value,
+                active_turn,
             }),
         )
         .await;

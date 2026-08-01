@@ -2135,6 +2135,10 @@ Flow: user clicks "New project" → names it → picks a directory via the file 
   returned `harness_thread_id`, writes `<thread_id>.json`, and immediately calls `start_turn`.
   If native creation fails, nothing is persisted. If persistence or synchronous `turn/start` fails
   after native creation, cleanup is best-effort and failures are logged.
+  This first turn begins before the browser subscribes to the new thread, so the composer opens
+  locked on a turn it has observed nothing of. It must not stay locked on the strength of that
+  assumption alone: the subscribe snapshot's `active_turn` (§13.6) is what settles whether the turn
+  is still running, and a turn that finished during the gap releases the composer with no re-open.
 - **Open existing:** selecting a persisted thread calls the same open endpoint with
   `thread_id = Some(existing_id)`. The server reattaches the harness using the stored native
   `harness_thread_id` but preserves the durable Giskard `ThreadId`; opening a thread is
@@ -2915,7 +2919,8 @@ interactive forwarder owns the turn gate, the passive subscriber yields before b
 above, sent once to a connecting client only and never broadcast, so a browser that missed the live
 signal still shows what is blocked; a separate message so clients can tell a replay from a live
 event and apply SB6's alert-once-per-session rule),
-`ThreadState { thread_id, state }` (persisted snapshot on subscribe/resync),
+`ThreadState { thread_id, state, active_turn }` (persisted snapshot on subscribe/resync;
+`active_turn` is live server state rather than part of the persisted snapshot — see §13.6),
 `LiveTurnSnapshot { thread_id, turn_id, user_input?, accumulated,
 answered_approvals, answered_server_requests }` (in-flight turn reconstruction on reconnect,
 carrying the turn input when the server synthesized the turn context, the `WireAgentEvent`s of the
@@ -3055,6 +3060,15 @@ events through the same event handler used for live WebSocket events.
   stale active-turn controls) before rendering the returned recent history and then replaying the
   live snapshot. Later metadata-only `ThreadState` broadcasts are not subscribe snapshots and must
   not clear the visible transcript.
+
+  Step 2 is conditional, so its *absence* carries no information: a turn that is over and a turn
+  the harness has accepted but not yet streamed both produce no `LiveTurnSnapshot`. The
+  `ThreadState` of step 1 therefore states turn liveness outright in `active_turn`, answered from
+  the server's active-turn gate — held from before `POST /threads/start` returns until the turn
+  ends, so it covers the window where the live buffer is still empty. This is what a client needs
+  when it starts a turn over HTTP and subscribes afterwards (§7.1): if that turn finishes first,
+  its `TurnCompleted` was broadcast to a thread with no subscribers, and without `active_turn` the
+  client would keep its composer locked on a turn that is already done.
 
   This means a reconnected client sees the full in-progress turn, including still-pending
   approval and server-request prompts. The live buffer is bounded

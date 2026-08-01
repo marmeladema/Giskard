@@ -2313,7 +2313,7 @@ async fn wait_for_thread_state(
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
     thread_id: ThreadId,
-) {
+) -> giskard_proto::ThreadState {
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
@@ -2321,7 +2321,7 @@ async fn wait_for_thread_state(
                 if let Ok(ServerMessage::ThreadState(state)) = serde_json::from_str(&text)
                     && state.thread_id == thread_id
                 {
-                    return;
+                    return state;
                 }
             }
             Ok(Some(Ok(_))) => {}
@@ -2609,6 +2609,137 @@ async fn send_input_rejects_second_turn_before_turn_started() {
     harness.wait_for_start_calls(2).await;
     wait_for_turn_completed(&mut second, thread_id).await;
     assert_eq!(harness.start_calls(), 2);
+}
+
+/// A thread's first turn is started over HTTP (`POST /threads/start`), before the browser has a
+/// socket for that thread. If that turn finishes before the subscribe lands, nothing else on the
+/// socket describes it: the `TurnCompleted` was broadcast to a thread nobody was subscribed to, and
+/// a turn that is over leaves no `LiveTurnSnapshot` behind. The subscribe's `ThreadState` is then
+/// the only place the browser can learn the turn is done — without it the composer stays locked on
+/// a turn that ended before it was ever watched.
+#[tokio::test]
+async fn subscribe_thread_state_reports_a_turn_that_ended_before_the_socket_attached() {
+    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+
+    // The whole turn happens with no socket subscribed to this thread — the window the browser
+    // races when it starts a turn over HTTP and only then opens the thread. Driven through the
+    // registry rather than `POST /threads/start` because the replay harness only streams a fixture
+    // into a thread opened with that fixture's resume key, which that endpoint does not do.
+    let thread_file = state
+        .store
+        .load_thread(project_id, thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    state
+        .registry
+        .start_turn(
+            thread_id,
+            UserInput::text("a turn nobody is subscribed to"),
+            TurnOverrides {
+                model: Some(thread_file.current_model.clone()),
+                mode: thread_file.mode,
+                permission_preset: thread_file.permission_preset,
+            },
+            thread_file.current_model,
+        )
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while state.registry.thread_has_active_turn(thread_id).await {
+        if tokio::time::Instant::now() >= deadline {
+            panic!("the unsubscribed turn never finished");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+
+    let mut ws = connect_ws(port, &cookie).await;
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::Subscribe {
+            thread_id,
+            since: None,
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    let thread_state = wait_for_thread_state(&mut ws, thread_id).await;
+    assert!(
+        !thread_state.active_turn,
+        "a turn that finished before this socket subscribed must be reported as done"
+    );
+}
+
+/// The counterpart: a turn the harness has accepted but not yet said anything about. The live
+/// buffer is still empty here — there is no `TurnStarted` to put in it — so a liveness answer read
+/// from the buffer would wrongly say "idle" and unlock a composer whose turn is about to stream.
+/// The turn gate, reserved before the start request returns, is what covers this window.
+#[tokio::test]
+async fn subscribe_thread_state_reports_a_turn_the_harness_has_not_streamed_yet() {
+    let harness = Arc::new(SlowStartHarness::new());
+    let (_tmp, state, port) = start_slow_start_server_on_available_port(harness.clone()).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let cookie = login_cookie(&client, &base).await;
+    let (_, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+
+    let mut sender = connect_ws(port, &cookie).await;
+    sender
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&ClientMessage::Subscribe {
+                thread_id,
+                since: None,
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    sender
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&ClientMessage::SendInput {
+                thread_id,
+                text: "held inside the harness".into(),
+                attachments: Vec::new(),
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    harness.wait_for_start_calls(1).await;
+    assert!(
+        !state.live_buffers.is_active(thread_id).await,
+        "the harness is still inside start_turn, so there is nothing buffered for this turn"
+    );
+
+    let mut latecomer = connect_ws(port, &cookie).await;
+    latecomer
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&ClientMessage::Subscribe {
+                thread_id,
+                since: None,
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let thread_state = wait_for_thread_state(&mut latecomer, thread_id).await;
+    assert!(
+        thread_state.active_turn,
+        "a turn the harness has accepted is running, even before it streams anything"
+    );
+
+    harness.release_first_start();
+    wait_for_turn_completed(&mut sender, thread_id).await;
 }
 
 #[tokio::test]

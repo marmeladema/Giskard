@@ -2684,7 +2684,7 @@ function handleServer(msg, ws) {
   const renderStartedAtMs = browserNowMs();
   recordReconnectMessageReceived(ws, messageType);
   switch (msg.type) {
-    case "thread_state": renderThreadState(msg.state); break;
+    case "thread_state": renderThreadState(msg.state, msg.active_turn); break;
     case "history_page": renderHistoryPage(msg); break;
     case "history_delta": renderHistoryDelta(msg); break;
     case "live_turn_snapshot": renderLiveTurnSnapshot(msg); break;
@@ -3136,7 +3136,7 @@ function handleIncomingApprovalRequest(request, tid, opts) {
   renderApprovalRequest(request);
 }
 
-function renderThreadState(s) {
+function renderThreadState(s, activeTurn) {
   if (!s) return;
   const shouldResetTranscript = state.awaitingInitialThreadState || state.awaitingThreadResync;
   // An incremental resync keeps the transcript. Remember whether the viewport was pinned to the
@@ -3175,6 +3175,24 @@ function renderThreadState(s) {
   if (shouldResetTranscript) {
     resetTranscriptForAuthoritativeSnapshot();
   }
+  releaseFirstTurnLockIfIdle(activeTurn);
+}
+
+// The first turn of a draft thread is started over HTTP, before this thread's socket exists, so the
+// composer locks optimistically (`firstTurnStartingThreadId`) with nothing on the wire yet to
+// confirm the turn. Every other lock is released by something the socket delivers — `turn_completed`
+// for a turn we watched, `error` for one that failed, a resync for one we missed. This one has no
+// such release when the turn finishes *before* the socket attaches: its `turn_completed` was
+// addressed to nobody and, the turn being over, no live snapshot follows to correct us. The
+// composer would then stay locked until the thread is re-opened. The server's `active_turn` is the
+// authority here — held from before the start request returned until the turn ends — so a `false`
+// really does mean there is nothing left to wait for.
+function releaseFirstTurnLockIfIdle(activeTurn) {
+  if (activeTurn !== false) return;   // only an explicit "no turn is running" releases the lock
+  if (!state.firstTurnStartingThreadId) return;
+  if (String(state.firstTurnStartingThreadId) !== String(state.threadId)) return;
+  state.firstTurnStartingThreadId = null;
+  setTurnActive(false);
 }
 function resetTranscriptForAuthoritativeSnapshot() {
   const keepFirstTurnActive =
