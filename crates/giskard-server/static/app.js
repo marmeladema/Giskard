@@ -166,6 +166,7 @@ let state = {
   pendingLiveSnapshotReconcile:false,
   diffOverlayText:null,
   gitStatus:null, gitLoading:false, gitError:null, gitRequestSeq:0,
+  draftGitStrategy:"shared",
   gitExpanded:false, gitRepoByProject:new Map(), gitResizeTimer:null, gitBodyHtml:null, gitDiffPending:false, gitRefreshTimer:null,
   mcpServers:[], mcpCapabilities:{ status:false, reload:false, oauth_login:false }, mcpLoading:false, mcpError:null, expandedMcps:new Set(),
   threadReadOnly:false, readOnlyProvider:null, readOnlyMessage:null,
@@ -2111,6 +2112,7 @@ function openDraftThread(pid) {
   // `modelLoading` until the project's default arrives; `currentModel` stays null until then so a
   // placeholder can never reach `threads/start` (LT7).
   state.draftThread = { projectId:pid, title:"New thread", modelLoading:true, modelError:null };
+  setDraftGitStrategy(GIT_STRATEGY_SHARED);   // chosen per draft: never carried over from the last one
   state.firstTurnStartingThreadId = null;
   state.pendingUserEl = null;
   state.pendingUserText = null;
@@ -3228,6 +3230,12 @@ function resetTranscriptForAuthoritativeSnapshot() {
   else setTurnActive(false);
 }
 const MODE_LABELS = { build:"Build", plan:"Plan" };
+/* The `git_strategy` values `threads/start` accepts, and what each adds to the closed turn chip.
+   The default says nothing there — a chip that named the ordinary case on every thread would stop
+   being a signal. Keyed by wire value so this doubles as the set the UI will send: a strategy the
+   server does not know must not reach it. */
+const GIT_STRATEGY_SHARED = "shared";
+const GIT_STRATEGY_CHIP = { shared:"", worktree:" · Worktree" };
 const PERMISSION_PRESET_LABELS = {
   ask:"Ask first",
   read_only:"Ask first",
@@ -3247,7 +3255,50 @@ function updateTurnButton() {
   const btn = $("turnPickerBtn"); if (!btn) return;
   const mode = MODE_LABELS[state.mode] || "Build";
   const preset = PERMISSION_PRESET_LABELS[state.permissionPreset] || "Ask first";
-  btn.querySelector(".mp-label").textContent = `${mode} · ${preset}`;
+  const strategy = isDraftThread() ? GIT_STRATEGY_CHIP[state.draftGitStrategy] || "" : "";
+  btn.querySelector(".mp-label").textContent = `${mode} · ${preset}${strategy}`;
+  renderGitStrategyControl();
+}
+
+/* The workspace choice belongs to a draft only: once a thread exists its workspace is fixed, so the
+   field is absent rather than shown disabled. Every strategy but the shared checkout also needs a
+   repository to branch from — without one there is nothing to isolate, and the reason is worth
+   saying rather than leaving a dead control. */
+function isDraftWorkspaceRepo() {
+  return state.gitRepoByProject.get(state.projectId) === true;
+}
+
+function renderGitStrategyControl() {
+  const control = $("gitStrategyControl");
+  const select = $("gitStrategySel");
+  if (!control || !select) return;
+  const draft = isDraftThread();
+  control.hidden = !draft;
+  if (!draft) return;
+
+  const isRepo = isDraftWorkspaceRepo();
+  select.disabled = !isRepo;
+  select.value = isRepo ? state.draftGitStrategy : GIT_STRATEGY_SHARED;
+  $("gitStrategyHint").textContent = gitStrategyHintText(isRepo);
+}
+
+function gitStrategyHintText(isRepo) {
+  if (!isRepo) return "This project is not a Git repository, so there is nothing to branch from.";
+  if (state.draftGitStrategy !== "worktree") return "";
+  // The row directly above shows the project's changed-file count at this moment, so saying nothing
+  // would let the user send expecting those changes to come along. A worktree is the last commit,
+  // exactly.
+  const dirty = gitDirtyCount(state.gitStatus);
+  const base = "Starts from the last commit, on a branch of its own.";
+  if (!dirty) return base;
+  return `${base} Your ${dirty} uncommitted change${dirty === 1 ? "" : "s"} stay in the project's checkout.`;
+}
+
+function setDraftGitStrategy(strategy) {
+  // Anything the server would reject is not worth holding: an unknown value here could only come
+  // from a stale option, and defaulting to the shared checkout is the choice that changes nothing.
+  state.draftGitStrategy = GIT_STRATEGY_CHIP[strategy] === undefined ? GIT_STRATEGY_SHARED : strategy;
+  updateTurnButton();
 }
 function setMode(mode) {
   state.mode = mode === "plan" ? "plan" : "build";
@@ -5589,6 +5640,9 @@ async function loadGitStatus(pid) {
     if (requestSeq === state.gitRequestSeq && state.projectId === pid) {
       state.gitLoading = false;
       renderGitLine();
+      // The draft's worktree field reads this status twice over: whether the project is a
+      // repository at all, and how much uncommitted work would stay behind.
+      renderGitStrategyControl();
     }
   }
 }
@@ -8005,6 +8059,7 @@ $("input").addEventListener("input", () => {
   saveComposerDraft();
   updateComposerControls();   // the Send button tracks whether there is anything to send
 });
+$("gitStrategySel").onchange = (e) => setDraftGitStrategy(e.target.value);
 $("attachBtn").onclick = () => $("attachmentInput").click();
 $("attachmentInput").addEventListener("change", attachSelectedFiles);
 initComposerFileDrop();
@@ -8051,7 +8106,11 @@ async function startDraftThread(text, attachments) {
       attachments,
       model_ref: state.currentModel,
       mode: state.mode || "build",
-      permission_preset: state.permissionPreset || "ask_first"
+      permission_preset: state.permissionPreset || "ask_first",
+      // Gated on the workspace still being a repository, not just on the flag. The toggle renders
+      // unchecked once it isn't one, so sending `true` here would ask for isolation the user can no
+      // longer see they requested — and the start would fail rather than the box simply being off.
+      git_strategy: isDraftWorkspaceRepo() ? state.draftGitStrategy : GIT_STRATEGY_SHARED
     });
     const tid = res && res.thread_id;
     if (!tid) throw new Error("new thread response did not include thread_id");

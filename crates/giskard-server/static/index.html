@@ -215,6 +215,20 @@
                 <option value="full_access">⚠ Full Access</option>
               </select>
             </div>
+            <!-- Only a draft can choose this: a thread's workspace is fixed once it exists, so the
+                 field is absent for open threads rather than shown disabled. A select rather than a
+                 checkbox because where a thread's working tree comes from is an open question, not
+                 a yes/no one — a third answer is a new option here rather than a new control. The
+                 hint carries what the labels cannot: a new worktree is the last commit, exactly, so
+                 work in progress in the project's checkout stays there. -->
+            <div class="mp-field mp-git-strategy" id="gitStrategyControl" hidden>
+              <label for="gitStrategySel">Git checkout</label>
+              <select id="gitStrategySel" aria-describedby="gitStrategyHint">
+                <option value="shared">Shared with the project</option>
+                <option value="worktree">Its own worktree</option>
+              </select>
+              <span class="mp-hint" id="gitStrategyHint"></span>
+            </div>
           </div>
         </div>
         <div class="picker picker-right" id="modelPicker">
