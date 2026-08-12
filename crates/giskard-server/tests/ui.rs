@@ -2933,6 +2933,53 @@ fn app_js() -> &'static str {
     include_str!("../static/app.js")
 }
 
+/// Where a thread's working tree comes from is decided once, on the draft, and the choice has to be
+/// visible without reopening the popover that set it.
+#[test]
+fn browser_offers_the_git_strategy_choice_on_drafts_only() {
+    let source = app_js();
+    let markup = include_str!("../static/index.html");
+
+    assert!(
+        markup.contains("id=\"gitStrategyControl\"") && markup.contains("id=\"gitStrategySel\""),
+        "the draft picker carries the Git strategy choice"
+    );
+    // A select, not a checkbox: the set of strategies is open, and the next one has to be an option
+    // here rather than a second control.
+    assert!(
+        markup.contains("<option value=\"shared\"")
+            && markup.contains("<option value=\"worktree\""),
+        "both strategies are offered by their wire value"
+    );
+    assert!(
+        source.contains("control.hidden = !draft;"),
+        "a thread's workspace is fixed once it exists, so the field is absent for open threads"
+    );
+    assert!(
+        source.contains("select.disabled = !isRepo;"),
+        "there is nothing to branch from without a repository"
+    );
+    assert!(
+        source.contains(
+            "git_strategy: isDraftWorkspaceRepo() ? state.draftGitStrategy : GIT_STRATEGY_SHARED"
+        ),
+        "the draft's choice reaches threads/start gated on the workspace still being a repository, \
+         so a request can never ask for a strategy the control no longer shows as chosen"
+    );
+    assert!(
+        source.contains("setDraftGitStrategy(GIT_STRATEGY_SHARED);"),
+        "each draft chooses for itself rather than inheriting the last draft's choice"
+    );
+    assert!(
+        source.contains("GIT_STRATEGY_CHIP[state.draftGitStrategy]"),
+        "the closed chip reports the choice"
+    );
+    assert!(
+        source.contains("Your ${dirty} uncommitted change"),
+        "the hint names the work that stays in the project's checkout"
+    );
+}
+
 #[test]
 fn browser_applies_harness_context_window_updates_to_the_gauge() {
     let source = app_js();

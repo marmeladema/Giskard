@@ -654,6 +654,11 @@
   .mp-field[hidden] { display:none; }   /* the grid display above would otherwise defeat [hidden] */
   .mp-field > label, .mp-field > span { color:var(--muted); font-size:11px; }
   .mp-field select { width:100%; }
+  /* The Git strategy choice and its explanation need the full width: the hint is a sentence, not a
+     label, and wrapping it into a column would make it unreadable at the popover's width. */
+  .mp-git-strategy { grid-column:1 / -1; }
+  .mp-hint { color:var(--muted); font-size:11px; line-height:1.35; }
+  .mp-hint:empty { display:none; }
   .mp-reload { grid-column:1 / -1; }   /* the reload button gets its own full-width row */
   .mp-reload button { width:100%; }
   .composer textarea:disabled { opacity:.65; cursor:not-allowed; }
