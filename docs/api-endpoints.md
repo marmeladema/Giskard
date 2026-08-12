@@ -19,6 +19,13 @@ WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticke
 /api/projects/{id}/mcp/oauth-login`. Wire types are defined once in `giskard-proto`. See
 [§13.6](../specs/giskard-specification.md) for the message protocol.
 
+`POST /api/projects/{id}/threads/start` takes `git_strategy`, which decides where the thread's
+working tree comes from: `shared` (the project's own checkout — the default, and what an omitted
+field means) or `worktree` (a linked Git worktree of its own, §7.1). It is an enum rather than a
+flag so the set can grow, and an unrecognized value is rejected rather than treated as the default:
+a client that asked for isolation and was silently given the shared checkout would have no way to
+tell.
+
 `POST /api/projects/{id}/threads/start` creates the durable thread from the first user message or
 attachment set, persists a deterministic title generated from the prompt or first attachment name,
 and returns the title with the new thread and turn identifiers. The request accepts optional
@@ -94,8 +101,9 @@ even on an unborn one), `detached` with the short commit in `head`, ahead/behind
 reports an upstream, staged/unstaged/untracked and conflicted counts, and the changed file list.
 
 Which workspace it reads is decided by the optional `?thread_id=...`: with it, the named thread's
-workspace — its own Git worktree when the thread was started with one (§7.1) — and without it,
-the project's effective workspace root, which is what a draft reads before any thread exists.
+workspace — its own Git worktree when the thread was started with one, or its parent's when the
+thread is a sub-agent, which is where the harness ran it (§7.1) — and without it, the project's
+effective workspace root, which is what a draft reads before any thread exists.
 A
 `thread_id` that does not resolve *within this project* is a 404 rather than a fall back to the
 project's workspace: answering from a different tree under the name of the one that was asked for is

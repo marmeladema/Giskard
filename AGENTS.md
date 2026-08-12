@@ -25,6 +25,14 @@ README. Update that file in the same change whenever you add, remove, or change 
 route in `crates/giskard-server/src/routes.rs` (path, method, request/response shape, or documented
 behavior) so it never drifts from the code.
 
+Per-thread Git worktrees are documented in `docs/git-worktrees.md`, linked from the README and
+referenced from spec §7.1. Keep it synchronized with `crates/giskard-server/src/worktree.rs` —
+especially the branch/path naming, the boundary between what a worktree isolates and what it shares
+with the project's repository, and what archive, delete and project delete do to a worktree and its
+branch. The documentation is the mitigation for this feature's
+sharpest edge (work that exists only inside a worktree), so a behavior change that is not reflected
+there is not finished.
+
 ## Build & Test
 
 ```bash

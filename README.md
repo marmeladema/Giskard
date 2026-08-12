@@ -115,6 +115,12 @@ Then open **http://127.0.0.1:8787**, log in, and:
    server machine (the agent's workspace).
 2. **+** on the project → draft a new thread. No Codex thread is created until the first message is
    sent, so choose the **Plan/Build** mode, **permission preset**, and **model** first if needed.
+   A draft on a Git project also picks its **Git checkout**: shared with the project, or a **Git
+   worktree** of its own, so its file changes never touch the project's checkout. The choice is
+   available only on the draft — the workspace is fixed once the thread exists. Isolation changes where the thread works, not what it
+   is allowed to do: its permission preset still applies unchanged. See
+   [Per-thread Git worktrees](docs/git-worktrees.md) for what does and does not come across, branch
+   naming, and what deleting an isolated thread destroys.
 3. Type in the composer (Enter to send). Use the attachment button or drop files onto the composer
    to include images, PDFs, or other files with the message. A message accepts up to eight files
    and 25 MiB total. The first send creates the Codex thread with the selected
@@ -124,6 +130,8 @@ Then open **http://127.0.0.1:8787**, log in, and:
    Git repository, a one-line **Git status** sits just above the composer — branch, ahead/behind,
    changed-file count and total diffstat — and expands in place into the changed files, each
    opening its diff. It refreshes as the agent changes the tree, so it stays current during a turn.
+   For a thread isolated in a worktree, the row reports that worktree rather than the project's
+   checkout.
 4. Linked child threads appear in the **Sub-agents** monitor and can be opened from their activity
    rows; their header **Parent** button returns to the owning thread. See
    [Sub-agent threads](docs/subagents.md) for spawning protocols, monitoring, prompts, direct
@@ -298,6 +306,7 @@ $GISKARD_DATA_DIR/
 │   ├── threads/
 │   │   ├── <thread_id>.json      # thread metadata, permission preset, token cache
 │   │   └── <thread_id>.jsonl     # authoritative turn history — one Turn per line, append-only
+│   ├── worktrees/<thread_id>/    # Git worktree for a thread started isolated (docs/git-worktrees.md)
 │   └── tokens.json               # per-project token ledger (total, by_day, by_model)
 └── tokens-global.json            # cross-project token ledger
 ```

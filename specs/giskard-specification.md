@@ -1913,6 +1913,8 @@ giskard/
 │       ├── threads/
 │       │   ├── <thread_id>.json        # thread metadata, permission preset, token cache — no history
 │       │   └── <thread_id>.jsonl       # authoritative turn history, one Turn per line (§5.4)
+│       ├── worktrees/          # only for threads started isolated (§7.1)
+│       │   └── <thread_id>/            # the thread's linked Git worktree — a checkout, not Giskard state
 │       └── tokens.json         # per-project token ledger (aggregates + daily buckets)
 └── tokens-global.json          # global token ledger (daily/weekly/monthly/total)
 ```
@@ -1985,6 +1987,18 @@ All defined in `giskard-core`, serialized by `giskard-persist`. Illustrative sha
       }                                  //   model id contains slashes (e.g. "@cf/z-ai/glm-4.7").
     }
   },
+  "git_workspace": {                     // absent unless the thread was started isolated (§7.1).
+    "strategy": "worktree",              // which `git_strategy` produced it; the tag is what lets a
+                                         //   later strategy be a new variant rather than a migration
+    "path": "/home/user/.giskard/projects/01J…/worktrees/01K…",   // the checkout Git manages
+    "workspace": "…/worktrees/01K…/packages/api",  // omitted unless the project is a repository
+                                         //   subdirectory; then this is where the thread works
+    "branch": "giskard/worktree-01k9x2m4qpz8v",   // the branch Giskard created — only the starting
+    "base_commit": "e17b742…",           //   point; where the thread went afterwards is not tracked
+    "repo_root": "/home/user/dev/ostinato-radio",     // the project checkout it was branched from
+    "common_dir": "/home/user/dev/ostinato-radio/.git",              // resolved, never constructed:
+    "git_dir": "/home/user/dev/ostinato-radio/.git/worktrees/01K…"   //   the project may itself be
+  },                                     //   a linked worktree, whose `.git` is a pointer file
   "created_at": "…", "updated_at": "…"
   // NB: no `turns[]` — history is the authoritative `<thread_id>.jsonl`, one `Turn` per line (H1).
 }
@@ -2141,6 +2155,36 @@ Flow: user clicks "New project" → names it → picks a directory via the file 
   locked on a turn it has observed nothing of. It must not stay locked on the strength of that
   assumption alone: the subscribe snapshot's `active_turn` (§13.6) is what settles whether the turn
   is still running, and a turn that finished during the gap releases the composer with no re-open.
+- **Isolation in a Git worktree:** the start request carries `git_strategy`, settable only from a
+  draft because a thread's workspace is fixed once it exists. It is an enum — `shared` (the
+  project's own checkout, the default and the only possibility for a non-Git workspace) and
+  `worktree` — rather than a flag, because where a thread's working tree comes from is an open
+  question and a boolean could not carry a third answer. An unknown value is **rejected**: a client
+  asking for a strategy the server does not implement must not be quietly started in the shared
+  checkout, which looks like it worked. On `worktree`, the server creates a linked
+  worktree at `projects/<project_id>/worktrees/<thread_id>` on branch
+  `giskard/worktree-<first 13 chars of the lowercased thread ULID>` *before* opening the harness —
+  the worktree is the cwd the harness is given — and records it as `ThreadFile.git_workspace`,
+  tagged with the strategy that produced it. Creation
+  failure fails the start rather than falling back to the project's checkout, and every later failure
+  in that handler rolls the worktree and its branch back. The thread's workspace is that worktree
+  everywhere it matters: harness cwd, the file endpoints and the Git status endpoints (§13.5).
+  `ThreadWorktree.path` is the checkout Git manages and `workspace` is where the thread works; they
+  differ only when the project directory is a *subdirectory* of its repository, since Git can check
+  out only a whole repository — the worktree is then the repository root and the workspace is the
+  same subdirectory beneath it, so a path names the same file with isolation as without. A project
+  directory absent from the repository's committed content has no counterpart in a fresh checkout,
+  and isolation fails rather than inventing one.
+  Isolation decides *where* a thread works and nothing else — the permission preset still decides
+  what it may do there, and an isolated thread's sandbox is exactly an ordinary thread's, so Git
+  commands that write the repository escalate for approval under Auto Approve just as they do
+  without a worktree. Sub-agent threads never get a worktree record of their own: a child spawned
+  during an isolated thread's turn inherits its parent's cwd from the harness, and Giskard resolves
+  the same worktree for it by reading the parent chain — for the harness cwd on open, resume and
+  reattach, and for the Git status endpoints. The chain is read, never copied down it, so the
+  worktree stays owned by the thread that created it and deleting a sub-agent cannot remove it.
+  Full behaviour, including the shared-repository boundary, is documented in
+  `docs/git-worktrees.md`.
 - **Open existing:** selecting a persisted thread calls the same open endpoint with
   `thread_id = Some(existing_id)`. The server reattaches the harness using the stored native
   `harness_thread_id` but preserves the durable Giskard `ThreadId`; opening a thread is
@@ -2165,11 +2209,18 @@ Flow: user clicks "New project" → names it → picks a directory via the file 
   the harness lifecycle operation first (Codex `thread/archive`) and marks the local thread
   metadata `archived = true` only after success. Unarchive is the reverse operation (Codex
   `thread/unarchive`, then `archived = false`). Archived threads are listed separately and do not
-  restore as the active thread after reload.
+  restore as the active thread after reload. Archiving leaves a thread's worktree on disk; reclaiming
+  it is deferred to a later phase.
 - **Delete:** delete calls the harness lifecycle operation first (Codex `thread/delete`) and removes
   local `<thread_id>.json` + `<thread_id>.jsonl` only after success. Delete also drops the in-memory
   Giskard harness handle. Archive/delete are rejected while the thread has an active turn or running
-  command; the browser surfaces the failure as an error notice.
+  command; the browser surfaces the failure as an error notice. Delete also takes the thread's
+  worktree and the branch Giskard created with it — in that order, since Git refuses to delete a
+  checked-out branch — leaving branches the agent made during the thread alone. It is refused with
+  `409` when the worktree of the thread or of any sub-agent beneath it holds uncommitted changes or
+  commits reachable from no other ref, unless `?force=true`; `GET …/deletion-impact` reports the same
+  facts so the confirmation can name them first. Deleting a *project* sweeps its worktrees
+  unconditionally, because a single thread must not be able to leave a project half-deleted.
 - **Rename:** the thread list actions menu exposes `Rename`. It edits the row title next to the
   `...` menu. Saving calls the harness first (Codex `thread/name/set`) and then persists
   `ThreadFile.title`; the browser updates both the row title and the open-thread header/mobile
