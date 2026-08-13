@@ -336,6 +336,31 @@ pub fn apply_numstat_counts(
     status.deleted_total = deleted_total;
 }
 
+/// Read the commit a deleted branch pointed at out of `git branch -d`/`-D`'s own report.
+///
+/// Unlike the other formats here this one is *porcelain* — text written for a person, of the shape
+/// `Deleted branch <name> (was <sha>).` Git offers no machine-readable form of it, and the sha is
+/// worth having: it is the only record of where the branch was, and it makes the reflog window
+/// usable after a thread is deleted. So this parses it, narrowly, and answers `None` for anything
+/// that does not match rather than guessing.
+///
+/// Being porcelain, it is also translated. Callers must run Git with `LC_ALL=C`; nothing here can
+/// check that for them.
+pub fn parse_deleted_branch_sha(stdout: &str) -> Option<String> {
+    let (_, rest) = stdout.split_once("(was ")?;
+    let (sha, _) = rest.split_once(')')?;
+    let sha = sha.trim();
+    // Git fills this slot with whatever the ref pointed at, and for a symbolic ref that is another
+    // ref's name rather than a commit — `Deleted branch sym (was refs/heads/main).`. Returning it
+    // would put a non-commit where callers report "the commit it pointed at", and send anyone
+    // following the log to a reflog lookup that cannot succeed. Only a hex object name counts.
+    if sha.len() >= 4 && sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(sha.to_string())
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -811,5 +836,40 @@ mod tests {
         // both.txt contributes from each side (2 + 3 added, 1 + 0 deleted), work.txt from one.
         assert_eq!(status.added_total, 10);
         assert_eq!(status.deleted_total, 5);
+    }
+
+    /// Git's own wording, and the shapes that are not it.
+    #[test]
+    fn reads_the_deleted_branch_sha_from_gits_wording() {
+        assert_eq!(
+            parse_deleted_branch_sha("Deleted branch giskard/worktree-04demo (was e17b742).\n"),
+            Some("e17b742".to_string())
+        );
+        // A branch name containing the marker must not be mistaken for the report's own. The first
+        // marker still wins — which is why the caller passes only this command's output — but what
+        // it yields is not an object name, so the report is refused rather than guessed at.
+        assert_eq!(
+            parse_deleted_branch_sha("Deleted branch feature/(was x) (was abc1234).\n"),
+            None
+        );
+        assert_eq!(parse_deleted_branch_sha("nothing to report"), None);
+        assert_eq!(parse_deleted_branch_sha("Deleted branch x (was )."), None);
+        assert_eq!(parse_deleted_branch_sha("Deleted branch x (was abc"), None);
+    }
+
+    /// Deleting a symbolic ref succeeds and reports the ref it pointed at, not a commit. Handing
+    /// that back would be a non-commit in the one field that records where the branch was.
+    #[test]
+    fn refuses_a_symbolic_refs_target_as_the_commit() {
+        assert_eq!(
+            parse_deleted_branch_sha("Deleted branch sym (was refs/heads/main).\n"),
+            None
+        );
+        // Nor does a short-but-hex-looking fragment pass: Git abbreviates to at least four.
+        assert_eq!(parse_deleted_branch_sha("Deleted branch x (was ab)."), None);
+        assert_eq!(
+            parse_deleted_branch_sha("Deleted branch x (was abcd)."),
+            Some("abcd".to_string())
+        );
     }
 }

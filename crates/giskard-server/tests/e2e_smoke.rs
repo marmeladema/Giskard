@@ -6276,6 +6276,7 @@ async fn subscribe_reopens_persisted_thread() {
                 created_at: now,
                 updated_at: now,
                 archived: false,
+                git_workspace: None,
             },
         )
         .await
@@ -6411,6 +6412,7 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
                 created_at: now,
                 updated_at: now,
                 archived: false,
+                git_workspace: None,
             },
         )
         .await
@@ -6569,6 +6571,7 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
                 created_at: now,
                 updated_at: now,
                 archived: false,
+                git_workspace: None,
             },
         )
         .await
@@ -6800,6 +6803,7 @@ async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
                 created_at: now,
                 updated_at: now,
                 archived: false,
+                git_workspace: None,
             },
         )
         .await
@@ -7295,6 +7299,7 @@ wire_api = "responses"
                 created_at: now,
                 updated_at: now,
                 archived: false,
+                git_workspace: None,
             },
         )
         .await
@@ -7398,6 +7403,7 @@ wire_api = "responses"
                 created_at: now,
                 updated_at: now,
                 archived: false,
+                git_workspace: None,
             },
         )
         .await

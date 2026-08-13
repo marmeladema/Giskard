@@ -45,6 +45,7 @@ fn test_thread(
         created_at: now,
         updated_at: now,
         archived,
+        git_workspace: None,
     }
 }
 

@@ -333,6 +333,7 @@ async fn replay_persisted_state_roundtrip() {
         created_at: now,
         updated_at: now,
         archived: false,
+        git_workspace: None,
     };
 
     store.save_thread(pid, &thread_file).await.unwrap();

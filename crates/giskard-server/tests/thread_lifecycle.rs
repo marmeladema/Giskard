@@ -176,6 +176,7 @@ async fn thread_lifecycle_native_failure_preserves_local_thread() {
                 created_at: now,
                 updated_at: now,
                 archived: false,
+                git_workspace: None,
             },
         )
         .await

@@ -97,6 +97,96 @@ pub struct ThreadFile {
     pub updated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub archived: bool,
+    /// The Git workspace this thread was created with, when it was created with one. Absent for
+    /// ordinary threads, which work in the project's own workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_workspace: Option<ThreadGitWorkspace>,
+}
+
+/// A Git workspace a thread owns, tagged by the strategy that produced it.
+///
+/// Tagged rather than a bare struct because the strategies are meant to *coexist*: a worktree and a
+/// thread-owned repository answer different needs — one shares the project's history and delivers
+/// work by simply existing, the other trades that for a boundary — and a user picking per thread
+/// wants both available. So this is not a placeholder for one shape replacing another. A new
+/// strategy is a new variant, old records keep parsing because their tag still names their own
+/// variant, and nothing has to be migrated.
+///
+/// The tag values match `GitStrategy` on the wire, so a record says which choice produced it in the
+/// same vocabulary the request used.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "strategy", rename_all = "snake_case")]
+pub enum ThreadGitWorkspace {
+    Worktree(ThreadWorktree),
+}
+
+impl ThreadGitWorkspace {
+    /// Where the thread works — the one question every strategy must answer, and the only thing
+    /// most callers need. Everything else about a workspace is strategy-specific.
+    pub fn workspace_root(&self) -> &str {
+        match self {
+            Self::Worktree(worktree) => worktree.workspace_root(),
+        }
+    }
+
+    /// The worktree behind this workspace, if that is what it is.
+    ///
+    /// Deliberately fallible rather than a field: creation, removal and deletion impact are
+    /// strategy-specific, so a caller doing one of those has to say which strategy it handles and
+    /// what it does about the others.
+    pub fn as_worktree(&self) -> Option<&ThreadWorktree> {
+        match self {
+            Self::Worktree(worktree) => Some(worktree),
+        }
+    }
+}
+
+/// A linked Git worktree owned by one thread, so its file changes never touch the project's
+/// checkout or another thread's.
+///
+/// The Git directories are recorded rather than derived: `<workspace>/.git` is only the repository
+/// when the project directory is an ordinary checkout, and is a pointer *file* when the project is
+/// itself a linked worktree. Both paths come from `git rev-parse` inside the worktree at creation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadWorktree {
+    /// Absolute path of the worktree — the checkout Git created, and what `git worktree remove`
+    /// and the impact probes operate on. Not necessarily where the thread works: see `workspace`.
+    pub path: String,
+    /// Absolute path the thread actually works in, and what every path resolves against.
+    ///
+    /// Equal to `path` when the project directory is the repository's top level. When the project
+    /// is rooted in a *subdirectory* of its repository, Git can only check out the whole repository,
+    /// so the worktree is its root while the thread works in the same subdirectory beneath it —
+    /// otherwise an isolated thread would silently work one or more levels above the directory the
+    /// project scoped it to, and a path would name a different file than it does for an ordinary
+    /// thread of the same project.
+    ///
+    /// Absent for the top-level case, which is the common one; read it through
+    /// [`ThreadWorktree::workspace_root`] rather than directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// The branch created for this thread. Only its *starting* branch: the agent may switch away,
+    /// so this names what to clean up, never what is currently checked out.
+    pub branch: String,
+    /// The commit the branch started from, or `None` in a repository with no commits, where the
+    /// worktree is created on an orphan branch and there is nothing to count from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
+    /// The checkout that owns the worktree — where `git worktree remove` and `git branch -D` run.
+    pub repo_root: String,
+    /// `git rev-parse --git-common-dir`: the shared repository (objects, refs, config, hooks).
+    pub common_dir: String,
+    /// `git rev-parse --git-dir`: this worktree's private directory (its index, HEAD, reflog).
+    pub git_dir: String,
+}
+
+impl ThreadWorktree {
+    /// Where the thread works. The whole point of the pair: `path` is the checkout Git manages,
+    /// this is the directory inside it that stands in for the project's own.
+    pub fn workspace_root(&self) -> &str {
+        self.workspace.as_deref().unwrap_or(&self.path)
+    }
 }
 
 fn is_false(value: &bool) -> bool {
@@ -850,6 +940,39 @@ impl PersistStore {
 }
 
 #[cfg(test)]
+mod git_workspace_tests {
+    use super::*;
+
+    /// The tag is what makes another strategy additive rather than a migration, so it has to be
+    /// written, and the variant's own fields have to survive sitting beside it — `ThreadWorktree`
+    /// denies unknown fields, and an internally tagged enum is exactly where that can go wrong.
+    #[test]
+    fn git_workspace_round_trips_with_its_strategy_tag() {
+        let workspace = ThreadGitWorkspace::Worktree(ThreadWorktree {
+            path: "/data/wt".into(),
+            workspace: Some("/data/wt/packages/api".into()),
+            branch: "giskard/worktree-01test".into(),
+            base_commit: Some("e17b742".into()),
+            repo_root: "/home/me/project".into(),
+            common_dir: "/home/me/project/.git".into(),
+            git_dir: "/home/me/project/.git/worktrees/t".into(),
+        });
+
+        let json = serde_json::to_value(&workspace).unwrap();
+        assert_eq!(
+            json["strategy"], "worktree",
+            "the record names the strategy that produced it"
+        );
+        assert_eq!(json["path"], "/data/wt");
+        assert_eq!(
+            serde_json::from_value::<ThreadGitWorkspace>(json).unwrap(),
+            workspace,
+            "and reads back as the same variant"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
@@ -957,6 +1080,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             archived: false,
+            git_workspace: None,
         };
         store.save_thread(pid, &thread).await.unwrap();
 
@@ -1002,6 +1126,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             archived: false,
+            git_workspace: None,
         };
         let mut value = serde_json::to_value(&thread).unwrap();
         let object = value.as_object_mut().unwrap();
@@ -1057,6 +1182,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             archived: false,
+            git_workspace: None,
         };
         let mut value = serde_json::to_value(&thread).unwrap();
         value.as_object_mut().unwrap().remove("permission_preset");
@@ -1106,6 +1232,7 @@ mod tests {
                 created_at: now,
                 updated_at: now,
                 archived: false,
+                git_workspace: None,
             };
             store.save_thread(pid, &thread).await.unwrap();
         }
@@ -1281,6 +1408,7 @@ mod tests {
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
                     archived: false,
+                    git_workspace: None,
                 },
             )
             .await
@@ -1461,6 +1589,7 @@ mod tests {
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
                     archived: false,
+                    git_workspace: None,
                 },
             )
             .await
@@ -1503,6 +1632,7 @@ mod tests {
                     created_at: now,
                     updated_at: now,
                     archived: false,
+                    git_workspace: None,
                 },
             )
             .await

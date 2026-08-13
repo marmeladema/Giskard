@@ -792,6 +792,7 @@ async fn open_thread(
         created_at: now,
         updated_at: now,
         archived: false,
+        git_workspace: None,
     };
     state.store.save_thread(project_id, &thread_file).await?;
 
@@ -947,6 +948,7 @@ async fn start_thread_with_message(
         created_at: now,
         updated_at: now,
         archived: false,
+        git_workspace: None,
     };
 
     if let Err(error) = state.store.save_thread(project_id, &thread_file).await {
