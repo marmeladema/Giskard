@@ -2186,11 +2186,11 @@ struct HighlightQuery {
 /// `image`, and probed for existence by `linkify` and `render`.
 ///
 /// Resolved per thread rather than per project because that is what these endpoints promise: the
-/// caller asks about a file *as this thread sees it*. Today every thread in a project shares the
-/// project's workspace, so the answer is the same for all of them — but the thread is loaded and
-/// verified rather than ignored, which is what makes an unknown or foreign id a `404` instead of a
-/// silent answer from a workspace nobody asked about. `load_thread` is scoped to the project, so a
-/// thread belonging to another one is unknown here too.
+/// caller asks about a file *as this thread sees it*. Today every thread in a project works in the
+/// one root that project configures, so the answer is the same for all of them — but the thread is
+/// loaded and verified rather than ignored, which is what makes an unknown or foreign id a `404`
+/// instead of a silent answer from a workspace nobody asked about. `load_thread` is scoped to the
+/// project, so a thread belonging to another one is unknown here too.
 async fn thread_workspace(
     state: &AppState,
     project_id: ProjectId,
@@ -4683,13 +4683,12 @@ async fn save_plan(
     requested_path: &str,
 ) -> Result<String, String> {
     let (project_id, tf) = load_thread(state, thread_id).await?;
-    let project = state
-        .store
-        .load_project(project_id)
+    // Through the same resolver the file endpoints use, rather than straight from the project. A
+    // plan is written into the workspace the thread works in, and this was the last place that held
+    // a thread and then asked the project where to put its file.
+    let workspace_root = thread_workspace(state, project_id, thread_id)
         .await
-        .map_err(|e| e.to_string())?
-        .ok_or("project not found")?;
-    let workspace_root = PathBuf::from(project.workspace_root.as_deref().unwrap_or(&project.dir));
+        .map_err(|e| format!("could not resolve the thread's workspace: {e}"))?;
 
     // Plan extraction reads the authoritative JSONL history (H1), not the metadata file.
     let turns = state
