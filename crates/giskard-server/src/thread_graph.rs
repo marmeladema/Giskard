@@ -1,9 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
+use giskard_core::error::PersistError;
 use giskard_core::ids::{ProjectId, ThreadId};
 use giskard_core::thread::ThreadKind;
 use giskard_persist::PersistStore;
-use giskard_persist::store::ThreadFile;
+use giskard_persist::store::{ThreadFile, ThreadGitWorkspace};
+use tracing::warn;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExistingLinkDisposition {
@@ -37,6 +39,62 @@ pub(crate) async fn load_thread_graph(
         }
     }
     Ok(graph)
+}
+
+/// The Git workspace a thread's work belongs in: its own when it has one, otherwise the nearest
+/// one above it in the parent chain. Strategy-neutral — a sub-agent inherits whatever its owner was
+/// created with.
+///
+/// Only a thread started with isolation carries a workspace record; a sub-agent never does. The
+/// harness spawns a sub-agent inside its parent's turn, so it inherits that cwd and its work lands
+/// in the parent's worktree — but a lookup that read the child's own record alone would answer with
+/// the project's checkout, and it would be wrong in the way that is hardest to notice. The harness
+/// ignores a cwd override while the child is still live, so the mismatch would surface only on the
+/// next cold turn: a direct follow-up, or anything after a restart, running somewhere other than
+/// where that same thread's earlier work is.
+///
+/// The chain is read, never copied down it. The worktree stays owned by the thread that created it,
+/// so deleting a sub-agent cannot take its parent's checkout and branch with it.
+pub(crate) async fn inherited_git_workspace(
+    store: &PersistStore,
+    project_id: ProjectId,
+    thread: &ThreadFile,
+) -> Result<Option<ThreadGitWorkspace>, PersistError> {
+    if thread.git_workspace.is_some() {
+        return Ok(thread.git_workspace.clone());
+    }
+    let mut seen = HashSet::from([thread.id]);
+    let mut next = thread.parent_thread_id;
+    while let Some(parent_id) = next {
+        // A cyclic chain is malformed rather than impossible — `graph_issue` reports one instead of
+        // repairing it — and this walk has to terminate on it either way.
+        if !seen.insert(parent_id) {
+            warn!(
+                %project_id,
+                thread_id = %thread.id,
+                "stopping the Git workspace lookup on a cyclic parent chain"
+            );
+            return Ok(None);
+        }
+        // A parent that is not persisted breaks the chain, and the caller's fallback is the
+        // project's checkout — so a sub-agent silently runs in the user's tree instead of the
+        // worktree its owner works in. That is the failure this function's callers are least able
+        // to notice, so it is said out loud.
+        let Some(parent) = store.load_thread(project_id, parent_id).await? else {
+            warn!(
+                %project_id,
+                thread_id = %thread.id,
+                missing_parent_thread_id = %parent_id,
+                "stopping the worktree lookup on a parent that is not persisted"
+            );
+            return Ok(None);
+        };
+        if parent.git_workspace.is_some() {
+            return Ok(parent.git_workspace);
+        }
+        next = parent.parent_thread_id;
+    }
+    Ok(None)
 }
 
 pub(crate) fn classify_existing_link(
@@ -195,6 +253,106 @@ mod tests {
             archived: false,
             git_workspace: None,
         }
+    }
+
+    fn worktree(path: &str) -> ThreadGitWorkspace {
+        ThreadGitWorkspace::Worktree(giskard_persist::store::ThreadWorktree {
+            path: path.into(),
+            workspace: None,
+            branch: "giskard/worktree-01test".into(),
+            base_commit: None,
+            repo_root: "/repo".into(),
+            common_dir: "/repo/.git".into(),
+            git_dir: "/repo/.git/worktrees/t".into(),
+        })
+    }
+
+    /// A sub-agent works in its parent's worktree and never records one, so the lookup has to read
+    /// the chain — at any depth, and without hanging on a chain that is malformed.
+    #[tokio::test]
+    async fn worktree_is_inherited_from_the_nearest_owner_in_the_chain() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = PersistStore::new(dir.path().to_path_buf());
+        let project_id = ProjectId::new();
+        store
+            .create_project(
+                project_id,
+                "inheritance",
+                "/repo",
+                ModelRef {
+                    provider: "test".into(),
+                    model: "test".into(),
+                    reasoning_effort: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let root = ThreadId::new();
+        let child = ThreadId::new();
+        let grandchild = ThreadId::new();
+        let orphan = ThreadId::new();
+        let mut files = vec![
+            thread(root, ThreadKind::Primary, None),
+            thread(child, ThreadKind::Subagent, Some(root)),
+            thread(grandchild, ThreadKind::Subagent, Some(child)),
+            thread(orphan, ThreadKind::Subagent, Some(ThreadId::new())),
+        ];
+        files[0].git_workspace = Some(worktree("/worktrees/root"));
+        for file in &files {
+            store.save_thread(project_id, file).await.unwrap();
+        }
+
+        // Its own record wins, and a descendant at any depth inherits it.
+        for (thread, expected) in [
+            (&files[0], Some("/worktrees/root")),
+            (&files[1], Some("/worktrees/root")),
+            (&files[2], Some("/worktrees/root")),
+            // A parent that is not persisted answers "none", not the nearest thing to hand.
+            (&files[3], None),
+        ] {
+            assert_eq!(
+                inherited_git_workspace(&store, project_id, thread)
+                    .await
+                    .unwrap()
+                    .map(|workspace| workspace.workspace_root().to_string()),
+                expected.map(str::to_string),
+                "wrong Git workspace for {}",
+                thread.id
+            );
+        }
+
+        // A child of an owner-less chain inherits nothing rather than the project's own worktree.
+        files[0].git_workspace = None;
+        store.save_thread(project_id, &files[0]).await.unwrap();
+        assert!(
+            inherited_git_workspace(&store, project_id, &files[2])
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // A cycle is malformed but persistable — `graph_issue` reports one rather than repairing
+        // it — so the walk has to terminate instead of following it forever.
+        //
+        // The cycle-closing thread owns a workspace *on disk*, so this asserts on a value rather
+        // than only on termination: a walk that followed the cycle would come back around, load it,
+        // and answer `Some`. Without that the assertion could only ever fail by hanging.
+        //
+        // Saved from a clone so the in-memory `files[2]` the walk starts from still owns nothing —
+        // otherwise the lookup short-circuits on its own record and never walks at all.
+        let mut cycle_owner = files[2].clone();
+        cycle_owner.git_workspace = Some(worktree("/worktrees/grandchild"));
+        store.save_thread(project_id, &cycle_owner).await.unwrap();
+        files[0].kind = ThreadKind::Subagent;
+        files[0].parent_thread_id = Some(grandchild);
+        store.save_thread(project_id, &files[0]).await.unwrap();
+        assert!(
+            inherited_git_workspace(&store, project_id, &files[2])
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

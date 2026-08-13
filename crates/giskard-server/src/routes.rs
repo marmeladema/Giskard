@@ -30,7 +30,7 @@ use giskard_git_parser::{
     GitNumstatEntry, apply_numstat_counts, index_numstat, parse_git_numstat, parse_git_status,
 };
 use giskard_persist::Config;
-use giskard_persist::store::{ProjectConfig, ThreadFile};
+use giskard_persist::store::{ProjectConfig, ThreadFile, ThreadGitWorkspace, ThreadWorktree};
 use giskard_proto::*;
 use tokio::process::Command as TokioCommand;
 use tokio::sync::mpsc;
@@ -41,7 +41,8 @@ use crate::auth::{
     get_session_token_from_header, sign_token, verify_token,
 };
 use crate::thread_graph::{
-    descendant_deletion_order, graph_issue, load_thread_graph, should_refresh_subagent_title,
+    descendant_deletion_order, graph_issue, inherited_git_workspace, load_thread_graph,
+    should_refresh_subagent_title,
 };
 
 const HARNESS_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -593,6 +594,12 @@ async fn open_thread(
             }));
         }
 
+        // A thread with a worktree is opened against that worktree, not the project's checkout — and
+        // a sub-agent against its parent's, which is where the harness ran it. Resolved after the
+        // early return above: an already-attached thread is the common case for this endpoint, and
+        // the lookup walks the ownership chain reading persisted parents to answer.
+        let ws_root = thread_workspace_root(&state, &project_config, &thread_file).await?;
+
         // Opening an existing thread must not hard-fail when the harness can't attach — most
         // often because the thread's provider was removed from config. The browser opens a
         // thread through this endpoint *before* subscribing over the WebSocket, so a 500 here
@@ -603,7 +610,7 @@ async fn open_thread(
                 .registry
                 .open_linked_thread(
                     &project_config,
-                    ws_root,
+                    &ws_root,
                     Some(thread_id),
                     thread_file.harness_thread_id.clone(),
                     current_model.clone(),
@@ -614,7 +621,7 @@ async fn open_thread(
                 .registry
                 .open_thread(
                     &project_config,
-                    ws_root,
+                    &ws_root,
                     Some(thread_id),
                     Some(thread_file.harness_thread_id.clone()),
                     current_model.clone(),
@@ -879,7 +886,7 @@ async fn start_thread_with_message(
     let catalog = project_model_catalog(&state, &project_config, &app_config).await;
     let (model_ref, model_descriptor) =
         resolve_initial_thread_model(&app_config, &catalog, req.model_ref);
-    let ws_root = project_config
+    let project_ws_root = project_config
         .workspace_root
         .as_deref()
         .unwrap_or(&project_config.dir);
@@ -891,10 +898,46 @@ async fn start_thread_with_message(
         model = %model_ref.model,
         mode = ?req.mode,
         permission_preset = ?req.permission_preset,
+        git_strategy = ?req.git_strategy,
         "starting new thread from initial user message"
     );
 
-    let handle = state
+    // The worktree has to exist before the harness opens the thread, because it *is* the cwd the
+    // harness is opened against. A failure here fails the whole request rather than falling back to
+    // the project's checkout: a thread that silently runs unisolated still looks isolated in the UI,
+    // which is the one outcome worse than an error the user can act on.
+    let worktree = match req.git_strategy {
+        GitStrategy::Shared => None,
+        GitStrategy::Worktree => {
+            let path = crate::worktree::worktree_path(
+                state.store.data_dir(),
+                &project_id.to_string(),
+                thread_id,
+            );
+            let branch = crate::worktree::branch_name(thread_id);
+            match crate::worktree::create(Path::new(project_ws_root), &path, &branch).await {
+                Ok(worktree) => {
+                    info!(%project_id, %thread_id, branch, path = %path.display(), "created thread worktree");
+                    Some(worktree)
+                }
+                Err(error) => {
+                    warn!(%project_id, %thread_id, branch, %error, "could not create thread worktree");
+                    return Err(match error {
+                        crate::worktree::WorktreeError::Unavailable(message) => {
+                            ApiError::Unavailable(message)
+                        }
+                        other => ApiError::BadRequest(other.to_string()),
+                    });
+                }
+            }
+        }
+    };
+    let ws_root = worktree
+        .as_ref()
+        .map(|w| w.workspace_root())
+        .unwrap_or(project_ws_root);
+
+    let handle = match state
         .registry
         .open_thread(
             &project_config,
@@ -904,7 +947,13 @@ async fn start_thread_with_message(
             model_ref.clone(),
         )
         .await
-        .map_err(harness_api_error)?;
+    {
+        Ok(handle) => handle,
+        Err(error) => {
+            remove_worktree_after_start_failure(worktree.as_ref(), thread_id, "open_thread").await;
+            return Err(harness_api_error(error));
+        }
+    };
     if handle.thread != thread_id {
         cleanup_new_thread_after_start_failure(
             &state,
@@ -915,6 +964,8 @@ async fn start_thread_with_message(
             "open_thread_mismatch",
         )
         .await;
+        remove_worktree_after_start_failure(worktree.as_ref(), thread_id, "open_thread_mismatch")
+            .await;
         let detail = format!(
             "harness opened wrong thread: expected {thread_id}, got {}",
             handle.thread
@@ -948,7 +999,7 @@ async fn start_thread_with_message(
         created_at: now,
         updated_at: now,
         archived: false,
-        git_workspace: None,
+        git_workspace: worktree.clone().map(ThreadGitWorkspace::Worktree),
     };
 
     if let Err(error) = state.store.save_thread(project_id, &thread_file).await {
@@ -961,6 +1012,7 @@ async fn start_thread_with_message(
             "save_thread",
         )
         .await;
+        remove_worktree_after_start_failure(worktree.as_ref(), thread_id, "save_thread").await;
         return Err(ApiError::Internal(error.to_string()));
     }
 
@@ -990,6 +1042,7 @@ async fn start_thread_with_message(
                 "start_turn",
             )
             .await;
+            remove_worktree_after_start_failure(worktree.as_ref(), thread_id, "start_turn").await;
             return Err(harness_api_error(error));
         }
     };
@@ -1421,6 +1474,70 @@ fn truncate_title(text: &str, max_chars: usize) -> String {
     clipped
         .trim_end_matches(|ch: char| ch.is_ascii_whitespace() || " ,;:-".contains(ch))
         .to_string()
+}
+
+/// The workspace a thread works in: the nearest Git worktree in its ownership chain, the project's
+/// workspace otherwise.
+///
+/// Every path served for a thread — the harness cwd, file reads, Git status — has to agree on this,
+/// or the browser shows one workspace while the agent edits another. The chain rather than the
+/// thread's own record, because a sub-agent works in its parent's worktree and holds no record of
+/// one itself (see [`inherited_git_workspace`]).
+async fn thread_workspace_root(
+    state: &AppState,
+    project: &ProjectConfig,
+    thread: &ThreadFile,
+) -> Result<String, ApiError> {
+    Ok(inherited_git_workspace(&state.store, project.id, thread)
+        .await?
+        .map(|workspace| workspace.workspace_root().to_string())
+        .unwrap_or_else(|| project_workspace_root(project).to_string()))
+}
+
+/// The project's own workspace, which is what a draft reads before any thread exists.
+fn project_workspace_root(project: &ProjectConfig) -> &str {
+    project.workspace_root.as_deref().unwrap_or(&project.dir)
+}
+
+/// Unwind the worktree created for a thread whose startup then failed.
+///
+/// The worktree is created before the harness is opened, so every later failure in that handler
+/// leaves one behind: an empty checkout and a branch belonging to a thread that does not exist.
+/// Forced, because there is nothing in it worth confirming — no turn ever ran.
+async fn remove_worktree_after_start_failure(
+    worktree: Option<&ThreadWorktree>,
+    thread_id: ThreadId,
+    failed_action: &str,
+) {
+    let Some(worktree) = worktree else {
+        return;
+    };
+    match crate::worktree::remove(worktree, /*force*/ true).await {
+        Ok(()) => debug!(
+            %thread_id,
+            branch = %worktree.branch,
+            %failed_action,
+            "removed thread worktree after failed new-thread startup"
+        ),
+        Err(error) => warn!(
+            %thread_id,
+            branch = %worktree.branch,
+            path = %worktree.path,
+            %failed_action,
+            %error,
+            "could not remove thread worktree after failed new-thread startup"
+        ),
+    }
+    // The branch outlives `worktree remove`, and a thread that never started has nothing on it.
+    if let Err(error) = crate::worktree::delete_branch(worktree).await {
+        warn!(
+            %thread_id,
+            branch = %worktree.branch,
+            %failed_action,
+            %error,
+            "could not delete thread branch after failed new-thread startup"
+        );
+    }
 }
 
 async fn cleanup_new_thread_after_start_failure(
@@ -2188,11 +2305,10 @@ struct HighlightQuery {
 /// `image`, and probed for existence by `linkify` and `render`.
 ///
 /// Resolved per thread rather than per project because that is what these endpoints promise: the
-/// caller asks about a file *as this thread sees it*. Today every thread in a project works in the
-/// one root that project configures, so the answer is the same for all of them — but the thread is
-/// loaded and verified rather than ignored, which is what makes an unknown or foreign id a `404`
-/// instead of a silent answer from a workspace nobody asked about. `load_thread` is scoped to the
-/// project, so a thread belonging to another one is unknown here too.
+/// caller asks about a file *as this thread sees it*, and with isolation that is no longer the same
+/// answer for every thread — a thread started in its own worktree holds a *different file under the
+/// same path*. `load_thread` is scoped to the project, so an unknown thread, or one belonging to
+/// another project, is a `404` rather than an answer from a workspace nobody asked about.
 async fn thread_workspace(
     state: &AppState,
     project_id: ProjectId,
@@ -2203,16 +2319,13 @@ async fn thread_workspace(
         .load_project(project_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if state
+    let thread = state
         .store
         .load_thread(project_id, thread_id)
         .await?
-        .is_none()
-    {
-        return Err(ApiError::NotFound);
-    }
+        .ok_or(ApiError::NotFound)?;
     Ok(PathBuf::from(
-        project.workspace_root.as_deref().unwrap_or(&project.dir),
+        thread_workspace_root(state, &project, &thread).await?,
     ))
 }
 
@@ -4098,7 +4211,7 @@ async fn ensure_thread_open(
         });
     }
 
-    let Some((project_config, _thread_file)) =
+    let Some((project_config, persisted_thread)) =
         find_persisted_thread(state, thread_id, action).await?
     else {
         return Err(WsError::new(
@@ -4110,10 +4223,16 @@ async fn ensure_thread_open(
         .action(action));
     };
 
-    let ws_root = project_config
-        .workspace_root
-        .as_deref()
-        .unwrap_or(&project_config.dir);
+    // Resume must land in the worktree the thread works in — its own, or its parent's for a
+    // sub-agent. Falling back to the project's checkout here would silently un-isolate the thread
+    // after a restart, with nothing in the UI to say so.
+    let ws_root = thread_workspace_root(state, &project_config, &persisted_thread)
+        .await
+        .map_err(|e| {
+            WsError::new("workspace_unavailable", ErrorSeverity::Error, e.to_string())
+                .thread(thread_id)
+                .action(action)
+        })?;
     let app_config = state
         .store
         .load_config()
@@ -4151,7 +4270,7 @@ async fn ensure_thread_open(
             .registry
             .open_linked_thread(
                 &project_config,
-                ws_root,
+                &ws_root,
                 Some(thread_id),
                 thread_file.harness_thread_id.clone(),
                 current_model,
@@ -4162,7 +4281,7 @@ async fn ensure_thread_open(
             .registry
             .open_thread(
                 &project_config,
-                ws_root,
+                &ws_root,
                 Some(thread_id),
                 Some(thread_file.harness_thread_id.clone()),
                 current_model,

@@ -1811,11 +1811,11 @@ async fn materialize_subagent_thread(
         .get(&project_id)
         .cloned()
         .ok_or(HarnessError::ThreadNotFound(parent_thread_id))?;
-    let workspace_root = project_config
-        .workspace_root
-        .as_deref()
-        .unwrap_or(&project_config.dir)
-        .to_owned();
+    // The harness already runs this child inside its parent's turn, so its cwd is the parent's
+    // workspace. Passing the project's checkout instead would be ignored while the child is live
+    // and applied on its next cold resume, moving the thread out of the worktree its own earlier
+    // work is in.
+    let workspace_root = subagent_workspace_root(&shared, &project_config, &parent_file).await?;
     let handle = harness
         .open_thread(OpenThreadOptions {
             project: project_id,
@@ -1976,6 +1976,31 @@ async fn run_subagent_materialization_queue(
     }
 }
 
+/// The workspace a sub-agent's harness thread is opened against: the nearest worktree in its
+/// ownership chain, the project's workspace otherwise.
+///
+/// Takes the parent's thread file when the child is not persisted yet, and the child's own once it
+/// is; [`inherited_git_workspace`] answers the same for both.
+async fn subagent_workspace_root(
+    shared: &RegistryShared,
+    project_config: &ProjectConfig,
+    thread: &ThreadFile,
+) -> Result<String, HarnessError> {
+    let worktree =
+        crate::thread_graph::inherited_git_workspace(&shared.store, project_config.id, thread)
+            .await
+            .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+    Ok(worktree
+        .map(|worktree| worktree.workspace_root().to_string())
+        .unwrap_or_else(|| {
+            project_config
+                .workspace_root
+                .as_deref()
+                .unwrap_or(&project_config.dir)
+                .to_owned()
+        }))
+}
+
 async fn ensure_subagent_thread_open(
     project_config: &ProjectConfig,
     thread_file: &ThreadFile,
@@ -1991,11 +2016,9 @@ async fn ensure_subagent_thread_open(
         .get(&project_config.id)
         .cloned()
         .ok_or(HarnessError::ThreadNotFound(thread_file.id))?;
-    let workspace_root = project_config
-        .workspace_root
-        .as_deref()
-        .unwrap_or(&project_config.dir)
-        .to_owned();
+    // Reopening a persisted sub-agent is that cold resume: resolve from the chain, not from the
+    // child's own record, which never names a worktree.
+    let workspace_root = subagent_workspace_root(shared, project_config, thread_file).await?;
     let handle = harness
         .open_thread(OpenThreadOptions {
             project: project_config.id,
