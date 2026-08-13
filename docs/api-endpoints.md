@@ -10,8 +10,9 @@ WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticke
 `POST /api/projects/{id}/threads/{thread_id}/archive`, `GET /api/models`, `POST
 /api/models/refresh`, `GET /api/projects/{id}/models`,
 `GET /api/tokens`, `GET /api/projects/{id}/tokens`,
-`GET /api/projects/{id}/highlight|raw|image`, `POST
-/api/projects/{id}/linkify`, `POST /api/projects/{id}/render`,
+`GET /api/projects/{id}/threads/{thread_id}/highlight|raw|image`, `POST
+/api/projects/{id}/threads/{thread_id}/linkify`, `POST
+/api/projects/{id}/threads/{thread_id}/render`,
 `GET /api/projects/{id}/git/status`, `GET /api/projects/{id}/git/diff`, `GET /api/browse`, `POST
 /api/browse/mkdir`, `GET /api/projects/{id}/mcp`, `POST /api/projects/{id}/mcp/reload`, and `POST
 /api/projects/{id}/mcp/oauth-login`. Wire types are defined once in `giskard-proto`. See
@@ -44,6 +45,28 @@ verifies the agent actually applied the switch before persisting it, and the thr
 again with its history intact. The same verified switch works for any thread that hasn't been
 opened since the server started; threads with a live agent session stay bound to their provider
 (create a new thread to change providers there).
+
+Five endpoints resolve a path against a thread's workspace, and all five name that thread in the
+path — there is no thread-less form. The thread is part of the request rather than an optional
+scope, because a caller that could omit it would be answered from a workspace it never named. Every
+thread in a project currently shares the project's workspace, so today the answer is the same for
+all of them; what the thread buys now is that it is verified — an unknown thread, or one belonging
+to another project, is a `404` rather than a silent answer.
+
+They use the workspace for two different things, which is worth keeping straight:
+
+- **`highlight`, `raw` and `image` read the file.** The workspace decides which bytes come back, so
+  the wrong one is answered successfully with the wrong content.
+- **`linkify` and `render` only test that a path exists.** Neither opens a file: `linkify` returns
+  spans for the candidates that resolve inside the workspace and are files, and `render` is
+  workspace-independent apart from running that same pass to decide which text becomes a
+  `.path-link` button. The wrong workspace there costs a link, not content — a path rendered
+  clickable that then fails to load, or a real file left as plain text.
+
+That second group is why they belong on the same scope as the first. The existence check is a
+prediction about what the read endpoints will serve; resolve them against different workspaces and
+the UI renders links that break when clicked. A workspace path that cannot be canonicalized simply
+yields no links, so `render` still returns correct Markdown.
 
 `GET /api/projects/{id}/git/status` returns best-effort, read-only Git metadata for the project's
 effective workspace root, parsed from `git status --porcelain=v2 -z`: the current branch (reported

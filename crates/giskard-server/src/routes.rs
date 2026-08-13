@@ -90,13 +90,31 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
             "/api/projects/{id}/threads/{thread_id}/archive",
             post(archive_thread),
         )
-        .route("/api/projects/{id}/highlight", get(highlight_file))
-        .route("/api/projects/{id}/raw", get(download_file))
-        .route("/api/projects/{id}/image", get(image_file))
+        // File reads name their thread in the path rather than leaving it implicit. The workspace a
+        // read is answered from is the thread's, so the thread has to be part of the request; a
+        // caller that could omit it would be answered from somewhere it never asked about.
+        .route(
+            "/api/projects/{id}/threads/{thread_id}/highlight",
+            get(highlight_file),
+        )
+        .route(
+            "/api/projects/{id}/threads/{thread_id}/raw",
+            get(download_file),
+        )
+        .route(
+            "/api/projects/{id}/threads/{thread_id}/image",
+            get(image_file),
+        )
         .route("/api/projects/{id}/git/status", get(git_status))
         .route("/api/projects/{id}/git/diff", get(git_diff))
-        .route("/api/projects/{id}/linkify", post(linkify))
-        .route("/api/projects/{id}/render", post(render_markdown))
+        .route(
+            "/api/projects/{id}/threads/{thread_id}/linkify",
+            post(linkify),
+        )
+        .route(
+            "/api/projects/{id}/threads/{thread_id}/render",
+            post(render_markdown),
+        )
         .route("/api/browse", get(browse))
         .route("/api/browse/mkdir", post(browse_mkdir))
         .route("/api/models", get(list_models))
@@ -2164,23 +2182,49 @@ struct HighlightQuery {
     end: Option<usize>,
 }
 
-/// `GET /api/projects/{id}/highlight` — syntax-highlighted file content (spec §11.2).
+/// The workspace a thread's file requests resolve against — read from by `highlight`, `raw` and
+/// `image`, and probed for existence by `linkify` and `render`.
 ///
-/// Returns highlighted HTML, detected language, binary flag, total line count,
-/// and file size. The `start`/`end` query params enable line-range pagination
-/// for large files. Path is confined to the project's workspace root.
-async fn highlight_file(
-    State(state): State<AppState>,
-    AxumPath(project_id): AxumPath<ProjectId>,
-    Query(q): Query<HighlightQuery>,
-) -> Result<Json<HighlightResponse>, ApiError> {
+/// Resolved per thread rather than per project because that is what these endpoints promise: the
+/// caller asks about a file *as this thread sees it*. Today every thread in a project shares the
+/// project's workspace, so the answer is the same for all of them — but the thread is loaded and
+/// verified rather than ignored, which is what makes an unknown or foreign id a `404` instead of a
+/// silent answer from a workspace nobody asked about. `load_thread` is scoped to the project, so a
+/// thread belonging to another one is unknown here too.
+async fn thread_workspace(
+    state: &AppState,
+    project_id: ProjectId,
+    thread_id: ThreadId,
+) -> Result<PathBuf, ApiError> {
     let project = state
         .store
         .load_project(project_id)
         .await?
         .ok_or(ApiError::NotFound)?;
+    if state
+        .store
+        .load_thread(project_id, thread_id)
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::NotFound);
+    }
+    Ok(PathBuf::from(
+        project.workspace_root.as_deref().unwrap_or(&project.dir),
+    ))
+}
 
-    let workspace_root = PathBuf::from(project.workspace_root.as_deref().unwrap_or(&project.dir));
+/// `GET /api/projects/{id}/threads/{thread_id}/highlight` — syntax-highlighted file content (spec §11.2).
+///
+/// Returns highlighted HTML, detected language, binary flag, total line count,
+/// and file size. The `start`/`end` query params enable line-range pagination
+/// for large files. Path is confined to the named thread's workspace root.
+async fn highlight_file(
+    State(state): State<AppState>,
+    AxumPath((project_id, thread_id)): AxumPath<(ProjectId, ThreadId)>,
+    Query(q): Query<HighlightQuery>,
+) -> Result<Json<HighlightResponse>, ApiError> {
+    let workspace_root = thread_workspace(&state, project_id, thread_id).await?;
     let resolved = resolve_confined_path(&workspace_root, &q.path)
         .ok_or(ApiError::Forbidden("path escapes workspace root".into()))?;
 
@@ -2206,23 +2250,17 @@ struct RawQuery {
     path: String,
 }
 
-/// `GET /api/projects/{id}/raw` — download a raw file (spec §11.2).
+/// `GET /api/projects/{id}/threads/{thread_id}/raw` — download a raw file (spec §11.2).
 ///
 /// Returns the file contents as `application/octet-stream` with a
 /// `Content-Disposition: attachment` header. Path is confined to the
 /// project's workspace root.
 async fn download_file(
     State(state): State<AppState>,
-    AxumPath(project_id): AxumPath<ProjectId>,
+    AxumPath((project_id, thread_id)): AxumPath<(ProjectId, ThreadId)>,
     Query(q): Query<RawQuery>,
 ) -> Result<axum::response::Response, ApiError> {
-    let project = state
-        .store
-        .load_project(project_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-
-    let workspace_root = PathBuf::from(project.workspace_root.as_deref().unwrap_or(&project.dir));
+    let workspace_root = thread_workspace(&state, project_id, thread_id).await?;
     let resolved = resolve_confined_path(&workspace_root, &q.path)
         .ok_or(ApiError::Forbidden("path escapes workspace root".into()))?;
 
@@ -2246,22 +2284,16 @@ async fn download_file(
         .into_response())
 }
 
-/// `GET /api/projects/{id}/image` — inline raster image preview.
+/// `GET /api/projects/{id}/threads/{thread_id}/image` — inline raster image preview.
 ///
 /// This deliberately serves a narrower surface than `/raw`: only common raster formats are
 /// returned with image MIME types for browser `<img>` rendering. SVG remains a normal file link.
 async fn image_file(
     State(state): State<AppState>,
-    AxumPath(project_id): AxumPath<ProjectId>,
+    AxumPath((project_id, thread_id)): AxumPath<(ProjectId, ThreadId)>,
     Query(q): Query<RawQuery>,
 ) -> Result<axum::response::Response, ApiError> {
-    let project = state
-        .store
-        .load_project(project_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-
-    let workspace_root = PathBuf::from(project.workspace_root.as_deref().unwrap_or(&project.dir));
+    let workspace_root = thread_workspace(&state, project_id, thread_id).await?;
     let resolved = resolve_confined_path(&workspace_root, &q.path)
         .ok_or(ApiError::Forbidden("path escapes workspace root".into()))?;
     let content_type = raster_image_content_type(&resolved)
@@ -2287,7 +2319,7 @@ fn raster_image_content_type(path: &Path) -> Option<&'static str> {
     }
 }
 
-/// `POST /api/projects/{id}/linkify` — detect file paths in agent text (spec §11.2).
+/// `POST /api/projects/{id}/threads/{thread_id}/linkify` — detect file paths in agent text (spec §11.2).
 ///
 /// Scans the request body's `text` field for strings that look like file paths,
 /// resolves them against the project's workspace root, and returns byte-offset
@@ -2295,16 +2327,10 @@ fn raster_image_content_type(path: &Path) -> Option<&'static str> {
 /// spans to render clickable links in agent messages.
 async fn linkify(
     State(state): State<AppState>,
-    AxumPath(project_id): AxumPath<ProjectId>,
+    AxumPath((project_id, thread_id)): AxumPath<(ProjectId, ThreadId)>,
     Json(req): Json<LinkifyRequest>,
 ) -> Result<Json<LinkifyResponse>, ApiError> {
-    let project = state
-        .store
-        .load_project(project_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-
-    let workspace_root = PathBuf::from(project.workspace_root.as_deref().unwrap_or(&project.dir));
+    let workspace_root = thread_workspace(&state, project_id, thread_id).await?;
     let root_canonical = workspace_root.canonicalize().unwrap_or(workspace_root);
 
     let spans = crate::linkify::linkify_text(&req.text, &root_canonical);
@@ -2321,7 +2347,7 @@ async fn linkify(
     Ok(Json(LinkifyResponse { links }))
 }
 
-/// `POST /api/projects/{id}/render` — render agent Markdown to sanitized HTML (spec §11.2).
+/// `POST /api/projects/{id}/threads/{thread_id}/render` — render agent Markdown to sanitized HTML (spec §11.2).
 ///
 /// Agents emit GitHub-flavored Markdown; this returns safe HTML the client injects directly.
 /// Detected workspace paths are wrapped in `.path-link` buttons (the same affordance `/linkify`
@@ -2329,16 +2355,10 @@ async fn linkify(
 /// sanitization guarantees.
 async fn render_markdown(
     State(state): State<AppState>,
-    AxumPath(project_id): AxumPath<ProjectId>,
+    AxumPath((project_id, thread_id)): AxumPath<(ProjectId, ThreadId)>,
     Json(req): Json<RenderRequest>,
 ) -> Result<Json<RenderResponse>, ApiError> {
-    let project = state
-        .store
-        .load_project(project_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-
-    let workspace_root = PathBuf::from(project.workspace_root.as_deref().unwrap_or(&project.dir));
+    let workspace_root = thread_workspace(&state, project_id, thread_id).await?;
     let root_canonical = workspace_root.canonicalize().unwrap_or(workspace_root);
 
     let html = crate::markdown::render_markdown(&req.text, &root_canonical);

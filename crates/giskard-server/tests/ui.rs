@@ -1275,7 +1275,7 @@ async fn index_page_is_served_and_public() {
         body.contains("function isImageViewActivity")
             && body.contains("p.title === \"Image viewed\"")
             && body.contains("function renderImageViewActivity")
-            && body.contains("projectFileUrl(\"image\", path)")
+            && body.contains("threadFileUrl(\"image\", path)")
             && body.contains("activity-image-preview"),
         "UI renders ImageView activity rows as inline image previews"
     );
@@ -1310,7 +1310,7 @@ async fn index_page_is_served_and_public() {
         "UI hides protocol-only context compaction metadata from old persisted activity rows"
     );
     assert!(
-        body.contains("/linkify"),
+        body.contains("/threads/${threadId}/linkify"),
         "UI calls the server-side path linkifier"
     );
     assert!(
@@ -1403,7 +1403,7 @@ async fn index_page_is_served_and_public() {
         "user messages render as Markdown like agent text, not as plain text"
     );
     assert!(
-        body.contains("/render`, { text }"),
+        body.contains("/threads/${threadId}/render`, { text }"),
         "UI requests server-rendered Markdown for agent text"
     );
     assert!(
@@ -1475,7 +1475,42 @@ async fn index_page_is_served_and_public() {
         "project-root path display keeps / as a valid root"
     );
     assert!(
-        body.contains("projectFileUrl(\"highlight\""),
+        body.contains("$(\"codeOverlay\").dataset.projectId = state.projectId;")
+            && body.contains("$(\"codeOverlay\").dataset.threadId = state.threadId;")
+            && body.contains("overlayFileUrl(\"raw\", state.codePath)")
+            && body.contains("overlayFileUrl(\"highlight\", path)")
+            // The URL is built from the pinned pair, not from whatever is live now — reading either
+            // half from `state` reintroduces the mismatch this exists to prevent.
+            && {
+                let helper = between(
+                    &body,
+                    "function overlayFileUrl(kind, path) {",
+                    "async function openCodeOverlay",
+                );
+                helper.contains("${data.projectId}/threads/${data.threadId}")
+                    && !helper.contains("state.")
+            },
+        "the source overlay pins the project and thread it opened for, so navigating away cannot \
+         download or re-render the file under an identity it was never read from"
+    );
+    assert!(
+        between(
+            &body,
+            "async function openThread(",
+            "state.projectId = pid;"
+        )
+        .contains("closeCodeOverlay();")
+            && between(
+                &body,
+                "function openDraftThread(pid) {",
+                "state.projectId = pid;"
+            )
+            .contains("closeCodeOverlay();"),
+        "navigating to another thread closes the file view, which belongs to the thread it was \
+         opened from"
+    );
+    assert!(
+        body.contains("overlayFileUrl(\"highlight\""),
         "UI requests server-side syntax highlighted source"
     );
     assert!(
@@ -1483,8 +1518,10 @@ async fn index_page_is_served_and_public() {
             && body.contains("function renderMarkdownCodeOverlay")
             && body.contains("function showSourceCodeOverlay")
             && body.contains("isMarkdownSourcePath(path, res.language)")
-            && body.contains("`/api/projects/${projectId}/raw?path=${encodeURIComponent(path)}`")
-            && body.contains("`/api/projects/${projectId}/render`, { text: source }")
+            && body.contains(
+                "`/api/projects/${projectId}/threads/${threadId}/raw?path=${encodeURIComponent(path)}`"
+            )
+            && body.contains("/threads/${threadId}/render`, {")
             && body.contains(
                 "showCodeOverlayWarning(\"Markdown preview unavailable; showing source.\")"
             )
@@ -1492,11 +1529,11 @@ async fn index_page_is_served_and_public() {
         "Markdown files in the source overlay render as Markdown with a source toggle and visible fallback"
     );
     assert!(
-        body.contains("projectFileUrl(\"raw\""),
+        body.contains("overlayFileUrl(\"raw\""),
         "UI exposes raw file downloads"
     );
     assert!(
-        body.contains("projectFileUrl(\"image\""),
+        body.contains("threadFileUrl(\"image\""),
         "UI exposes confined image preview URLs"
     );
     assert!(
@@ -2044,7 +2081,7 @@ fn browser_applies_cached_markdown_to_detached_history_rows() {
     assert_order(
         markdown,
         "el._markdownRenderKey = cacheKey;",
-        "if (!text.trim() || !projectId) return;",
+        "if (!text.trim() || !projectId || !threadId) return;",
     );
 }
 
@@ -2928,7 +2965,7 @@ fn browser_surfaces_markdown_overlay_fallback_warning() {
     let source = app_js();
     let markdown_overlay = between(
         source,
-        "async function renderMarkdownCodeOverlay(path, highlightRes, projectId, requestId) {",
+        "async function renderMarkdownCodeOverlay(path, highlightRes, projectId, threadId, requestId) {",
         "function showMarkdownCodeOverlay() {",
     );
     assert!(
@@ -2969,12 +3006,14 @@ fn browser_scopes_source_overlay_async_results_to_open_request() {
         open.contains("const requestId = Math.random().toString(36).slice(2);")
             && open.contains("$(\"codeOverlay\").dataset.requestId = requestId;")
             && open.contains("if (!codeOverlayRequestMatches(path, projectId, requestId)) return;")
-            && open.contains("await renderMarkdownCodeOverlay(path, res, projectId, requestId);"),
+            && open.contains(
+                "await renderMarkdownCodeOverlay(path, res, projectId, threadId, requestId);"
+            ),
         "source overlay opens should stamp and validate a per-open request token"
     );
     let markdown_overlay = between(
         source,
-        "async function renderMarkdownCodeOverlay(path, highlightRes, projectId, requestId) {",
+        "async function renderMarkdownCodeOverlay(path, highlightRes, projectId, threadId, requestId) {",
         "function showCodeOverlayWarning(message) {",
     );
     assert!(

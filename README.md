@@ -270,7 +270,9 @@ What the server enforces itself:
   escalate to script execution), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` /
   `frame-ancestors 'none'`, `Referrer-Policy: no-referrer`, and same-origin COOP/CORP.
 - **Workspace confinement.** File reads (`highlight`/`raw`/`image`), plan writes, and the browse picker
-  are confined to each project's workspace root with symlink-resolving canonicalization. When
+  are confined to each project's workspace root with symlink-resolving canonicalization. File reads
+  also name the thread they are read for, and one that does not resolve within the project is
+  refused rather than answered from elsewhere. When
   `[browse] roots` is set, it also constrains **project creation** — without it, an
   authenticated client can create a project rooted anywhere the server user can read. Set
   `roots` to your development directories on any exposed instance.

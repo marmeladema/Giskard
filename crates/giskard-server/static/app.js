@@ -2093,6 +2093,9 @@ function renderDraftPlaceholder() {
 }
 function openDraftThread(pid) {
   saveComposerDraft();
+  // Same reason as `openThread`: a draft has no workspace to read files from, so a file view left
+  // over from the previous thread would have nothing behind it.
+  closeCodeOverlay();
   clearWsReconnectTimer();
   clearWsProbeTimer();
   const oldWs = state.ws;
@@ -2178,6 +2181,10 @@ async function openThread(pid, tid, title, opts) {
   try { localStorage.setItem("giskard.lastThread", JSON.stringify({ pid, tid })); } catch {}
 
   clearThreadActivity(tid);
+  // The file view belongs to the thread it was opened from, and navigation is leaving that thread —
+  // a notification click can even land in another project. Close it rather than leave it showing
+  // one workspace's file while the app is somewhere else.
+  closeCodeOverlay();
   state.projectId = pid; state.threadId = tid; state.pendingUserEl = null; state.pendingUserText = null;
   renderParentThreadButton();
   state.threadReadOnly = false; state.readOnlyProvider = null; state.readOnlyMessage = null;
@@ -6503,9 +6510,11 @@ function renderMarkdown(el, text) {
   el.textContent = text;
   const projectId = state.projectId;
   const threadId = state.threadId;
-  const cacheKey = (projectId || "") + "\n" + text;
+  // Keyed by thread as well as project: the render resolves paths against the thread's workspace,
+  // so a project-wide cache would hand one thread's link set to another.
+  const cacheKey = (projectId || "") + "\n" + (threadId || "") + "\n" + text;
   el._markdownRenderKey = cacheKey;
-  if (!text.trim() || !projectId) return;
+  if (!text.trim() || !projectId || !threadId) return;
 
   const apply = (html) => {
     if (el._markdownRenderKey !== cacheKey) return;
@@ -6523,7 +6532,7 @@ function renderMarkdown(el, text) {
     return;
   }
 
-  api("POST", `/api/projects/${projectId}/render`, { text })
+  api("POST", `/api/projects/${projectId}/threads/${threadId}/render`, { text })
     .then((res) => {
       const html = res && typeof res.html === "string" ? res.html : "";
       state.markdownCache.set(cacheKey, html);
@@ -6602,12 +6611,13 @@ function wireCodeCopy(el) {
 function renderLinkedText(el, text) {
   text = String(text || "");
   el.textContent = text;
-  if (!text.trim() || !state.projectId) return;
+  if (!text.trim() || !state.projectId || !state.threadId) return;
 
   const projectId = state.projectId;
-  const cacheKey = projectId + "\n" + text;
+  const threadId = state.threadId;
+  const cacheKey = projectId + "\n" + threadId + "\n" + text;
   const apply = (links) => {
-    if (!el.isConnected || projectId !== state.projectId) return;
+    if (!el.isConnected || projectId !== state.projectId || threadId !== state.threadId) return;
     applyLinkedText(el, text, links || []);
     keepTranscriptRowAnchored(el);
   };
@@ -6617,7 +6627,7 @@ function renderLinkedText(el, text) {
     return;
   }
 
-  api("POST", `/api/projects/${projectId}/linkify`, { text })
+  api("POST", `/api/projects/${projectId}/threads/${threadId}/linkify`, { text })
     .then((res) => {
       const links = Array.isArray(res.links) ? res.links : [];
       state.linkifyCache.set(cacheKey, links);
@@ -7028,7 +7038,7 @@ function imageViewPath(p) {
 }
 function renderImageViewActivity(p) {
   const path = imageViewPath(p);
-  const src = projectFileUrl("image", path);
+  const src = threadFileUrl("image", path);
   return [
     `<div class="activity-image-title">${escapeHtml(p.title || "Image viewed")}</div>`,
     `<a class="activity-image-link" href="${escapeAttr(src)}" target="_blank" rel="noopener" title="Open image">`,
@@ -7348,8 +7358,10 @@ document.addEventListener("click", (e) => {
 });
 
 /* ---------- source overlay ---------- */
-function projectFileUrl(kind, path) {
-  return `/api/projects/${state.projectId}/${kind}?path=${encodeURIComponent(path)}`;
+/* File reads are answered from the thread's workspace, so the thread is part of the URL rather than
+   left implicit — the request says which thread's view of the file it wants. */
+function threadFileUrl(kind, path) {
+  return `/api/projects/${state.projectId}/threads/${state.threadId}/${kind}?path=${encodeURIComponent(path)}`;
 }
 function diffStats(diff) {
   let added = 0;
@@ -7377,9 +7389,21 @@ function codeOverlayRequestMatches(path, projectId, requestId) {
     state.projectId === projectId &&
     $("codeOverlay").dataset.requestId === requestId;
 }
+/* The overlay reads files as one thread in one project sees them, so it pins both when it opens.
+   Reading the live values again later would let a navigation mid-flight — a notification click can
+   move to a thread in another project without touching the overlay — download or re-render the file
+   under an identity that never existed: this thread, that project. */
+function overlayFileUrl(kind, path) {
+  const data = $("codeOverlay").dataset;
+  if (!data.projectId || !data.threadId) return "";
+  return `/api/projects/${data.projectId}/threads/${data.threadId}/${kind}?path=${encodeURIComponent(path)}`;
+}
 async function openCodeOverlay(path, line) {
-  if (!state.projectId || !path) return;
+  // A thread as well as a project: the file is read as that thread sees it, and the route says so.
+  if (!state.projectId || !state.threadId || !path) return;
   const requestId = Math.random().toString(36).slice(2);
+  $("codeOverlay").dataset.projectId = state.projectId;
+  $("codeOverlay").dataset.threadId = state.threadId;
   state.codePath = path;
   state.codeLine = normalizeLine(line, null);
   state.codeOverlaySource = null;
@@ -7398,8 +7422,9 @@ async function openCodeOverlay(path, line) {
   cancelOutputOverlayRefresh();
 
   const projectId = state.projectId;
+  const threadId = state.threadId;
   try {
-    const res = await api("GET", projectFileUrl("highlight", path));
+    const res = await api("GET", overlayFileUrl("highlight", path));
     if (!codeOverlayRequestMatches(path, projectId, requestId)) return;
     const bits = [];
     if (res.language) bits.push(res.language);
@@ -7413,7 +7438,7 @@ async function openCodeOverlay(path, line) {
     } else {
       renderCodeHtml(res, state.codeLine);
       if (isMarkdownSourcePath(path, res.language)) {
-        await renderMarkdownCodeOverlay(path, res, projectId, requestId);
+        await renderMarkdownCodeOverlay(path, res, projectId, threadId, requestId);
       }
     }
   } catch (e) {
@@ -7424,17 +7449,22 @@ async function openCodeOverlay(path, line) {
     setCodeSourceToggle(false);
   }
 }
-async function renderMarkdownCodeOverlay(path, highlightRes, projectId, requestId) {
+async function renderMarkdownCodeOverlay(path, highlightRes, projectId, threadId, requestId) {
   const line = state.codeLine;
   try {
-    const source = await api("GET", `/api/projects/${projectId}/raw?path=${encodeURIComponent(path)}`);
+    const source = await api(
+      "GET",
+      `/api/projects/${projectId}/threads/${threadId}/raw?path=${encodeURIComponent(path)}`,
+    );
     if (!codeOverlayRequestMatches(path, projectId, requestId)) return;
-    const cacheKey = projectId + "\n" + String(source || "");
+    const cacheKey = projectId + "\n" + threadId + "\n" + String(source || "");
     let html;
     if (state.markdownCache.has(cacheKey)) {
       html = state.markdownCache.get(cacheKey);
     } else {
-      const rendered = await api("POST", `/api/projects/${projectId}/render`, { text: source });
+      const rendered = await api("POST", `/api/projects/${projectId}/threads/${threadId}/render`, {
+        text: source,
+      });
       if (!rendered || typeof rendered.html !== "string") {
         throw new Error("Markdown renderer returned an invalid response");
       }
@@ -7612,6 +7642,8 @@ function setCodeCopyDiff(visible) {
 function closeCodeOverlay() {
   $("codeOverlay").classList.remove("open");
   delete $("codeOverlay").dataset.requestId;
+  delete $("codeOverlay").dataset.projectId;
+  delete $("codeOverlay").dataset.threadId;
   state.codePath = null;
   state.codeLine = null;
   state.codeOverlaySource = null;
@@ -7885,7 +7917,8 @@ $("codeSourceToggle").onclick = () => {
 };
 $("codeDownload").onclick = () => {
   if (state.outputOverlay) { downloadOutputOverlay(); return; }
-  if (state.projectId && state.codePath) window.location.href = projectFileUrl("raw", state.codePath);
+  const raw = state.codePath ? overlayFileUrl("raw", state.codePath) : "";
+  if (raw) window.location.href = raw;
 };
 function downloadOutputOverlay() {
   const ov = state.outputOverlay;

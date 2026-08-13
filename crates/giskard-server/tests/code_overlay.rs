@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use giskard_core::ids::ProjectId;
+use giskard_core::ids::{ProjectId, ThreadId};
 use giskard_harness::AgentHarness;
 use giskard_persist::store::ProjectConfig;
 use giskard_server::{AppState, HarnessFactory, build_app};
@@ -39,6 +39,7 @@ fn generate_password_hash(password: &str) -> String {
         .to_string()
 }
 
+/// The endpoints under test name a thread in their path, so the fixture persists one.
 async fn start_server(
     port: u16,
 ) -> (
@@ -46,6 +47,7 @@ async fn start_server(
     tempfile::TempDir,
     Arc<AppState>,
     ProjectId,
+    ThreadId,
     String,
 ) {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -120,6 +122,13 @@ session_days = 30
     .await
     .unwrap();
 
+    let tid = ThreadId::new();
+    state
+        .store
+        .save_thread(pid, &thread_file(pid, tid))
+        .await
+        .unwrap();
+
     let cookie = {
         let client = reqwest::Client::new();
         let resp = client
@@ -139,18 +148,47 @@ session_days = 30
             .to_string()
     };
 
-    (tmp, proj_dir, Arc::new(state), pid, cookie)
+    (tmp, proj_dir, Arc::new(state), pid, tid, cookie)
+}
+
+fn thread_file(pid: ProjectId, tid: ThreadId) -> giskard_persist::store::ThreadFile {
+    giskard_persist::store::ThreadFile {
+        version: 1,
+        id: tid,
+        project_id: pid,
+        title: "code overlay".into(),
+        harness_thread_id: format!("native-{tid}"),
+        parent_thread_id: None,
+        spawned_by_turn_id: None,
+        kind: giskard_core::thread::ThreadKind::Primary,
+        mode: giskard_core::turn::Mode::Build,
+        current_model: giskard_core::model::ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: None,
+        },
+        context_window: 1,
+        model_context_windows: std::collections::HashMap::new(),
+        permission_preset: giskard_core::turn::PermissionPreset::AskFirst,
+        model_efforts: std::collections::HashMap::new(),
+        tokens: giskard_core::token::TokenLedger::default(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        archived: false,
+    }
 }
 
 #[tokio::test]
 async fn highlight_rust_file() {
     let port = 19001;
-    let (_data_dir, _proj_dir, _state, pid, cookie) = start_server(port).await;
+    let (_data_dir, _proj_dir, _state, pid, tid, cookie) = start_server(port).await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
     let resp = client
-        .get(format!("{base}/api/projects/{pid}/highlight?path=main.rs"))
+        .get(format!(
+            "{base}/api/projects/{pid}/threads/{tid}/highlight?path=main.rs"
+        ))
         .header("cookie", &cookie)
         .send()
         .await
@@ -168,13 +206,13 @@ async fn highlight_rust_file() {
 #[tokio::test]
 async fn highlight_toml_file() {
     let port = 19026;
-    let (_data_dir, _proj_dir, _state, pid, cookie) = start_server(port).await;
+    let (_data_dir, _proj_dir, _state, pid, tid, cookie) = start_server(port).await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
     let resp = client
         .get(format!(
-            "{base}/api/projects/{pid}/highlight?path=config.toml"
+            "{base}/api/projects/{pid}/threads/{tid}/highlight?path=config.toml"
         ))
         .header("cookie", &cookie)
         .send()
@@ -196,12 +234,14 @@ async fn highlight_toml_file() {
 #[tokio::test]
 async fn highlight_binary_file() {
     let port = 19002;
-    let (_data_dir, _proj_dir, _state, pid, cookie) = start_server(port).await;
+    let (_data_dir, _proj_dir, _state, pid, tid, cookie) = start_server(port).await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
     let resp = client
-        .get(format!("{base}/api/projects/{pid}/highlight?path=data.bin"))
+        .get(format!(
+            "{base}/api/projects/{pid}/threads/{tid}/highlight?path=data.bin"
+        ))
         .header("cookie", &cookie)
         .send()
         .await
@@ -216,12 +256,14 @@ async fn highlight_binary_file() {
 #[tokio::test]
 async fn download_raw_file() {
     let port = 19003;
-    let (_data_dir, _proj_dir, _state, pid, cookie) = start_server(port).await;
+    let (_data_dir, _proj_dir, _state, pid, tid, cookie) = start_server(port).await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
     let resp = client
-        .get(format!("{base}/api/projects/{pid}/raw?path=main.rs"))
+        .get(format!(
+            "{base}/api/projects/{pid}/threads/{tid}/raw?path=main.rs"
+        ))
         .header("cookie", &cookie)
         .send()
         .await
@@ -235,12 +277,14 @@ async fn download_raw_file() {
 #[tokio::test]
 async fn image_preview_serves_raster_image_inline() {
     let port = 19027;
-    let (_data_dir, _proj_dir, _state, pid, cookie) = start_server(port).await;
+    let (_data_dir, _proj_dir, _state, pid, tid, cookie) = start_server(port).await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
     let resp = client
-        .get(format!("{base}/api/projects/{pid}/image?path=image.png"))
+        .get(format!(
+            "{base}/api/projects/{pid}/threads/{tid}/image?path=image.png"
+        ))
         .header("cookie", &cookie)
         .send()
         .await
@@ -259,12 +303,14 @@ async fn image_preview_serves_raster_image_inline() {
 #[tokio::test]
 async fn image_preview_rejects_svg() {
     let port = 19028;
-    let (_data_dir, _proj_dir, _state, pid, cookie) = start_server(port).await;
+    let (_data_dir, _proj_dir, _state, pid, tid, cookie) = start_server(port).await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
     let resp = client
-        .get(format!("{base}/api/projects/{pid}/image?path=vector.svg"))
+        .get(format!(
+            "{base}/api/projects/{pid}/threads/{tid}/image?path=vector.svg"
+        ))
         .header("cookie", &cookie)
         .send()
         .await
@@ -276,12 +322,12 @@ async fn image_preview_rejects_svg() {
 #[tokio::test]
 async fn linkify_finds_paths() {
     let port = 19004;
-    let (_data_dir, _proj_dir, _state, pid, cookie) = start_server(port).await;
+    let (_data_dir, _proj_dir, _state, pid, tid, cookie) = start_server(port).await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
     let resp = client
-        .post(format!("{base}/api/projects/{pid}/linkify"))
+        .post(format!("{base}/api/projects/{pid}/threads/{tid}/linkify"))
         .header("cookie", &cookie)
         .json(&serde_json::json!({"text": "see main.rs for the entry point"}))
         .send()
@@ -298,13 +344,13 @@ async fn linkify_finds_paths() {
 #[tokio::test]
 async fn render_endpoint_returns_sanitized_markdown_with_path_links() {
     let port = 19022;
-    let (_data_dir, _proj_dir, _state, pid, cookie) = start_server(port).await;
+    let (_data_dir, _proj_dir, _state, pid, tid, cookie) = start_server(port).await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
     let text = "See `main.rs` and **open** main.rs now.\n\n```rust\nfn main() {}\n```\n\n<img src=x onerror=alert(1)>";
     let resp = client
-        .post(format!("{base}/api/projects/{pid}/render"))
+        .post(format!("{base}/api/projects/{pid}/threads/{tid}/render"))
         .header("cookie", &cookie)
         .json(&serde_json::json!({ "text": text }))
         .send()
@@ -349,7 +395,7 @@ async fn render_endpoint_returns_sanitized_markdown_with_path_links() {
 #[tokio::test]
 async fn linkify_endpoint_returns_only_existing_workspace_files() {
     let port = 19012;
-    let (_data_dir, proj_dir, _state, pid, cookie) = start_server(port).await;
+    let (_data_dir, proj_dir, _state, pid, tid, cookie) = start_server(port).await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
@@ -367,7 +413,7 @@ async fn linkify_endpoint_returns_only_existing_workspace_files() {
     );
 
     let resp = client
-        .post(format!("{base}/api/projects/{pid}/linkify"))
+        .post(format!("{base}/api/projects/{pid}/threads/{tid}/linkify"))
         .header("cookie", &cookie)
         .json(&serde_json::json!({ "text": text }))
         .send()
@@ -418,13 +464,13 @@ async fn linkify_endpoint_rejects_symlink_escape() {
         .await
         .unwrap();
 
-    let (_data_dir, proj_dir, _state, pid, cookie) = start_server(port).await;
+    let (_data_dir, proj_dir, _state, pid, tid, cookie) = start_server(port).await;
     std::os::unix::fs::symlink(&outside_file, proj_dir.path().join("linked.rs")).unwrap();
 
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!("{base}/api/projects/{pid}/linkify"))
+        .post(format!("{base}/api/projects/{pid}/threads/{tid}/linkify"))
         .header("cookie", &cookie)
         .json(&serde_json::json!({"text": "linked.rs exists but points outside"}))
         .send()
@@ -442,13 +488,13 @@ async fn linkify_endpoint_rejects_symlink_escape() {
 #[tokio::test]
 async fn highlight_rejects_path_escape() {
     let port = 19005;
-    let (_data_dir, _proj_dir, _state, pid, cookie) = start_server(port).await;
+    let (_data_dir, _proj_dir, _state, pid, tid, cookie) = start_server(port).await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
     let resp = client
         .get(format!(
-            "{base}/api/projects/{pid}/highlight?path=../../etc/passwd"
+            "{base}/api/projects/{pid}/threads/{tid}/highlight?path=../../etc/passwd"
         ))
         .header("cookie", &cookie)
         .send()
@@ -461,14 +507,14 @@ async fn highlight_rejects_path_escape() {
 #[tokio::test]
 async fn highlight_and_raw_reject_missing_files() {
     let port = 19015;
-    let (_data_dir, _proj_dir, _state, pid, cookie) = start_server(port).await;
+    let (_data_dir, _proj_dir, _state, pid, tid, cookie) = start_server(port).await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
     for endpoint in ["highlight", "raw", "image"] {
         let resp = client
             .get(format!(
-                "{base}/api/projects/{pid}/{endpoint}?path=missing.rs"
+                "{base}/api/projects/{pid}/threads/{tid}/{endpoint}?path=missing.rs"
             ))
             .header("cookie", &cookie)
             .send()
@@ -482,10 +528,68 @@ async fn highlight_and_raw_reject_missing_files() {
     }
 }
 
+/// The thread is in the route, so it is answered for or refused — never ignored. An id that does not
+/// resolve within this project would otherwise be served from a workspace the caller never named.
+#[tokio::test]
+async fn code_overlay_endpoints_refuse_a_thread_they_cannot_resolve() {
+    let port = 19017;
+    let (_data_dir, _proj_dir, state, pid, _tid, cookie) = start_server(port).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+
+    // A thread of another project: `load_thread` is project-scoped, so it is unknown here — which is
+    // also what stops one project's endpoints reading through another's workspace.
+    let other_project = ProjectId::new();
+    state
+        .store
+        .create_project(
+            other_project,
+            "other",
+            "/tmp",
+            giskard_core::model::ModelRef {
+                provider: "openai".into(),
+                model: "gpt-5.5".into(),
+                reasoning_effort: None,
+            },
+        )
+        .await
+        .unwrap();
+    let foreign = ThreadId::new();
+    state
+        .store
+        .save_thread(other_project, &thread_file(other_project, foreign))
+        .await
+        .unwrap();
+
+    for thread in [ThreadId::new(), foreign] {
+        for (method, endpoint) in [
+            ("GET", "highlight?path=main.rs"),
+            ("GET", "raw?path=main.rs"),
+            ("GET", "image?path=image.png"),
+            ("POST", "linkify"),
+            ("POST", "render"),
+        ] {
+            let url = format!("{base}/api/projects/{pid}/threads/{thread}/{endpoint}");
+            let request = match method {
+                "POST" => client
+                    .post(url)
+                    .json(&serde_json::json!({"text": "main.rs"})),
+                _ => client.get(url),
+            };
+            let resp = request.header("cookie", &cookie).send().await.unwrap();
+            assert_eq!(
+                resp.status(),
+                404,
+                "{method} {endpoint} must refuse a thread it cannot resolve in this project"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn code_overlay_endpoints_return_not_found_for_missing_project() {
     let port = 19016;
-    let (_data_dir, _proj_dir, _state, _pid, cookie) = start_server(port).await;
+    let (_data_dir, _proj_dir, _state, _pid, tid, cookie) = start_server(port).await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let missing_project = ProjectId::new();
@@ -497,7 +601,7 @@ async fn code_overlay_endpoints_return_not_found_for_missing_project() {
         ("POST", "linkify"),
         ("POST", "render"),
     ] {
-        let url = format!("{base}/api/projects/{missing_project}/{endpoint}");
+        let url = format!("{base}/api/projects/{missing_project}/threads/{tid}/{endpoint}");
         let request = match method {
             "POST" => client
                 .post(url)
@@ -523,7 +627,7 @@ async fn highlight_and_raw_reject_symlink_escape() {
         .await
         .unwrap();
 
-    let (_data_dir, proj_dir, _state, pid, cookie) = start_server(port).await;
+    let (_data_dir, proj_dir, _state, pid, tid, cookie) = start_server(port).await;
     std::os::unix::fs::symlink(&outside_file, proj_dir.path().join("linked.rs")).unwrap();
 
     let base = format!("http://127.0.0.1:{port}");
@@ -531,7 +635,7 @@ async fn highlight_and_raw_reject_symlink_escape() {
     for endpoint in ["highlight", "raw", "image"] {
         let resp = client
             .get(format!(
-                "{base}/api/projects/{pid}/{endpoint}?path=linked.rs"
+                "{base}/api/projects/{pid}/threads/{tid}/{endpoint}?path=linked.rs"
             ))
             .header("cookie", &cookie)
             .send()
@@ -550,7 +654,7 @@ async fn highlight_and_raw_reject_symlink_escape() {
 #[tokio::test]
 async fn highlight_oversized_file_returns_metadata() {
     let port = 19011;
-    let (_data_dir, proj_dir, _state, pid, cookie) = start_server(port).await;
+    let (_data_dir, proj_dir, _state, pid, tid, cookie) = start_server(port).await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
@@ -560,7 +664,9 @@ async fn highlight_oversized_file_returns_metadata() {
         .unwrap();
 
     let resp = client
-        .get(format!("{base}/api/projects/{pid}/highlight?path=big.txt"))
+        .get(format!(
+            "{base}/api/projects/{pid}/threads/{tid}/highlight?path=big.txt"
+        ))
         .header("cookie", &cookie)
         .send()
         .await
