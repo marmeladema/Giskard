@@ -48,10 +48,11 @@ opened since the server started; threads with a live agent session stay bound to
 
 Five endpoints resolve a path against a thread's workspace, and all five name that thread in the
 path — there is no thread-less form. The thread is part of the request rather than an optional
-scope, because a caller that could omit it would be answered from a workspace it never named. Every
-thread in a project currently shares the project's workspace, so today the answer is the same for
-all of them; what the thread buys now is that it is verified — an unknown thread, or one belonging
-to another project, is a `404` rather than a silent answer.
+scope, because a caller that could omit it would be answered from a workspace it never named. That
+workspace is the thread's own Git worktree when it was started with one, its parent's when it is a
+sub-agent, and the project's otherwise (§7.1) — so with isolation the answer genuinely differs
+between threads of one project, and the same path names a different file in each. An unknown
+thread, or one belonging to another project, is a `404` rather than a silent answer.
 
 They use the workspace for two different things, which is worth keeping straight:
 
@@ -68,10 +69,19 @@ prediction about what the read endpoints will serve; resolve them against differ
 the UI renders links that break when clicked. A workspace path that cannot be canonicalized simply
 yields no links, so `render` still returns correct Markdown.
 
-`GET /api/projects/{id}/git/status` returns best-effort, read-only Git metadata for the project's
-effective workspace root, parsed from `git status --porcelain=v2 -z`: the current branch (reported
+`GET /api/projects/{id}/git/status` returns best-effort, read-only Git metadata for a workspace,
+parsed from `git status --porcelain=v2 -z`: the current branch (reported
 even on an unborn one), `detached` with the short commit in `head`, ahead/behind counts when Git
 reports an upstream, staged/unstaged/untracked and conflicted counts, and the changed file list.
+
+Which workspace it reads is decided by the optional `?thread_id=...`: with it, the named thread's
+workspace — its own Git worktree when the thread was started with one (§7.1) — and without it,
+the project's effective workspace root, which is what a draft reads before any thread exists.
+A
+`thread_id` that does not resolve *within this project* is a 404 rather than a fall back to the
+project's workspace: answering from a different tree under the name of the one that was asked for is
+the confusion isolation exists to prevent, and it would also let one project's endpoints read
+through another's workspace.
 
 An untracked directory is reported as a single entry with a trailing slash rather than one entry
 per file beneath it, matching what `git status` reports to a person.
@@ -87,9 +97,11 @@ returned without line counts. Non-Git workspaces return
 reported, so `error` means only that the status could not be determined (git could not be run, or
 timed out).
 
-`GET /api/projects/{id}/git/diff` returns the combined staged and unstaged diff for the whole
-working tree; with `?path=...` it returns that diff for one workspace-relative path, and the
-response echoes the path back. `?side=staged` or `?side=unstaged` narrows it to the index or the
+`GET /api/projects/{id}/git/diff` takes the same `?thread_id=...` scope, on the same terms, so a
+diff describes the tree the status row that opened it described. It returns the combined staged and
+unstaged diff for the whole working tree; with `?path=...` it returns that diff for one
+workspace-relative path, and the response echoes the path back. `?side=staged` or `?side=unstaged`
+narrows it to the index or the
 worktree, so a path that is both staged and modified again can be diffed one side at a time; any
 other value is rejected. The path is lexical workspace-relative only: absolute paths and `..`
 escapes are rejected, so deleted files can still be diffed without allowing access outside the

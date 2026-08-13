@@ -167,7 +167,7 @@ let state = {
   diffOverlayText:null,
   gitStatus:null, gitLoading:false, gitError:null, gitRequestSeq:0,
   draftGitStrategy:"shared",
-  gitExpanded:false, gitRepoByProject:new Map(), gitResizeTimer:null, gitBodyHtml:null, gitDiffPending:false, gitRefreshTimer:null,
+  gitExpanded:false, gitRepoByWorkspace:new Map(), gitResizeTimer:null, gitBodyHtml:null, gitDiffPending:false, gitRefreshTimer:null,
   mcpServers:[], mcpCapabilities:{ status:false, reload:false, oauth_login:false }, mcpLoading:false, mcpError:null, expandedMcps:new Set(),
   threadReadOnly:false, readOnlyProvider:null, readOnlyMessage:null,
   pickerTypeahead:"", pickerTypeaheadTimer:null, pickerSelectedRow:null,
@@ -3265,7 +3265,7 @@ function updateTurnButton() {
    repository to branch from — without one there is nothing to isolate, and the reason is worth
    saying rather than leaving a dead control. */
 function isDraftWorkspaceRepo() {
-  return state.gitRepoByProject.get(state.projectId) === true;
+  return state.gitRepoByWorkspace.get(gitWorkspaceKey()) === true;
 }
 
 function renderGitStrategyControl() {
@@ -5319,10 +5319,25 @@ function renderRunningCommands() {
 
 /* Git status line (above the composer).
  *
- * Status is fetched per thread open, so `gitRepoByProject` remembers only whether a project's
- * workspace is a repository at all: that is what decides whether the row exists, and caching just
- * that much keeps the composer from shifting down when you move between threads of a project
- * already known to be one. The status itself is always refetched. */
+ * Status is fetched per thread open, so `gitRepoByWorkspace` remembers only whether a workspace is a
+ * repository at all: that is what decides whether the row exists, and caching just that much keeps
+ * the composer from shifting down when you move between threads of a project already known to be
+ * one. The status itself is always refetched.
+ *
+ * The key is the workspace, not the project, because a thread isolated in a Git worktree has its
+ * own: keying by project would answer for one workspace under the name of another the moment you
+ * moved between an isolated thread and an ordinary one. */
+
+/* Every Git read is scoped to the thread on screen, so the row, its file list and the diffs it
+   opens all describe one tree. A draft has no thread yet and reads the project's workspace, which
+   is what the server does with an absent `thread_id`. */
+function gitScopeQuery() {
+  return state.threadId ? `thread_id=${encodeURIComponent(state.threadId)}` : "";
+}
+
+function gitWorkspaceKey() {
+  return `${state.projectId || ""}:${state.threadId || ""}`;
+}
 const GIT_SECTIONS = [
   { key:"conflicted", label:"Conflicts" },
   { key:"staged", label:"Staged" },
@@ -5412,7 +5427,7 @@ function gitLineVisible(stateName) {
   if (!state.projectId) return false;
   if (stateName === "error") return true;
   if (stateName === "unavailable") return false;
-  if (stateName === "loading") return state.gitRepoByProject.get(state.projectId) === true;
+  if (stateName === "loading") return state.gitRepoByWorkspace.get(gitWorkspaceKey()) === true;
   return true;
 }
 
@@ -5627,11 +5642,12 @@ async function loadGitStatus(pid) {
   state.gitError = null;
   renderGitLine();
   try {
-    const res = await api("GET", `/api/projects/${pid}/git/status`);
+    const scope = gitScopeQuery();
+    const res = await api("GET", `/api/projects/${pid}/git/status${scope ? `?${scope}` : ""}`);
     if (requestSeq !== state.gitRequestSeq || state.projectId !== pid) return;
     state.gitStatus = res;
     state.gitError = res && res.error ? res.error : null;
-    state.gitRepoByProject.set(pid, !!(res && res.is_repository));
+    state.gitRepoByWorkspace.set(gitWorkspaceKey(), !!(res && res.is_repository));
   } catch (e) {
     if (requestSeq !== state.gitRequestSeq || state.projectId !== pid) return;
     state.gitStatus = null;
@@ -5678,7 +5694,8 @@ function setGitExpanded(expanded, opts) {
 async function openGitDiff(path, side) {
   const pid = state.projectId;
   if (!pid || !path || state.gitDiffPending) return;
-  const query = `path=${encodeURIComponent(path)}${side ? `&side=${encodeURIComponent(side)}` : ""}`;
+  const scope = gitScopeQuery();
+  const query = `path=${encodeURIComponent(path)}${side ? `&side=${encodeURIComponent(side)}` : ""}${scope ? `&${scope}` : ""}`;
   state.gitDiffPending = true;
   try {
     const res = await api("GET", `/api/projects/${pid}/git/diff?${query}`);
@@ -5701,7 +5718,8 @@ async function openGitWorkingDiff() {
   if (!pid || state.gitDiffPending) return;
   state.gitDiffPending = true;
   try {
-    const res = await api("GET", `/api/projects/${pid}/git/diff`);
+    const scope = gitScopeQuery();
+    const res = await api("GET", `/api/projects/${pid}/git/diff${scope ? `?${scope}` : ""}`);
     if (state.projectId !== pid) return;
     if (!res || res.is_empty || !String(res.diff || "").trim()) {
       notice("No tracked changes to review.", "warning");
