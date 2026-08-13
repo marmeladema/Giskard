@@ -528,6 +528,57 @@ async fn highlight_and_raw_reject_missing_files() {
     }
 }
 
+/// The root a thread works in is not always the directory its project lives in: `workspace_root`
+/// (§6.3) moves the harness sandbox boundary — to a subdirectory, to narrow the agent's write
+/// scope, or elsewhere entirely — and every thread in that project then works there. Reads have to
+/// follow it.
+///
+/// Worth pinning because the resolution now has one home, shared by the file endpoints and the plan
+/// write: a regression there moves all of them at once, and silently, since both directories exist
+/// and both are readable.
+#[tokio::test]
+async fn thread_reads_follow_the_configured_workspace_root() {
+    let port = 19018;
+    let (_data_dir, proj_dir, state, pid, tid, cookie) = start_server(port).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+
+    // The same relative path in both trees, holding different text: reading the wrong root succeeds
+    // and returns the wrong file, which is the failure this guards.
+    let elsewhere = tempfile::TempDir::new().unwrap();
+    tokio::fs::write(
+        elsewhere.path().join("main.rs"),
+        "fn from_workspace_root() {}\n",
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        proj_dir.path().join("main.rs"),
+        "fn from_project_dir() {}\n",
+    )
+    .await
+    .unwrap();
+
+    let mut project = state.store.load_project(pid).await.unwrap().unwrap();
+    project.workspace_root = Some(elsewhere.path().to_string_lossy().into_owned());
+    state.store.save_project(&project).await.unwrap();
+
+    let raw = client
+        .get(format!(
+            "{base}/api/projects/{pid}/threads/{tid}/raw?path=main.rs"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert!(raw.status().is_success());
+    assert_eq!(
+        raw.text().await.unwrap(),
+        "fn from_workspace_root() {}\n",
+        "a read must come from the root the thread works in, not the directory its project lives in"
+    );
+}
+
 /// The thread is in the route, so it is answered for or refused — never ignored. An id that does not
 /// resolve within this project would otherwise be served from a workspace the caller never named.
 #[tokio::test]

@@ -2234,9 +2234,12 @@ Auto-generate an initial title from the first user message (truncated); user-edi
   heuristically across the whole thread.)
 - Writing the plan file is a normal file write within the workspace root; it is **not** gated
   by the agent approval flow (it's a user action, not an agent action), but it respects the
-  workspace-root boundary. **Path confinement (P4):** the resolved path is canonicalized and
-  anything escaping the workspace root (via `..` or symlink) is rejected before writing, using
-  the same hardening specified for the browse endpoint in §6.2. A user-edited path like
+  workspace-root boundary. The root is the one resolved *for the saving thread* — the same
+  resolution the thread-scoped file endpoints use (§11.2) — so a plan is written where that
+  thread works and the link offered afterwards can read it back. **Path confinement (P4):** the
+  resolved path is canonicalized and anything escaping the workspace root (via `..` or symlink) is
+  rejected before writing, using the same hardening specified for the browse endpoint in §6.2. A
+  user-edited path like
   `../../etc/foo.md` must hit this check on write, not just on browse.
 - After saving, the UI links the new file (openable in the code overlay, §11.2).
 
