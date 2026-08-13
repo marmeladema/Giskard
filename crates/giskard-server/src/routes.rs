@@ -1476,6 +1476,39 @@ fn truncate_title(text: &str, max_chars: usize) -> String {
         .to_string()
 }
 
+/// A workspace query for an endpoint whose URL names a project but whose subject may be a thread.
+#[derive(Deserialize)]
+struct WorkspaceQuery {
+    /// The thread whose workspace to read. Omitted for the project's own workspace, which is what a
+    /// draft has before any thread exists.
+    thread_id: Option<ThreadId>,
+}
+
+/// Resolve the workspace an endpoint should read, given an optional thread.
+///
+/// An unknown thread is an error rather than a fallback: answering from the project's workspace
+/// would hand back a different tree under the name of the one that was asked for, which is exactly
+/// the confusion isolation exists to prevent. `load_thread` is scoped to the project, so a thread id
+/// belonging to another project is unknown here too — otherwise this project's endpoints would read
+/// files out of that project's workspace.
+async fn workspace_for_query(
+    state: &AppState,
+    project: &ProjectConfig,
+    query: &WorkspaceQuery,
+) -> Result<PathBuf, ApiError> {
+    let Some(thread_id) = query.thread_id else {
+        return Ok(PathBuf::from(project_workspace_root(project)));
+    };
+    let thread = state
+        .store
+        .load_thread(project.id, thread_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    Ok(PathBuf::from(
+        thread_workspace_root(state, project, &thread).await?,
+    ))
+}
+
 /// The workspace a thread works in: the nearest Git worktree in its ownership chain, the project's
 /// workspace otherwise.
 ///
@@ -2503,18 +2536,22 @@ fn resolve_confined_path(workspace_root: &Path, requested: &str) -> Option<PathB
 async fn git_status(
     State(state): State<AppState>,
     AxumPath(project_id): AxumPath<ProjectId>,
+    Query(q): Query<WorkspaceQuery>,
 ) -> Result<Json<GitStatusResponse>, ApiError> {
     let project = state
         .store
         .load_project(project_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let workspace_root = PathBuf::from(project.workspace_root.as_deref().unwrap_or(&project.dir));
+    let workspace_root = workspace_for_query(&state, &project, &q).await?;
     Ok(Json(git_status_for_workspace(&workspace_root).await))
 }
 
 #[derive(Deserialize)]
 struct GitDiffQuery {
+    /// The thread whose workspace to diff, matching the status the row came from. A diff read from
+    /// a different tree than the row that opened it would describe someone else's changes.
+    thread_id: Option<ThreadId>,
     /// Omitted for the whole working tree; present to diff a single workspace-relative path.
     path: Option<String>,
     /// Which side to diff: `staged` (index against HEAD) or `unstaged` (worktree against index).
@@ -2564,7 +2601,14 @@ async fn git_diff(
         .load_project(project_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let workspace_root = PathBuf::from(project.workspace_root.as_deref().unwrap_or(&project.dir));
+    let workspace_root = workspace_for_query(
+        &state,
+        &project,
+        &WorkspaceQuery {
+            thread_id: q.thread_id,
+        },
+    )
+    .await?;
     let relative_path = match q.path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
         Some(requested) => Some(
             safe_git_relative_path(requested)
