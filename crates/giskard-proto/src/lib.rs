@@ -476,6 +476,34 @@ pub struct StartThreadRequest {
     pub model_ref: ModelRef,
     pub mode: Mode,
     pub permission_preset: PermissionPreset,
+    /// How this thread gets the working tree it runs in (spec §7.1).
+    ///
+    /// Only creation carries this: a thread's workspace is fixed once it exists, so there is no
+    /// endpoint that changes it afterwards.
+    #[serde(default)]
+    pub git_strategy: GitStrategy,
+}
+
+/// Where a thread's working tree comes from.
+///
+/// An enum rather than a flag because the question has more than two answers and the set is open —
+/// giving a thread a checkout it genuinely owns, rather than a second view of the project's
+/// repository, is a different strategy again. A boolean could never carry a third choice, and a
+/// client that had learned to send `true` could not be told about one.
+///
+/// Serde rejects a variant it does not know, so a client asking for a strategy this server does not
+/// implement is refused rather than quietly started in the shared checkout — which is the failure
+/// worth designing against here, since it looks like it worked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitStrategy {
+    /// The project's own checkout, shared with every other thread of the project. The default, and
+    /// the only possibility when the workspace is not a Git repository.
+    #[default]
+    Shared,
+    /// A linked Git worktree of the project's repository, private to this thread and the sub-agents
+    /// it spawns. Isolates files; shares the repository (`docs/git-worktrees.md`).
+    Worktree,
 }
 
 #[derive(Debug, Clone, Serialize)]
