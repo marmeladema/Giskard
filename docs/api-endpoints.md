@@ -7,7 +7,8 @@ WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticke
 /api/projects/{id}/threads/{thread_id}`, `POST
 /api/projects/{id}/threads/{parent_thread_id}/subagent-links/{item_id}/open`, `PATCH
 /api/projects/{id}/threads/{thread_id}/title`,
-`POST /api/projects/{id}/threads/{thread_id}/archive`, `GET /api/models`, `POST
+`POST /api/projects/{id}/threads/{thread_id}/archive`,
+`GET /api/projects/{id}/threads/{thread_id}/deletion-impact`, `GET /api/models`, `POST
 /api/models/refresh`, `GET /api/projects/{id}/models`,
 `GET /api/tokens`, `GET /api/projects/{id}/tokens`,
 `GET /api/projects/{id}/threads/{thread_id}/highlight|raw|image`, `POST
@@ -45,6 +46,24 @@ verifies the agent actually applied the switch before persisting it, and the thr
 again with its history intact. The same verified switch works for any thread that hasn't been
 opened since the server started; threads with a live agent session stay bound to their provider
 (create a new thread to change providers there).
+
+`DELETE /api/projects/{id}/threads/{thread_id}` refuses with `409` when the thread — or any linked
+child it cascades to — has a Git worktree holding work that exists nowhere else: uncommitted
+changes, or commits on its branch that no other ref reaches. The message names what would be
+destroyed. `?force=true` deletes anyway, which is what the browser sends once its confirmation
+card has shown the same facts. Deleting a thread takes its worktree and the branch it started on;
+branches the agent created during the thread are left alone, since they live in the shared
+repository and are the user's now. Deleting a *project* sweeps its worktrees unconditionally —
+that confirmation is project-scoped and one thread's unfinished work must not strand the rest
+half-deleted.
+
+`GET /api/projects/{id}/threads/{thread_id}/deletion-impact` reports, per worktree in that
+subtree, the branch, the uncommitted-change count, the count of commits reachable from no other
+ref, and a `summary` sentence when either is non-zero. It exists so a confirmation can state the
+cost before the user decides rather than after they try. When Git cannot answer for a worktree, the
+endpoint returns `503` rather than reporting zeroes: "the cost could not be determined" and "nothing
+would be lost" lead to opposite confirmation copy, so a client must not read the first as the
+second. The matching `DELETE` refuses for the same reason.
 
 Five endpoints resolve a path against a thread's workspace, and all five name that thread in the
 path — there is no thread-less form. The thread is part of the request rather than an optional

@@ -91,6 +91,10 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
             "/api/projects/{id}/threads/{thread_id}/archive",
             post(archive_thread),
         )
+        .route(
+            "/api/projects/{id}/threads/{thread_id}/deletion-impact",
+            get(thread_deletion_impact),
+        )
         // File reads name their thread in the path rather than leaving it implicit. The workspace a
         // read is answered from is the thread's, so the thread has to be part of the request; a
         // caller that could omit it would be answered from somewhere it never asked about.
@@ -458,6 +462,35 @@ async fn delete_project(
         .await
         .map_err(harness_api_error)?;
     state.model_catalogs.remove(id).await;
+    // Forced: the user confirmed a project-scope deletion, and a thread whose worktree still holds
+    // work must not be able to strand the whole project half-deleted.
+    //
+    // Placed between the two deletions on purpose. After the registry, because that is what shuts
+    // the agents down, and a checkout must not be pulled out from under a session still running in
+    // it — and because a registry failure returns early, which would otherwise leave every thread
+    // file naming a checkout that is already gone. Before the thread files, because they are the
+    // only record of where each checkout is.
+    for thread_id in state.store.list_threads(id).await? {
+        let Some(worktree) = state
+            .store
+            .load_thread(id, thread_id)
+            .await?
+            .and_then(|tf| tf.git_workspace)
+            .and_then(|ws| ws.as_worktree().cloned())
+        else {
+            continue;
+        };
+        // Deliberately ignored, unlike the per-thread route: this confirmation is project-scoped and
+        // already forced, so one thread whose checkout will not come down must not strand the whole
+        // project half-deleted. The helper logs what it could not remove.
+        let _ = remove_worktree_for_deleted_thread(
+            &worktree,
+            thread_id,
+            "delete_project",
+            /*force*/ true,
+        )
+        .await;
+    }
     state.store.delete_project(id).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -1476,6 +1509,123 @@ fn truncate_title(text: &str, max_chars: usize) -> String {
         .to_string()
 }
 
+/// What removing a thread's worktree would destroy, in the two ways it can.
+///
+/// Committed work and working-tree work are lost differently: the branch holds commits, so deleting
+/// it is what loses those; the worktree holds edits, so removing it is what loses those. A thread
+/// can be at risk from either, both, or neither.
+struct WorktreeDeletionImpact {
+    branch: String,
+    uncommitted_changes: usize,
+    /// Commits on the thread's branch reachable from no other ref — what deleting it destroys.
+    unreachable_commits: usize,
+}
+
+impl WorktreeDeletionImpact {
+    fn destroys_work(&self) -> bool {
+        self.uncommitted_changes > 0 || self.unreachable_commits > 0
+    }
+
+    /// A sentence the user can decide from, naming both kinds of loss when both apply.
+    fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if self.uncommitted_changes > 0 {
+            parts.push(format!(
+                "{} uncommitted change{}",
+                self.uncommitted_changes,
+                if self.uncommitted_changes == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ));
+        }
+        if self.unreachable_commits > 0 {
+            parts.push(format!(
+                "{} commit{} on no other ref",
+                self.unreachable_commits,
+                if self.unreachable_commits == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ));
+        }
+        format!("{} in worktree {}", parts.join(" and "), self.branch)
+    }
+}
+
+/// Fails rather than reporting an empty impact when Git cannot answer. "Nothing would be lost" is
+/// the verdict that lets a deletion run unconfirmed, so it must never be what an error looks like.
+async fn worktree_deletion_impact(
+    worktree: &ThreadWorktree,
+) -> Result<WorktreeDeletionImpact, crate::worktree::WorktreeError> {
+    Ok(WorktreeDeletionImpact {
+        branch: worktree.branch.clone(),
+        uncommitted_changes: crate::worktree::uncommitted_changes(worktree).await?,
+        unreachable_commits: crate::worktree::commits_reachable_from_nowhere_else(worktree).await?,
+    })
+}
+
+/// Remove a deleted thread's worktree and the branch it started on.
+///
+/// Ordering is forced: Git refuses to delete a branch that is checked out in a worktree. Branches
+/// the agent created during the thread are deliberately untouched — they live in the shared
+/// repository and are the user's now.
+///
+/// Returns the failure rather than only logging it. The thread file is the only record of where this
+/// checkout and branch are, so a caller that deleted it first and then discovered the cleanup had
+/// failed would have stranded both with nothing left to find them by.
+async fn remove_worktree_for_deleted_thread(
+    worktree: &ThreadWorktree,
+    thread_id: ThreadId,
+    action: &str,
+    force: bool,
+) -> Result<(), crate::worktree::WorktreeError> {
+    // `force` is the user's answer, not a constant. The impact probe ran earlier in the request, so
+    // anything written to the checkout since — by an editor, a hook, a shell the user still has open
+    // — is invisible to it; Git looks again here, and on an unforced deletion its refusal is the
+    // last chance to ask. Attempted even when the directory is already gone, forced or not: removal
+    // de-registers a vanished checkout (measured: exit 0), and until it is de-registered Git refuses
+    // to delete the branch it holds.
+    if let Err(error) = crate::worktree::remove(worktree, force).await {
+        warn!(
+            %thread_id,
+            branch = %worktree.branch,
+            path = %worktree.path,
+            %action,
+            %error,
+            "could not remove the thread's worktree"
+        );
+        return Err(error);
+    }
+    // A worktree whose directory is gone stays *registered* with Git, and a registered worktree
+    // holds its branch: without pruning, a checkout removed outside Giskard would leave a branch
+    // that can never be deleted.
+    match crate::worktree::delete_branch(worktree).await {
+        // Reported so the reflog window is usable: the commit is recoverable for as long as Git
+        // keeps it, and nothing else records where the branch pointed.
+        Ok(sha) => info!(
+            %thread_id,
+            branch = %worktree.branch,
+            was = sha.as_deref().unwrap_or("(unknown)"),
+            %action,
+            "deleted the thread's worktree and branch"
+        ),
+        Err(error) => {
+            warn!(
+                %thread_id,
+                branch = %worktree.branch,
+                %action,
+                %error,
+                "could not delete the thread's branch"
+            );
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 /// A workspace query for an endpoint whose URL names a project but whose subject may be a thread.
 #[derive(Deserialize)]
 struct WorkspaceQuery {
@@ -1765,9 +1915,65 @@ async fn rename_thread(
     Ok(Json(thread_summary(&tf)))
 }
 
+/// `GET /api/projects/{id}/threads/{thread_id}/deletion-impact` — what deleting this thread would
+/// destroy, for the confirmation card to say before the user decides rather than after they try.
+///
+/// Covers the whole subtree, because deleting a thread cascades to its linked children and each may
+/// have a worktree of its own.
+async fn thread_deletion_impact(
+    State(state): State<AppState>,
+    AxumPath((project_id, thread_id)): AxumPath<(ProjectId, ThreadId)>,
+) -> Result<Json<ThreadDeletionImpactResponse>, ApiError> {
+    let graph = load_thread_graph(&state.store, project_id).await?;
+    let deletion_order = descendant_deletion_order(&graph, thread_id);
+    if deletion_order.is_empty() {
+        return Err(ApiError::NotFound);
+    }
+    let mut worktrees = Vec::new();
+    for candidate in &deletion_order {
+        let Some(worktree) = graph
+            .get(candidate)
+            .and_then(|tf| tf.git_workspace.as_ref())
+            .and_then(ThreadGitWorkspace::as_worktree)
+        else {
+            continue;
+        };
+        let impact = worktree_deletion_impact(worktree).await.map_err(|error| {
+            warn!(
+                %project_id,
+                thread_id = %candidate,
+                branch = %worktree.branch,
+                %error,
+                action = "thread_deletion_impact",
+                "could not determine what deleting this thread would destroy"
+            );
+            ApiError::Unavailable(format!(
+                "could not check what deleting this thread would destroy: {error}"
+            ))
+        })?;
+        worktrees.push(WorktreeImpactResponse {
+            thread_id: *candidate,
+            branch: impact.branch.clone(),
+            uncommitted_changes: impact.uncommitted_changes,
+            unreachable_commits: impact.unreachable_commits,
+            summary: impact.destroys_work().then(|| impact.describe()),
+        });
+    }
+    Ok(Json(ThreadDeletionImpactResponse { worktrees }))
+}
+
+#[derive(Deserialize)]
+struct DeleteThreadQuery {
+    /// Delete even when a worktree holds work that exists nowhere else. The browser sets this only
+    /// after showing what would be destroyed (`GET .../deletion-impact`).
+    #[serde(default)]
+    force: bool,
+}
+
 async fn delete_thread(
     State(state): State<AppState>,
     AxumPath((project_id, thread_id)): AxumPath<(ProjectId, ThreadId)>,
+    Query(q): Query<DeleteThreadQuery>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     let _lifecycle_guard = state
         .registry
@@ -1802,6 +2008,42 @@ async fn delete_thread(
         .load_project(project_id)
         .await?
         .ok_or(ApiError::NotFound)?;
+    // Worktrees are preflighted across the whole subtree before anything is deleted, for the same
+    // reason liveness is: a refusal partway through would leave a half-deleted ownership tree.
+    if !q.force {
+        for candidate in &deletion_order {
+            let Some(worktree) = graph
+                .get(candidate)
+                .and_then(|tf| tf.git_workspace.as_ref())
+                .and_then(ThreadGitWorkspace::as_worktree)
+            else {
+                continue;
+            };
+            let impact = worktree_deletion_impact(worktree).await.map_err(|error| {
+                warn!(
+                    %project_id,
+                    thread_id = %candidate,
+                    branch = %worktree.branch,
+                    %error,
+                    action = "delete_thread",
+                    "refusing to delete a thread whose worktree Git cannot report on"
+                );
+                // A conflict rather than a server error: the deletion is refused pending the user's
+                // say-so, and the browser's 409 path already offers exactly that — confirm again to
+                // go ahead anyway.
+                ApiError::Conflict(format!(
+                    "could not check whether deleting worktree {} would destroy work: {error}",
+                    worktree.branch
+                ))
+            })?;
+            if impact.destroys_work() {
+                return Err(ApiError::Conflict(format!(
+                    "deleting this thread would destroy {}",
+                    impact.describe()
+                )));
+            }
+        }
+    }
     let descendant_count = deletion_order.len().saturating_sub(1);
     info!(
         %project_id,
@@ -1824,6 +2066,31 @@ async fn delete_thread(
                 "thread deletion graph changed unexpectedly".into(),
             ));
         };
+        // Before the thread file goes: it is the only record of this checkout's path, branch and
+        // repository, so cleaning up afterwards means cleaning up blind if anything fails. Keeping
+        // the thread on failure is what makes a retry possible, and a retry converges — the probes
+        // read a missing checkout as no work, removal de-registers a vanished one, and deleting an
+        // already-gone branch is not an error. `force` accepts whatever is left behind instead,
+        // which is the only way to delete a thread whose repository has gone missing entirely.
+        //
+        // The message deliberately does not promise nothing was touched: cleanup is two Git
+        // commands, and the second can fail after the first has already removed the checkout.
+        if let Some(worktree) = thread_file
+            .git_workspace
+            .as_ref()
+            .and_then(ThreadGitWorkspace::as_worktree)
+            && let Err(error) =
+                remove_worktree_for_deleted_thread(worktree, *candidate, "delete_thread", q.force)
+                    .await
+            && !q.force
+        {
+            return Err(ApiError::Conflict(format!(
+                "could not finish removing worktree {} at {}: {error}. The thread was kept so this \
+                 can be retried — some of the cleanup may already have run. Deleting it anyway \
+                 leaves whatever remains of the checkout and branch behind.",
+                worktree.branch, worktree.path
+            )));
+        }
         if let Err(error) = state
             .registry
             .delete_thread(
@@ -1862,6 +2129,7 @@ async fn delete_thread(
             );
             return Err(error.into());
         }
+
         info!(
             %project_id,
             root_thread_id = %thread_id,
@@ -1944,6 +2212,114 @@ fn sort_browse_entries(entries: &mut [DirEntry]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds a real repository with one linked worktree, and hands back the record the deletion
+    /// path works from.
+    async fn repo_with_worktree(tmp: &std::path::Path) -> ThreadWorktree {
+        let repo = tmp.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "t@example.invalid"],
+            vec!["config", "user.name", "T"],
+            vec!["commit", "-q", "--allow-empty", "-m", "initial"],
+        ] {
+            let out = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(&args)
+                .output()
+                .expect("run git");
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+        crate::worktree::create(&repo, &tmp.join("wt"), "giskard/worktree-01race")
+            .await
+            .expect("create worktree")
+    }
+
+    /// The impact probe runs earlier in the request than the removal does, so anything written to
+    /// the checkout in between is invisible to it — an editor saving, a hook, a shell the user left
+    /// open. Passing the user's answer through to `git worktree remove` closes that window: Git
+    /// looks again, and on an unforced deletion its refusal is what turns the race into a second
+    /// confirmation instead of lost work.
+    #[tokio::test]
+    async fn an_unforced_removal_refuses_a_checkout_that_went_dirty_after_the_probe() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let worktree = repo_with_worktree(tmp.path()).await;
+        let thread_id = ThreadId::new();
+
+        // Exactly the race: clean when the impact was measured, dirty by the time removal runs.
+        assert_eq!(
+            crate::worktree::uncommitted_changes(&worktree)
+                .await
+                .unwrap(),
+            0
+        );
+        std::fs::write(
+            std::path::Path::new(&worktree.path).join("late.txt"),
+            "written after the probe\n",
+        )
+        .unwrap();
+
+        let refused =
+            remove_worktree_for_deleted_thread(&worktree, thread_id, "test", /*force*/ false).await;
+        assert!(
+            refused.is_err(),
+            "an unforced removal must not discard work that appeared after the probe"
+        );
+        assert!(
+            std::path::Path::new(&worktree.path)
+                .join("late.txt")
+                .exists(),
+            "the refusal must leave the work where it is"
+        );
+
+        // The second confirmation is what actually destroys it, which is the contract the card
+        // describes.
+        remove_worktree_for_deleted_thread(&worktree, thread_id, "test", /*force*/ true)
+            .await
+            .expect("a forced removal takes the checkout down");
+        assert!(!std::path::Path::new(&worktree.path).exists());
+    }
+
+    /// Cleanup is two Git commands and the second can fail after the first has run, leaving the
+    /// checkout gone and the branch behind. Nothing persists that half-state, so the retry has to
+    /// converge on its own: removal de-registers a vanished checkout, and the branch deletion runs
+    /// against the repository, which is still there.
+    #[tokio::test]
+    async fn cleanup_converges_when_retried_after_a_partial_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let worktree = repo_with_worktree(tmp.path()).await;
+        let thread_id = ThreadId::new();
+
+        // The state a failed second command leaves: checkout gone, branch still there.
+        crate::worktree::remove(&worktree, /*force*/ true)
+            .await
+            .expect("remove the checkout");
+        assert!(!std::path::Path::new(&worktree.path).exists());
+        let listed = std::process::Command::new("git")
+            .current_dir(&worktree.repo_root)
+            .args(["branch", "--list", &worktree.branch])
+            .output()
+            .expect("run git");
+        assert!(
+            !String::from_utf8_lossy(&listed.stdout).trim().is_empty(),
+            "the fixture must leave the branch behind, or it tests nothing"
+        );
+
+        remove_worktree_for_deleted_thread(&worktree, thread_id, "test", /*force*/ false)
+            .await
+            .expect("a retry must finish the cleanup rather than fail on what is already done");
+
+        let listed = std::process::Command::new("git")
+            .current_dir(&worktree.repo_root)
+            .args(["branch", "--list", &worktree.branch])
+            .output()
+            .expect("run git");
+        assert!(
+            String::from_utf8_lossy(&listed.stdout).trim().is_empty(),
+            "the retry left the branch behind"
+        );
+    }
 
     fn dir_entry(name: &str, is_dir: bool) -> DirEntry {
         DirEntry {

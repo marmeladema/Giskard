@@ -404,6 +404,27 @@ pub struct GitDiffResponse {
     pub is_empty: bool,
 }
 
+/// What deleting a thread would destroy, per worktree in the subtree it cascades to (spec §7.1).
+#[derive(Debug, Clone, Serialize)]
+pub struct ThreadDeletionImpactResponse {
+    /// Empty when no thread in the subtree has a worktree, which is the ordinary case.
+    pub worktrees: Vec<WorktreeImpactResponse>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorktreeImpactResponse {
+    pub thread_id: ThreadId,
+    pub branch: String,
+    /// Modified or untracked files in the worktree. Ignored files are excluded: they do not block
+    /// removal and are not work.
+    pub uncommitted_changes: usize,
+    /// Commits on the thread's branch that no other ref reaches, which deleting it destroys.
+    pub unreachable_commits: usize,
+    /// A sentence naming what would be lost, or `None` when nothing would be.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ListProjectsResponse {
     pub projects: Vec<ProjectSummary>,

@@ -83,6 +83,40 @@ test.describe("worktree draft toggle", () => {
     await expect(page.locator("#gitStrategySel")).toHaveValue("shared");
   });
 
+  /**
+   * Deleting a thread destroys its worktree, and a worktree can hold the only copy of work. The
+   * card names it while the question is still open — after the fact there is nothing to decide.
+   */
+  test("names what deleting an isolated thread would destroy", async ({ page }) => {
+    await newDraft(page);
+    await openPicker(page);
+    await page.locator("#gitStrategySel").selectOption("worktree");
+    await page.locator("#turnPickerBtn").click();
+    await page.locator("#input").fill("Work that is not committed");
+    await page.locator("#sendBtn").click();
+    await expect(
+      page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY }),
+    ).toBeVisible();
+
+    // The scripted harness leaves the worktree clean, so nothing is at risk yet and the card asks
+    // its ordinary question.
+    const rowContainer = page.locator(".thread.active").locator("xpath=..");
+    await rowContainer.locator(".thread-menu-btn").click();
+    const impact = page.waitForResponse((r) => r.url().includes("/deletion-impact"));
+    await rowContainer.locator(".thread-menu .danger").click();
+    await expect(page.locator("#removeThreadModal")).toHaveClass(/open/);
+
+    // The card asked, and the answer was "nothing at stake" — for the thread's own worktree, which
+    // it reports either way.
+    const body = await (await impact).json();
+    expect(body.worktrees).toHaveLength(1);
+    expect(body.worktrees[0].summary).toBeUndefined();
+    await expect(page.locator("#removeThreadWorktree")).toBeHidden();
+
+    await page.locator("#removeThreadCancel").click();
+    await expect(page.locator("#removeThreadModal")).not.toHaveClass(/open/);
+  });
+
   test("starts a thread that runs in the worktree", async ({ page }) => {
     await newDraft(page);
     await openPicker(page);

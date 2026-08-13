@@ -11,17 +11,102 @@ use std::sync::Arc;
 use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ApprovalId, ProjectId, ServerRequestId, ThreadId, TurnId};
+use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
+use giskard_core::item::{Item, ItemPayload, SubagentAction, SubagentLink};
 use giskard_core::model::ModelRef;
 use giskard_core::server_request::ServerRequestResponse;
-use giskard_core::turn::TurnOverrides;
+use giskard_core::token::TokenUsage;
+use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
     AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
 };
-use giskard_persist::store::ProjectConfig;
+use giskard_persist::store::{ProjectConfig, ThreadGitWorkspace};
 use giskard_server::{AppState, HarnessFactory, build_app};
 use tokio::sync::Mutex;
+
+/// Saving a plan writes a file into the workspace and then offers it back as a link. For an
+/// isolated thread that has to be the worktree: writing to the project's checkout would put the
+/// plan outside the tree the agent works in, and the link offered afterwards would read a file that
+/// is not there.
+#[tokio::test]
+async fn a_plan_saved_from_an_isolated_thread_lands_in_its_worktree() {
+    let server = start(/*git_repo*/ true).await;
+    server
+        .harness
+        .agent_says
+        .lock()
+        .await
+        .replace("## Step one\n\nRefactor the auth module.".to_string());
+    let (_, body) = server
+        .start_thread_in_mode("Plan the work", true, "plan")
+        .await;
+    let started: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let thread_id: ThreadId = started["thread_id"].as_str().unwrap().parse().unwrap();
+    let worktree = server
+        .state
+        .store
+        .load_thread(server.project_id, thread_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .git_workspace
+        .and_then(|ws| ws.as_worktree().cloned())
+        .unwrap();
+    server.wait_until_idle(thread_id).await;
+
+    let port = server.base.rsplit(':').next().unwrap().to_string();
+    let request = tokio_tungstenite::tungstenite::http::Request::builder()
+        .uri(format!("ws://127.0.0.1:{port}/api/ws"))
+        .header("host", format!("127.0.0.1:{port}"))
+        .header("cookie", server.cookie.clone())
+        .header("upgrade", "websocket")
+        .header("connection", "upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .body(())
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("connect websocket");
+    use futures_util::SinkExt;
+    for message in [
+        giskard_proto::ClientMessage::Subscribe {
+            thread_id,
+            since: None,
+        },
+        giskard_proto::ClientMessage::SavePlan {
+            thread_id,
+            path: "docs/plan.md".into(),
+        },
+    ] {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&message).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+    }
+
+    let in_worktree = Path::new(&worktree.path).join("docs/plan.md");
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while !in_worktree.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the plan was never written into the thread's worktree"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        std::fs::read_to_string(&in_worktree)
+            .unwrap()
+            .contains("Refactor the auth module"),
+        "the worktree's copy must hold the plan"
+    );
+    assert!(
+        !server._project.path().join("docs/plan.md").exists(),
+        "nothing may be written into the project's checkout"
+    );
+}
 
 /// The file endpoints already name their thread; isolation is what makes that answer differ. A
 /// worktree holds the same paths as the project's checkout with different contents in them, so a
@@ -152,6 +237,12 @@ struct RecordingHarness {
     /// the map happened to be held. Every event for that thread would then vanish and the test would
     /// fail on an unexplained timeout. Nothing holds this guard across an await.
     threads: std::sync::Mutex<Vec<(ThreadId, tokio::sync::broadcast::Sender<AgentEvent>)>>,
+    /// When set, the next turn reports having spawned a sub-agent with this native id, which is what
+    /// drives the registry to materialize a linked thread the way Codex does.
+    spawns_subagent: Mutex<Option<String>>,
+    /// When set, every turn emits this as agent text. Plan extraction reads the persisted history,
+    /// so a turn that streams nothing leaves nothing to save.
+    agent_says: Mutex<Option<String>>,
 }
 
 #[async_trait::async_trait]
@@ -187,11 +278,80 @@ impl AgentHarness for RecordingHarness {
 
     async fn start_turn(
         &self,
-        _thread: &ThreadHandle,
+        thread: &ThreadHandle,
         _input: UserInput,
         _overrides: TurnOverrides,
     ) -> Result<TurnId, HarnessError> {
-        Ok(TurnId::new())
+        let turn = TurnId::new();
+        // Complete the turn immediately. A turn that never ends holds the thread's turn gate, and
+        // every lifecycle operation these tests drive — delete above all — refuses a live thread.
+        // Cloned out and the guard dropped before the awaits below: a `std` mutex must not be held
+        // across one, and a `Sender` clone is all this needs.
+        let sender = self
+            .threads
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(id, _)| *id == thread.thread)
+            .map(|(_, tx)| tx.clone());
+        if let Some(tx) = sender {
+            let _ = tx.send(AgentEvent::TurnStarted {
+                thread: thread.thread,
+                turn,
+            });
+            if let Some(text) = self.agent_says.lock().await.clone() {
+                let _ = tx.send(AgentEvent::ItemCompleted {
+                    thread: thread.thread,
+                    turn,
+                    item: Item {
+                        id: ItemId::new(),
+                        harness_item_id: format!("say_{turn}"),
+                        payload: ItemPayload::AgentMessage { text },
+                        created_at: chrono::Utc::now(),
+                    },
+                });
+            }
+            if let Some(child) = self.spawns_subagent.lock().await.take() {
+                let _ = tx.send(AgentEvent::ItemCompleted {
+                    thread: thread.thread,
+                    turn,
+                    item: Item {
+                        id: ItemId::new(),
+                        harness_item_id: format!("spawn_{turn}"),
+                        payload: ItemPayload::ToolCall {
+                            name: "spawn_subagent".into(),
+                            input: serde_json::json!({}),
+                            output: None,
+                            server: None,
+                            status: Some("completed".into()),
+                            metadata: None,
+                            subagent: Some(SubagentLink {
+                                harness_thread_id: child,
+                                path: Some("reviewer".into()),
+                                initial_prompt: Some("review the change".into()),
+                                action: SubagentAction::Spawned,
+                                // Pending, not completed: a child that is still running is the one
+                                // the monitor attaches to, which is the route being covered.
+                                status: Some(giskard_core::item::SubagentStatus::Pending),
+                                message: None,
+                            }),
+                            error: None,
+                        },
+                        created_at: chrono::Utc::now(),
+                    },
+                });
+            }
+            let _ = tx.send(AgentEvent::TurnCompleted {
+                thread: thread.thread,
+                turn,
+                usage: TokenUsage::new(0, 0),
+                status: TurnStatus {
+                    kind: TurnStatusKind::Completed,
+                    message: None,
+                },
+            });
+        }
+        Ok(turn)
     }
 
     fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
@@ -225,6 +385,14 @@ impl AgentHarness for RecordingHarness {
     }
 
     async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
+        Ok(())
+    }
+
+    async fn delete_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
+        self.threads
+            .lock()
+            .unwrap()
+            .retain(|(id, _)| *id != thread.thread);
         Ok(())
     }
 
@@ -399,7 +567,12 @@ impl Harnessed {
         (status, response.text().await.unwrap_or_default())
     }
 
-    async fn start_thread(&self, text: &str, worktree: bool) -> (reqwest::StatusCode, String) {
+    async fn start_thread_in_mode(
+        &self,
+        text: &str,
+        worktree: bool,
+        mode: &str,
+    ) -> (reqwest::StatusCode, String) {
         let response = self
             .client
             .post(format!(
@@ -410,7 +583,7 @@ impl Harnessed {
             .json(&serde_json::json!({
                 "text": text,
                 "model_ref": {"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null},
-                "mode": "build",
+                "mode": mode,
                 "permission_preset": "ask_first",
                 "git_strategy": if worktree { "worktree" } else { "shared" },
             }))
@@ -418,11 +591,12 @@ impl Harnessed {
             .await
             .unwrap();
         let status = response.status();
-        // Errors come back as plain text, successes as JSON, so read the body once and let each
-        // test decide what it is looking at.
         (status, response.text().await.unwrap_or_default())
     }
 
+    async fn start_thread(&self, text: &str, worktree: bool) -> (reqwest::StatusCode, String) {
+        self.start_thread_in_mode(text, worktree, "build").await
+    }
     async fn file_response(
         &self,
         kind: &str,
@@ -469,6 +643,69 @@ impl Harnessed {
         id
     }
 
+    /// Wait for the turn started with the thread to finish, since every lifecycle operation
+    /// refuses a live thread.
+    async fn wait_until_idle(&self, thread_id: ThreadId) {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        while self.state.registry.thread_has_active_turn(thread_id).await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the thread's first turn never completed"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Rewrite the persisted worktree record, which is how these tests put Git in a state it cannot
+    /// answer for without breaking the whole fixture.
+    async fn repoint_worktree(&self, thread_id: ThreadId, path: &str, repo_root: &str) {
+        let mut file = self
+            .state
+            .store
+            .load_thread(self.project_id, thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut worktree = file
+            .git_workspace
+            .as_ref()
+            .and_then(|ws| ws.as_worktree().cloned())
+            .expect("the thread records a worktree");
+        worktree.path = path.to_string();
+        worktree.repo_root = repo_root.to_string();
+        file.git_workspace = Some(ThreadGitWorkspace::Worktree(worktree));
+        self.state
+            .store
+            .save_thread(self.project_id, &file)
+            .await
+            .unwrap();
+    }
+
+    async fn worktree_of(&self, thread_id: ThreadId) -> giskard_persist::store::ThreadWorktree {
+        self.state
+            .store
+            .load_thread(self.project_id, thread_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .git_workspace
+            .and_then(|ws| ws.as_worktree().cloned())
+            .expect("the thread records its worktree")
+    }
+
+    async fn delete_thread(&self, thread_id: ThreadId, force: bool) -> reqwest::Response {
+        let query = if force { "?force=true" } else { "" };
+        self.client
+            .delete(format!(
+                "{}/api/projects/{}/threads/{thread_id}{query}",
+                self.base, self.project_id
+            ))
+            .header("cookie", &self.cookie)
+            .send()
+            .await
+            .unwrap()
+    }
+
     async fn git_status_response(&self, thread_id: ThreadId) -> reqwest::Response {
         self.client
             .get(format!(
@@ -498,6 +735,51 @@ impl Harnessed {
             .await
             .unwrap()
     }
+}
+
+/// The sub-agent the registry materialized under `parent`, once it lands on disk.
+async fn wait_for_subagent(server: &Harnessed, parent: ThreadId) -> ThreadId {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        for thread_id in server
+            .state
+            .store
+            .list_threads(server.project_id)
+            .await
+            .unwrap()
+        {
+            let Some(thread) = server
+                .state
+                .store
+                .load_thread(server.project_id, thread_id)
+                .await
+                .unwrap()
+            else {
+                continue;
+            };
+            if thread.parent_thread_id == Some(parent) {
+                return thread_id;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the sub-agent was never materialized"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+}
+
+fn branch_exists(repo: &Path, branch: &str) -> bool {
+    !String::from_utf8_lossy(
+        &Command::new("git")
+            .current_dir(repo)
+            .args(["branch", "--list", branch])
+            .output()
+            .expect("run git")
+            .stdout,
+    )
+    .trim()
+    .is_empty()
 }
 
 fn paths_in(status: &serde_json::Value) -> Vec<String> {
@@ -640,6 +922,348 @@ async fn reopening_an_isolated_thread_returns_to_its_worktree() {
     );
 }
 
+/// Deleting a thread takes its worktree and the branch it started on with it — that branch is
+/// Giskard's own scaffolding, and leaving it would strand a ref nothing points to any more.
+#[tokio::test]
+async fn deleting_a_thread_removes_its_worktree_and_branch() {
+    let server = start(/*git_repo*/ true).await;
+    let (_, body) = server.start_thread("Isolate this work", true).await;
+    let started: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let thread_id: ThreadId = started["thread_id"].as_str().unwrap().parse().unwrap();
+    let worktree = server.worktree_of(thread_id).await;
+    server.wait_until_idle(thread_id).await;
+
+    let response = server.delete_thread(thread_id, /*force*/ false).await;
+
+    assert_eq!(response.status(), 204);
+    assert!(!Path::new(&worktree.path).exists());
+    assert!(
+        !branch_exists(server._project.path(), &worktree.branch),
+        "the thread's branch outlived the thread that owned it"
+    );
+}
+
+/// A worktree the user removed by hand is still registered with Git, and a registered worktree
+/// holds its branch. Deleting the thread has to finish the job rather than leave a branch nothing
+/// can remove — which means still asking Git to remove a checkout that is already gone.
+#[tokio::test]
+async fn deleting_a_thread_whose_worktree_vanished_still_clears_its_branch() {
+    let server = start(/*git_repo*/ true).await;
+    let (_, body) = server.start_thread("Isolate this work", true).await;
+    let started: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let thread_id: ThreadId = started["thread_id"].as_str().unwrap().parse().unwrap();
+    let worktree = server.worktree_of(thread_id).await;
+    server.wait_until_idle(thread_id).await;
+    std::fs::remove_dir_all(&worktree.path).unwrap();
+
+    let response = server.delete_thread(thread_id, /*force*/ false).await;
+
+    assert_eq!(response.status(), 204);
+    assert!(
+        !branch_exists(server._project.path(), &worktree.branch),
+        "the branch survived a worktree that was already gone"
+    );
+}
+
+/// A worktree holding work that exists nowhere else is not deleted on a plain request: the
+/// confirmation has to happen first, and the refusal names what is at stake.
+#[tokio::test]
+async fn deleting_a_thread_refuses_to_discard_work_without_confirmation() {
+    let server = start(/*git_repo*/ true).await;
+    let (_, body) = server.start_thread("Isolate this work", true).await;
+    let started: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let thread_id: ThreadId = started["thread_id"].as_str().unwrap().parse().unwrap();
+    let worktree = server.worktree_of(thread_id).await;
+    server.wait_until_idle(thread_id).await;
+    std::fs::write(
+        Path::new(&worktree.path).join("in-progress.txt"),
+        "not committed anywhere\n",
+    )
+    .unwrap();
+
+    let refusal = server.delete_thread(thread_id, /*force*/ false).await;
+    assert_eq!(refusal.status(), 409);
+    let message = refusal.text().await.unwrap();
+    assert!(
+        message.contains("1 uncommitted change") && message.contains(&worktree.branch),
+        "the refusal must name what would be destroyed, got: {message}"
+    );
+    assert!(
+        Path::new(&worktree.path).exists(),
+        "a refused deletion must leave the worktree alone"
+    );
+
+    // The card shows the same facts before asking, then confirms.
+    let impact: serde_json::Value = server
+        .client
+        .get(format!(
+            "{}/api/projects/{}/threads/{thread_id}/deletion-impact",
+            server.base, server.project_id
+        ))
+        .header("cookie", &server.cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(impact["worktrees"][0]["uncommitted_changes"], 1);
+    assert!(
+        impact["worktrees"][0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("uncommitted change")
+    );
+
+    let forced = server.delete_thread(thread_id, /*force*/ true).await;
+    assert_eq!(forced.status(), 204);
+    assert!(!Path::new(&worktree.path).exists());
+}
+
+/// Commits are the other way work is lost, and they are invisible in the working tree: the branch
+/// looks clean while holding the only copy of an afternoon.
+#[tokio::test]
+async fn deleting_a_thread_refuses_to_discard_commits_on_no_other_branch() {
+    let server = start(/*git_repo*/ true).await;
+    let (_, body) = server.start_thread("Isolate this work", true).await;
+    let started: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let thread_id: ThreadId = started["thread_id"].as_str().unwrap().parse().unwrap();
+    let worktree = server.worktree_of(thread_id).await;
+    server.wait_until_idle(thread_id).await;
+    let path = Path::new(&worktree.path);
+    std::fs::write(path.join("committed.txt"), "work\n").unwrap();
+    git(path, &["add", "committed.txt"]);
+    git(path, &["commit", "-qm", "thread work"]);
+
+    let refusal = server.delete_thread(thread_id, /*force*/ false).await;
+
+    assert_eq!(refusal.status(), 409);
+    let message = refusal.text().await.unwrap();
+    assert!(
+        message.contains("1 commit on no other ref"),
+        "the refusal must name the commits at stake, got: {message}"
+    );
+
+    // Parked on a branch of the agent's own, the same commit is no longer at risk — and that branch
+    // survives the deletion, because it is the user's now.
+    git(path, &["branch", "agent/keep-this"]);
+    let response = server.delete_thread(thread_id, /*force*/ false).await;
+    assert_eq!(response.status(), 204);
+    assert!(branch_exists(server._project.path(), "agent/keep-this"));
+    assert!(!branch_exists(server._project.path(), &worktree.branch));
+}
+
+/// Deleting a project is a project-scope decision the user has already confirmed, so it sweeps the
+/// worktrees rather than refusing over one thread's unfinished work.
+#[tokio::test]
+async fn deleting_a_project_sweeps_its_worktrees() {
+    let server = start(/*git_repo*/ true).await;
+    let (_, body) = server.start_thread("Isolate this work", true).await;
+    let started: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let thread_id: ThreadId = started["thread_id"].as_str().unwrap().parse().unwrap();
+    let worktree = server.worktree_of(thread_id).await;
+    server.wait_until_idle(thread_id).await;
+    std::fs::write(
+        Path::new(&worktree.path).join("in-progress.txt"),
+        "not committed anywhere\n",
+    )
+    .unwrap();
+
+    let response = server
+        .client
+        .delete(format!(
+            "{}/api/projects/{}",
+            server.base, server.project_id
+        ))
+        .header("cookie", &server.cookie)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 204);
+    assert!(!Path::new(&worktree.path).exists());
+    assert!(!branch_exists(server._project.path(), &worktree.branch));
+}
+
+/// The registry materializes a sub-agent the moment the parent's turn reports spawning one, and it
+/// opens the child against a workspace of its own choosing. That has to be the parent's worktree:
+/// the harness is already running the child there.
+#[tokio::test]
+async fn materializing_a_subagent_opens_it_in_its_parents_worktree() {
+    let server = start(/*git_repo*/ true).await;
+    server
+        .harness
+        .spawns_subagent
+        .lock()
+        .await
+        .replace("native-child".to_string());
+    let (_, body) = server.start_thread("Isolate this work", true).await;
+    let started: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let parent_id: ThreadId = started["thread_id"].as_str().unwrap().parse().unwrap();
+    let worktree = server.worktree_of(parent_id).await;
+
+    wait_for_subagent(&server, parent_id).await;
+
+    // The child's thread file lands before the harness open that records its workspace root, so
+    // comparing straight away races the second open.
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while server.workspace_roots().await.len() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the sub-agent was never opened"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        server.workspace_roots().await,
+        vec![worktree.path.clone(), worktree.path],
+        "the parent and the sub-agent it spawned must be opened in the same worktree"
+    );
+}
+
+/// After a restart nothing is attached, so the next report of activity on a sub-agent has to reopen
+/// it — the other registry route into a child's workspace, and a cold one, where the cwd Giskard
+/// sends is the cwd the harness uses.
+#[tokio::test]
+async fn reattaching_a_subagent_after_a_restart_uses_its_parents_worktree() {
+    let server = start(/*git_repo*/ true).await;
+    server
+        .harness
+        .spawns_subagent
+        .lock()
+        .await
+        .replace("native-child".to_string());
+    let (_, body) = server.start_thread("Isolate this work", true).await;
+    let started: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let parent_id: ThreadId = started["thread_id"].as_str().unwrap().parse().unwrap();
+    let worktree = server.worktree_of(parent_id).await;
+    let child = wait_for_subagent(&server, parent_id).await;
+
+    // A second server over the same data directory: the child is persisted but nothing is attached.
+    let (restarted, base, cookie) = restart(&server).await;
+    restarted
+        .spawns_subagent
+        .lock()
+        .await
+        .replace("native-child".to_string());
+    let port = base.rsplit(':').next().unwrap().to_string();
+    let request = tokio_tungstenite::tungstenite::http::Request::builder()
+        .uri(format!("ws://127.0.0.1:{port}/api/ws"))
+        .header("host", format!("127.0.0.1:{port}"))
+        .header("cookie", cookie)
+        .header("upgrade", "websocket")
+        .header("connection", "upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .body(())
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("connect websocket");
+    use futures_util::SinkExt;
+    for message in [
+        giskard_proto::ClientMessage::Subscribe {
+            thread_id: parent_id,
+            since: None,
+        },
+        giskard_proto::ClientMessage::SendInput {
+            thread_id: parent_id,
+            text: "Ask the reviewer again".into(),
+            attachments: Vec::new(),
+        },
+    ] {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&message).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+    }
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        // Two opens: the parent on subscribe, then the child when its activity is reported.
+        if restarted.opened_workspace_roots.lock().await.len() >= 2 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the sub-agent was never reattached"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        restarted.opened_workspace_roots.lock().await.clone(),
+        vec![worktree.path.clone(), worktree.path],
+        "reattaching a sub-agent must use the worktree it works in"
+    );
+    // The reattach must not have invented a second child.
+    assert_eq!(wait_for_subagent(&server, parent_id).await, child);
+}
+
+/// Opening a sub-agent is the cold path — the one where the harness stops ignoring the cwd Giskard
+/// sends and applies it. It is the moment the child would silently move out of the worktree its own
+/// earlier work is in.
+#[tokio::test]
+async fn opening_a_subagent_attaches_in_its_parents_worktree() {
+    let server = start(/*git_repo*/ true).await;
+    let (_, body) = server.start_thread("Isolate this work", true).await;
+    let started: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let parent_id: ThreadId = started["thread_id"].as_str().unwrap().parse().unwrap();
+    let worktree = server.worktree_of(parent_id).await;
+    server.wait_until_idle(parent_id).await;
+    let child = server.persist_subagent(parent_id).await;
+    // Drop the parent's own open, so what is asserted below is the sub-agent's.
+    server.harness.opened_workspace_roots.lock().await.clear();
+
+    let response = server
+        .client
+        .post(format!(
+            "{}/api/projects/{}/threads",
+            server.base, server.project_id
+        ))
+        .header("cookie", &server.cookie)
+        .json(&serde_json::json!({ "thread_id": child, "resume": null }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    assert_eq!(
+        server.workspace_roots().await,
+        vec![worktree.path],
+        "opening a sub-agent must attach in the worktree it works in"
+    );
+}
+
+/// The inheritance is a lookup, not a copy: the worktree stays owned by the thread that created it,
+/// so removing a sub-agent must leave its parent's checkout and branch untouched.
+#[tokio::test]
+async fn deleting_a_subagent_leaves_its_parents_worktree_alone() {
+    let server = start(/*git_repo*/ true).await;
+    let (_, body) = server.start_thread("Isolate this work", true).await;
+    let started: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let parent_id: ThreadId = started["thread_id"].as_str().unwrap().parse().unwrap();
+    let worktree = server.worktree_of(parent_id).await;
+    server.wait_until_idle(parent_id).await;
+    let child = server.persist_subagent(parent_id).await;
+
+    let response = server.delete_thread(child, /*force*/ false).await;
+    assert!(
+        response.status().is_success(),
+        "deleting a sub-agent failed: {}",
+        response.text().await.unwrap_or_default()
+    );
+
+    assert!(
+        Path::new(&worktree.path).exists(),
+        "the parent's checkout was removed with its sub-agent"
+    );
+    assert!(
+        branch_exists(server._project.path(), &worktree.branch),
+        "the parent's branch was deleted with its sub-agent"
+    );
+}
+
 /// The row above the composer has to describe the tree the agent is working in. Reading the
 /// project's checkout for an isolated thread would report a branch and a change list belonging to
 /// someone else, and would never move as the agent works.
@@ -688,6 +1312,135 @@ async fn git_status_reads_the_threads_own_workspace() {
     let project = server.git_status(None).await;
     assert_eq!(project["branch"].as_str(), Some("main"));
     assert!(paths_in(&project).contains(&"user-edit.txt".to_string()));
+}
+
+/// A probe that cannot run must not read as "nothing would be lost". Deletion is forced and takes
+/// the branch with it, so that answer is the one that authorises destroying work — and the thread's
+/// own guard is the last thing standing between a broken Git and an unrecoverable delete.
+///
+/// Both probes are broken separately, because either one alone answering `0` on failure is enough
+/// to wave a deletion through: the checkout is asked about uncommitted files, the repository about
+/// commits reachable from no other ref.
+#[tokio::test]
+async fn deleting_a_thread_refuses_when_git_cannot_report_what_would_be_lost() {
+    for break_the in ["checkout", "repository"] {
+        let server = start(/*git_repo*/ true).await;
+        let (_, body) = server.start_thread("Isolate this work", true).await;
+        let started: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let thread_id: ThreadId = started["thread_id"].as_str().unwrap().parse().unwrap();
+        let worktree = server.worktree_of(thread_id).await;
+        server.wait_until_idle(thread_id).await;
+
+        // A directory that exists but is not a repository: Git runs and refuses, rather than the
+        // path simply being absent, which is a definite "no work here" and not a failure.
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        let elsewhere = elsewhere.path().to_string_lossy().into_owned();
+        let (path, repo_root) = match break_the {
+            "checkout" => (elsewhere.clone(), worktree.repo_root.clone()),
+            _ => (worktree.path.clone(), elsewhere.clone()),
+        };
+        server.repoint_worktree(thread_id, &path, &repo_root).await;
+
+        let impact = server
+            .client
+            .get(format!(
+                "{}/api/projects/{}/threads/{thread_id}/deletion-impact",
+                server.base, server.project_id
+            ))
+            .header("cookie", &server.cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            impact.status(),
+            503,
+            "with the {break_the} unreadable the card must be told the question could not be \
+             answered, not told there is no risk"
+        );
+
+        let refused = server.delete_thread(thread_id, /*force*/ false).await;
+        assert_eq!(refused.status(), 409, "broken {break_the}");
+        let message = refused.text().await.unwrap();
+        assert!(
+            message.contains("could not check"),
+            "the refusal must say why it refused: {message}"
+        );
+        assert!(
+            server
+                .state
+                .store
+                .load_thread(server.project_id, thread_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "a refused deletion must leave the thread intact"
+        );
+
+        // The user can still say "delete it anyway", which is the whole point of keeping this a
+        // refusal rather than a hard error.
+        let forced = server.delete_thread(thread_id, /*force*/ true).await;
+        assert!(
+            forced.status().is_success(),
+            "forced delete, broken {break_the}"
+        );
+    }
+}
+
+/// Cleanup runs before the thread file does, because that file is the only record of where the
+/// checkout and branch are. A cleanup that fails after it was deleted would strand both with
+/// nothing left to find them by, so the deletion is refused and the thread kept for a retry.
+#[tokio::test]
+async fn a_thread_whose_worktree_cannot_be_removed_is_kept_so_the_delete_can_be_retried() {
+    let server = start(/*git_repo*/ true).await;
+    let (_, body) = server.start_thread("Isolate this work", true).await;
+    let started: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let thread_id: ThreadId = started["thread_id"].as_str().unwrap().parse().unwrap();
+    let worktree = server.worktree_of(thread_id).await;
+    server.wait_until_idle(thread_id).await;
+
+    // Points at the project's own checkout: still a repository, so the impact probes answer
+    // normally, but `git worktree remove` refuses a main working tree.
+    let project_root = server._project.path().to_string_lossy().into_owned();
+    server
+        .repoint_worktree(thread_id, &project_root, &worktree.repo_root)
+        .await;
+
+    let refused = server.delete_thread(thread_id, /*force*/ false).await;
+    assert_eq!(refused.status(), 409);
+    let message = refused.text().await.unwrap();
+    assert!(
+        message.contains(&worktree.branch),
+        "the refusal must name what was left behind: {message}"
+    );
+    assert!(
+        server
+            .state
+            .store
+            .load_thread(server.project_id, thread_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "the thread must survive so the deletion can be retried"
+    );
+    assert!(
+        Path::new(&project_root).exists(),
+        "the refusal must not have removed anything"
+    );
+
+    let forced = server.delete_thread(thread_id, /*force*/ true).await;
+    assert!(
+        forced.status().is_success(),
+        "force must still get rid of a thread whose worktree will not come down"
+    );
+    assert!(
+        server
+            .state
+            .store
+            .load_thread(server.project_id, thread_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// A sub-agent records no worktree of its own: the harness spawns it inside its parent's turn, so
