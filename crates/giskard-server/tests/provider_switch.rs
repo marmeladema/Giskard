@@ -192,6 +192,7 @@ fn seeded_thread(project_id: ProjectId, thread_id: ThreadId) -> ThreadFile {
         created_at: now,
         updated_at: now,
         archived: false,
+        git_workspace: None,
     }
 }
 

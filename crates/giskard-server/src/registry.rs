@@ -1879,6 +1879,7 @@ async fn materialize_subagent_thread(
         created_at: now,
         updated_at: now,
         archived: false,
+        git_workspace: None,
     };
     shared
         .store
@@ -4422,6 +4423,7 @@ mod tests {
                     created_at: now,
                     updated_at: now,
                     archived: false,
+                    git_workspace: None,
                 },
             )
             .await
@@ -4810,6 +4812,7 @@ mod tests {
                     created_at: now,
                     updated_at: now,
                     archived: false,
+                    git_workspace: None,
                 },
             )
             .await
@@ -4925,6 +4928,7 @@ mod tests {
                     created_at: now,
                     updated_at: now,
                     archived: false,
+                    git_workspace: None,
                 },
             )
             .await
@@ -5054,6 +5058,7 @@ mod tests {
                     created_at: now,
                     updated_at: now,
                     archived: false,
+                    git_workspace: None,
                 },
             )
             .await
@@ -5177,6 +5182,7 @@ mod tests {
                     created_at: now,
                     updated_at: now,
                     archived: false,
+                    git_workspace: None,
                 },
             )
             .await
@@ -5331,6 +5337,7 @@ mod tests {
                     created_at: now,
                     updated_at: now,
                     archived: false,
+                    git_workspace: None,
                 },
             )
             .await
@@ -5455,6 +5462,7 @@ mod tests {
                     created_at: now,
                     updated_at: now,
                     archived: false,
+                    git_workspace: None,
                 },
             )
             .await
@@ -5586,6 +5594,7 @@ mod tests {
                     created_at: now,
                     updated_at: now,
                     archived: false,
+                    git_workspace: None,
                 },
             )
             .await
@@ -5741,6 +5750,7 @@ mod tests {
                     created_at: now,
                     updated_at: now,
                     archived: false,
+                    git_workspace: None,
                 },
             )
             .await
@@ -5839,6 +5849,7 @@ mod tests {
                     created_at: now,
                     updated_at: now,
                     archived: false,
+                    git_workspace: None,
                 },
             )
             .await
@@ -6007,6 +6018,7 @@ mod tests {
                     created_at: now,
                     updated_at: now,
                     archived: false,
+                    git_workspace: None,
                 },
             )
             .await
@@ -6233,6 +6245,7 @@ mod tests {
                     created_at: now,
                     updated_at: now,
                     archived: false,
+                    git_workspace: None,
                 },
             )
             .await
@@ -6346,6 +6359,7 @@ mod tests {
                     created_at: now,
                     updated_at: now,
                     archived: false,
+                    git_workspace: None,
                 },
             )
             .await
@@ -6605,6 +6619,7 @@ mod tests {
                     created_at: now,
                     updated_at: now,
                     archived: false,
+                    git_workspace: None,
                 },
             )
             .await
@@ -6803,6 +6818,7 @@ mod tests {
                     created_at: now,
                     updated_at: now,
                     archived: false,
+                    git_workspace: None,
                 },
             )
             .await
@@ -7011,6 +7027,7 @@ mod tests {
                     created_at: now,
                     updated_at: now,
                     archived: false,
+                    git_workspace: None,
                 },
             )
             .await

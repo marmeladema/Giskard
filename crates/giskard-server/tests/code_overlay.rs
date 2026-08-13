@@ -175,6 +175,7 @@ fn thread_file(pid: ProjectId, tid: ThreadId) -> giskard_persist::store::ThreadF
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         archived: false,
+        git_workspace: None,
     }
 }
 
