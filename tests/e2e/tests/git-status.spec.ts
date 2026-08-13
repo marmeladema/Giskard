@@ -204,6 +204,14 @@ test.describe("git status line", () => {
   // The overlay is shared, so a view that takes it over has to hand back what the previous one
   // put there — including when the takeover happens without closing first.
   test("drops the diff state when a source file takes over the overlay", async ({ page }) => {
+    // A source view is read as a thread sees the file, so this takeover needs a real thread — the
+    // diff beneath it does not, which is exactly why the two can meet in one overlay.
+    await page.locator("#input").fill("Open a source file over a diff");
+    await page.locator("#sendBtn").click();
+    await expect(
+      page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY }),
+    ).toBeVisible();
+
     await page.locator("#gitLineToggle").click();
     await page.locator('.git-file[data-git-diff="src/main.rs"]').click();
     await expect(page.locator("#codeCopyDiff")).toBeVisible();

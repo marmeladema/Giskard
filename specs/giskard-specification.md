@@ -304,7 +304,8 @@
 **Changelog (1.49 → 1.50), ImageView activity previews:**
 - **IV1:** Codex `ImageView` activity rows render a bounded inline raster image preview in the
   transcript instead of exposing protocol metadata such as call ids. The preview is sourced through
-  a project-confined `GET /api/projects/{id}/image?path=…` endpoint. SVG is intentionally excluded
+  a workspace-confined `GET /api/projects/{id}/threads/{thread_id}/image?path=…` endpoint. SVG is
+  intentionally excluded
   from inline preview v1 and remains a normal file/path link.
 
 **Changelog (1.48 → 1.49), composer drafts and approval button contrast:**
@@ -820,7 +821,8 @@
 
 **Changelog (1.12 → 1.13), rendered agent Markdown:**
 - **M1:** Agent and reasoning messages are GitHub-flavored Markdown. The server renders them to
-  sanitized HTML via `POST /api/projects/{id}/render`; the browser injects the returned HTML.
+  sanitized HTML via `POST /api/projects/{id}/threads/{thread_id}/render`; the browser injects the
+  returned HTML.
   Rendering happens when the `ItemCompleted` message is finalized (not per delta); the raw text is
   shown until the render resolves, so streaming stays readable and a failed request degrades to
   plain text.
@@ -2622,17 +2624,22 @@ alongside raw token counts. Off by default; raw token counts are the primary met
   filesystem validation; the response carries `path = "src/main.rs"` and `line = 42`, and the
   overlay scrolls to that line after loading. When possible, the target line is centered in the
   overlay viewport so before/after context is visible.
-- **Initial UI slice (L1):** the served self-contained UI calls `POST /api/projects/{id}/linkify`
+- **Initial UI slice (L1):** the served self-contained UI calls
+  `POST /api/projects/{id}/threads/{thread_id}/linkify`
   for completed text items, renders path spans as inline controls, opens
-  `GET /api/projects/{id}/highlight?path=…` in the code overlay, and downloads through
-  `GET /api/projects/{id}/raw?path=…`. This is intentionally whole-file oriented until the
+  `GET /api/projects/{id}/threads/{thread_id}/highlight?path=…` in the code overlay, and downloads
+  through
+  `GET /api/projects/{id}/threads/{thread_id}/raw?path=…`. This is intentionally whole-file
+  oriented until the
   virtualized line-range viewer in §11.3 is implemented.
 - **Image previews (IV1):** completed Codex `ImageView` activity rows render a thumbnail through
-  `GET /api/projects/{id}/image?path=…`. The endpoint uses the same workspace confinement as
+  `GET /api/projects/{id}/threads/{thread_id}/image?path=…`. The endpoint uses the same workspace
+  confinement as
   `highlight`/`raw`, serves only common raster image types with image MIME types, and rejects SVG
   for inline preview.
 - **Markdown rendering (M1–M3):** agent/reasoning text is Markdown, so finalized messages are sent
-  to `POST /api/projects/{id}/render` instead of `/linkify`. The server parses the Markdown
+  to `POST /api/projects/{id}/threads/{thread_id}/render` instead of `/linkify`. The server parses
+  the Markdown
   (`pulldown-cmark`) and emits **sanitized** HTML with a custom serializer: all text is escaped,
   raw HTML in the source is escaped to inert text (never passed through), link URLs are restricted
   to `http`/`https`/`mailto`, and images are not fetched. Path detection runs in the same pass over
