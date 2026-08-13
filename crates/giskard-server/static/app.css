@@ -659,6 +659,10 @@
   .mp-git-strategy { grid-column:1 / -1; }
   .mp-hint { color:var(--muted); font-size:11px; line-height:1.35; }
   .mp-hint:empty { display:none; }
+  /* A confirmation that names what it destroys, so the warning reads as part of the question
+     rather than as an error that has already happened. */
+  .danger-note { color:var(--danger, #f87171); font-size:12px; line-height:1.4; margin-top:6px; }
+  .danger-note[hidden] { display:none; }
   .mp-reload { grid-column:1 / -1; }   /* the reload button gets its own full-width row */
   .mp-reload button { width:100%; }
   .composer textarea:disabled { opacity:.65; cursor:not-allowed; }

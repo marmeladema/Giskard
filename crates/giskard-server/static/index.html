@@ -321,6 +321,12 @@
           Permanently delete thread <strong id="removeThreadName">this thread</strong><span id="removeThreadCascade"></span>?
         </p>
         <p class="muted">This cannot be undone.</p>
+        <!-- Populated from the deletion-impact request when a thread in the subtree has a worktree
+             holding work that exists nowhere else. Said before the user decides rather than after
+             they try, since the whole point is that it cannot be undone. A live region because it
+             arrives after the dialog has opened and focus has already moved to the confirm button,
+             so a screen reader would otherwise never reach the sentence naming what is destroyed. -->
+        <p class="danger-note" id="removeThreadWorktree" role="status" aria-live="polite" hidden></p>
       </div>
       <div class="foot">
         <span class="err" id="removeThreadErr" role="alert" aria-live="assertive"></span>

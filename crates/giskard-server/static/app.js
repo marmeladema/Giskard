@@ -1607,8 +1607,33 @@ function openRemoveThreadModal(pid, tid, title, cascade) {
   $("removeThreadErr").textContent = "";
   $("removeThreadName").textContent = title || "this thread";
   $("removeThreadCascade").textContent = cascade || "";
+  $("removeThreadWorktree").hidden = true;
+  $("removeThreadWorktree").textContent = "";
   $("removeThreadModal").classList.add("open");
   $("removeThreadConfirm").focus();
+  loadRemoveThreadWorktreeImpact(pid, tid);
+}
+
+/* What deleting this thread would destroy, asked before the user decides rather than reported after
+   they try. A thread's worktree holds uncommitted edits, and its branch may hold commits that exist
+   on no other ref; either is gone for good, so the card has to name them while the question is
+   still open. Failing to load it leaves the card as it was: the server refuses the deletion on its
+   own if work is at risk, so a missing warning costs a round trip, not the work. */
+async function loadRemoveThreadWorktreeImpact(pid, tid) {
+  try {
+    const res = await api("GET", `/api/projects/${pid}/threads/${tid}/deletion-impact`);
+    const pending = state.pendingRemoveThread;
+    if (!pending || String(pending.pid) !== String(pid) || String(pending.tid) !== String(tid)) return;
+    const losses = (res && Array.isArray(res.worktrees) ? res.worktrees : [])
+      .map(w => w && w.summary)
+      .filter(Boolean);
+    pending.worktreeAtRisk = losses.length > 0;
+    const note = $("removeThreadWorktree");
+    note.textContent = losses.length ? `This also destroys ${losses.join("; ")}.` : "";
+    note.hidden = !losses.length;
+  } catch {
+    // Left silent on purpose: see above.
+  }
 }
 
 function setRemoveThreadDeleting(deleting) {
@@ -1662,7 +1687,11 @@ $("removeThreadConfirm").onclick = async () => {
   setRemoveThreadDeleting(true);
   $("removeThreadErr").textContent = "";
   try {
-    await api("DELETE", `/api/projects/${pid}/threads/${tid}`, undefined, {
+    // Forced only when the card actually warned about a worktree. Forcing every deletion would
+    // make the server's guard unreachable from the UI, and a worktree that became dirty between
+    // opening the card and confirming it would be discarded without anyone having said so.
+    const force = pending.worktreeAtRisk ? "?force=true" : "";
+    await api("DELETE", `/api/projects/${pid}/threads/${tid}${force}`, undefined, {
       timeoutMs: THREAD_DELETE_TIMEOUT_MS,
     });
     // The server cascades to descendants it discovered itself, which can include children this
@@ -1701,7 +1730,19 @@ $("removeThreadConfirm").onclick = async () => {
     closeRemoveThreadModal({ force:true, restoreFocus: !openedDraft });
   } catch (e) {
     if (state.pendingRemoveThread === pending && pending.requestSeq === requestSeq) {
-      $("removeThreadErr").textContent = "Delete thread failed: " + apiFailureMessage(e);
+      // A 409 here is the server refusing to discard work — either the impact request had not
+      // answered yet, or the worktree became dirty while the card was open. Show what it says and
+      // arm the confirmation, so the second click is a decision made with the facts rather than a
+      // repeat of the same refusal.
+      if (e && e.status === 409) {
+        pending.worktreeAtRisk = true;
+        const note = $("removeThreadWorktree");
+        note.textContent = apiFailureMessage(e);
+        note.hidden = false;
+        $("removeThreadErr").textContent = "Confirm again to delete it anyway.";
+      } else {
+        $("removeThreadErr").textContent = "Delete thread failed: " + apiFailureMessage(e);
+      }
     }
   } finally {
     if (state.pendingRemoveThread === pending && pending.requestSeq === requestSeq) {
