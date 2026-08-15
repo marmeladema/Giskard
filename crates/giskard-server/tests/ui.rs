@@ -2933,31 +2933,72 @@ fn app_js() -> &'static str {
     include_str!("../static/app.js")
 }
 
-/// Where a thread's working tree comes from is decided once, on the draft, and the choice has to be
-/// visible without reopening the popover that set it.
+/// Where a thread's working tree comes from is decided once, on the draft. The choice belongs to the
+/// Git row — the row that describes the very tree it changes — rather than to the mode/permissions
+/// popover, where it was filed under a card about neither.
 #[test]
 fn browser_offers_the_git_strategy_choice_on_drafts_only() {
     let source = app_js();
     let markup = include_str!("../static/index.html");
 
+    let row = between(
+        markup,
+        "class=\"git-line-actions\"",
+        "class=\"git-line-body\"",
+    );
     assert!(
-        markup.contains("id=\"gitStrategyControl\"") && markup.contains("id=\"gitStrategySel\""),
-        "the draft picker carries the Git strategy choice"
+        row.contains("id=\"gitStrategySel\""),
+        "the checkout choice sits on the Git row, beside the branch and counts it changes"
+    );
+    let turn_picker = between(markup, "id=\"turnPickerMenu\"", "id=\"modelPicker\"");
+    assert!(
+        !turn_picker.contains("gitStrategy"),
+        "and no longer in the mode/permission card, which is about neither"
     );
     // A select, not a checkbox: the set of strategies is open, and the next one has to be an option
-    // here rather than a second control.
+    // here rather than a second control. It is also the control itself rather than a chip that opens
+    // one — the choice is one click from the row, not two.
     assert!(
-        markup.contains("<option value=\"shared\"")
-            && markup.contains("<option value=\"worktree\""),
-        "both strategies are offered by their wire value"
+        row.contains("<option value=\"shared\"") && row.contains("<option value=\"worktree\""),
+        "both strategies are offered by their wire value, on the row"
+    );
+    // The row is 27px of chips with no width for a sentence, so what an option *is* rides on the
+    // select's own tooltip, refreshed per choice.
+    assert!(
+        source.contains("select.title = offered ? gitStrategyHintText() : \"\";"),
+        "what the option is, is the control's tooltip rather than a line on the row"
+    );
+    // What it would *cost* is printed instead: a tooltip does not exist on a phone, and this is the
+    // one fact a user needs before sending.
+    assert!(
+        between(markup, "class=\"git-line-head\"", "class=\"git-line-body\"")
+            .contains("id=\"gitStrategyWarning\""),
+        "the cost is printed on its own line under the row, where touch can read it"
     );
     assert!(
-        source.contains("control.hidden = !draft;"),
-        "a thread's workspace is fixed once it exists, so the field is absent for open threads"
+        markup.contains("id=\"gitStrategyWarning\" role=\"status\" aria-live=\"polite\""),
+        "and announced, since it appears in response to a choice made elsewhere on the row"
+    );
+    // Pinned as the adjacent pair rather than as one line: a lone `contains` of the assignment still
+    // matches when a guard is prepended to it, which is exactly the regression that would leave a
+    // stale cost sitting in the live region.
+    assert!(
+        source.contains(concat!(
+            "  const cost = offered ? gitStrategyWarningText() : \"\";\n",
+            "  warning.textContent = cost;\n",
+            "  warning.hidden = !cost;"
+        )),
+        "the line is cleared as well as hidden, so a stale cost is never announced later"
+    );
+    // No visible label fits either, so the control still has to name itself to a screen reader.
+    assert!(
+        row.contains("aria-label=\"Git checkout\""),
+        "the control names itself where no visible label fits"
     );
     assert!(
-        source.contains("select.disabled = !isRepo;"),
-        "there is nothing to branch from without a repository"
+        source.contains("const offered = isDraftThread() && isDraftWorkspaceRepo();"),
+        "a thread's workspace is fixed once it exists, and a non-repository has nothing to branch \
+         from — so the control is absent in both cases rather than shown dead"
     );
     assert!(
         source.contains(
@@ -2971,12 +3012,32 @@ fn browser_offers_the_git_strategy_choice_on_drafts_only() {
         "each draft chooses for itself rather than inheriting the last draft's choice"
     );
     assert!(
-        source.contains("GIT_STRATEGY_CHIP[state.draftGitStrategy]"),
-        "the closed chip reports the choice"
+        source.contains("GIT_STRATEGIES.has(strategy) ? strategy : GIT_STRATEGY_SHARED"),
+        "a value the server would refuse never becomes the draft's choice"
+    );
+    // Pinned positively rather than as the absence of the old suffix: "no longer contains that exact
+    // fragment" would pass again the moment a suffix came back spelled any other way.
+    assert!(
+        source.contains("textContent = `${mode} · ${preset}`;"),
+        "and the turn chip summarises mode and preset only — the checkout choice is on the row, and \
+         one fact belongs in one place"
     );
     assert!(
-        source.contains("Your ${dirty} uncommitted change"),
-        "the hint names the work that stays in the project's checkout"
+        source.contains("Your 1 uncommitted change stays in the project's checkout.")
+            && source.contains("uncommitted changes stay in the project's checkout."),
+        "the warning names the work that stays behind, with the verb agreeing with the count"
+    );
+    // Nothing is at stake without a worktree, or without uncommitted work, and a line that appeared
+    // every time would stop being read.
+    let warning = between(
+        source,
+        "function gitStrategyWarningText()",
+        "function setDraftGitStrategy",
+    );
+    assert!(
+        warning.contains("if (state.draftGitStrategy !== \"worktree\") return \"\";")
+            && warning.contains("if (!dirty) return \"\";"),
+        "and it is absent when there is nothing to lose"
     );
 }
 

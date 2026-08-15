@@ -164,6 +164,20 @@
             <span class="git-diffstat mono" id="gitDiffstat" hidden></span>
           </button>
           <div class="git-line-actions">
+            <!-- Only a draft can choose this: a thread's workspace is fixed once it exists, so the
+                 control is absent for open threads rather than shown disabled. It sits on this row
+                 because this row describes the very tree the choice is about — the branch a worktree
+                 would start from, and the changed files it would leave behind. A select rather than
+                 a checkbox because where a thread's working tree comes from is an open question, not
+                 a yes/no one: a third answer is a new option here rather than a new control. The
+                 row has no width for a sentence, so what an option *is* rides on the select's
+                 `title`, refreshed per choice; `aria-label` names the control itself, since the row
+                 has no room for a visible label either. What an option would *cost* is printed
+                 below instead — see `gitStrategyWarning`. -->
+            <select id="gitStrategySel" class="git-strategy" aria-label="Git checkout" hidden>
+              <option value="shared">Shared</option>
+              <option value="worktree">Worktree</option>
+            </select>
             <button type="button" class="git-act" id="gitReviewAll" hidden
                     title="Open the whole working-tree diff">Review all</button>
             <button type="button" class="git-act git-act-icon" id="gitRefresh"
@@ -172,6 +186,12 @@
             </button>
           </div>
         </div>
+        <!-- What the chosen checkout would leave behind, printed rather than hovered: it is the one
+             fact a user needs *before* sending, and a tooltip does not exist on a phone. It appears
+             only when there is something to lose — a worktree with uncommitted work in the project's
+             checkout — so the row stays quiet in the ordinary case. Announced politely because it
+             appears in response to choosing, away from where the eye is. -->
+        <p class="git-strategy-warning" id="gitStrategyWarning" role="status" aria-live="polite" hidden></p>
         <div class="git-line-body" id="gitLineBody" hidden></div>
       </div>
       <div class="composer" id="composer" style="display:none">
@@ -214,20 +234,6 @@
                 <option value="auto_approve">Auto approve</option>
                 <option value="full_access">⚠ Full Access</option>
               </select>
-            </div>
-            <!-- Only a draft can choose this: a thread's workspace is fixed once it exists, so the
-                 field is absent for open threads rather than shown disabled. A select rather than a
-                 checkbox because where a thread's working tree comes from is an open question, not
-                 a yes/no one — a third answer is a new option here rather than a new control. The
-                 hint carries what the labels cannot: a new worktree is the last commit, exactly, so
-                 work in progress in the project's checkout stays there. -->
-            <div class="mp-field mp-git-strategy" id="gitStrategyControl" hidden>
-              <label for="gitStrategySel">Git checkout</label>
-              <select id="gitStrategySel" aria-describedby="gitStrategyHint">
-                <option value="shared">Shared with the project</option>
-                <option value="worktree">Its own worktree</option>
-              </select>
-              <span class="mp-hint" id="gitStrategyHint"></span>
             </div>
           </div>
         </div>

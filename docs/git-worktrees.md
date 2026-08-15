@@ -1,11 +1,22 @@
 # Per-thread Git worktrees
 
 A thread can be started in a Git worktree of its own, so what it edits is invisible to the project's
-checkout and to every other thread. The choice is made once, on the draft, with the **Git checkout**
-picker in the mode/permissions popover: **Shared with the project** (the default) or **Its own
-worktree**, after which the chip reads `Build · Ask first · Worktree`. It is not a project setting,
-it does not carry over to the next draft, and it cannot be changed afterwards, because a thread's
-working directory is fixed the moment the thread exists.
+checkout and to every other thread. The choice is made once, on the draft, from the **Git checkout**
+dropdown at the right of the **Git status row** above the composer: **Shared** (the default) or
+**Worktree**. It sits on that row because that row describes the very tree the choice changes — the
+branch a worktree would start from, and the changed files it would leave behind. It is not a project
+setting, it does not carry over to the next draft, and it cannot be changed afterwards, because a
+thread's working directory is fixed the moment the thread exists.
+
+Hovering the dropdown says what the selected option *is* — a worktree starts from the last commit, on
+a branch of its own. What it would *cost* is printed on a line under the row instead of hovered:
+choose **Worktree** while the project has uncommitted work and it says how much of that work stays
+in the project's checkout. That one is printed because it is the fact you need before sending, and a
+tooltip cannot be read on a phone. It appears only when something is actually at stake, so the row
+stays quiet on a clean tree or a shared checkout.
+
+A project whose workspace is not a Git repository has no status row and so no dropdown: there is
+nothing to branch from, and such a thread simply uses the project's directory.
 
 It is a picker rather than a switch because where a thread's working tree comes from has more than
 two possible answers — a checkout the thread genuinely owns, rather than a second view of the

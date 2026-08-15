@@ -3271,12 +3271,11 @@ function resetTranscriptForAuthoritativeSnapshot() {
   else setTurnActive(false);
 }
 const MODE_LABELS = { build:"Build", plan:"Plan" };
-/* The `git_strategy` values `threads/start` accepts, and what each adds to the closed turn chip.
-   The default says nothing there — a chip that named the ordinary case on every thread would stop
-   being a signal. Keyed by wire value so this doubles as the set the UI will send: a strategy the
-   server does not know must not reach it. */
+/* The `git_strategy` values `threads/start` accepts. This is the set the UI will send, so a strategy
+   the server does not know must not reach it; the names the user reads are the row's own `<option>`
+   elements. */
 const GIT_STRATEGY_SHARED = "shared";
-const GIT_STRATEGY_CHIP = { shared:"", worktree:" · Worktree" };
+const GIT_STRATEGIES = new Set(["shared", "worktree"]);
 const PERMISSION_PRESET_LABELS = {
   ask:"Ask first",
   read_only:"Ask first",
@@ -3296,49 +3295,68 @@ function updateTurnButton() {
   const btn = $("turnPickerBtn"); if (!btn) return;
   const mode = MODE_LABELS[state.mode] || "Build";
   const preset = PERMISSION_PRESET_LABELS[state.permissionPreset] || "Ask first";
-  const strategy = isDraftThread() ? GIT_STRATEGY_CHIP[state.draftGitStrategy] || "" : "";
-  btn.querySelector(".mp-label").textContent = `${mode} · ${preset}${strategy}`;
+  // The checkout choice is not summarised here: it has its own control on the Git row, which reads
+  // its value outright, and repeating it would put the same fact in two places a hand's width apart.
+  btn.querySelector(".mp-label").textContent = `${mode} · ${preset}`;
   renderGitStrategyControl();
 }
 
 /* The workspace choice belongs to a draft only: once a thread exists its workspace is fixed, so the
-   field is absent rather than shown disabled. Every strategy but the shared checkout also needs a
-   repository to branch from — without one there is nothing to isolate, and the reason is worth
-   saying rather than leaving a dead control. */
+   control is absent rather than shown disabled. Every strategy but the shared checkout also needs a
+   repository to branch from, and a workspace that is not one has no Git row to carry the control in
+   the first place. */
 function isDraftWorkspaceRepo() {
   return state.gitRepoByWorkspace.get(gitWorkspaceKey()) === true;
 }
 
+/* The control lives on the Git row, which is itself absent for a workspace that is not a repository
+   — so "there is nothing to branch from" needs no wording here: there is no row to say it on, and no
+   choice to make either. The two halves of the explanation land in different places, because they
+   are needed at different moments: what the option *is* is the select's `title`, and what it would
+   *cost* is printed under the row where a phone can read it. */
 function renderGitStrategyControl() {
-  const control = $("gitStrategyControl");
   const select = $("gitStrategySel");
-  if (!control || !select) return;
-  const draft = isDraftThread();
-  control.hidden = !draft;
-  if (!draft) return;
+  const warning = $("gitStrategyWarning");
+  if (!select || !warning) return;
+  const offered = isDraftThread() && isDraftWorkspaceRepo();
 
-  const isRepo = isDraftWorkspaceRepo();
-  select.disabled = !isRepo;
-  select.value = isRepo ? state.draftGitStrategy : GIT_STRATEGY_SHARED;
-  $("gitStrategyHint").textContent = gitStrategyHintText(isRepo);
+  select.hidden = !offered;
+  select.title = offered ? gitStrategyHintText() : "";
+  if (offered) select.value = state.draftGitStrategy;
+
+  // Cleared as well as hidden: left in place it would be read out by the live region the next time
+  // the row came back, describing a decision that is no longer on the table.
+  const cost = offered ? gitStrategyWarningText() : "";
+  warning.textContent = cost;
+  warning.hidden = !cost;
 }
 
-function gitStrategyHintText(isRepo) {
-  if (!isRepo) return "This project is not a Git repository, so there is nothing to branch from.";
+/* What the option *is*. Short enough for a tooltip, and true whether or not anything is at stake. */
+function gitStrategyHintText() {
+  return state.draftGitStrategy === "worktree"
+    ? "Starts from the last commit, on a branch of its own."
+    : "Shares the project's working tree with every other thread.";
+}
+
+/* What the option would *cost*, which is why this one is printed rather than hovered: the row above
+   shows the project's changed-file count at this moment, so saying nothing would let the user send
+   expecting those changes to come along — and a tooltip cannot say it on a phone. Empty when there
+   is nothing to lose, so the row stays quiet in the ordinary case. */
+function gitStrategyWarningText() {
   if (state.draftGitStrategy !== "worktree") return "";
-  // The row directly above shows the project's changed-file count at this moment, so saying nothing
-  // would let the user send expecting those changes to come along. A worktree is the last commit,
-  // exactly.
   const dirty = gitDirtyCount(state.gitStatus);
-  const base = "Starts from the last commit, on a branch of its own.";
-  if (!dirty) return base;
-  return `${base} Your ${dirty} uncommitted change${dirty === 1 ? "" : "s"} stay in the project's checkout.`;
+  if (!dirty) return "";
+  // The verb agrees with the count too: "1 uncommitted change stay" reads as a typo at exactly the
+  // moment the sentence is asking to be trusted about what it will not carry across.
+  return dirty === 1
+    ? "Your 1 uncommitted change stays in the project's checkout."
+    : `Your ${dirty} uncommitted changes stay in the project's checkout.`;
 }
 
 function setDraftGitStrategy(strategy) {
   // Anything the server would reject is not worth holding: an unknown value here could only come
   // from a stale option, and defaulting to the shared checkout is the choice that changes nothing.
-  state.draftGitStrategy = GIT_STRATEGY_CHIP[strategy] === undefined ? GIT_STRATEGY_SHARED : strategy;
+  state.draftGitStrategy = GIT_STRATEGIES.has(strategy) ? strategy : GIT_STRATEGY_SHARED;
   updateTurnButton();
 }
 function setMode(mode) {

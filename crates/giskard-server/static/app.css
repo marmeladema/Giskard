@@ -530,6 +530,20 @@
   .git-act:hover { border-color:var(--border); background:var(--panel2); color:var(--fg); }
   .git-act[hidden] { display:none; }
   .git-act-icon { display:inline-flex; align-items:center; padding:3px 5px; }
+  /* The draft's checkout choice, sized to sit among this row's actions rather than to look like a
+     form field: the row is 27px tall and every other control on it is a small muted chip. */
+  .git-strategy {
+    flex:none; max-width:9.5em; padding:1px 4px; border-radius:5px;
+    border:1px solid var(--border); background:var(--panel2); color:var(--muted);
+    font:inherit; font-size:11px; line-height:1.5;
+  }
+  .git-strategy:hover, .git-strategy:focus { color:var(--fg); border-color:var(--accent); }
+  /* Aligned under the row's text, not its caret, so it reads as a note on the row rather than as a
+     caption to the dropdown at the far end of it. */
+  .git-strategy-warning {
+    margin:0; padding:0 12px 5px 30px; color:var(--muted); font-size:11px; line-height:1.35;
+  }
+  .git-strategy-warning[hidden] { display:none; }
 
   .git-line-body {
     max-height:min(40vh, 320px); overflow-y:auto; padding:2px 12px 8px;
@@ -654,9 +668,6 @@
   .mp-field[hidden] { display:none; }   /* the grid display above would otherwise defeat [hidden] */
   .mp-field > label, .mp-field > span { color:var(--muted); font-size:11px; }
   .mp-field select { width:100%; }
-  /* The Git strategy choice and its explanation need the full width: the hint is a sentence, not a
-     label, and wrapping it into a column would make it unreadable at the popover's width. */
-  .mp-git-strategy { grid-column:1 / -1; }
   .mp-hint { color:var(--muted); font-size:11px; line-height:1.35; }
   .mp-hint:empty { display:none; }
   /* A confirmation that names what it destroys, so the warning reads as part of the question

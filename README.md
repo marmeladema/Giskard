@@ -115,8 +115,10 @@ Then open **http://127.0.0.1:8787**, log in, and:
    server machine (the agent's workspace).
 2. **+** on the project → draft a new thread. No Codex thread is created until the first message is
    sent, so choose the **Plan/Build** mode, **permission preset**, and **model** first if needed.
-   A draft on a Git project also picks its **Git checkout**: shared with the project, or a **Git
-   worktree** of its own, so its file changes never touch the project's checkout. The choice is
+   A draft on a Git project also picks its **Git checkout** from the dropdown on the **Git status
+   row** above the composer: shared with the project, or a **Git worktree** of its own, so its file
+   changes never touch the project's checkout. Choosing a worktree while the project has uncommitted
+   work prints how much of it stays behind. The choice is
    available only on the draft — the workspace is fixed once the thread exists. Isolation changes where the thread works, not what it
    is allowed to do: its permission preset still applies unchanged. See
    [Per-thread Git worktrees](docs/git-worktrees.md) for what does and does not come across, branch
