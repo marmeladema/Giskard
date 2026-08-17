@@ -22,7 +22,7 @@ marked **[spike]**.
 | What selects the harness | **The thread's model.** A thread whose `ModelRef.provider` belongs to an Anthropic/Claude-Code provider runs on the Claude harness. No separate harness selector in the UI. |
 | Child-process model | **One persistent `claude` child process per loaded thread**, alive across turns. Spawned only when a thread with an Anthropic model is loaded. **No idle reaping in the MVP.** |
 | Structured diffs | **`structured_diffs: false` in v1.** Synthesize `FileChange`/`DiffUpdated` from `Edit`/`Write` tool calls + git in a later phase. |
-| Live approvals | **Supported and verified end to end (§9).** Recommended for the adapter's first working milestone. |
+| Live approvals | **Supported and verified end to end (§9).** MVP uses the `--permission-prompt-tool stdio` channel, in the adapter's first working milestone. The hook route is postponed to a later decision and refactor (§9.4); the MCP-tool route is rejected (§9.1). |
 
 ---
 
@@ -328,17 +328,38 @@ allow rules from settings files and bare names in `--allowedTools` are applied *
 permission callback and are invisible to it. So an `ask_first` Giskard thread could execute a command
 without ever asking, purely because `~/.claude/settings.json` allows it. Run children with a
 controlled `--setting-sources` (and document what is honoured) so the preset means what the UI says.
+This is a mitigation, not a guarantee — it works by dropping the user's configuration rather than by
+overriding it. The unconditional fix is the hook route, deliberately postponed to §9.4.
 
 ---
 
 ## 9. Live approvals — verified end to end
 
-### 9.1 Two routes, and why we take the stdio one
+### 9.1 Three routes; stdio for the MVP, the hook deferred
+
+Claude Code can hand a permission decision to an external party three ways. **The MVP takes the stdio
+route. The hook route is deliberately postponed to a later decision and refactor (§9.4).** The MCP
+route is documented here so it is not rediscovered as a new idea, and rejected.
+
+#### Route A — `--permission-prompt-tool stdio` (**chosen for the MVP**)
+
+`stdio` is a sentinel in an argument that otherwise names an MCP tool: it means "ask my parent process
+over the pipe I am already talking on". The ask arrives as a `can_use_tool` control request and is
+answered with a `control_response` — the exchange verified in §9.2. The SDK passes exactly this flag
+when a `canUseTool` callback is supplied, and refuses to combine the two ("canUseTool callback cannot
+be used with permissionPromptToolName"). Not answering has a defined failure mode ("tool permission
+stream closed before response received"), so a dropped response fails the tool call rather than
+hanging.
+
+Chosen because it needs no extra process, it is the only route whose reply schema can express Giskard's
+whole `ApprovalDecision` enum, and it is the path the official SDK itself uses.
+
+#### Route B — an MCP permission tool (**rejected**)
 
 `--permission-prompt-tool` normally names **an MCP tool** that Claude Code calls whenever it needs a
 permission decision — the flag's own help is "MCP tool to use for permission prompts". The tool is
-addressed by its fully qualified name and receives a `tool_name` + `input` wire; it must answer with a
-single `text` content block whose text is JSON:
+addressed by its fully qualified name and receives a `tool_name` + `input` + `tool_use_id` wire (field
+names observed, not inferred); it must answer with a single `text` content block whose text is JSON:
 
 ```jsonc
 // claude … --mcp-config approver.json --permission-prompt-tool mcp__approver__approve
@@ -353,25 +374,36 @@ single `text` content block whose text is JSON:
 { "behavior": "deny", "message": "Not allowed to delete build output" }
 ```
 
-**`stdio` is a sentinel in that same argument**, not an MCP server: it means "ask my parent process
-over the pipe I am already talking on". The SDK passes exactly this when a `canUseTool` callback is
-supplied, and refuses to combine the two ("canUseTool callback cannot be used with
-permissionPromptToolName"). Not answering has a defined failure mode ("tool permission stream closed
-before response received"), so a dropped response fails the tool call rather than hanging.
+Rejected for three reasons:
 
-Giskard should take the `stdio` route, for three reasons:
-
-1. **No second process.** The MCP route means Giskard ships an MCP server, spawns it per child, and
-   then needs its own channel from that server back to the browser — a round trip through a process
-   that exists only to relay. The stdio route reuses the pipe the adapter already owns.
-2. **The MCP route's reply schema is strictly weaker**: `{behavior:"allow", updatedInput?}` or
-   `{behavior:"deny", message}` — no `updatedPermissions` and no `interrupt`. That deletes
+1. **A second process for nothing.** Giskard would ship an MCP server, spawn it per child, and then
+   need its own channel from that server back to the browser — a relay whose only job is carrying a
+   question the adapter could receive directly.
+2. **Its reply schema is strictly weaker**: `{behavior:"allow", updatedInput?}` or
+   `{behavior:"deny", message}` — no `updatedPermissions`, no `interrupt`. That deletes
    `AcceptForSession` and `Cancel` from the mapping in §9.2, which is half of Giskard's approval card.
-3. Asks that need real user interaction are explicitly unsupported through it ("MCP tool requires user
+3. Asks needing real user interaction are explicitly unsupported through it ("MCP tool requires user
    interaction; not supported via `--permission-prompt-tool`").
 
-The MCP route stays worth knowing for one scenario: a future where approvals must be decided by
-something that is not the Giskard process (a policy daemon, a shared approver across machines).
+It is also effectively unadopted in the wild, so Giskard would be discovering its sharp edges alone:
+[anthropics/claude-code#1175](https://github.com/anthropics/claude-code/issues/1175) requests a minimal
+working example and still stands unanswered; the only public implementations
+([CLIAI/mcp_permission_server_claude_code](https://github.com/CLIAI/mcp_permission_server_claude_code))
+are self-described as possibly non-functional, and the variant inspected returns
+`{"approved": bool, "reason": string}` — not the `behavior` contract the CLI actually validates, which
+is likely why it does not work.
+
+#### Route C — a `PermissionRequest` / `PreToolUse` hook (**postponed — see §9.4**)
+
+A hook is a command Claude Code runs before a tool call; it receives the request as JSON on stdin and
+writes `{"behavior":"allow"}` or `{"behavior":"deny"}` on stdout. Unlike the other two routes it is
+**unconditional**: per the official permissions documentation, hooks run before every other step and a
+hook's deny applies even in `bypassPermissions` mode. That property is what makes it interesting to
+Giskard, and it is why the ecosystem has converged here rather than on MCP — e.g.
+[claude-remote-approver](https://github.com/yuuichieguchi/claude-remote-approver) routes approvals to a
+phone via a `hooks.PermissionRequest` entry, and
+[claude-code-permission-policy](https://github.com/defrex/claude-code-permission-policy) runs a Haiku
+policy judge the same way.
 
 ### 9.2 The verified stdio exchange
 
@@ -410,6 +442,8 @@ Two findings from the round trip:
   write a permanent rule into the user's own settings file, which Giskard must never do as a side
   effect of one approval card.
 
+### 9.3 Decision mapping
+
 **This maps onto Giskard's existing approval model almost exactly:**
 
 | `ApprovalDecision` | Claude response |
@@ -432,12 +466,52 @@ decision mapping is 1:1, and the alternative ships a Claude harness whose only u
 as central. Only `Cancel`'s `interrupt: true` behaviour and the `updatedPermissions` reply remain
 unexercised; both are additive to a working allow/deny loop.
 
+### 9.4 The hook route, postponed
+
+**Status: not in the MVP.** The stdio route ships first; adopting the hook is a separate decision taken
+later, against a working harness, and it is a refactor rather than an addition.
+
+**Why it is on the table at all.** The stdio route has one structural weakness, and it is not a
+protocol defect but an ordering one: `can_use_tool` is consulted *last*. Deny rules, ask rules, the
+permission mode, and allow rules — including allow rules from the user's own `settings.json` — are all
+evaluated first, and anything they approve never reaches the callback. That is the §8 hazard: an
+`ask_first` thread can execute a command without asking, because the user once allowed it locally. The
+MVP's mitigation is `--setting-sources` (open question 3), which works by *removing* the user's
+configuration rather than by overriding it. A hook is the only route that holds unconditionally: it
+runs before every other step, and its deny stands even in `bypassPermissions`.
+
+**What adopting it would change.** This is why it is a refactor and not a flag:
+
+1. **A second inbound channel.** A hook is a separate short-lived process, not the child's pipe. It
+   needs a way to reach the Giskard server (a loopback endpoint with a per-child token is the obvious
+   shape) and to correlate its request with a thread and a live turn — routing the adapter currently
+   gets for free from the pipe it owns.
+2. **Approval identity moves.** `ApprovalId → ThreadId` routing (`registry.rs:709`) currently resolves
+   through the harness that raised the ask. A hook-raised ask arrives from outside any harness, so the
+   registry needs a path that does not assume a `ThreadHandle`.
+3. **Hook installation is state on the user's machine**, not process arguments — the harness would be
+   writing settings, which Giskard has so far been careful never to do (§9.2's `destination` caveat).
+   A per-child `--settings` payload is the likely way to keep it ephemeral, and needs verification.
+4. **Both channels would be live at once.** The hook covers every call; `can_use_tool` still fires for
+   what the hook passes through. Giskard must not raise two approval cards for one tool call, so
+   `tool_use_id` becomes the deduplication key across two independent transports.
+
+**Precedent to copy from when the time comes:**
+[claude-remote-approver](https://github.com/yuuichieguchi/claude-remote-approver) (hook → ntfy → phone,
+answering `{"behavior":"allow"|"deny"}` on stdout) is the same shape as hook → Giskard → browser.
+
+**Trigger for revisiting:** the first time an `ask_first` thread is observed executing something it
+should have asked about, or the first user who wants their local `settings.json` honoured *and*
+`ask_first` to be trustworthy — the two goals `--setting-sources` cannot satisfy at once.
+
 ---
 
 ## 10. Not in v1
 
 Structured diffs; native rename/archive/delete; MCP reload and OAuth; `terminate_command`; linked
-sub-agent child threads; idle process reaping; using Claude Code's own hooks or `sdkMcpServers`.
+sub-agent child threads; idle process reaping; `sdkMcpServers`; and **hook-based approval enforcement**
+— the stdio channel is the MVP's only approval path, with the hook route deferred to a later decision
+and refactor (§9.4).
 
 ---
 
@@ -478,6 +552,11 @@ and `Notice` of §5.4, capability-driven UI checks, screenshot regeneration if t
 **Phase 5 — polish.** Idle reaping (make `idle_shutdown_secs` real), synthesized `FileChange`/
 `DiffUpdated`, version-drift warning surfaced in the UI.
 
+**Later, as its own decision — the hook route (§9.4).** Not scheduled here on purpose: it is a
+refactor of how an approval reaches the server (second inbound channel, approval routing that does not
+assume a `ThreadHandle`, ephemeral hook installation, cross-transport deduplication by `tool_use_id`),
+and it should be decided against a working harness rather than designed in advance.
+
 **Docs to update:** `specs/giskard-specification.md` (§4.1/4.2 capability wording, new §4.8 Claude
 mapping, §4.7 → per-harness process lifecycle, §6.4, §8.2/8.3, §9.1, §12.2, §13.5); `README.md`
 (one-process-per-project claim at line 60, crate list, setup); `config.example.toml` (provider
@@ -492,7 +571,7 @@ Codex adapter's identifier/lifecycle contract.
 | Risk | Mitigation |
 | --- | --- |
 | Giskard owns unversioned wire types; Claude Code ships often | Pin a tested version, log `claude_code_version`, warn on drift, keep the mapper tolerant of unknown message types (log at `debug`, never fail a turn) |
-| Local settings allow-rules undercut `ask_first` — **observed**, not theoretical (§9) | Controlled `--setting-sources`; document exactly what is honoured (§8); regression-test that a preset's promise holds |
+| Local settings allow-rules undercut `ask_first` — **observed**, not theoretical (§9) | MVP: controlled `--setting-sources`, documented, with a regression test that the preset's promise holds. Durable fix is the hook route, postponed by decision (§9.4) — this risk stays open until then |
 | One process per loaded thread | MVP accepts it and documents the cost; reaping in Phase 5 |
 | Cross-harness model switch loses agent context | Explicit confirm + `Notice` + remembered native ids (§5.4) |
 | Cost/quota semantics differ under a subscription | Treat euro cost as notional; surface `rate_limit_event` (§6) |
@@ -508,4 +587,6 @@ Codex adapter's identifier/lifecycle contract.
    `sandbox_workspace_write.writable_roots` from its own config for this)?
 3. `--setting-sources` policy (§8, §9): load nothing, so Giskard's presets are the only authority; or
    load `project` so a repo's checked-in `.claude/settings.json` still applies? The second is friendlier
-   and the first is honest about what the approval UI promises.
+   and the first is honest about what the approval UI promises. Note this is a forced choice only while
+   the MVP relies on the stdio route alone; the hook route (§9.4) would let both hold at once, which is
+   the main argument for eventually taking it.
