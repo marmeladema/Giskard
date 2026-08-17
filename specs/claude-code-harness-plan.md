@@ -333,11 +333,47 @@ controlled `--setting-sources` (and document what is honoured) so the preset mea
 
 ## 9. Live approvals — verified end to end
 
-Passing **`--permission-prompt-tool stdio`** routes every permission ask to the client as
-`control_request` / `can_use_tool`. The SDK sets exactly this flag when a `canUseTool` callback is
-supplied, and rejects combining it with a real MCP prompt tool ("canUseTool callback cannot be used
-with permissionPromptToolName"). Not answering has a defined failure mode ("tool permission stream
-closed before response received"), so a dropped response fails the tool call rather than hanging.
+### 9.1 Two routes, and why we take the stdio one
+
+`--permission-prompt-tool` normally names **an MCP tool** that Claude Code calls whenever it needs a
+permission decision — the flag's own help is "MCP tool to use for permission prompts". The tool is
+addressed by its fully qualified name and receives a `tool_name` + `input` wire; it must answer with a
+single `text` content block whose text is JSON:
+
+```jsonc
+// claude … --mcp-config approver.json --permission-prompt-tool mcp__approver__approve
+// approver.json: {"mcpServers":{"approver":{"command":"node","args":["approver.js"]}}}
+
+// the approver tool is invoked with, roughly:
+{ "tool_name": "Bash", "input": { "command": "rm -rf build", "description": "Clean" } }
+
+// and must return one text block containing:
+{ "behavior": "allow", "updatedInput": { "command": "rm -rf build" } }
+// or
+{ "behavior": "deny", "message": "Not allowed to delete build output" }
+```
+
+**`stdio` is a sentinel in that same argument**, not an MCP server: it means "ask my parent process
+over the pipe I am already talking on". The SDK passes exactly this when a `canUseTool` callback is
+supplied, and refuses to combine the two ("canUseTool callback cannot be used with
+permissionPromptToolName"). Not answering has a defined failure mode ("tool permission stream closed
+before response received"), so a dropped response fails the tool call rather than hanging.
+
+Giskard should take the `stdio` route, for three reasons:
+
+1. **No second process.** The MCP route means Giskard ships an MCP server, spawns it per child, and
+   then needs its own channel from that server back to the browser — a round trip through a process
+   that exists only to relay. The stdio route reuses the pipe the adapter already owns.
+2. **The MCP route's reply schema is strictly weaker**: `{behavior:"allow", updatedInput?}` or
+   `{behavior:"deny", message}` — no `updatedPermissions` and no `interrupt`. That deletes
+   `AcceptForSession` and `Cancel` from the mapping in §9.2, which is half of Giskard's approval card.
+3. Asks that need real user interaction are explicitly unsupported through it ("MCP tool requires user
+   interaction; not supported via `--permission-prompt-tool`").
+
+The MCP route stays worth knowing for one scenario: a future where approvals must be decided by
+something that is not the Giskard process (a policy daemon, a shared approver across machines).
+
+### 9.2 The verified stdio exchange
 
 **Confirmed by round trip** against 2.1.233 (`--permission-prompt-tool stdio --setting-sources ""`,
 default permission mode, prompt asking for `touch /tmp/spike-probe-file`). The ask, verbatim:
