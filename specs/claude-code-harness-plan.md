@@ -22,7 +22,7 @@ marked **[spike]**.
 | What selects the harness | **The thread's model.** A thread whose `ModelRef.provider` belongs to an Anthropic/Claude-Code provider runs on the Claude harness. No separate harness selector in the UI. |
 | Child-process model | **One persistent `claude` child process per loaded thread**, alive across turns. Spawned only when a thread with an Anthropic model is loaded. **No idle reaping in the MVP.** |
 | Structured diffs | **`structured_diffs: false` in v1.** Synthesize `FileChange`/`DiffUpdated` from `Edit`/`Write` tool calls + git in a later phase. |
-| Live approvals | **Open — see §9.** Evidence is now in hand; the decision is scope/phasing. |
+| Live approvals | **Supported and verified end to end (§9).** Recommended for the adapter's first working milestone. |
 
 ---
 
@@ -79,7 +79,10 @@ keeps serving turns until stdin closes.
 | `result` | terminal per turn: `usage`, `total_cost_usd`, `modelUsage[model].contextWindow`, `stop_reason`, `is_error`, `permission_denials`, `terminal_reason` → `TurnCompleted` |
 | `autocompact_state` | `effective_window` / `threshold` → `ContextWindowUpdated` (the *effective* window, exactly the Codex analogue: 947 000 for a 1 M Sonnet) |
 | `rate_limit_event` | `rateLimitType: "five_hour"`, `resetsAt`, `overageStatus` → **subscription-plan headroom**; surface as `Notice` |
-| `system/status`, `system/task_summary`, `system/post_turn_summary` | activity/labels; `post_turn_summary` carries `status_category` + `status_detail` |
+| `system/status`, `system/task_summary`, `system/post_turn_summary` | activity/labels; `post_turn_summary` carries `status_category` (`review_ready`, `blocked`, …), `status_detail` and `needs_action` |
+| `system/thinking_tokens` | running reasoning-token estimate during a turn |
+| `thinking` content blocks | carry an opaque `signature`; map to `Reasoning` items and never re-send the text as input |
+| `tool_result_meta` | `non_execution_kind` (e.g. `"permission-rule"`) distinguishes "tool ran and failed" from "tool never ran" |
 | `system/permission_denied` | a denial with `decision_reason_type` (`rule`/`mode`/`classifier`/…) → `Notice` |
 | `system/commands_changed` | slash-command inventory (large; elide from logs) |
 
@@ -107,7 +110,7 @@ CLI → client:
 
 | Capability | Claude | Basis |
 | --- | --- | --- |
-| `live_approvals` | **true (pending §9 decision)** | `can_use_tool` control request; response `{behavior:"allow",updatedInput?,updatedPermissions?}` \| `{behavior:"deny",message?,interrupt?}` |
+| `live_approvals` | **true (verified)** | `can_use_tool` control request; response `{behavior:"allow",updatedInput?,updatedPermissions?}` \| `{behavior:"deny",message?,interrupt?}`. Round trip and blocked execution confirmed — §9. |
 | `plan_build_modes` | **true** | `--permission-mode plan` + `set_permission_mode`. Semantics differ — see §8. |
 | `per_turn_model` | **true** | `set_model` control request; fallback = respawn with `--resume --model` |
 | `reasoning_effort` | **true** | `--effort low\|medium\|high\|xhigh\|max` (`Effort` is already an open string newtype, so the differing value set costs nothing) |
@@ -294,20 +297,48 @@ controlled `--setting-sources` (and document what is honoured) so the preset mea
 
 ---
 
-## 9. Live approvals — the open decision, with evidence
+## 9. Live approvals — verified end to end
 
-**What the CLI actually implements** (from its own argv construction and schemas):
+Passing **`--permission-prompt-tool stdio`** routes every permission ask to the client as
+`control_request` / `can_use_tool`. The SDK sets exactly this flag when a `canUseTool` callback is
+supplied, and rejects combining it with a real MCP prompt tool ("canUseTool callback cannot be used
+with permissionPromptToolName"). Not answering has a defined failure mode ("tool permission stream
+closed before response received"), so a dropped response fails the tool call rather than hanging.
 
-- Passing **`--permission-prompt-tool stdio`** routes every permission ask to the client as
-  `control_request` / `can_use_tool`. The SDK sets exactly this flag when a `canUseTool` callback is
-  supplied, and rejects combining it with a real MCP prompt tool ("canUseTool callback cannot be used
-  with permissionPromptToolName").
-- The ask carries `tool_name`, `input`, `tool_use_id`, `title`, and `permission_suggestions`
-  (the "always allow …" candidates).
-- The response schema is
-  `{behavior:"allow", updatedInput?, updatedPermissions?}` | `{behavior:"deny", message?, interrupt?}`.
-- Not answering has a defined failure mode ("tool permission stream closed before response
-  received"), so a dropped response fails the tool call rather than hanging forever.
+**Confirmed by round trip** against 2.1.233 (`--permission-prompt-tool stdio --setting-sources ""`,
+default permission mode, prompt asking for `touch /tmp/spike-probe-file`). The ask, verbatim:
+
+```json
+{"type":"control_request","request_id":"15cdfe89-…","request":{
+  "subtype":"can_use_tool","tool_name":"Bash","display_name":"Bash",
+  "input":{"command":"touch /tmp/spike-probe-file","description":"Create empty probe file in /tmp"},
+  "description":"Create empty probe file in /tmp",
+  "permission_suggestions":[
+    {"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"touch /tmp/spike-probe-file"}],
+     "behavior":"allow","destination":"localSettings"},
+    {"type":"addDirectories","directories":["/tmp"],"destination":"session"},
+    {"type":"setMode","mode":"acceptEdits","destination":"session"}],
+  "blocked_path":"/tmp/spike-probe-file",
+  "tool_use_id":"toolu_01X3jH3ePoR9cjeZwene5DwQ"}}
+```
+
+Answering `{"subtype":"success","request_id":…,"response":{"behavior":"deny","message":"…"}}`
+produced a `tool_result` with `is_error: true`, our message as its content, and
+`tool_result_meta:[{"non_execution_kind":"permission-rule"}]`. **The command did not run** — the file
+was never created — and the turn then completed normally (`stop_reason: "end_turn"`,
+`is_error: false`), with `post_turn_summary.status_category: "blocked"` plus a `needs_action` hint.
+So a denial blocks the action without failing the turn, which is exactly Giskard's approval-card
+semantics.
+
+Two findings from the round trip:
+
+- **`--setting-sources ""` is the knob that makes `ask_first` honest.** With the user's settings
+  loaded, the same probe auto-approved the command and no ask was ever emitted (§8). Giskard must
+  control this explicitly, not inherit it.
+- **`permission_suggestions` is typed and carries a `destination`.** `AcceptForSession` must reuse
+  only the `session`-destination suggestions; a suggestion with `destination: "localSettings"` would
+  write a permanent rule into the user's own settings file, which Giskard must never do as a side
+  effect of one approval card.
 
 **This maps onto Giskard's existing approval model almost exactly:**
 
@@ -321,20 +352,15 @@ controlled `--setting-sources` (and document what is honoured) so the preset mea
 
 `ApprovalKind` mapping: `Bash` → `CommandExecution{command,cwd}`; `Edit`/`Write`/`NotebookEdit` →
 `FileChange{path,change}`; `mcp__<server>__<tool>` → `McpToolCall{server,tool_name}`; everything else
-→ `Permission{detail}`. `title` and `permission_suggestions` fill `ApprovalMetadata`.
+→ `Permission{detail}`. `display_name`, `description`, `blocked_path` and the suggestions fill
+`ApprovalMetadata`.
 
-**Why my live probe did not see an ask** (so the evidence is not contradictory): this container
-pre-grants Bash, and per the CLI's own warning, settings allow-rules are consulted *before* the
-callback. That is a property of the sandbox, not of the protocol — and it is the same hazard §8
-already flags.
-
-**Residual risk:** the `can_use_tool` request/response field names above come from the shipped
-binary's schemas, not from a round trip Giskard performed. A half-day spike on a machine with no
-pre-granted Bash rules would confirm the wire shape and the deny/interrupt behaviour.
-
-**Recommendation:** ship v1 with `live_approvals: false` (presets only, UI degrades per §13.5) **and**
-run the spike in parallel, then turn the capability on in the same phase as the mapper hardening.
-That keeps the first milestone small without designing the approval path out of the architecture.
+**Recommendation (revised after the round trip):** advertise `live_approvals: true` and build the
+approval path in the adapter's first working milestone. The wire shape is no longer a risk, the
+decision mapping is 1:1, and the alternative ships a Claude harness whose only usable presets are
+"auto-approve" and "bypass" — a downgrade against the Codex experience in the feature Giskard treats
+as central. Only `Cancel`'s `interrupt: true` behaviour and the `updatedPermissions` reply remain
+unexercised; both are additive to a working allow/deny loop.
 
 ---
 
@@ -350,9 +376,10 @@ sub-agent child threads; idle process reaping; using Claude Code's own hooks or 
 Each phase carries the `AGENTS.md` obligations: `cargo fmt`/`clippy -D warnings`, error-path tests,
 structured logs at new boundaries, and doc sync in the same change.
 
-**Phase 0 — spikes (≈1 day).** Confirm `can_use_tool` end-to-end on a clean permission environment;
-confirm `set_model` / `set_permission_mode` request shapes; confirm `/compact` over stream input;
-confirm interrupt mid-tool-call. Capture sanitized transcripts as test fixtures.
+**Phase 0 — spikes.** `can_use_tool` and `interrupt` are **done** (§3.3, §9). Remaining: `set_model` /
+`set_permission_mode` request shapes, `/compact` over stream input, interrupt *mid-tool-call*, and
+`Cancel`'s `interrupt: true` on a deny. Capture sanitized transcripts as fixtures for the mapper
+tests — the §9 ask payload is the first one.
 
 **Phase 1 — multi-harness plumbing (no Claude yet).** `HarnessKind`; `ProviderConfig.harness`;
 `ThreadFile.harness` + `harness_thread_ids` (with default-on-read migration); registry re-keying and
@@ -363,12 +390,15 @@ two-harness test without any CLI.
 
 **Phase 2 — `giskard-harness-claude` MVP.** New crate + README. Wire types, child supervisor, mapper
 (`assistant`/`stream_event`/`user`/`result` → items and turns), `open_thread`/`start_turn`/
-`subscribe`/`interrupt`/`shutdown`, token usage, `ContextWindowUpdated`, static `list_models`,
-capability set from §4 with `live_approvals: false`. Mapper unit tests off Phase-0 fixtures.
+`subscribe`/`interrupt`/`shutdown`, **`can_use_tool` ↔ `ApprovalRequested` with the §9 decision
+mapping**, token usage, `ContextWindowUpdated`, static `list_models`, capability set from §4. Mapper
+unit tests off Phase-0 fixtures, including a denial that must not be reported as an executed-and-failed
+tool call.
 
-**Phase 3 — approvals + model/mode switching.** `can_use_tool` ↔ `ApprovalRequested`, the decision
-mapping in §9, `set_model` / `set_permission_mode`, elicitation → `ServerRequestReceived`,
-`rate_limit_event` → `Notice`, `/compact`.
+**Phase 3 — the rest of the control channel.** `set_model` / `set_permission_mode` (per-turn model and
+mode without respawning), elicitation / `request_user_dialog` → `ServerRequestReceived`,
+`rate_limit_event` → `Notice`, `/compact`, `AcceptForSession` via session-destination
+`updatedPermissions`.
 
 **Phase 4 — cross-harness UX.** Model-picker filtering by provider→harness, the switch confirmation
 and `Notice` of §5.4, capability-driven UI checks, screenshot regeneration if the picker changes
@@ -391,7 +421,7 @@ Codex adapter's identifier/lifecycle contract.
 | Risk | Mitigation |
 | --- | --- |
 | Giskard owns unversioned wire types; Claude Code ships often | Pin a tested version, log `claude_code_version`, warn on drift, keep the mapper tolerant of unknown message types (log at `debug`, never fail a turn) |
-| Local settings allow-rules undercut `ask_first` | Controlled `--setting-sources`; document exactly what is honoured (§8) |
+| Local settings allow-rules undercut `ask_first` — **observed**, not theoretical (§9) | Controlled `--setting-sources`; document exactly what is honoured (§8); regression-test that a preset's promise holds |
 | One process per loaded thread | MVP accepts it and documents the cost; reaping in Phase 5 |
 | Cross-harness model switch loses agent context | Explicit confirm + `Notice` + remembered native ids (§5.4) |
 | Cost/quota semantics differ under a subscription | Treat euro cost as notional; surface `rate_limit_event` (§6) |
@@ -401,8 +431,10 @@ Codex adapter's identifier/lifecycle contract.
 
 ## 13. Open questions
 
-1. **§9** — `live_approvals` in v1, or Phase 3 as recommended?
-2. Should the **project-level** default harness still be offered at project creation, or is the
+1. Should the **project-level** default harness still be offered at project creation, or is the
    model picker the only place a harness is ever chosen?
-3. Do Claude threads need `--add-dir` fed from anything beyond the workspace root (Codex reads
+2. Do Claude threads need `--add-dir` fed from anything beyond the workspace root (Codex reads
    `sandbox_workspace_write.writable_roots` from its own config for this)?
+3. `--setting-sources` policy (§8, §9): load nothing, so Giskard's presets are the only authority; or
+   load `project` so a repo's checked-in `.claude/settings.json` still applies? The second is friendlier
+   and the first is honest about what the approval UI promises.
