@@ -23,6 +23,7 @@ marked **[unverified]**.
 | Child-process model | **One persistent `claude` child process per loaded thread**, alive across turns. Spawned only when a thread with an Anthropic model is loaded. **No idle reaping in the MVP.** |
 | Structured diffs | **`structured_diffs: false` in v1.** Synthesize `FileChange`/`DiffUpdated` from `Edit`/`Write` tool calls + git in a later phase. |
 | `AcceptForSession` when the harness offers no rule to persist | **Keep the button visible anyway** (§9.3). It behaves as a one-off `Accept`; log the degradation and revisit only if users report it. |
+| Settings sources for child processes | **`--setting-sources ""` — none** (§8), so Giskard's presets are the only permission authority. Honouring a repo's `project` settings is a follow-up gated on a security review. |
 | Live approvals | **Supported and verified end to end (§9).** MVP uses the `--permission-prompt-tool stdio` channel, in the adapter's first working milestone. The hook route is postponed to a later decision and refactor (§9.4); the MCP-tool route is rejected (§9.1). |
 
 ---
@@ -327,10 +328,32 @@ must say this explicitly for harnesses without `plan_build_modes` independence.
 **Do not let the user's local allow-rules silently pre-approve.** The CLI's own warning is explicit:
 allow rules from settings files and bare names in `--allowedTools` are applied *before* the
 permission callback and are invisible to it. So an `ask_first` Giskard thread could execute a command
-without ever asking, purely because `~/.claude/settings.json` allows it. Run children with a
-controlled `--setting-sources` (and document what is honoured) so the preset means what the UI says.
-This is a mitigation, not a guarantee — it works by dropping the user's configuration rather than by
-overriding it. The unconditional fix is the hook route, deliberately postponed to §9.4.
+without ever asking, purely because `~/.claude/settings.json` allows it.
+
+**Decision: children run with `--setting-sources ""` — no settings sources at all.** Giskard's presets
+are then the only permission authority, and the approval UI means exactly what it says. This is a
+mitigation, not a guarantee: it works by dropping the user's configuration rather than by overriding
+it, so a future Claude Code change could reintroduce a pre-approval path. The unconditional fix is the
+hook route, deliberately postponed to §9.4.
+
+**Follow-up (needs investigation, security first): loading `project` settings.** A repo's checked-in
+`.claude/settings.json` is the one settings source a user might reasonably expect Giskard to honour, and
+supporting it is a plausible improvement. It must not be enabled without answering, at minimum:
+
+- **The agent can write the file it is governed by.** `.claude/settings.json` lives inside the
+  workspace the agent has write access to, so enabling project settings creates a path where an agent
+  grants itself permissions by editing a file. Needs answering: does Claude Code re-read settings
+  within a running session or only at startup; does a rule written during a turn take effect in that
+  turn, the next turn, or the next thread; and can Giskard's presets be made to win regardless.
+- **A repository is untrusted input.** A cloned repo can ship a permissive `.claude/settings.json`, and
+  Claude Code's own defence against this — the workspace trust dialog — is documented as **skipped in
+  non-interactive mode**, which is the only mode Giskard uses. Enabling project settings would adopt a
+  stranger's permission rules with no prompt anywhere in the flow.
+- **Per-thread worktrees multiply it.** Each worktree carries its own copy of the file, so "which
+  settings are in force" becomes per-thread rather than per-project.
+
+Until those are answered, `""` is the safe default and the cost is small: a user who wants a rule
+applied can express it as a Giskard permission preset instead.
 
 ---
 
@@ -590,9 +613,10 @@ should have asked about, or the first user who wants their local `settings.json`
 ## 10. Not in v1
 
 Structured diffs; native rename/archive/delete; MCP reload and OAuth; `terminate_command`; linked
-sub-agent child threads; idle process reaping; `sdkMcpServers`; and **hook-based approval enforcement**
+sub-agent child threads; idle process reaping; `sdkMcpServers`; **hook-based approval enforcement**
 — the stdio channel is the MVP's only approval path, with the hook route deferred to a later decision
-and refactor (§9.4).
+and refactor (§9.4); and **honouring any settings source**, including a repo's own
+`.claude/settings.json`, which is a follow-up gated on the security review in §8.
 
 ---
 
@@ -671,8 +695,3 @@ Codex adapter's identifier/lifecycle contract.
    model picker the only place a harness is ever chosen?
 2. Do Claude threads need `--add-dir` fed from anything beyond the workspace root (Codex reads
    `sandbox_workspace_write.writable_roots` from its own config for this)?
-3. `--setting-sources` policy (§8, §9): load nothing, so Giskard's presets are the only authority; or
-   load `project` so a repo's checked-in `.claude/settings.json` still applies? The second is friendlier
-   and the first is honest about what the approval UI promises. Note this is a forced choice only while
-   the MVP relies on the stdio route alone; the hook route (§9.4) would let both hold at once, which is
-   the main argument for eventually taking it.
