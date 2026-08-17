@@ -449,7 +449,7 @@ Two findings from the round trip:
 | `ApprovalDecision` | Claude response |
 | --- | --- |
 | `Accept` | `{behavior:"allow"}` — **verified** |
-| `AcceptForSession` | **Giskard-side session memory.** The `updatedPermissions` wire exists and is applied, but does not reliably suppress a repeat ask — see below |
+| `AcceptForSession` | `{behavior:"allow", updatedPermissions:[<the ask's own addRules suggestion, destination rewritten to "session">]}` — **verified**; see below |
 | `Decline` | `{behavior:"deny", message:"Declined"}` — **verified**: tool blocked, turn continues and completes normally |
 | `Cancel` | `{behavior:"deny", interrupt:true}` — **verified**, and genuinely distinct from `Decline` (below) |
 | `AcceptWithExecPolicyAmendment` | no analogue — do not advertise it in `available` |
@@ -463,58 +463,62 @@ turn: `subtype: "error_during_execution"`, `terminal_reason: "aborted_streaming"
 `TurnStatusKind::Interrupted`, **not** `Failed`, even though the harness reports `is_error: true` and
 an error-shaped subtype. The adapter knows which it is, because it sent the `interrupt`.
 
-**`AcceptForSession` — the wire mechanism exists and is applied; Giskard should still not rely on it.**
+**`AcceptForSession` — use `updatedPermissions` with `destination: "session"`. Verified.**
 
-`updatedPermissions` is real and supported. The CLI validates it against a typed schema
-(`addRules` / `replaceRules` / `removeRules` / `setMode` / `addDirectories` / `removeDirectories`, each
-with a `destination` of `userSettings | projectSettings | localSettings | session | cliArg`), applies it
-to the live permission context and persists it. Confirmed from `--debug-file` output, which logs the
-apply verbatim:
+`updatedPermissions` is a typed, supported mechanism: `addRules` / `replaceRules` / `removeRules` /
+`setMode` / `addDirectories` / `removeDirectories`, each with a `destination` of
+`userSettings | projectSettings | localSettings | session | cliArg`, applied to the live permission
+context and (for persistent destinations) written to disk.
 
-```
-Applying permission update: Adding 1 allow rule(s) to destination 'session': ["Bash(echo SAME > same.txt)"]
-Applying permission update: Adding 1 directory with destination 'session': ["…/t6"]
-```
+**The recipe that works** — take the `addRules` entry out of the ask's own `permission_suggestions`,
+override its `destination` to `"session"`, and send it back with the allow. Verified on both permission
+dimensions: a command asked once and then ran twice more with no further ask.
 
-What could **not** be reproduced is the effect Giskard actually wants. Across four runs — a synthesized
-glob rule, the CLI's own suggestions echoed verbatim, an exact-command rule at `session` scope, and an
-exact-command rule plus the directory grant — a repeat of the *identical* command asked again every
-time. The updates are accepted and applied; they just do not suppress the next ask under these
-conditions (`--setting-sources ""`, default mode, a `Bash` command containing a `>` redirect, whose ask
-appears to be driven by the file-write dimension rather than the command-rule one — the CLI's own
-suggestion list for these calls contains only `addDirectories`).
+| Command | Asks with the session rule | Rule as the CLI stored it |
+| --- | --- | --- |
+| `python3 -c "print(1)"` (no file write) | **1** (was 3) | `Bash(python3 -c "print\(1\)")` |
+| `touch probe.txt` (file write) | **1** (was 3) | `Bash(touch probe.txt)` |
 
-Also observed: echoing the CLI's `localSettings` suggestion **wrote a persistent rule into the user's
-project** (`.claude/settings.local.json` gained `"Bash(echo A > a.txt)"`), confirming the §9.2
-destination hazard by observation rather than from a schema.
+**Do not synthesize the rule text.** Every earlier failure in this investigation was a hand-written
+rule that did not match the command's canonical form — the CLI escapes glob metacharacters and
+preserves quoting (`python3 -c "print\(1\)"`), so a rule Giskard composes itself will silently fail to
+match while still being reported as applied. Echo the CLI's own `ruleContent` verbatim; change only the
+destination.
 
-**Decision: implement `AcceptForSession` inside Giskard.** Remember the approved `(tool_name, input)`
-for the child's lifetime and auto-answer matching asks without troubling the browser. Reasons, in order:
-it is deterministic and does not depend on rule-matching semantics Giskard neither controls nor can
-test exhaustively; spec §9.2.1 already defines "session" as exactly this (harness-process lifetime,
-fail-closed on respawn); it is harness-neutral, so Codex and Claude behave identically; and it never
-writes to the user's repository. Not sending `updatedPermissions` at all also avoids granting a rule
-twice — once on the wire and once in Giskard's memory.
+**Session scope is exactly Giskard's definition of session.** These rules live in the child process's
+permission context and die with it, which is precisely spec §9.2.1 — "session" = harness-process
+lifetime, fail-closed on respawn. No Giskard-side approval memory is needed, and none should be built:
+the harness already provides the semantics the spec asks for.
 
-**Invariant: never send a persistent destination.** `localSettings`, `projectSettings` and
-`userSettings` all write permission rules to disk on the user's machine. Giskard must not do that from
-an approval click — a click means "let this proceed", never "change my configuration permanently".
-The MVP sends no `updatedPermissions` at all; if a later change ever sends one, it must be filtered to
-`destination: "session"`.
+**Degradation:** some calls carry no `addRules` suggestion at all — a `Bash` command containing a shell
+redirect (`echo A > a.txt`) offers only `addDirectories`, because the ask comes from the write path
+rather than the command rule. There is nothing to persist for those, so `AcceptForSession` degrades to
+a plain `Accept` for that call and the next identical command asks again. The adapter must handle the
+empty case rather than assume a suggestion is always present; whether the UI hides or annotates the
+button in that case is a UI decision (open question 3).
 
-The trap this guards against is specific and easy to walk into: the ask payload *contains* a
-`localSettings` suggestion, so the obvious implementation — forward `permission_suggestions` back as
-`updatedPermissions` — is exactly the one that writes to the user's repository. That is how the write in
-§9.2 was produced. Under `--setting-sources ""` it is a pure side effect with no upside: the file
-Giskard just wrote is not even read back by the session that wrote it. With per-thread worktrees it is
-worse than untidy, since each worktree accumulates its own `.claude/settings.local.json`.
+Also observed while establishing this: echoing the CLI's suggestion **unmodified** writes a persistent
+rule into the user's project (`.claude/settings.local.json` gained `"Bash(echo A > a.txt)"`), because
+the suggested destination is `localSettings`. Hence the invariant below.
 
-Suggestions remain useful as **card metadata** — rendering "always allow `echo A > a.txt`" as a label is
-fine. Acting on one is what writes files.
+**Invariant: always override the destination to `session`; never forward a persistent one.**
+`localSettings`, `projectSettings` and `userSettings` all write permission rules to disk on the user's
+machine. An approval click means "let this proceed for now", never "change my configuration
+permanently", so the adapter must rewrite the destination on every suggestion it echoes and drop any it
+cannot rewrite.
 
-*Open, and deliberately not chased:* the exact conditions under which an applied `session` rule does
-suppress a later ask. It would change nothing above, and `--debug-file` is the diagnostic channel if a
-future change makes it worth revisiting.
+The trap is specific and easy to walk into: the ask's suggestions arrive with
+`destination: "localSettings"`, so forwarding them **unchanged** — the obvious one-liner — writes to the
+user's repository. That is how the write above was produced. Under `--setting-sources ""` it is also
+pointless: the file Giskard just wrote is not read back by the session that wrote it. With per-thread
+worktrees each worktree would accumulate its own `.claude/settings.local.json`.
+
+A regression test belongs here: approve for session, then assert both that the repeat call does not ask
+**and** that no settings file appeared under the workspace.
+
+*Diagnostic note:* `--debug-file` logs every applied update (`Applying permission update: Adding 1 allow
+rule(s) to destination 'session': [...]`), including the rule in the CLI's canonical stored form. That is
+the channel for diagnosing an `AcceptForSession` that silently fails to match.
 
 `ApprovalKind` mapping: `Bash` → `CommandExecution{command,cwd}`; `Edit`/`Write`/`NotebookEdit` →
 `FileChange{path,change}`; `mcp__<server>__<tool>` → `McpToolCall{server,tool_name}`; everything else
@@ -582,8 +586,8 @@ and refactor (§9.4).
 Each phase carries the `AGENTS.md` obligations: `cargo fmt`/`clippy -D warnings`, error-path tests,
 structured logs at new boundaries, and doc sync in the same change.
 
-**Phase 0 — spikes.** Done: `can_use_tool` allow, deny, and deny-with-`interrupt` (§9.3),
-`updatedPermissions` (§9.3 — applied but not load-bearing), `interrupt`, `set_model`, `set_permission_mode` (§3.3), concurrent
+**Phase 0 — spikes.** Done: `can_use_tool` allow, deny, deny-with-`interrupt`, and session-scoped
+`updatedPermissions` (§9.3), `interrupt`, `set_model`, `set_permission_mode` (§3.3), concurrent
 same-cwd sessions (§3.4). Remaining: `/compact` over stream input, and interrupt *mid-tool-call*.
 Capture sanitized transcripts as fixtures for the mapper tests — the §9.2 ask payload is the first one.
 
@@ -646,7 +650,9 @@ Codex adapter's identifier/lifecycle contract.
    model picker the only place a harness is ever chosen?
 2. Do Claude threads need `--add-dir` fed from anything beyond the workspace root (Codex reads
    `sandbox_workspace_write.writable_roots` from its own config for this)?
-3. `--setting-sources` policy (§8, §9): load nothing, so Giskard's presets are the only authority; or
+3. When an ask carries no `addRules` suggestion (shell-redirect commands, §9.3), `AcceptForSession`
+   cannot stick. Hide the button for that call, or show it and let it behave as a one-off `Accept`?
+4. `--setting-sources` policy (§8, §9): load nothing, so Giskard's presets are the only authority; or
    load `project` so a repo's checked-in `.claude/settings.json` still applies? The second is friendlier
    and the first is honest about what the approval UI promises. Note this is a forced choice only while
    the MVP relies on the stdio route alone; the hook route (§9.4) would let both hold at once, which is
