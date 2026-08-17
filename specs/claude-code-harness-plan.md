@@ -34,7 +34,7 @@ marked **[spike]**.
 | Protocol crate | `codex-codes` 0.143.2 (typed, versioned) | **none exists for Rust** — Giskard owns the wire types |
 | Processes | **1 `codex app-server` per project**, multiplexing every thread | **1 `claude` per session**; a session ≈ one Giskard thread |
 | Native thread id | Codex-minted rollout id | **client-minted UUID** via `--session-id`; resumed with `--resume=<uuid>` |
-| Concurrency | one worker task fans out to N threads | N independent children, each single-threaded through its own turn |
+| Concurrency | one worker task fans out to N threads | N independent children, each single-threaded through its own turn. **Verified:** two sessions in the same cwd ran concurrent tool-using turns, each with its own `<uuid>.jsonl` under one cwd-encoded directory, no locking or contention (§3.4). |
 | Turn ids | native `turnId` | **none** — Giskard mints every `TurnId`; a turn is "user message → `result`" |
 | Model catalog | `model/list` RPC | no RPC; static built-in catalog |
 | Session storage | Codex thread store | `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` — **cwd-scoped** |
@@ -94,8 +94,13 @@ Client → CLI, as `{"type":"control_request","request_id":…,"request":{…}}`
   `planModeInstructions`, `toolAliases`, `supportedDialogKinds`. Answered with the command/agent
   inventory. **Verified working.**
 - `interrupt` — **verified working**; response `{"still_queued":[]}`. This is `AgentHarness::interrupt`.
-- `set_permission_mode`, `set_model` — present in the CLI's control dispatch, so **mode and model can
-  change without respawning the child** [spike: confirm request shapes].
+- `set_model` (`{subtype:"set_model", model:"<id>"}`) and `set_permission_mode`
+  (`{subtype:"set_permission_mode", mode:"<mode>"}`) — **verified working mid-session**: a live child
+  started on Sonnet answered turn 1 as `claude-sonnet-5`, accepted `set_model`, and answered turn 2 as
+  `claude-haiku-4-5`, with **no respawn and no session change**. `set_permission_mode` echoes the
+  applied mode (`{"mode":"plan"}`). Note the CLI **re-emits `system/init`** after a model change, so
+  the adapter must treat `init` as a repeatable announcement, not a one-shot handshake, and re-read
+  the effective model from it.
 - `control_cancel_request` — cancels an in-flight control request.
 
 CLI → client:
@@ -104,6 +109,24 @@ CLI → client:
 - `request_user_dialog` / `elicitation` — MCP elicitation and host dialogs → maps to Giskard's
   existing `ServerRequestReceived` / `respond_server_request` path.
 
+### 3.4 Simultaneous sessions in one working directory
+
+**Verified supported.** Two children were launched in the same cwd at the same time, each with its own
+`--session-id`, and both ran a Bash tool call to completion (`is_error: false`, `stop_reason:
+"end_turn"`) with both approvals granted through `can_use_tool`. Transcripts landed as two separate
+`<uuid>.jsonl` files inside the single cwd-encoded directory
+(`~/.claude/projects/<encoded-cwd>/`). No lock file, no serialization, no cross-talk.
+
+This is what makes the per-thread child model viable: a project's threads share a directory by design,
+and the CLI does not treat that as exclusive. The residual hazard is **not** the CLI — it is two agents
+editing the same files at once, which is exactly what per-thread Git worktrees
+(`docs/git-worktrees.md`) already exist to isolate. Threads sharing the project workspace can collide
+on file content under Claude for the same reason they can under Codex.
+
+One caveat to carry into the adapter: `.claude/` project state within the cwd (checkpoints,
+project-scoped settings) is shared by every session in that directory. Nothing observed conflicts, but
+it means "same cwd" is not full isolation.
+
 ---
 
 ## 4. Capability matrix
@@ -111,8 +134,8 @@ CLI → client:
 | Capability | Claude | Basis |
 | --- | --- | --- |
 | `live_approvals` | **true (verified)** | `can_use_tool` control request; response `{behavior:"allow",updatedInput?,updatedPermissions?}` \| `{behavior:"deny",message?,interrupt?}`. Round trip and blocked execution confirmed — §9. |
-| `plan_build_modes` | **true** | `--permission-mode plan` + `set_permission_mode`. Semantics differ — see §8. |
-| `per_turn_model` | **true** | `set_model` control request; fallback = respawn with `--resume --model` |
+| `plan_build_modes` | **true (verified)** | `--permission-mode plan` + `set_permission_mode`, which echoes the applied mode. Semantics differ — see §8. |
+| `per_turn_model` | **true (verified)** | `set_model` mid-session, no respawn (§3.3) |
 | `reasoning_effort` | **true** | `--effort low\|medium\|high\|xhigh\|max` (`Effort` is already an open string newtype, so the differing value set costs nothing) |
 | `structured_diffs` | **false (v1)** | no native diff feed |
 | `resumable_threads` | **true** | `--session-id` / `--resume`, cwd-scoped |
@@ -226,6 +249,9 @@ server change, not an adapter workaround, and it needs error-path tests per `AGE
 - Spawn on `open_thread`, one child per thread, `--session-id <fresh uuid>` or `--resume=<stored>`.
 - cwd = the thread's worktree if it has one, else the project workspace root; `--add-dir` for extra
   writable roots (the analogue of Codex's `runtimeWorkspaceRoots`).
+- Threads of one project may run **concurrently in the same cwd** with no coordination between children
+  (§3.4); the adapter needs no cross-thread locking, only per-thread turn serialization, which the
+  server's existing `ThreadTurnGate` already provides.
 - Keep alive across turns. **No idle reaping in the MVP** — `harness.idle_shutdown_secs` is declared
   in config but implemented nowhere today, and the MVP does not change that. Document the cost
   honestly: one Node/Bun process (~150–300 MB RSS) per *loaded* Claude thread, so ~10 open threads is
@@ -252,6 +278,14 @@ server change, not an adapter workaround, and it needs error-path tests per `AGE
   `input = input_tokens + cache_creation_input_tokens + cache_read_input_tokens`. Document the
   consequence: with `tokens.cost_estimation = true`, flat per-Mtok rates **overstate** cost, because
   cache reads bill at a fraction. For a subscription user the euro figure is notional anyway.
+- **Ancillary models pollute `by_model`.** `result.modelUsage` always carries a Haiku entry alongside
+  the selected model, because Claude Code runs its own summaries/titles on a small model. Observed on
+  every turn, including a Sonnet-only one. Decide deliberately: attribute the turn to the selected
+  model (matching `Turn.model` and the Codex ledger's meaning) and either fold the ancillary usage
+  into the same entry or record it under its own `(provider, model)` key. Dropping it makes Giskard's
+  totals disagree with Anthropic's; hiding it under the selected model makes per-model rates wrong.
+  Recommendation: record each `modelUsage` entry under its real model id, so `by_model` stays truthful,
+  and keep `Turn.model` as the user's selection.
 - **Cost.** Do not use `result.total_cost_usd` as truth for a Pro/Max user — it is priced as if the
   request were API-billed. Prefer the `rate_limit_event` five-hour window as the honest "how much
   budget is left" signal, surfaced as a `Notice` (and, later, a header chip).
@@ -376,10 +410,11 @@ sub-agent child threads; idle process reaping; using Claude Code's own hooks or 
 Each phase carries the `AGENTS.md` obligations: `cargo fmt`/`clippy -D warnings`, error-path tests,
 structured logs at new boundaries, and doc sync in the same change.
 
-**Phase 0 — spikes.** `can_use_tool` and `interrupt` are **done** (§3.3, §9). Remaining: `set_model` /
-`set_permission_mode` request shapes, `/compact` over stream input, interrupt *mid-tool-call*, and
-`Cancel`'s `interrupt: true` on a deny. Capture sanitized transcripts as fixtures for the mapper
-tests — the §9 ask payload is the first one.
+**Phase 0 — spikes.** Done: `can_use_tool` allow **and** deny (§9), `interrupt`, `set_model`,
+`set_permission_mode` (§3.3), concurrent same-cwd sessions (§3.4). Remaining: `/compact` over stream
+input, interrupt *mid-tool-call*, `Cancel`'s `interrupt: true` on a deny, and `updatedPermissions` for
+`AcceptForSession`. Capture sanitized transcripts as fixtures for the mapper tests — the §9 ask payload
+is the first one.
 
 **Phase 1 — multi-harness plumbing (no Claude yet).** `HarnessKind`; `ProviderConfig.harness`;
 `ThreadFile.harness` + `harness_thread_ids` (with default-on-read migration); registry re-keying and
