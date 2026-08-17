@@ -147,7 +147,7 @@ it means "same cwd" is not full isolation.
 | `mcp_reload` | **false (v1)** | only the interactive `/mcp reconnect` |
 | `mcp_oauth_login` | **false** | interactive only |
 | `context_compaction` | **true** | `/compact` as a user message [unverified]; `autocompact_state` feeds the gauge |
-| Native rename / archive / delete | **unsupported** | no equivalents — see §5.5 |
+| Native rename / archive / delete | **unsupported** | no equivalents — see §5.6 |
 | `terminate_command` | **unsupported (v1)** | background shells are controlled by the agent's own `KillShell` tool, not from outside |
 | Linked sub-agent threads | **unsupported** | Claude `Task` subagents are not resumable sessions, so `SubagentLink.harness_thread_id` has no value to carry. Map them as `ToolCall` items; optionally nest their text with `--forward-subagent-text` + `parent_tool_use_id`. |
 
@@ -175,9 +175,12 @@ model_listing = false
 ```
 
 Then `harness_for(model: &ModelRef, config) -> HarnessKind` is a pure lookup, and the rule "a thread
-runs on the harness of its current model's provider" needs no new UI. `ProjectConfig.harness` stays
-as the project's **default** for new threads (and for `list_models` overlay), no longer as a hard
-binding.
+runs on the harness of its current model's provider" needs no new UI — the model picker is already the
+only place the choice is expressed, since project creation asks for a `default_model` and nothing else.
+
+`ProjectConfig.harness` is therefore redundant for routing. It exists today but is hardcoded to
+`"codex"` at creation (`store.rs:578`) and never chosen by anyone; under this design it would carry at
+most the project's default and a label for warnings. Whether to keep or drop it is open question 1.
 
 ### 5.2 Registry re-keying
 
@@ -220,7 +223,40 @@ pub harness_thread_ids: HashMap<String, String>,
 `harness_thread_ids` as the archive. `store.rs:578` stops hardcoding `harness: "codex"` for new
 projects and takes the requested kind.
 
-### 5.4 Switching a thread across harnesses
+### 5.4 Project-scoped harness queries become ambiguous
+
+§5.2 covers the thread-addressed operations. The other half of the registry is **project-scoped** and
+silently assumes a project has exactly one harness:
+
+| Call site | Today |
+| --- | --- |
+| `registry.capabilities(&project_config)` (`routes.rs:3374`, `:3425`, `:3474`, `:3518`) | capabilities of *the* project harness |
+| `registry.list_models(&project_config)` (`routes.rs:3392`) | catalog overlay for `GET /api/projects/{id}/models` |
+| `registry.list_mcp_servers` / `reload_mcp_servers` / `start_mcp_oauth_login` | MCP endpoints, per project |
+
+With two harnesses in one project each needs a defined rule:
+
+- **Capabilities must become thread-scoped.** The capability-driven UI (spec §13.5) decides what to
+  render — approval cards, the effort selector, the diff viewer — and those answers now differ between
+  two threads of the same project. A project-level capability answer would be wrong for one of them.
+  Resolving capabilities through the thread's harness (and, on a draft, through the model being
+  selected) is the correct shape; the project-level endpoints keep a project answer only where they
+  genuinely describe the project.
+- **Model catalogs merge rather than choose.** Each harness's catalog should overlay only the models
+  whose provider maps to it, so a project offering both Codex and Claude models gets accurate metadata
+  for both instead of one harness's view of the other's models.
+- **MCP endpoints need an explicit decision**, deferred with the rest of MCP (§10): Claude's MCP status
+  is per-child and read-only, so the honest v1 answer is that the MCP endpoints describe the Codex
+  harness and report nothing for Claude threads.
+
+**A consequence for process lifecycle.** `capabilities()` currently calls `get_or_create_harness`, so
+answering it *spawns* the harness. Under the MVP's rule — a child process only when a thread with an
+Anthropic model is loaded (§1) — merely opening a project's model picker must not start a `claude`
+process. This is why the Claude harness is a **façade**: the `Arc<dyn AgentHarness>` registered for a
+project answers `capabilities()` and `list_models()` from static knowledge, and spawns child processes
+only in `open_thread`. Creating the façade must stay free.
+
+### 5.5 Switching a thread across harnesses
 
 Selecting `anthropic/claude-opus-5` on a Codex thread is a **native-thread boundary** — strictly
 stronger than the provider switch analyzed in `model-provider-switching-analysis.md`, because there
@@ -237,7 +273,7 @@ is no protocol that can carry Codex history into a Claude session. Contract:
 This is the single most user-visible sharp edge of per-thread harnesses and needs the same
 documentation treatment as worktrees.
 
-### 5.5 Operations the Claude harness cannot do
+### 5.6 Operations the Claude harness cannot do
 
 `harness_api_error` (`routes.rs:3549`) maps `HarnessError::Unsupported` → **400**, and
 `set_thread_name` / `set_thread_archived` / `delete_thread` call the harness *first* (spec TN2/TD3,
@@ -246,7 +282,7 @@ local state. Fix: treat `Unsupported` from these three lifecycle calls as a **so
 `debug`, proceed with the local mutation, and (for delete) skip only the native step. This is a
 server change, not an adapter workaround, and it needs error-path tests per `AGENTS.md`.
 
-### 5.6 Process lifecycle (MVP)
+### 5.7 Process lifecycle (MVP)
 
 - Spawn on `open_thread`, one child per thread, `--session-id <fresh uuid>` or `--resume=<stored>`.
 - cwd = the thread's worktree if it has one, else the project workspace root; `--add-dir` for extra
@@ -656,7 +692,7 @@ mode without respawning), elicitation / `request_user_dialog` → `ServerRequest
 `updatedPermissions`.
 
 **Phase 4 — cross-harness UX.** Model-picker filtering by provider→harness, the switch confirmation
-and `Notice` of §5.4, capability-driven UI checks, screenshot regeneration if the picker changes
+and `Notice` of §5.5, capability-driven UI checks, screenshot regeneration if the picker changes
 (`tests/e2e/screenshots.sh`).
 
 **Phase 5 — polish.** Idle reaping (make `idle_shutdown_secs` real), synthesized `FileChange`/
@@ -683,7 +719,7 @@ Codex adapter's identifier/lifecycle contract.
 | Giskard owns unversioned wire types; Claude Code ships often | Pin a tested version, log `claude_code_version`, warn on drift, keep the mapper tolerant of unknown message types (log at `debug`, never fail a turn) |
 | Local settings allow-rules undercut `ask_first` — **observed**, not theoretical (§9) | MVP: controlled `--setting-sources`, documented, with a regression test that the preset's promise holds. Durable fix is the hook route, postponed by decision (§9.4) — this risk stays open until then |
 | One process per loaded thread | MVP accepts it and documents the cost; reaping in Phase 5 |
-| Cross-harness model switch loses agent context | Explicit confirm + `Notice` + remembered native ids (§5.4) |
+| Cross-harness model switch loses agent context | Explicit confirm + `Notice` + remembered native ids (§5.5) |
 | Cost/quota semantics differ under a subscription | Treat euro cost as notional; surface `rate_limit_event` (§6) |
 | Registry re-keying touches approval/interrupt/delete routing | Phase 1 is harness-agnostic and fully testable with two replay harnesses before any CLI is involved |
 
@@ -691,7 +727,10 @@ Codex adapter's identifier/lifecycle contract.
 
 ## 13. Open questions
 
-1. Should the **project-level** default harness still be offered at project creation, or is the
-   model picker the only place a harness is ever chosen?
+1. Does `ProjectConfig.harness` still earn its place? Project creation never asked for a harness — it
+   takes a `default_model` and the field is hardcoded to `"codex"` (`store.rs:578`). Once the harness
+   is derived from a thread's model provider (§5.1), the field is redundant for routing and survives
+   only as the project's default and as a label in warnings (`routes.rs:3387`). Keep it as a
+   derived-and-persisted default, or drop it and derive everything from `default_model`?
 2. Do Claude threads need `--add-dir` fed from anything beyond the workspace root (Codex reads
    `sandbox_workspace_write.writable_roots` from its own config for this)?
