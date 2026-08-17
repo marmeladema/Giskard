@@ -10,7 +10,7 @@ contract folds into `specs/giskard-specification.md` (§4, §6.4, §8, §9, §12
 
 Protocol facts below were verified empirically against **Claude Code 2.1.233** (live stream-json
 session, plus the shipped CLI binary's own schemas and argv construction). Anything not verified is
-marked **[spike]**.
+marked **[unverified]**.
 
 ---
 
@@ -144,7 +144,7 @@ it means "same cwd" is not full isolation.
 | `mcp_status` | **true (read-only)** | `system/init.mcp_servers` |
 | `mcp_reload` | **false (v1)** | only the interactive `/mcp reconnect` |
 | `mcp_oauth_login` | **false** | interactive only |
-| `context_compaction` | **true** | `/compact` as a user message [spike]; `autocompact_state` feeds the gauge |
+| `context_compaction` | **true** | `/compact` as a user message [unverified]; `autocompact_state` feeds the gauge |
 | Native rename / archive / delete | **unsupported** | no equivalents — see §5.5 |
 | `terminate_command` | **unsupported (v1)** | background shells are controlled by the agent's own `KillShell` tool, not from outside |
 | Linked sub-agent threads | **unsupported** | Claude `Task` subagents are not resumable sessions, so `SubagentLink.harness_thread_id` has no value to carry. Map them as `ToolCall` items; optionally nest their text with `--forward-subagent-text` + `parent_tool_use_id`. |
@@ -586,10 +586,16 @@ and refactor (§9.4).
 Each phase carries the `AGENTS.md` obligations: `cargo fmt`/`clippy -D warnings`, error-path tests,
 structured logs at new boundaries, and doc sync in the same change.
 
-**Phase 0 — spikes.** Done: `can_use_tool` allow, deny, deny-with-`interrupt`, and session-scoped
-`updatedPermissions` (§9.3), `interrupt`, `set_model`, `set_permission_mode` (§3.3), concurrent
-same-cwd sessions (§3.4). Remaining: `/compact` over stream input, and interrupt *mid-tool-call*.
-Capture sanitized transcripts as fixtures for the mapper tests — the §9.2 ask payload is the first one.
+**Phase 0 — protocol verification.** Establish each protocol behaviour the adapter depends on by
+running it against the real CLI, before any of it is assumed in code.
+
+*Verified:* `can_use_tool` allow, deny, deny-with-`interrupt`, and session-scoped `updatedPermissions`
+(§9.3); `interrupt`, `set_model`, `set_permission_mode` (§3.3); concurrent same-cwd sessions (§3.4).
+
+*Outstanding:* `/compact` over stream input, and interrupt *mid-tool-call*.
+
+Each run's transcript is sanitized and kept as a fixture for the mapper tests — the §9.2 ask payload is
+the first one.
 
 **Phase 1 — multi-harness plumbing (no Claude yet).** `HarnessKind`; `ProviderConfig.harness`;
 `ThreadFile.harness` + `harness_thread_ids` (with default-on-read migration); registry re-keying and
