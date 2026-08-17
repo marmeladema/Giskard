@@ -449,7 +449,7 @@ Two findings from the round trip:
 | `ApprovalDecision` | Claude response |
 | --- | --- |
 | `Accept` | `{behavior:"allow"}` — **verified** |
-| `AcceptForSession` | **Giskard-side session memory, not the wire.** See below |
+| `AcceptForSession` | **Giskard-side session memory.** The `updatedPermissions` wire exists and is applied, but does not reliably suppress a repeat ask — see below |
 | `Decline` | `{behavior:"deny", message:"Declined"}` — **verified**: tool blocked, turn continues and completes normally |
 | `Cancel` | `{behavior:"deny", interrupt:true}` — **verified**, and genuinely distinct from `Decline` (below) |
 | `AcceptWithExecPolicyAmendment` | no analogue — do not advertise it in `available` |
@@ -463,29 +463,42 @@ turn: `subtype: "error_during_execution"`, `terminal_reason: "aborted_streaming"
 `TurnStatusKind::Interrupted`, **not** `Failed`, even though the harness reports `is_error: true` and
 an error-shaped subtype. The adapter knows which it is, because it sent the `interrupt`.
 
-**`AcceptForSession` — do not use `updatedPermissions`.** Tested three ways:
+**`AcceptForSession` — the wire mechanism exists and is applied; Giskard should still not rely on it.**
 
-| Reply | Result |
-| --- | --- |
-| Synthesized `addRules` glob (`echo *`), `destination: "session"` | no effect; every later call still asked |
-| The CLI's **own** `permission_suggestions` echoed back verbatim | rule written to `.claude/settings.local.json` as `"Bash(echo A > a.txt)"`; later calls still asked, because the suggested rule is scoped to the **exact command string** |
-| Exact-command `addRules`, `destination: "session"` | no file written, and the *identical* command re-asked all three times |
+`updatedPermissions` is real and supported. The CLI validates it against a typed schema
+(`addRules` / `replaceRules` / `removeRules` / `setMode` / `addDirectories` / `removeDirectories`, each
+with a `destination` of `userSettings | projectSettings | localSettings | session | cliArg`), applies it
+to the live permission context and persists it. Confirmed from `--debug-file` output, which logs the
+apply verbatim:
 
-Two conclusions. First, `updatedPermissions` is honoured, but only the `localSettings` destination did
-anything observable — and what it did was **write a persistent rule into the user's project**, which
-confirms the §9.2 destination hazard by observation rather than by reading a schema. Second, none of it
-suppressed a later ask, and it cannot under the MVP's `--setting-sources ""` policy (§8): a rule
-written into a settings file the session does not load can never match. The two plan decisions are in
-direct tension, and `--setting-sources` wins because it is what makes `ask_first` honest.
+```
+Applying permission update: Adding 1 allow rule(s) to destination 'session': ["Bash(echo SAME > same.txt)"]
+Applying permission update: Adding 1 directory with destination 'session': ["…/t6"]
+```
 
-So implement `AcceptForSession` **inside Giskard**: remember the approved `(tool_name, input)` for the
-child's lifetime and auto-answer matching asks without troubling the browser. Spec §9.2.1 already
-defines "session" as exactly that — harness-process lifetime, fail-closed on respawn — so this needs no
-new semantics, is harness-neutral, and never writes to the user's repository.
+What could **not** be reproduced is the effect Giskard actually wants. Across four runs — a synthesized
+glob rule, the CLI's own suggestions echoed verbatim, an exact-command rule at `session` scope, and an
+exact-command rule plus the directory grant — a repeat of the *identical* command asked again every
+time. The updates are accepted and applied; they just do not suppress the next ask under these
+conditions (`--setting-sources ""`, default mode, a `Bash` command containing a `>` redirect, whose ask
+appears to be driven by the file-write dimension rather than the command-rule one — the CLI's own
+suggestion list for these calls contains only `addDirectories`).
 
-*Untested branch:* whether a `localSettings` rule suppresses matching asks when settings sources **are**
-loaded. Not worth resolving — Giskard should not be writing permission rules into a user's project from
-one approval click regardless of the answer.
+Also observed: echoing the CLI's `localSettings` suggestion **wrote a persistent rule into the user's
+project** (`.claude/settings.local.json` gained `"Bash(echo A > a.txt)"`), confirming the §9.2
+destination hazard by observation rather than from a schema.
+
+**Decision: implement `AcceptForSession` inside Giskard.** Remember the approved `(tool_name, input)`
+for the child's lifetime and auto-answer matching asks without troubling the browser. Reasons, in order:
+it is deterministic and does not depend on rule-matching semantics Giskard neither controls nor can
+test exhaustively; spec §9.2.1 already defines "session" as exactly this (harness-process lifetime,
+fail-closed on respawn); it is harness-neutral, so Codex and Claude behave identically; and it never
+writes to the user's repository. Not sending `updatedPermissions` at all also avoids granting a rule
+twice — once on the wire and once in Giskard's memory.
+
+*Open, and deliberately not chased:* the exact conditions under which an applied `session` rule does
+suppress a later ask. It would change nothing above, and `--debug-file` is the diagnostic channel if a
+future change makes it worth revisiting.
 
 `ApprovalKind` mapping: `Bash` → `CommandExecution{command,cwd}`; `Edit`/`Write`/`NotebookEdit` →
 `FileChange{path,change}`; `mcp__<server>__<tool>` → `McpToolCall{server,tool_name}`; everything else
@@ -553,8 +566,8 @@ and refactor (§9.4).
 Each phase carries the `AGENTS.md` obligations: `cargo fmt`/`clippy -D warnings`, error-path tests,
 structured logs at new boundaries, and doc sync in the same change.
 
-**Phase 0 — spikes.** Done: `can_use_tool` allow, deny, and deny-with-`interrupt` (§9.3), the
-`updatedPermissions` dead end (§9.3), `interrupt`, `set_model`, `set_permission_mode` (§3.3), concurrent
+**Phase 0 — spikes.** Done: `can_use_tool` allow, deny, and deny-with-`interrupt` (§9.3),
+`updatedPermissions` (§9.3 — applied but not load-bearing), `interrupt`, `set_model`, `set_permission_mode` (§3.3), concurrent
 same-cwd sessions (§3.4). Remaining: `/compact` over stream input, and interrupt *mid-tool-call*.
 Capture sanitized transcripts as fixtures for the mapper tests — the §9.2 ask payload is the first one.
 
