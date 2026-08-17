@@ -22,6 +22,7 @@ marked **[unverified]**.
 | What selects the harness | **The thread's model.** A thread whose `ModelRef.provider` belongs to an Anthropic/Claude-Code provider runs on the Claude harness. No separate harness selector in the UI. |
 | Child-process model | **One persistent `claude` child process per loaded thread**, alive across turns. Spawned only when a thread with an Anthropic model is loaded. **No idle reaping in the MVP.** |
 | Structured diffs | **`structured_diffs: false` in v1.** Synthesize `FileChange`/`DiffUpdated` from `Edit`/`Write` tool calls + git in a later phase. |
+| `AcceptForSession` when the harness offers no rule to persist | **Keep the button visible anyway** (§9.3). It behaves as a one-off `Accept`; log the degradation and revisit only if users report it. |
 | Live approvals | **Supported and verified end to end (§9).** MVP uses the `--permission-prompt-tool stdio` channel, in the adapter's first working milestone. The hook route is postponed to a later decision and refactor (§9.4); the MCP-tool route is rejected (§9.1). |
 
 ---
@@ -490,12 +491,22 @@ permission context and die with it, which is precisely spec §9.2.1 — "session
 lifetime, fail-closed on respawn. No Giskard-side approval memory is needed, and none should be built:
 the harness already provides the semantics the spec asks for.
 
-**Degradation:** some calls carry no `addRules` suggestion at all — a `Bash` command containing a shell
+**Degradation.** Some calls carry no `addRules` suggestion at all — a `Bash` command containing a shell
 redirect (`echo A > a.txt`) offers only `addDirectories`, because the ask comes from the write path
 rather than the command rule. There is nothing to persist for those, so `AcceptForSession` degrades to
-a plain `Accept` for that call and the next identical command asks again. The adapter must handle the
-empty case rather than assume a suggestion is always present; whether the UI hides or annotates the
-button in that case is a UI decision (open question 3).
+a plain `Accept` and the next identical command asks again. The adapter must handle the empty case
+rather than assume a suggestion is always present.
+
+**Decision: the UI keeps offering the button unconditionally**, including for those calls. Consistency
+is worth more than a button that appears and disappears depending on whether a command happens to
+contain a redirect — a distinction no user should have to reason about. The cost is bounded: the user
+occasionally gets asked again after choosing "for session".
+
+Per the `AGENTS.md` rule that degraded-but-usable flows surface rather than fail silently, the adapter
+logs when it happens (thread, tool, and the fact that no rule suggestion was offered), so a complaint
+can be confirmed from logs instead of reproduced by guesswork. If complaints do arrive, the narrow fix
+is already visible: fall back to Giskard-side session memory **only** for asks that carry no `addRules`
+suggestion, leaving the verified wire path untouched for everything else.
 
 Also observed while establishing this: echoing the CLI's suggestion **unmodified** writes a persistent
 rule into the user's project (`.claude/settings.local.json` gained `"Bash(echo A > a.txt)"`), because
@@ -656,9 +667,7 @@ Codex adapter's identifier/lifecycle contract.
    model picker the only place a harness is ever chosen?
 2. Do Claude threads need `--add-dir` fed from anything beyond the workspace root (Codex reads
    `sandbox_workspace_write.writable_roots` from its own config for this)?
-3. When an ask carries no `addRules` suggestion (shell-redirect commands, §9.3), `AcceptForSession`
-   cannot stick. Hide the button for that call, or show it and let it behave as a one-off `Accept`?
-4. `--setting-sources` policy (§8, §9): load nothing, so Giskard's presets are the only authority; or
+3. `--setting-sources` policy (§8, §9): load nothing, so Giskard's presets are the only authority; or
    load `project` so a repo's checked-in `.claude/settings.json` still applies? The second is friendlier
    and the first is honest about what the approval UI promises. Note this is a forced choice only while
    the MVP relies on the stdio route alone; the hook route (§9.4) would let both hold at once, which is
