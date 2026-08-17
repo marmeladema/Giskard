@@ -12,6 +12,9 @@ Protocol facts below were verified empirically against **Claude Code 2.1.233** (
 session, plus the shipped CLI binary's own schemas and argv construction). Anything not verified is
 marked **[unverified]**.
 
+Section references written as "spec §X" point at `specs/giskard-specification.md`; bare "§X" refers to
+this document.
+
 ---
 
 ## 1. Decisions already taken
@@ -62,7 +65,7 @@ Two consequences drive the whole design:
 claude -p --input-format stream-json --output-format stream-json --verbose \
        --session-id <uuid> --model <id> --effort <level> \
        --permission-mode <mode> --add-dir <root>... \
-       --permission-prompt-tool stdio            # only if live approvals are adopted (§9)
+       --permission-prompt-tool stdio            # routes approvals to Giskard (§9)
        [--resume=<uuid>] [--include-partial-messages] [--replay-user-messages]
 ```
 
@@ -143,7 +146,7 @@ it means "same cwd" is not full isolation.
 | `resumable_threads` | **true** | `--session-id` / `--resume`, cwd-scoped |
 | `model_listing` | **true (static)** | no RPC; adapter returns a built-in catalog of Claude models |
 | `token_usage` | **true** | `result.usage` |
-| `mcp_status` | **true (read-only)** | `system/init.mcp_servers` |
+| `mcp_status` | **true (read-only)** at the harness level | `system/init.mcp_servers` lists servers and status. The project-scoped MCP *endpoints* stay Codex-only in v1 (§5.4) |
 | `mcp_reload` | **false (v1)** | only the interactive `/mcp reconnect` |
 | `mcp_oauth_login` | **false** | interactive only |
 | `context_compaction` | **true** | `/compact` as a user message [unverified]; `autocompact_state` feeds the gauge |
@@ -192,7 +195,7 @@ harnesses: HashMap<(ProjectId, HarnessKind), Arc<dyn AgentHarness>>
 async fn get_or_create_harness(&self, project, kind, config) -> …
 ```
 
-`ThreadBinding` (`:217`) gains the `HarnessKind` that opened it, so every existing lookup path
+`ThreadBinding` (`:178`) gains the `HarnessKind` that opened it, so every existing lookup path
 resolves the right instance rather than "the project's harness":
 
 - `start_turn`, `interrupt`, `compact_thread`, `terminate_command` — from the binding;
@@ -221,7 +224,8 @@ pub harness_thread_ids: HashMap<String, String>,
 
 `harness_thread_id` stays as the **active** harness's id (no migration, no reader changes), with
 `harness_thread_ids` as the archive. `store.rs:578` stops hardcoding `harness: "codex"` for new
-projects and takes the requested kind.
+projects and derives it from the project's `default_model` instead, since creation asks for a model and
+never for a harness (§5.1).
 
 ### 5.4 Project-scoped harness queries become ambiguous
 
@@ -231,7 +235,7 @@ silently assumes a project has exactly one harness:
 | Call site | Today |
 | --- | --- |
 | `registry.capabilities(&project_config)` (`routes.rs:3374`, `:3425`, `:3474`, `:3518`) | capabilities of *the* project harness |
-| `registry.list_models(&project_config)` (`routes.rs:3392`) | catalog overlay for `GET /api/projects/{id}/models` |
+| `registry.list_models(&project_config)` (`routes.rs:3393`) | catalog overlay for `GET /api/projects/{id}/models` |
 | `registry.list_mcp_servers` / `reload_mcp_servers` / `start_mcp_oauth_login` | MCP endpoints, per project |
 
 With two harnesses in one project each needs a defined rule:
@@ -291,9 +295,11 @@ server change, not an adapter workaround, and it needs error-path tests per `AGE
   (§3.4); the adapter needs no cross-thread locking, only per-thread turn serialization, which the
   server's existing `ThreadTurnGate` already provides.
 - Keep alive across turns. **No idle reaping in the MVP** — `harness.idle_shutdown_secs` is declared
-  in config but implemented nowhere today, and the MVP does not change that. Document the cost
-  honestly: one Node/Bun process (~150–300 MB RSS) per *loaded* Claude thread, so ~10 open threads is
-  a real memory line item. Reaping is the first post-MVP follow-up.
+  in config but implemented nowhere today, and the MVP does not change that. The cost is larger than a
+  guess would suggest: a `claude` process was **measured at 440–530 MB RSS**, so Giskard's ~10-thread
+  target scale (spec §1.4) implies multiple gigabytes of resident memory if every thread is loaded.
+  Reaping is therefore the first post-MVP follow-up, and the MVP should at least log the count of live
+  children so the growth is visible before it becomes a complaint.
 - Child exit while a turn is live → `TurnCompleted{Failed}` + `Error`, thread marked disconnected,
   same recovery UX as a Codex app-server crash.
 - Record `claude_code_version` from `system/init` and warn when it differs from the pinned tested
@@ -311,7 +317,7 @@ server change, not an adapter workaround, and it needs error-path tests per `AGE
   events.
 - **Context window.** Emit `ContextWindowUpdated` from `autocompact_state.effective_window`, falling
   back to `result.modelUsage[<model>].contextWindow`. This is the effective, post-headroom number,
-  which is exactly what §10.3 wants.
+  which is exactly what the spec's context gauge (§10.3) wants.
 - **Tokens.** `TokenUsage { input, output, total }` from `result.usage`, with
   `input = input_tokens + cache_creation_input_tokens + cache_read_input_tokens`. Document the
   consequence: with `tokens.cost_estimation = true`, flat per-Mtok rates **overstate** cost, because
@@ -342,8 +348,8 @@ Generalize the wording from "Codex" to "the active harness" and add:
   pay-as-you-go API billing instead of the subscription. `system/init.apiKeySource` reports which
   path was used (`"none"` = OAuth/subscription); surface anything else as a warning so a stray key in
   the environment cannot silently start spending credits.
-- If the child reports unauthenticated, fail the thread open with a message naming the fix, as §12.2
-  already requires for Codex.
+- If the child reports unauthenticated, fail the thread open with a message naming the fix, as spec
+  §12.2 already requires for Codex.
 
 ---
 
@@ -351,9 +357,18 @@ Generalize the wording from "Codex" to "the active harness" and add:
 
 | Giskard preset | `--permission-mode` | Notes |
 | --- | --- | --- |
-| `ask_first` | `manual` | only meaningful with live approvals (§9); without them it has nothing to ask |
-| `auto_approve` | `acceptEdits` | edits proceed, escalations still ask |
-| `full_access` | `bypassPermissions` | needs `--allow-dangerously-skip-permissions`; the CLI warns that in this mode `can_use_tool` is never consulted |
+| `ask_first` | `default` | **verified** — this is the mode the §9.2 round trip ran in: no auto-approvals, unmatched calls reach `can_use_tool`. (`manual` is accepted on the command line but `system/init` reports it back as `default`, so use `default` and avoid the discrepancy.) |
+| `auto_approve` | `acceptEdits` | file edits and filesystem commands inside the workspace proceed; other escalations still ask |
+| `full_access` | `bypassPermissions` | `can_use_tool` is never consulted in this mode. **Refuses to start as root** — see below |
+
+**`full_access` cannot be assumed available.** Launching with `--permission-mode bypassPermissions`
+exits non-zero with `--dangerously-skip-permissions cannot be used with root/sudo privileges for
+security reasons`. Giskard is a self-hosted single-user app that is quite often run as root in a
+container, so this is a live failure mode, not an edge case: on such a host, selecting Full Access
+would fail to start the child at all. The adapter must detect the refusal at spawn and surface a
+browser-visible error naming the cause ("Full Access is unavailable when the server runs as root"),
+rather than reporting a generic spawn failure. Whether Giskard should also hide or disable the preset
+on such a host is a UI question for Phase 4.
 
 **Plan mode collapses the orthogonality.** In Codex, Plan/Build is collaboration mode only and is
 orthogonal to the preset (spec §9.1). In Claude Code, `plan` *is* a permission mode, so Plan + preset
@@ -441,7 +456,7 @@ Rejected for three reasons:
    question the adapter could receive directly.
 2. **Its reply schema is strictly weaker**: `{behavior:"allow", updatedInput?}` or
    `{behavior:"deny", message}` — no `updatedPermissions`, no `interrupt`. That deletes
-   `AcceptForSession` and `Cancel` from the mapping in §9.2, which is half of Giskard's approval card.
+   `AcceptForSession` and `Cancel` from the mapping in §9.3, which is half of Giskard's approval card.
 3. Asks needing real user interaction are explicitly unsupported through it ("MCP tool requires user
    interaction; not supported via `--permission-prompt-tool`").
 
@@ -499,8 +514,8 @@ Two findings from the round trip:
   control this explicitly, not inherit it.
 - **`permission_suggestions` is typed and carries a `destination`.** Echoing a `localSettings`
   suggestion back **writes a permanent rule into the user's project** — observed, see §9.3 — which
-  Giskard must never do as a side effect of one approval card. This is why `AcceptForSession` is
-  implemented inside Giskard instead.
+  Giskard must never do as a side effect of one approval card. Hence the destination invariant in
+  §9.3: rewrite every suggestion to `session` before returning it.
 
 ### 9.3 Decision mapping
 
@@ -594,17 +609,16 @@ A regression test belongs here: approve for session, then assert both that the r
 rule(s) to destination 'session': [...]`), including the rule in the CLI's canonical stored form. That is
 the channel for diagnosing an `AcceptForSession` that silently fails to match.
 
-`ApprovalKind` mapping: `Bash` → `CommandExecution{command,cwd}`; `Edit`/`Write`/`NotebookEdit` →
+**`ApprovalKind` mapping.** `Bash` → `CommandExecution{command,cwd}`; `Edit`/`Write`/`NotebookEdit` →
 `FileChange{path,change}`; `mcp__<server>__<tool>` → `McpToolCall{server,tool_name}`; everything else
 → `Permission{detail}`. `display_name`, `description`, `blocked_path` and the suggestions fill
 `ApprovalMetadata`.
 
-**Recommendation (revised after the round trip):** advertise `live_approvals: true` and build the
-approval path in the adapter's first working milestone. The wire shape is no longer a risk, the
-decision mapping is 1:1, and the alternative ships a Claude harness whose only usable presets are
-"auto-approve" and "bypass" — a downgrade against the Codex experience in the feature Giskard treats
-as central. Every decision in the table above is now verified on the wire, so the adapter can be
-written against a settled contract.
+**Conclusion.** Advertise `live_approvals: true` and build the approval path in the adapter's first
+working milestone. Every row of the table above is verified on the wire, so the adapter is written
+against a settled contract rather than a guess; and the alternative — deferring approvals — ships a
+Claude harness whose only usable presets are "auto-approve" and "bypass", a downgrade against Codex in
+the feature Giskard treats as central.
 
 ### 9.4 The hook route, postponed
 
@@ -616,7 +630,7 @@ protocol defect but an ordering one: `can_use_tool` is consulted *last*. Deny ru
 permission mode, and allow rules — including allow rules from the user's own `settings.json` — are all
 evaluated first, and anything they approve never reaches the callback. That is the §8 hazard: an
 `ask_first` thread can execute a command without asking, because the user once allowed it locally. The
-MVP's mitigation is `--setting-sources` (open question 3), which works by *removing* the user's
+MVP's mitigation is `--setting-sources ""` (§8), which works by *removing* the user's
 configuration rather than by overriding it. A hook is the only route that holds unconditionally: it
 runs before every other step, and its deny stands even in `bypassPermissions`.
 
@@ -630,7 +644,7 @@ runs before every other step, and its deny stands even in `bypassPermissions`.
    through the harness that raised the ask. A hook-raised ask arrives from outside any harness, so the
    registry needs a path that does not assume a `ThreadHandle`.
 3. **Hook installation is state on the user's machine**, not process arguments — the harness would be
-   writing settings, which Giskard has so far been careful never to do (§9.2's `destination` caveat).
+   writing settings, which Giskard is otherwise careful never to do (the destination invariant, §9.3).
    A per-child `--settings` payload is the likely way to keep it ephemeral, and needs verification.
 4. **Both channels would be live at once.** The hook covers every call; `can_use_tool` still fires for
    what the hook passes through. Giskard must not raise two approval cards for one tool call, so
@@ -648,7 +662,8 @@ should have asked about, or the first user who wants their local `settings.json`
 
 ## 10. Not in v1
 
-Structured diffs; native rename/archive/delete; MCP reload and OAuth; `terminate_command`; linked
+Structured diffs; native rename/archive/delete (Giskard applies all three locally instead, §5.6);
+MCP reload and OAuth; `terminate_command`; linked
 sub-agent child threads; idle process reaping; `sdkMcpServers`; **hook-based approval enforcement**
 — the stdio channel is the MVP's only approval path, with the hook route deferred to a later decision
 and refactor (§9.4); and **honouring any settings source**, including a repo's own
@@ -661,8 +676,10 @@ and refactor (§9.4); and **honouring any settings source**, including a repo's 
 Each phase carries the `AGENTS.md` obligations: `cargo fmt`/`clippy -D warnings`, error-path tests,
 structured logs at new boundaries, and doc sync in the same change.
 
-**Phase 0 — protocol verification.** Establish each protocol behaviour the adapter depends on by
-running it against the real CLI, before any of it is assumed in code.
+### Phase 0 — protocol verification
+
+Establish each protocol behaviour the adapter depends on by running it against the real CLI, before any
+of it is assumed in code.
 
 *Verified:* `can_use_tool` allow, deny, deny-with-`interrupt`, and session-scoped `updatedPermissions`
 (§9.3); `interrupt`, `set_model`, `set_permission_mode` (§3.3); concurrent same-cwd sessions (§3.4).
@@ -672,38 +689,76 @@ running it against the real CLI, before any of it is assumed in code.
 Each run's transcript is sanitized and kept as a fixture for the mapper tests — the §9.2 ask payload is
 the first one.
 
-**Phase 1 — multi-harness plumbing (no Claude yet).** `HarnessKind`; `ProviderConfig.harness`;
-`ThreadFile.harness` + `harness_thread_ids` (with default-on-read migration); registry re-keying and
-binding-based routing; harness-scoped `find_thread_by_harness_id`; dispatching `HarnessFactory`; soft
-`Unsupported` handling for rename/archive/delete. Provable entirely with `ReplayHarness` +
-`giskard-server-replay` — a second replay instance registered under a different kind gives a real
-two-harness test without any CLI.
+### Phase 1 — preparatory refactors, landable before any Claude code
 
-**Phase 2 — `giskard-harness-claude` MVP.** New crate + README. Wire types, child supervisor, mapper
+Every item below can be built, reviewed and merged **without the Claude adapter existing**, each as its
+own change. Two of them fix defects that exist today; the rest are structural preparation that leaves
+behaviour identical while there is only one harness. All are provable with `ReplayHarness` and
+`giskard-server-replay` — registering a second replay instance under a different kind gives a genuine
+two-harness test with no CLI involved.
+
+| # | Change | Justification today, without Claude | Depends on |
+| --- | --- | --- | --- |
+| **P1** | **Soft `Unsupported` for `set_thread_name` / `set_thread_archived` / `delete_thread`** (§5.6) | **Resolves a contradiction inside the current design.** `AgentHarness` declares these optional — its default implementations return `Unsupported` — while the server turns `Unsupported` into a user-visible HTTP 400 (`routes.rs:3549`). The trait says "may be absent", the server says "must exist". Nothing trips it today (Codex implements all three; `ReplayHarness` overrides them with `Ok`), so this is a consistency fix rather than a bug fix — but it is the contract that decides whether a harness can decline an operation at all. | — |
+| **P2** | **Thread-scoped capabilities** (§5.4) | **Corrects the shape, before it has consequences.** Capabilities belong to the harness serving a thread, not to a project; today the two coincide, so there is no user-visible symptom — which is precisely why it is cheap now and expensive once a project can hold two harnesses. The capability-driven UI (spec §13.5) is the consumer. | — |
+| **P3** | **`HarnessKind` newtype** replacing the bare `String` on `ProjectConfig.harness`, `config.toml`, and the factory | One place parses and validates a harness name instead of string comparisons scattered across the binary and the store. Pure typing; no behaviour change. | — |
+| **P4** | **`ProviderConfig.harness` + `harness_for(&ModelRef, &Config)`** (§5.1) | Additive config field defaulting to `"codex"`; every existing `config.toml` keeps working and the lookup returns `codex` for everything. Establishes provider→harness as the single source of truth before anything depends on it. | P3 |
+| **P5** | **Dispatching `HarnessFactory`** — a table keyed by `HarnessKind` instead of `bin/giskard-server.rs:19`'s `if config.harness != "codex"` | Turns a hardcoded rejection into an extension point, and lets the replay binary register its own kind by the same mechanism the real binary uses. | P3 |
+| **P6** | **Registry re-keying to `(ProjectId, HarnessKind)`** plus the `HarnessKind` on `ThreadBinding` (§5.2) | The structural centre of the work, and the riskiest to combine with adapter development. Landing it alone keeps behaviour identical with one kind while making the two-harness test possible. | P3, P5 |
+| **P7** | **`ThreadFile.harness` + `harness_thread_ids`, default-on-read** (§5.3) | A forward-compatible persistence migration. Landing it early means existing installations are already writing files that carry the field before any feature reads it, so the Claude work never needs a migration step of its own. | P3 |
+| **P8** | **Harness-scoped `find_thread_by_harness_id`** (`routes.rs:560`) | Hardening: the lookup compares an opaque native id with no notion of which harness minted it. Harmless today, wrong the moment two id namespaces share the field. | P6, P7 |
+
+Suggested order: **P1, P2** first — they are self-contained, argue for themselves as design fixes, and
+are worth merging whether or not the Claude harness is ever built. Then **P3 → P5 → P6**, the structural
+spine. **P4, P7, P8** can land alongside at any point after their dependencies.
+
+Being honest about what this phase is: apart from P1 and P2, these changes buy no user-visible
+improvement on a Codex-only installation. Their value is that the risky structural work is separated
+from the unfamiliar protocol work, so a regression during Phase 2 has an unambiguous cause. If the
+Claude harness were abandoned after Phase 1, P1–P3 would still be worth keeping and P4–P8 would be
+harmless but idle.
+
+The two-harness test to add with P6 is the acceptance criterion for the whole phase: two projects, or
+one project with two threads, served by two `ReplayHarness` instances registered under different kinds,
+asserting that turns, approvals, interrupts and deletion each reach the right instance.
+
+### Phase 2 — `giskard-harness-claude` MVP
+
+New crate + README. Wire types, child supervisor, mapper
 (`assistant`/`stream_event`/`user`/`result` → items and turns), `open_thread`/`start_turn`/
 `subscribe`/`interrupt`/`shutdown`, **`can_use_tool` ↔ `ApprovalRequested` with the §9 decision
 mapping**, token usage, `ContextWindowUpdated`, static `list_models`, capability set from §4. Mapper
 unit tests off Phase-0 fixtures, including a denial that must not be reported as an executed-and-failed
 tool call.
 
-**Phase 3 — the rest of the control channel.** `set_model` / `set_permission_mode` (per-turn model and
+### Phase 3 — the rest of the control channel
+
+`set_model` / `set_permission_mode` (per-turn model and
 mode without respawning), elicitation / `request_user_dialog` → `ServerRequestReceived`,
 `rate_limit_event` → `Notice`, `/compact`, `AcceptForSession` via session-destination
 `updatedPermissions`.
 
-**Phase 4 — cross-harness UX.** Model-picker filtering by provider→harness, the switch confirmation
+### Phase 4 — cross-harness UX
+
+Model-picker filtering by provider→harness, the switch confirmation
 and `Notice` of §5.5, capability-driven UI checks, screenshot regeneration if the picker changes
 (`tests/e2e/screenshots.sh`).
 
-**Phase 5 — polish.** Idle reaping (make `idle_shutdown_secs` real), synthesized `FileChange`/
+### Phase 5 — polish
+
+Idle reaping (make `idle_shutdown_secs` real), synthesized `FileChange`/
 `DiffUpdated`, version-drift warning surfaced in the UI.
 
-**Later, as its own decision — the hook route (§9.4).** Not scheduled here on purpose: it is a
+### Later, as its own decision — the hook route (§9.4)
+
+Not scheduled here on purpose: it is a
 refactor of how an approval reaches the server (second inbound channel, approval routing that does not
 assume a `ThreadHandle`, ephemeral hook installation, cross-transport deduplication by `tool_use_id`),
 and it should be decided against a working harness rather than designed in advance.
 
-**Docs to update:** `specs/giskard-specification.md` (§4.1/4.2 capability wording, new §4.8 Claude
+### Documentation to update
+
+`specs/giskard-specification.md` (§4.1/4.2 capability wording, new §4.8 Claude
 mapping, §4.7 → per-harness process lifecycle, §6.4, §8.2/8.3, §9.1, §12.2, §13.5); `README.md`
 (one-process-per-project claim at line 60, crate list, setup); `config.example.toml` (provider
 `harness` key, `[[providers]]` block for Anthropic); `docs/subagents.md` (state that linked children
@@ -718,10 +773,12 @@ Codex adapter's identifier/lifecycle contract.
 | --- | --- |
 | Giskard owns unversioned wire types; Claude Code ships often | Pin a tested version, log `claude_code_version`, warn on drift, keep the mapper tolerant of unknown message types (log at `debug`, never fail a turn) |
 | Local settings allow-rules undercut `ask_first` — **observed**, not theoretical (§9) | MVP: controlled `--setting-sources`, documented, with a regression test that the preset's promise holds. Durable fix is the hook route, postponed by decision (§9.4) — this risk stays open until then |
-| One process per loaded thread | MVP accepts it and documents the cost; reaping in Phase 5 |
+| One process per loaded thread, **measured at 440–530 MB RSS** | MVP accepts the cost and logs the live-child count so growth is visible; reaping in Phase 5. At the spec's ~10-thread scale this is gigabytes, so it is a capacity question, not a detail |
 | Cross-harness model switch loses agent context | Explicit confirm + `Notice` + remembered native ids (§5.5) |
 | Cost/quota semantics differ under a subscription | Treat euro cost as notional; surface `rate_limit_event` (§6) |
-| Registry re-keying touches approval/interrupt/delete routing | Phase 1 is harness-agnostic and fully testable with two replay harnesses before any CLI is involved |
+| Registry re-keying touches approval/interrupt/delete routing | Phase 1 lands it separately from any adapter work and proves it with two replay harnesses, so a regression there cannot be confused with a protocol bug |
+| `full_access` is unavailable when the server runs as root — **observed** (§8) | Detect the spawn refusal and surface a browser-visible cause; decide in Phase 4 whether to hide the preset on such a host |
+| Claude Code auto-approves through a mode or rule before `can_use_tool` is consulted | Presets pin the mode explicitly and `--setting-sources ""` removes rule sources; the ordering itself is only fixable by the hook route (§9.4) |
 
 ---
 
