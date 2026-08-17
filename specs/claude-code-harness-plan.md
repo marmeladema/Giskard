@@ -503,10 +503,14 @@ contain a redirect — a distinction no user should have to reason about. The co
 occasionally gets asked again after choosing "for session".
 
 Per the `AGENTS.md` rule that degraded-but-usable flows surface rather than fail silently, the adapter
-logs when it happens (thread, tool, and the fact that no rule suggestion was offered), so a complaint
-can be confirmed from logs instead of reproduced by guesswork. If complaints do arrive, the narrow fix
-is already visible: fall back to Giskard-side session memory **only** for asks that carry no `addRules`
-suggestion, leaving the verified wire path untouched for everything else.
+logs when it happens (thread, tool, and the fact that no rule suggestion was offered), so a report can
+be confirmed from logs instead of reproduced by guesswork.
+
+**No fix is chosen.** If reports arrive, the investigation starts from those logs and from what the
+harness offers for the affected calls; the answer is not known yet and should not be guessed here. One
+option is ruled out in advance: Giskard does not maintain its own map of session approvals. Approval
+state belongs to the harness process that enforces it (§9.3, above), and a second copy in Giskard would
+be a parallel source of truth that can disagree with the one doing the work.
 
 Also observed while establishing this: echoing the CLI's suggestion **unmodified** writes a persistent
 rule into the user's project (`.claude/settings.local.json` gained `"Bash(echo A > a.txt)"`), because
@@ -540,8 +544,8 @@ the channel for diagnosing an `AcceptForSession` that silently fails to match.
 approval path in the adapter's first working milestone. The wire shape is no longer a risk, the
 decision mapping is 1:1, and the alternative ships a Claude harness whose only usable presets are
 "auto-approve" and "bypass" — a downgrade against the Codex experience in the feature Giskard treats
-as central. Every decision in the table above is now either verified on the wire or resolved to a
-Giskard-side implementation, so the adapter can be written against a settled contract.
+as central. Every decision in the table above is now verified on the wire, so the adapter can be
+written against a settled contract.
 
 ### 9.4 The hook route, postponed
 
