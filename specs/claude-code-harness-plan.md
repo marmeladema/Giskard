@@ -437,10 +437,10 @@ Two findings from the round trip:
 - **`--setting-sources ""` is the knob that makes `ask_first` honest.** With the user's settings
   loaded, the same probe auto-approved the command and no ask was ever emitted (§8). Giskard must
   control this explicitly, not inherit it.
-- **`permission_suggestions` is typed and carries a `destination`.** `AcceptForSession` must reuse
-  only the `session`-destination suggestions; a suggestion with `destination: "localSettings"` would
-  write a permanent rule into the user's own settings file, which Giskard must never do as a side
-  effect of one approval card.
+- **`permission_suggestions` is typed and carries a `destination`.** Echoing a `localSettings`
+  suggestion back **writes a permanent rule into the user's project** — observed, see §9.3 — which
+  Giskard must never do as a side effect of one approval card. This is why `AcceptForSession` is
+  implemented inside Giskard instead.
 
 ### 9.3 Decision mapping
 
@@ -448,11 +448,44 @@ Two findings from the round trip:
 
 | `ApprovalDecision` | Claude response |
 | --- | --- |
-| `Accept` | `{behavior:"allow"}` |
-| `AcceptForSession` | `{behavior:"allow", updatedPermissions:[…from permission_suggestions]}`, or Giskard-side session memory — §9.2.1 already defines "session" as harness-process lifetime, fail-closed on respawn, which is precisely a child's lifetime |
-| `Decline` | `{behavior:"deny", message:"Declined"}` |
-| `Cancel` | `{behavior:"deny", interrupt:true}` — the `interrupt` flag is Codex's Cancel semantics |
+| `Accept` | `{behavior:"allow"}` — **verified** |
+| `AcceptForSession` | **Giskard-side session memory, not the wire.** See below |
+| `Decline` | `{behavior:"deny", message:"Declined"}` — **verified**: tool blocked, turn continues and completes normally |
+| `Cancel` | `{behavior:"deny", interrupt:true}` — **verified**, and genuinely distinct from `Decline` (below) |
 | `AcceptWithExecPolicyAmendment` | no analogue — do not advertise it in `available` |
+
+**`Cancel` verified.** Replying `{"behavior":"deny","message":…,"interrupt":true}` aborts the whole
+turn: `subtype: "error_during_execution"`, `terminal_reason: "aborted_streaming"`, `is_error: true`,
+`stop_reason: null`. The plain `Decline` reply on the same setup left the turn running to a normal
+`stop_reason: "end_turn"`. So the two decisions really are different operations, as in Codex.
+
+*Mapping consequence:* a turn Giskard itself cancelled must be persisted as
+`TurnStatusKind::Interrupted`, **not** `Failed`, even though the harness reports `is_error: true` and
+an error-shaped subtype. The adapter knows which it is, because it sent the `interrupt`.
+
+**`AcceptForSession` — do not use `updatedPermissions`.** Tested three ways:
+
+| Reply | Result |
+| --- | --- |
+| Synthesized `addRules` glob (`echo *`), `destination: "session"` | no effect; every later call still asked |
+| The CLI's **own** `permission_suggestions` echoed back verbatim | rule written to `.claude/settings.local.json` as `"Bash(echo A > a.txt)"`; later calls still asked, because the suggested rule is scoped to the **exact command string** |
+| Exact-command `addRules`, `destination: "session"` | no file written, and the *identical* command re-asked all three times |
+
+Two conclusions. First, `updatedPermissions` is honoured, but only the `localSettings` destination did
+anything observable — and what it did was **write a persistent rule into the user's project**, which
+confirms the §9.2 destination hazard by observation rather than by reading a schema. Second, none of it
+suppressed a later ask, and it cannot under the MVP's `--setting-sources ""` policy (§8): a rule
+written into a settings file the session does not load can never match. The two plan decisions are in
+direct tension, and `--setting-sources` wins because it is what makes `ask_first` honest.
+
+So implement `AcceptForSession` **inside Giskard**: remember the approved `(tool_name, input)` for the
+child's lifetime and auto-answer matching asks without troubling the browser. Spec §9.2.1 already
+defines "session" as exactly that — harness-process lifetime, fail-closed on respawn — so this needs no
+new semantics, is harness-neutral, and never writes to the user's repository.
+
+*Untested branch:* whether a `localSettings` rule suppresses matching asks when settings sources **are**
+loaded. Not worth resolving — Giskard should not be writing permission rules into a user's project from
+one approval click regardless of the answer.
 
 `ApprovalKind` mapping: `Bash` → `CommandExecution{command,cwd}`; `Edit`/`Write`/`NotebookEdit` →
 `FileChange{path,change}`; `mcp__<server>__<tool>` → `McpToolCall{server,tool_name}`; everything else
@@ -463,8 +496,8 @@ Two findings from the round trip:
 approval path in the adapter's first working milestone. The wire shape is no longer a risk, the
 decision mapping is 1:1, and the alternative ships a Claude harness whose only usable presets are
 "auto-approve" and "bypass" — a downgrade against the Codex experience in the feature Giskard treats
-as central. Only `Cancel`'s `interrupt: true` behaviour and the `updatedPermissions` reply remain
-unexercised; both are additive to a working allow/deny loop.
+as central. Every decision in the table above is now either verified on the wire or resolved to a
+Giskard-side implementation, so the adapter can be written against a settled contract.
 
 ### 9.4 The hook route, postponed
 
@@ -520,11 +553,10 @@ and refactor (§9.4).
 Each phase carries the `AGENTS.md` obligations: `cargo fmt`/`clippy -D warnings`, error-path tests,
 structured logs at new boundaries, and doc sync in the same change.
 
-**Phase 0 — spikes.** Done: `can_use_tool` allow **and** deny (§9), `interrupt`, `set_model`,
-`set_permission_mode` (§3.3), concurrent same-cwd sessions (§3.4). Remaining: `/compact` over stream
-input, interrupt *mid-tool-call*, `Cancel`'s `interrupt: true` on a deny, and `updatedPermissions` for
-`AcceptForSession`. Capture sanitized transcripts as fixtures for the mapper tests — the §9 ask payload
-is the first one.
+**Phase 0 — spikes.** Done: `can_use_tool` allow, deny, and deny-with-`interrupt` (§9.3), the
+`updatedPermissions` dead end (§9.3), `interrupt`, `set_model`, `set_permission_mode` (§3.3), concurrent
+same-cwd sessions (§3.4). Remaining: `/compact` over stream input, and interrupt *mid-tool-call*.
+Capture sanitized transcripts as fixtures for the mapper tests — the §9.2 ask payload is the first one.
 
 **Phase 1 — multi-harness plumbing (no Claude yet).** `HarnessKind`; `ProviderConfig.harness`;
 `ThreadFile.harness` + `harness_thread_ids` (with default-on-read migration); registry re-keying and
