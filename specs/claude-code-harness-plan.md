@@ -496,6 +496,22 @@ fail-closed on respawn); it is harness-neutral, so Codex and Claude behave ident
 writes to the user's repository. Not sending `updatedPermissions` at all also avoids granting a rule
 twice — once on the wire and once in Giskard's memory.
 
+**Invariant: never send a persistent destination.** `localSettings`, `projectSettings` and
+`userSettings` all write permission rules to disk on the user's machine. Giskard must not do that from
+an approval click — a click means "let this proceed", never "change my configuration permanently".
+The MVP sends no `updatedPermissions` at all; if a later change ever sends one, it must be filtered to
+`destination: "session"`.
+
+The trap this guards against is specific and easy to walk into: the ask payload *contains* a
+`localSettings` suggestion, so the obvious implementation — forward `permission_suggestions` back as
+`updatedPermissions` — is exactly the one that writes to the user's repository. That is how the write in
+§9.2 was produced. Under `--setting-sources ""` it is a pure side effect with no upside: the file
+Giskard just wrote is not even read back by the session that wrote it. With per-thread worktrees it is
+worse than untidy, since each worktree accumulates its own `.claude/settings.local.json`.
+
+Suggestions remain useful as **card metadata** — rendering "always allow `echo A > a.txt`" as a label is
+fine. Acting on one is what writes files.
+
 *Open, and deliberately not chased:* the exact conditions under which an applied `session` rule does
 suppress a later ask. It would change nothing above, and `--debug-file` is the diagnostic channel if a
 future change makes it worth revisiting.
