@@ -181,7 +181,6 @@ session_days = 30
 [[providers]]
 id = "openai"
 name = "OpenAI"
-wire_api = "responses"
   [[providers.models]]
   id = "gpt-5.5"
   context_window = 258400

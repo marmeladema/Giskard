@@ -7210,7 +7210,6 @@ async fn open_thread_normalizes_stale_provider_from_configured_model() {
 [[providers]]
 id = "proxy"
 name = "proxy"
-wire_api = "responses"
 
   [[providers.models]]
   id = "gpt-5.5"
@@ -7344,7 +7343,6 @@ async fn open_thread_normalization_reuses_live_handle() {
 [[providers]]
 id = "proxy"
 name = "proxy"
-wire_api = "responses"
 
   [[providers.models]]
   id = "gpt-5.5"
@@ -7482,7 +7480,6 @@ async fn start_thread_with_initial_message_uses_selected_provider_and_starts_tur
 [[providers]]
 id = "openai"
 name = "OpenAI"
-wire_api = "responses"
 
   [[providers.models]]
   id = "gpt-5.5"
@@ -7493,7 +7490,6 @@ wire_api = "responses"
 [[providers]]
 id = "proxy"
 name = "Proxy"
-wire_api = "responses"
 
   [[providers.models]]
   id = "glm-5.2-workers-ai"
@@ -7610,7 +7606,6 @@ async fn select_model_rejects_provider_change_on_non_empty_thread() {
 [[providers]]
 id = "openai"
 name = "OpenAI"
-wire_api = "responses"
 
   [[providers.models]]
   id = "gpt-5.5"
@@ -7621,7 +7616,6 @@ wire_api = "responses"
 [[providers]]
 id = "proxy"
 name = "Proxy"
-wire_api = "responses"
 
   [[providers.models]]
   id = "glm-5.2-workers-ai"
@@ -7710,7 +7704,6 @@ async fn send_input_rejects_persisted_provider_mismatch_on_non_empty_thread() {
 [[providers]]
 id = "openai"
 name = "OpenAI"
-wire_api = "responses"
 
   [[providers.models]]
   id = "gpt-5.5"
@@ -7721,7 +7714,6 @@ wire_api = "responses"
 [[providers]]
 id = "proxy"
 name = "Proxy"
-wire_api = "responses"
 
   [[providers.models]]
   id = "glm-5.2-workers-ai"

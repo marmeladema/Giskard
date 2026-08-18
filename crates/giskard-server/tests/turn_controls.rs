@@ -148,7 +148,6 @@ filename_template = "plan-{{slug}}-{{ts}}.md"
 [[providers]]
 id = "cloudflare-litellm"
 name = "Cloudflare LiteLLM"
-wire_api = "responses"
 model_listing = false
   [[providers.models]]
   id = "@cf/z-ai/glm-4.7"

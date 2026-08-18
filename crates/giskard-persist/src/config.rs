@@ -140,7 +140,6 @@ pub struct ProviderConfig {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
-    pub wire_api: String,
     #[serde(default)]
     pub model_listing: bool,
     /// API key sent as `Authorization: Bearer …` on the `/v1/models` discovery request (§8.3),
@@ -229,7 +228,6 @@ cost_estimation = false
 [[providers]]
 id = "openai"
 name = "OpenAI (Codex built-in)"
-wire_api = "responses"
 model_listing = false
 
   [[providers.models]]
@@ -248,7 +246,6 @@ model_listing = false
 id = "cloudflare-litellm"
 name = "Cloudflare Workers AI (via LiteLLM)"
 base_url = "http://127.0.0.1:4000/v1"
-wire_api = "responses"
 model_listing = true
 
   [[providers.models]]

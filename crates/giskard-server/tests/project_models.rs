@@ -153,7 +153,6 @@ session_days = 30
 [[providers]]
 id = "openai"
 name = "OpenAI"
-wire_api = "responses"
   [[providers.models]]
   id = "gpt-5.5"
   display_name = "GPT-5.5"
@@ -164,7 +163,6 @@ wire_api = "responses"
 id = "mock"
 name = "Mock"
 base_url = "http://{mock_addr}"
-wire_api = "responses"
 model_listing = true
 "#
         ),
