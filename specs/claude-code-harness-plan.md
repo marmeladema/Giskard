@@ -132,6 +132,59 @@ One caveat to carry into the adapter: `.claude/` project state within the cwd (c
 project-scoped settings) is shared by every session in that directory. Nothing observed conflicts, but
 it means "same cwd" is not full isolation.
 
+### 3.5 Configuration surface
+
+Claude Code's configuration file is `settings.json`, resolved from several scopes with **managed
+(policy) settings highest, then command-line flags, then `.claude/settings.local.json`, then the
+project's `.claude/settings.json`, then `~/.claude/settings.json`**. Credentials do not live there —
+the OAuth session and API keys are held in `~/.claude.json`.
+
+It is a flat file of many top-level keys rather than a few grouped sections. The ones that matter to a
+Giskard adapter:
+
+| Key | Relevance |
+| --- | --- |
+| `permissions` | `allow` / `deny` / `ask` rule lists, **`additionalDirectories`**, `defaultMode`, `disableBypassPermissionsMode` — the whole permission surface §8 and §9 operate on |
+| `env` | environment variables applied to the session; the route by which provider selection is configured (below) |
+| `model`, `availableModels`, `enforceAvailableModels`, `fallbackModel` | model selection and restriction |
+| `apiKeyHelper`, `awsCredentialExport`, `awsAuthRefresh` | credential production for non-subscription auth |
+| `autoCompactEnabled`, `autoCompactWindow` | the compaction behaviour whose state arrives as `autocompact_state` (§3.2) |
+| `cleanupPeriodDays` | how long session transcripts survive — relevant because Giskard's `--resume` depends on them (default 30 days) |
+| `disableAllHooks`, `allowManagedHooksOnly` | constrain the hook route if it is ever adopted (§9.4) |
+| `allowedMcpServers`, `deniedMcpServers`, `disabledMcpjsonServers` | MCP surface |
+
+**`--settings` and `--setting-sources` are independent, and this is load-bearing.**
+`--setting-sources` selects which settings *files* are consulted; `--settings` supplies an explicit
+payload as a file path or inline JSON. **Verified:** with `--setting-sources ""` — Giskard's chosen
+posture (§8) — an inline `--settings` payload is still applied. The test: in `acceptEdits` mode a
+`Write` outside the workspace prompts, and adding
+`--settings '{"permissions":{"additionalDirectories":["/tmp/outside-dir"]}}'` made the same write
+proceed with no ask.
+
+So Giskard can hand a child exactly the configuration it intends, while ignoring every settings file on
+the machine. Two consequences:
+
+- **`--add-dir` has a settings-level equivalent**, `permissions.additionalDirectories`, verified above.
+  Either mechanism works; the flag is simpler for a fixed list, the payload is better if Giskard ever
+  needs to send permission state and directories together.
+- **The hook route's open mechanical question is answered** (§9.4): a per-child `--settings` payload is
+  a viable way to install a hook ephemerally, without writing to the user's settings files.
+
+**There is no provider registry.** Unlike Codex — where `[[providers]]` and `model_providers` name
+endpoints and wire APIs — Claude Code selects its backend entirely through **environment variables**:
+`CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY` for first-party clouds,
+and `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_MODEL`,
+`ANTHROPIC_SMALL_FAST_MODEL` for a gateway or proxy. These can be set in the child's environment
+directly or through the `env` key of a `--settings` payload.
+
+This shapes what a Giskard "provider" means for this harness. For Codex a provider is a per-request
+routing choice; for Claude Code it is **a property of how the child process was launched**. A
+subscription-backed `anthropic` provider and a hypothetical `bedrock` provider would both have
+`harness = "claude"` and differ only in the environment their children receive — which fits §5.1's
+provider→harness lookup without changing it, but means the provider must be resolved at spawn time and
+cannot change within a live child. Only the *model* can (§3.3). Nothing in the MVP needs this; it is
+recorded so the provider field is not mistaken for something the protocol carries.
+
 ---
 
 ## 4. Capability matrix
@@ -350,6 +403,12 @@ Generalize the wording from "Codex" to "the active harness" and add:
   the environment cannot silently start spending credits.
 - If the child reports unauthenticated, fail the thread open with a message naming the fix, as spec
   §12.2 already requires for Codex.
+- Credentials live in `~/.claude.json`, not in any settings file (§3.5), so Giskard's
+  `--setting-sources ""` posture does not disturb the subscription login. The other provider-selecting
+  environment variables (`ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK`, …) deserve the same treatment
+  as `ANTHROPIC_API_KEY`: the child's environment should be constructed deliberately rather than
+  inherited wholesale, or a variable set for some unrelated reason will silently redirect a
+  subscription thread to another backend.
 
 ---
 
@@ -645,9 +704,10 @@ runs before every other step, and its deny stands even in `bypassPermissions`.
 2. **Approval identity moves.** `ApprovalId → ThreadId` routing (`registry.rs:709`) currently resolves
    through the harness that raised the ask. A hook-raised ask arrives from outside any harness, so the
    registry needs a path that does not assume a `ThreadHandle`.
-3. **Hook installation is state on the user's machine**, not process arguments — the harness would be
-   writing settings, which Giskard is otherwise careful never to do (the destination invariant, §9.3).
-   A per-child `--settings` payload is the likely way to keep it ephemeral, and needs verification.
+3. **Hook installation is normally state on the user's machine**, not process arguments — and Giskard
+   must not write settings files (the destination invariant, §9.3). A per-child `--settings` payload
+   avoids that, and §3.5 verifies such a payload applies even with `--setting-sources ""`. This is the
+   one mechanical unknown of the hook route that is now closed.
 4. **Both channels would be live at once.** The hook covers every call; `can_use_tool` still fires for
    what the hook passes through. Giskard must not raise two approval cards for one tool call, so
    `tool_use_id` becomes the deduplication key across two independent transports.
@@ -791,5 +851,9 @@ Codex adapter's identifier/lifecycle contract.
    is derived from a thread's model provider (§5.1), the field is redundant for routing and survives
    only as the project's default and as a label in warnings (`routes.rs:3387`). Keep it as a
    derived-and-persisted default, or drop it and derive everything from `default_model`?
-2. Do Claude threads need `--add-dir` fed from anything beyond the workspace root (Codex reads
-   `sandbox_workspace_write.writable_roots` from its own config for this)?
+2. What should feed a Claude child's extra writable roots? The mechanism is settled — `--add-dir`, or
+   `permissions.additionalDirectories` in a `--settings` payload, both verified (§3.5). The open part
+   is the *source*: Codex reads `sandbox_workspace_write.writable_roots` from its own config, which has
+   no Claude equivalent, so Giskard would need its own project-level setting to express "this project
+   also writes to `~/.cargo` and a shared build cache" — or decide that the workspace root alone is
+   enough for v1.
