@@ -365,7 +365,6 @@ mod tests {
 [[providers]]
 id = "cloudflare-litellm"
 name = "Cloudflare Workers AI (via LiteLLM)"
-wire_api = "responses"
 model_listing = true
   [[providers.models]]
   id = "@cf/z-ai/glm-4.7"
@@ -564,7 +563,6 @@ model_listing = true
 [[providers]]
 id = "p"
 name = "P"
-wire_api = "responses"
   [[providers.models]]
   id = "declared-named"
   display_name = "Config Name"
@@ -754,7 +752,6 @@ wire_api = "responses"
 [[providers]]
 id = "configured"
 name = "Configured"
-wire_api = "responses"
   [[providers.models]]
   id = "shared-model"
   context_window = 1000
@@ -763,7 +760,6 @@ wire_api = "responses"
 [[providers]]
 id = "discovered"
 name = "Discovered"
-wire_api = "responses"
 "#,
         )
         .unwrap();
@@ -805,7 +801,6 @@ wire_api = "responses"
             id: "other".into(),
             name: "Other".into(),
             base_url: None,
-            wire_api: "responses".into(),
             model_listing: false,
             api_key: None,
             api_key_env: None,

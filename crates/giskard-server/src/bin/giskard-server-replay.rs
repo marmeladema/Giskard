@@ -746,7 +746,6 @@ kind = "replay"
 [[providers]]
 id = "replay"
 name = "Replay (scripted)"
-wire_api = "responses"
 model_listing = false
   [[providers.models]]
   id = "replay-model"

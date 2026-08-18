@@ -225,7 +225,6 @@ session_days = 30
 [[providers]]
 id = "{NEW_PROVIDER}"
 name = "opencodex proxy"
-wire_api = "responses"
 model_listing = false
   [[providers.models]]
   id = "glm-5.2"
@@ -236,7 +235,6 @@ model_listing = false
 [[providers]]
 id = "openai"
 name = "OpenAI"
-wire_api = "responses"
 model_listing = false
   [[providers.models]]
   id = "gpt-5.5"

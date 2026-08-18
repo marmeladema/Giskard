@@ -2349,9 +2349,9 @@ UI always shows provider + model together.
 ### 8.2 Provider configuration
 
 Providers are declared in `config.toml` (§16.3). Each declares: `id`, display `name`,
-`base_url`, auth reference, `wire_api` (`responses`/`chat`), and whether it exposes a model
-list endpoint. Example providers relevant here: OpenAI direct (Codex's built-in), and a
-LiteLLM gateway fronting Cloudflare Workers AI.
+`base_url`, auth reference, and whether it exposes a model list endpoint. Example providers
+relevant here: OpenAI direct (Codex's built-in), and a LiteLLM gateway fronting Cloudflare
+Workers AI.
 
 > Note: Codex itself reads its own `~/.codex/config.toml` for provider/auth (Codex is
 > "already configured", §12.2). Giskard's provider config governs (a) what the UI offers in
@@ -3407,7 +3407,6 @@ cost_estimation = false
 [[providers]]
 id = "openai"
 name = "OpenAI (Codex built-in)"
-wire_api = "responses"
 model_listing = false
   # typed model entries carry the metadata the UI needs (§8.3):
   [[providers.models]]
@@ -3425,7 +3424,6 @@ model_listing = false
 id = "cloudflare-litellm"
 name = "Cloudflare Workers AI (via LiteLLM)"
 base_url = "http://127.0.0.1:4000/v1"
-wire_api = "responses"          # LiteLLM bridges /responses → /chat/completions
 model_listing = true            # GET /v1/models available; merged over static entries
   [[providers.models]]          # static fallback; dynamic listing may add/refine
   id = "@cf/z-ai/glm-4.7"

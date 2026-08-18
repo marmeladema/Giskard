@@ -147,7 +147,6 @@ session_days = 30
 id = "mock"
 name = "Mock"
 base_url = "http://{mock_addr}"
-wire_api = "responses"
 model_listing = true
   [[providers.models]]
   id = "static-model"
@@ -309,7 +308,6 @@ session_days = 30
 id = "secured"
 name = "Secured"
 base_url = "http://{mock_addr}"
-wire_api = "responses"
 model_listing = true
 api_key = "secret-key"
 "#
@@ -394,7 +392,6 @@ session_days = 30
 id = "secured"
 name = "Secured"
 base_url = "http://{mock_addr}"
-wire_api = "responses"
 model_listing = true
 "#
         ),

@@ -73,7 +73,6 @@ idle_shutdown_secs = 0
 [[providers]]
 id = "openai"
 name = "OpenAI (Codex built-in)"
-wire_api = "responses"
 model_listing = false
   [[providers.models]]
   id = "gpt-5.5"
@@ -90,7 +89,6 @@ model_listing = false
 id = "cloudflare-litellm"
 name = "Cloudflare Workers AI (via LiteLLM)"
 base_url = "http://127.0.0.1:4000/v1"   # GET {base_url}/models is merged over the static list
-wire_api = "responses"
 model_listing = true
 # Auth for the /v1/models discovery request (e.g. a LiteLLM master key). Sent as
 # `Authorization: Bearer <key>`. Use `api_key` for an inline secret, or `api_key_env` to read it
