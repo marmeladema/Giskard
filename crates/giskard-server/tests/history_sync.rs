@@ -191,16 +191,7 @@ async fn history_pagination_over_websocket() {
     let pid = ProjectId::new();
     state
         .store
-        .create_project(
-            pid,
-            "proj",
-            &proj_dir.path().to_string_lossy(),
-            giskard_core::model::ModelRef {
-                provider: "openai".into(),
-                model: "gpt-5.5".into(),
-                reasoning_effort: None,
-            },
-        )
+        .create_project(pid, "proj", &proj_dir.path().to_string_lossy())
         .await
         .unwrap();
 
@@ -357,16 +348,7 @@ async fn resync_delta_over_websocket() {
     let pid = ProjectId::new();
     state
         .store
-        .create_project(
-            pid,
-            "proj",
-            &proj_dir.path().to_string_lossy(),
-            giskard_core::model::ModelRef {
-                provider: "openai".into(),
-                model: "gpt-5.5".into(),
-                reasoning_effort: None,
-            },
-        )
+        .create_project(pid, "proj", &proj_dir.path().to_string_lossy())
         .await
         .unwrap();
 
@@ -489,16 +471,7 @@ async fn subscribe_corrupt_history_returns_structured_error() {
     let pid = ProjectId::new();
     state
         .store
-        .create_project(
-            pid,
-            "proj",
-            &proj_dir.path().to_string_lossy(),
-            giskard_core::model::ModelRef {
-                provider: "openai".into(),
-                model: "gpt-5.5".into(),
-                reasoning_effort: None,
-            },
-        )
+        .create_project(pid, "proj", &proj_dir.path().to_string_lossy())
         .await
         .unwrap();
 

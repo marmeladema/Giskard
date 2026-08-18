@@ -16,14 +16,15 @@ use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{Item, ItemPayload};
 use giskard_core::mcp::McpServerStatus;
-use giskard_core::model::ModelDescriptor;
+use giskard_core::model::{ModelDescriptor, ModelRef};
 use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::TurnOverrides;
 use giskard_core::turn::{TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+    AgentEventStream, AgentHarness, HarnessCapabilities, HarnessProvider, OpenThreadOptions,
+    ThreadHandle,
 };
 
 /// A recorded fixture: an ordered list of `AgentEvent`s to replay.
@@ -90,6 +91,16 @@ pub struct ReplayHarness {
     /// When set, `list_models` fails with this message instead of returning `models` — used to
     /// exercise the server's best-effort degradation when a harness catalog query errors.
     models_error: Option<String>,
+    /// Provider table returned by `list_providers` (empty unless set via
+    /// [`ReplayHarness::with_providers`]), standing in for a real harness's own provider config.
+    providers: Vec<HarnessProvider>,
+    /// When set, `list_providers` fails with this message instead of returning `providers`.
+    providers_error: Option<String>,
+    /// The model reported for a thread imported by native id, where the caller names none and a
+    /// real harness answers from the thread's own record. Defaults to `openai/gpt-5.5`; a test
+    /// whose config does not offer that model sets its own with
+    /// [`ReplayHarness::with_imported_model`].
+    imported_model: ModelRef,
     shutdown_called: AtomicBool,
 }
 
@@ -109,6 +120,7 @@ impl ReplayHarness {
                 structured_diffs: true,
                 resumable_threads: true,
                 model_listing: false,
+                provider_listing: false,
                 token_usage: true,
                 mcp_status: true,
                 mcp_reload: true,
@@ -119,6 +131,13 @@ impl ReplayHarness {
             fixtures: Mutex::new(fixtures),
             models: Vec::new(),
             models_error: None,
+            providers: Vec::new(),
+            providers_error: None,
+            imported_model: ModelRef {
+                provider: "openai".into(),
+                model: "gpt-5.5".into(),
+                reasoning_effort: None,
+            },
             shutdown_called: AtomicBool::new(false),
         }
     }
@@ -136,6 +155,32 @@ impl ReplayHarness {
     pub fn with_failing_models(mut self, message: impl Into<String>) -> Self {
         self.capabilities.model_listing = true;
         self.models_error = Some(message.into());
+        self
+    }
+
+    /// Advertise a provider table: sets what `list_providers` returns and turns on the
+    /// `provider_listing` capability, so the server resolves discovery endpoints and validates
+    /// configured provider ids against it.
+    pub fn with_providers(mut self, providers: Vec<HarnessProvider>) -> Self {
+        self.capabilities.provider_listing = true;
+        self.providers = providers;
+        self
+    }
+
+    /// Advertise `provider_listing` but make `list_providers` fail, to exercise the server's
+    /// best-effort degradation (the picker should still get the static config list).
+    pub fn with_failing_providers(mut self, message: impl Into<String>) -> Self {
+        self.capabilities.provider_listing = true;
+        self.providers_error = Some(message.into());
+        self
+    }
+
+    /// Set the model this harness reports for a thread imported by native id — the stand-in for
+    /// the model that thread was already on. Tests whose configured providers do not include the
+    /// default `openai/gpt-5.5` need this, or the imported thread lands on a provider their config
+    /// never declared.
+    pub fn with_imported_model(mut self, model: ModelRef) -> Self {
+        self.imported_model = model;
         self
     }
 
@@ -185,6 +230,13 @@ impl AgentHarness for ReplayHarness {
         }
     }
 
+    async fn list_providers(&self) -> Result<Vec<HarnessProvider>, HarnessError> {
+        match &self.providers_error {
+            Some(message) => Err(HarnessError::Transport(message.clone())),
+            None => Ok(self.providers.clone()),
+        }
+    }
+
     async fn list_mcp_servers(&self) -> Result<Vec<McpServerStatus>, HarnessError> {
         Ok(vec![])
     }
@@ -229,7 +281,13 @@ impl AgentHarness for ReplayHarness {
             warning: None,
             // A deterministic replay applies exactly the requested model, so echo it as
             // effective — this is what lets server tests exercise verified provider switches.
-            resumed_model: Some(opts.initial_model.clone()),
+            // An import names no model, and a harness answers that from the thread itself, so
+            // the fake stands in with its configured one rather than reporting nothing.
+            resumed_model: Some(
+                opts.initial_model
+                    .clone()
+                    .unwrap_or_else(|| self.imported_model.clone()),
+            ),
             agent_name: None,
             parent_harness_thread_id: None,
         })
@@ -474,11 +532,11 @@ mod tests {
                 workspace_root: "/tmp".into(),
                 resume: Some("th_test".into()),
                 resume_policy: giskard_harness::ResumePolicy::AllowFreshFallback,
-                initial_model: ModelRef {
+                initial_model: Some(ModelRef {
                     provider: "openai".into(),
                     model: "gpt-5.5".into(),
                     reasoning_effort: None,
-                },
+                }),
             })
             .await
             .unwrap();
@@ -537,11 +595,11 @@ mod tests {
                 workspace_root: "/tmp".into(),
                 resume: Some("th_test".into()),
                 resume_policy: giskard_harness::ResumePolicy::AllowFreshFallback,
-                initial_model: ModelRef {
+                initial_model: Some(ModelRef {
                     provider: "openai".into(),
                     model: "gpt-5.5".into(),
                     reasoning_effort: None,
-                },
+                }),
             })
             .await
             .unwrap();

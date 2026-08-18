@@ -1,5 +1,7 @@
 //! Regression coverage for Codex-style server-initiated browser requests.
 
+mod common;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -9,7 +11,7 @@ use futures_util::{SinkExt, StreamExt};
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ProjectId, ServerRequestId, ThreadId, TurnId};
-use giskard_core::model::{ModelDescriptor, ModelRef};
+use giskard_core::model::ModelDescriptor;
 use giskard_core::server_request::{ServerRequest, ServerRequestResponse};
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
@@ -22,6 +24,8 @@ use giskard_proto::{ClientMessage, LiveTurnSnapshot, ServerMessage, WireAgentEve
 use giskard_server::{AppState, HarnessFactory, build_app};
 use tokio::sync::{Mutex, broadcast};
 use tokio::time::{Duration, Instant};
+
+use common::fake_native_model;
 
 type TestWs =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -82,6 +86,7 @@ impl AgentHarness for ServerRequestHarness {
             structured_diffs: true,
             resumable_threads: true,
             model_listing: false,
+            provider_listing: false,
             token_usage: true,
             mcp_status: false,
             mcp_reload: false,
@@ -102,7 +107,10 @@ impl AgentHarness for ServerRequestHarness {
                 .resume
                 .unwrap_or_else(|| "server_request_harness".into()),
             warning: None,
-            resumed_model: Some(opts.initial_model.clone()),
+            resumed_model: opts
+                .initial_model
+                .clone()
+                .or_else(|| Some(fake_native_model())),
             agent_name: None,
             parent_harness_thread_id: None,
         })
@@ -258,16 +266,7 @@ async fn spawn_test_app() -> (
     let pid = ProjectId::new();
     state
         .store
-        .create_project(
-            pid,
-            "proj",
-            &proj_dir.path().to_string_lossy(),
-            ModelRef {
-                provider: "openai".into(),
-                model: "gpt-5".into(),
-                reasoning_effort: None,
-            },
-        )
+        .create_project(pid, "proj", &proj_dir.path().to_string_lossy())
         .await
         .unwrap();
 

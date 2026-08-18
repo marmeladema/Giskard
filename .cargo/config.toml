@@ -1,0 +1,16 @@
+# Environment for everything cargo launches, including test binaries.
+#
+# `crates/giskard-server/tests/model_refresh.rs` needs a discovery API key to be *present* in the
+# environment, because that is the only way one can reach a provider: Giskard reads the key from the
+# variable the harness names and never from an inline secret (§8.2), so there is no in-memory path
+# to inject one through.
+#
+# The test must not set it itself. `std::env::set_var` mutates the shared `environ` structure that
+# every reader walks — the hazard is the array and its strings, not the variable name — so setting
+# it while cargo's parallel test threads, the tokio runtime, and reqwest's proxy lookups are reading
+# the environment is a data race, which is why Rust 2024 made that function `unsafe`. Supplying the
+# value here means it already exists before the process has any threads, and the test only reads it.
+#
+# Cargo does not override a variable that is already set, so exporting your own value still wins.
+[env]
+GISKARD_TEST_DISCOVERY_KEY = "secret-key"

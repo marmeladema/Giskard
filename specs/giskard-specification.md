@@ -64,9 +64,12 @@
   its composer, open over it, or mark its rows failed — losing text typed in the meantime, the same
   class of loss as LT6. The continuation touches nothing unless the draft it was started for is
   still the one on screen.
-- **LT9:** The project's model *catalog* (`GET /api/projects/{id}/models`) is a separate fetch from
+- **LT9 (superseded by §8.3 "A new thread's starting model is derived, never stored"):** The
+  project's model *catalog* (`GET /api/projects/{id}/models`) is a separate fetch from
   its default model, and failing it does not block the draft: the default is what `threads/start`
-  carries, and the catalog only governs what else could be picked. The failure is surfaced anyway —
+  carries, and the catalog only governs what else could be picked. The catalog is now the draft's
+  only model source — there is no stored default to fall back to — so failing it does leave the
+  draft with no model, and it says so rather than starting a turn on a guess. The failure is surfaced anyway —
   it leaves the picker with no options at all, so without a message it reads as a project with no
   models rather than a list that could not be loaded. This applies to any active project, not just a
   draft; per-source discovery *warnings* stay gated on an explicit reload, where they are not noise.
@@ -1163,7 +1166,7 @@ Robot series). The Cargo workspace uses `giskard-*` crate names throughout (see 
 ```
 Config (global)
 └── Project (1 directory, 1 harness process)
-    ├── ProjectConfig (workspace root, default model, harness kind, …)
+    ├── ProjectConfig (workspace root, harness kind, …)
     └── Thread (durable conversation)
         ├── ThreadState (mode, current model, permission preset, token totals, context window)
         └── Turn (one user input → agent work)
@@ -1365,6 +1368,9 @@ pub struct HarnessCapabilities {
     /// The harness can list its own model catalog (e.g. Codex's app-server `model/list`),
     /// used to overlay friendly display names onto the configured list (§8.3).
     pub model_listing: bool,
+    /// The harness can report the providers it is configured to route to (§8.2), supplying the
+    /// endpoint and key location for discovery and the set of ids a config may name.
+    pub provider_listing: bool,
     /// Token usage reported on turn completion.
     pub token_usage: bool,
     /// MCP server status can be listed through the harness.
@@ -1381,7 +1387,10 @@ pub struct HarnessCapabilities {
 Codex advertises all Codex-backed capabilities as `true`, including `model_listing`: the adapter
 maps the app-server `model/list` RPC and Giskard overlays that metadata — friendly display names and
 each model's advertised reasoning efforts — onto its config/provider model list, by model id (§8.3).
-Context window still comes from Giskard's config/provider metadata (`model/list` omits it). A future
+Context window still comes from Giskard's config/provider metadata (`model/list` omits it, and
+carries no provider either, which is why `[[providers]]` still declares the pairs). `provider_listing`
+is likewise `true`: the adapter reads Codex's `[model_providers]` table out of `config/read` (§8.2).
+A future
 Claude Code adapter would likely set `live_approvals`,
 `structured_diffs`, `mcp_status`, and possibly `plan_build_modes` to `false` or a degraded form,
 and the UI reacts accordingly (§13.5).
@@ -1395,6 +1404,9 @@ pub trait AgentHarness: Send + Sync {
 
     /// List models available through this harness/provider, if supported.
     async fn list_models(&self) -> Result<Vec<ModelDescriptor>, HarnessError>;
+
+    /// List the providers this harness routes to, if it can introspect its own config (§8.2).
+    async fn list_providers(&self) -> Result<Vec<HarnessProvider>, HarnessError>;
 
     /// List configured MCP servers and their visible tools/resources.
     async fn list_mcp_servers(&self) -> Result<Vec<McpServerStatus>, HarnessError>;
@@ -1908,8 +1920,7 @@ giskard/
 ├── projects.json               # index of projects (id, name, dir, created_at, order)
 ├── projects/
 │   └── <project_id>/
-│       ├── project.json        # ProjectConfig: workspace root, default model,
-│       │                       #   provider defaults, harness kind
+│       ├── project.json        # ProjectConfig: workspace root, harness kind
 │       ├── threads/
 │       │   ├── <thread_id>.json        # thread metadata, permission preset, token cache — no history
 │       │   └── <thread_id>.jsonl       # authoritative turn history, one Turn per line (§5.4)
@@ -1951,7 +1962,10 @@ All defined in `giskard-core`, serialized by `giskard-persist`. Illustrative sha
   "dir": "/home/user/dev/ostinato-radio",
   "harness": "codex",
   "workspace_root": null,               // null ⇒ defaults to `dir`
-  "default_model": { "provider": "openai", "model": "gpt-5.5", "reasoning_effort": "high" },
+  // no default model: a new thread's starting model is derived from the project's catalog (§8.3).
+  // A file written before that change still carries `default_model`; it is ignored on load and
+  // dropped the next time the file is written, because `deny_unknown_fields` would otherwise
+  // make every pre-existing project unloadable.
   "created_at": "…", "updated_at": "…"
 }
 ```
@@ -2089,7 +2103,8 @@ This section exists so the migration path is pre-approved; do **not** implement 
 ### 6.1 Project creation
 
 Flow: user clicks "New project" → names it → picks a directory via the file browser (§6.2)
-→ optionally sets workspace root and default model → confirm.
+→ optionally sets workspace root → confirm. No model is chosen here: the project has no harness
+yet, so there is no catalog to choose from (§8.3).
 
 - The chosen directory may be **empty or existing, git or non-git** — all valid. No git
   requirement, no scaffolding.
@@ -2348,14 +2363,39 @@ UI always shows provider + model together.
 
 ### 8.2 Provider configuration
 
-Providers are declared in `config.toml` (§16.3). Each declares: `id`, display `name`, an
-optional `base_url`, an optional auth reference, and whether it exposes a model list endpoint.
-Example providers relevant here: OpenAI direct (Codex's built-in), and a LiteLLM gateway
-fronting Cloudflare Workers AI.
+Providers are declared in `config.toml` (§16.3). A declaration carries only what the harness
+cannot supply: an `id`, whether to run model-list discovery, and the models to offer. Example
+providers relevant here: OpenAI direct (Codex's built-in), and a LiteLLM gateway fronting
+Cloudflare Workers AI.
+
+**The harness owns provider configuration.** A provider's display name, endpoint, and key
+location already exist in the harness's own configuration, and Giskard reads them back through
+`AgentHarness::list_providers` (behind the `provider_listing` capability) rather than asking the
+user to restate them. Restating them is not merely redundant: two copies of an endpoint drift,
+and the copy Giskard holds is not the one that routes turns. A harness that cannot introspect its
+own configuration reports nothing, and Giskard falls back to the declared list alone.
+
+Only the **name** of an environment variable holding a key is read, never an inline secret. A
+harness may hold one (Codex's `experimental_bearer_token`), but copying it into Giskard would
+spread a credential into another process's memory and logs to no end; discovery against such a
+provider requires the env-var form instead.
+
+**Id validation.** A `[[providers]] id` is the routing key sent to the harness, so an id the
+harness does not know cannot route. Giskard checks the configured ids against the harness's
+provider table whenever it composes a project's model list, and reports each unknown id as a
+warning (§8.3) naming the provider. The models stay in the picker — the harness may be
+misconfigured rather than the id being wrong — but the mismatch is surfaced at picker time
+instead of arriving as a provider-side `model_not_found` in the middle of a turn. An unanswered
+table (no capability, or a failed query) validates nothing: silence is not evidence that the ids
+are wrong.
 
 > Note: Codex itself reads its own `~/.codex/config.toml` for provider/auth (Codex is
 > "already configured", §12.2). Giskard's provider config governs (a) what the UI offers in
-> the model picker and (b) optional `/v1/models` discovery. The `ModelRef` Giskard sends as a
+> the model picker and (b) optional `/v1/models` discovery. Codex's provider table reaches
+> Giskard through `config/read`, which returns the whole effective config including the
+> `[model_providers]` entries; its five built-in ids (`openai`, `amazon-bedrock`,
+> `amazon-bedrock-runtime`, `ollama`, `lmstudio`) never appear there and the adapter adds them.
+> The `ModelRef` Giskard sends as a
 > per-turn override must correspond to a model/provider Codex is configured to reach. For the
 > Codex harness specifically, provider is native-thread-scoped: `thread/start`/`thread/resume`
 > receive `modelProvider`, while `turn/start` only supports a model override. New thread drafts
@@ -2375,10 +2415,12 @@ fronting Cloudflare Workers AI.
   context_window = 262144
   supports_reasoning_effort = true
   ```
-- If a provider advertises `model_listing` and exposes `GET /v1/models`, Giskard can **refresh
-  the list dynamically** and merge results with the static list. A manual "refresh models"
-  action triggers this; results are cached in memory (and optionally written back into the
-  provider's config section) with a timestamp.
+- If a provider advertises `model_listing`, Giskard can **refresh the list dynamically** from
+  `GET {base_url}/models` and merge results with the static list. The `base_url` and the key come
+  from the harness's provider table (§8.2), so discovery is a per-project operation: there is no
+  endpoint to query until a harness can name one. A provider whose harness entry carries no
+  `base_url` contributes no discovery and says so as a warning. A manual "refresh models" action
+  triggers this; results are cached in memory per project.
 - Each model entry resolves to a `ModelDescriptor { provider, model, context_window,
   supports_reasoning_effort, display_name }`. `context_window` drives the thread context gauge
   (§10.3); `supports_reasoning_effort` drives whether the effort selector is shown (§8.5).
@@ -2426,10 +2468,31 @@ fronting Cloudflare Workers AI.
   config + discovery list while remaining visible to the user. The composed list is cached per
   project and is the descriptor source for both picker display and model mutations; the picker and
   turn-start/select paths must not resolve the same model against different metadata. "Reload
-  models" replaces that project's cache. The global `/api/models` route remains a separate
-  no-project baseline (config + discovery, no harness metadata) for the startup list and new-project
-  dialog; an active project's catalog must never overwrite it.
-- **Stale-provider normalization (E5).** When a persisted/project `ModelRef` names a provider
+  models" replaces that project's cache. This is the **only** model list: there is no project-less
+  route. Discovery and the harness catalog both need a provider's endpoint, which only a harness
+  knows (§8.2), and no harness exists before a project does — so a project-less list could only
+  repeat `config.toml` back, which is not a model list worth serving.
+- **Importing a native thread takes that thread's model, not a chosen one.** Importing a harness
+  thread Giskard has no record of must not name a model: on Codex, `model`/`modelProvider` on
+  `thread/resume` are overrides that suppress the thread's own persisted model
+  (`merge_persisted_resume_metadata` returns early once either is present), so naming one silently
+  moves an existing conversation onto a different model. The imported thread takes the model **and
+  reasoning effort** the harness reports — `thread/resume` answers with both, and the picker has to
+  land on what the thread is actually running rather than showing "Default" for a thread mid-flight
+  at another effort. If the harness reports no model, the thread cannot be imported. Reopening a
+  thread Giskard already tracks is the opposite case and does name its persisted model — that
+  override is also how a thread's provider is switched (§8.2).
+- **A new thread's starting model is derived, never stored.** A project record carries no default
+  model. The model a draft starts on is taken from the project's catalog at the moment the draft
+  opens — the model the harness marks as its default (Codex's `model/list` `isDefault`), else the
+  first entry. Storing it would only cache a decision made against an earlier provider and harness
+  configuration: it can name a model the config no longer declares, or miss the one that has since
+  become the default, and nothing would say so. Deriving it leaves nothing to go stale and no
+  second place to keep in sync. A project is also created before its harness exists, so there is
+  nothing to choose from at creation time in any case; the new-project dialog asks for a folder and
+  a name only. If the catalog is empty the draft says so rather than substituting a model — a wrong
+  provider is not recoverable once a thread has started (LT7).
+- **Stale-provider normalization (E5).** When a persisted thread's `ModelRef` names a provider
   that is no longer configured, but its `model` id appears under exactly one configured provider,
   the server rewrites the provider to that configured provider before opening/resuming or starting
   a turn. If the matched model does not support reasoning effort, `reasoning_effort` is cleared.
@@ -3404,32 +3467,26 @@ filename_template = "plan-{slug}-{ts}.md"
 cost_estimation = false
 # [tokens.rates."openai/gpt-5.5"]  input_per_mtok_eur = …  output_per_mtok_eur = …
 
+# `id` must name a provider the harness knows (§8.2). Name, endpoint, and key location are read
+# back from the harness, not restated here.
 [[providers]]
 id = "openai"
-name = "OpenAI (Codex built-in)"
 model_listing = false
-  # typed model entries carry the metadata the UI needs (§8.3):
+  # typed model entries supply what no harness reports (§8.3):
   [[providers.models]]
   id = "gpt-5.5"
-  display_name = "GPT-5.5"
   context_window = 262144
-  supports_reasoning_effort = true
   [[providers.models]]
   id = "gpt-5.4"
-  display_name = "GPT-5.4"
   context_window = 262144
-  supports_reasoning_effort = true
 
 [[providers]]
-id = "cloudflare-litellm"
-name = "Cloudflare Workers AI (via LiteLLM)"
-base_url = "http://127.0.0.1:4000/v1"
-model_listing = true            # GET /v1/models available; merged over static entries
+id = "cloudflare-litellm"  # ⇒ [model_providers.cloudflare-litellm] in ~/.codex/config.toml
+model_listing = true            # discovery against the base_url the harness reports for it
   [[providers.models]]          # static fallback; dynamic listing may add/refine
   id = "@cf/z-ai/glm-4.7"
-  display_name = "GLM-4.7 (Workers AI)"
   context_window = 131072
-  supports_reasoning_effort = false
+  # display_name / supports_reasoning_effort may be set to override the harness catalog (§8.3)
 
 [harness]
 kind = "codex"

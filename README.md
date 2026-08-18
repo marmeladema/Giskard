@@ -219,14 +219,35 @@ service does not silently run with an empty provider list.
 | `[history]` | `initial` / `page` | `5` / `5` | Turns fetched on open (topped up client-side to ~2 screens) / per scroll-up page. |
 | `[harness]` | `kind` | `codex` | Agent harness (v1: `codex`). |
 | | `idle_shutdown_secs` | `0` (keep alive) | Terminate an idle project's harness after N seconds. |
-| `[[providers]]` | `id`, `name`, `base_url?`, `model_listing`, `api_key?` / `api_key_env?`, `[[providers.models]]` | — | What the model picker offers. With `model_listing = true` + `base_url` the picker is refreshed from `GET {base_url}/models` (on load, and via the ↻ button), so `[[providers.models]]` becomes optional. Set `api_key` (inline) or `api_key_env` (env-var name) for endpoints that require auth — sent as `Authorization: Bearer …`. |
+| `[[providers]]` | `id`, `model_listing`, `[[providers.models]]` | — | Which `(provider, model)` pairs the picker offers. `id` must name a provider Codex knows (see below). With `model_listing = true` the list is topped up from `GET {base_url}/models` — using the endpoint and key Codex has for that provider — so `[[providers.models]]` becomes optional. |
 
 Provider config governs the **picker** and optional `/v1/models` discovery only — Codex itself
 reads `~/.codex/config.toml` for real provider/auth, so any model you select must be one Codex can
-actually reach. Giskard has no model-name defaults table. Initial context-window metadata comes
-from an explicit `[[providers.models]]` entry or a model object's `context_window` /
-`max_input_tokens` field in the provider's `/models` response; otherwise the picker starts with the
-conservative 128k fallback.
+actually reach.
+
+Because Codex already owns that file, Giskard does not ask you to restate any of it. A provider's
+display name, `base_url`, and the environment variable holding its key are read back from Codex, so
+a `[[providers]]` entry declares only its `id`, whether to run discovery, and the models to offer.
+The `id` must match a provider Codex knows: a built-in (`openai`, `amazon-bedrock`,
+`amazon-bedrock-runtime`, `ollama`, `lmstudio`) or one of your own `[model_providers.<id>]` tables.
+Giskard checks this when it composes a project's model list and shows a warning naming any id Codex
+has never heard of — its models stay in the picker, but they cannot be routed until you add the
+provider to Codex. A key set inline in Codex as `experimental_bearer_token` is deliberately not
+read; discovery against such a provider needs `env_key` instead.
+
+Giskard has no model-name defaults table. Initial context-window metadata comes from an explicit
+`[[providers.models]]` entry or a model object's `context_window` / `max_input_tokens` field in the
+provider's `/models` response; otherwise the picker starts with the conservative 128k fallback.
+`display_name` and reasoning-effort support are supplied by Codex's own model catalog, so declaring
+them is only necessary to override it.
+
+Discovery and Codex's catalog both need a running project harness, so they apply to a project's
+picker. Creating a project therefore does not ask you to pick a model: there is no harness yet, so
+any list offered would be missing exactly the models discovery would have found. A project stores
+no default model either — the model a new thread starts on is read from the project's current
+picker list each time (Codex's default model when it marks one, otherwise the first entry), so it
+follows your provider and Codex configuration instead of remembering a choice that quietly stops
+matching it.
 
 Models with `supports_reasoning_effort = true` expose a thread-header **Effort** selector next to
 the model picker. Choose `Default` to omit the effort parameter, or select one of the exact effort
@@ -304,7 +325,7 @@ $GISKARD_DATA_DIR/
 ├── session.key                  # 32-byte local key for signed browser sessions
 ├── projects.json                # project index (id, name, dir, created_at, order)
 ├── projects/<project_id>/
-│   ├── project.json             # workspace root, default model, harness kind
+│   ├── project.json             # workspace root, harness kind
 │   ├── threads/
 │   │   ├── <thread_id>.json      # thread metadata, permission preset, token cache
 │   │   └── <thread_id>.jsonl     # authoritative turn history — one Turn per line, append-only

@@ -1,3 +1,5 @@
+mod common;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -26,6 +28,8 @@ use giskard_proto::{
     ClientMessage, ErrorSeverity, ServerMessage, ThreadActivity, ThreadActivityKind, WireAgentEvent,
 };
 use giskard_server::{AppState, HarnessFactory, build_app};
+
+use common::fake_native_model;
 
 struct TestFactory {
     fixture: ReplayFixture,
@@ -154,7 +158,9 @@ struct CountingOpenHarness {
     start_calls: AtomicUsize,
     delete_calls: AtomicUsize,
     shutdown_calls: AtomicUsize,
-    opened_models: tokio::sync::Mutex<Vec<ModelRef>>,
+    /// What each `open_thread` requested — `None` when the caller left the model to the
+    /// harness, which is how an imported thread keeps the model it was already on.
+    opened_models: tokio::sync::Mutex<Vec<Option<ModelRef>>>,
     started_models: tokio::sync::Mutex<Vec<Option<ModelRef>>>,
     started_inputs: tokio::sync::Mutex<Vec<String>>,
     start_error: tokio::sync::Mutex<Option<HarnessError>>,
@@ -423,7 +429,7 @@ impl CountingOpenHarness {
         self.open_calls.load(Ordering::SeqCst)
     }
 
-    async fn opened_models(&self) -> Vec<ModelRef> {
+    async fn opened_models(&self) -> Vec<Option<ModelRef>> {
         self.opened_models.lock().await.clone()
     }
 
@@ -463,6 +469,7 @@ impl AgentHarness for UnsupportedCompactionHarness {
             structured_diffs: false,
             resumable_threads: true,
             model_listing: false,
+            provider_listing: false,
             token_usage: false,
             mcp_status: false,
             mcp_reload: false,
@@ -483,7 +490,10 @@ impl AgentHarness for UnsupportedCompactionHarness {
             thread,
             harness_thread_id: opts.resume.unwrap_or_else(|| format!("test_{thread}")),
             warning: None,
-            resumed_model: Some(opts.initial_model.clone()),
+            resumed_model: opts
+                .initial_model
+                .clone()
+                .or_else(|| Some(fake_native_model())),
             agent_name: None,
             parent_harness_thread_id: None,
         })
@@ -552,6 +562,7 @@ impl AgentHarness for SlowCompactionHarness {
             structured_diffs: false,
             resumable_threads: true,
             model_listing: false,
+            provider_listing: false,
             token_usage: false,
             mcp_status: false,
             mcp_reload: false,
@@ -572,7 +583,10 @@ impl AgentHarness for SlowCompactionHarness {
             thread,
             harness_thread_id: opts.resume.unwrap_or_else(|| format!("test_{thread}")),
             warning: None,
-            resumed_model: Some(opts.initial_model.clone()),
+            resumed_model: opts
+                .initial_model
+                .clone()
+                .or_else(|| Some(fake_native_model())),
             agent_name: None,
             parent_harness_thread_id: None,
         })
@@ -709,6 +723,7 @@ impl AgentHarness for ActivityHarness {
             structured_diffs: false,
             resumable_threads: true,
             model_listing: false,
+            provider_listing: false,
             token_usage: false,
             mcp_status: false,
             mcp_reload: false,
@@ -754,7 +769,10 @@ impl AgentHarness for ActivityHarness {
             thread,
             harness_thread_id,
             warning: None,
-            resumed_model: Some(opts.initial_model.clone()),
+            resumed_model: opts
+                .initial_model
+                .clone()
+                .or_else(|| Some(fake_native_model())),
             agent_name,
             parent_harness_thread_id,
         })
@@ -1206,6 +1224,7 @@ impl AgentHarness for SlowStartHarness {
             structured_diffs: false,
             resumable_threads: true,
             model_listing: false,
+            provider_listing: false,
             token_usage: false,
             mcp_status: false,
             mcp_reload: false,
@@ -1226,7 +1245,10 @@ impl AgentHarness for SlowStartHarness {
             thread,
             harness_thread_id: opts.resume.unwrap_or_else(|| format!("test_{thread}")),
             warning: None,
-            resumed_model: Some(opts.initial_model.clone()),
+            resumed_model: opts
+                .initial_model
+                .clone()
+                .or_else(|| Some(fake_native_model())),
             agent_name: None,
             parent_harness_thread_id: None,
         })
@@ -1332,6 +1354,7 @@ impl AgentHarness for CountingOpenHarness {
             structured_diffs: false,
             resumable_threads: true,
             model_listing: false,
+            provider_listing: false,
             token_usage: false,
             mcp_status: false,
             mcp_reload: false,
@@ -1359,7 +1382,10 @@ impl AgentHarness for CountingOpenHarness {
                 .resume
                 .unwrap_or_else(|| format!("count_{thread}_{open_call}")),
             warning: None,
-            resumed_model: Some(opts.initial_model.clone()),
+            resumed_model: opts
+                .initial_model
+                .clone()
+                .or_else(|| Some(fake_native_model())),
             agent_name: None,
             parent_harness_thread_id: None,
         })
@@ -1448,6 +1474,7 @@ impl AgentHarness for NoMcpHarness {
             structured_diffs: false,
             resumable_threads: false,
             model_listing: false,
+            provider_listing: false,
             token_usage: false,
             mcp_status: false,
             mcp_reload: false,
@@ -2102,7 +2129,6 @@ async fn create_project_only(client: &reqwest::Client, base: &str, cookie: &str)
         .json(&serde_json::json!({
             "name": "thread-actions",
             "dir": "/tmp/thread-actions",
-            "default_model": {"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null},
         }))
         .send()
         .await
@@ -5552,7 +5578,6 @@ async fn project_remove_shuts_down_harness_and_removes_giskard_data_only() {
         .json(&serde_json::json!({
             "name": "remove-me",
             "dir": source_dir.to_string_lossy(),
-            "default_model": {"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null},
         }))
         .send()
         .await
@@ -6098,7 +6123,6 @@ async fn websocket_serializes_harness_error_events() {
         .json(&serde_json::json!({
             "name": "test-project",
             "dir": "/tmp/test",
-            "default_model": {"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null},
         }))
         .send()
         .await
@@ -6236,7 +6260,6 @@ async fn subscribe_reopens_persisted_thread() {
         .json(&serde_json::json!({
             "name": "test-project",
             "dir": "/tmp/test",
-            "default_model": model,
         }))
         .send()
         .await
@@ -6375,7 +6398,6 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
         .json(&serde_json::json!({
             "name": "test-project",
             "dir": "/tmp/test",
-            "default_model": model,
         }))
         .send()
         .await
@@ -6535,7 +6557,6 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
         .json(&serde_json::json!({
             "name": "test-project",
             "dir": "/tmp/test",
-            "default_model": model,
         }))
         .send()
         .await
@@ -6767,7 +6788,6 @@ async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
         .json(&serde_json::json!({
             "name": "test-project",
             "dir": "/tmp/test",
-            "default_model": model,
         }))
         .send()
         .await
@@ -6973,7 +6993,6 @@ async fn failed_turn_is_persisted_with_error_message() {
         .json(&serde_json::json!({
             "name": "test-project",
             "dir": "/tmp/test",
-            "default_model": {"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null},
         }))
         .send()
         .await
@@ -7120,7 +7139,6 @@ async fn notice_event_is_delivered_to_client() {
         .json(&serde_json::json!({
             "name": "p",
             "dir": "/tmp/test",
-            "default_model": {"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null},
         }))
         .send()
         .await
@@ -7209,7 +7227,6 @@ async fn open_thread_normalizes_stale_provider_from_configured_model() {
     let extra_config = r#"
 [[providers]]
 id = "proxy"
-name = "proxy"
 
   [[providers.models]]
   id = "gpt-5.5"
@@ -7242,19 +7259,12 @@ name = "proxy"
         .unwrap()
         .to_string();
 
-    let stale_model = ModelRef {
-        provider: "openai".into(),
-        model: "gpt-5.5".into(),
-        reasoning_effort: None,
-    };
-
     let resp = client
         .post(format!("{base}/api/projects"))
         .header("cookie", &cookie)
         .json(&serde_json::json!({
             "name": "test-project",
             "dir": "/tmp/test",
-            "default_model": stale_model,
         }))
         .send()
         .await
@@ -7265,9 +7275,6 @@ name = "proxy"
         .unwrap()
         .to_string();
     let pid: ProjectId = project_id.parse().unwrap();
-
-    let saved_project = state.store.load_project(pid).await.unwrap().unwrap();
-    assert_eq!(saved_project.default_model.provider, "proxy");
 
     let tid = ThreadId::new();
     let now = chrono::Utc::now();
@@ -7342,7 +7349,6 @@ async fn open_thread_normalization_reuses_live_handle() {
     let extra_config = r#"
 [[providers]]
 id = "proxy"
-name = "proxy"
 
   [[providers.models]]
   id = "gpt-5.5"
@@ -7373,7 +7379,7 @@ name = "proxy"
     let pid = ProjectId::new();
     state
         .store
-        .create_project(pid, "test-project", "/tmp/test", stale_model.clone())
+        .create_project(pid, "test-project", "/tmp/test")
         .await
         .unwrap();
     let tid = ThreadId::new();
@@ -7415,7 +7421,7 @@ name = "proxy"
             "/tmp/test",
             Some(tid),
             Some("th_live".into()),
-            stale_model,
+            Some(stale_model),
         )
         .await
         .unwrap();
@@ -7479,7 +7485,6 @@ async fn start_thread_with_initial_message_uses_selected_provider_and_starts_tur
     let extra_config = r#"
 [[providers]]
 id = "openai"
-name = "OpenAI"
 
   [[providers.models]]
   id = "gpt-5.5"
@@ -7489,7 +7494,6 @@ name = "OpenAI"
 
 [[providers]]
 id = "proxy"
-name = "Proxy"
 
   [[providers.models]]
   id = "glm-5.2-workers-ai"
@@ -7538,10 +7542,11 @@ name = "Proxy"
     assert_eq!(harness.open_calls(), 1);
     assert_eq!(harness.start_calls(), 1);
     let opened = harness.opened_models().await;
-    assert_eq!(opened[0].provider, "proxy");
-    assert_eq!(opened[0].model, "glm-5.2-workers-ai");
+    let opened_first = opened[0].as_ref().expect("a fresh thread names its model");
+    assert_eq!(opened_first.provider, "proxy");
+    assert_eq!(opened_first.model, "glm-5.2-workers-ai");
     let started_models = harness.started_models().await;
-    assert_eq!(started_models[0], Some(opened[0].clone()));
+    assert_eq!(started_models[0], Some(opened_first.clone()));
     assert_eq!(harness.started_inputs().await, vec!["Hello".to_string()]);
 
     let saved_thread = state.store.load_thread(pid, tid).await.unwrap().unwrap();
@@ -7605,7 +7610,6 @@ async fn select_model_rejects_provider_change_on_non_empty_thread() {
     let extra_config = r#"
 [[providers]]
 id = "openai"
-name = "OpenAI"
 
   [[providers.models]]
   id = "gpt-5.5"
@@ -7615,7 +7619,6 @@ name = "OpenAI"
 
 [[providers]]
 id = "proxy"
-name = "Proxy"
 
   [[providers.models]]
   id = "glm-5.2-workers-ai"
@@ -7703,7 +7706,6 @@ async fn send_input_rejects_persisted_provider_mismatch_on_non_empty_thread() {
     let extra_config = r#"
 [[providers]]
 id = "openai"
-name = "OpenAI"
 
   [[providers.models]]
   id = "gpt-5.5"
@@ -7713,7 +7715,6 @@ name = "OpenAI"
 
 [[providers]]
 id = "proxy"
-name = "Proxy"
 
   [[providers.models]]
   id = "glm-5.2-workers-ai"
@@ -7846,7 +7847,6 @@ async fn login_project_thread_message() {
         .json(&serde_json::json!({
             "name": "test-project",
             "dir": "/tmp/test",
-            "default_model": {"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null},
         }))
         .send()
         .await

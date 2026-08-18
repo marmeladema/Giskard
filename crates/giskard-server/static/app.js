@@ -153,7 +153,7 @@ let state = {
   // streamed); `newestPersistedTurnId` is the id of the newest turn known to have completed — the
   // high-water mark a future resync will use as its "give me turns after this" cursor.
   currentRenderTurnId:null, newestPersistedTurnId:null,
-  globalModels:[], models:[], modelsProject:null, modelsLoadingProject:null, pendingModelBeforeSelect:null, streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null,
+  models:[], modelsProject:null, modelsLoadingProject:null, pendingModelBeforeSelect:null, streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null,
   streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), renderedItemBodyByKey:new Map(), itemKindsByItemId:new Map(),
   pendingApprovals:new Map(), answeredApprovals:new Map(), answeredApprovalsById:new Map(), renderedApprovalStateKeys:new Set(), pendingServerRequests:new Map(), answeredServerRequests:new Set(),
   runningCommands:new Map(), commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null,
@@ -262,39 +262,8 @@ async function startApp() {
   $("app").classList.add("open");
   initServiceWorkerNotifications();
   initNotificationSettings();
-  try { state.globalModels = (await api("GET","/api/models")).models || []; } catch { state.globalModels=[]; }
   renderModelSelect();
   await loadProjects();
-  refreshModels();   // background: merge in any provider /v1/models discovery (§8.3)
-}
-
-// The global (no-project) model list: configured models merged with each `model_listing`
-// provider's /v1/models discovery. Used for the startup baseline and the new-project modal. Once a
-// project is open its per-project list (with harness names) is authoritative, so this does not
-// clobber it. Best-effort; on failure the current list stays.
-let _refreshingModels = false;
-async function refreshModels(opts) {
-  opts = opts || {};
-  if (_refreshingModels) return;
-  _refreshingModels = true;
-  const btn = $("refreshModels"); if (btn) btn.disabled = true;
-  try {
-    const res = await api("POST","/api/models/refresh");
-    if (res && Array.isArray(res.models)) {
-      state.globalModels = res.models;
-      populateModalModels();
-    }
-    // Surface per-provider discovery failures (e.g. a 401 from a misconfigured api_key) so they
-    // aren't silent. Suppressed on the modal-open auto-refresh to avoid duplicate toasts.
-    if (opts.announce !== false && res && Array.isArray(res.warnings)) {
-      for (const w of res.warnings) notice(`Model discovery — ${w.source}: ${w.message}`, "warning");
-    }
-  } catch (e) {
-    notice("Could not refresh models: "+e.message, "warning");
-  } finally {
-    _refreshingModels = false;
-    if (btn) btn.disabled = false;
-  }
 }
 
 // The per-project model list is authoritative when a project is open: configured models + each
@@ -338,6 +307,7 @@ async function loadProjectModels(pid, opts) {
       state.modelsProject = pid;
       renderModelSelect();
       updateModelButton();
+      settleDraftModel();
     }
     // Only surface warnings/errors while `pid` is still the active project — a switch mid-request
     // must not misattribute the previous project's discovery failures to the new one.
@@ -351,6 +321,9 @@ async function loadProjectModels(pid, opts) {
     // user cannot pick another — they need to know why rather than find an empty list.
     if (pid === state.projectId) {
       notice("Could not load this project's models: " + e.message, "warning");
+      // A draft waiting on this list would otherwise sit on "Loading this project's model…"
+      // forever; LT7 says it must not fall back to a guess, so it reports instead.
+      settleDraftModel("this project's models could not be loaded: " + e.message);
     }
   } finally {
     _loadingProjectModels = false;
@@ -1720,7 +1693,6 @@ $("removeThreadConfirm").onclick = async () => {
       // avoids the transient stale entry).
       try { localStorage.removeItem("giskard.lastThread"); } catch {}
       openDraftThread(pid);
-      applyProjectDefaultModel(pid, state.draftThread);
       openedDraft = true;
     }
     pending.deleting = false;
@@ -1805,27 +1777,12 @@ function clearProjectView(pid) {
 /* ---------- new-project modal + directory picker ---------- */
 $("newProj").onclick = () => openProjectModal();
 
-function populateModalModels() {
-  const sel = $("pmModel"); if (!sel) return;
-  const prev = sel.value;
-  sel.innerHTML = "";
-  for (const m of state.globalModels) {
-    const o = document.createElement("option");
-    o.value = `${m.provider}/${m.model}`; o.textContent = modelOptionLabel(m);
-    o.dataset.provider = m.provider; o.dataset.model = m.model;
-    sel.append(o);
-  }
-  if (!state.globalModels.length) { const o=document.createElement("option"); o.textContent="(no models configured)"; sel.append(o); }
-  if (prev) sel.value = prev;
-}
 function openProjectModal() {
   closeDrawers();
   $("pmErr").textContent = "";
-  populateModalModels();
   $("projectModal").classList.add("open");
   // Start browsing where we last were, falling back to the filesystem root.
   browsePicker(localStorage.getItem("giskard.lastBrowse") || "/");
-  refreshModels({ announce:false });   // pull discovered models; startup already announced failures
 }
 function closeProjectModal() { $("projectModal").classList.remove("open"); }
 $("pmCancel").onclick = closeProjectModal;
@@ -1940,12 +1897,11 @@ $("pmCreate").onclick = async () => {
   const name = $("pmName").value.trim();
   if (!dir) { $("pmErr").textContent = "Pick a folder first."; return; }
   if (!name) { $("pmErr").textContent = "Enter a project name."; return; }
-  const opt = $("pmModel").selectedOptions[0];
-  const model = opt && opt.dataset.model
-    ? { provider: opt.dataset.provider, model: opt.dataset.model, reasoning_effort:null }
-    : { provider:"openai", model:"gpt-5.5", reasoning_effort:null };
   try {
-    const { id } = await api("POST","/api/projects",{ name, dir, default_model:model });
+    // No model is chosen here: the project has no harness yet, so there is no catalog to choose
+    // from. The draft picks one from the project's catalog once that loads (§8.3), which is also
+    // the only way to get the harness's preferred model rather than a guess.
+    const { id } = await api("POST","/api/projects",{ name, dir });
     closeProjectModal();
     await loadProjects();
     // Land on the new project's draft view rather than leaving the previously
@@ -1995,40 +1951,38 @@ $("removeProjectConfirm").onclick = async () => {
   }
 };
 
-// Open the draft immediately, then resolve the project's default model in the background.
+// Open the draft immediately; its model settles when the project's catalog arrives.
 //
-// Fetching the project first left the *previous* thread on screen for a network round-trip, with
-// its composer visible and editable. Anything typed in that window was destroyed when
+// Fetching anything first left the *previous* thread on screen for a network round-trip, with its
+// composer visible and editable. Anything typed in that window was destroyed when
 // `openDraftThread` finally ran and reset the composer, and the Send that followed found an empty
 // box and returned silently — so the click read as "nothing happened" and the message was gone.
-// Nothing about drawing a draft needs the project record; only the model does.
+// Nothing about drawing a draft needs the model.
 function newThread(pid) {
   openDraftThread(pid);
-  applyProjectDefaultModel(pid, state.draftThread);
 }
 
-async function applyProjectDefaultModel(pid, draft) {
-  let project = null;
-  let failure = null;
-  try {
-    project = await api("GET", `/api/projects/${pid}`);
-  } catch (e) {
-    failure = "the project could not be loaded: " + e.message;
-  }
-  // Only apply the default if this is still the same untouched draft. The draft is interactive from
-  // the moment it opens, so while this was in flight the user may have sent it, switched away,
-  // opened another one — or picked a model themselves. Their choice wins: the project default is a
-  // starting point, not an override, and replacing it would run the turn on a model they did not
-  // pick. A pinned draft already left `modelLoading` false, so there is nothing to settle here.
-  if (!draft || state.draftThread !== draft || draft.modelPinned) return;
-
-  const model = project && project.default_model;
-  if (!failure && (!model || !model.provider || !model.model)) {
-    failure = "this project has no default model";
-  }
+// Settle a draft's starting model from the project's catalog: the model the harness marks as its
+// default, else the first entry.
+//
+// Derived from the catalog every time rather than stored on the project. A remembered default is a
+// copy of a decision made against an older provider/harness configuration and goes stale silently —
+// pointing at a model the config no longer declares, or missing the one that became default. There
+// is nothing to keep in sync if nothing is kept.
+//
+// Only applies to a draft that is still the current, untouched one. A draft is interactive from the
+// moment it opens, so while the catalog was in flight the user may have sent it, switched away,
+// opened another — or picked a model themselves. Their choice wins: this is a starting point, not
+// an override, and replacing it would run the turn on a model they did not pick.
+function settleDraftModel(failure) {
+  const draft = state.draftThread;
+  if (!draft || draft.modelPinned) return;
+  if (!failure && state.modelsProject !== draft.projectId) return;   // catalog not in yet
+  const chosen = failure ? null : (state.models.find(m => m.is_default) || state.models[0] || null);
+  if (!failure && !chosen) failure = "this project has no models to choose from";
   draft.modelLoading = false;
-  draft.modelError = failure;
-  if (!failure) state.currentModel = normalizeDraftModel(model);
+  draft.modelError = failure || null;
+  if (chosen) state.currentModel = normalizeDraftModel(chosen);
   syncModelControls();
   updateComposerControls();
   if (failure) notice("Cannot start a thread here — " + failure + ".", "error");
@@ -2170,6 +2124,10 @@ function openDraftThread(pid) {
   renderMcpButton();
   renderSubagentsButton();
   loadProjectModels(pid);   // load this project's model list (config + discovery + Codex names)
+  // A no-op while the list is still loading; `loadProjectModels` settles it on arrival. This call
+  // covers reopening a draft in a project whose catalog is already loaded, where that fetch is
+  // skipped entirely and nothing else would resolve the draft's model.
+  settleDraftModel();
   setMode("build");
   setPermissionPreset("ask_first");
   setTurnActive(false);

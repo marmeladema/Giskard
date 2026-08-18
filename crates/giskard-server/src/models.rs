@@ -2,7 +2,7 @@
 //!
 //! Applies the metadata-source precedence for a `(provider, model)` pair:
 //! 1. the typed `[[providers.models]]` config entry;
-//! 2. the `/v1/models` dynamic listing (merged over the static list by [`refresh_models`]);
+//! 2. the `/v1/models` dynamic listing (merged over the static list by [`discover_models`]);
 //! 3. a conservative fallback (`context_window = 128000`, no reasoning effort).
 
 use std::collections::HashMap;
@@ -13,6 +13,7 @@ use tracing::warn;
 
 use giskard_core::ids::ProjectId;
 use giskard_core::model::{ModelDescriptor, ModelRef};
+use giskard_harness::HarnessProvider;
 use giskard_persist::Config;
 use giskard_proto::ModelListingWarning;
 
@@ -52,6 +53,7 @@ fn from_config(config: &Config, provider: &str, model: &str) -> Option<ModelDesc
         supports_reasoning_effort: m.supports_reasoning_effort,
         reasoning_efforts: Vec::new(),
         display_name: m.display_name.clone(),
+        is_default: false,
     })
 }
 
@@ -140,6 +142,7 @@ pub fn list_descriptors(config: &Config) -> Vec<ModelDescriptor> {
                 supports_reasoning_effort: m.supports_reasoning_effort,
                 reasoning_efforts: Vec::new(),
                 display_name: m.display_name.clone(),
+                is_default: false,
             });
         }
     }
@@ -151,6 +154,8 @@ pub fn list_descriptors(config: &Config) -> Vec<ModelDescriptor> {
 ///
 /// - **Display names** fill a descriptor whose `display_name` is unset, so an explicit
 ///   `[[providers.models]] display_name` always wins.
+/// - **`is_default`** marks the model the harness would start from, used only to seed a project's
+///   default (§8.3). Config has no way to express it, so the catalog is its only source.
 /// - **Reasoning efforts** (the exact levels a model advertises) are applied only to models the
 ///   config did **not** explicitly declare. A `[[providers.models]]` entry keeps its configured
 ///   effort setting; for discovery-only models the catalog is the source of truth.
@@ -178,6 +183,9 @@ pub fn apply_harness_metadata(
         if d.display_name.is_none() {
             d.display_name = h.display_name.clone();
         }
+        // Which model to start from is the harness's to state, and it states it by model id — so
+        // it applies to a declared entry too, unlike the effort metadata below.
+        d.is_default = h.is_default;
         if !declared.contains(&(d.provider.as_str(), d.model.as_str())) {
             d.supports_reasoning_effort = h.supports_reasoning_effort;
             d.reasoning_efforts = h.reasoning_efforts.clone();
@@ -251,13 +259,55 @@ pub fn merge_models(
     base
 }
 
+/// Check each configured provider id against the providers the harness actually knows (§8.2),
+/// returning one warning per id the harness has never heard of.
+///
+/// A mismatch is not fatal — the models stay in the picker — but it is the difference between
+/// finding out at config time and finding out mid-turn, when the provider answers
+/// `model_not_found` for a routing id it was never configured with.
+pub fn validate_provider_ids(
+    config: &Config,
+    harness_providers: &[HarnessProvider],
+    harness_kind: &str,
+) -> Vec<ModelListingWarning> {
+    config
+        .providers
+        .iter()
+        .filter(|p| !harness_providers.iter().any(|known| known.id == p.id))
+        .map(|p| {
+            warn!(
+                provider = %p.id,
+                harness = %harness_kind,
+                action = "validate_provider_ids",
+                "configured provider is not one the harness knows; its models cannot be routed"
+            );
+            ModelListingWarning {
+                source: format!("provider:{}", p.id),
+                message: format!(
+                    "provider id is not configured in {harness_kind}; models under it cannot \
+                     be routed until it is added there"
+                ),
+            }
+        })
+        .collect()
+}
+
 /// Refresh the model list by querying `GET {base_url}/models` for every provider that advertises
-/// `model_listing`, merging the results over the static list (§8.3). Best-effort: a provider whose
-/// endpoint errors, returns a non-success status, or sends unparseable JSON is skipped (its static
-/// entries remain), so the call always returns at least the static list. Each such failure is
-/// logged **and** returned as a [`ModelListingWarning`] so it can be surfaced to the user rather
-/// than silently yielding no models (e.g. a 401 from a proxy whose api_key is missing/wrong).
-pub async fn refresh_models(config: &Config) -> (Vec<ModelDescriptor>, Vec<ModelListingWarning>) {
+/// `model_listing`, merging the results over the static list (§8.3).
+///
+/// The endpoint and key location come from `harness_providers` — the harness owns provider
+/// configuration (§8.2), so a provider the harness does not know, or knows without a `base_url`,
+/// simply contributes no discovery.
+///
+/// Best-effort: a provider whose endpoint errors, returns a non-success status, or sends
+/// unparseable JSON is skipped (its static entries remain), so the call always returns at least
+/// the static list. Each such failure is logged **and** returned as a [`ModelListingWarning`] so
+/// it can be surfaced to the user rather than silently yielding no models (e.g. a 401 from a proxy
+/// whose key is missing or wrong).
+pub async fn discover_models(
+    config: &Config,
+    harness_providers: &[HarnessProvider],
+) -> (Vec<ModelDescriptor>, Vec<ModelListingWarning>) {
     let base = list_descriptors(config);
     let mut warnings: Vec<ModelListingWarning> = Vec::new();
 
@@ -277,14 +327,30 @@ pub async fn refresh_models(config: &Config) -> (Vec<ModelDescriptor>, Vec<Model
         if !p.model_listing {
             continue;
         }
-        let Some(base_url) = &p.base_url else {
+        // An unknown id already warned in `validate_provider_ids`; skipping quietly here keeps one
+        // problem to one message.
+        let Some(known) = harness_providers.iter().find(|known| known.id == p.id) else {
+            continue;
+        };
+        let Some(base_url) = known.base_url.as_deref() else {
+            warn!(
+                provider = %p.id,
+                action = "discover_models",
+                "provider requests model listing but the harness reports no base_url for it"
+            );
+            warnings.push(ModelListingWarning {
+                source: format!("provider:{}", p.id),
+                message: "model_listing is on but the harness reports no base_url for this \
+                          provider; only declared models are offered"
+                    .into(),
+            });
             continue;
         };
         let url = format!("{}/models", base_url.trim_end_matches('/'));
-        // Attach the provider's discovery key (inline or from an env var) for endpoints that
-        // require auth — e.g. a LiteLLM proxy with a master key returns 401 otherwise.
+        // Attach the provider's discovery key for endpoints that require auth — e.g. a LiteLLM
+        // proxy with a master key returns 401 otherwise.
         let mut request = client.get(&url);
-        if let Some(key) = p.resolve_api_key() {
+        if let Some(key) = known.resolve_api_key() {
             request = request.bearer_auth(key);
         }
 
@@ -301,9 +367,9 @@ pub async fn refresh_models(config: &Config) -> (Vec<ModelDescriptor>, Vec<Model
             Ok(resp) => {
                 let status = resp.status();
                 if !status.is_success() {
-                    // A 401/403 almost always means the discovery api_key is missing or wrong.
+                    // A 401/403 almost always means the discovery key is missing or wrong.
                     let hint = if status.as_u16() == 401 || status.as_u16() == 403 {
-                        " — check the provider's api_key / api_key_env"
+                        " — check the env var the harness names for this provider's key"
                     } else {
                         ""
                     };
@@ -364,7 +430,6 @@ mod tests {
         let toml = r#"
 [[providers]]
 id = "cloudflare-litellm"
-name = "Cloudflare Workers AI (via LiteLLM)"
 model_listing = true
   [[providers.models]]
   id = "@cf/z-ai/glm-4.7"
@@ -403,6 +468,7 @@ model_listing = true
             supports_reasoning_effort: true,
             reasoning_efforts: vec!["high".into()],
             display_name: Some("Stale".into()),
+            is_default: false,
         }];
 
         let descriptor = resolve_catalog_descriptor(&stale_catalog, &config, &model);
@@ -504,6 +570,7 @@ model_listing = true
                 supports_reasoning_effort: false,
                 reasoning_efforts: Vec::new(),
                 display_name: None,
+                is_default: false,
             },
             ModelDescriptor {
                 provider: "cloudflare-litellm".into(),
@@ -512,6 +579,7 @@ model_listing = true
                 supports_reasoning_effort: false,
                 reasoning_efforts: Vec::new(),
                 display_name: Some("GLM-4.7".into()),
+                is_default: false,
             },
         ];
         // Harness catalog is provider-agnostic (empty provider), keyed by model id.
@@ -523,6 +591,7 @@ model_listing = true
                 supports_reasoning_effort: true,
                 reasoning_efforts: vec!["low".into(), "high".into()],
                 display_name: Some("GPT-5.5".into()),
+                is_default: false,
             },
             ModelDescriptor {
                 provider: String::new(),
@@ -531,6 +600,7 @@ model_listing = true
                 supports_reasoning_effort: true,
                 reasoning_efforts: vec!["medium".into()],
                 display_name: Some("GLM 4.7".into()),
+                is_default: false,
             },
         ];
 
@@ -562,7 +632,6 @@ model_listing = true
             r#"
 [[providers]]
 id = "p"
-name = "P"
   [[providers.models]]
   id = "declared-named"
   display_name = "Config Name"
@@ -584,6 +653,7 @@ name = "P"
             supports_reasoning_effort: supports,
             reasoning_efforts: Vec::new(),
             display_name: name.map(str::to_string),
+            is_default: false,
         };
         // Harness catalog entry (empty provider) with a name and effort list.
         let cat = |model: &str, name: &str, efforts: &[&str]| ModelDescriptor {
@@ -593,6 +663,7 @@ name = "P"
             supports_reasoning_effort: !efforts.is_empty(),
             reasoning_efforts: efforts.iter().map(|e| (*e).to_string()).collect(),
             display_name: Some(name.into()),
+            is_default: false,
         };
 
         let base = vec![
@@ -663,6 +734,7 @@ name = "P"
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
             display_name: Some("GPT-5.5".into()),
+            is_default: false,
         }];
         let merged = apply_harness_metadata(base.clone(), &unsupported, &config);
         assert!(!merged[0].supports_reasoning_effort);
@@ -675,6 +747,7 @@ name = "P"
             supports_reasoning_effort: true,
             reasoning_efforts: Vec::new(),
             display_name: Some("GPT-5.5".into()),
+            is_default: false,
         }];
         let merged = apply_harness_metadata(base, &default_only, &config);
         assert!(merged[0].supports_reasoning_effort);
@@ -751,7 +824,6 @@ name = "P"
             r#"
 [[providers]]
 id = "configured"
-name = "Configured"
   [[providers.models]]
   id = "shared-model"
   context_window = 1000
@@ -759,7 +831,6 @@ name = "Configured"
 
 [[providers]]
 id = "discovered"
-name = "Discovered"
 "#,
         )
         .unwrap();
@@ -771,6 +842,7 @@ name = "Discovered"
             supports_reasoning_effort: true,
             reasoning_efforts: vec!["focused".into()],
             display_name: Some("Shared Model".into()),
+            is_default: false,
         }];
 
         let merged = apply_harness_metadata(base, &harness, &config);
@@ -799,11 +871,7 @@ name = "Discovered"
         let mut config = config_with_glm();
         config.providers.push(giskard_persist::ProviderConfig {
             id: "other".into(),
-            name: "Other".into(),
-            base_url: None,
             model_listing: false,
-            api_key: None,
-            api_key_env: None,
             models: vec![giskard_persist::ModelConfig {
                 id: "@cf/z-ai/glm-4.7".into(),
                 display_name: None,

@@ -86,16 +86,7 @@ session_days = 30
     let pid = ProjectId::new();
     state
         .store
-        .create_project(
-            pid,
-            "viz-test",
-            &proj_dir_path,
-            giskard_core::model::ModelRef {
-                provider: "openai".into(),
-                model: "gpt-5.5".into(),
-                reasoning_effort: None,
-            },
-        )
+        .create_project(pid, "viz-test", &proj_dir_path)
         .await
         .unwrap();
 

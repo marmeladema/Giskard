@@ -4,6 +4,8 @@
 //! strategy must be opened against the worktree rather than the project's checkout, and must still
 //! be after a restart. Everything here therefore records the workspace root the harness was handed.
 
+mod common;
+
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -13,7 +15,6 @@ use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{Item, ItemPayload, SubagentAction, SubagentLink};
-use giskard_core::model::ModelRef;
 use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
@@ -24,6 +25,8 @@ use giskard_harness::{
 use giskard_persist::store::{ProjectConfig, ThreadGitWorkspace};
 use giskard_server::{AppState, HarnessFactory, build_app};
 use tokio::sync::Mutex;
+
+use common::fake_native_model;
 
 /// Saving a plan writes a file into the workspace and then offers it back as a link. For an
 /// isolated thread that has to be the worktree: writing to the project's checkout would put the
@@ -270,7 +273,10 @@ impl AgentHarness for RecordingHarness {
             thread,
             harness_thread_id: opts.resume.unwrap_or_else(|| format!("native-{thread}")),
             warning: None,
-            resumed_model: Some(opts.initial_model),
+            resumed_model: opts
+                .initial_model
+                .clone()
+                .or_else(|| Some(fake_native_model())),
             agent_name: None,
             parent_harness_thread_id: None,
         })
@@ -495,11 +501,6 @@ async fn start(git_repo: bool) -> Harnessed {
             project_id,
             "worktree-test",
             &project.path().to_string_lossy(),
-            ModelRef {
-                provider: "openai".into(),
-                model: "gpt-5.5".into(),
-                reasoning_effort: None,
-            },
         )
         .await
         .unwrap();
@@ -1548,11 +1549,6 @@ async fn git_status_refuses_a_thread_from_another_project() {
             other_project,
             "other",
             &server._project.path().to_string_lossy(),
-            ModelRef {
-                provider: "openai".into(),
-                model: "gpt-5.5".into(),
-                reasoning_effort: None,
-            },
         )
         .await
         .unwrap();

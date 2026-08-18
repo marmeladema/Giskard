@@ -328,10 +328,65 @@ Each returned model is mapped to a Giskard `ModelDescriptor` (`map_model`):
 - **Conservative context window** — `model/list` omits the context window, so
   descriptors use the conservative default; the catalog is a source of names and
   reasoning-effort levels only, not gauge sizing.
+- **Default model** — Codex's `is_default` is carried through, so the server can
+  seed a new draft's starting model from the catalog rather than storing one per
+  project.
 
 The server overlays this metadata onto the configured/discovered model list by
 model id (see `giskard-server` §8.3): config names win, and reasoning efforts
 fill in for models the config did not explicitly declare.
+
+## Provider table (`config/read`)
+
+The adapter advertises the `provider_listing` capability and implements
+`list_providers` from the same `config/read` RPC used for writable roots, run as
+a control command on the worker queue (`handle_list_providers`). Codex owns
+provider configuration, so Giskard reads it back instead of asking the user to
+restate it in `config.toml`.
+
+`config/read` returns the whole effective config, and the app-server `Config`
+type forwards every key it does not model itself. `[model_providers]` therefore
+arrives as an unmodeled key, which the adapter's own `CodexConfig` picks up — the
+generated `codex-codes` types omit it, which is why it is deserialized locally.
+
+- **Per-directory** — the request carries the project's workspace root, because a
+  project layer can declare providers the home config does not.
+- **Built-ins are added** — `[model_providers]` holds only user-declared entries,
+  so `CODEX_BUILT_IN_PROVIDER_IDS` (`openai`, `amazon-bedrock`,
+  `amazon-bedrock-runtime`, `ollama`, `lmstudio`) is merged in. Without them a
+  project pinned to `openai` would look like an unknown provider.
+- **Env-var names only** — a provider's `env_key` is reported, never
+  `experimental_bearer_token`. An inline secret stays in Codex's config rather
+  than being copied into another process.
+- **Empty is absence** — Codex defaults an omitted `name` to `""`; the adapter
+  normalizes empty strings to `None`.
+
+## Resume does not name a model
+
+`thread/resume` treats `model`/`modelProvider` as *overrides*: Codex's
+`merge_persisted_resume_metadata` returns early once either is present, so the
+thread's own persisted model stops being applied. Supplying one therefore moves
+an existing conversation onto a different model rather than expressing a
+preference.
+
+`OpenThreadOptions::initial_model` is consequently optional, and the adapter
+omits both keys when it is `None`:
+
+- **Importing** a native thread Giskard has no record of passes `None`, and the
+  thread keeps the model Codex reports for it.
+- **Reopening** a thread Giskard already tracks passes its persisted model — that
+  override is also the mechanism for switching a thread's provider.
+- **Starting** a fresh thread requires one (`fresh_model`); there is no existing
+  thread whose model Codex could report. The resume-failed recovery path that
+  starts a replacement therefore returns the resume error instead when no model
+  was named.
+
+`thread/resume` also reports `reasoningEffort`, and a reported effort wins over a
+requested one — an imported thread must show the effort it is actually running,
+not "Default". `thread/start` reports none, so there the request is the only
+source. When Codex reports an empty model or provider the adapter logs and
+returns no effective model, and the server refuses the import rather than
+guessing.
 
 ## Runtime context window
 

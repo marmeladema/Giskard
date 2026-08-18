@@ -16,8 +16,8 @@ async function holdRoute(page: Page, url: RegExp, method: string): Promise<() =>
   return () => release();
 }
 
-/** `GET /api/projects/{id}` — the project record, not its `/models` catalog. */
-const PROJECT_GET = /\/api\/projects\/[^/?]+$/;
+/** `GET /api/projects/{id}/models` — the project's catalog, which the draft's model comes from. */
+const MODELS_GET = /\/api\/projects\/[^/?]+\/models$/;
 
 // Clicking "+" used to fetch the project before switching to the draft. For the length of that
 // round-trip the *previous* thread stayed on screen with its composer visible and editable, so
@@ -28,21 +28,22 @@ const PROJECT_GET = /\/api\/projects\/[^/?]+$/;
 // This surfaced as a rare flake in the suite — a test would type into a composer that was about to
 // be wiped — but it is a real way to lose a message, and it gets more likely the slower the server.
 //
-// The draft now opens immediately and the project's default model is applied when it arrives. That
-// makes the draft interactive *while* the fetch is in flight, so these tests hold the fetch open to
-// make the window wide and deterministic, and each waits for the response to be delivered before
-// asserting — otherwise they would pass on state captured before the deferred callback ever ran.
+// The draft now opens immediately and takes its model from the project's catalog when that
+// arrives — nothing is stored on the project to read instead. That makes the draft interactive
+// *while* the catalog is in flight, so these tests hold that fetch open to make the window wide and
+// deterministic, and each waits for the response to be delivered before asserting — otherwise they
+// would pass on state captured before the deferred callback ever ran.
 test.describe("draft composer", () => {
   test.beforeEach(async ({ page }) => {
     await login(page);
   });
 
-  /** The single-project GET that `newThread` used to await before opening the draft. */
-  const holdProjectFetch = (page: Page) => holdRoute(page, PROJECT_GET, "GET");
+  /** The catalog fetch a draft's model resolves from. */
+  const holdModelsFetch = (page: Page) => holdRoute(page, MODELS_GET, "GET");
 
-  function projectFetched(page: Page) {
+  function modelsFetched(page: Page) {
     return page.waitForResponse(
-      (r) => r.request().method() === "GET" && PROJECT_GET.test(new URL(r.url()).pathname),
+      (r) => r.request().method() === "GET" && MODELS_GET.test(new URL(r.url()).pathname),
     );
   }
 
@@ -74,8 +75,8 @@ test.describe("draft composer", () => {
 
   test("keeps a message typed while the new thread is still opening", async ({ page }) => {
     const message = "Typed before the draft finished opening";
-    const release = await holdProjectFetch(page);
-    const fetched = projectFetched(page);
+    const release = await holdModelsFetch(page);
+    const fetched = modelsFetched(page);
 
     await page.locator(".proj", { hasText: "Demo" }).locator(".project-add").click();
 
@@ -89,7 +90,7 @@ test.describe("draft composer", () => {
     // assertions below have to come after the response has actually been delivered.
     release();
     await fetched;
-    // The project's default model arriving is what proves the deferred callback ran at all.
+    // The catalog arriving — and the draft settling on it — proves the deferred callback ran.
     await expect(modelButton(page)).toContainText("Replay Model");
     await expect(input).toHaveValue(message);
 
@@ -101,12 +102,12 @@ test.describe("draft composer", () => {
   });
 
   // A draft opens before its model is known, so `state.currentModel` is null rather than a
-  // stand-in until the project's default arrives. Send stays unavailable for that window: starting
+  // stand-in until the catalog arrives. Send stays unavailable for that window: starting
   // the first turn on a fallback would bind the thread to a provider the project never chose, and a
   // started thread cannot be switched across providers, so it would not be recoverable.
   test("holds the first send until the project's model has resolved", async ({ page }) => {
-    const release = await holdProjectFetch(page);
-    const fetched = projectFetched(page);
+    const release = await holdModelsFetch(page);
+    const fetched = modelsFetched(page);
     const started = page.waitForRequest(
       (r) => r.method() === "POST" && r.url().endsWith("/threads/start"),
     );
@@ -136,34 +137,35 @@ test.describe("draft composer", () => {
   // must not quietly replace it — the turn would then run on settings the user did not pick. The
   // project's stored default carries no reasoning effort, so an unguarded overwrite resets a chosen
   // one to "Default"; picking an effort also resolves the draft, so it becomes sendable at once.
-  test("keeps a reasoning effort chosen while the project's model was still loading", async ({ page }) => {
-    const release = await holdProjectFetch(page);
-    const fetched = projectFetched(page);
+  // A choice the user made must survive a later catalog load — reloading the picker re-derives the
+  // draft's model, and an unguarded re-derive would reset an explicitly chosen effort to "Default"
+  // and run the turn on settings the user did not pick.
+  test("keeps a reasoning effort chosen across a model catalog reload", async ({ page }) => {
     const started = page.waitForRequest(
       (r) => r.method() === "POST" && r.url().endsWith("/threads/start"),
     );
 
     await page.locator(".proj", { hasText: "Demo" }).locator(".project-add").click();
     await expect(page.locator("#input")).toBeVisible();
-    // Fill first, so the send-availability assertions below turn only on the model resolving and
-    // not on whether there is anything to send.
     await page.locator("#input").fill("Sent on an explicitly chosen effort");
-    await expect(page.locator("#sendBtn")).toBeDisabled();
+    await expect(modelButton(page)).toContainText("Replay Model");
 
-    // The catalog is a separate fetch and has already landed, so the controls are usable here.
     await modelButton(page).click();
     await expect(page.locator("#effortSel")).toBeVisible();
     await page.locator("#effortSel").selectOption("high");
     await expect(modelButton(page)).toContainText("High");
-    // An explicit choice resolves the draft, so it is sendable without waiting for the default.
-    await expect(page.locator("#sendBtn")).toBeEnabled();
 
-    release();
-    await fetched;
-    // The default has had its chance to land. The explicit choice must still be in effect.
+    // Reload the catalog: the draft re-derives from it, and must leave the explicit choice alone.
+    // The reload button lives in the picker popover, so this happens before it is dismissed.
+    const reloaded = modelsFetched(page);
+    await page.locator("#refreshModels").click();
+    // A failed reload also leaves the chosen effort alone, so the assertion below only means
+    // something once the catalog has actually been delivered.
+    expect((await reloaded).ok()).toBe(true);
     await expect(modelButton(page)).toContainText("High");
 
     await page.keyboard.press("Escape");   // the picker popover overlays the composer
+    await expect(page.locator("#sendBtn")).toBeEnabled();
     await page.locator("#sendBtn").click();
     const body = (await started).postDataJSON();
     expect(body.model_ref).toMatchObject({
@@ -173,11 +175,12 @@ test.describe("draft composer", () => {
     });
   });
 
-  // If the model never resolves there is nothing authoritative to start on, so the draft stays
-  // uncommittable rather than falling back. The keyboard path is checked too: Enter reaches
-  // `sendInput` directly and cannot be gated by the button's disabled state.
-  test("keeps the first send unavailable when the project's model never resolved", async ({ page }) => {
-    await page.route(PROJECT_GET, async (route) =>
+  // The catalog is the only source of a draft's model, so if it fails there is nothing
+  // authoritative to start on and the draft stays uncommittable rather than falling back. The
+  // failure has to be visible rather than presenting as an empty picker. The keyboard path is
+  // checked too: Enter reaches `sendInput` directly and cannot be gated by the button's state.
+  test("keeps the first send unavailable when the model catalog never loads", async ({ page }) => {
+    await page.route(MODELS_GET, async (route) =>
       route.request().method() === "GET" ? route.abort() : route.fallback(),
     );
     let started = false;
@@ -187,8 +190,9 @@ test.describe("draft composer", () => {
 
     await page.locator(".proj", { hasText: "Demo" }).locator(".project-add").click();
     await expect(page.locator("#input")).toBeVisible();
-    await page.locator("#input").fill("Typed while the project fetch was failing");
+    await page.locator("#input").fill("Typed while the model catalog was failing");
 
+    await expect(page.locator("#notices")).toContainText("Could not load this project's models");
     await expect(modelButton(page)).toContainText("Model unavailable");
     await expect(page.locator("#sendBtn")).toBeDisabled();
 
@@ -196,38 +200,9 @@ test.describe("draft composer", () => {
     await page.locator("#input").press("Enter");
     await expect(page.locator("#notices")).toContainText("Cannot start a thread here");
 
-    expect(started, "no turn may be started without a project model").toBe(false);
-    // And the text is still there to send once a model is picked.
-    await expect(page.locator("#input")).toHaveValue("Typed while the project fetch was failing");
-  });
-
-  // The model catalog is a separate fetch from the project's default model. If it fails the draft is
-  // still committable — the default is what `threads/start` carries — but the picker is left with no
-  // options, so the failure has to be visible rather than presenting as an empty list.
-  test("reports a failed model catalog and still sends on the project's default", async ({ page }) => {
-    await page.route(/\/api\/projects\/[^/?]+\/models$/, (route) =>
-      route.request().method() === "GET" ? route.abort() : route.fallback(),
-    );
-    const started = page.waitForRequest(
-      (r) => r.method() === "POST" && r.url().endsWith("/threads/start"),
-    );
-
-    await page.locator(".proj", { hasText: "Demo" }).locator(".project-add").click();
-    await expect(page.locator("#input")).toBeVisible();
-    await expect(page.locator("#notices")).toContainText("Could not load this project's models");
-
-    // The default model still resolved, so the draft is sendable and goes out on that model. With
-    // no catalog there is no descriptor to supply a display name, so the picker shows the raw id.
-    await expect(modelButton(page)).toContainText("replay-model");
-    await page.locator("#input").fill("Sent with an unavailable model catalog");
-    await expect(page.locator("#sendBtn")).toBeEnabled();
-    await page.locator("#sendBtn").click();
-
-    const body = (await started).postDataJSON();
-    expect(body.model_ref).toMatchObject({ provider: "replay", model: "replay-model" });
-    await expect(
-      page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY }),
-    ).toBeVisible();
+    expect(started, "no turn may be started without a model").toBe(false);
+    // And the text is still there to send once a model is available.
+    await expect(page.locator("#input")).toHaveValue("Typed while the model catalog was failing");
   });
 
   // Two successive drafts in the same project share the composer draft key `draft:<pid>`, so the key

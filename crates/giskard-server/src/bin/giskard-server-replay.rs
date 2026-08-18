@@ -34,7 +34,6 @@ use giskard_core::ids::{ApprovalId, ItemId, ThreadId, TurnId};
 use giskard_core::item::{
     Item, ItemDelta, ItemKind, ItemPayload, ItemStart, SubagentAction, SubagentLink,
 };
-use giskard_core::model::ModelRef;
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
@@ -125,6 +124,9 @@ impl ScriptedHarness {
                 structured_diffs: true,
                 resumable_threads: true,
                 model_listing: false,
+                // The scripted harness knows its one provider, so the picker exercises the same
+                // id-validation path the real Codex harness does.
+                provider_listing: true,
                 token_usage: true,
                 mcp_status: false,
                 mcp_reload: false,
@@ -365,6 +367,17 @@ impl AgentHarness for ScriptedHarness {
         Ok(vec![])
     }
 
+    /// The scripted stand-in for Codex's `[model_providers]` table: one provider, no endpoint, so
+    /// the seeded config's `replay` id validates while no discovery is attempted.
+    async fn list_providers(&self) -> Result<Vec<giskard_harness::HarnessProvider>, HarnessError> {
+        Ok(vec![giskard_harness::HarnessProvider {
+            id: "replay".into(),
+            name: Some("Replay (scripted)".into()),
+            base_url: None,
+            api_key_env: None,
+        }])
+    }
+
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
         let thread = opts.thread.unwrap_or_default();
         let harness_thread_id = opts
@@ -399,7 +412,10 @@ impl AgentHarness for ScriptedHarness {
             thread,
             harness_thread_id,
             warning: None,
-            resumed_model: Some(opts.initial_model),
+            resumed_model: opts
+                .initial_model
+                .clone()
+                .or_else(|| Some(fake_native_model())),
             agent_name: parent_harness_thread_id.as_ref().map(|_| {
                 if blocks_on_approval {
                     SCRIPTED_APPROVAL_SUBAGENT_AGENT_NAME.to_string()
@@ -779,7 +795,6 @@ kind = "replay"
 
 [[providers]]
 id = "replay"
-name = "Replay (scripted)"
 model_listing = false
   [[providers.models]]
   id = "replay-model"
@@ -842,17 +857,11 @@ async fn run() -> Result<(), String> {
         .await
         .map_err(|e| format!("cannot read project index: {e}"))?;
     if projects.projects.is_empty() {
-        let default_model = ModelRef {
-            provider: "replay".into(),
-            model: "replay-model".into(),
-            reasoning_effort: None,
-        };
         store
             .create_project(
                 giskard_core::ids::ProjectId::new(),
                 "Demo",
                 &workspace.to_string_lossy(),
-                default_model,
             )
             .await
             .map_err(|e| format!("cannot seed demo project: {e}"))?;
@@ -934,4 +943,17 @@ fn run_git_seed<const N: usize>(workspace: &Path, args: [&str; N]) -> Result<(),
     } else {
         stderr
     })
+}
+
+/// The model a fake harness reports for a thread it is asked to import. A real harness answers this
+/// from the thread itself; an import names no model, so the fake stands in with a fixed one rather
+/// than claiming not to know.
+fn fake_native_model() -> giskard_core::model::ModelRef {
+    // The identity this server actually advertises, in `[[providers]]` and `list_providers` alike.
+    // Reporting anything else would bind an imported thread to a provider the picker never offers.
+    giskard_core::model::ModelRef {
+        provider: "replay".into(),
+        model: "replay-model".into(),
+        reasoning_effort: None,
+    }
 }

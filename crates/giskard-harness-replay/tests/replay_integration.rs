@@ -115,11 +115,11 @@ async fn open_thread_one_turn_assert_state() {
             workspace_root: "/tmp/test".into(),
             resume: Some("th_test_001".into()),
             resume_policy: giskard_harness::ResumePolicy::AllowFreshFallback,
-            initial_model: ModelRef {
+            initial_model: Some(ModelRef {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
-            },
+            }),
         })
         .await
         .expect("open_thread failed");
@@ -251,11 +251,11 @@ async fn replay_persisted_state_roundtrip() {
             workspace_root: "/tmp/test".into(),
             resume: Some("th_test_001".into()),
             resume_policy: giskard_harness::ResumePolicy::AllowFreshFallback,
-            initial_model: ModelRef {
+            initial_model: Some(ModelRef {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
-            },
+            }),
         })
         .await
         .unwrap();
@@ -293,16 +293,7 @@ async fn replay_persisted_state_roundtrip() {
 
     let pid = giskard_core::ProjectId::new();
     store
-        .create_project(
-            pid,
-            "test-proj",
-            "/tmp/test",
-            ModelRef {
-                provider: "openai".into(),
-                model: "gpt-5.5".into(),
-                reasoning_effort: None,
-            },
-        )
+        .create_project(pid, "test-proj", "/tmp/test")
         .await
         .unwrap();
 

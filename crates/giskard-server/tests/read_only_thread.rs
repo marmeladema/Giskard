@@ -132,12 +132,7 @@ session_days = 30
     let tid = ThreadId::new();
     let proj_dir = tempfile::TempDir::new().unwrap();
     store
-        .create_project(
-            pid,
-            "proj",
-            &proj_dir.path().to_string_lossy(),
-            orphaned_model(),
-        )
+        .create_project(pid, "proj", &proj_dir.path().to_string_lossy())
         .await
         .unwrap();
     store

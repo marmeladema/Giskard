@@ -54,6 +54,11 @@ pub struct ModelDescriptor {
     pub reasoning_efforts: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// Whether the harness marks this as the model to start from when nothing else is chosen
+    /// (Codex's `model/list` `isDefault`). Used to seed a project's default model (§8.3); it is
+    /// never a fallback for a thread that already has one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_default: bool,
 }
 
 impl ModelRef {
@@ -77,6 +82,7 @@ impl ModelDescriptor {
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
             display_name: None,
+            is_default: false,
         }
     }
 }

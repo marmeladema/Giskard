@@ -84,16 +84,7 @@ session_days = 30
     let pid = ProjectId::new();
     state
         .store
-        .create_project(
-            pid,
-            "viz-test",
-            &proj_dir_path,
-            giskard_core::model::ModelRef {
-                provider: "openai".into(),
-                model: "gpt-5.5".into(),
-                reasoning_effort: None,
-            },
-        )
+        .create_project(pid, "viz-test", &proj_dir_path)
         .await
         .unwrap();
 
@@ -594,16 +585,7 @@ async fn code_overlay_endpoints_refuse_a_thread_they_cannot_resolve() {
     let other_project = ProjectId::new();
     state
         .store
-        .create_project(
-            other_project,
-            "other",
-            "/tmp",
-            giskard_core::model::ModelRef {
-                provider: "openai".into(),
-                model: "gpt-5.5".into(),
-                reasoning_effort: None,
-            },
-        )
+        .create_project(other_project, "other", "/tmp")
         .await
         .unwrap();
     let foreign = ThreadId::new();

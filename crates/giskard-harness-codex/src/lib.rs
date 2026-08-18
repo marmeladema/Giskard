@@ -37,8 +37,8 @@ use giskard_core::token::TokenUsage;
 use giskard_core::turn::{PermissionPreset, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::{AttachmentKind, UserAttachment, UserInput};
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, HarnessNotice, OpenThreadOptions,
-    ResumePolicy, ThreadHandle,
+    AgentEventStream, AgentHarness, HarnessCapabilities, HarnessNotice, HarnessProvider,
+    OpenThreadOptions, ResumePolicy, ThreadHandle,
 };
 
 use mapping::CodexMapper;
@@ -76,7 +76,40 @@ struct ConfigReadResponse {
 #[derive(Debug, Deserialize)]
 struct CodexConfig {
     sandbox_workspace_write: Option<SandboxWorkspaceWrite>,
+    /// User-declared `[model_providers.<id>]` entries. Codex's `config/read` serializes its whole
+    /// effective config and the app-server `Config` type forwards every key it does not model
+    /// itself, so this table arrives even though the generated protocol types omit it. Built-in
+    /// providers are *not* included here — see [`CODEX_BUILT_IN_PROVIDER_IDS`].
+    #[serde(default)]
+    model_providers: HashMap<String, CodexModelProvider>,
 }
+
+/// The subset of Codex's `ModelProviderInfo` Giskard needs: a name for the picker and the endpoint
+/// plus key location for `/v1/models` discovery.
+///
+/// `experimental_bearer_token` is deliberately not read. Codex discourages it, and an inline secret
+/// is the one field worth leaving where it already lives.
+#[derive(Debug, Deserialize)]
+struct CodexModelProvider {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    env_key: Option<String>,
+}
+
+/// Provider ids Codex ships built in. They never appear in the `[model_providers]` table (which
+/// only carries user-declared entries), so Giskard would otherwise report a project pinned to
+/// `openai` as pointing at an unknown provider. Mirrors `built_in_model_providers` in Codex's
+/// `model-provider-info` crate.
+const CODEX_BUILT_IN_PROVIDER_IDS: [&str; 5] = [
+    "openai",
+    "amazon-bedrock",
+    "amazon-bedrock-runtime",
+    "ollama",
+    "lmstudio",
+];
 
 #[derive(Debug, Deserialize)]
 struct SandboxWorkspaceWrite {
@@ -167,6 +200,10 @@ enum ControlCommand {
     StartMcpOauthLogin {
         name: String,
         response: oneshot::Sender<Result<McpOauthStart, HarnessError>>,
+    },
+    ListProviders {
+        cwd: String,
+        response: oneshot::Sender<Result<Vec<HarnessProvider>, HarnessError>>,
     },
     ListModels {
         response: oneshot::Sender<Result<Vec<ModelDescriptor>, HarnessError>>,
@@ -664,6 +701,9 @@ async fn codex_respond_error_json(
 
 /// Codex CLI harness adapter (one app-server process per project).
 pub struct CodexHarness {
+    /// Kept so `list_providers` can resolve Codex's config for this project's directory: config is
+    /// layered per-cwd, so the provider table is only correct when asked for the right root.
+    workspace_root: PathBuf,
     cmd_tx: mpsc::Sender<QueuedHarnessCommand>,
     control_tx: mpsc::Sender<QueuedControlCommand>,
     senders: SenderMap,
@@ -705,6 +745,7 @@ impl CodexHarness {
         let worker_queue = Arc::new(WorkerQueueWatchdog::new());
 
         let harness = Arc::new(Self {
+            workspace_root: workspace_root.clone(),
             cmd_tx,
             control_tx,
             senders: senders.clone(),
@@ -718,6 +759,7 @@ impl CodexHarness {
                 structured_diffs: true,
                 resumable_threads: true,
                 model_listing: true,
+                provider_listing: true,
                 token_usage: true,
                 mcp_status: true,
                 mcp_reload: true,
@@ -870,6 +912,20 @@ impl AgentHarness for CodexHarness {
         let (tx, rx) = oneshot::channel();
         self.enqueue_control("list_models", ControlCommand::ListModels { response: tx })
             .await?;
+        rx.await
+            .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
+    }
+
+    async fn list_providers(&self) -> Result<Vec<HarnessProvider>, HarnessError> {
+        let (tx, rx) = oneshot::channel();
+        self.enqueue_control(
+            "list_providers",
+            ControlCommand::ListProviders {
+                cwd: self.workspace_root.to_string_lossy().into_owned(),
+                response: tx,
+            },
+        )
+        .await?;
         rx.await
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
@@ -1685,6 +1741,18 @@ async fn handle_control_command(
             let _ = response.send(result);
             StreamOutcome::TurnEnded
         }
+        Some(ControlCommand::ListProviders { cwd, response }) => {
+            let result = timeout_codex_control(
+                "list_providers",
+                None,
+                None,
+                None,
+                handle_list_providers(client, cwd),
+            )
+            .await;
+            let _ = response.send(result);
+            StreamOutcome::TurnEnded
+        }
         Some(ControlCommand::ListModels { response }) => {
             let result =
                 timeout_codex_control("list_models", None, None, None, handle_list_models(client))
@@ -1864,7 +1932,7 @@ async fn handle_open_thread(
             context,
             resume_id,
             &cwd,
-            &opts.initial_model,
+            opts.initial_model.as_ref(),
             opts.resume_policy,
         )
         .await
@@ -1873,6 +1941,9 @@ async fn handle_open_thread(
             Err(error) if opts.resume_policy == ResumePolicy::RequireExisting => {
                 return Err(error);
             }
+            // Recovery needs a model to start on, and importing a thread by native id supplies
+            // none — the model was the resumed thread's to report. Nothing sensible to start.
+            Err(error) if opts.initial_model.is_none() => return Err(error),
             Err(e) => {
                 // C5: Codex thread store purged/rotated. Start fresh instead of hard-failing.
                 resume_warning = Some(HarnessNotice {
@@ -1887,13 +1958,13 @@ async fn handle_open_thread(
                     opts.project,
                 )
                 .with_thread_id(thread_id);
-                start_thread(client, context, &cwd, &opts.initial_model).await?
+                start_thread(client, context, &cwd, &fresh_model(opts)?).await?
             }
         }
     } else {
         let context = CodexOperationContext::for_project("thread_start", opts.project)
             .with_thread_id(thread_id);
-        start_thread(client, context, &cwd, &opts.initial_model).await?
+        start_thread(client, context, &cwd, &fresh_model(opts)?).await?
     };
 
     // B4: bind the (possibly re-established) native id to the durable ThreadId.
@@ -1940,7 +2011,7 @@ async fn resume_thread_with_policy(
     context: CodexOperationContext<'_>,
     resume_id: &str,
     cwd: &str,
-    model: &giskard_core::model::ModelRef,
+    model: Option<&giskard_core::model::ModelRef>,
     policy: ResumePolicy,
 ) -> Result<OpenedNativeThread, HarnessError> {
     let mut retry = 0usize;
@@ -1987,19 +2058,35 @@ async fn resume_thread_with_policy(
 /// intentionally ignore resume overrides for an already-loaded thread while still answering
 /// success, so callers switching providers must compare this against what they requested (see
 /// `specs/model-provider-switching-analysis.md`). Empty response fields (older servers) yield
-/// `None`; the reasoning effort is not part of the response and is carried from the request.
+/// `None`.
+///
+/// `reasoning_effort` is the thread's, so a reported one wins over the request: `thread/resume`
+/// answers with the effort the thread is actually on, and an import names no effort at all.
+/// `thread/start` does not report one, and there the request is the only source.
 fn effective_model(
     model: &str,
     model_provider: &str,
-    requested: &giskard_core::model::ModelRef,
+    reported_effort: Option<giskard_core::model::Effort>,
+    requested: Option<&giskard_core::model::ModelRef>,
 ) -> Option<giskard_core::model::ModelRef> {
     if model.is_empty() || model_provider.is_empty() {
+        // An import has no requested model to fall back on, so this is the difference between a
+        // thread whose model Codex declined to report and one Giskard dropped on the floor. The
+        // caller turns it into a refusal; without this the refusal has no cause attached.
+        warn!(
+            model_empty = model.is_empty(),
+            model_provider_empty = model_provider.is_empty(),
+            requested = ?requested.map(giskard_core::model::ModelRef::key),
+            action = "effective_model",
+            "Codex reported no effective model for the opened thread"
+        );
         return None;
     }
     Some(giskard_core::model::ModelRef {
         provider: model_provider.to_string(),
         model: model.to_string(),
-        reasoning_effort: requested.reasoning_effort.clone(),
+        reasoning_effort: reported_effort
+            .or_else(|| requested.and_then(|r| r.reasoning_effort.clone())),
     })
 }
 
@@ -2008,15 +2095,22 @@ async fn resume_thread(
     context: CodexOperationContext<'_>,
     resume_id: &str,
     cwd: &str,
-    model: &giskard_core::model::ModelRef,
+    model: Option<&giskard_core::model::ModelRef>,
 ) -> Result<OpenedNativeThread, HarnessError> {
-    let params: codex_codes::ThreadResumeParams = serde_json::from_value(serde_json::json!({
+    // `model`/`modelProvider` are overrides, not preferences: Codex stops applying the thread's
+    // own persisted model the moment either is present (`merge_persisted_resume_metadata` returns
+    // early on `has_model_resume_override`). Omitting them is how a caller says "keep whatever this
+    // thread was already using".
+    let mut params_json = serde_json::json!({
         "threadId": resume_id,
         "cwd": cwd,
-        "model": model.model,
-        "modelProvider": model.provider,
-    }))
-    .map_err(|e| HarnessError::Protocol(e.to_string()))?;
+    });
+    if let Some(model) = model {
+        params_json["model"] = serde_json::Value::String(model.model.clone());
+        params_json["modelProvider"] = serde_json::Value::String(model.provider.clone());
+    }
+    let params: codex_codes::ThreadResumeParams =
+        serde_json::from_value(params_json).map_err(|e| HarnessError::Protocol(e.to_string()))?;
     let resp: codex_codes::ThreadResumeResponse = codex_request(
         client,
         context,
@@ -2024,7 +2118,14 @@ async fn resume_thread(
         &params,
     )
     .await?;
-    let resumed = effective_model(&resp.model, &resp.model_provider, model);
+    let resumed = effective_model(
+        &resp.model,
+        &resp.model_provider,
+        resp.reasoning_effort
+            .as_ref()
+            .map(|effort| giskard_core::model::Effort::new(effort.0.clone())),
+        model,
+    );
     Ok(OpenedNativeThread {
         harness_thread_id: resp.thread.id,
         model: resumed,
@@ -2041,6 +2142,14 @@ async fn resume_thread(
             .and_then(trimmed_non_empty)
             .map(ToOwned::to_owned),
     })
+}
+
+/// The model a *fresh* native thread starts on. Unlike a resume, there is no existing thread whose
+/// model Codex could report, so the caller has to have named one.
+fn fresh_model(opts: &OpenThreadOptions) -> Result<giskard_core::model::ModelRef, HarnessError> {
+    opts.initial_model
+        .clone()
+        .ok_or_else(|| HarnessError::Protocol("starting a new thread requires a model".into()))
 }
 
 async fn start_thread(
@@ -2062,7 +2171,7 @@ async fn start_thread(
         &params,
     )
     .await?;
-    let started = effective_model(&resp.model, &resp.model_provider, initial_model);
+    let started = effective_model(&resp.model, &resp.model_provider, None, Some(initial_model));
     Ok(OpenedNativeThread {
         harness_thread_id: resp.thread.id,
         model: started,
@@ -2863,6 +2972,67 @@ async fn handle_list_mcp_servers(
     Ok(out)
 }
 
+/// Read the providers Codex is configured to route to (§8.2), from the `config/read` RPC.
+///
+/// Codex owns provider configuration: `~/.codex/config.toml` holds each provider's display name,
+/// `base_url`, and `env_key`, and Giskard reads them back here instead of asking the user to
+/// restate them. `config/read` returns the whole effective config, so the `[model_providers]`
+/// table arrives as an unmodeled key that our own [`CodexConfig`] picks up.
+///
+/// The result is the built-in ids Codex always accepts plus every user-declared entry. Built-ins
+/// come first so a user entry that somehow shadows one wins on `id` collision; Codex itself
+/// rejects that at load time for all but the Bedrock ids.
+///
+/// Config is resolved per directory, so `cwd` must be the project's workspace root: a project
+/// layer can add providers the home config does not have.
+async fn handle_list_providers(
+    client: &mut dyn CodexTransport,
+    cwd: String,
+) -> Result<Vec<HarnessProvider>, HarnessError> {
+    let params = ConfigReadParams {
+        include_layers: false,
+        cwd,
+    };
+    let response: ConfigReadResponse = codex_request(
+        client,
+        CodexOperationContext::new("list_providers"),
+        "config/read",
+        &params,
+    )
+    .await?;
+
+    let mut providers: Vec<HarnessProvider> = CODEX_BUILT_IN_PROVIDER_IDS
+        .iter()
+        .map(|id| HarnessProvider {
+            id: (*id).to_string(),
+            name: None,
+            base_url: None,
+            api_key_env: None,
+        })
+        .collect();
+
+    for (id, provider) in response.config.model_providers {
+        let entry = HarnessProvider {
+            id: id.clone(),
+            name: non_empty(provider.name),
+            base_url: non_empty(provider.base_url),
+            api_key_env: non_empty(provider.env_key),
+        };
+        match providers.iter_mut().find(|existing| existing.id == id) {
+            Some(existing) => *existing = entry,
+            None => providers.push(entry),
+        }
+    }
+
+    Ok(providers)
+}
+
+/// Treat an absent and an empty string alike: Codex defaults `name` to `""` rather than omitting
+/// it, and an empty `base_url`/`env_key` is a misconfiguration, not a value.
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
 /// List the models Codex advertises over the app-server `model/list` RPC, mapped to Giskard
 /// [`ModelDescriptor`]s so the picker can show Codex's friendly `display_name` instead of raw
 /// model ids.
@@ -2937,6 +3107,7 @@ fn map_model(model: codex_codes::Model) -> ModelDescriptor {
         supports_reasoning_effort: !reasoning_efforts.is_empty(),
         reasoning_efforts,
         display_name,
+        is_default: model.is_default,
     }
 }
 
@@ -3327,11 +3498,17 @@ mod tests {
                                  {native_thread_id}"
                             )))
                         } else {
-                            Ok(thread_open_response(
+                            let mut response = thread_open_response(
+                                // An import sends no override, and Codex then answers with the
+                                // thread's own persisted model rather than anything requested.
                                 native_thread_id,
-                                params["model"].as_str().unwrap_or("gpt-5.5"),
-                                params["modelProvider"].as_str().unwrap_or("openai"),
-                            ))
+                                params["model"].as_str().unwrap_or("resumed-model"),
+                                params["modelProvider"]
+                                    .as_str()
+                                    .unwrap_or("resumed-provider"),
+                            );
+                            response["reasoningEffort"] = json!("high");
+                            Ok(response)
                         }
                     }
                     codex_codes::protocol::methods::TURN_START => {
@@ -3392,6 +3569,20 @@ mod tests {
                                             "/home/test/.cache/sccache",
                                             "relative/cache"
                                         ]
+                                    },
+                                    // Codex forwards every config key it does not model itself,
+                                    // so the provider table arrives alongside the modeled ones.
+                                    "model_providers": {
+                                        "litellm": {
+                                            "name": "LiteLLM",
+                                            "base_url": "http://127.0.0.1:4000/v1",
+                                            "env_key": "LITELLM_KEY",
+                                            "wire_api": "responses"
+                                        },
+                                        "unnamed": {
+                                            "name": "",
+                                            "base_url": "http://127.0.0.1:9000/v1"
+                                        }
                                     }
                                 },
                                 "origins": {}
@@ -3526,7 +3717,7 @@ mod tests {
             workspace_root: PathBuf::from("/tmp"),
             resume: resume.map(str::to_owned),
             resume_policy: ResumePolicy::AllowFreshFallback,
-            initial_model: test_model(None),
+            initial_model: Some(test_model(None)),
         }
     }
 
@@ -4396,6 +4587,119 @@ mod tests {
             req.method == THREAD_BACKGROUND_TERMINALS_TERMINATE
                 || req.method == codex_codes::protocol::methods::TURN_INTERRUPT
         }));
+    }
+
+    #[tokio::test]
+    async fn importing_a_thread_takes_its_model_and_effort_from_codex() {
+        let (harness, controller) = spawn_fake_harness();
+
+        // No model named: this is importing a native thread whose model is Codex's to report.
+        let handle = timeout(
+            Duration::from_secs(1),
+            harness.open_thread(OpenThreadOptions {
+                project: ProjectId::new(),
+                thread: Some(ThreadId::new()),
+                workspace_root: PathBuf::from("/tmp"),
+                resume: Some("native-existing".into()),
+                resume_policy: ResumePolicy::AllowFreshFallback,
+                initial_model: None,
+            }),
+        )
+        .await
+        .expect("open_thread should complete")
+        .expect("open_thread should succeed");
+
+        assert_eq!(
+            handle.resumed_model,
+            Some(giskard_core::model::ModelRef {
+                provider: "resumed-provider".into(),
+                model: "resumed-model".into(),
+                // The picker has to land on the effort the thread is actually running, not
+                // "Default": Codex reports it on resume, so dropping it would understate the
+                // thread's own settings.
+                reasoning_effort: Some(giskard_core::model::Effort::new("high")),
+            })
+        );
+
+        let resume = controller
+            .requests()
+            .await
+            .into_iter()
+            .find(|req| req.method == codex_codes::protocol::methods::THREAD_RESUME)
+            .expect("a thread/resume request");
+        assert!(
+            resume.params.get("model").is_none() && resume.params.get("modelProvider").is_none(),
+            "an import must send no model override, which would suppress the thread's own: {:?}",
+            resume.params
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_list_providers_reads_the_config_model_providers_table() {
+        let (harness, controller) = spawn_fake_harness();
+
+        assert!(
+            harness.capabilities().provider_listing,
+            "Codex harness should advertise provider listing"
+        );
+
+        let providers = timeout(Duration::from_secs(1), harness.list_providers())
+            .await
+            .expect("list_providers should complete")
+            .expect("list_providers should succeed");
+
+        let by_id = |id: &str| {
+            providers
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap_or_else(|| panic!("provider {id} missing from {providers:?}"))
+                .clone()
+        };
+
+        // Built-ins are always routable even though Codex never lists them in `model_providers`.
+        for built_in in CODEX_BUILT_IN_PROVIDER_IDS {
+            assert!(
+                providers.iter().any(|p| p.id == built_in),
+                "built-in {built_in} should be routable: {providers:?}"
+            );
+        }
+
+        let litellm = by_id("litellm");
+        assert_eq!(litellm.name.as_deref(), Some("LiteLLM"));
+        assert_eq!(
+            litellm.base_url.as_deref(),
+            Some("http://127.0.0.1:4000/v1")
+        );
+        assert_eq!(litellm.api_key_env.as_deref(), Some("LITELLM_KEY"));
+
+        // Codex defaults an omitted `name` to "", which is absence, not a display name.
+        let unnamed = by_id("unnamed");
+        assert_eq!(unnamed.name, None);
+        assert_eq!(unnamed.api_key_env, None);
+
+        let requests = controller.requests().await;
+        assert!(
+            requests.iter().any(|req| req.method == "config/read"),
+            "list_providers should issue a config/read request"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_list_providers_surfaces_config_read_failure() {
+        let (harness, controller) = spawn_fake_harness();
+        controller.fail_config_read("config/read exploded").await;
+
+        let result = timeout(Duration::from_secs(1), harness.list_providers())
+            .await
+            .expect("list_providers should complete");
+
+        match result {
+            Err(HarnessError::Transport(message)) => assert!(
+                message.contains("config/read exploded"),
+                "transport failure should carry the cause: {message}"
+            ),
+            other => panic!("expected a transport failure, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -29,7 +29,18 @@ impl HarnessFactory for TestFactory {
         &self,
         _config: &ProjectConfig,
     ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
-        Ok(Arc::new(ReplayHarness::from_fixture(self.fixture.clone())))
+        // The thread is imported by native id, so the model it starts on is the harness's to
+        // report. This test's config only offers `cloudflare-litellm`, and it goes on to select a
+        // different model on that same provider.
+        Ok(Arc::new(
+            ReplayHarness::from_fixture(self.fixture.clone()).with_imported_model(
+                giskard_core::model::ModelRef {
+                    provider: "cloudflare-litellm".into(),
+                    model: "gpt-5.5".into(),
+                    reasoning_effort: None,
+                },
+            ),
+        ))
     }
 }
 
@@ -147,7 +158,6 @@ filename_template = "plan-{{slug}}-{{ts}}.md"
 
 [[providers]]
 id = "cloudflare-litellm"
-name = "Cloudflare LiteLLM"
 model_listing = false
   [[providers.models]]
   id = "@cf/z-ai/glm-4.7"
@@ -214,15 +224,6 @@ async fn modes_models_approvals_and_plan_dump() {
         .unwrap()
         .to_string();
 
-    // Model listing endpoint (static list is empty here; just assert it responds).
-    let resp = client
-        .get(format!("{base}/api/models"))
-        .header("cookie", &cookie)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-
     // Create project pointing at the writable dir.
     let resp = client
         .post(format!("{base}/api/projects"))
@@ -230,11 +231,6 @@ async fn modes_models_approvals_and_plan_dump() {
         .json(&serde_json::json!({
             "name": "proj",
             "dir": proj_dir_path,
-            "default_model": {
-                "provider": "cloudflare-litellm",
-                "model": "gpt-5.5",
-                "reasoning_effort": null,
-            },
         }))
         .send()
         .await

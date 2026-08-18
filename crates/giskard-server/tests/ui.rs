@@ -515,7 +515,6 @@ async fn index_page_is_served_and_public() {
                "threadsRefreshed && !knownThreadForId(pid, activeThread)"
            )
            && remove_thread_confirm.contains("openDraftThread(pid)")
-           && remove_thread_confirm.contains("applyProjectDefaultModel(pid, state.draftThread)")
            && !remove_thread_confirm.contains("clearThreadView("),
         "thread deletion warns about and lands on a draft in the same project"
     );
@@ -1622,31 +1621,50 @@ async fn index_page_is_served_and_public() {
 }
 
 #[test]
-fn browser_isolates_global_and_project_model_catalogs() {
+fn browser_has_no_model_list_outside_a_project() {
     let body = app_js();
 
-    let start_app = between(
-        body,
-        "async function startApp() {",
-        "// The global (no-project)",
+    // There is no browser-side model list outside a project. A model belongs to a project's
+    // catalog, which needs that project's harness, so nothing fetches models before one is open.
+    assert!(
+        !body.contains("state.globalModels") && !body.contains("/api/models/refresh"),
+        "no no-project model list survives in the browser"
     );
     assert!(
-        start_app
-            .contains("state.globalModels = (await api(\"GET\",\"/api/models\")).models || []")
-            && !start_app.contains("state.models = (await api(\"GET\",\"/api/models\""),
-        "startup keeps the no-project catalog separate from the active project catalog"
+        !body.contains("pmModel"),
+        "the new-project modal does not ask for a model it has no catalog to offer"
     );
 
-    let modal_models = between(
+    // The draft's starting model comes from the project's catalog, never from a stored project
+    // field: a remembered default is a copy of an older configuration that goes stale unseen.
+    let settle = between(
         body,
-        "function populateModalModels() {",
-        "function openProjectModal() {",
+        "function settleDraftModel(failure) {",
+        "// Remember that the user",
     );
     assert!(
-        modal_models.contains("for (const m of state.globalModels)")
-            && modal_models.contains("if (!state.globalModels.length)")
-            && !modal_models.contains("state.models"),
-        "the new-project modal only exposes the global model catalog"
+        settle.contains("state.models.find(m => m.is_default) || state.models[0] || null")
+            && settle.contains("draft.modelPinned")
+            && !settle.contains("default_model"),
+        "the draft model is derived from the live catalog, and a user's own pick still wins"
+    );
+    assert!(
+        !body.contains("applyProjectDefaultModel") && !body.contains("project.default_model"),
+        "no project-record default survives in the browser"
+    );
+
+    let create_project = between(
+        body,
+        "$(\"pmCreate\").onclick",
+        "function openRemoveProjectModal",
+    );
+    assert!(
+        !create_project.contains("default_model"),
+        "project creation names no model: there is no catalog to choose from yet"
+    );
+    assert!(
+        !create_project.contains("gpt-5.5"),
+        "no hardcoded model stands in for a catalog the browser cannot see"
     );
 
     let prepare_catalog = between(

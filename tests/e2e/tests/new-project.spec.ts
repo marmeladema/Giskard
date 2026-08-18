@@ -37,11 +37,12 @@ test.describe("new-project modal", () => {
     await page.locator("#newProj").click();
     await expect(page.locator("#projectModal")).toHaveClass(/open/);
 
-    // The replay server has exactly one configured model ("Replay Model"), so the modal's default
-    // model dropdown has one selectable option. Wait for it so the Create button submits a real
-    // model rather than the "(no models configured)" placeholder.
-    const modelSelect = page.locator("#pmModel");
-    await expect(modelSelect).toContainText("Replay Model");
+    // The modal asks for a folder and a name, and nothing else: a project has no harness until it
+    // exists, so there is no model catalog to offer here.
+    await expect(page.locator("#pmModel")).toHaveCount(0);
+    const createRequest = page.waitForRequest(
+      (r) => r.method() === "POST" && new URL(r.url()).pathname === "/api/projects",
+    );
 
     // Browse the picker to /tmp. The modal reopens where the browser last browsed (persisted in
     // localStorage), so the start is not fixed; `browseTo` walks up to "/" then down into the
@@ -58,6 +59,9 @@ test.describe("new-project modal", () => {
       (r) => r.request().method() === "POST" && new URL(r.url()).pathname === "/api/projects",
     );
     await page.locator("#pmCreate").click();
+    // Absent from the DOM is not the same as absent from the request: the payload must name no
+    // model either, since a project record no longer stores one.
+    expect((await createRequest).postDataJSON()).not.toHaveProperty("default_model");
     const createdJson = (await (await created).json()) as { id: string };
     const projectId = createdJson.id;
 
@@ -84,8 +88,9 @@ test.describe("new-project modal", () => {
       await expect(page.locator("#transcript")).toContainText("Start a new thread");
       await expect(page.locator("#mbTitle")).toContainText(projectName);
 
-      // The draft's default model resolves from the new project's record, so the picker shows the
-      // configured model and Send becomes available — the same end state as the per-project "+".
+      // The draft's starting model is derived from the new project's catalog — a project record
+      // stores none — so the picker shows the configured model and Send becomes available, the
+      // same end state as the per-project "+".
       // Type first: an empty composer disables Send for its own reason, which would mask whether
       // the model resolved.
       await expect(page.locator("#modelPickerBtn")).toContainText("Replay Model");

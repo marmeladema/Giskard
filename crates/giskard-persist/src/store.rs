@@ -50,7 +50,16 @@ pub struct ProjectConfig {
     pub harness: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_root: Option<String>,
-    pub default_model: ModelRef,
+    /// Absorbs the `default_model` key of a `project.json` written before a thread's starting model
+    /// moved to the project catalog (§8.3). **Never read** — the leading underscore is the
+    /// reminder — and `skip_serializing` drops it the next time this file is written.
+    ///
+    /// It has to exist at all only because of `deny_unknown_fields` above, which is load-bearing
+    /// here: it is what makes an obsolete *`permission_preset`* fail loudly instead of silently
+    /// reverting a user's sandboxing to the default. Keeping that guard means every key a previous
+    /// version wrote has to be named, even the ones that no longer mean anything.
+    #[serde(default, skip_serializing, rename = "default_model")]
+    _default_model: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -555,7 +564,6 @@ impl PersistStore {
         id: ProjectId,
         name: &str,
         dir: &str,
-        default_model: ModelRef,
     ) -> Result<ProjectConfig, PersistError> {
         let now = Utc::now();
         let mut index = self.load_project_index().await?;
@@ -577,7 +585,7 @@ impl PersistStore {
             dir: dir.into(),
             harness: "codex".into(),
             workspace_root: None,
-            default_model,
+            _default_model: None,
             created_at: now,
             updated_at: now,
         };
@@ -996,7 +1004,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let id = ProjectId::new();
         store
-            .create_project(id, "test-project", "/tmp/test", test_model())
+            .create_project(id, "test-project", "/tmp/test")
             .await
             .unwrap();
 
@@ -1014,7 +1022,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let id = ProjectId::new();
         let project = store
-            .create_project(id, "test-project", "/tmp/test", test_model())
+            .create_project(id, "test-project", "/tmp/test")
             .await
             .unwrap();
 
@@ -1039,7 +1047,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let id = ProjectId::new();
         store
-            .create_project(id, "to-delete", "/tmp/test", test_model())
+            .create_project(id, "to-delete", "/tmp/test")
             .await
             .unwrap();
 
@@ -1055,7 +1063,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
         store
-            .create_project(pid, "proj", "/tmp/test", test_model())
+            .create_project(pid, "proj", "/tmp/test")
             .await
             .unwrap();
 
@@ -1097,11 +1105,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_project_ignores_a_default_model_left_by_an_older_version() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        store
+            .create_project(pid, "proj", "/tmp/test")
+            .await
+            .unwrap();
+
+        // Put the file back the way a Giskard that still stored a per-project model wrote it.
+        let mut value =
+            serde_json::to_value(store.load_project(pid).await.unwrap().unwrap()).unwrap();
+        value.as_object_mut().unwrap().insert(
+            "default_model".into(),
+            serde_json::json!({"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null}),
+        );
+        tokio::fs::write(
+            store.project_json_path(pid),
+            serde_json::to_vec_pretty(&value).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // Every project on disk predates the removal, and `deny_unknown_fields` would otherwise
+        // make each one unloadable.
+        let loaded = store
+            .load_project(pid)
+            .await
+            .expect("a project written by an older Giskard still loads")
+            .expect("project exists");
+        assert_eq!(loaded.name, "proj");
+
+        // The key is not carried forward — but only a write drops it, and nothing writes this file
+        // on startup, so it survives on disk until the project is next modified.
+        store.save_project(&loaded).await.unwrap();
+        let raw = tokio::fs::read_to_string(store.project_json_path(pid))
+            .await
+            .unwrap();
+        assert!(
+            !raw.contains("default_model"),
+            "rewriting the project drops the stale key: {raw}"
+        );
+    }
+
+    #[tokio::test]
     async fn load_thread_accepts_legacy_approval_policy_field() {
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
         store
-            .create_project(pid, "proj", "/tmp/test", test_model())
+            .create_project(pid, "proj", "/tmp/test")
             .await
             .unwrap();
 
@@ -1157,7 +1209,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
         store
-            .create_project(pid, "proj", "/tmp/test", test_model())
+            .create_project(pid, "proj", "/tmp/test")
             .await
             .unwrap();
 
@@ -1205,7 +1257,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
         store
-            .create_project(pid, "proj", "/tmp/test", test_model())
+            .create_project(pid, "proj", "/tmp/test")
             .await
             .unwrap();
 
@@ -1246,7 +1298,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
         store
-            .create_project(pid, "proj", "/tmp/test", test_model())
+            .create_project(pid, "proj", "/tmp/test")
             .await
             .unwrap();
 
@@ -1267,7 +1319,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
         store
-            .create_project(pid, "proj", "/tmp/test", test_model())
+            .create_project(pid, "proj", "/tmp/test")
             .await
             .unwrap();
 
@@ -1307,7 +1359,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
         store
-            .create_project(pid, "proj", "/tmp/test", test_model())
+            .create_project(pid, "proj", "/tmp/test")
             .await
             .unwrap();
 
@@ -1604,7 +1656,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
         store
-            .create_project(pid, "proj", "/tmp/test", test_model())
+            .create_project(pid, "proj", "/tmp/test")
             .await
             .unwrap();
 
