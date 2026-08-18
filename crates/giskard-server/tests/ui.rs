@@ -243,6 +243,10 @@ async fn index_page_is_served_and_public() {
         "command approval cwd is rendered as metadata, not as a second detail line"
     );
     assert!(
+        body.contains("if (!kind.path) return \"File list was not provided by Codex.\";"),
+        "file approvals must explain when Codex omitted the changed paths"
+    );
+    assert!(
         body.contains("item.kind === \"path\" && item.source_link"),
         "approval path metadata only links explicit source paths"
     );

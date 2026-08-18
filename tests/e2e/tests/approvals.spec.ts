@@ -3,8 +3,27 @@ import {
   SCRIPTED_APPROVAL_THEN_ERROR_MESSAGE,
   SCRIPTED_APPROVAL_THEN_ERROR_TRIGGER,
   SCRIPTED_APPROVAL_TRIGGER,
+  SCRIPTED_EMPTY_FILE_APPROVAL_TRIGGER,
   login,
 } from "./helpers";
+
+test("a path-free file approval keeps grant root separate from changed files", async ({ page }) => {
+  await login(page);
+  await page.locator(".proj", { hasText: "Demo" }).locator(".project-add").click();
+
+  await page.locator("#input").fill(SCRIPTED_EMPTY_FILE_APPROVAL_TRIGGER);
+  await page.locator("#sendBtn").click();
+
+  const approval = page.locator("#transcript .msg.approval");
+  await expect(approval.locator(".approval-title")).toHaveText("Apply file changes?");
+  await expect(approval.locator(".approval-detail")).toHaveText(
+    "File list was not provided by Codex.",
+  );
+  await expect(approval.locator(".approval-detail")).not.toContainText("modified");
+  const metadata = approval.locator(".approval-meta-row");
+  await expect(metadata.locator(".approval-meta-label")).toHaveText("Grant root");
+  await expect(metadata.locator(".approval-meta-value")).toHaveText("/tmp/project");
+});
 
 // Regression: an approval answered during an in-flight turn must stay resolved after a browser
 // reload. Approval resolution used to live only in browser memory, so a reload re-surfaced the
