@@ -2348,10 +2348,10 @@ UI always shows provider + model together.
 
 ### 8.2 Provider configuration
 
-Providers are declared in `config.toml` (§16.3). Each declares: `id`, display `name`,
-`base_url`, auth reference, and whether it exposes a model list endpoint. Example providers
-relevant here: OpenAI direct (Codex's built-in), and a LiteLLM gateway fronting Cloudflare
-Workers AI.
+Providers are declared in `config.toml` (§16.3). Each declares: `id`, display `name`, an
+optional `base_url`, an optional auth reference, and whether it exposes a model list endpoint.
+Example providers relevant here: OpenAI direct (Codex's built-in), and a LiteLLM gateway
+fronting Cloudflare Workers AI.
 
 > Note: Codex itself reads its own `~/.codex/config.toml` for provider/auth (Codex is
 > "already configured", §12.2). Giskard's provider config governs (a) what the UI offers in
