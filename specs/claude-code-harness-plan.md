@@ -297,7 +297,7 @@ defaulting to `"codex"` so every existing `config.toml` keeps working:
 id = "anthropic"
 name = "Anthropic (Claude Code)"
 harness = "claude"          # new
-wire_api = "anthropic"      # required by the struct; unused for this harness (see below)
+wire_api = "anthropic"      # required by the struct; read by nothing (see below)
 model_listing = false       # no GET /v1/models to discover from
   [[providers.models]]
   id = "claude-sonnet-5"
@@ -306,11 +306,21 @@ model_listing = false       # no GET /v1/models to discover from
   supports_reasoning_effort = true
 ```
 
-`wire_api` and `model_listing` describe how Giskard talks to a *provider endpoint*, which is
-meaningless for a harness that owns its own transport: `wire_api` is inert here, and `model_listing`
-refers to HTTP discovery, not to the harness's `list_models` capability. Leaving both present and inert
-avoids changing `ProviderConfig`'s shape for every existing config; making `wire_api` optional would be
-a tidier follow-up.
+The two remaining fields deserve a note, because they are not symmetrical:
+
+- **`model_listing` is real.** It gates the optional `GET {base_url}/v1/models` discovery in
+  `refresh_models`. It is unrelated to the harness's own `list_models` capability, and `false` is
+  correct here because Claude Code exposes no such endpoint.
+- **`wire_api` is inert — for every harness, not just this one.** `ProviderConfig` declares it
+  (`config.rs:143`) and **no code reads it**; the only other occurrence in the tree is a test fixture.
+  Per spec §8.2 it documents which Codex wire API (`responses` / `chat`) the provider speaks, but Codex
+  learns that from its own `~/.codex/config.toml`, and Giskard's copy is declarative parity rather than
+  a setting with an effect. Giskard's provider block governs only what the model picker offers and
+  whether `/v1/models` discovery runs.
+
+So a Claude provider must supply `wire_api` purely because the struct requires a `String`. Making it
+`Option<String>` is a small honest cleanup that fits naturally into P4 (§11), and it stops a new
+provider block from having to state something untrue about a harness that owns its own transport.
 
 Then `harness_for(model: &ModelRef, config) -> HarnessKind` is a pure lookup, and the rule "a thread
 runs on the harness of its current model's provider" needs no new UI — the model picker is already the
@@ -862,7 +872,7 @@ two-harness test with no CLI involved.
 | **P1** | **Soft `Unsupported` for `set_thread_name` / `set_thread_archived` / `delete_thread`** (§5.6) | **Resolves a contradiction inside the current design.** `AgentHarness` declares these optional — its default implementations return `Unsupported` — while the server turns `Unsupported` into a user-visible HTTP 400 (`routes.rs:3549`). The trait says "may be absent", the server says "must exist". Nothing trips it today (Codex implements all three; `ReplayHarness` overrides them with `Ok`), so this is a consistency fix rather than a bug fix — but it is the contract that decides whether a harness can decline an operation at all. | — |
 | **P2** | **Thread-scoped capabilities** (§5.4) | **Corrects the shape, before it has consequences.** Capabilities belong to the harness serving a thread, not to a project; today the two coincide, so there is no user-visible symptom — which is precisely why it is cheap now and expensive once a project can hold two harnesses. The capability-driven UI (spec §13.5) is the consumer. | — |
 | **P3** | **`HarnessKind` newtype** replacing the bare `String` on `ProjectConfig.harness`, `config.toml`, and the factory | One place parses and validates a harness name instead of string comparisons scattered across the binary and the store. Pure typing; no behaviour change. | — |
-| **P4** | **`ProviderConfig.harness` + `harness_for(&ModelRef, &Config)`** (§5.1) | Additive config field defaulting to `"codex"`; every existing `config.toml` keeps working and the lookup returns `codex` for everything. Establishes provider→harness as the single source of truth before anything depends on it. | P3 |
+| **P4** | **`ProviderConfig.harness` + `harness_for(&ModelRef, &Config)`** (§5.1), and make `wire_api` optional | Additive config field defaulting to `"codex"`; every existing `config.toml` keeps working and the lookup returns `codex` for everything. Establishes provider→harness as the single source of truth before anything depends on it. `wire_api` is required by the struct but read by nothing (§5.1), so relaxing it in the same change stops future provider blocks from having to assert a wire protocol that no longer applies. | P3 |
 | **P5** | **Dispatching `HarnessFactory`** — a table keyed by `HarnessKind` instead of `bin/giskard-server.rs:19`'s `if config.harness != "codex"` | Turns a hardcoded rejection into an extension point, and lets the replay binary register its own kind by the same mechanism the real binary uses. | P3 |
 | **P6** | **Registry re-keying to `(ProjectId, HarnessKind)`** plus the `HarnessKind` on `ThreadBinding` (§5.2) | The structural centre of the work, and the riskiest to combine with adapter development. Landing it alone keeps behaviour identical with one kind while making the two-harness test possible. | P3, P5 |
 | **P7** | **`ThreadFile.harness` + `harness_thread_ids`, default-on-read** (§5.3) | A forward-compatible persistence migration. Landing it early means existing installations are already writing files that carry the field before any feature reads it, so the Claude work never needs a migration step of its own. | P3 |
