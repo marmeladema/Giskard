@@ -1,6 +1,8 @@
 //! End-to-end coverage: a running tool/MCP call surfaces in the `RunningTasks` snapshot through the
 //! real server path (registry forward → broadcast → WebSocket), the same way commands do (TK1).
 
+mod common;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -9,7 +11,7 @@ use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{ItemKind, ItemStart, ToolCallStart};
-use giskard_core::model::{ModelDescriptor, ModelRef};
+use giskard_core::model::ModelDescriptor;
 use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
@@ -21,6 +23,8 @@ use giskard_proto::{ClientMessage, ServerMessage, TaskKind};
 use giskard_server::{AppState, HarnessFactory, build_app};
 use tokio::sync::{Mutex, broadcast};
 use tokio::time::{Duration, Instant};
+
+use common::fake_native_model;
 
 /// Harness that, on `start_turn`, emits `TurnStarted` + an in-progress tool `ItemStarted` and
 /// leaves the turn open (the tool blocks the turn), so the server keeps a running tool task.
@@ -50,6 +54,7 @@ impl AgentHarness for ToolHarness {
             structured_diffs: true,
             resumable_threads: true,
             model_listing: false,
+            provider_listing: false,
             token_usage: true,
             mcp_status: false,
             mcp_reload: false,
@@ -67,7 +72,10 @@ impl AgentHarness for ToolHarness {
             thread: opts.thread.unwrap_or_default(),
             harness_thread_id: opts.resume.unwrap_or_else(|| "tool_harness".into()),
             warning: None,
-            resumed_model: Some(opts.initial_model.clone()),
+            resumed_model: opts
+                .initial_model
+                .clone()
+                .or_else(|| Some(fake_native_model())),
             agent_name: None,
             parent_harness_thread_id: None,
         })
@@ -220,16 +228,7 @@ async fn running_tool_call_surfaces_in_running_tasks_snapshot() {
     let pid = giskard_core::ids::ProjectId::new();
     state
         .store
-        .create_project(
-            pid,
-            "tool-proj",
-            &proj_dir.path().to_string_lossy(),
-            ModelRef {
-                provider: "openai".into(),
-                model: "gpt-5.5".into(),
-                reasoning_effort: None,
-            },
-        )
+        .create_project(pid, "tool-proj", &proj_dir.path().to_string_lossy())
         .await
         .unwrap();
 

@@ -275,16 +275,7 @@ mod tests {
         let store = PersistStore::new(dir.path().to_path_buf());
         let project_id = ProjectId::new();
         store
-            .create_project(
-                project_id,
-                "inheritance",
-                "/repo",
-                ModelRef {
-                    provider: "test".into(),
-                    model: "test".into(),
-                    reasoning_effort: None,
-                },
-            )
+            .create_project(project_id, "inheritance", "/repo")
             .await
             .unwrap();
 

@@ -4,6 +4,8 @@
 //! so mid-thread model/effort changes take effect (§8.4/§8.5); (2) the thread's permission preset
 //! must reach the harness (§9). A capturing harness records every `TurnOverrides` it is handed.
 
+mod common;
+
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
@@ -26,19 +28,27 @@ use giskard_server::{AppState, HarnessFactory, build_app};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::broadcast;
 
+use common::fake_native_model;
+
 /// Harness that records the overrides passed to `start_turn` and emits a trivial completed turn.
 struct CapturingHarness {
     captured: Arc<TokioMutex<Vec<TurnOverrides>>>,
     tx: broadcast::Sender<AgentEvent>,
     thread_id: StdMutex<Option<ThreadId>>,
+    /// What each `open_thread` asked for. `None` means the caller left the model to the harness.
+    requested_models: Arc<StdMutex<Vec<Option<ModelRef>>>>,
 }
 
 impl CapturingHarness {
-    fn new(captured: Arc<TokioMutex<Vec<TurnOverrides>>>) -> Self {
+    fn with_requests(
+        captured: Arc<TokioMutex<Vec<TurnOverrides>>>,
+        requested_models: Arc<StdMutex<Vec<Option<ModelRef>>>>,
+    ) -> Self {
         let (tx, _) = broadcast::channel(64);
         Self {
             captured,
             tx,
+            requested_models,
             thread_id: StdMutex::new(None),
         }
     }
@@ -55,6 +65,7 @@ impl AgentHarness for CapturingHarness {
             structured_diffs: true,
             resumable_threads: true,
             model_listing: false,
+            provider_listing: false,
             token_usage: true,
             mcp_status: false,
             mcp_reload: false,
@@ -70,11 +81,18 @@ impl AgentHarness for CapturingHarness {
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
         let tid = opts.thread.unwrap_or_default();
         *self.thread_id.lock().unwrap() = Some(tid);
+        self.requested_models
+            .lock()
+            .unwrap()
+            .push(opts.initial_model.clone());
         Ok(ThreadHandle {
             thread: tid,
             harness_thread_id: opts.resume.unwrap_or_else(|| "cap".into()),
             warning: None,
-            resumed_model: Some(opts.initial_model.clone()),
+            resumed_model: opts
+                .initial_model
+                .clone()
+                .or_else(|| Some(fake_native_model())),
             agent_name: None,
             parent_harness_thread_id: None,
         })
@@ -134,12 +152,25 @@ impl AgentHarness for CapturingHarness {
 
 struct CapFactory {
     captured: Arc<TokioMutex<Vec<TurnOverrides>>>,
+    requested_models: Arc<StdMutex<Vec<Option<ModelRef>>>>,
+}
+
+impl CapFactory {
+    fn new(captured: Arc<TokioMutex<Vec<TurnOverrides>>>) -> Self {
+        Self {
+            captured,
+            requested_models: Arc::new(StdMutex::new(Vec::new())),
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl HarnessFactory for CapFactory {
     async fn create(&self, _config: &ProjectConfig) -> Result<Arc<dyn AgentHarness>, HarnessError> {
-        Ok(Arc::new(CapturingHarness::new(self.captured.clone())))
+        Ok(Arc::new(CapturingHarness::with_requests(
+            self.captured.clone(),
+            self.requested_models.clone(),
+        )))
     }
 }
 
@@ -180,7 +211,6 @@ session_days = 30
 
 [[providers]]
 id = "openai"
-name = "OpenAI"
   [[providers.models]]
   id = "gpt-5.5"
   context_window = 258400
@@ -192,13 +222,9 @@ name = "OpenAI"
     .unwrap();
 
     let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let state = AppState::new(
-        store,
-        Arc::new(CapFactory {
-            captured: captured.clone(),
-        }),
-        (0..32u8).collect(),
-    );
+    let factory = Arc::new(CapFactory::new(captured.clone()));
+    let requested_models = factory.requested_models.clone();
+    let state = AppState::new(store, factory, (0..32u8).collect());
     let app = build_app(state.clone());
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
         .await
@@ -211,16 +237,7 @@ name = "OpenAI"
     let pid = giskard_core::ids::ProjectId::new();
     state
         .store
-        .create_project(
-            pid,
-            "proj",
-            &proj_dir.path().to_string_lossy(),
-            ModelRef {
-                provider: "openai".into(),
-                model: "gpt-5.5".into(),
-                reasoning_effort: None,
-            },
-        )
+        .create_project(pid, "proj", &proj_dir.path().to_string_lossy())
         .await
         .unwrap();
 
@@ -258,6 +275,31 @@ name = "OpenAI"
             .unwrap();
         serde_json::from_value(resp["thread_id"].clone()).unwrap()
     };
+
+    // Importing a native thread must not name a model. Codex treats `model`/`modelProvider` on
+    // `thread/resume` as an override and stops applying the thread's own persisted model, so
+    // requesting one here would silently move an existing conversation onto a different model.
+    // The thread's model is whatever the harness reports back.
+    assert_eq!(
+        requested_models.lock().unwrap().as_slice(),
+        &[None],
+        "importing a thread by native id asks the harness for no particular model"
+    );
+    let imported = state
+        .store
+        .load_thread(pid, thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        imported.current_model,
+        ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: None,
+        },
+        "the imported thread takes the model the harness reported for it"
+    );
 
     let ws_request = tokio_tungstenite::tungstenite::http::Request::builder()
         .uri(format!("ws://127.0.0.1:{port}/api/ws"))

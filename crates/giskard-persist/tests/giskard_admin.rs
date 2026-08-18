@@ -58,7 +58,7 @@ async fn list_threads_prints_archived_status() {
     let archived_id = ThreadId::new();
 
     store
-        .create_project(project_id, "proj", "/tmp/proj", test_model())
+        .create_project(project_id, "proj", "/tmp/proj")
         .await
         .unwrap();
     store

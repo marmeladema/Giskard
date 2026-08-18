@@ -351,11 +351,6 @@ async fn create_project_is_confined_to_browse_roots() {
                 .json(&serde_json::json!({
                     "name": "proj",
                     "dir": dir,
-                    "default_model": {
-                        "provider": "openai",
-                        "model": "gpt-5.5",
-                        "reasoning_effort": null,
-                    },
                 }))
                 .send()
                 .await

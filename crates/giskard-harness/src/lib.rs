@@ -34,6 +34,8 @@ pub struct HarnessCapabilities {
     pub resumable_threads: bool,
     /// A queryable model list (e.g. GET /v1/models via the provider).
     pub model_listing: bool,
+    /// The harness can report the providers it is configured to route to (§8.2).
+    pub provider_listing: bool,
     /// Token usage reported on turn completion.
     pub token_usage: bool,
     /// MCP server status can be listed through the harness.
@@ -44,6 +46,36 @@ pub struct HarnessCapabilities {
     pub mcp_oauth_login: bool,
     /// Manual context compaction can be requested for a thread.
     pub context_compaction: bool,
+}
+
+/// A provider the harness is configured to route turns to (spec §8.2).
+///
+/// Giskard declares providers by `id` alone; the endpoint, display name, and key location live in
+/// the harness's own configuration and are read back through [`AgentHarness::list_providers`]
+/// rather than restated in `config.toml`.
+///
+/// Deliberately carries the *name* of the environment variable holding the key, never the key
+/// itself: a harness config may hold an inline secret, and copying it into Giskard would spread it
+/// across another process's memory and logs for no benefit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessProvider {
+    /// Routing id. A Giskard `[[providers]] id` must match one of these to be reachable.
+    pub id: String,
+    /// Friendly name for the picker, when the harness supplies one.
+    pub name: Option<String>,
+    /// OpenAI-compatible base URL, used for Giskard's own `/v1/models` discovery (§8.3).
+    pub base_url: Option<String>,
+    /// Environment variable holding this provider's API key, when the harness names one.
+    pub api_key_env: Option<String>,
+}
+
+impl HarnessProvider {
+    /// Resolve the discovery API key from the environment variable this provider names. Empty
+    /// values are treated as unset.
+    pub fn resolve_api_key(&self) -> Option<String> {
+        let var = self.api_key_env.as_deref()?;
+        std::env::var(var).ok().filter(|value| !value.is_empty())
+    }
 }
 
 /// Options for opening (or resuming) a thread.
@@ -60,7 +92,16 @@ pub struct OpenThreadOptions {
     /// ownership and event-routing identity, so silently replacing it would attach Giskard to a
     /// different thread. Normal primary-thread reopen keeps the historical fresh-session recovery.
     pub resume_policy: ResumePolicy,
-    pub initial_model: ModelRef,
+    /// The model to open on, or `None` to take whatever the harness already has for a resumed
+    /// thread.
+    ///
+    /// `None` is only meaningful together with `resume`: importing a native thread Giskard has no
+    /// record of, where the harness is the only one who knows which model that thread was using.
+    /// Requesting one there does not express a preference, it *overrides* — Codex stops applying
+    /// the thread's persisted model as soon as `model`/`modelProvider` is supplied — so a guess
+    /// would silently move an existing conversation onto a different model. Starting a fresh
+    /// thread, and reopening one Giskard already tracks, both pass `Some`.
+    pub initial_model: Option<ModelRef>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -157,6 +198,15 @@ pub trait AgentHarness: Send + Sync {
 
     /// List models available through this harness/provider, if supported.
     async fn list_models(&self) -> Result<Vec<ModelDescriptor>, HarnessError>;
+
+    /// List the providers this harness can route to (§8.2), when it can introspect its own
+    /// configuration. Giskard uses the result to resolve discovery endpoints and to tell the user
+    /// when a configured provider id is one the harness has never heard of.
+    async fn list_providers(&self) -> Result<Vec<HarnessProvider>, HarnessError> {
+        Err(HarnessError::Unsupported(
+            "provider listing is not supported by this harness".into(),
+        ))
+    }
 
     /// List configured MCP servers and their visible tools/resources.
     async fn list_mcp_servers(&self) -> Result<Vec<McpServerStatus>, HarnessError> {

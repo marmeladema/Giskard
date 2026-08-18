@@ -9,15 +9,35 @@ use axum::{Router, response::Json as AxumJson, routing::get};
 use futures::SinkExt;
 use giskard_core::ids::ProjectId;
 use giskard_core::model::{Effort, ModelDescriptor, ModelRef};
-use giskard_harness::AgentHarness;
+use giskard_harness::{AgentHarness, HarnessProvider};
 use giskard_harness_replay::ReplayHarness;
 use giskard_persist::store::ProjectConfig;
 use giskard_proto::ClientMessage;
 use giskard_server::{AppState, HarnessFactory, build_app};
 
+/// The provider table these tests' harnesses report, standing in for Codex's `[model_providers]`:
+/// `openai` with no endpoint, and `mock` pointing at the discovery stub.
+fn harness_providers(mock_addr: &str) -> Vec<HarnessProvider> {
+    vec![
+        HarnessProvider {
+            id: "openai".into(),
+            name: Some("OpenAI".into()),
+            base_url: None,
+            api_key_env: None,
+        },
+        HarnessProvider {
+            id: "mock".into(),
+            name: Some("Mock".into()),
+            base_url: Some(format!("http://{mock_addr}")),
+            api_key_env: None,
+        },
+    ]
+}
+
 /// A factory whose harness advertises a fixed model catalog (standing in for Codex `model/list`).
 struct CatalogFactory {
     models: Vec<ModelDescriptor>,
+    providers: Vec<HarnessProvider>,
 }
 
 #[async_trait::async_trait]
@@ -27,13 +47,17 @@ impl HarnessFactory for CatalogFactory {
         _config: &ProjectConfig,
     ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
         Ok(Arc::new(
-            ReplayHarness::new().with_models(self.models.clone()),
+            ReplayHarness::new()
+                .with_models(self.models.clone())
+                .with_providers(self.providers.clone()),
         ))
     }
 }
 
 /// A factory whose harness advertises `model_listing` but fails every catalog query.
-struct FailingCatalogFactory;
+struct FailingCatalogFactory {
+    providers: Vec<HarnessProvider>,
+}
 
 #[async_trait::async_trait]
 impl HarnessFactory for FailingCatalogFactory {
@@ -42,7 +66,9 @@ impl HarnessFactory for FailingCatalogFactory {
         _config: &ProjectConfig,
     ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
         Ok(Arc::new(
-            ReplayHarness::new().with_failing_models("model/list boom"),
+            ReplayHarness::new()
+                .with_failing_models("model/list boom")
+                .with_providers(self.providers.clone()),
         ))
     }
 }
@@ -55,6 +81,7 @@ fn catalog_model(model: &str, name: &str, efforts: &[&str]) -> ModelDescriptor {
         supports_reasoning_effort: !efforts.is_empty(),
         reasoning_efforts: efforts.iter().map(|e| (*e).to_string()).collect(),
         display_name: Some(name.into()),
+        is_default: false,
     }
 }
 
@@ -116,7 +143,7 @@ async fn connect_ws(
 /// project. Returns the request base, an authenticated client + cookie, the project id, and the
 /// TempDir (kept alive by the caller).
 async fn spawn_project(
-    factory: Arc<dyn HarnessFactory>,
+    make_factory: impl FnOnce(&str) -> Arc<dyn HarnessFactory>,
 ) -> (
     String,
     reqwest::Client,
@@ -132,6 +159,7 @@ async fn spawn_project(
     let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mock_addr = mock_listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(mock_listener, mock).await.unwrap() });
+    let factory = make_factory(&mock_addr.to_string());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -152,7 +180,6 @@ session_days = 30
 
 [[providers]]
 id = "openai"
-name = "OpenAI"
   [[providers.models]]
   id = "gpt-5.5"
   display_name = "GPT-5.5"
@@ -161,8 +188,6 @@ name = "OpenAI"
 
 [[providers]]
 id = "mock"
-name = "Mock"
-base_url = "http://{mock_addr}"
 model_listing = true
 "#
         ),
@@ -184,7 +209,6 @@ model_listing = true
         .json(&serde_json::json!({
             "name": "proj",
             "dir": "/tmp/giskard-project-models-test",
-            "default_model": {"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null},
         }))
         .send()
         .await
@@ -208,8 +232,13 @@ async fn project_models_compose_discovery_and_harness_catalog() {
         catalog_model("gpt-5.5", "Catalog GPT (should not win)", &["low", "high"]),
         catalog_model("glm-5.2", "GLM 5.2 Pro", &["medium", "high"]),
     ];
-    let (base, client, cookie, project_id, _tmp, _store) =
-        spawn_project(Arc::new(CatalogFactory { models })).await;
+    let (base, client, cookie, project_id, _tmp, _store) = spawn_project(|mock_addr| {
+        Arc::new(CatalogFactory {
+            models,
+            providers: harness_providers(mock_addr),
+        })
+    })
+    .await;
 
     let body: serde_json::Value = client
         .get(format!("{base}/api/projects/{project_id}/models"))
@@ -262,8 +291,12 @@ async fn project_models_degrade_when_harness_catalog_query_fails() {
     // Harness advertises model_listing but every `list_models` call errors. The overlay is
     // best-effort, so the endpoint must still return the config + discovery list — just without the
     // harness's names/efforts — rather than failing the request.
-    let (base, client, cookie, project_id, _tmp, _store) =
-        spawn_project(Arc::new(FailingCatalogFactory)).await;
+    let (base, client, cookie, project_id, _tmp, _store) = spawn_project(|mock_addr| {
+        Arc::new(FailingCatalogFactory {
+            providers: harness_providers(mock_addr),
+        })
+    })
+    .await;
 
     let resp = client
         .get(format!("{base}/api/projects/{project_id}/models"))
@@ -312,8 +345,13 @@ async fn project_models_degrade_when_harness_catalog_query_fails() {
 #[tokio::test]
 async fn catalog_effort_survives_new_thread_creation() {
     let models = vec![catalog_model("glm-5.2", "GLM 5.2 Pro", &["medium", "high"])];
-    let (base, client, cookie, project_id, _tmp, store) =
-        spawn_project(Arc::new(CatalogFactory { models })).await;
+    let (base, client, cookie, project_id, _tmp, store) = spawn_project(|mock_addr| {
+        Arc::new(CatalogFactory {
+            models,
+            providers: harness_providers(mock_addr),
+        })
+    })
+    .await;
 
     // Populate the same project catalog that drives the browser picker.
     let catalog = client
@@ -405,4 +443,98 @@ async fn catalog_effort_survives_new_thread_creation() {
             .map(|e| e.as_str()),
         Some("medium")
     );
+}
+
+/// The draft's starting model is derived from the project's live catalog, preferring the model the
+/// harness marks as its default over the first entry (§8.3). Nothing is stored on the project: the
+/// catalog is the only source, so the answer follows provider and harness config instead of a
+/// remembered choice that can go stale.
+#[tokio::test]
+async fn draft_default_model_comes_from_the_live_catalog() {
+    // "gpt-5.5" is declared first, so picking it would prove nothing; the harness marks the
+    // discovered "glm-5.2" as its default instead.
+    let mut default_marked = catalog_model("glm-5.2", "GLM 5.2", &["high"]);
+    default_marked.is_default = true;
+    let models = vec![catalog_model("gpt-5.5", "GPT-5.5", &[]), default_marked];
+
+    let (base, client, cookie, project_id, _tmp, store) = spawn_project(|mock_addr| {
+        Arc::new(CatalogFactory {
+            models,
+            providers: harness_providers(mock_addr),
+        })
+    })
+    .await;
+
+    let project: serde_json::Value = client
+        .get(format!("{base}/api/projects/{project_id}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        project.get("default_model").is_none(),
+        "a project record carries no model to go stale: {project}"
+    );
+    assert!(
+        !serde_json::to_string(&store.load_project(project_id).await.unwrap().unwrap())
+            .unwrap()
+            .contains("default_model"),
+        "and none is persisted either"
+    );
+
+    let catalog: serde_json::Value = client
+        .get(format!("{base}/api/projects/{project_id}/models"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let models = catalog["models"].as_array().unwrap();
+    let default_entry = models
+        .iter()
+        .find(|m| m["is_default"] == true)
+        .unwrap_or_else(|| panic!("catalog marks a default the browser can pick: {catalog}"));
+    assert_eq!(default_entry["model"], "glm-5.2");
+    assert_eq!(default_entry["provider"], "mock");
+    // Order matters for the fallback: the marked model is not first, so a browser that took
+    // `models[0]` would get the wrong one.
+    assert_eq!(models[0]["model"], "gpt-5.5");
+}
+
+/// With nothing marked default, the catalog exposes no `is_default` at all and the first entry is
+/// what a caller falls back to.
+#[tokio::test]
+async fn unmarked_catalog_exposes_no_default_and_falls_back_to_first() {
+    let models = vec![
+        catalog_model("gpt-5.5", "GPT-5.5", &[]),
+        catalog_model("glm-5.2", "GLM 5.2", &["high"]),
+    ];
+    let (base, client, cookie, project_id, _tmp, _store) = spawn_project(|mock_addr| {
+        Arc::new(CatalogFactory {
+            models,
+            providers: harness_providers(mock_addr),
+        })
+    })
+    .await;
+
+    let catalog: serde_json::Value = client
+        .get(format!("{base}/api/projects/{project_id}/models"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let models = catalog["models"].as_array().unwrap();
+    assert!(
+        !models.iter().any(|m| m["is_default"] == true),
+        "no model claims to be the default: {catalog}"
+    );
+    assert_eq!(models[0]["model"], "gpt-5.5", "first entry is the fallback");
 }

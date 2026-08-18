@@ -66,40 +66,33 @@ kind = "codex"
 idle_shutdown_secs = 0
 
 # ---- Providers ----
-# What the model picker offers and (optionally) which endpoints expose GET /v1/models. Codex reads
-# its own ~/.codex/config.toml for actual auth; the ModelRef Giskard sends per turn must correspond
-# to a model/provider Codex is configured to reach.
+# Which (provider, model) pairs the picker offers, and which of them to top up from the provider's
+# GET /v1/models. Nothing else: a provider's display name, base_url, and API key live in Codex's
+# own ~/.codex/config.toml, and Giskard reads them back from Codex rather than asking for them
+# twice. Each `id` here must name a provider Codex knows — a built-in (`openai`, `amazon-bedrock`,
+# `amazon-bedrock-runtime`, `ollama`, `lmstudio`) or one of your `[model_providers.<id>]` entries.
+# An id Codex has never heard of is reported as a warning on the picker rather than failing later
+# with a provider-side model_not_found.
 
 [[providers]]
 id = "openai"
-name = "OpenAI (Codex built-in)"
 model_listing = false
   [[providers.models]]
   id = "gpt-5.5"
-  display_name = "GPT-5.5"
   context_window = 262144
-  supports_reasoning_effort = true
   [[providers.models]]
   id = "gpt-5.4"
-  display_name = "GPT-5.4"
   context_window = 262144
-  supports_reasoning_effort = true
 
+# Matches `[model_providers.cloudflare-litellm]` in ~/.codex/config.toml, which supplies the
+# base_url discovery queries and the env var holding its key.
 [[providers]]
 id = "cloudflare-litellm"
-name = "Cloudflare Workers AI (via LiteLLM)"
-base_url = "http://127.0.0.1:4000/v1"   # GET {base_url}/models is merged over the static list
 model_listing = true
-# Auth for the /v1/models discovery request (e.g. a LiteLLM master key). Sent as
-# `Authorization: Bearer <key>`. Use `api_key` for an inline secret, or `api_key_env` to read it
-# from an environment variable so it stays out of this file (api_key wins if both are set). Omit
-# both for an endpoint that needs no auth.
-# api_key = "sk-litellm-..."
-api_key_env = "LITELLM_KEY"
 # With model_listing = true you can omit [[providers.models]] entirely and let the models come from
-# the endpoint; declare entries only to give a model accurate metadata (context window, etc.).
+# the endpoint; declare entries only to give a model metadata the endpoint does not report.
+# context_window is the one field nothing else can supply: Codex's model/list omits it, so an
+# undeclared model starts on the conservative 128k fallback until the harness reports otherwise.
   [[providers.models]]
   id = "@cf/z-ai/glm-4.7"
-  display_name = "GLM-4.7 (Workers AI)"
   context_window = 131072
-  supports_reasoning_effort = false

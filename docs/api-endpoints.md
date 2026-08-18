@@ -8,8 +8,8 @@ WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticke
 /api/projects/{id}/threads/{parent_thread_id}/subagent-links/{item_id}/open`, `PATCH
 /api/projects/{id}/threads/{thread_id}/title`,
 `POST /api/projects/{id}/threads/{thread_id}/archive`,
-`GET /api/projects/{id}/threads/{thread_id}/deletion-impact`, `GET /api/models`, `POST
-/api/models/refresh`, `GET /api/projects/{id}/models`,
+`GET /api/projects/{id}/threads/{thread_id}/deletion-impact`,
+`GET /api/projects/{id}/models`,
 `GET /api/tokens`, `GET /api/projects/{id}/tokens`,
 `GET /api/projects/{id}/threads/{thread_id}/highlight|raw|image`, `POST
 /api/projects/{id}/threads/{thread_id}/linkify`, `POST
@@ -18,6 +18,27 @@ WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticke
 /api/browse/mkdir`, `GET /api/projects/{id}/mcp`, `POST /api/projects/{id}/mcp/reload`, and `POST
 /api/projects/{id}/mcp/oauth-login`. Wire types are defined once in `giskard-proto`. See
 [§13.6](../specs/giskard-specification.md) for the message protocol.
+
+`POST /api/projects` takes a name and a directory; there is no `default_model`. A project record
+stores no model at all. The model a new thread starts on is derived from the project's catalog when
+the draft opens (the harness's default when it marks one, else the first entry), so it tracks the
+current provider and harness configuration rather than caching a choice that can go stale.
+When `POST /api/projects/{id}/threads` imports a native harness thread (see below), it asks for
+**no** model: the model is that thread's, and only the harness knows it. Requesting one there is an
+override, not a preference — Codex stops applying the thread's persisted model as soon as
+`model`/`modelProvider` is supplied — so the imported thread takes whatever the harness reports
+back, and the call answers 409 if the harness reports nothing. A harness that refuses the resume
+outright — most often because the thread's provider is no longer in its own config — is also a 409:
+the server is fine and the state is user-fixable, so it is neither a 500 nor an error-level log.
+
+`GET /api/projects/{id}/models` is the only model-listing endpoint: the declared
+`[[providers.models]]` entries, plus each listing-enabled provider's `/v1/models` discovery and the
+harness's own catalog, with unknown provider ids and per-provider discovery failures reported in
+`warnings`. There is no project-less equivalent. Both discovery and the harness catalog need a
+provider's endpoint, which only a harness knows, and there is no harness until a project is open —
+so a project-less list could only ever repeat `config.toml` back, which is why neither
+`GET /api/models` nor `POST /api/models/refresh` exists. The thread picker's reload button re-runs
+this endpoint for the active project.
 
 `POST /api/projects/{id}/threads/start` takes `git_strategy`, which decides where the thread's
 working tree comes from: `shared` (the project's own checkout — the default, and what an omitted

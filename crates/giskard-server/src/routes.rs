@@ -29,6 +29,7 @@ use giskard_core::user_input::UserInput;
 use giskard_git_parser::{
     GitNumstatEntry, apply_numstat_counts, index_numstat, parse_git_numstat, parse_git_status,
 };
+use giskard_harness::HarnessProvider;
 use giskard_persist::Config;
 use giskard_persist::store::{ProjectConfig, ThreadFile, ThreadGitWorkspace, ThreadWorktree};
 use giskard_proto::*;
@@ -122,8 +123,6 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
         )
         .route("/api/browse", get(browse))
         .route("/api/browse/mkdir", post(browse_mkdir))
-        .route("/api/models", get(list_models))
-        .route("/api/models/refresh", post(refresh_models))
         .route("/api/projects/{id}/models", get(project_list_models))
         .route("/api/projects/{id}/mcp", get(list_mcp_servers))
         .route("/api/projects/{id}/mcp/reload", post(reload_mcp_servers))
@@ -388,11 +387,7 @@ async fn create_project(
     if let Some(ws_root) = &req.workspace_root {
         ensure_dir_within_browse_roots(ws_root, &config.browse.roots)?;
     }
-    let default_model = crate::models::normalize_model_ref(&config, &req.default_model);
-    state
-        .store
-        .create_project(id, &req.name, &req.dir, default_model)
-        .await?;
+    state.store.create_project(id, &req.name, &req.dir).await?;
 
     if let Some(ws_root) = &req.workspace_root {
         let mut config = state
@@ -579,19 +574,11 @@ async fn open_thread(
     Json(req): Json<OpenThreadRequest>,
 ) -> Result<Json<OpenThreadResponse>, ApiError> {
     let app_config = state.store.load_config().await?;
-    let mut project_config = state
+    let project_config = state
         .store
         .load_project(project_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let default_model =
-        crate::models::normalize_model_ref(&app_config, &project_config.default_model);
-    if default_model != project_config.default_model {
-        project_config.default_model = default_model;
-        project_config.updated_at = Utc::now();
-        state.store.save_project(&project_config).await?;
-    }
-
     let ws_root = project_config
         .workspace_root
         .as_deref()
@@ -657,7 +644,7 @@ async fn open_thread(
                     &ws_root,
                     Some(thread_id),
                     Some(thread_file.harness_thread_id.clone()),
-                    current_model.clone(),
+                    Some(current_model.clone()),
                 )
                 .await
         };
@@ -761,7 +748,7 @@ async fn open_thread(
                             ws_root,
                             Some(existing.id),
                             Some(existing.harness_thread_id.clone()),
-                            existing.current_model.clone(),
+                            Some(existing.current_model.clone()),
                         )
                         .await
                 }
@@ -791,22 +778,28 @@ async fn open_thread(
         }));
     }
 
+    // Importing a native thread Giskard has no record of: the model is the thread's, and only the
+    // harness knows it. Naming one here would not express a preference — Codex treats
+    // `model`/`modelProvider` on resume as an override and stops applying the thread's own
+    // persisted model — so it would silently move an existing conversation onto another model.
     let handle = state
         .registry
-        .open_thread(
-            &project_config,
-            ws_root,
-            None,
-            Some(resume),
-            project_config.default_model.clone(),
-        )
+        .open_thread(&project_config, ws_root, None, Some(resume), None)
         .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        // Not `Internal`: the usual reason is that this thread's provider is no longer in the
+        // harness's config, which is a conflict with the current state of the world and fixable by
+        // the user. Answering 500 would both blame the server and log at error, alerting on a
+        // config edit.
+        .map_err(|e| ApiError::Conflict(e.to_string()))?;
 
-    let current_model = handle
-        .resumed_model
-        .clone()
-        .unwrap_or_else(|| project_config.default_model.clone());
+    let current_model = handle.resumed_model.clone().ok_or_else(|| {
+        // Nothing to fall back to: this thread's model was never ours to choose, and starting it
+        // on a guess would bind it to a provider it was not using (LT7).
+        ApiError::Conflict(
+            "the harness did not report which model this thread is using; it cannot be imported"
+                .into(),
+        )
+    })?;
     let catalog = project_model_catalog(&state, &project_config, &app_config).await;
     let descriptor =
         crate::models::resolve_catalog_descriptor(&catalog, &app_config, &current_model);
@@ -903,19 +896,11 @@ async fn start_thread_with_message(
     validate_user_attachments(&req.attachments)?;
 
     let app_config = state.store.load_config().await?;
-    let mut project_config = state
+    let project_config = state
         .store
         .load_project(project_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let default_model =
-        crate::models::normalize_model_ref(&app_config, &project_config.default_model);
-    if default_model != project_config.default_model {
-        project_config.default_model = default_model;
-        project_config.updated_at = Utc::now();
-        state.store.save_project(&project_config).await?;
-    }
-
     let catalog = project_model_catalog(&state, &project_config, &app_config).await;
     let (model_ref, model_descriptor) =
         resolve_initial_thread_model(&app_config, &catalog, req.model_ref);
@@ -977,7 +962,7 @@ async fn start_thread_with_message(
             ws_root,
             Some(thread_id),
             None,
-            model_ref.clone(),
+            Some(model_ref.clone()),
         )
         .await
     {
@@ -3257,31 +3242,16 @@ fn safe_git_relative_path(path: &str) -> Option<String> {
     }
 }
 
-async fn list_models(State(state): State<AppState>) -> Result<Json<ListModelsResponse>, ApiError> {
-    let config = state.store.load_config().await?;
-    Ok(Json(ListModelsResponse {
-        models: crate::models::list_descriptors(&config),
-        warnings: Vec::new(),
-    }))
-}
-
-/// `POST /api/models/refresh` — merge each listing-enabled provider's `/v1/models` over the static
-/// list (spec §8.3). Best-effort: always returns at least the static list, plus any per-provider
-/// discovery failures (e.g. a 401) as `warnings` so the UI can surface them.
-async fn refresh_models(
-    State(state): State<AppState>,
-) -> Result<Json<ListModelsResponse>, ApiError> {
-    let config = state.store.load_config().await?;
-    let (models, warnings) = crate::models::refresh_models(&config).await;
-    Ok(Json(ListModelsResponse { models, warnings }))
-}
-
-/// `GET /api/projects/{id}/models` — the model picker list for a project: every configured model
-/// merged with each `model_listing` provider's `/v1/models` discovery, and the project harness's
-/// friendly `display_name` overlaid by model id where the config left one unset (spec §8.3). For a
-/// Codex project this surfaces Codex's `model/list` names instead of raw ids. Per-provider discovery
-/// failures come back as `warnings`; the harness name overlay is best-effort (a harness that can't
-/// list models just yields the discovered list with config/raw names).
+/// `GET /api/projects/{id}/models` — the model picker list for a project, and the only model
+/// listing there is: every configured model merged with each `model_listing` provider's
+/// `/v1/models` discovery, and the project harness's friendly `display_name` overlaid by model id
+/// where the config left one unset (spec §8.3). For a Codex project this surfaces Codex's
+/// `model/list` names instead of raw ids.
+///
+/// `warnings` carries everything that degraded the list rather than failing it: a configured
+/// provider id the harness does not know (§8.2), per-provider discovery failures, and a harness
+/// that could not answer at all. Each is best-effort — the usable part of the list is always
+/// returned.
 async fn project_list_models(
     State(state): State<AppState>,
     AxumPath(project_id): AxumPath<ProjectId>,
@@ -3348,7 +3318,34 @@ async fn refresh_project_model_catalog(
     project_config: &ProjectConfig,
     config: &Config,
 ) -> (Vec<ModelDescriptor>, Vec<ModelListingWarning>) {
-    let (base, mut warnings) = crate::models::refresh_models(config).await;
+    let (harness_providers, mut warnings) = harness_provider_table(state, project_config).await;
+    // Only an answered table can convict a configured id of being unknown. When the harness cannot
+    // say, every id is unverified rather than wrong, and discovery simply does not run.
+    if let Some(table) = &harness_providers {
+        warnings.extend(crate::models::validate_provider_ids(
+            config,
+            table,
+            &project_config.harness,
+        ));
+    }
+    // Discovery needs endpoints only the harness can name. Without a table it cannot run at all,
+    // and a provider configured for listing would otherwise come back short with no explanation.
+    if harness_providers.is_none() && config.providers.iter().any(|p| p.model_listing) {
+        warn!(
+            project_id = %project_config.id,
+            harness = %project_config.harness,
+            action = "refresh_project_model_catalog",
+            "no harness provider table; /v1/models discovery cannot run"
+        );
+        warnings.push(ModelListingWarning {
+            source: format!("harness:{}", project_config.harness),
+            message: "model discovery needs the provider endpoints this harness cannot report;                       only declared models are offered"
+                .into(),
+        });
+    }
+    let (base, discovery_warnings) =
+        crate::models::discover_models(config, harness_providers.as_deref().unwrap_or(&[])).await;
+    warnings.extend(discovery_warnings);
     let (models, harness_warning) =
         overlay_harness_metadata(state, project_config, config, base).await;
     if let Some(warning) = harness_warning {
@@ -3359,6 +3356,55 @@ async fn refresh_project_model_catalog(
         .replace(project_config.id, models.clone())
         .await;
     (models, warnings)
+}
+
+/// Read the providers the project's harness is configured to route to (§8.2).
+///
+/// Best-effort in the same way as the metadata overlay: a harness that cannot introspect its own
+/// configuration, or fails to answer, yields an empty table. An empty table disables both discovery
+/// and id validation rather than reporting every configured provider as unknown — absence of
+/// evidence is not evidence that the ids are wrong.
+async fn harness_provider_table(
+    state: &AppState,
+    project_config: &ProjectConfig,
+) -> (Option<Vec<HarnessProvider>>, Vec<ModelListingWarning>) {
+    match state.registry.capabilities(project_config).await {
+        Ok(caps) if !caps.provider_listing => return (None, Vec::new()),
+        Ok(_) => {}
+        Err(e) => {
+            warn!(
+                project_id = %project_config.id,
+                harness = %project_config.harness,
+                error = %e,
+                "cannot read harness capabilities; serving models without provider resolution"
+            );
+            return (
+                None,
+                vec![ModelListingWarning {
+                    source: format!("harness:{}", project_config.harness),
+                    message: format!("could not read provider-listing capabilities: {e}"),
+                }],
+            );
+        }
+    }
+    match state.registry.list_providers(project_config).await {
+        Ok(providers) => (Some(providers), Vec::new()),
+        Err(e) => {
+            warn!(
+                project_id = %project_config.id,
+                harness = %project_config.harness,
+                error = %e,
+                "harness provider listing failed; serving models without provider resolution"
+            );
+            (
+                None,
+                vec![ModelListingWarning {
+                    source: format!("harness:{}", project_config.harness),
+                    message: format!("provider listing failed: {e}"),
+                }],
+            )
+        }
+    }
 }
 
 /// Overlay the project harness's model metadata (friendly names + advertised reasoning efforts) onto
@@ -4704,7 +4750,7 @@ async fn ensure_thread_open(
                 &ws_root,
                 Some(thread_id),
                 Some(thread_file.harness_thread_id.clone()),
-                current_model,
+                Some(current_model),
             )
             .await
     }
@@ -5006,7 +5052,7 @@ async fn switch_provider_cold(
                 ws_root,
                 Some(thread_id),
                 Some(thread_file.harness_thread_id.clone()),
-                requested.clone(),
+                Some(requested.clone()),
             )
             .await
     }

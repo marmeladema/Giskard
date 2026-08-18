@@ -24,7 +24,8 @@ use giskard_core::thread::ThreadKind;
 use giskard_core::turn::{Mode, Turn, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentHarness, HarnessCapabilities, OpenThreadOptions, ResumePolicy, ThreadHandle,
+    AgentHarness, HarnessCapabilities, HarnessProvider, OpenThreadOptions, ResumePolicy,
+    ThreadHandle,
 };
 use giskard_persist::PersistStore;
 use giskard_persist::store::{ProjectConfig, ThreadFile};
@@ -178,7 +179,10 @@ impl PassiveMonitorTaskTracker {
 struct ThreadBinding {
     project: ProjectId,
     handle: ThreadHandle,
-    native_model: ModelRef,
+    /// The model the harness reports this native thread is on. `None` when neither the caller nor
+    /// the harness named one — callers already treat an unknown native model the same as an
+    /// unbound thread.
+    native_model: Option<ModelRef>,
 }
 
 #[derive(Clone, Default)]
@@ -507,7 +511,7 @@ impl HarnessRegistry {
         workspace_root: &str,
         thread: Option<ThreadId>,
         resume: Option<String>,
-        initial_model: ModelRef,
+        initial_model: Option<ModelRef>,
     ) -> Result<ThreadHandle, HarnessError> {
         self.open_thread_with_resume_policy(
             config,
@@ -533,7 +537,7 @@ impl HarnessRegistry {
             workspace_root,
             thread,
             Some(resume),
-            initial_model,
+            Some(initial_model),
             ResumePolicy::RequireExisting,
         )
         .await
@@ -545,7 +549,7 @@ impl HarnessRegistry {
         workspace_root: &str,
         thread: Option<ThreadId>,
         resume: Option<String>,
-        initial_model: ModelRef,
+        initial_model: Option<ModelRef>,
         resume_policy: ResumePolicy,
     ) -> Result<ThreadHandle, HarnessError> {
         debug!(
@@ -587,7 +591,7 @@ impl HarnessRegistry {
         let native_model = handle
             .resumed_model
             .clone()
-            .unwrap_or_else(|| initial_model.clone());
+            .or_else(|| initial_model.clone());
         let mut threads = self.shared.threads.lock().await;
         threads.insert(
             handle.thread,
@@ -601,8 +605,8 @@ impl HarnessRegistry {
             project_id = %config.id,
             thread_id = %handle.thread,
             harness_thread_id = %handle.harness_thread_id,
-            provider = %initial_model.provider,
-            model = %initial_model.model,
+            provider = initial_model.as_ref().map(|m| m.provider.as_str()).unwrap_or("<harness>"),
+            model = initial_model.as_ref().map(|m| m.model.as_str()).unwrap_or("<harness>"),
             warning = handle.warning.as_ref().map(|w| w.code.as_str()).unwrap_or(""),
             "harness thread opened"
         );
@@ -1035,6 +1039,14 @@ impl HarnessRegistry {
         harness.list_models().await
     }
 
+    pub async fn list_providers(
+        &self,
+        config: &ProjectConfig,
+    ) -> Result<Vec<HarnessProvider>, HarnessError> {
+        let harness = self.get_or_create_harness(config.id, config).await?;
+        harness.list_providers().await
+    }
+
     pub async fn capabilities(
         &self,
         config: &ProjectConfig,
@@ -1085,7 +1097,7 @@ impl HarnessRegistry {
         let threads = self.shared.threads.lock().await;
         threads
             .get(&thread_id)
-            .map(|binding| binding.native_model.clone())
+            .and_then(|binding| binding.native_model.clone())
     }
 
     pub async fn get_project_for_thread(&self, thread_id: ThreadId) -> Option<ProjectId> {
@@ -1823,7 +1835,7 @@ async fn materialize_subagent_thread(
             workspace_root: workspace_root.into(),
             resume: Some(info.native_thread_id.clone()),
             resume_policy: ResumePolicy::RequireExisting,
-            initial_model: model.clone(),
+            initial_model: Some(model.clone()),
         })
         .await?;
     // This path calls the harness directly rather than `open_thread_with_resume_policy`, so retain
@@ -1849,7 +1861,7 @@ async fn materialize_subagent_thread(
     }
     let current_model = handle.resumed_model.clone().unwrap_or(model);
     let info = subagent_info_with_agent_name(info, handle.agent_name.clone());
-    let native_model = current_model.clone();
+    let native_model = Some(current_model.clone());
     shared.threads.lock().await.insert(
         handle.thread,
         ThreadBinding {
@@ -2026,7 +2038,7 @@ async fn ensure_subagent_thread_open(
             workspace_root: workspace_root.into(),
             resume: Some(thread_file.harness_thread_id.clone()),
             resume_policy: ResumePolicy::RequireExisting,
-            initial_model: thread_file.current_model.clone(),
+            initial_model: Some(thread_file.current_model.clone()),
         })
         .await?;
     // This path calls the harness directly rather than `open_thread_with_resume_policy`, so retain
@@ -2037,10 +2049,12 @@ async fn ensure_subagent_thread_open(
             handle.harness_thread_id, thread_file.harness_thread_id
         )));
     }
-    let native_model = handle
-        .resumed_model
-        .clone()
-        .unwrap_or_else(|| thread_file.current_model.clone());
+    let native_model = Some(
+        handle
+            .resumed_model
+            .clone()
+            .unwrap_or_else(|| thread_file.current_model.clone()),
+    );
     let agent_name = handle.agent_name.clone();
     shared.threads.lock().await.insert(
         handle.thread,
@@ -4266,7 +4280,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .create_project(project_id, "proj", "/tmp/test")
             .await
             .unwrap();
         let (tx, _) = broadcast::channel(8);
@@ -4420,7 +4434,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .create_project(project_id, "proj", "/tmp/test")
             .await
             .unwrap();
         let now = Utc::now();
@@ -4809,7 +4823,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .create_project(project_id, "proj", "/tmp/test")
             .await
             .unwrap();
         let now = Utc::now();
@@ -4925,7 +4939,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .create_project(project_id, "proj", "/tmp/test")
             .await
             .unwrap();
         let now = Utc::now();
@@ -5055,7 +5069,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .create_project(project_id, "proj", "/tmp/test")
             .await
             .unwrap();
         let now = Utc::now();
@@ -5179,7 +5193,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .create_project(project_id, "proj", "/tmp/test")
             .await
             .unwrap();
         let now = Utc::now();
@@ -5334,7 +5348,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .create_project(project_id, "proj", "/tmp/test")
             .await
             .unwrap();
         let now = Utc::now();
@@ -5459,7 +5473,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .create_project(project_id, "proj", "/tmp/test")
             .await
             .unwrap();
         let now = Utc::now();
@@ -5591,7 +5605,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .create_project(project_id, "proj", "/tmp/test")
             .await
             .unwrap();
         let now = Utc::now();
@@ -5747,7 +5761,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .create_project(project_id, "proj", "/tmp/test")
             .await
             .unwrap();
         let now = Utc::now();
@@ -5846,7 +5860,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .create_project(project_id, "proj", "/tmp/test")
             .await
             .unwrap();
         let now = Utc::now();
@@ -6015,7 +6029,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .create_project(project_id, "proj", "/tmp/test")
             .await
             .unwrap();
         let now = Utc::now();
@@ -6133,7 +6147,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .create_project(project_id, "proj", "/tmp/test")
             .await
             .unwrap();
         let (tx, _) = broadcast::channel(16);
@@ -6242,7 +6256,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .create_project(project_id, "proj", "/tmp/test")
             .await
             .unwrap();
         let now = Utc::now();
@@ -6356,7 +6370,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .create_project(project_id, "proj", "/tmp/test")
             .await
             .unwrap();
         let now = Utc::now();
@@ -6616,7 +6630,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .create_project(project_id, "proj", "/tmp/test")
             .await
             .unwrap();
         let now = Utc::now();
@@ -6815,7 +6829,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .create_project(project_id, "proj", "/tmp/test")
             .await
             .unwrap();
         let now = Utc::now();
@@ -7024,7 +7038,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test", model.clone())
+            .create_project(project_id, "proj", "/tmp/test")
             .await
             .unwrap();
         let now = Utc::now();

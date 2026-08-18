@@ -143,16 +143,7 @@ async fn token_ledgers_and_dashboard() {
     let pid = ProjectId::new();
     state
         .store
-        .create_project(
-            pid,
-            "proj",
-            &proj_dir.path().to_string_lossy(),
-            giskard_core::model::ModelRef {
-                provider: "openai".into(),
-                model: "gpt-5.5".into(),
-                reasoning_effort: None,
-            },
-        )
+        .create_project(pid, "proj", &proj_dir.path().to_string_lossy())
         .await
         .unwrap();
 

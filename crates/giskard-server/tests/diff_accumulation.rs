@@ -9,7 +9,6 @@ use giskard_core::diff::{DiffHunk, DiffLine, FileDiff};
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ItemId, ProjectId, ThreadId, TurnId};
 use giskard_core::item::{FileChangeKind, Item, ItemKind, ItemPayload, ItemStart};
-use giskard_core::model::ModelRef;
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnStatus, TurnStatusKind};
 use giskard_harness::AgentHarness;
@@ -199,16 +198,7 @@ session_days = 30
     let pid = ProjectId::new();
     state
         .store
-        .create_project(
-            pid,
-            "diff-test",
-            &proj_dir_path,
-            ModelRef {
-                provider: "openai".into(),
-                model: "gpt-5.5".into(),
-                reasoning_effort: None,
-            },
-        )
+        .create_project(pid, "diff-test", &proj_dir_path)
         .await
         .unwrap();
 

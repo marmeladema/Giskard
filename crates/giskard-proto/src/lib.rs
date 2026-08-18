@@ -435,7 +435,6 @@ pub struct CreateProjectRequest {
     pub name: String,
     pub dir: String,
     pub workspace_root: Option<String>,
-    pub default_model: ModelRef,
 }
 
 #[derive(Debug, Clone, Serialize)]

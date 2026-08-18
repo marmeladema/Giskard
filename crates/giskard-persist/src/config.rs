@@ -134,43 +134,23 @@ impl Default for VizConfig {
 }
 
 /// A provider declaration (spec Appendix C).
+///
+/// Deliberately minimal: a provider's display name, endpoint, and key location are the harness's
+/// configuration (for Codex, `~/.codex/config.toml`), and Giskard reads them back through
+/// `AgentHarness::list_providers` rather than asking for them a second time here. What is left is
+/// what no harness can supply — which `(provider, model)` pairs to offer, and the context window
+/// for each (§8.3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
+    /// Routing id. Must match a provider the harness knows (§8.2); Giskard validates this against
+    /// the harness's own provider table and warns when it does not.
     pub id: String,
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_url: Option<String>,
+    /// Whether to merge `GET {base_url}/models` discovery over the declared models, using the
+    /// endpoint the harness reports for this provider.
     #[serde(default)]
     pub model_listing: bool,
-    /// API key sent as `Authorization: Bearer …` on the `/v1/models` discovery request (§8.3),
-    /// for endpoints that require auth (e.g. a LiteLLM proxy with a master key). Inline secret.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<String>,
-    /// Name of an environment variable to read the discovery API key from, so the secret can be
-    /// kept out of `config.toml`. Used only when `api_key` is unset.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key_env: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelConfig>,
-}
-
-impl ProviderConfig {
-    /// Resolve the discovery API key: the inline `api_key`, else the value of the env var named by
-    /// `api_key_env`. Empty values are treated as unset.
-    pub fn resolve_api_key(&self) -> Option<String> {
-        if let Some(key) = self.api_key.as_deref()
-            && !key.is_empty()
-        {
-            return Some(key.to_string());
-        }
-        if let Some(var) = self.api_key_env.as_deref()
-            && let Ok(val) = std::env::var(var)
-            && !val.is_empty()
-        {
-            return Some(val);
-        }
-        None
-    }
 }
 
 /// A typed model entry within a provider (spec §8.3 / Appendix C).
@@ -227,7 +207,6 @@ cost_estimation = false
 
 [[providers]]
 id = "openai"
-name = "OpenAI (Codex built-in)"
 model_listing = false
 
   [[providers.models]]
@@ -244,8 +223,6 @@ model_listing = false
 
 [[providers]]
 id = "cloudflare-litellm"
-name = "Cloudflare Workers AI (via LiteLLM)"
-base_url = "http://127.0.0.1:4000/v1"
 model_listing = true
 
   [[providers.models]]

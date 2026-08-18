@@ -3,6 +3,8 @@
 //! thread under it — but only when the harness *confirms* the switch. An unconfirmed switch is
 //! rejected with `thread_provider_switch_ignored` and persists nothing.
 
+mod common;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -21,6 +23,8 @@ use giskard_persist::store::{ProjectConfig, ThreadFile};
 use giskard_proto::ClientMessage;
 use giskard_server::{AppState, HarnessFactory, build_app};
 use tokio::sync::broadcast;
+
+use common::fake_native_model;
 
 const DEAD_PROVIDER: &str = "cloudflare-litellm";
 const NEW_PROVIDER: &str = "opencodex";
@@ -43,14 +47,16 @@ impl AgentHarness for SwitchHarness {
     }
 
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
-        if opts.initial_model.provider == DEAD_PROVIDER {
+        // An import names no model, so the fake answers with the one it is already on —
+        // the same thing a real harness reports from its own record.
+        let mut effective = opts.initial_model.clone().unwrap_or_else(fake_native_model);
+        if effective.provider == DEAD_PROVIDER {
             return Err(HarnessError::Transport(format!(
                 "JSON-RPC error (-32600): failed to load configuration: Model provider \
                  {:?} not found",
                 DEAD_PROVIDER
             )));
         }
-        let mut effective = opts.initial_model.clone();
         if let Some(provider) = &self.report_provider {
             effective.provider = provider.clone();
         }
@@ -224,7 +230,6 @@ session_days = 30
 
 [[providers]]
 id = "{NEW_PROVIDER}"
-name = "opencodex proxy"
 model_listing = false
   [[providers.models]]
   id = "glm-5.2"
@@ -234,7 +239,6 @@ model_listing = false
 
 [[providers]]
 id = "openai"
-name = "OpenAI"
 model_listing = false
   [[providers.models]]
   id = "gpt-5.5"
@@ -253,12 +257,7 @@ model_listing = false
     let tid = ThreadId::new();
     let proj_dir = tempfile::TempDir::new().unwrap();
     store
-        .create_project(
-            pid,
-            "proj",
-            &proj_dir.path().to_string_lossy(),
-            dead_model(),
-        )
+        .create_project(pid, "proj", &proj_dir.path().to_string_lossy())
         .await
         .unwrap();
     store
