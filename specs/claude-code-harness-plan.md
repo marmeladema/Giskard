@@ -617,10 +617,9 @@ Two findings from the round trip:
   the same probe auto-approved the command and no ask was ever emitted; it took `--setting-sources ""`
   to see the ask at all. Under the chosen `user` scope (§8) this is an accepted limit of `ask_first`,
   not a defect — but it is why the preset cannot be described as "always asks".
-- **`permission_suggestions` is typed and carries a `destination`.** Echoing a `localSettings`
-  suggestion back **writes a permanent rule into the user's project** — observed, see §9.3 — which
-  Giskard must never do as a side effect of one approval card. Hence the destination invariant in
-  §9.3: rewrite every suggestion to `session` before returning it.
+- **`permission_suggestions` is typed and carries a `destination`**, which decides whether a granted
+  rule is remembered for the session or written to a settings file. Giskard always uses `session`
+  (§9.3).
 
 ### 9.3 Decision mapping
 
@@ -695,21 +694,16 @@ Also observed while establishing this: echoing the CLI's suggestion **unmodified
 rule into the user's project (`.claude/settings.local.json` gained `"Bash(echo A > a.txt)"`), because
 the suggested destination is `localSettings`. Hence the invariant below.
 
-**Invariant: always override the destination to `session`; never forward a persistent one.**
-`localSettings`, `projectSettings` and `userSettings` all write permission rules to disk on the user's
-machine. An approval click means "let this proceed for now", never "change my configuration
-permanently", so the adapter must rewrite the destination on every suggestion it echoes and drop any it
-cannot rewrite.
+**Invariant: rewrite the destination to `session` on every suggestion echoed back.** The other
+destinations persist: `localSettings`, `projectSettings` and `userSettings` write the rule to the
+corresponding settings file — observed once during this investigation, when an unmodified suggestion
+added `"Bash(echo A > a.txt)"` to a project's `.claude/settings.local.json`. Giskard uses none of them,
+because an approval click means "let this proceed for now" and not "edit my configuration". Suggestions
+that cannot be rewritten are dropped.
 
-The trap is specific and easy to walk into: the ask's suggestions arrive with
-`destination: "localSettings"`, so forwarding them **unchanged** — the obvious one-liner — writes to the
-user's repository. That is how the write above was produced. It is also pointless under the chosen
-`user` scope: `localSettings` writes land in the project's `.claude/settings.local.json`, which is a
-scope Giskard does not load, so the file is written and never read. With per-thread worktrees each
-worktree would accumulate its own copy.
-
-A regression test belongs here: approve for session, then assert both that the repeat call does not ask
-**and** that no settings file appeared under the workspace.
+The rule is worth a line of test coverage rather than vigilance, since the way to break it is the
+obvious one-liner — forwarding `permission_suggestions` unchanged: approve for session, assert the
+repeat call does not ask and that no settings file appeared.
 
 *Diagnostic note:* `--debug-file` logs every applied update (`Applying permission update: Adding 1 allow
 rule(s) to destination 'session': [...]`), including the rule in the CLI's canonical stored form. That is
