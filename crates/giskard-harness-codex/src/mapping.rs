@@ -81,6 +81,9 @@ pub struct CodexMapper {
     active_turns: HashMap<ThreadId, String>,
     running_command_turns: HashMap<(ThreadId, String), String>,
     running_commands: HashSet<NativeItemKey>,
+    /// File-change items arrive before approval requests, whose payloads only identify the item.
+    /// Retain their structured changes so the approval card can name what it will modify.
+    file_change_previews: HashMap<NativeItemKey, Vec<FileChangeEntry>>,
     pending_approval_responses: HashMap<ApprovalId, PendingApprovalResponse>,
     pending_server_requests: HashMap<ServerRequestId, PendingServerRequest>,
 }
@@ -100,6 +103,7 @@ impl CodexMapper {
             active_turns: HashMap::new(),
             running_command_turns: HashMap::new(),
             running_commands: HashSet::new(),
+            file_change_previews: HashMap::new(),
             pending_approval_responses: HashMap::new(),
             pending_server_requests: HashMap::new(),
         }
@@ -134,6 +138,8 @@ impl CodexMapper {
             .retain(|(owner, _)| *owner != thread);
         self.invalid_context_window_turns
             .retain(|(owner, _)| *owner != thread);
+        self.file_change_previews
+            .retain(|(owner, _, _), _| *owner != thread);
     }
 
     /// Register the native turn id returned by `turn/start` before notifications start streaming.
@@ -275,10 +281,15 @@ impl CodexMapper {
                     .remove(&(thread, turn.id.clone()));
                 self.invalid_context_window_turns
                     .remove(&(thread, turn.id.clone()));
+                let completed_turn = self.resolve_turn(thread, &turn.id);
+                self.file_change_previews
+                    .retain(|(owner, item_turn, _), _| {
+                        *owner != thread || *item_turn != completed_turn
+                    });
                 let status = map_turn_status(&turn.status);
                 Some(AgentEvent::TurnCompleted {
                     thread,
-                    turn: self.resolve_turn(thread, &turn.id),
+                    turn: completed_turn,
                     usage,
                     status,
                 })
@@ -348,6 +359,10 @@ impl CodexMapper {
             }) => {
                 let thread = self.resolve_thread(thread_id, fallback_thread)?;
                 let turn = self.resolve_turn(thread, turn_id);
+                if let codex_codes::ThreadItem::FileChange { id, changes, .. } = item {
+                    self.file_change_previews
+                        .insert((thread, turn, id.clone()), map_file_changes(changes));
+                }
                 let (harness_item_id, kind, command, tool) =
                     map_thread_item_start(item, *started_at_ms);
                 let id = self.resolve_item(thread, turn, &harness_item_id);
@@ -421,6 +436,12 @@ impl CodexMapper {
 
             Notification::FileChangePatchUpdated(n) => {
                 let text = summarize_file_changes(&n.changes);
+                let thread = self.resolve_thread(&n.thread_id, fallback_thread)?;
+                let turn = self.resolve_turn(thread, &n.turn_id);
+                self.file_change_previews.insert(
+                    (thread, turn, n.item_id.clone()),
+                    map_file_changes(&n.changes),
+                );
                 self.map_text_delta(&n.thread_id, &n.turn_id, &n.item_id, &text, fallback_thread)
             }
 
@@ -797,6 +818,31 @@ impl CodexMapper {
             CodexServerRequest::FileChangeApproval(params) => {
                 let thread = self.resolve_thread(&params.thread_id, fallback_thread)?;
                 let turn = self.resolve_turn(thread, &params.turn_id);
+                let preview = self
+                    .file_change_previews
+                    .get(&(thread, turn, params.item_id.clone()))
+                    .cloned()
+                    .unwrap_or_default();
+                let preview_path = preview
+                    .first()
+                    .map(|entry| entry.path.clone())
+                    .unwrap_or_default();
+                let preview_change = preview
+                    .first()
+                    .map(|entry| entry.change)
+                    .unwrap_or(FileChangeKind::Modified);
+                if preview.is_empty() {
+                    warn!(
+                        %thread,
+                        %turn,
+                        native_item_id = params.item_id,
+                        has_grant_root = params
+                            .grant_root
+                            .as_deref()
+                            .is_some_and(|path| !path.trim().is_empty()),
+                        "Codex file-change approval omitted changed paths"
+                    );
+                }
                 let approval_id = ApprovalId(req_id);
                 self.pending_approval_responses.insert(
                     approval_id.clone(),
@@ -813,15 +859,15 @@ impl CodexMapper {
                     request: ApprovalRequest {
                         id: approval_id,
                         kind: ApprovalKind::FileChange {
-                            path: params
-                                .grant_root
-                                .as_ref()
-                                .map(PathBuf::from)
-                                .unwrap_or_default(),
-                            change: FileChangeKind::Modified,
+                            path: preview_path,
+                            change: preview_change,
                         },
                         reason: params.reason.clone(),
-                        metadata: file_change_approval_metadata(params),
+                        metadata: file_change_approval_metadata(
+                            &self.workspace_root,
+                            params,
+                            &preview,
+                        ),
                         available: vec![
                             ApprovalDecision::Accept,
                             ApprovalDecision::AcceptForSession,
@@ -1509,11 +1555,21 @@ fn command_approval_metadata(
 }
 
 fn file_change_approval_metadata(
+    workspace_root: &Path,
     params: &codex_codes::protocol::FileChangeRequestApprovalParams,
+    changes: &[FileChangeEntry],
 ) -> Vec<ApprovalMetadata> {
     let mut metadata = Vec::new();
     if let Some(grant_root) = &params.grant_root {
         add_path_metadata(&mut metadata, "Grant root", grant_root, false);
+    }
+    for change in changes {
+        add_workspace_path_metadata(
+            &mut metadata,
+            workspace_root,
+            &format!("File {}", file_change_label(change.change)),
+            &change.path.to_string_lossy(),
+        );
     }
     metadata
 }
@@ -3778,7 +3834,7 @@ mod tests {
         {
             AgentEvent::ApprovalRequested { request, .. } => match request.kind {
                 ApprovalKind::FileChange { path, change } => {
-                    assert_eq!(path, PathBuf::from("/tmp/project"));
+                    assert_eq!(path, PathBuf::new());
                     assert_eq!(change, FileChangeKind::Modified);
                     assert_no_opaque_approval_ids(&request.metadata);
                     assert!(metadata_has_path(
@@ -3806,6 +3862,183 @@ mod tests {
         assert_eq!(
             decoded.decision,
             codex_codes::protocol::FileChangeApprovalDecision::AcceptForSession
+        );
+    }
+
+    #[test]
+    fn file_change_approval_uses_the_structured_item_preview() {
+        let workspace = test_workspace("file-approval-preview");
+        write_test_file(&workspace, "src/main.rs", "fn main() {}\n");
+        let mut mapper = CodexMapper::new(workspace.clone());
+        let fallback = ThreadId::new();
+        let file_change = Notification::ItemStarted(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "thread1",
+                "turnId": "turn1",
+                "startedAtMs": 123,
+                "item": {
+                    "type": "fileChange",
+                    "id": "file1",
+                    "status": "inProgress",
+                    "changes": [
+                        { "path": "src/main.rs", "kind": { "type": "update", "movePath": null }, "diff": "" },
+                        { "path": "src/new.rs", "kind": { "type": "add" }, "diff": "" }
+                    ]
+                }
+            }))
+            .unwrap(),
+        );
+        mapper
+            .map_notification(&file_change, fallback)
+            .expect("file-change start should map");
+
+        let request = CodexServerRequest::FileChangeApproval(
+            serde_json::from_value(serde_json::json!({
+                "itemId": "file1",
+                "threadId": "thread1",
+                "turnId": "turn1",
+                "startedAtMs": 123,
+                "grantRoot": "/tmp/project"
+            }))
+            .unwrap(),
+        );
+        let event = mapper
+            .map_server_request(&RequestId::String("file_req".into()), &request, fallback)
+            .expect("file approval should map");
+        let AgentEvent::ApprovalRequested { request, .. } = event else {
+            panic!("expected file-change approval event");
+        };
+        assert_eq!(
+            request.kind,
+            ApprovalKind::FileChange {
+                path: "src/main.rs".into(),
+                change: FileChangeKind::Modified,
+            }
+        );
+        assert!(metadata_has_path(
+            &request.metadata,
+            "File modified",
+            "src/main.rs",
+            true
+        ));
+        assert!(metadata_has_path(
+            &request.metadata,
+            "File created",
+            "src/new.rs",
+            false
+        ));
+        assert!(metadata_has_path(
+            &request.metadata,
+            "Grant root",
+            "/tmp/project",
+            false
+        ));
+    }
+
+    #[test]
+    fn file_change_approval_without_targets_stays_explicitly_empty() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let fallback = ThreadId::new();
+        let request = CodexServerRequest::FileChangeApproval(
+            serde_json::from_value(serde_json::json!({
+                "itemId": "file1",
+                "threadId": "thread1",
+                "turnId": "turn1",
+                "startedAtMs": 123
+            }))
+            .unwrap(),
+        );
+        let event = mapper
+            .map_server_request(&RequestId::String("file_req".into()), &request, fallback)
+            .expect("file approval should map");
+        let AgentEvent::ApprovalRequested { request, .. } = event else {
+            panic!("expected file-change approval event");
+        };
+        assert_eq!(
+            request.kind,
+            ApprovalKind::FileChange {
+                path: PathBuf::new(),
+                change: FileChangeKind::Modified,
+            }
+        );
+        assert!(request.reason.is_none());
+        assert!(request.metadata.is_empty());
+    }
+
+    #[test]
+    fn file_change_previews_are_replaced_scoped_and_cleared() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let first_thread = ThreadId::new();
+        let second_thread = ThreadId::new();
+        mapper.register_thread("thread1".into(), first_thread);
+        mapper.register_thread("thread2".into(), second_thread);
+
+        for (thread, turn, path) in [
+            ("thread1", "turn1", "src/old.rs"),
+            ("thread1", "turn1", "src/new.rs"),
+            ("thread1", "turn2", "src/other-turn.rs"),
+            ("thread2", "turn1", "src/other-thread.rs"),
+        ] {
+            let file_change = Notification::ItemStarted(
+                serde_json::from_value(serde_json::json!({
+                    "threadId": thread,
+                    "turnId": turn,
+                    "startedAtMs": 123,
+                    "item": {
+                        "type": "fileChange",
+                        "id": "file1",
+                        "status": "inProgress",
+                        "changes": [
+                            { "path": path, "kind": { "type": "update", "movePath": null }, "diff": "" }
+                        ]
+                    }
+                }))
+                .unwrap(),
+            );
+            mapper
+                .map_notification(&file_change, first_thread)
+                .expect("file-change start should map");
+        }
+
+        assert_eq!(mapper.file_change_previews.len(), 3);
+        let first_turn = mapper.resolve_turn(first_thread, "turn1");
+        let refresh = Notification::FileChangePatchUpdated(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "thread1",
+                "turnId": "turn1",
+                "itemId": "file1",
+                "changes": [
+                    { "path": "src/refreshed.rs", "kind": { "type": "update", "movePath": null }, "diff": "" }
+                ]
+            }))
+            .unwrap(),
+        );
+        mapper
+            .map_notification(&refresh, first_thread)
+            .expect("patch refresh should map");
+        assert_eq!(
+            mapper.file_change_previews[&(first_thread, first_turn, "file1".into())][0].path,
+            PathBuf::from("src/refreshed.rs")
+        );
+
+        let completed = Notification::TurnCompleted(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "thread1",
+                "turn": { "id": "turn1", "status": "completed" }
+            }))
+            .unwrap(),
+        );
+        mapper
+            .map_notification(&completed, first_thread)
+            .expect("turn completion should map");
+        assert_eq!(mapper.file_change_previews.len(), 2);
+        mapper.clear_active_turn(first_thread);
+        assert_eq!(mapper.file_change_previews.len(), 1);
+        assert!(
+            mapper
+                .file_change_previews
+                .keys()
+                .all(|(thread, _, _)| *thread == second_thread)
         );
     }
 

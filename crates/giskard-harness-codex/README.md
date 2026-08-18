@@ -390,6 +390,16 @@ The browser-facing ID is not a thread, turn, item, or process ID. Resolving a
 request removes the pending registry entry so duplicate or stale responses fail
 instead of being routed to another request.
 
+Current Codex file-change approval requests identify the associated item but do
+not carry its changed paths. With current Codex app-server ordering, the adapter
+retains the structured changes from the preceding `item/started` file-change
+item and refreshes them from any subsequent `item/fileChange/patchUpdated`
+notification. It then exposes those paths as approval metadata. If no item
+changes were supplied, Giskard logs the degraded request and the browser states
+that Codex did not provide the file list. An optional grant root remains
+separately labeled permission-scope metadata and is never presented as a changed
+target.
+
 ## Code and tests
 
 - [`src/mapping.rs`](src/mapping.rs) owns native-to-Giskard identity translation and command

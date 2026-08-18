@@ -4042,7 +4042,10 @@ function approvalDetail(request) {
   if (kind.kind==="command_execution") {
     return kind.command || "(empty command)";
   }
-  if (kind.kind==="file_change") return [kind.change, kind.path].filter(Boolean).join(" ");
+  if (kind.kind==="file_change") {
+    if (!kind.path) return "File list was not provided by Codex.";
+    return [kind.change, kind.path].filter(Boolean).join(" ");
+  }
   if (kind.kind==="permission") return kind.detail || "";
   if (kind.kind==="mcp_tool_call") {
     const server = kind.server ? `${kind.server}:` : "";

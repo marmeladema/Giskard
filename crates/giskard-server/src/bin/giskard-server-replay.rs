@@ -27,7 +27,7 @@ use async_trait::async_trait;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
-use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalRequest};
+use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalMetadata, ApprovalRequest};
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ThreadId, TurnId};
@@ -70,6 +70,10 @@ const SCRIPTED_SUBAGENT_APPROVAL_DELAY: std::time::Duration =
 /// answered card is not re-surfaced as actionable. The approval id is fixed so tests can target it.
 const SCRIPTED_APPROVAL_TRIGGER: &str = "Trigger a scripted approval request.";
 const SCRIPTED_APPROVAL_ID: &str = "scripted-approval-1";
+/// Raises the path-free file approval emitted by current Codex versions when no structured patch
+/// preview is available. Grant-root metadata remains available separately.
+const SCRIPTED_EMPTY_FILE_APPROVAL_TRIGGER: &str = "Trigger a path-free file approval request.";
+const SCRIPTED_EMPTY_FILE_APPROVAL_ID: &str = "scripted-empty-file-approval-1";
 /// Raises an approval and then streams a harness error in the same still-open turn. The error is
 /// the last activity-bearing event, so a reconnect that took the replayed events at face value
 /// would land on "errored, no active turn" and lose the fact that the turn is still blocked on the
@@ -437,13 +441,20 @@ impl AgentHarness for ScriptedHarness {
         };
 
         let raise_approval_then_error = input_text == Some(SCRIPTED_APPROVAL_THEN_ERROR_TRIGGER);
-        let raise_approval =
-            input_text == Some(SCRIPTED_APPROVAL_TRIGGER) || raise_approval_then_error;
+        let raise_empty_file_approval = input_text == Some(SCRIPTED_EMPTY_FILE_APPROVAL_TRIGGER);
+        let raise_approval = input_text == Some(SCRIPTED_APPROVAL_TRIGGER)
+            || raise_approval_then_error
+            || raise_empty_file_approval;
         if raise_approval {
+            let approval_id = if raise_empty_file_approval {
+                SCRIPTED_EMPTY_FILE_APPROVAL_ID
+            } else {
+                SCRIPTED_APPROVAL_ID
+            };
             self.active_approvals
                 .lock()
                 .await
-                .insert(ApprovalId(SCRIPTED_APPROVAL_ID.into()), (thread_id, turn));
+                .insert(ApprovalId(approval_id.into()), (thread_id, turn));
         }
 
         let raise_server_request_then_error =
@@ -510,13 +521,36 @@ impl AgentHarness for ScriptedHarness {
                     thread: thread_id,
                     turn,
                     request: ApprovalRequest {
-                        id: ApprovalId(SCRIPTED_APPROVAL_ID.into()),
-                        kind: ApprovalKind::CommandExecution {
-                            command: "rm -rf ./build".into(),
-                            cwd: "/tmp/demo".into(),
+                        id: ApprovalId(
+                            if raise_empty_file_approval {
+                                SCRIPTED_EMPTY_FILE_APPROVAL_ID
+                            } else {
+                                SCRIPTED_APPROVAL_ID
+                            }
+                            .into(),
+                        ),
+                        kind: if raise_empty_file_approval {
+                            ApprovalKind::FileChange {
+                                path: std::path::PathBuf::new(),
+                                change: giskard_core::item::FileChangeKind::Modified,
+                            }
+                        } else {
+                            ApprovalKind::CommandExecution {
+                                command: "rm -rf ./build".into(),
+                                cwd: "/tmp/demo".into(),
+                            }
                         },
-                        reason: Some("The agent wants to remove the build directory.".into()),
-                        metadata: vec![],
+                        reason: (!raise_empty_file_approval)
+                            .then(|| "The agent wants to remove the build directory.".into()),
+                        metadata: if raise_empty_file_approval {
+                            vec![ApprovalMetadata::Path {
+                                label: "Grant root".into(),
+                                path: "/tmp/project".into(),
+                                source_link: false,
+                            }]
+                        } else {
+                            vec![]
+                        },
                         available: vec![ApprovalDecision::Accept, ApprovalDecision::Decline],
                     },
                 });

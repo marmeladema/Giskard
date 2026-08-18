@@ -19,6 +19,7 @@ export const SCRIPTED_SUBAGENT_REPLY = "Child replay output";
  * `crates/giskard-server/src/bin/giskard-server-replay.rs`.
  */
 export const SCRIPTED_APPROVAL_TRIGGER = "Trigger a scripted approval request.";
+export const SCRIPTED_EMPTY_FILE_APPROVAL_TRIGGER = "Trigger a path-free file approval request.";
 
 /**
  * Prompt that raises an approval and then streams a harness error in the same still-open turn, so
