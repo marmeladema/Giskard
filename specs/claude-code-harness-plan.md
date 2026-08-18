@@ -26,7 +26,7 @@ this document.
 | Child-process model | **One persistent `claude` child process per loaded thread**, alive across turns. Spawned only when a thread with an Anthropic model is loaded. **No idle reaping in the MVP.** |
 | Structured diffs | **`structured_diffs: false` in v1.** Synthesize `FileChange`/`DiffUpdated` from `Edit`/`Write` tool calls + git in a later phase. |
 | `AcceptForSession` when the harness offers no rule to persist | **Keep the button visible anyway** (§9.3). It behaves as a one-off `Accept`; log the degradation and revisit only if users report it. |
-| Settings sources for child processes | **`--setting-sources user`** (§8): the user's own `~/.claude/settings.json` applies, so extra writable roots and personal rules are configured where the user already keeps them. Project and local scopes stay excluded. The accepted cost is that a user allow-rule can pre-approve a call `ask_first` would otherwise have asked about. |
+| Settings sources for child processes | **`--setting-sources user`** (§8.3): the user's own `~/.claude/settings.json` applies, so extra writable roots and personal rules are configured where the user already keeps them. Project and local scopes stay excluded. The accepted cost is that a user allow-rule can pre-approve a call `ask_first` would otherwise have asked about. |
 | Live approvals | **Supported and verified end to end (§9).** MVP uses the `--permission-prompt-tool stdio` channel, in the adapter's first working milestone. The hook route is postponed to a later decision and refactor (§9.4); the MCP-tool route is rejected (§9.1). |
 
 ---
@@ -50,7 +50,10 @@ Two consequences drive the whole design:
    thread-addressed. A `ClaudeHarness` is a project-scoped façade that internally owns a
    `HashMap<ThreadId, ChildSession>`. "One working context = one harness instance" (spec §4.7) still
    holds; the instance just fans out to children instead of multiplexing one pipe.
-2. **Resume is cwd-scoped.** A thread using a per-thread Git worktree
+2. **Resume is cwd-scoped.** Resuming works — **verified**: a fresh process launched with
+   `--resume=<uuid>` answered a question that could only be answered from the previous process's
+   conversation, and reused the same session id rather than forking. But the transcript it reads lives
+   under a directory keyed by cwd, so a thread using a per-thread Git worktree
    (`docs/git-worktrees.md`) must always respawn with the *same* cwd, or `--resume` silently cannot
    find the session. Giskard already persists `ThreadFile.git_workspace`, so the adapter must derive
    cwd from the thread, never from the project.
@@ -161,7 +164,7 @@ project's `.claude/settings.json`, then `~/.claude/settings.json`**.
   schema.)
 
 The practical consequence for Giskard: the permission surface is settings-schema state, so
-`--setting-sources` decides exactly which files reach it. Under the chosen `user` scope (§8) the
+`--setting-sources` decides exactly which files reach it. Under the chosen `user` scope (§8.3) the
 machine owner's file contributes and a checkout's files do not, while authentication is unaffected
 either way because it is not settings-schema state at all.
 
@@ -170,7 +173,7 @@ Giskard adapter:
 
 | Key | Relevance |
 | --- | --- |
-| `permissions` | `allow` / `deny` / `ask` rule lists, **`additionalDirectories`**, `defaultMode`, `disableBypassPermissionsMode` — the whole permission surface §8 and §9 operate on |
+| `permissions` | `allow` / `deny` / `ask` rule lists, **`additionalDirectories`**, `defaultMode`, `disableBypassPermissionsMode` — the whole permission surface §8.1 and §9 operate on |
 | `env` | environment variables applied to the session; the route by which provider selection is configured (below) |
 | `model`, `availableModels`, `enforceAvailableModels`, `fallbackModel` | model selection and restriction |
 | `apiKeyHelper`, `awsCredentialExport`, `awsAuthRefresh` | credential production for non-subscription auth |
@@ -187,8 +190,8 @@ payload as a file path or inline JSON. **Verified:** an inline `--settings` payl
 `--settings '{"permissions":{"additionalDirectories":["/tmp/outside-dir"]}}'` made the same write
 proceed with no ask.
 
-So Giskard can hand a child exactly the configuration it intends, while ignoring every settings file on
-the machine. Two consequences:
+So the two mechanisms compose: `--setting-sources user` decides which of the user's files apply (§8.3),
+while `--settings` can add configuration for one child that exists nowhere on disk. Two consequences:
 
 - **`--add-dir` has a settings-level equivalent**, `permissions.additionalDirectories`, verified above.
   Either mechanism works; the flag is simpler for a fixed list, the payload is better if Giskard ever
@@ -220,12 +223,12 @@ recorded so the provider field is not mistaken for something the protocol carrie
 | `live_approvals` | **true (verified)** | `can_use_tool` control request; response `{behavior:"allow",updatedInput?,updatedPermissions?}` \| `{behavior:"deny",message?,interrupt?}`. Round trip and blocked execution confirmed — §9. |
 | `plan_build_modes` | **true (verified)** | `--permission-mode plan` + `set_permission_mode`, which echoes the applied mode. Semantics differ — see §8. |
 | `per_turn_model` | **true (verified)** | `set_model` mid-session, no respawn (§3.3) |
-| `reasoning_effort` | **true** | `--effort low\|medium\|high\|xhigh\|max` (`Effort` is already an open string newtype, so the differing value set costs nothing) |
+| `reasoning_effort` | **true**, with a caveat | `--effort low\|medium\|high\|xhigh\|max`; accepted without error, but **not echoed anywhere in the stream** — unlike the model, there is no way to confirm the effective effort, so Giskard displays what it requested. `Effort` is already an open string newtype, so the differing value set costs nothing |
 | `structured_diffs` | **false (v1)** | no native diff feed |
-| `resumable_threads` | **true** | `--session-id` / `--resume`, cwd-scoped |
+| `resumable_threads` | **true (verified)** | a fresh process launched with `--resume=<uuid>` recovered the earlier conversation's content and kept the same session id (no fork). cwd-scoped — §2 |
 | `model_listing` | **true (static)** | no RPC; adapter returns a built-in catalog of Claude models |
-| `token_usage` | **true** | `result.usage` |
-| `mcp_status` | **true (read-only)** at the harness level | `system/init.mcp_servers` lists servers and status. The project-scoped MCP *endpoints* stay Codex-only in v1 (§5.4) |
+| `token_usage` | **true (observed)** | `result.usage` on every turn, plus per-model totals in `result.modelUsage` — §6 |
+| `mcp_status` | **true (read-only)** at the harness level [unverified with servers configured] | `system/init.mcp_servers` carries the inventory; only ever seen empty here. The project-scoped MCP *endpoints* stay Codex-only in v1 (§5.4) |
 | `mcp_reload` | **false (v1)** | only the interactive `/mcp reconnect` |
 | `mcp_oauth_login` | **false** | interactive only |
 | `context_compaction` | **true** | `/compact` as a user message [unverified]; `autocompact_state` feeds the gauge |
@@ -247,14 +250,20 @@ defaulting to `"codex"` so every existing `config.toml` keeps working:
 id = "anthropic"
 name = "Anthropic (Claude Code)"
 harness = "claude"          # new
-wire_api = "anthropic"
-model_listing = false
+wire_api = "anthropic"      # required by the struct; unused for this harness (see below)
+model_listing = false       # no GET /v1/models to discover from
   [[providers.models]]
-  id = "claude-opus-5"
-  display_name = "Opus 5"
-  context_window = 1000000
+  id = "claude-sonnet-5"
+  display_name = "Sonnet 5"
+  context_window = 1000000  # observed via result.modelUsage; refined at runtime by §6
   supports_reasoning_effort = true
 ```
+
+`wire_api` and `model_listing` describe how Giskard talks to a *provider endpoint*, which is
+meaningless for a harness that owns its own transport: `wire_api` is inert here, and `model_listing`
+refers to HTTP discovery, not to the harness's `list_models` capability. Leaving both present and inert
+avoids changing `ProviderConfig`'s shape for every existing config; making `wire_api` optional would be
+a tidier follow-up.
 
 Then `harness_for(model: &ModelRef, config) -> HarnessKind` is a pure lookup, and the rule "a thread
 runs on the harness of its current model's provider" needs no new UI — the model picker is already the
@@ -286,7 +295,7 @@ resolves the right instance rather than "the project's harness":
   a Claude UUID and a Codex rollout id live in the same field and must not alias.
 
 `HarnessFactory::create` takes `(kind, &ProjectConfig, cwd)` and the binary's factory dispatches
-`"codex" | "claude"` (`bin/giskard-server.rs:14` currently rejects anything but `"codex"`).
+`"codex" | "claude"` (`bin/giskard-server.rs:19` currently rejects anything but `"codex"`).
 
 ### 5.3 Persistence
 
@@ -368,8 +377,9 @@ server change, not an adapter workaround, and it needs error-path tests per `AGE
 ### 5.7 Process lifecycle (MVP)
 
 - Spawn on `open_thread`, one child per thread, `--session-id <fresh uuid>` or `--resume=<stored>`.
-- cwd = the thread's worktree if it has one, else the project workspace root; `--add-dir` for extra
-  writable roots (the analogue of Codex's `runtimeWorkspaceRoots`).
+- cwd = the thread's worktree if it has one, else the project workspace root. Extra writable roots come
+  from the user's own `permissions.additionalDirectories` (§8.3), so the adapter passes `--add-dir` only
+  for roots Giskard itself introduces, if any.
 - Threads of one project may run **concurrently in the same cwd** with no coordination between children
   (§3.4); the adapter needs no cross-thread locking, only per-thread turn serialization, which the
   server's existing `ThreadTurnGate` already provides.
@@ -401,14 +411,12 @@ server change, not an adapter workaround, and it needs error-path tests per `AGE
   `input = input_tokens + cache_creation_input_tokens + cache_read_input_tokens`. Document the
   consequence: with `tokens.cost_estimation = true`, flat per-Mtok rates **overstate** cost, because
   cache reads bill at a fraction. For a subscription user the euro figure is notional anyway.
-- **Ancillary models pollute `by_model`.** `result.modelUsage` always carries a Haiku entry alongside
-  the selected model, because Claude Code runs its own summaries/titles on a small model. Observed on
-  every turn, including a Sonnet-only one. Decide deliberately: attribute the turn to the selected
-  model (matching `Turn.model` and the Codex ledger's meaning) and either fold the ancillary usage
-  into the same entry or record it under its own `(provider, model)` key. Dropping it makes Giskard's
-  totals disagree with Anthropic's; hiding it under the selected model makes per-model rates wrong.
-  Recommendation: record each `modelUsage` entry under its real model id, so `by_model` stays truthful,
-  and keep `Turn.model` as the user's selection.
+- **Ancillary models appear in `by_model`.** `result.modelUsage` always carries a Haiku entry alongside
+  the selected model, because Claude Code runs its own summaries and titles on a small model — observed
+  on every turn, including Sonnet-only ones. **Record each `modelUsage` entry under its real model id**
+  and keep `Turn.model` as the user's selection. Dropping the ancillary usage would make Giskard's
+  totals disagree with the provider's; folding it into the selected model would corrupt that model's
+  per-Mtok rates.
 - **Cost.** Do not use `result.total_cost_usd` as truth for a Pro/Max user — it is priced as if the
   request were API-billed. Prefer the `rate_limit_event` five-hour window as the honest "how much
   budget is left" signal, surfaced as a `Notice` (and, later, a header chip).
@@ -438,7 +446,9 @@ Generalize the wording from "Codex" to "the active harness" and add:
 
 ---
 
-## 8. Presets and Plan mode
+## 8. Presets, Plan mode, and settings sources
+
+### 8.1 Permission presets
 
 | Giskard preset | `--permission-mode` | Notes |
 | --- | --- | --- |
@@ -457,55 +467,51 @@ is recorded because the failure is a non-obvious spawn error rather than a permi
 adapter should detect the refusal and surface the cause instead of a generic spawn failure — the same
 treatment any other unusable preset gets.
 
+### 8.2 Plan mode
+
 **Plan mode collapses the orthogonality.** In Codex, Plan/Build is collaboration mode only and is
 orthogonal to the preset (spec §9.1). In Claude Code, `plan` *is* a permission mode, so Plan + preset
 occupy one slot. Contract: Plan wins — a Plan-mode turn sends `--permission-mode plan` / 
 `set_permission_mode plan` regardless of preset, and the preset applies again in Build. Spec §9.1
 must say this explicitly for harnesses without `plan_build_modes` independence.
 
-**Do not let the user's local allow-rules silently pre-approve.** The CLI's own warning is explicit:
-allow rules from settings files and bare names in `--allowedTools` are applied *before* the
-permission callback and are invisible to it. So an `ask_first` Giskard thread could execute a command
-without ever asking, purely because `~/.claude/settings.json` allows it.
+### 8.3 Settings sources
 
-**Decision: children run with `--setting-sources user`.** The user's own
-`~/.claude/settings.json` applies; the project and local scopes do not. This mirrors how Giskard
-already treats Codex, whose adapter reads the user's `~/.codex` configuration for
-`sandbox_workspace_write.writable_roots` — the machine's owner configures their agent where they
-already configure it, and Giskard does not grow a parallel setting for the same thing. It also answers
-where extra writable roots come from (§3.5, open question 2) with no Giskard-side surface at all.
+**Decision: children run with `--setting-sources user`.** The user's own `~/.claude/settings.json`
+applies; the project and local scopes do not.
 
-**The accepted cost, stated plainly.** User-scope `permissions.allow` rules are evaluated *before*
-`can_use_tool`, so a user who has allowed something for their own CLI use gets it pre-approved inside
-Giskard too — an `ask_first` thread can then execute that command without asking. This was observed
-directly: the first probe in this investigation saw no ask at all because the surrounding environment's
-settings already allowed `Bash`. `ask_first` therefore means "ask unless *you* have already said
-otherwise", not "ask always".
+The principle is the one Giskard already applies to Codex, whose adapter reads the user's `~/.codex`
+configuration for `sandbox_workspace_write.writable_roots`: the machine's owner configures their agent
+where they already configure it, and Giskard does not grow a parallel setting for the same thing. It
+answers where extra writable roots come from with no Giskard-side surface at all (§3.5).
 
-That is a coherent contract for a single-user, self-hosted tool — it is the user's machine and the
-user's rules — but it is weaker than Codex's, where the adapter takes one field from the user's config
-and Giskard's preset still drives every approval decision. Two consequences follow:
+It goes further than the Codex adapter, though, and the difference is the cost of the decision. Codex's
+adapter takes *one field* and Giskard's preset still drives every approval; loading the user scope here
+adopts their whole permission surface, including `permissions.allow`. Those rules are evaluated
+**before** `can_use_tool`, so a command the user allowed for their own CLI use is pre-approved inside
+Giskard too, and an `ask_first` thread will run it without asking. `ask_first` therefore means "ask
+unless you have already said otherwise", not "ask always".
 
-- the preset descriptions in the UI should not promise more than this;
+For a single-user tool on the user's own machine that is a coherent contract, but it has two
+consequences worth carrying:
+
+- the preset descriptions in the UI must not promise more than this;
 - the hook route (§9.4) is the only mechanism that would let a user keep their personal rules *and*
   have `ask_first` be absolute, which raises its value relative to when it was postponed.
 
-**Excluded on purpose: `project` and `local` scopes.** A repository is untrusted input, and those two
-scopes are the ones a repository can carry:
+**`project` and `local` scopes stay excluded**, because those are the two a checkout can carry, and a
+repository is untrusted input. Extending to them is a separate decision needing at least these answers:
 
-Extending to them is a separate decision that must not be taken without answering, at minimum:
-
-- **The agent can write the file it is governed by.** `.claude/settings.json` lives inside the
-  workspace the agent has write access to, so enabling project settings creates a path where an agent
-  grants itself permissions by editing a file. Needs answering: does Claude Code re-read settings
-  within a running session or only at startup; does a rule written during a turn take effect in that
-  turn, the next turn, or the next thread; and can Giskard's presets be made to win regardless.
-- **A repository is untrusted input.** A cloned repo can ship a permissive `.claude/settings.json`, and
-  Claude Code's own defence against this — the workspace trust dialog — is documented as **skipped in
-  non-interactive mode**, which is the only mode Giskard uses. Enabling project settings would adopt a
-  stranger's permission rules with no prompt anywhere in the flow.
-- **Per-thread worktrees multiply it.** Each worktree carries its own copy of the file, so "which
-  settings are in force" becomes per-thread rather than per-project.
+- **The agent can write the file that governs it.** `.claude/settings.json` lives inside the workspace
+  the agent may edit, so enabling project settings creates a path to self-granted permissions. Unknown:
+  whether Claude Code re-reads settings within a running session or only at startup; whether a rule
+  written during a turn takes effect in that turn, the next, or the next thread; and whether Giskard's
+  presets can be made to win regardless.
+- **A cloned repository can ship permissive rules**, and Claude Code's own defence — the workspace trust
+  dialog — is documented as skipped in non-interactive mode, the only mode Giskard uses. Nothing in the
+  flow would prompt.
+- **Per-thread worktrees multiply it.** Each worktree carries its own copy, so "which settings are in
+  force" becomes per-thread rather than per-project.
 
 Until those are answered, `user` is the boundary: configuration the machine's owner wrote applies,
 configuration that arrived with a checkout does not.
@@ -615,8 +621,8 @@ Two findings from the round trip:
 
 - **Settings allow-rules pre-empt the callback.** With the surrounding environment's settings loaded,
   the same probe auto-approved the command and no ask was ever emitted; it took `--setting-sources ""`
-  to see the ask at all. Under the chosen `user` scope (§8) this is an accepted limit of `ask_first`,
-  not a defect — but it is why the preset cannot be described as "always asks".
+  to see the ask at all. Under the chosen `user` scope this is an accepted limit
+  of `ask_first` rather than a defect (§8.3).
 - **`permission_suggestions` is typed and carries a `destination`**, which decides whether a granted
   rule is remembered for the session or written to a settings file. Giskard always uses `session`
   (§9.3).
@@ -728,9 +734,9 @@ later, against a working harness, and it is a refactor rather than an addition.
 **Why it is on the table at all.** The stdio route has one structural weakness, and it is not a
 protocol defect but an ordering one: `can_use_tool` is consulted *last*. Deny rules, ask rules, the
 permission mode, and allow rules — including allow rules from the user's own `settings.json` — are all
-evaluated first, and anything they approve never reaches the callback. That is the §8 hazard: an
+evaluated first, and anything they approve never reaches the callback. That is the §8.3 hazard: an
 `ask_first` thread can execute a command without asking, because the user once allowed it in their own
-`~/.claude/settings.json`. Since the MVP deliberately loads that file (§8), this is not hypothetical —
+`~/.claude/settings.json`. Since the MVP deliberately loads that file (§8.3), this is not hypothetical —
 it is the accepted cost of the settings decision. A hook is the only route that removes it without also
 discarding the user's configuration: hooks run before every other step, and a hook's deny stands even in
 `bypassPermissions`.
@@ -752,7 +758,7 @@ discarding the user's configuration: hooks run before every other step, and a ho
    what the hook passes through. Giskard must not raise two approval cards for one tool call, so
    `tool_use_id` becomes the deduplication key across two independent transports.
 
-Adopting it would also let `ask_first` become absolute *without* reverting the §8 decision — the user
+Adopting it would also let `ask_first` become absolute *without* reverting the §8.3 decision — the user
 keeps their `settings.json` and Giskard stops being pre-empted by it. That combination is the strongest
 argument for eventually taking this route.
 
@@ -761,7 +767,7 @@ argument for eventually taking this route.
 answering `{"behavior":"allow"|"deny"}` on stdout) is the same shape as hook → Giskard → browser.
 
 **Trigger for revisiting:** the first time an `ask_first` thread executes something the user expected to
-be asked about. Under §8 that is a foreseeable report rather than a surprise, so the trigger is less
+be asked about. Under §8.3 that is a foreseeable report rather than a surprise, so the trigger is less
 "if" than "when someone minds".
 
 ---
@@ -773,7 +779,7 @@ MCP reload and OAuth; `terminate_command`; linked
 sub-agent child threads; idle process reaping; `sdkMcpServers`; **hook-based approval enforcement**
 — the stdio channel is the MVP's only approval path, with the hook route deferred to a later decision
 and refactor (§9.4); and **honouring a repository's own `.claude/settings.json`** — the `project` and
-`local` settings scopes stay excluded, gated on the security review in §8, while the user scope is
+`local` settings scopes stay excluded, gated on the security review in §8.3, while the user scope is
 loaded.
 
 ---
@@ -879,13 +885,13 @@ Codex adapter's identifier/lifecycle contract.
 | Risk | Mitigation |
 | --- | --- |
 | Giskard owns unversioned wire types; Claude Code ships often | Pin a tested version, log `claude_code_version`, warn on drift, keep the mapper tolerant of unknown message types (log at `debug`, never fail a turn) |
-| User settings allow-rules pre-empt `ask_first` — **observed**, and now **accepted** by the §8 decision | Not mitigated by design: the UI wording must match what the preset actually promises, and the hook route (§9.4) is the only fix that keeps the user's settings *and* an absolute `ask_first` |
+| User settings allow-rules pre-empt `ask_first` — **observed**, and now **accepted** by the §8.3 decision | Not mitigated by design: the UI wording must match what the preset actually promises, and the hook route (§9.4) is the only fix that keeps the user's settings *and* an absolute `ask_first` |
 | One process per loaded thread, **measured at 440–530 MB RSS** | MVP accepts the cost and logs the live-child count so growth is visible; reaping in Phase 5. At the spec's ~10-thread scale this is gigabytes, so it is a capacity question, not a detail |
 | Cross-harness model switch loses agent context | Explicit confirm + `Notice` + remembered native ids (§5.5) |
 | Cost/quota semantics differ under a subscription | Treat euro cost as notional; surface `rate_limit_event` (§6) |
 | Registry re-keying touches approval/interrupt/delete routing | Phase 1 lands it separately from any adapter work and proves it with two replay harnesses, so a regression there cannot be confused with a protocol bug |
-| `full_access` fails to start when the server process runs as root (§8) | Outside the documented setup, but the raw failure is an opaque spawn error: detect the refusal and surface its cause |
-| A checkout carries permission rules Giskard would otherwise honour | `project` and `local` scopes stay excluded (§8); only the machine owner's user-scope file is loaded |
+| `full_access` fails to start when the server process runs as root (§8.1) | Outside the documented setup, but the raw failure is an opaque spawn error: detect the refusal and surface its cause |
+| A checkout carries permission rules Giskard would otherwise honour | `project` and `local` scopes stay excluded (§8.3); only the machine owner's user-scope file is loaded |
 
 ---
 
