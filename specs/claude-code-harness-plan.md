@@ -359,16 +359,18 @@ Generalize the wording from "Codex" to "the active harness" and add:
 | --- | --- | --- |
 | `ask_first` | `default` | **verified** — this is the mode the §9.2 round trip ran in: no auto-approvals, unmatched calls reach `can_use_tool`. (`manual` is accepted on the command line but `system/init` reports it back as `default`, so use `default` and avoid the discrepancy.) |
 | `auto_approve` | `acceptEdits` | file edits and filesystem commands inside the workspace proceed; other escalations still ask |
-| `full_access` | `bypassPermissions` | `can_use_tool` is never consulted in this mode. **Refuses to start as root** — see below |
+| `full_access` | `bypassPermissions` | `can_use_tool` is never consulted in this mode. Refuses to start if the server process is running as root — see below |
 
-**`full_access` cannot be assumed available.** Launching with `--permission-mode bypassPermissions`
-exits non-zero with `--dangerously-skip-permissions cannot be used with root/sudo privileges for
-security reasons`. Giskard is a self-hosted single-user app that is quite often run as root in a
-container, so this is a live failure mode, not an edge case: on such a host, selecting Full Access
-would fail to start the child at all. The adapter must detect the refusal at spawn and surface a
-browser-visible error naming the cause ("Full Access is unavailable when the server runs as root"),
-rather than reporting a generic spawn failure. Whether Giskard should also hide or disable the preset
-on such a host is a UI question for Phase 4.
+**`full_access` depends on the identity of the server process.** Launching with
+`--permission-mode bypassPermissions` exits non-zero with `--dangerously-skip-permissions cannot be
+used with root/sudo privileges for security reasons`. Observed while probing from a root shell; it is a
+property of the effective uid, not of Giskard.
+
+This should not arise in the documented setup: Giskard runs as the user whose `$HOME` holds the data
+directory and whose harness credentials the child inherits (spec §12.2), and that user is not root. It
+is recorded because the failure is a non-obvious spawn error rather than a permission message, so the
+adapter should detect the refusal and surface the cause instead of a generic spawn failure — the same
+treatment any other unusable preset gets.
 
 **Plan mode collapses the orthogonality.** In Codex, Plan/Build is collaboration mode only and is
 orthogonal to the preset (spec §9.1). In Claude Code, `plan` *is* a permission mode, so Plan + preset
@@ -777,7 +779,7 @@ Codex adapter's identifier/lifecycle contract.
 | Cross-harness model switch loses agent context | Explicit confirm + `Notice` + remembered native ids (§5.5) |
 | Cost/quota semantics differ under a subscription | Treat euro cost as notional; surface `rate_limit_event` (§6) |
 | Registry re-keying touches approval/interrupt/delete routing | Phase 1 lands it separately from any adapter work and proves it with two replay harnesses, so a regression there cannot be confused with a protocol bug |
-| `full_access` is unavailable when the server runs as root — **observed** (§8) | Detect the spawn refusal and surface a browser-visible cause; decide in Phase 4 whether to hide the preset on such a host |
+| `full_access` fails to start when the server process runs as root (§8) | Outside the documented setup, but the raw failure is an opaque spawn error: detect the refusal and surface its cause |
 | Claude Code auto-approves through a mode or rule before `can_use_tool` is consulted | Presets pin the mode explicitly and `--setting-sources ""` removes rule sources; the ordering itself is only fixable by the hook route (§9.4) |
 
 ---
