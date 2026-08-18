@@ -224,6 +224,43 @@ provider→harness lookup without changing it, but means the provider must be re
 cannot change within a live child. Only the *model* can (§3.3). Nothing in the MVP needs this; it is
 recorded so the provider field is not mistaken for something the protocol carries.
 
+### 3.6 User attachments
+
+Giskard's `UserInput::Text` carries `Vec<UserAttachment>` (`name`, `mime_type`, `size`,
+`kind: Image | File`, `data_base64`), so the adapter has to put them somewhere. Claude Code accepts
+them **inline in the user message**, as Anthropic content blocks alongside the text block — verified
+with tools disabled, so the answers could only have come from the attachment:
+
+| Attachment | Block | Result |
+| --- | --- | --- |
+| PNG image | `{"type":"image","source":{"type":"base64","media_type":"image/png","data":…}}` | described the image correctly |
+| PDF | `{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":…}}` | read text out of the document |
+| Plain text | `{"type":"document","source":{"type":"text","media_type":"text/plain","data":…}}` | read the file's contents |
+
+**The encoding differs by type, and getting it wrong fails at the API rather than at the CLI.** A text
+document sent as `source.type: "base64"` came back as `API Error: a document in the conversation could
+not be processed and was removed`. Since `UserAttachment` always stores `data_base64`, the adapter must
+**decode text attachments back to a string** and pass `source.type: "text"`, while images and PDFs keep
+their base64.
+
+This is markedly simpler than the Codex path, which uploads non-image files to the harness host with
+`fs/createDirectory` + `fs/writeFile`, appends the host path to the prompt, and then has to clean the
+upload directory up on turn end, stream loss, failed start, and shutdown. None of that is needed here:
+no temp directory, no cleanup, nothing to leak.
+
+Two limits to respect:
+
+- **Inline attachments consume context**, and the underlying API bounds document and image size. Large
+  files should be rejected with a clear message rather than silently truncated. The exact thresholds
+  are not pinned down here.
+- **Other file types** (`.docx`, archives, binaries) have no inline representation. The fallback is the
+  Codex-shaped one — write the file into the workspace and name the path in the prompt, letting the
+  agent's own `Read` tool open it — but that requires a writable location and cleanup, so v1 may simply
+  decline them with a message. [unverified]
+
+Giskard's existing rule that raw attachment bytes stay out of persisted history and the in-memory
+history cache applies unchanged: `UserInput`'s serializer already drops `data_base64`.
+
 ---
 
 ## 4. Capability matrix
@@ -850,7 +887,8 @@ asserting that turns, approvals, interrupts and deletion each reach the right in
 New crate + README. Wire types, child supervisor, mapper
 (`assistant`/`stream_event`/`user`/`result` → items and turns), `open_thread`/`start_turn`/
 `subscribe`/`interrupt`/`shutdown`, **`can_use_tool` ↔ `ApprovalRequested` with the §9 decision
-mapping**, token usage, `ContextWindowUpdated`, static `list_models`, capability set from §4. Mapper
+mapping**, user attachments as inline content blocks (§3.6), token usage, `ContextWindowUpdated`,
+static `list_models`, capability set from §4. Mapper
 unit tests off Phase-0 fixtures, including a denial that must not be reported as an executed-and-failed
 tool call.
 
