@@ -109,6 +109,16 @@ Client → CLI, as `{"type":"control_request","request_id":…,"request":{…}}`
   applied mode (`{"mode":"plan"}`). Note the CLI **re-emits `system/init`** after a model change, so
   the adapter must treat `init` as a repeatable announcement, not a one-shot handshake, and re-read
   the effective model from it.
+- `apply_flag_settings` (`{subtype:"apply_flag_settings", settings:{…}}`) — the general session-settings
+  channel, carrying `effortLevel`, `ultracode`, `model`, `fastMode`, `advisorModel`, `viewMode`.
+  **Verified for effort:** a child started with `--effort low` reported `effort: "low"`, accepted
+  `{settings:{effortLevel:"high"}}`, and then reported `effort: "high"` — so reasoning effort is
+  changeable mid-session exactly as the model is. **Invalid values fail silently**: `effortLevel:
+  "banana"` was answered `success`, left the previous value in place, and produced no error anywhere
+  the client can see.
+- `get_settings` — returns `{applied, effective, sources}`, where `applied` carries the session's live
+  `model`, `effort` and `ultracode`. This is the read-back channel for anything set through
+  `apply_flag_settings`, and the only way to confirm an effort change actually landed.
 - `control_cancel_request` — cancels an in-flight control request.
 
 CLI → client:
@@ -223,7 +233,7 @@ recorded so the provider field is not mistaken for something the protocol carrie
 | `live_approvals` | **true (verified)** | `can_use_tool` control request; response `{behavior:"allow",updatedInput?,updatedPermissions?}` \| `{behavior:"deny",message?,interrupt?}`. Round trip and blocked execution confirmed — §9. |
 | `plan_build_modes` | **true (verified)** | `--permission-mode plan` + `set_permission_mode`, which echoes the applied mode. Semantics differ — see §8. |
 | `per_turn_model` | **true (verified)** | `set_model` mid-session, no respawn (§3.3) |
-| `reasoning_effort` | **true**, with a caveat | `--effort low\|medium\|high\|xhigh\|max`; accepted without error, but **not echoed anywhere in the stream** — unlike the model, there is no way to confirm the effective effort, so Giskard displays what it requested. `Effort` is already an open string newtype, so the differing value set costs nothing |
+| `reasoning_effort` | **true (verified), and dynamic** | `--effort low\|medium\|high\|xhigh\|max` at spawn, then `apply_flag_settings{effortLevel}` mid-session — verified to change `low` → `high` on a live child, and confirmable through `get_settings.applied.effort` (§3.3). An unknown value is accepted and ignored silently, so the adapter validates against the catalog and may read back. `Effort` is already an open string newtype, so the differing value set costs nothing |
 | `structured_diffs` | **false (v1)** | no native diff feed |
 | `resumable_threads` | **true (verified)** | a fresh process launched with `--resume=<uuid>` recovered the earlier conversation's content and kept the same session id (no fork). cwd-scoped — §2 |
 | `model_listing` | **true (static)** | no RPC; adapter returns a built-in catalog of Claude models |
@@ -846,8 +856,10 @@ tool call.
 
 ### Phase 3 — the rest of the control channel
 
-`set_model` / `set_permission_mode` (per-turn model and
-mode without respawning), elicitation / `request_user_dialog` → `ServerRequestReceived`,
+`set_model`, `set_permission_mode` and
+`apply_flag_settings{effortLevel}` — per-turn model, mode and reasoning effort with no respawn, which
+together make `TurnOverrides` fully supported — elicitation / `request_user_dialog` →
+`ServerRequestReceived`,
 `rate_limit_event` → `Notice`, `/compact`, `AcceptForSession` via session-destination
 `updatedPermissions`.
 
