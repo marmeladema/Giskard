@@ -12,5 +12,11 @@
 # value here means it already exists before the process has any threads, and the test only reads it.
 #
 # Cargo does not override a variable that is already set, so exporting your own value still wins.
+#
+# The two below are for `crates/giskard-harness`, which vets an environment-supplied key the same
+# way it vets a command's stdout. They exist for the same reason and under the same rule: a test
+# cannot create them itself. One is padded, one is unusable; both are read, never written.
 [env]
 GISKARD_TEST_DISCOVERY_KEY = "secret-key"
+GISKARD_TEST_PADDED_KEY = "  padded-key\n"
+GISKARD_TEST_UNUSABLE_KEY = "two\nlines"

@@ -1,10 +1,12 @@
 //! The `AgentHarness` abstraction — the keystone of the harness-agnostic design (spec §4).
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use tokio::sync::broadcast;
+use tracing::{debug, warn};
 
 use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
@@ -54,9 +56,9 @@ pub struct HarnessCapabilities {
 /// the harness's own configuration and are read back through [`AgentHarness::list_providers`]
 /// rather than restated in `config.toml`.
 ///
-/// Deliberately carries the *name* of the environment variable holding the key, never the key
-/// itself: a harness config may hold an inline secret, and copying it into Giskard would spread it
-/// across another process's memory and logs for no benefit.
+/// Deliberately carries *where the key comes from*, never the key itself: a harness config may
+/// hold an inline secret, and copying it into Giskard would spread it across another process's
+/// memory and logs for no benefit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessProvider {
     /// Routing id. A Giskard `[providers.<id>]` key must match one of these to be reachable.
@@ -65,17 +67,222 @@ pub struct HarnessProvider {
     pub name: Option<String>,
     /// OpenAI-compatible base URL, used for Giskard's own `/v1/models` discovery (§8.3).
     pub base_url: Option<String>,
-    /// Environment variable holding this provider's API key, when the harness names one.
-    pub api_key_env: Option<String>,
+    /// Where this provider's discovery key comes from, when the harness names a source.
+    pub auth: Option<ProviderAuth>,
+}
+
+/// Where a provider's discovery key comes from.
+///
+/// One variant or none, never both: Codex's own `ModelProviderInfo::validate` rejects a provider
+/// that declares `auth` alongside `env_key`, so the two sources are mutually exclusive upstream and
+/// an enum is the honest shape rather than two optional fields that could disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderAuth {
+    /// The key is the value of this environment variable.
+    Env(String),
+    /// The key is whatever this command prints to stdout.
+    Command(ProviderAuthCommand),
+}
+
+/// A command whose stdout is a provider's bearer token (Codex's `[model_providers.<id>.auth]`).
+///
+/// Giskard runs this itself when composing a project's model list, because `/v1/models` discovery
+/// is Giskard's own HTTP request rather than one the harness makes. That means executing a command
+/// named in the harness's config file — the same file that already tells Giskard which endpoint to
+/// call, and the same command the harness runs on every turn, so this widens *when* it runs rather
+/// than *whether* it does.
+///
+/// It is worth being precise about where that config can come from, since opening a project points
+/// the harness at a directory: for Codex, provider tables are read only from the user-level,
+/// packaged-default, and enterprise-managed layers. `model_providers` sits on Codex's
+/// project-local denylist, so a `.codex/config.toml` committed to a cloned repository cannot
+/// introduce a provider — and therefore cannot introduce a command to run. A harness that does not
+/// hold that line should not report `ProviderAuth::Command`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderAuthCommand {
+    /// Program to run. A bare name resolves via `PATH`; a relative path resolves against `cwd`.
+    pub command: String,
+    pub args: Vec<String>,
+    /// Working directory, when the harness names one.
+    pub cwd: Option<PathBuf>,
+    /// How long to wait for the command before giving up.
+    pub timeout: Duration,
+}
+
+/// A provider's key source that could not produce a usable token.
+///
+/// Distinct from "no key configured", which is not an error: an unset environment variable leaves
+/// discovery to try unauthenticated. This is the source being *present and broken* — a command that
+/// fails, or a value that cannot be sent.
+///
+/// `origin` names which one, phrased to read as the subject of `reason`, because a provider has two
+/// and a message blaming the wrong one sends the user to the wrong place.
+#[derive(Debug, thiserror::Error)]
+#[error("{origin} {reason}")]
+pub struct ProviderAuthError {
+    /// Named `origin` rather than `source`, which `thiserror` reserves for a nested error.
+    pub origin: String,
+    pub reason: String,
+}
+
+impl ProviderAuthError {
+    fn command(command: &str, reason: impl Into<String>) -> Self {
+        Self {
+            origin: format!("auth command `{command}`"),
+            reason: reason.into(),
+        }
+    }
+
+    fn env(var: &str, reason: impl Into<String>) -> Self {
+        Self {
+            origin: format!("environment variable ${var}"),
+            reason: reason.into(),
+        }
+    }
 }
 
 impl HarnessProvider {
-    /// Resolve the discovery API key from the environment variable this provider names. Empty
-    /// values are treated as unset.
-    pub fn resolve_api_key(&self) -> Option<String> {
-        let var = self.api_key_env.as_deref()?;
-        std::env::var(var).ok().filter(|value| !value.is_empty())
+    /// Resolve the discovery API key from whichever source this provider names.
+    ///
+    /// `Ok(None)` covers both "no source" and an environment variable that is unset or empty —
+    /// discovery then tries unauthenticated, which is what it did before any of this existed. A
+    /// command that fails, times out, or prints nothing is `Err`, so the caller can say what went
+    /// wrong instead of reporting the 401 that would follow.
+    ///
+    /// The token is recomputed on each call. Codex caches it with a refresh interval; discovery
+    /// runs when a project's model list is composed, which is rare enough that a cache would mostly
+    /// hold a stale token.
+    pub async fn resolve_api_key(&self) -> Result<Option<String>, ProviderAuthError> {
+        match self.auth.as_ref() {
+            None => Ok(None),
+            // An unset variable and one holding only whitespace mean the same thing.
+            Some(ProviderAuth::Env(var)) => match std::env::var(var).ok() {
+                None => Ok(None),
+                Some(value) => usable_token(value.trim()).map_err(|tail| {
+                    ProviderAuthError::env(var, format!("holds a value that {tail}"))
+                }),
+            },
+            Some(ProviderAuth::Command(auth)) => run_auth_command(auth).await.map(Some),
+        }
     }
+}
+
+/// Vet a candidate token, whichever source produced it.
+///
+/// `Ok(None)` is "there is no token here". `Err` carries why a non-empty one is unusable: it goes
+/// out verbatim in an `Authorization` header, which cannot hold control characters or non-ASCII, so
+/// letting it through would surface as an opaque HTTP-client "builder error" that reads as if the
+/// provider were unreachable — from either source, which is why both go through here.
+fn usable_token(candidate: &str) -> Result<Option<String>, &'static str> {
+    if candidate.is_empty() {
+        return Ok(None);
+    }
+    if candidate.bytes().any(|b| !(0x20..=0x7e).contains(&b)) {
+        return Err("is not plain visible ASCII, so it cannot be sent in an Authorization header");
+    }
+    Ok(Some(candidate.to_string()))
+}
+
+/// How much of a failing command's stderr is worth repeating.
+const MAX_AUTH_STDERR: usize = 400;
+
+/// The command's stderr, trimmed and bounded, or `None` when it said nothing.
+fn truncated_stderr(stderr: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stderr);
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let Some((cut, _)) = text.char_indices().nth(MAX_AUTH_STDERR) else {
+        return Some(text.to_string());
+    };
+    Some(format!("{}…", &text[..cut]))
+}
+
+async fn run_auth_command(auth: &ProviderAuthCommand) -> Result<String, ProviderAuthError> {
+    // The arguments are not logged: they are a credential helper's invocation, and a helper that
+    // takes its secret as an argument would otherwise put it in the log. The count is enough to
+    // tell one configured provider's command from another.
+    debug!(
+        action = "provider_auth_command",
+        command = %auth.command,
+        args = auth.args.len(),
+        timeout_ms = auth.timeout.as_millis(),
+        "running provider auth command"
+    );
+    let started = std::time::Instant::now();
+    let mut command = tokio::process::Command::new(&auth.command);
+    command
+        .args(&auth.args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // Without this a command that ignores the timeout outlives the request that wanted it.
+        .kill_on_drop(true);
+    if let Some(cwd) = &auth.cwd {
+        command.current_dir(cwd);
+    }
+
+    let output = tokio::time::timeout(auth.timeout, command.output())
+        .await
+        .map_err(|_| {
+            // Logged here as well as returned: the caller reports the failure against a provider,
+            // but only this boundary knows the command sat for the whole budget rather than
+            // failing fast, which is what a hanging helper looks like.
+            warn!(
+                action = "provider_auth_command",
+                command = %auth.command,
+                timeout_ms = auth.timeout.as_millis(),
+                "provider auth command timed out"
+            );
+            ProviderAuthError::command(
+                &auth.command,
+                format!("timed out after {} ms", auth.timeout.as_millis()),
+            )
+        })?
+        .map_err(|e| ProviderAuthError::command(&auth.command, format!("failed to start: {e}")))?;
+
+    if !output.status.success() {
+        // stderr is the command's own diagnostic and the only clue to why it refused, so it is
+        // quoted back the way Codex quotes it. The token itself is on stdout and never is. Bounded
+        // because this reaches both a log line and an API response, and a chatty helper should not
+        // decide how big either gets.
+        let detail = match truncated_stderr(&output.stderr) {
+            Some(stderr) => format!(": {stderr}"),
+            None => String::new(),
+        };
+        return Err(ProviderAuthError::command(
+            &auth.command,
+            format!("exited with {}{detail}", output.status),
+        ));
+    }
+
+    let token = String::from_utf8(output.stdout)
+        .map_err(|_| ProviderAuthError::command(&auth.command, "wrote non-UTF-8 data to stdout"))?
+        .trim()
+        .to_string();
+    let token = match usable_token(&token) {
+        Ok(Some(token)) => token,
+        Ok(None) => {
+            return Err(ProviderAuthError::command(
+                &auth.command,
+                "produced an empty token",
+            ));
+        }
+        Err(tail) => {
+            return Err(ProviderAuthError::command(
+                &auth.command,
+                format!("produced a token that {tail}; it should print the token and nothing else"),
+            ));
+        }
+    };
+    debug!(
+        action = "provider_auth_command",
+        command = %auth.command,
+        elapsed_ms = started.elapsed().as_millis(),
+        "provider auth command produced a token"
+    );
+    Ok(token)
 }
 
 /// Options for opening (or resuming) a thread.
@@ -313,4 +520,210 @@ pub trait AgentHarness: Send + Sync {
     /// Takes `&self` (not `self: Arc<Self>`) so the trait stays object-safe.
     /// Idempotent: implementations perform teardown once and treat further calls as no-ops.
     async fn shutdown(&self) -> Result<(), HarnessError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn command_provider(args: &[&str], timeout: Duration) -> HarnessProvider {
+        HarnessProvider {
+            id: "opencodex".into(),
+            name: None,
+            base_url: None,
+            auth: Some(ProviderAuth::Command(ProviderAuthCommand {
+                command: "sh".into(),
+                args: args.iter().map(|a| (*a).to_string()).collect(),
+                cwd: None,
+                timeout,
+            })),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_command_token_is_its_trimmed_stdout() {
+        let provider = command_provider(&["-c", "echo  spaced-token  "], Duration::from_secs(5));
+        assert_eq!(
+            provider.resolve_api_key().await.unwrap(),
+            Some("spaced-token".to_string()),
+            "surrounding whitespace and the trailing newline are not part of the token"
+        );
+    }
+
+    /// Only stdout is the token. A command that chats on stderr and still succeeds is fine.
+    #[tokio::test]
+    async fn stderr_is_not_part_of_the_token() {
+        let provider = command_provider(
+            &["-c", "echo noise >&2; printf %s real-token"],
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            provider.resolve_api_key().await.unwrap(),
+            Some("real-token".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_command_that_prints_nothing_is_an_error() {
+        let provider = command_provider(&["-c", "true"], Duration::from_secs(5));
+        let err = provider
+            .resolve_api_key()
+            .await
+            .expect_err("an empty token is not a token");
+        assert!(err.to_string().contains("empty token"), "{err}");
+    }
+
+    /// A helper that prints the token plus a stray line cannot go in a header. Reporting it against
+    /// the command beats the HTTP client's opaque "builder error", which reads as if the provider
+    /// were unreachable. Only the interior matters — `trim` has already taken the edges off.
+    #[tokio::test]
+    async fn a_token_that_cannot_be_a_header_value_is_an_error() {
+        for script in [
+            r"printf 'tok\nnoise'",
+            r"printf 'tok\ttab'",
+            "printf 'tok\u{e9}n'",
+        ] {
+            let provider = command_provider(&["-c", script], Duration::from_secs(5));
+            let err = provider
+                .resolve_api_key()
+                .await
+                .expect_err("a token that cannot be a header value is not usable")
+                .to_string();
+            assert!(
+                err.contains("visible ASCII"),
+                "{script:?} should be rejected: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_command_reports_its_status_and_stderr() {
+        let provider = command_provider(
+            &["-c", "echo vault locked >&2; exit 7"],
+            Duration::from_secs(5),
+        );
+        let err = provider
+            .resolve_api_key()
+            .await
+            .expect_err("exit 7 is a failure");
+        let message = err.to_string();
+        assert!(
+            message.contains("vault locked"),
+            "stderr should be quoted: {message}"
+        );
+        assert!(
+            message.contains('7'),
+            "the exit status should be named: {message}"
+        );
+    }
+
+    /// A chatty helper should not decide how long a warning or a log line gets.
+    #[tokio::test]
+    async fn a_flood_of_stderr_is_bounded() {
+        let provider = command_provider(
+            &["-c", "printf 'x%.0s' $(seq 1 5000) >&2; exit 1"],
+            Duration::from_secs(5),
+        );
+        let message = provider
+            .resolve_api_key()
+            .await
+            .expect_err("exit 1 is a failure")
+            .to_string();
+        assert!(message.ends_with('…'), "output should be cut: {message}");
+        assert!(
+            message.len() < 600,
+            "the whole 5000-char flood should not be repeated (len {})",
+            message.len()
+        );
+    }
+
+    /// A command that hangs must not hang discovery with it.
+    #[tokio::test]
+    async fn a_hanging_command_times_out() {
+        let provider = command_provider(&["-c", "sleep 30"], Duration::from_millis(150));
+        let err = provider
+            .resolve_api_key()
+            .await
+            .expect_err("the command outlives its timeout");
+        assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_command_that_does_not_exist_reports_that() {
+        let mut provider = command_provider(&[], Duration::from_secs(5));
+        provider.auth = Some(ProviderAuth::Command(ProviderAuthCommand {
+            command: "giskard-no-such-program".into(),
+            args: Vec::new(),
+            cwd: None,
+            timeout: Duration::from_secs(5),
+        }));
+        let err = provider
+            .resolve_api_key()
+            .await
+            .expect_err("a missing program cannot produce a token");
+        assert!(err.to_string().contains("failed to start"), "{err}");
+    }
+
+    fn env_provider(var: &str) -> HarnessProvider {
+        HarnessProvider {
+            id: "litellm".into(),
+            name: None,
+            base_url: None,
+            auth: Some(ProviderAuth::Env(var.into())),
+        }
+    }
+
+    /// An environment-supplied key gets the same treatment as a command's stdout: a variable set
+    /// from a file or a here-doc routinely carries a trailing newline, and that is not part of it.
+    #[tokio::test]
+    async fn an_env_key_is_trimmed() {
+        // Supplied by `.cargo/config.toml`; a test cannot set one without racing every other reader.
+        let provider = env_provider("GISKARD_TEST_PADDED_KEY");
+        assert_eq!(
+            provider.resolve_api_key().await.unwrap(),
+            Some("padded-key".to_string())
+        );
+    }
+
+    /// And the same vetting: an interior newline cannot go in a header from either source. The
+    /// message has to name the variable, not a command the provider does not have.
+    #[tokio::test]
+    async fn an_env_key_that_cannot_be_a_header_value_names_the_variable() {
+        let provider = env_provider("GISKARD_TEST_UNUSABLE_KEY");
+        let err = provider
+            .resolve_api_key()
+            .await
+            .expect_err("a value with an interior newline cannot be sent")
+            .to_string();
+        assert!(
+            err.contains("environment variable $GISKARD_TEST_UNUSABLE_KEY"),
+            "the variable should be named: {err}"
+        );
+        assert!(err.contains("visible ASCII"), "{err}");
+        assert!(
+            !err.contains("command"),
+            "an env-backed provider has no command to blame: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unset_env_var_is_absence_rather_than_failure() {
+        let provider = env_provider("GISKARD_DEFINITELY_UNSET_KEY");
+        assert_eq!(
+            provider.resolve_api_key().await.unwrap(),
+            None,
+            "discovery still tries unauthenticated when no key is in the environment"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_naming_no_source_has_no_key() {
+        let provider = HarnessProvider {
+            id: "openai".into(),
+            name: None,
+            base_url: None,
+            auth: None,
+        };
+        assert_eq!(provider.resolve_api_key().await.unwrap(), None);
+    }
 }

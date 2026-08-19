@@ -2383,10 +2383,25 @@ user to restate them. Restating them is not merely redundant: two copies of an e
 and the copy Giskard holds is not the one that routes turns. A harness that cannot introspect its
 own configuration reports nothing, and Giskard falls back to the declared list alone.
 
-Only the **name** of an environment variable holding a key is read, never an inline secret. A
-harness may hold one (Codex's `experimental_bearer_token`), but copying it into Giskard would
-spread a credential into another process's memory and logs to no end; discovery against such a
-provider requires the env-var form instead.
+Only the **location** of a key is read, never an inline secret. A harness reports either the name
+of an environment variable holding it, or a command whose stdout is the token (Codex's
+`[model_providers.<id>.auth]`), and the two are mutually exclusive — Codex rejects a provider
+declaring both. An inline secret (Codex's `experimental_bearer_token`) is not read at all: copying
+it into Giskard would spread a credential into another process's memory and logs to no end.
+
+Giskard runs that command itself, because `/v1/models` discovery is its own HTTP request rather
+than one the harness makes. A harness may only report a command it read from configuration the
+*user* controls, never from the project directory: opening a project points the harness at a
+checkout, and a command named by a file inside that checkout would run on nothing more than
+composing a model list. (Codex holds this line itself — `model_providers` is on its project-local
+denylist, so a repository's own `.codex/config.toml` cannot declare a provider at all.)
+
+The token is recomputed whenever discovery needs it rather than cached: discovery runs when a
+project's model list is composed, which is rare enough that a cache would mostly hold a stale
+token. A command that fails, times out, or prints nothing is reported as itself and the request is
+not attempted — sending it unauthenticated would bury the cause under a 401 blaming the endpoint.
+The same vetting applies to a key read from an environment variable: either source is trimmed and
+must be usable as a header value, and the failure names whichever one it came from.
 
 **Id validation.** A `[providers.<id>]` key is the routing id sent to the harness, so an id the
 harness does not know cannot route. Giskard checks the configured ids against the harness's

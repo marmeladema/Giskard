@@ -11,3 +11,4 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }

@@ -7,6 +7,7 @@
 //! `GET /api/projects/{id}/models` rather than the no-project baseline.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{Router, response::Json as AxumJson, routing::get};
 use chrono::Utc;
@@ -15,7 +16,7 @@ use giskard_core::ids::{ItemId, ProjectId, ThreadId, TurnId};
 use giskard_core::item::{Item, ItemKind, ItemPayload, ItemStart};
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnStatus, TurnStatusKind};
-use giskard_harness::{AgentHarness, HarnessProvider};
+use giskard_harness::{AgentHarness, HarnessProvider, ProviderAuth, ProviderAuthCommand};
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 use giskard_persist::store::ProjectConfig;
 use giskard_server::{AppState, HarnessFactory, build_app};
@@ -211,7 +212,7 @@ model_listing = true
                 id: "mock".into(),
                 name: Some("Mock".into()),
                 base_url: Some(format!("http://{mock_addr}")),
-                api_key_env: None,
+                auth: None,
             }],
         }),
         (0..32u8).collect(),
@@ -382,7 +383,7 @@ model_listing = true
                 id: "secured".into(),
                 name: Some("Secured".into()),
                 base_url: Some(format!("http://{mock_addr}")),
-                api_key_env: Some(KEY_ENV.into()),
+                auth: Some(ProviderAuth::Env(KEY_ENV.into())),
             }],
         }),
         (0..32u8).collect(),
@@ -470,7 +471,7 @@ model_listing = true
                 id: "secured".into(),
                 name: Some("Secured".into()),
                 base_url: Some(format!("http://{mock_addr}")),
-                api_key_env: None,
+                auth: None,
             }],
         }),
         (0..32u8).collect(),
@@ -498,10 +499,16 @@ model_listing = true
     let warnings = refreshed["warnings"].as_array().unwrap();
     assert_eq!(warnings.len(), 1, "one provider failed: {refreshed}");
     assert_eq!(warnings[0]["source"], "provider:secured");
+    let message = warnings[0]["message"].as_str().unwrap();
     assert!(
-        warnings[0]["message"].as_str().unwrap().contains("401"),
-        "warning names the status: {}",
-        warnings[0]["message"]
+        message.contains("401"),
+        "warning names the status: {message}"
+    );
+    // The hint has to match how this provider authenticates. Naming an env var here would send the
+    // user looking for a variable the harness never mentioned.
+    assert!(
+        message.contains("names no key"),
+        "warning should say the harness named no key: {message}"
     );
 }
 
@@ -546,7 +553,7 @@ session_days = 30
                 id: "openai".into(),
                 name: None,
                 base_url: None,
-                api_key_env: None,
+                auth: None,
             }],
         }),
         (0..32u8).collect(),
@@ -749,4 +756,179 @@ model_listing = true
         .map(|m| m["model"].as_str().unwrap())
         .collect();
     assert_eq!(ids, vec!["declared-only"], "the declared list still serves");
+}
+
+/// A provider whose key comes from `[model_providers.<id>.auth]` — a command Codex runs — is
+/// discoverable too: Giskard runs the command and sends its stdout as the bearer token.
+///
+/// Unlike the `env_key` case this needs nothing from the environment, so the command is the whole
+/// contract: whatever it prints (trimmed) is the token.
+#[tokio::test]
+async fn dynamic_model_refresh_runs_a_provider_auth_command() {
+    const TOKEN: &str = "token-from-command";
+    let mock = Router::new().route(
+        "/models",
+        get(|headers: axum::http::HeaderMap| async move {
+            let authorized = headers.get("authorization").and_then(|v| v.to_str().ok())
+                == Some(&*format!("Bearer {TOKEN}"));
+            let data = if authorized {
+                serde_json::json!([{ "id": "command-auth-model" }])
+            } else {
+                serde_json::json!([])
+            };
+            AxumJson(serde_json::json!({ "data": data }))
+        }),
+    );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(mock_listener, mock).await.unwrap() });
+
+    // The trailing newline `echo` adds must not reach the header: the token is trimmed.
+    let ids = discover_with_auth(
+        19214,
+        mock_addr,
+        ProviderAuth::Command(ProviderAuthCommand {
+            command: "sh".into(),
+            args: vec!["-c".into(), format!("echo {TOKEN}")],
+            cwd: None,
+            timeout: Duration::from_secs(5),
+        }),
+    )
+    .await
+    .0;
+    assert!(
+        ids.contains(&"command-auth-model".to_string()),
+        "the command's stdout should have been sent as the bearer token: {ids:?}"
+    );
+}
+
+/// A provider auth command that fails is reported as itself. Sending the request unauthenticated
+/// would bury the real cause under a 401 that blames the endpoint, so discovery does not try.
+#[tokio::test]
+async fn a_failing_provider_auth_command_is_reported() {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = hits.clone();
+    let mock = Router::new().route(
+        "/models",
+        get(move || {
+            let seen = seen.clone();
+            async move {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                AxumJson(serde_json::json!({ "data": [{ "id": "never-reached" }] }))
+            }
+        }),
+    );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(mock_listener, mock).await.unwrap() });
+
+    let (ids, warnings) = discover_with_auth(
+        19215,
+        mock_addr,
+        ProviderAuth::Command(ProviderAuthCommand {
+            command: "sh".into(),
+            args: vec!["-c".into(), "echo no-such-vault >&2; exit 3".into()],
+            cwd: None,
+            timeout: Duration::from_secs(5),
+        }),
+    )
+    .await;
+
+    assert!(
+        ids.is_empty(),
+        "a provider with no token lists nothing: {ids:?}"
+    );
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "discovery must not fall back to an unauthenticated request"
+    );
+    let joined = warnings.join(" | ");
+    for expected in ["sh", "exited with", "no-such-vault"] {
+        assert!(
+            joined.contains(expected),
+            "the warning should name the command, its status, and its stderr ({expected:?}): \
+             {joined}"
+        );
+    }
+}
+
+/// Stand up a server whose single `model_listing` provider authenticates the given way, and return
+/// the discovered model ids plus the catalog warnings.
+async fn discover_with_auth(
+    port: u16,
+    mock_addr: std::net::SocketAddr,
+    auth: ProviderAuth,
+) -> (Vec<String>, Vec<String>) {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let hash = password_hash("testpass");
+    tokio::fs::write(
+        tmp.path().join("config.toml"),
+        format!(
+            r#"
+[server]
+bind = "127.0.0.1:{port}"
+secure_cookies = false
+
+[auth]
+password_hash = "{hash}"
+session_days = 30
+
+[providers.secured]
+model_listing = true
+"#
+        ),
+    )
+    .await
+    .unwrap();
+
+    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
+    let state = AppState::new(
+        store,
+        Arc::new(DiffFactory {
+            fixture: make_fixture(),
+            imported_model: None,
+            providers: vec![HarnessProvider {
+                id: "secured".into(),
+                name: Some("Secured".into()),
+                base_url: Some(format!("http://{mock_addr}")),
+                auth: Some(auth),
+            }],
+        }),
+        (0..32u8).collect(),
+    );
+    let app = build_app(state);
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let base = format!("http://127.0.0.1:{port}");
+    let (client, cookie) = login(&base).await;
+    let project = create_project(&client, &base, &cookie).await;
+    let body: serde_json::Value = client
+        .get(format!("{base}/api/projects/{project}/models"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let ids = body["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["model"].as_str().unwrap().to_string())
+        .collect();
+    let warnings = body["warnings"]
+        .as_array()
+        .map(|w| {
+            w.iter()
+                .map(|entry| entry["message"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    (ids, warnings)
 }

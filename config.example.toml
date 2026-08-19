@@ -73,6 +73,10 @@ idle_shutdown_secs = 0
 # `amazon-bedrock-runtime`, `ollama`, `lmstudio`) or one of your `[model_providers.<id>]` entries.
 # An id Codex has never heard of is reported as a warning on the picker rather than failing later
 # with a provider-side model_not_found.
+#
+# Discovery authenticates however Codex says to: `env_key` names an environment variable, and
+# [model_providers.<id>.auth] names a command whose stdout is the bearer token — Giskard runs it
+# each time it needs one. Nothing to configure here either way.
 
 # The table is keyed by the routing id, mirroring Codex's own `[model_providers.<id>]`. Providers
 # are offered to the picker in the order declared here. An id that is not a bare TOML key — one
