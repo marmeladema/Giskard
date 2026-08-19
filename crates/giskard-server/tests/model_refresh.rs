@@ -31,6 +31,8 @@ struct DiffFactory {
     imported_model: Option<giskard_core::model::ModelRef>,
     /// The version the harness reports, sent to a provider's `/models` as `client_version`.
     client_version: Option<String>,
+    /// What the harness's own catalog (`model/list`) reports.
+    harness_models: Vec<giskard_core::model::ModelDescriptor>,
 }
 
 #[async_trait::async_trait]
@@ -52,6 +54,11 @@ impl HarnessFactory for DiffFactory {
         let harness = match &self.client_version {
             Some(version) => harness.with_client_version(version.clone()),
             None => harness,
+        };
+        let harness = if self.harness_models.is_empty() {
+            harness
+        } else {
+            harness.with_models(self.harness_models.clone())
         };
         Ok(Arc::new(harness))
     }
@@ -221,6 +228,7 @@ model_listing = true
                 auth: None,
             }],
             client_version: None,
+            harness_models: Vec::new(),
         }),
         (0..32u8).collect(),
     );
@@ -384,6 +392,7 @@ model_listing = true
             fixture: make_fixture(),
             imported_model: None,
             client_version: None,
+            harness_models: Vec::new(),
             providers: vec![HarnessProvider {
                 id: "secured".into(),
                 name: Some("Secured".into()),
@@ -470,6 +479,7 @@ model_listing = true
             fixture: make_fixture(),
             imported_model: None,
             client_version: None,
+            harness_models: Vec::new(),
             providers: vec![HarnessProvider {
                 id: "secured".into(),
                 name: Some("Secured".into()),
@@ -549,6 +559,7 @@ session_days = 30
             fixture: make_fixture(),
             imported_model: None,
             client_version: None,
+            harness_models: Vec::new(),
             // The harness knows "openai" — nothing named "typoed".
             providers: vec![HarnessProvider {
                 id: "openai".into(),
@@ -637,6 +648,7 @@ session_days = 30
             fixture: make_fixture(),
             imported_model: None,
             client_version: None,
+            harness_models: Vec::new(),
             providers: Vec::new(),
         }),
         (0..32u8).collect(),
@@ -706,6 +718,7 @@ model_listing = true
             fixture: make_fixture(),
             imported_model: None,
             client_version: None,
+            harness_models: Vec::new(),
             providers: Vec::new(),
         }),
         (0..32u8).collect(),
@@ -893,6 +906,7 @@ model_listing = true
             fixture: make_fixture(),
             imported_model: None,
             client_version: None,
+            harness_models: Vec::new(),
             providers: vec![HarnessProvider {
                 id: "secured".into(),
                 name: Some("Secured".into()),
@@ -1010,6 +1024,20 @@ async fn discover_catalog(
     mock_addr: std::net::SocketAddr,
     client_version: Option<&str>,
 ) -> (Vec<serde_json::Value>, Vec<String>) {
+    discover_catalog_with(
+        mock_addr,
+        client_version,
+        "\n[providers.opencodex]\nmodel_listing = true\n",
+    )
+    .await
+}
+
+/// As above, but the caller supplies the `[providers.*]` section — including none at all.
+async fn discover_catalog_with(
+    mock_addr: std::net::SocketAddr,
+    client_version: Option<&str>,
+    providers: &str,
+) -> (Vec<serde_json::Value>, Vec<String>) {
     let (listener, port) = ephemeral_listener().await;
     let tmp = tempfile::TempDir::new().unwrap();
     let hash = password_hash("testpass");
@@ -1024,10 +1052,7 @@ secure_cookies = false
 [auth]
 password_hash = "{hash}"
 session_days = 30
-
-[providers.opencodex]
-model_listing = true
-"#
+{providers}"#
         ),
     )
     .await
@@ -1046,6 +1071,7 @@ model_listing = true
                 auth: None,
             }],
             client_version: client_version.map(str::to_string),
+            harness_models: Vec::new(),
         }),
         (0..32u8).collect(),
     );
@@ -1110,5 +1136,267 @@ async fn a_known_harness_version_is_sent_as_client_version() {
     assert_eq!(
         seen_query.lock().unwrap().clone(),
         Some("client_version=0.58.0".to_string())
+    );
+}
+
+/// The point of the change: a config that names no providers at all still gets a full picker,
+/// because the harness already knows which providers exist. Nobody should have to re-declare in
+/// Giskard what they already declared to Codex.
+#[tokio::test]
+async fn an_empty_config_still_discovers_the_harness_providers() {
+    let mock = Router::new().route(
+        "/models",
+        get(|| async {
+            AxumJson(serde_json::json!({
+                "models": [
+                    { "slug": "gpt-5.5", "display_name": "GPT-5.5", "context_window": 272000 }
+                ]
+            }))
+        }),
+    );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(mock_listener, mock).await.unwrap() });
+
+    // No `[providers]` section whatsoever.
+    let (models, warnings) = discover_catalog_with(mock_addr, None, "").await;
+    assert!(
+        warnings.is_empty(),
+        "nothing should have gone wrong: {warnings:?}"
+    );
+    assert_eq!(
+        models.len(),
+        1,
+        "the provider was discovered unprompted: {models:?}"
+    );
+    assert_eq!(models[0]["model"], "gpt-5.5");
+    assert_eq!(models[0]["context_window"], 272_000);
+}
+
+/// The opt-out still works, and is now the only thing config needs to say about listing.
+#[tokio::test]
+async fn model_listing_false_still_opts_out() {
+    let hit = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = hit.clone();
+    let mock = Router::new().route(
+        "/models",
+        get(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { AxumJson(serde_json::json!({ "models": [ { "slug": "nope" } ] })) }
+        }),
+    );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(mock_listener, mock).await.unwrap() });
+
+    let (models, _) = discover_catalog_with(
+        mock_addr,
+        None,
+        "\n[providers.opencodex]\nmodel_listing = false\n",
+    )
+    .await;
+    assert!(
+        models.is_empty(),
+        "opted out, so nothing discovered: {models:?}"
+    );
+    assert_eq!(
+        hit.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "and the endpoint was never even asked"
+    );
+}
+
+/// Providers are queried concurrently, which is what makes on-by-default affordable: serially,
+/// every slow endpoint delayed all the ones behind it. Three providers that each take ~700ms
+/// should finish in about 700ms, not ~2.1s.
+#[tokio::test]
+async fn providers_are_queried_concurrently() {
+    const PROVIDERS: usize = 3;
+    const DELAY: Duration = Duration::from_millis(700);
+
+    let mut table = Vec::new();
+    for i in 0..PROVIDERS {
+        let slug = format!("model-{i}");
+        let mock = Router::new().route(
+            "/models",
+            get(move || {
+                let slug = slug.clone();
+                async move {
+                    tokio::time::sleep(DELAY).await;
+                    AxumJson(serde_json::json!({ "models": [ { "slug": slug } ] }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        table.push(HarnessProvider {
+            id: format!("p{i}"),
+            name: None,
+            base_url: Some(format!("http://{addr}")),
+            auth: None,
+        });
+    }
+
+    let config: giskard_persist::Config = toml::from_str("").unwrap();
+    let started = std::time::Instant::now();
+    let discovery = giskard_server::models::discover_models(&config, &table, None).await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        discovery.models.len(),
+        PROVIDERS,
+        "every provider contributed: {:?}",
+        discovery.models
+    );
+    assert!(
+        discovery.warnings.is_empty(),
+        "nothing should have failed: {:?}",
+        discovery.warnings
+    );
+    // Generous: serial would be >= 2.1s, so anything under 1.5s proves the requests overlapped
+    // without making the test sensitive to a slow machine.
+    assert!(
+        elapsed < DELAY * 2,
+        "expected overlapping requests, took {elapsed:?} for {PROVIDERS} providers"
+    );
+
+    // Order still follows the target order rather than whichever endpoint answered first.
+    let ids: Vec<&str> = discovery.models.iter().map(|m| m.model.as_str()).collect();
+    assert_eq!(ids, ["model-0", "model-1", "model-2"]);
+}
+
+/// A stock harness: its own catalog answers, but no provider has an endpoint to discover against
+/// and config names nothing. That is the plain ChatGPT-auth Codex setup, and until the catalog was
+/// attributed to the provider Codex routes to, it produced an empty picker in silence.
+#[tokio::test]
+async fn a_stock_harness_catalog_fills_the_picker_on_its_own() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let hash = password_hash("testpass");
+    let (listener, port) = ephemeral_listener().await;
+    tokio::fs::write(
+        tmp.path().join("config.toml"),
+        format!(
+            "\n[server]\nbind = \"127.0.0.1:{port}\"\nsecure_cookies = false\n\n[auth]\npassword_hash = \"{hash}\"\nsession_days = 30\n"
+        ),
+    )
+    .await
+    .unwrap();
+
+    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
+    let state = AppState::new(
+        store,
+        Arc::new(DiffFactory {
+            fixture: make_fixture(),
+            imported_model: None,
+            client_version: None,
+            harness_models: vec![giskard_core::model::ModelDescriptor {
+                provider: "openai".into(),
+                model: "gpt-5.5".into(),
+                context_window: giskard_core::model::ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
+                supports_reasoning_effort: true,
+                reasoning_efforts: vec!["low".into(), "high".into()],
+                display_name: Some("GPT-5.5".into()),
+                is_default: true,
+            }],
+            // Like Codex's built-ins: known, but with nothing to query.
+            providers: vec![HarnessProvider {
+                id: "openai".into(),
+                name: None,
+                base_url: None,
+                auth: None,
+            }],
+        }),
+        (0..32u8).collect(),
+    );
+    let app = build_app(state);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let base = format!("http://127.0.0.1:{port}");
+    let (client, cookie) = login(&base).await;
+    let project = create_project(&client, &base, &cookie).await;
+    let body: serde_json::Value = client
+        .get(format!("{base}/api/projects/{project}/models"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let models = body["models"].as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        models.len(),
+        1,
+        "the harness catalog is a source of its own: {models:?}"
+    );
+    assert_eq!(models[0]["provider"], "openai");
+    assert_eq!(models[0]["model"], "gpt-5.5");
+    assert_eq!(models[0]["display_name"], "GPT-5.5");
+    assert_eq!(models[0]["is_default"], true);
+    let warnings = body["warnings"].as_array().cloned().unwrap_or_default();
+    assert!(
+        warnings.is_empty(),
+        "and nothing to complain about: {warnings:?}"
+    );
+}
+
+/// The backstop: when nothing at all can supply a model, say so instead of serving a blank picker.
+#[tokio::test]
+async fn an_empty_picker_explains_itself() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let hash = password_hash("testpass");
+    let (listener, port) = ephemeral_listener().await;
+    tokio::fs::write(
+        tmp.path().join("config.toml"),
+        format!(
+            "\n[server]\nbind = \"127.0.0.1:{port}\"\nsecure_cookies = false\n\n[auth]\npassword_hash = \"{hash}\"\nsession_days = 30\n"
+        ),
+    )
+    .await
+    .unwrap();
+
+    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
+    let state = AppState::new(
+        store,
+        Arc::new(DiffFactory {
+            fixture: make_fixture(),
+            imported_model: None,
+            client_version: None,
+            harness_models: Vec::new(),
+            providers: vec![HarnessProvider {
+                id: "openai".into(),
+                name: None,
+                base_url: None,
+                auth: None,
+            }],
+        }),
+        (0..32u8).collect(),
+    );
+    let app = build_app(state);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let base = format!("http://127.0.0.1:{port}");
+    let (client, cookie) = login(&base).await;
+    let project = create_project(&client, &base, &cookie).await;
+    let body: serde_json::Value = client
+        .get(format!("{base}/api/projects/{project}/models"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert!(body["models"].as_array().is_none_or(|m| m.is_empty()));
+    let warnings = body["warnings"].as_array().cloned().unwrap_or_default();
+    assert!(
+        warnings.iter().any(|w| w["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no models are available")),
+        "an empty picker must explain itself: {warnings:?}"
     );
 }

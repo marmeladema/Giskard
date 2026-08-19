@@ -76,6 +76,11 @@ struct ConfigReadResponse {
 #[derive(Debug, Deserialize)]
 struct CodexConfig {
     sandbox_workspace_write: Option<SandboxWorkspaceWrite>,
+    /// `model_provider` — the routing id Codex uses when nothing overrides it. Absent whenever the
+    /// user never set the key, which is the common case; Codex then routes to its `openai`
+    /// built-in.
+    #[serde(default)]
+    model_provider: Option<String>,
     /// User-declared `[model_providers.<id>]` entries. Codex's `config/read` serializes its whole
     /// effective config and the app-server `Config` type forwards every key it does not model
     /// itself, so this table arrives even though the generated protocol types omit it. Built-in
@@ -261,6 +266,9 @@ enum ControlCommand {
         response: oneshot::Sender<Result<Vec<HarnessProvider>, HarnessError>>,
     },
     ListModels {
+        /// Codex layers config per directory, so the routing provider its catalog belongs to is
+        /// only correct when asked for this project's root.
+        cwd: String,
         response: oneshot::Sender<Result<Vec<ModelDescriptor>, HarnessError>>,
     },
     Shutdown {
@@ -957,26 +965,45 @@ fn build_initialize_params() -> codex_codes::InitializeParams {
     }
 }
 
+/// Read Codex's effective config for `cwd`.
+///
+/// Three callers need it — writable roots, the provider table, and the routing provider — and each
+/// was building the same params and naming the same method. `action` distinguishes them in the
+/// request log, since a failure means different things to each.
+async fn read_codex_config(
+    client: &mut dyn CodexTransport,
+    cwd: String,
+    action: &'static str,
+) -> Result<CodexConfig, HarnessError> {
+    let params = ConfigReadParams {
+        include_layers: false,
+        cwd,
+    };
+    let response: ConfigReadResponse = codex_request(
+        client,
+        CodexOperationContext::new(action),
+        "config/read",
+        &params,
+    )
+    .await?;
+    Ok(response.config)
+}
+
 async fn configured_workspace_write_roots(
     client: &mut dyn CodexTransport,
     workspace_root: &std::path::Path,
 ) -> Vec<PathBuf> {
-    let params = ConfigReadParams {
-        include_layers: false,
-        cwd: workspace_root.to_string_lossy().into_owned(),
-    };
-    let response: Result<ConfigReadResponse, HarnessError> = codex_request(
+    let response = read_codex_config(
         client,
-        CodexOperationContext::new("config_read_workspace_roots"),
-        "config/read",
-        &params,
+        workspace_root.to_string_lossy().into_owned(),
+        "config_read_workspace_roots",
     )
     .await;
 
     match response {
-        Ok(response) => {
+        Ok(config) => {
             let mut roots = vec![workspace_root.to_path_buf()];
-            if let Some(sandbox) = response.config.sandbox_workspace_write {
+            if let Some(sandbox) = config.sandbox_workspace_write {
                 for root in sandbox.writable_roots {
                     if root.is_absolute() {
                         roots.push(root);
@@ -1016,8 +1043,14 @@ impl AgentHarness for CodexHarness {
 
     async fn list_models(&self) -> Result<Vec<ModelDescriptor>, HarnessError> {
         let (tx, rx) = oneshot::channel();
-        self.enqueue_control("list_models", ControlCommand::ListModels { response: tx })
-            .await?;
+        self.enqueue_control(
+            "list_models",
+            ControlCommand::ListModels {
+                cwd: self.workspace_root.to_string_lossy().into_owned(),
+                response: tx,
+            },
+        )
+        .await?;
         rx.await
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
@@ -1859,10 +1892,15 @@ async fn handle_control_command(
             let _ = response.send(result);
             StreamOutcome::TurnEnded
         }
-        Some(ControlCommand::ListModels { response }) => {
-            let result =
-                timeout_codex_control("list_models", None, None, None, handle_list_models(client))
-                    .await;
+        Some(ControlCommand::ListModels { cwd, response }) => {
+            let result = timeout_codex_control(
+                "list_models",
+                None,
+                None,
+                None,
+                handle_list_models(client, cwd),
+            )
+            .await;
             let _ = response.send(result);
             StreamOutcome::TurnEnded
         }
@@ -3095,17 +3133,7 @@ async fn handle_list_providers(
     client: &mut dyn CodexTransport,
     cwd: String,
 ) -> Result<Vec<HarnessProvider>, HarnessError> {
-    let params = ConfigReadParams {
-        include_layers: false,
-        cwd,
-    };
-    let response: ConfigReadResponse = codex_request(
-        client,
-        CodexOperationContext::new("list_providers"),
-        "config/read",
-        &params,
-    )
-    .await?;
+    let config = read_codex_config(client, cwd, "list_providers").await?;
 
     let mut providers: Vec<HarnessProvider> = CODEX_BUILT_IN_PROVIDER_IDS
         .iter()
@@ -3117,7 +3145,7 @@ async fn handle_list_providers(
         })
         .collect();
 
-    for (id, provider) in response.config.model_providers {
+    for (id, provider) in config.model_providers {
         let entry = HarnessProvider {
             id: id.clone(),
             name: non_empty(provider.name.clone()),
@@ -3139,18 +3167,44 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.trim().is_empty())
 }
 
+/// The provider id Codex routes to when nothing overrides it, for attributing its own catalog.
+///
+/// An **absent** `model_provider` key is the common case and not a problem: Codex then routes to
+/// its `openai` built-in, the same id `CODEX_BUILT_IN_PROVIDER_IDS` leads with, so that is the
+/// answer.
+///
+/// A **failed** `config/read` is different and fails the listing. Guessing the default would
+/// attribute every model to `openai` for a user whose effective provider is something else,
+/// putting routes in the picker that do not exist — and doing it silently, since nothing
+/// downstream can tell an invented attribution from a real one. The caller already reports a
+/// failed catalog as a warning, which is the honest outcome: no models rather than wrong ones.
+async fn default_model_provider(
+    client: &mut dyn CodexTransport,
+    cwd: String,
+) -> Result<String, HarnessError> {
+    const CODEX_DEFAULT_PROVIDER: &str = "openai";
+    let config = read_codex_config(client, cwd, "list_models").await?;
+    Ok(non_empty(config.model_provider).unwrap_or_else(|| CODEX_DEFAULT_PROVIDER.to_string()))
+}
+
 /// List the models Codex advertises over the app-server `model/list` RPC, mapped to Giskard
 /// [`ModelDescriptor`]s so the picker can show Codex's friendly `display_name` instead of raw
 /// model ids.
 ///
 /// The `model/list` catalog is provider-agnostic — each entry carries only a model slug, no
-/// provider — so the returned descriptors leave `provider` empty; matching a descriptor to a
-/// Giskard `(provider, model)` pair is by model id and is the caller's responsibility. Codex also
-/// omits the context window from this RPC, so descriptors use the conservative default; these
-/// entries are a source of names/reasoning-effort support only, not gauge sizing.
+/// provider — but Giskard routes by `(provider, model)`, so an unattributed descriptor can only
+/// ever enrich an entry some other source already produced. That leaves a stock Codex, whose
+/// built-in providers carry no `base_url` to discover against, with nothing in the picker at all.
+///
+/// So the catalog is attributed to the provider Codex itself routes to, read from the same
+/// `config/read` that supplies the provider table. Codex omits the context window from this RPC,
+/// so descriptors still use the conservative default; these entries size no gauge until the
+/// harness reports a real window at turn time.
 async fn handle_list_models(
     client: &mut dyn CodexTransport,
+    cwd: String,
 ) -> Result<Vec<ModelDescriptor>, HarnessError> {
+    let provider = default_model_provider(client, cwd).await?;
     let mut out = Vec::new();
     let mut cursor = None;
 
@@ -3169,7 +3223,12 @@ async fn handle_list_models(
         )
         .await?;
 
-        out.extend(page.data.into_iter().filter(|m| !m.hidden).map(map_model));
+        out.extend(
+            page.data
+                .into_iter()
+                .filter(|m| !m.hidden)
+                .map(|m| map_model(m, &provider)),
+        );
         cursor = page.next_cursor;
         if cursor.is_none() {
             break;
@@ -3179,9 +3238,10 @@ async fn handle_list_models(
     Ok(out)
 }
 
-/// Map a Codex `model/list` entry to a Giskard [`ModelDescriptor`]. See [`handle_list_models`] for
-/// why `provider` is empty and the context window is conservative.
-fn map_model(model: codex_codes::Model) -> ModelDescriptor {
+/// Map a Codex `model/list` entry to a Giskard [`ModelDescriptor`] under `provider`. See
+/// [`handle_list_models`] for where that provider comes from — the entry itself names none — and
+/// why the context window is conservative.
+fn map_model(model: codex_codes::Model, provider: &str) -> ModelDescriptor {
     // `model` is the wire slug used in a ModelRef; `id` is the preset id. Prefer the slug, but fall
     // back to the id if an older/edge payload leaves it empty.
     let id = if model.model.is_empty() {
@@ -3207,7 +3267,7 @@ fn map_model(model: codex_codes::Model) -> ModelDescriptor {
         reasoning_efforts.push(default_reasoning_effort);
     }
     ModelDescriptor {
-        provider: String::new(),
+        provider: provider.to_string(),
         model: id,
         context_window: ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
         supports_reasoning_effort: !reasoning_efforts.is_empty(),
@@ -3454,6 +3514,9 @@ mod tests {
         thread_resume_missing_rollout_failures: usize,
         model_list_error: Option<String>,
         config_read_error: Option<String>,
+        /// `model_provider` in the `config/read` payload; `None` omits the key, as a config that
+        /// never set it does.
+        config_model_provider: Option<String>,
         hang_response_json: bool,
         hang_shutdown: bool,
         requests: Vec<FakeRequest>,
@@ -3542,6 +3605,10 @@ mod tests {
 
         async fn fail_config_read(&self, message: &str) {
             self.state.lock().await.config_read_error = Some(message.into());
+        }
+
+        async fn set_config_model_provider(&self, provider: impl Into<String>) {
+            self.state.lock().await.config_model_provider = Some(provider.into());
         }
 
         async fn hang_json_responses(&self) {
@@ -3668,8 +3735,7 @@ mod tests {
                         if let Some(message) = state.config_read_error.clone() {
                             Err(HarnessError::Transport(message))
                         } else {
-                            Ok(json!({
-                                "config": {
+                            let mut config = json!({
                                     "sandbox_workspace_write": {
                                         "writable_roots": [
                                             "/home/test/.cache/sccache",
@@ -3709,9 +3775,11 @@ mod tests {
                                             }
                                         }
                                     }
-                                },
-                                "origins": {}
-                            }))
+                            });
+                            if let Some(provider) = state.config_model_provider.clone() {
+                                config["model_provider"] = json!(provider);
+                            }
+                            Ok(json!({ "config": config, "origins": {} }))
                         }
                     }
                     codex_codes::protocol::methods::MODEL_LIST
@@ -4864,6 +4932,48 @@ mod tests {
         }
     }
 
+    /// Without the routing provider there is no correct attribution, and guessing the default
+    /// would put routes in the picker that do not exist for anyone whose effective provider is
+    /// something else. The listing fails instead, which the caller already surfaces as a warning.
+    #[tokio::test]
+    async fn codex_list_models_fails_rather_than_guess_the_provider() {
+        let (harness, controller) = spawn_fake_harness();
+        controller.fail_config_read("config/read exploded").await;
+
+        let result = timeout(Duration::from_secs(1), harness.list_models())
+            .await
+            .expect("list_models should complete");
+
+        let err = result.expect_err("an unattributable catalog is not served");
+        assert!(
+            err.to_string().contains("config/read exploded"),
+            "the real cause is reported: {err}"
+        );
+    }
+
+    /// Codex's `model/list` names no provider, so the adapter attributes the catalog to the one
+    /// Codex routes to. A config that sets `model_provider` is followed rather than defaulted.
+    #[tokio::test]
+    async fn codex_list_models_attributes_the_catalog_to_the_configured_provider() {
+        let (harness, controller) = spawn_fake_harness();
+        controller.set_config_model_provider("opencodex").await;
+
+        let models = timeout(Duration::from_secs(1), harness.list_models())
+            .await
+            .expect("list_models should complete")
+            .unwrap();
+
+        assert!(!models.is_empty());
+        assert!(
+            models.iter().all(|m| m.provider == "opencodex"),
+            "every entry follows Codex's routing provider: {:?}",
+            models
+                .iter()
+                .map(|m| m.provider.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[tokio::test]
     async fn codex_list_models_maps_model_list_rpc_to_descriptors() {
         let (harness, controller) = spawn_fake_harness();
@@ -4890,8 +5000,11 @@ mod tests {
         );
         // The exact effort levels from the catalog are preserved for the picker.
         assert_eq!(flagship.reasoning_efforts, vec!["medium", "high"]);
-        // model/list carries no provider and no context window.
-        assert_eq!(flagship.provider, "");
+        // model/list carries no provider of its own, so entries are attributed to the provider
+        // Codex routes to — `openai` here, the built-in default, since this config sets no
+        // `model_provider`. Without that a stock setup has nothing to put in the picker.
+        assert_eq!(flagship.provider, "openai");
+        // The context window is still absent from this RPC.
         assert_eq!(
             flagship.context_window,
             ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW

@@ -83,8 +83,22 @@ pub fn resolve_catalog_descriptor(
         .unwrap_or_else(|| resolve_descriptor(config, model))
 }
 
-pub fn normalize_model_ref(config: &Config, model: &ModelRef) -> ModelRef {
+pub fn normalize_model_ref(
+    config: &Config,
+    catalog: &[ModelDescriptor],
+    model: &ModelRef,
+) -> ModelRef {
     if config.providers.is_empty() || from_config(config, &model.provider, &model.model).is_some() {
+        return model.clone();
+    }
+    // A pair the catalog offers is not stale, whatever config says. This repairs a provider that
+    // has gone away; since the harness catalog became a source of picker entries in its own right,
+    // "absent from config" stopped implying "wrong" — and rewriting a model the user just picked
+    // would silently route the turn to a different provider than the one they chose.
+    if catalog
+        .iter()
+        .any(|d| d.provider == model.provider && d.model == model.model)
+    {
         return model.clone();
     }
 
@@ -151,8 +165,41 @@ pub fn list_descriptors(config: &Config) -> Vec<ModelDescriptor> {
     out
 }
 
-/// Overlay a harness model catalog's metadata onto a descriptor list, keyed by model id
-/// (provider-independent — Codex's `model/list` carries no provider):
+/// Put the composed picker list in provider order (§8.3).
+///
+/// Declared providers lead, in the order config writes them; everything else follows by id. The
+/// same rule `discovery_targets` uses, applied once at the end because the list is assembled from
+/// three sources that each contribute at a different point — config's declared models, discovery,
+/// and the harness catalog. Ordering only the first two would let a provider supplied solely by
+/// the catalog, as a stock `openai` is, land behind one the user never declared.
+///
+/// Stable, so each provider keeps the order its own models arrived in: an explicit
+/// `[[providers.<id>.models]]` entry still precedes that provider's discovered ones, and a
+/// provider-stated `priority` still orders its catalog.
+pub fn order_for_picker(mut models: Vec<ModelDescriptor>, config: &Config) -> Vec<ModelDescriptor> {
+    let rank = |provider: &str| {
+        config
+            .providers
+            .get_index_of(provider)
+            .unwrap_or(usize::MAX)
+    };
+    models.sort_by(|a, b| {
+        rank(&a.provider)
+            .cmp(&rank(&b.provider))
+            // Undeclared providers all share the sentinel rank, so their relative order is the id's
+            // — the harness table has none of its own to inherit.
+            .then_with(|| a.provider.cmp(&b.provider))
+    });
+    models
+}
+
+/// Overlay a harness model catalog's metadata onto a descriptor list, and append the entries it
+/// alone supplies.
+///
+/// Metadata is keyed by model id, not by route: a catalog entry describes a model, and the same
+/// model reached through a different provider is still that model. `is_default` is the exception —
+/// it names one route — and so is the append below, which needs a provider to produce an entry at
+/// all:
 ///
 /// - **Display names** fill a descriptor whose `display_name` is unset, so an explicit
 ///   `[[providers.<id>.models]] display_name` always wins.
@@ -187,9 +234,14 @@ pub fn apply_harness_metadata(
         if d.display_name.is_none() {
             d.display_name = h.display_name.clone();
         }
-        // Which model to start from is the harness's to state, and it states it by model id — so
-        // it applies to a declared entry too, unlike the effort metadata below.
-        d.is_default = h.is_default;
+        // Which model to start from is the harness's to state, and it applies to a declared entry
+        // too, unlike the effort metadata below. But it names one *route*, not one model id: now
+        // that the catalog carries a provider, honouring it by id alone would flag a same-named
+        // model under an unrelated provider as the default — and with the real entry appended
+        // below, both would claim it and the picker would start on whichever came first.
+        if h.provider.is_empty() || h.provider == d.provider {
+            d.is_default = h.is_default;
+        }
         // Config wins, and so does anything discovery already learned: a provider's own catalog
         // names efforts for *its* model, while `model/list` is keyed by model id alone and knows
         // nothing about providers, so it would otherwise replace an advertised list with the one
@@ -202,6 +254,37 @@ pub fn apply_harness_metadata(
             d.reasoning_efforts = h.reasoning_efforts.clone();
         }
     }
+
+    // The catalog is also a *source*, not only an overlay. A harness that names the provider its
+    // models route to has said everything a picker entry needs, and for a stock Codex it is the
+    // only thing that has: its built-in providers carry no `base_url`, so discovery finds nothing
+    // and config declaring nothing is now the expected case. Without this the picker is empty.
+    //
+    // Appended, then ordered with everything else by `order_for_picker` — a provider supplied
+    // only by the catalog is still a provider the user may have pinned. Skipped when the harness
+    // could not say which provider a model belongs to: an unattributed entry is not routable and
+    // would fail at turn time instead of here.
+    // `model_listing = false` is an opt-out from *listing*, whatever the source: a provider told
+    // to offer only its declared models must not have the harness's catalog appended under it
+    // either.
+    let present: HashSet<(&str, &str)> = base
+        .iter()
+        .map(|d| (d.provider.as_str(), d.model.as_str()))
+        .collect();
+    let mut from_catalog: Vec<ModelDescriptor> = harness_models
+        .iter()
+        .filter(|h| !h.provider.is_empty())
+        .filter(|h| {
+            config
+                .providers
+                .get(&h.provider)
+                .and_then(|configured| configured.model_listing)
+                != Some(false)
+        })
+        .filter(|h| !present.contains(&(h.provider.as_str(), h.model.as_str())))
+        .cloned()
+        .collect();
+    base.append(&mut from_catalog);
     base
 }
 
@@ -670,12 +753,83 @@ fn parse_models_body(body: &[u8], provider: &str) -> Result<Vec<(DiscoveredModel
     Ok(out.into_values().collect())
 }
 
-/// Refresh the model list by querying `GET {base_url}/models` for every provider that advertises
-/// `model_listing`, merging the results over the static list (§8.3).
+/// One provider a catalog refresh will query.
+struct DiscoveryTarget<'a> {
+    provider: &'a HarnessProvider,
+    /// Whether config asked for listing in so many words.
+    ///
+    /// Only an explicit request earns a warning when the provider cannot be discovered. Listing is
+    /// on for everyone now, and most of what the harness reports has nothing to query — Codex's
+    /// built-in provider ids arrive with no `base_url` at all — so warning on the default would
+    /// hand every user a fistful of complaints about providers they never mentioned.
+    requested: bool,
+}
+
+/// The providers to query, in picker order.
+///
+/// Listing is on unless a provider's config entry turns it off (§8.3). A provider the harness
+/// reports is one the user already declared *to the harness*; making them declare it again to
+/// Giskard bought nothing, and in practice almost nobody writes `[[providers.<id>.models]]` by
+/// hand — discovery is what makes a new model appear under the right slug at all.
+///
+/// Order is config's where config names a provider, then everything else by id. The harness table
+/// has no order to inherit: Codex parses `[model_providers]` into a `HashMap` before the config
+/// ever reaches the wire, so declaration order is gone upstream and what arrives is a hash order
+/// that changes between app-server restarts. Sorting the remainder keeps the picker — and the
+/// first-model fallback a draft starts on — from reshuffling underneath the user.
+fn discovery_targets<'a>(
+    config: &Config,
+    harness_providers: &'a [HarnessProvider],
+) -> Vec<DiscoveryTarget<'a>> {
+    let mut ordered: Vec<&HarnessProvider> = config
+        .providers
+        .keys()
+        .filter_map(|id| harness_providers.iter().find(|known| &known.id == id))
+        .collect();
+    let mut rest: Vec<&HarnessProvider> = harness_providers
+        .iter()
+        .filter(|known| !config.providers.contains_key(&known.id))
+        .collect();
+    rest.sort_by(|a, b| a.id.cmp(&b.id));
+    ordered.append(&mut rest);
+
+    ordered
+        .into_iter()
+        .filter_map(|provider| {
+            let listing = config
+                .providers
+                .get(&provider.id)
+                .and_then(|configured| configured.model_listing);
+            (listing != Some(false)).then_some(DiscoveryTarget {
+                provider,
+                requested: listing == Some(true),
+            })
+        })
+        .collect()
+}
+
+/// Whether a refresh would actually query anything.
+///
+/// Used to decide whether it is worth asking the harness for its version: listing is on by default
+/// now, so the old test — "does any config entry request listing?" — is both false for the common
+/// empty config and beside the point. What matters is whether some provider has an endpoint.
+pub fn will_query_any_provider(config: &Config, harness_providers: &[HarnessProvider]) -> bool {
+    discovery_targets(config, harness_providers)
+        .iter()
+        .any(|target| target.provider.base_url.is_some())
+}
+
+/// Refresh the model list by querying `GET {base_url}/models` for each provider the harness
+/// reports, merging the results over the static list (§8.3).
 ///
 /// The endpoint and key location come from `harness_providers` — the harness owns provider
-/// configuration (§8.2), so a provider the harness does not know, or knows without a `base_url`,
-/// simply contributes no discovery.
+/// configuration (§8.2), so a provider the harness does not know contributes no discovery, and one
+/// it knows without a `base_url` has nothing to query.
+///
+/// Providers are queried concurrently. Serially, one slow endpoint delayed every provider behind
+/// it, which mattered little while listing was opt-in per provider and matters now that it is on
+/// by default. Results are collected back in picker order, so concurrency changes the timing and
+/// nothing else.
 ///
 /// Best-effort: a provider whose endpoint errors, returns a non-success status, or sends
 /// unparseable JSON is skipped (its static entries remain), so the call always returns at least
@@ -705,109 +859,27 @@ pub async fn discover_models(
         }
     };
 
+    // Capped rather than an unbounded `join_all`. A provider with a command-backed key spawns a
+    // process to produce it, and listing is on for everyone now — a gateway-heavy
+    // `[model_providers]` table would otherwise mean one HTTP request *and* one process per
+    // provider, all at once, on something as routine as opening a project. Providers with no
+    // `base_url` return before either and cost nothing.
+    use futures::stream::StreamExt as _;
+    const MAX_CONCURRENT_PROVIDERS: usize = 8;
+    let targets = discovery_targets(config, harness_providers);
+    let queries: Vec<_> = targets
+        .iter()
+        .map(|target| discover_provider(&client, target, client_version))
+        .collect();
+    let results: Vec<_> = futures::stream::iter(queries)
+        .buffered(MAX_CONCURRENT_PROVIDERS)
+        .collect()
+        .await;
+
     let mut dynamic: Vec<DiscoveredModel> = Vec::new();
-    for (id, p) in &config.providers {
-        if !p.model_listing {
-            continue;
-        }
-        // An unknown id already warned in `validate_provider_ids`; skipping quietly here keeps one
-        // problem to one message.
-        let Some(known) = harness_providers.iter().find(|known| &known.id == id) else {
-            continue;
-        };
-        let Some(base_url) = known.base_url.as_deref() else {
-            warn!(
-                provider = %id,
-                action = "discover_models",
-                "provider requests model listing but the harness reports no base_url for it"
-            );
-            warnings.push(ModelListingWarning {
-                source: format!("provider:{id}"),
-                message: "model_listing is on but the harness reports no base_url for this \
-                          provider; only declared models are offered"
-                    .into(),
-            });
-            continue;
-        };
-        let url = models_url(base_url, client_version);
-
-        let mut fail = |message: String| {
-            warn!(provider = %id, %url, %message, "model discovery failed; skipping provider");
-            warnings.push(ModelListingWarning {
-                source: format!("provider:{id}"),
-                message,
-            });
-        };
-        let mut invalid_metadata_models = Vec::new();
-
-        // Attach the provider's discovery key for endpoints that require auth — e.g. a LiteLLM
-        // proxy with a master key returns 401 otherwise. A command-backed key that cannot be
-        // produced is reported as itself: sending the request unauthenticated would bury the real
-        // cause under a 401 blaming the endpoint.
-        let key = match known.resolve_api_key().await {
-            Ok(key) => key,
-            Err(e) => {
-                fail(e.to_string());
-                continue;
-            }
-        };
-        let mut request = client.get(&url);
-        if let Some(key) = key {
-            request = request.bearer_auth(key);
-        }
-
-        match request.send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                if !status.is_success() {
-                    // A 401/403 is about the key, so point at whichever source this provider
-                    // actually names rather than assuming an environment variable.
-                    let hint = if status.as_u16() == 401 || status.as_u16() == 403 {
-                        match &known.auth {
-                            Some(ProviderAuth::Env(var)) => {
-                                format!(
-                                    " — check ${var}, the env var the harness names for this \
-                                         provider's key"
-                                )
-                            }
-                            Some(ProviderAuth::Command(auth)) => format!(
-                                " — `{}` produced a token the provider rejected",
-                                auth.command
-                            ),
-                            None => " — the harness names no key for this provider".to_string(),
-                        }
-                    } else {
-                        String::new()
-                    };
-                    fail(format!("model listing returned HTTP {status}{hint}"));
-                    continue;
-                }
-                match resp.bytes().await {
-                    Ok(body) => match parse_models_body(&body, id) {
-                        Ok(models) => {
-                            for (model, invalid_metadata) in models {
-                                if invalid_metadata {
-                                    invalid_metadata_models.push(model.model.clone());
-                                }
-                                dynamic.push(model);
-                            }
-                        }
-                        Err(e) => fail(e),
-                    },
-                    Err(e) => fail(format!("could not read the /models response: {e}")),
-                }
-            }
-            Err(e) => fail(format!("could not reach {url}: {e}")),
-        }
-        if !invalid_metadata_models.is_empty() {
-            warnings.push(ModelListingWarning {
-                source: format!("provider:{id}"),
-                message: format!(
-                    "ignored invalid context capacity metadata for {} model(s)",
-                    invalid_metadata_models.len()
-                ),
-            });
-        }
+    for (models, provider_warnings) in results {
+        dynamic.extend(models);
+        warnings.extend(provider_warnings);
     }
 
     // Which pairs a provider actually spoke about, so the harness-catalog overlay can tell "nobody
@@ -824,9 +896,223 @@ pub async fn discover_models(
     }
 }
 
+/// Query one provider's `/models`, returning what it offered and anything worth telling the user.
+async fn discover_provider(
+    client: &reqwest::Client,
+    target: &DiscoveryTarget<'_>,
+    client_version: Option<&str>,
+) -> (Vec<DiscoveredModel>, Vec<ModelListingWarning>) {
+    let known = target.provider;
+    let id = &known.id;
+    let mut models: Vec<DiscoveredModel> = Vec::new();
+    let mut warnings: Vec<ModelListingWarning> = Vec::new();
+
+    let Some(base_url) = known.base_url.as_deref() else {
+        // Nothing to query. Worth saying only if the user asked for this provider by name.
+        if target.requested {
+            warn!(
+                provider = %id,
+                action = "discover_models",
+                "provider requests model listing but the harness reports no base_url for it"
+            );
+            warnings.push(ModelListingWarning {
+                source: format!("provider:{id}"),
+                message: "model_listing is on but the harness reports no base_url for this \
+                          provider; only declared models are offered"
+                    .into(),
+            });
+        }
+        return (models, warnings);
+    };
+    let url = models_url(base_url, client_version);
+
+    let mut fail = |message: String| {
+        warn!(provider = %id, %url, %message, "model discovery failed; skipping provider");
+        warnings.push(ModelListingWarning {
+            source: format!("provider:{id}"),
+            message,
+        });
+    };
+    let mut invalid_metadata_models = Vec::new();
+
+    // Attach the provider's discovery key for endpoints that require auth — e.g. a LiteLLM
+    // proxy with a master key returns 401 otherwise. A command-backed key that cannot be
+    // produced is reported as itself: sending the request unauthenticated would bury the real
+    // cause under a 401 blaming the endpoint.
+    let key = match known.resolve_api_key().await {
+        Ok(key) => key,
+        Err(e) => {
+            fail(e.to_string());
+            return (models, warnings);
+        }
+    };
+    let mut request = client.get(&url);
+    if let Some(key) = key {
+        request = request.bearer_auth(key);
+    }
+
+    match request.send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            if !status.is_success() {
+                // A 401/403 is about the key, so point at whichever source this provider
+                // actually names rather than assuming an environment variable.
+                let hint = if status.as_u16() == 401 || status.as_u16() == 403 {
+                    match &known.auth {
+                        Some(ProviderAuth::Env(var)) => {
+                            format!(
+                                " — check ${var}, the env var the harness names for this \
+                                     provider's key"
+                            )
+                        }
+                        Some(ProviderAuth::Command(auth)) => format!(
+                            " — `{}` produced a token the provider rejected",
+                            auth.command
+                        ),
+                        None => " — the harness names no key for this provider".to_string(),
+                    }
+                } else {
+                    String::new()
+                };
+                fail(format!("model listing returned HTTP {status}{hint}"));
+                return (models, warnings);
+            }
+            match resp.bytes().await {
+                Ok(body) => match parse_models_body(&body, id) {
+                    Ok(parsed) => {
+                        for (model, invalid_metadata) in parsed {
+                            if invalid_metadata {
+                                invalid_metadata_models.push(model.model.clone());
+                            }
+                            models.push(model);
+                        }
+                    }
+                    Err(e) => fail(e),
+                },
+                Err(e) => fail(format!("could not read the /models response: {e}")),
+            }
+        }
+        Err(e) => fail(format!("could not reach {url}: {e}")),
+    }
+    if !invalid_metadata_models.is_empty() {
+        warnings.push(ModelListingWarning {
+            source: format!("provider:{id}"),
+            message: format!(
+                "ignored invalid context capacity metadata for {} model(s)",
+                invalid_metadata_models.len()
+            ),
+        });
+    }
+    (models, warnings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn harness_provider(id: &str, base_url: Option<&str>) -> HarnessProvider {
+        HarnessProvider {
+            id: id.into(),
+            name: None,
+            base_url: base_url.map(str::to_string),
+            auth: None,
+        }
+    }
+
+    fn target_ids(config: &Config, table: &[HarnessProvider]) -> Vec<String> {
+        discovery_targets(config, table)
+            .iter()
+            .map(|t| t.provider.id.clone())
+            .collect()
+    }
+
+    /// The headline: a provider the harness reports is discovered without config naming it. The
+    /// harness table is where a provider is declared; repeating it here bought nothing.
+    #[test]
+    fn a_provider_absent_from_config_is_still_queried() {
+        let config: Config = toml::from_str("").unwrap();
+        let table = vec![harness_provider("opencodex", Some("http://x"))];
+        assert_eq!(target_ids(&config, &table), ["opencodex"]);
+    }
+
+    /// The opt-out is the only thing config has to say about listing now.
+    #[test]
+    fn model_listing_false_opts_a_provider_out() {
+        let config: Config =
+            toml::from_str("[providers.opencodex]\nmodel_listing = false\n[providers.other]\n")
+                .unwrap();
+        let table = vec![
+            harness_provider("opencodex", Some("http://x")),
+            harness_provider("other", Some("http://y")),
+        ];
+        assert_eq!(
+            target_ids(&config, &table),
+            ["other"],
+            "an explicit false is respected; a bare entry is not an opt-out"
+        );
+    }
+
+    /// Config orders the picker where it names providers; the rest follow by id, because the
+    /// harness table arrives in a hash order that changes between app-server restarts.
+    #[test]
+    fn config_declaration_order_leads_then_the_rest_by_id() {
+        let config: Config = toml::from_str("[providers.zeta]\n[providers.alpha]\n").unwrap();
+        // Deliberately not alphabetical, and not config order either.
+        let table = vec![
+            harness_provider("mid", Some("http://m")),
+            harness_provider("alpha", Some("http://a")),
+            harness_provider("beta", Some("http://b")),
+            harness_provider("zeta", Some("http://z")),
+        ];
+        assert_eq!(
+            target_ids(&config, &table),
+            ["zeta", "alpha", "beta", "mid"],
+            "declared providers keep config's order; undeclared ones sort by id"
+        );
+    }
+
+    /// A config entry naming a provider the harness has never heard of cannot be queried, and must
+    /// not wedge itself into the order.
+    #[test]
+    fn a_config_only_provider_is_not_a_target() {
+        let config: Config = toml::from_str("[providers.ghost]\n").unwrap();
+        let table = vec![harness_provider("real", Some("http://r"))];
+        assert_eq!(target_ids(&config, &table), ["real"]);
+    }
+
+    /// Whether a failure to discover is worth reporting depends on whether the user asked. Codex
+    /// reports five built-in provider ids with no `base_url`; on-by-default must not turn those
+    /// into five complaints per refresh.
+    #[test]
+    fn only_an_explicit_request_is_worth_warning_about() {
+        let config: Config = toml::from_str("[providers.asked]\nmodel_listing = true\n").unwrap();
+        let table = vec![
+            harness_provider("asked", None),
+            harness_provider("defaulted", None),
+        ];
+        let targets = discovery_targets(&config, &table);
+        let requested: Vec<(&str, bool)> = targets
+            .iter()
+            .map(|t| (t.provider.id.as_str(), t.requested))
+            .collect();
+        assert_eq!(requested, [("asked", true), ("defaulted", false)]);
+    }
+
+    /// The `client_version` gate: asking the harness for its version is only worth it when some
+    /// provider actually has an endpoint to query.
+    #[test]
+    fn the_version_gate_follows_the_harness_not_config() {
+        let empty: Config = toml::from_str("").unwrap();
+        assert!(
+            will_query_any_provider(&empty, &[harness_provider("p", Some("http://x"))]),
+            "an empty config must not stop us identifying the harness"
+        );
+        assert!(
+            !will_query_any_provider(&empty, &[harness_provider("builtin", None)]),
+            "a provider with no endpoint is not worth starting a harness for"
+        );
+        assert!(!will_query_any_provider(&empty, &[]));
+    }
 
     fn config_with_glm() -> Config {
         let toml = r#"
@@ -1444,6 +1730,146 @@ model_listing = true
         assert!(glm.reasoning_efforts.is_empty());
     }
 
+    /// Declaring a provider is how a user pins it first (§8.3). That has to hold for a provider
+    /// whose models come only from the harness catalog — a stock `openai` has no `base_url`, so
+    /// nothing else supplies it, and appending the catalog last would park the pinned provider
+    /// behind an undeclared one's discovered models.
+    #[test]
+    fn a_pinned_provider_leads_even_when_only_the_catalog_supplies_it() {
+        let config: Config = toml::from_str("[providers.openai]\n").unwrap();
+        // What discovery produced: an undeclared provider, so it sorts after the declared one.
+        let discovered = vec![ModelDescriptor::conservative(
+            "zzz".to_string(),
+            "model-a".to_string(),
+        )];
+        let harness = vec![ModelDescriptor {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            context_window: 128_000,
+            supports_reasoning_effort: false,
+            reasoning_efforts: Vec::new(),
+            display_name: None,
+            is_default: false,
+        }];
+
+        let out = order_for_picker(
+            apply_harness_metadata(discovered, &harness, &config, &HashSet::new()),
+            &config,
+        );
+        let order: Vec<(&str, &str)> = out
+            .iter()
+            .map(|d| (d.provider.as_str(), d.model.as_str()))
+            .collect();
+        assert_eq!(
+            order,
+            [("openai", "gpt-5.5"), ("zzz", "model-a")],
+            "the declared provider leads whatever supplied its models"
+        );
+    }
+
+    /// `model_listing = false` is an opt-out from listing, whatever the source. Without this the
+    /// example config's own guarantee — declare `false` and only your declared models are offered
+    /// — would be false for the provider the harness routes to.
+    #[test]
+    fn the_catalog_is_not_appended_under_a_provider_that_opted_out() {
+        let config: Config = toml::from_str(
+            "[providers.openai]\nmodel_listing = false\n  [[providers.openai.models]]\n  id = \"declared\"\n  context_window = 1000\n",
+        )
+        .unwrap();
+        let harness = vec![ModelDescriptor {
+            provider: "openai".into(),
+            model: "from-catalog".into(),
+            context_window: 128_000,
+            supports_reasoning_effort: false,
+            reasoning_efforts: Vec::new(),
+            display_name: None,
+            is_default: false,
+        }];
+        let out = apply_harness_metadata(
+            list_descriptors(&config),
+            &harness,
+            &config,
+            &HashSet::new(),
+        );
+        let ids: Vec<&str> = out.iter().map(|d| d.model.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["declared"],
+            "the opt-out holds for the catalog too: {ids:?}"
+        );
+    }
+
+    /// `is_default` names one route. Applying it by model id alone would flag a same-named model
+    /// under an unrelated provider, and with the catalog's own entry appended both would claim it
+    /// — the picker starts on whichever comes first, which is not the one the harness meant.
+    #[test]
+    fn is_default_follows_the_route_not_just_the_model_id() {
+        let config: Config = toml::from_str(
+            "[providers.litellm]\n  [[providers.litellm.models]]\n  id = \"gpt-5.5\"\n  context_window = 1000\n",
+        )
+        .unwrap();
+        let harness = vec![ModelDescriptor {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            context_window: 128_000,
+            supports_reasoning_effort: false,
+            reasoning_efforts: Vec::new(),
+            display_name: Some("GPT-5.5".into()),
+            is_default: true,
+        }];
+        let out = apply_harness_metadata(
+            list_descriptors(&config),
+            &harness,
+            &config,
+            &HashSet::new(),
+        );
+
+        let litellm = out
+            .iter()
+            .find(|d| d.provider == "litellm")
+            .expect("the declared entry survives");
+        assert!(
+            !litellm.is_default,
+            "another provider's route must not inherit the default flag"
+        );
+        assert_eq!(
+            litellm.display_name.as_deref(),
+            Some("GPT-5.5"),
+            "but the name still crosses providers — it describes the model, not the route"
+        );
+        let openai = out
+            .iter()
+            .find(|d| d.provider == "openai")
+            .expect("the catalog's own entry is appended");
+        assert!(openai.is_default, "and it is the one the harness marked");
+    }
+
+    /// A pair the catalog offers is not a stale provider. Rewriting it would send the turn to a
+    /// provider the user did not pick.
+    #[test]
+    fn a_catalog_pair_is_not_normalized_away() {
+        let config = config_with_glm();
+        let picked = ModelRef {
+            provider: "openai".into(),
+            model: "@cf/z-ai/glm-4.7".into(),
+            reasoning_effort: None,
+        };
+        let catalog = vec![ModelDescriptor::conservative(
+            "openai".to_string(),
+            "@cf/z-ai/glm-4.7".to_string(),
+        )];
+        assert_eq!(
+            normalize_model_ref(&config, &catalog, &picked),
+            picked,
+            "the catalog offers this exact route, so it stands"
+        );
+        assert_eq!(
+            normalize_model_ref(&config, &[], &picked).provider,
+            "cloudflare-litellm",
+            "with no catalog entry it is still repaired as before"
+        );
+    }
+
     /// A provider's own catalog outranks `model/list` on effort levels, per §8.3: `model/list` is
     /// keyed by model id and knows nothing about providers, so it must not replace the levels a
     /// specific provider advertised for its own model. Without this, the whole point of reading the
@@ -1782,6 +2208,7 @@ model_listing = true
         let config = config_with_glm();
         let normalized = normalize_model_ref(
             &config,
+            &[],
             &ModelRef {
                 provider: "openai".into(),
                 model: "@cf/z-ai/glm-4.7".into(),
@@ -1799,7 +2226,7 @@ model_listing = true
         config.providers.insert(
             "other".into(),
             giskard_persist::ProviderConfig {
-                model_listing: false,
+                model_listing: Some(false),
                 models: vec![giskard_persist::ModelConfig {
                     id: "@cf/z-ai/glm-4.7".into(),
                     display_name: None,
@@ -1813,6 +2240,6 @@ model_listing = true
             model: "@cf/z-ai/glm-4.7".into(),
             reasoning_effort: None,
         };
-        assert_eq!(normalize_model_ref(&config, &original), original);
+        assert_eq!(normalize_model_ref(&config, &[], &original), original);
     }
 }

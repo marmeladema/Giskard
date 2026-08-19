@@ -1365,8 +1365,9 @@ pub struct HarnessCapabilities {
     pub structured_diffs: bool,
     /// Durable thread resume across process/app restarts.
     pub resumable_threads: bool,
-    /// The harness can list its own model catalog (e.g. Codex's app-server `model/list`),
-    /// used to overlay friendly display names onto the configured list (§8.3).
+    /// The harness can list its own model catalog (e.g. Codex's app-server `model/list`), used
+    /// both to overlay metadata onto the configured list and, where the harness attributes its
+    /// models to a provider, as a source of picker entries in its own right (§8.3).
     pub model_listing: bool,
     /// The harness can report the providers it is configured to route to (§8.2), supplying the
     /// endpoint and key location for discovery and the set of ids a config may name.
@@ -1387,9 +1388,13 @@ pub struct HarnessCapabilities {
 Codex advertises all Codex-backed capabilities as `true`, including `model_listing`: the adapter
 maps the app-server `model/list` RPC and Giskard overlays that metadata — friendly display names and
 each model's advertised reasoning efforts — onto its config/provider model list, by model id (§8.3).
-Context window still comes from Giskard's config/provider metadata (`model/list` omits it, and
-carries no provider either, which is why `[[providers.<id>.models]]` still declares the pairs —
-unless the provider serves the harness catalog shape on discovery, which does carry both, §8.3).
+Context window still comes from Giskard's config/provider metadata (`model/list` omits it), unless
+the provider serves the harness catalog shape on discovery, which does carry one (§8.3). The
+adapter attributes `model/list` entries to the provider Codex routes to, read from the same
+`config/read` that supplies the provider table — without a provider the entries could only ever
+enrich someone else's, leaving a stock Codex with an empty picker. An **absent** `model_provider`
+means the `openai` built-in, Codex's own default; a **failed** `config/read` fails the listing
+instead, since guessing would attribute every model to `openai` for a user routing elsewhere.
 `provider_listing` is likewise `true`: the adapter reads Codex's `[model_providers]` table out of
 `config/read` (§8.2). `client_version` comes from the `user_agent` in the initialize handshake — the
 only place Codex states its own version — and identifies Giskard to a provider's `/models` endpoint
@@ -2442,12 +2447,45 @@ are wrong.
   context_window = 262144
   supports_reasoning_effort = true
   ```
-- If a provider advertises `model_listing`, Giskard can **refresh the list dynamically** from
-  `GET {base_url}/models` and merge results with the static list. The `base_url` and the key come
-  from the harness's provider table (§8.2), so discovery is a per-project operation: there is no
-  endpoint to query until a harness can name one. A provider whose harness entry carries no
-  `base_url` contributes no discovery and says so as a warning. A manual "refresh models" action
-  triggers this; results are cached in memory per project.
+- **Discovery is on for every provider the harness reports**, refreshing the list from
+  `GET {base_url}/models` and merging the results over the static list. The `base_url` and the key
+  come from the harness's provider table (§8.2), so discovery is a per-project operation: there is
+  no endpoint to query until a harness can name one. A manual "refresh models" action triggers
+  this; results are cached in memory per project.
+
+  Which providers end up *offered* is narrower than which are queried: one with no endpoint yields
+  nothing, so it appears only if the harness catalog covers it (below) or config declares its
+  models. A harness reporting built-in ids it neither has an endpoint for nor routes to — Codex
+  lists `ollama` and `lmstudio` whether or not they are used — contributes nothing for them, which
+  is the intended outcome rather than a gap.
+
+  `[providers.<id>]` is therefore **optional**, and a config naming no providers at all is the
+  expected case. A provider the harness reports is one the user already declared *to the harness*;
+  requiring them to declare it again to Giskard bought nothing, and in practice a hand-written
+  `[[providers.<id>.models]]` list is rare — discovery is what makes a new model appear under the
+  right slug at all. `model_listing = false` turns it off for one provider, which is what an
+  endpoint that serves turns but has no `/models` route needs.
+
+  The setting is **tri-state**, and the third state is load-bearing: unset means on, `true` means
+  on *and* asked for, `false` means off. Only a provider explicitly asked for is worth a warning
+  when it cannot be discovered — a harness reports providers with no `base_url` at all (Codex's
+  five built-in ids among them), and complaining about each on every refresh would bury the
+  warnings that matter under ones nobody asked for.
+
+  Providers are queried **concurrently**. Serially, one slow endpoint delayed every provider behind
+  it; that was tolerable while listing was opt-in per provider and is not once it is on by default.
+  Results are collected in picker order, so concurrency changes the timing and nothing else.
+- **Picker order** is config's where config names a provider, then everything else by id, applied
+  once to the composed list. The three sources contribute at different points — declared models,
+  discovery, then the harness catalog — so ordering any one of them alone would let a provider
+  supplied only by the catalog land behind one the user never declared. Within a provider the
+  arrival order stands: a declared entry precedes that provider's discovered ones, and a stated
+  `priority` still orders its catalog. The
+  harness table carries no order to inherit — Codex parses `[model_providers]` into a `HashMap`
+  before its config reaches the wire, so declaration order is lost upstream and what arrives is a
+  hash order that differs between app-server restarts. Declaring a provider is therefore how a user
+  pins it first; sorting the remainder keeps the picker, and the first-model fallback a draft starts
+  on (§8.5), from reshuffling underneath them.
 - **Two response shapes, combined.** The same endpoint answers differently depending on who is
   asking, so Giskard reads both:
   - the OpenAI-compatible `{"data": [{"id": …}]}`, which usually names ids and little else;
@@ -2511,6 +2549,18 @@ are wrong.
 
   `display_name` follows the same four steps, with the harness catalog filling a name the config
   and the provider both left unset.
+- **The harness catalog is a source, not only an overlay.** A harness that names the provider its
+  models route to has supplied everything a picker entry needs, so its catalog entries are offered
+  in their own right when no other source produced them — appended after config and discovery, and
+  skipped in two cases: when the harness cannot say which provider a model belongs to, since an
+  unattributed entry is not routable, and when that provider's config sets `model_listing = false`,
+  since the opt-out is from listing whatever the source and such a provider offers only its
+  declared models. This is what a stock harness depends on: Codex's built-in providers carry
+  no `base_url`, so discovery finds nothing for them and `model/list` is the only source there is.
+  Context window still comes from elsewhere (§4.3) — the catalog has none to give.
+- **An empty picker explains itself.** When nothing supplies a model *and* nothing else has already
+  warned, the refresh says so rather than serving a blank selector. A provider that reported its own
+  failure has already named the cause and is not followed by a vaguer one.
 - **Per-project model list + harness metadata.** When a project is open, the picker list is served
   **per project** by `GET /api/projects/{id}/models`: the configured models, merged with each
   `model_listing` provider's `/v1/models` discovery, with the project harness's metadata overlaid on
@@ -3541,11 +3591,14 @@ filename_template = "plan-{slug}-{ts}.md"
 cost_estimation = false
 # [tokens.rates."openai/gpt-5.5"]  input_per_mtok_eur = …  output_per_mtok_eur = …
 
-# Keyed by routing id, mirroring Codex's own `[model_providers.<id>]`. The id must name a provider
-# the harness knows (§8.2); name, endpoint, and key location are read back from the harness rather
-# than restated here. Declaration order is the picker's order.
+# Optional in full: discovery runs for every provider the harness reports, and the harness's own
+# catalog covers the provider it routes to (§8.3). A provider with neither contributes nothing.
+# Keyed
+# by routing id, mirroring Codex's own `[model_providers.<id>]`. The id must name a provider the
+# harness knows (§8.2); name, endpoint, and key location are read back from the harness rather than
+# restated here. Declared providers lead the picker in this order; the rest follow by id.
 [providers.openai]
-model_listing = false
+model_listing = false           # opt out — e.g. an endpoint with no /models route
   # typed model entries supply what no harness reports (§8.3):
   [[providers.openai.models]]
   id = "gpt-5.5"
@@ -3554,10 +3607,10 @@ model_listing = false
   id = "gpt-5.4"
   context_window = 262144
 
-# ⇒ [model_providers.cloudflare-litellm] in ~/.codex/config.toml
+# ⇒ [model_providers.cloudflare-litellm] in ~/.codex/config.toml. Discovery is on without saying
+# so; this entry only adds metadata and pins the provider's place in the picker.
 [providers.cloudflare-litellm]
-model_listing = true            # discovery against the base_url the harness reports for it
-  [[providers.cloudflare-litellm.models]]   # static fallback; dynamic listing may add/refine
+  [[providers.cloudflare-litellm.models]]   # refines what discovery reports
   id = "@cf/z-ai/glm-4.7"
   context_window = 131072
   # display_name / supports_reasoning_effort may be set to override the harness catalog (§8.3)

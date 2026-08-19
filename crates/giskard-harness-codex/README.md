@@ -321,10 +321,19 @@ Each returned model is mapped to a Giskard `ModelDescriptor` (`map_model`):
   the sole Giskard effort, matching the Codex TUI. An empty alternatives list with
   a `none` default maps to no reasoning-effort support.
 - **Hidden models** are filtered out (only picker-visible entries are returned).
-- **Empty provider** — the `model/list` catalog is provider-agnostic (a bare
-  model slug, no provider), so descriptors leave `provider` empty; matching a
-  catalog entry to a Giskard `(provider, model)` pair is by model id and is the
-  caller's responsibility.
+- **Attributed provider** — the `model/list` catalog is provider-agnostic (a
+  bare model slug, no provider), but Giskard routes by `(provider, model)`, so an
+  unattributed descriptor could only ever enrich an entry some other source
+  produced — leaving a stock Codex, whose built-in providers have no `base_url`
+  to discover against, with an empty picker. The adapter therefore issues a
+  second `config/read` (with the project `cwd`, since config is layered per
+  directory) and attributes every entry to the provider Codex routes to.
+  - An **absent or empty** `model_provider` means the `openai` built-in, which is
+    Codex's own default.
+  - A **failed** `config/read` fails the whole listing rather than guessing:
+    defaulting there would attribute every model to `openai` for a user routing
+    elsewhere, inventing picker entries that cannot work, and nothing downstream
+    can tell a guessed attribution from a real one.
 - **Conservative context window** — `model/list` omits the context window, so
   descriptors use the conservative default; the catalog is a source of names and
   reasoning-effort levels only, not gauge sizing.

@@ -156,8 +156,17 @@ impl Default for VizConfig {
 pub struct ProviderConfig {
     /// Whether to merge `GET {base_url}/models` discovery over the declared models, using the
     /// endpoint the harness reports for this provider.
+    ///
+    /// Unset means on (§8.3). A provider the harness reports is one the user already declared to
+    /// the harness; making them name it again here was ceremony, and in practice almost nobody
+    /// declares models by hand — discovery is how a new model shows up under the right slug at all.
+    /// `false` turns it off.
+    ///
+    /// Tri-state rather than a `true` default because "asked for" and "on by default" want
+    /// different behaviour when a provider cannot be discovered: an explicit `true` that cannot
+    /// work is worth a warning, while a defaulted-on provider with nothing to query is not.
     #[serde(default)]
-    pub model_listing: bool,
+    pub model_listing: Option<bool>,
     #[serde(default)]
     pub models: Vec<ModelConfig>,
 }
@@ -312,7 +321,7 @@ model_listing = true
         )
         .expect("the quoted form is the way to write it");
         let provider = &config.providers["openrouter.ai"];
-        assert!(provider.model_listing);
+        assert_eq!(provider.model_listing, Some(true));
         assert_eq!(provider.models.len(), 1);
     }
 
