@@ -5,7 +5,9 @@
 //! 2. the `/v1/models` dynamic listing (merged over the static list by [`discover_models`]);
 //! 3. a conservative fallback (`context_window = 128000`, no reasoning effort).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+use indexmap::IndexMap;
 
 use serde::Deserialize;
 use tokio::sync::RwLock;
@@ -156,17 +158,19 @@ pub fn list_descriptors(config: &Config) -> Vec<ModelDescriptor> {
 ///   `[[providers.<id>.models]] display_name` always wins.
 /// - **`is_default`** marks the model the harness would start from, used only to seed a project's
 ///   default (§8.3). Config has no way to express it, so the catalog is its only source.
-/// - **Reasoning efforts** (the exact levels a model advertises) are applied only to models the
-///   config did **not** explicitly declare. A `[[providers.<id>.models]]` entry keeps its configured
-///   effort setting; for discovery-only models the catalog is the source of truth.
+/// - **Reasoning efforts** (the exact levels a model advertises) fill a gap rather than overwrite:
+///   they are applied only to models the config did **not** declare *and* that discovery did not
+///   already describe. A `[[providers.<id>.models]]` entry keeps its configured effort setting, a
+///   provider that advertised its own levels keeps those, and only a model nothing else has
+///   described takes the harness catalog's.
 ///
 /// The harness never supplies context window (Codex's `model/list` omits it).
 pub fn apply_harness_metadata(
     mut base: Vec<ModelDescriptor>,
     harness_models: &[ModelDescriptor],
     config: &Config,
+    efforts_from_discovery: &HashSet<(String, String)>,
 ) -> Vec<ModelDescriptor> {
-    use std::collections::HashSet;
     let by_id: HashMap<&str, &ModelDescriptor> = harness_models
         .iter()
         .map(|m| (m.model.as_str(), m))
@@ -186,7 +190,14 @@ pub fn apply_harness_metadata(
         // Which model to start from is the harness's to state, and it states it by model id — so
         // it applies to a declared entry too, unlike the effort metadata below.
         d.is_default = h.is_default;
-        if !declared.contains(&(d.provider.as_str(), d.model.as_str())) {
+        // Config wins, and so does anything discovery already learned: a provider's own catalog
+        // names efforts for *its* model, while `model/list` is keyed by model id alone and knows
+        // nothing about providers, so it would otherwise replace an advertised list with the one
+        // some same-named model happens to have (§8.3 puts the `/v1/models` response above the
+        // harness catalog). Silence here still means the harness fills the gap.
+        if !declared.contains(&(d.provider.as_str(), d.model.as_str()))
+            && !efforts_from_discovery.contains(&(d.provider.clone(), d.model.clone()))
+        {
             d.supports_reasoning_effort = h.supports_reasoning_effort;
             d.reasoning_efforts = h.reasoning_efforts.clone();
         }
@@ -196,11 +207,43 @@ pub fn apply_harness_metadata(
 
 // ---- Dynamic /v1/models refresh (spec §8.3) ----
 
-/// OpenAI-compatible `GET /v1/models` response shape (`{ "data": [ { "id": "…" }, … ] }`).
+/// A `GET /v1/models` body, which may carry either list or both.
+///
+/// `data` is the OpenAI-compatible shape; `models` is the harness catalog a provider serves to a
+/// caller that identified itself. Both are optional so a body carrying one is not rejected for
+/// lacking the other — and both being absent is what distinguishes a body in neither shape from a
+/// legitimately empty listing, which still sends `{"data": []}`.
 #[derive(Deserialize)]
-struct OpenAiModelsResponse {
+struct ModelsBody {
     #[serde(default)]
-    data: Vec<OpenAiModel>,
+    models: Option<serde_json::Value>,
+    #[serde(default)]
+    data: Option<serde_json::Value>,
+}
+
+/// The entries of one of the two lists, or `None` when the key was absent or was not a list.
+///
+/// Both lists are taken loosely and read entry by entry. Typing either strictly would let a single
+/// unrecognisable entry — or a key a provider happens to use for something else — discard the other
+/// list along with it, and the two are independent claims about the same catalog.
+fn model_entries(
+    value: Option<serde_json::Value>,
+    provider: &str,
+    key: &str,
+) -> Option<Vec<serde_json::Value>> {
+    match value {
+        None => None,
+        Some(serde_json::Value::Array(entries)) => Some(entries),
+        Some(_) => {
+            warn!(
+                provider = %provider,
+                key,
+                action = "discover_models",
+                "ignoring a /models response key that is not a list"
+            );
+            None
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -210,6 +253,130 @@ struct OpenAiModel {
     context_window: Option<serde_json::Value>,
     #[serde(default)]
     max_input_tokens: Option<serde_json::Value>,
+}
+
+/// The harness catalog shape the same endpoint serves to a harness that identifies itself
+/// (`{ "models": [ … ] }`, Codex's `ModelsResponse`).
+///
+/// Worth parsing because it answers the one question the OpenAI shape cannot: `context_window`,
+/// which no harness reports over its own protocol — Codex drops it between this response and
+/// `model/list`. It also carries display names and the exact reasoning levels a model advertises,
+/// so a provider serving this needs no `[[providers.<id>.models]]` entries at all.
+///
+/// Only `slug` is typed: without one there is no model to speak of. Everything else is taken as raw
+/// JSON and interpreted below, so a `display_name` that arrives as a number costs that name rather
+/// than the whole entry — the same entry-by-entry, field-by-field tolerance the lists get.
+#[derive(Deserialize)]
+struct HarnessCatalogModel {
+    slug: String,
+    #[serde(default)]
+    display_name: Option<serde_json::Value>,
+    #[serde(default)]
+    context_window: Option<serde_json::Value>,
+    /// Codex resolves the effective window as `context_window.or(max_context_window)`
+    /// (`ModelInfo::resolved_context_window`), so an entry carrying only the maximum still has one.
+    #[serde(default)]
+    max_context_window: Option<serde_json::Value>,
+    /// `None` is "said nothing about efforts"; `Some([])` is "said there are none". The two must
+    /// stay apart: the harness-catalog overlay fills the first and must not touch the second.
+    ///
+    /// Taken as raw JSON like the rest: a value that is not a list is silence, not an answer —
+    /// suppressing the overlay on the strength of a malformed field would be worse than filling it.
+    #[serde(default)]
+    supported_reasoning_levels: Option<serde_json::Value>,
+    /// Codex separates the default effort from the selectable alternatives, and its TUI treats a
+    /// non-`none` default as the sole valid choice when the alternatives are empty. `map_model`
+    /// already normalizes that for the `model/list` path; this is the same rule for this one.
+    #[serde(default)]
+    default_reasoning_level: Option<serde_json::Value>,
+    /// `"list"` shows in a picker; `"hide"`/`"none"` do not. Absent is treated as listed, so a
+    /// server that omits the field does not silently empty the picker.
+    #[serde(default)]
+    visibility: Option<serde_json::Value>,
+    /// Codex sorts the catalog by this before building its picker list, so a provider serving this
+    /// shape is stating an order, not just a set.
+    #[serde(default)]
+    priority: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct HarnessCatalogEffort {
+    effort: String,
+}
+
+impl HarnessCatalogModel {
+    fn listed(&self) -> bool {
+        !matches!(
+            self.visibility.as_ref().and_then(|v| v.as_str()),
+            Some("hide") | Some("none")
+        )
+    }
+
+    fn priority(&self) -> Option<i64> {
+        self.priority.as_ref().and_then(serde_json::Value::as_i64)
+    }
+
+    /// The window this entry claims, following Codex's own resolution order, and whether either
+    /// field was present but unusable.
+    ///
+    /// The two are separate answers on purpose: a fallback that works should still be used, and the
+    /// malformed field it stepped around should still be reported.
+    fn context_window(&self) -> (Option<u32>, bool) {
+        let primary = parse_discovered_capacity(self.context_window.as_ref());
+        if let Ok(Some(window)) = primary {
+            return (Some(window), false);
+        }
+        let max = parse_discovered_capacity(self.max_context_window.as_ref());
+        let invalid = primary.is_err() || max.is_err();
+        (max.unwrap_or(None), invalid)
+    }
+
+    fn display_name(&self) -> Option<String> {
+        self.display_name
+            .as_ref()
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+    }
+
+    /// The effort levels this model advertises, or `None` when it said nothing about them.
+    ///
+    /// A level that is not an object with a string `effort` is skipped rather than costing the
+    /// list. An empty list stays empty — "no efforts" is an answer — except that a non-`none`
+    /// default with nothing else is that default, matching `map_model` on the `model/list` side.
+    fn reasoning_efforts(&self) -> Option<Vec<String>> {
+        let default = self
+            .default_reasoning_level
+            .as_ref()
+            .and_then(|value| value.as_str())
+            .filter(|effort| !effort.is_empty() && *effort != "none");
+        let stated = self
+            .supported_reasoning_levels
+            .as_ref()
+            .and_then(serde_json::Value::as_array);
+        if stated.is_none() && default.is_none() {
+            return None;
+        }
+        let mut efforts: Vec<String> = stated
+            .map(|levels| {
+                levels
+                    .iter()
+                    .filter_map(|level| {
+                        serde_json::from_value::<HarnessCatalogEffort>(level.clone())
+                            .ok()
+                            .map(|level| level.effort)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if efforts.is_empty()
+            && let Some(default) = default
+        {
+            efforts.push(default.to_string());
+        }
+        Some(efforts)
+    }
 }
 
 fn parse_discovered_capacity(value: Option<&serde_json::Value>) -> Result<Option<u32>, ()> {
@@ -224,12 +391,24 @@ fn parse_discovered_capacity(value: Option<&serde_json::Value>) -> Result<Option
     Ok(Some(capacity))
 }
 
-/// One model discovered from a provider's OpenAI-compatible `/v1/models` endpoint.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One model discovered from a provider's `/v1/models` endpoint.
+///
+/// Everything past `provider`/`model` is optional because the two response shapes carry different
+/// amounts: the OpenAI-compatible one usually just names ids, while a harness catalog fills all of
+/// it in.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DiscoveredModel {
     pub provider: String,
     pub model: String,
     pub context_window: Option<u32>,
+    pub display_name: Option<String>,
+    /// `None` is "the endpoint said nothing about efforts"; `Some([])` is "it said there are none".
+    /// Collapsing the two would let the harness-catalog overlay hand a model effort levels its own
+    /// provider just said it does not have.
+    pub reasoning_efforts: Option<Vec<String>>,
+    /// The catalog's ordering key, when it gave one. Codex sorts by this before building its
+    /// picker list, so a provider serving that shape is stating an order and not just a set.
+    pub priority: Option<i64>,
 }
 
 /// Merge dynamically discovered models over a static descriptor list. Static/config entries win;
@@ -252,6 +431,15 @@ pub fn merge_models(
             );
             if let Some(context_window) = discovered.context_window.filter(|window| *window > 0) {
                 descriptor.context_window = context_window;
+            }
+            descriptor.display_name = discovered.display_name.clone();
+            // An advertised effort list is also the answer to whether the selector is shown at all,
+            // so the two move together — including when the answer is "none", which is why this
+            // turns on `Some` rather than on a non-empty list. Silence leaves the conservative
+            // default for the harness catalog overlay (§8.3) to fill in later.
+            if let Some(efforts) = &discovered.reasoning_efforts {
+                descriptor.supports_reasoning_effort = !efforts.is_empty();
+                descriptor.reasoning_efforts = efforts.clone();
             }
             base.push(descriptor);
         }
@@ -292,6 +480,196 @@ pub fn validate_provider_ids(
         .collect()
 }
 
+/// What one discovery pass produced.
+pub struct Discovery {
+    /// The static list with everything discovered merged over it.
+    pub models: Vec<ModelDescriptor>,
+    pub warnings: Vec<ModelListingWarning>,
+    /// `(provider, model)` pairs whose reasoning efforts a provider stated — including stating that
+    /// there are none. The harness catalog overlay leaves these alone: `model/list` is keyed by
+    /// model id and knows nothing about providers, so it can only ever describe some model of that
+    /// name (§8.3).
+    pub efforts_from_discovery: HashSet<(String, String)>,
+}
+
+/// The discovery URL, identifying the harness to the provider when the harness knows its own
+/// version.
+///
+/// A provider that serves the harness's catalog decides what to answer from `client_version` — it
+/// is how the harness asks for the richer shape (§8.3). It is sent to every provider, not only the
+/// ones known to serve that shape: an OpenAI-compatible endpoint ignores a query parameter it does
+/// not know, and gating on how a provider authenticates would deny the richer catalog to one that
+/// serves it with a plain `env_key`.
+fn models_url(base_url: &str, client_version: Option<&str>) -> String {
+    // Split any query off first: appending the path to a base_url that already carries one would
+    // bury `/models` inside the query string.
+    let (path, query) = match base_url.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (base_url, None),
+    };
+    let mut url = format!("{}/models", path.trim_end_matches('/'));
+    if let Some(query) = query.filter(|query| !query.is_empty()) {
+        url.push('?');
+        url.push_str(query);
+    }
+    // Only a harness that reports something usable gets to shape the URL. The trait lets a harness
+    // return any string, and one carrying a space or an `&` would either corrupt the query or be
+    // rejected by the HTTP client — failing discovery for every provider over a value that is
+    // nothing but an identifier.
+    if let Some(version) = client_version.filter(|version| is_url_safe_version(version)) {
+        url.push(if url.contains('?') { '&' } else { '?' });
+        url.push_str("client_version=");
+        url.push_str(version);
+    }
+    url
+}
+
+/// Whether a harness-reported version can go in a query string as-is.
+///
+/// Deliberately narrow — versions are digits, dots, and at most a dash or plus suffix — so this
+/// needs no percent-encoding and a harness cannot inject query structure through it.
+fn is_url_safe_version(version: &str) -> bool {
+    !version.is_empty()
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+' | b'_' | b'~'))
+}
+
+/// Read a `/models` body, taking whatever each of the two shapes has to offer.
+///
+/// Sending `client_version` asks for the harness catalog; it does not guarantee one. A provider may
+/// answer the OpenAI-compatible shape regardless, or — with `data` and `models` being different
+/// keys — answer both at once. So both are read from a single parse and combined per model id,
+/// with the catalog winning field by field: it is the shape that actually carries metadata, and
+/// where it stays silent the OpenAI entry still fills the gap rather than being discarded.
+///
+/// A body carrying neither key is an error, not an empty listing.
+fn parse_models_body(body: &[u8], provider: &str) -> Result<Vec<(DiscoveredModel, bool)>, String> {
+    let parsed: ModelsBody =
+        serde_json::from_slice(body).map_err(|e| format!("unparseable /models response: {e}"))?;
+    let catalog = model_entries(parsed.models, provider, "models");
+    let openai = model_entries(parsed.data, provider, "data");
+    if catalog.is_none() && openai.is_none() {
+        return Err("/models response has neither a `models` nor a `data` list".to_string());
+    }
+
+    // Insertion-ordered so the picker keeps the order the provider listed, and so a catalog entry
+    // refines an OpenAI one in place rather than jumping to the end.
+    let mut out: IndexMap<String, (DiscoveredModel, bool)> = IndexMap::new();
+
+    for entry in openai.unwrap_or_default() {
+        let model: OpenAiModel = match serde_json::from_value(entry) {
+            Ok(model) => model,
+            Err(e) => {
+                warn!(
+                    provider = %provider,
+                    error = %e,
+                    action = "discover_models",
+                    "skipping an unreadable entry in the /models data list"
+                );
+                continue;
+            }
+        };
+        let context_window = parse_discovered_capacity(model.context_window.as_ref());
+        let max_input_tokens = parse_discovered_capacity(model.max_input_tokens.as_ref());
+        let invalid = context_window.is_err() || max_input_tokens.is_err();
+        if invalid {
+            warn!(
+                provider = %provider,
+                model = %model.id,
+                context_window = ?model.context_window,
+                max_input_tokens = ?model.max_input_tokens,
+                action = "discover_models",
+                "ignoring invalid model capacity metadata"
+            );
+        }
+        out.insert(
+            model.id.clone(),
+            (
+                DiscoveredModel {
+                    provider: provider.to_string(),
+                    model: model.id,
+                    context_window: context_window
+                        .ok()
+                        .flatten()
+                        .or_else(|| max_input_tokens.ok().flatten()),
+                    ..DiscoveredModel::default()
+                },
+                invalid,
+            ),
+        );
+    }
+
+    for entry in catalog.unwrap_or_default() {
+        let model: HarnessCatalogModel = match serde_json::from_value(entry) {
+            Ok(model) => model,
+            Err(e) => {
+                // One entry Giskard cannot read is not a reason to drop the rest, nor the `data`
+                // list beside it.
+                warn!(
+                    provider = %provider,
+                    error = %e,
+                    action = "discover_models",
+                    "skipping an unreadable entry in the /models catalog list"
+                );
+                continue;
+            }
+        };
+        if !model.listed() {
+            // Hidden in the catalog means hidden, even if the OpenAI list named it.
+            out.shift_remove(&model.slug);
+            continue;
+        }
+        let (context_window, invalid_window) = model.context_window();
+        if invalid_window {
+            warn!(
+                provider = %provider,
+                model = %model.slug,
+                context_window = ?model.context_window,
+                max_context_window = ?model.max_context_window,
+                action = "discover_models",
+                "ignoring invalid model capacity metadata"
+            );
+        }
+        let entry = out.entry(model.slug.clone()).or_insert_with(|| {
+            (
+                DiscoveredModel {
+                    provider: provider.to_string(),
+                    model: model.slug.clone(),
+                    ..DiscoveredModel::default()
+                },
+                false,
+            )
+        });
+        // Field by field: the catalog wins where it says something, and leaves what it does not
+        // mention as the OpenAI entry had it.
+        if let Some(window) = context_window {
+            entry.0.context_window = Some(window);
+        }
+        if let Some(name) = model.display_name() {
+            entry.0.display_name = Some(name);
+        }
+        if let Some(efforts) = model.reasoning_efforts() {
+            entry.0.reasoning_efforts = Some(efforts);
+        }
+        if let Some(priority) = model.priority() {
+            entry.0.priority = Some(priority);
+        }
+        entry.1 |= invalid_window;
+    }
+
+    // Codex sorts the catalog by `priority` before building its picker list, so a provider serving
+    // that shape is stating an order. Sorted per provider rather than globally: the picker's
+    // top-level order is the `[providers.<id>]` declaration order, which a global sort would
+    // interleave. Stable, so anything without a priority keeps the order the provider listed it in.
+    out.sort_by(|_, a, _, b| {
+        a.0.priority
+            .unwrap_or(i64::MAX)
+            .cmp(&b.0.priority.unwrap_or(i64::MAX))
+    });
+    Ok(out.into_values().collect())
+}
+
 /// Refresh the model list by querying `GET {base_url}/models` for every provider that advertises
 /// `model_listing`, merging the results over the static list (§8.3).
 ///
@@ -307,7 +685,8 @@ pub fn validate_provider_ids(
 pub async fn discover_models(
     config: &Config,
     harness_providers: &[HarnessProvider],
-) -> (Vec<ModelDescriptor>, Vec<ModelListingWarning>) {
+    client_version: Option<&str>,
+) -> Discovery {
     let base = list_descriptors(config);
     let mut warnings: Vec<ModelListingWarning> = Vec::new();
 
@@ -318,7 +697,11 @@ pub async fn discover_models(
         Ok(c) => c,
         Err(e) => {
             warn!(%e, "cannot build HTTP client; returning static model list");
-            return (base, warnings);
+            return Discovery {
+                models: base,
+                warnings,
+                efforts_from_discovery: HashSet::new(),
+            };
         }
     };
 
@@ -346,7 +729,7 @@ pub async fn discover_models(
             });
             continue;
         };
-        let url = format!("{}/models", base_url.trim_end_matches('/'));
+        let url = models_url(base_url, client_version);
 
         let mut fail = |message: String| {
             warn!(provider = %id, %url, %message, "model discovery failed; skipping provider");
@@ -399,34 +782,19 @@ pub async fn discover_models(
                     fail(format!("model listing returned HTTP {status}{hint}"));
                     continue;
                 }
-                match resp.json::<OpenAiModelsResponse>().await {
-                    Ok(body) => {
-                        for model in body.data {
-                            let context_window =
-                                parse_discovered_capacity(model.context_window.as_ref());
-                            let max_input_tokens =
-                                parse_discovered_capacity(model.max_input_tokens.as_ref());
-                            if context_window.is_err() || max_input_tokens.is_err() {
-                                warn!(
-                                    provider = %id,
-                                    model = %model.id,
-                                    context_window = ?model.context_window,
-                                    max_input_tokens = ?model.max_input_tokens,
-                                    "ignoring invalid model capacity metadata"
-                                );
-                                invalid_metadata_models.push(model.id.clone());
+                match resp.bytes().await {
+                    Ok(body) => match parse_models_body(&body, id) {
+                        Ok(models) => {
+                            for (model, invalid_metadata) in models {
+                                if invalid_metadata {
+                                    invalid_metadata_models.push(model.model.clone());
+                                }
+                                dynamic.push(model);
                             }
-                            dynamic.push(DiscoveredModel {
-                                provider: id.clone(),
-                                model: model.id,
-                                context_window: context_window
-                                    .ok()
-                                    .flatten()
-                                    .or_else(|| max_input_tokens.ok().flatten()),
-                            });
                         }
-                    }
-                    Err(e) => fail(format!("unparseable /models response: {e}")),
+                        Err(e) => fail(e),
+                    },
+                    Err(e) => fail(format!("could not read the /models response: {e}")),
                 }
             }
             Err(e) => fail(format!("could not reach {url}: {e}")),
@@ -442,7 +810,18 @@ pub async fn discover_models(
         }
     }
 
-    (merge_models(base, &dynamic), warnings)
+    // Which pairs a provider actually spoke about, so the harness-catalog overlay can tell "nobody
+    // said" from "the provider said none" (§8.3).
+    let efforts_from_discovery = dynamic
+        .iter()
+        .filter(|model| model.reasoning_efforts.is_some())
+        .map(|model| (model.provider.clone(), model.model.clone()))
+        .collect();
+    Discovery {
+        models: merge_models(base, &dynamic),
+        warnings,
+        efforts_from_discovery,
+    }
 }
 
 #[cfg(test)]
@@ -536,6 +915,421 @@ model_listing = true
     }
 
     #[test]
+    fn models_url_identifies_the_harness_when_it_knows_its_version() {
+        assert_eq!(
+            models_url("https://api.example/v1", Some("0.58.0")),
+            "https://api.example/v1/models?client_version=0.58.0"
+        );
+        // A trailing slash must not produce `//models`.
+        assert_eq!(
+            models_url("https://api.example/v1/", Some("0.58.0")),
+            "https://api.example/v1/models?client_version=0.58.0"
+        );
+        // A base_url that already carries a query keeps it.
+        assert_eq!(
+            models_url("https://api.example/v1?tenant=a", Some("0.58.0")),
+            "https://api.example/v1/models?tenant=a&client_version=0.58.0"
+        );
+        // Unknown version ⇒ no parameter at all rather than an empty one.
+        assert_eq!(
+            models_url("https://api.example/v1", None),
+            "https://api.example/v1/models"
+        );
+        // A harness may return any string; one that cannot go in a query as-is is dropped rather
+        // than corrupting the URL for every provider.
+        for unusable in ["", "0.1 0", "0.1&x=y", "0.1?x", "0.1/../"] {
+            assert_eq!(
+                models_url("https://api.example/v1", Some(unusable)),
+                "https://api.example/v1/models",
+                "{unusable:?} should not reach the query"
+            );
+        }
+    }
+
+    /// The shape a provider serves a harness that identified itself: the metadata Giskard otherwise
+    /// has to be told by hand, including the context window no harness reports over its protocol.
+    #[test]
+    fn a_harness_catalog_body_supplies_the_metadata_config_would_have_to_declare() {
+        let body = br#"{
+            "models": [
+                {
+                    "slug": "gpt-5.5",
+                    "display_name": "GPT-5.5",
+                    "context_window": 262144,
+                    "supported_reasoning_levels": [
+                        { "effort": "low", "description": "fast" },
+                        { "effort": "high", "description": "thorough" }
+                    ],
+                    "visibility": "list"
+                },
+                { "slug": "internal-eval", "visibility": "hide" },
+                { "slug": "retired", "visibility": "none" },
+                { "slug": "unlabelled" }
+            ]
+        }"#;
+        let parsed = parse_models_body(body, "opencodex").expect("the catalog shape should parse");
+        let ids: Vec<&str> = parsed.iter().map(|(m, _)| m.model.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["gpt-5.5", "unlabelled"],
+            "hidden models stay out of the picker; an absent visibility is not hidden"
+        );
+
+        let (rich, invalid) = &parsed[0];
+        assert!(!invalid);
+        assert_eq!(rich.provider, "opencodex");
+        assert_eq!(rich.context_window, Some(262_144));
+        assert_eq!(rich.display_name.as_deref(), Some("GPT-5.5"));
+        assert_eq!(
+            rich.reasoning_efforts.as_deref(),
+            Some(&["low".to_string(), "high".to_string()][..])
+        );
+    }
+
+    /// Codex separates the default effort from the selectable alternatives and treats a non-`none`
+    /// default as the sole choice when there are no alternatives. `map_model` already normalizes
+    /// that for the `model/list` path; the catalog path must agree, or a default-only reasoning
+    /// model reads as non-reasoning.
+    #[test]
+    fn a_default_only_reasoning_model_keeps_its_effort() {
+        let parsed = parse_models_body(
+            br#"{ "models": [
+                { "slug": "default-only", "default_reasoning_level": "medium",
+                  "supported_reasoning_levels": [] },
+                { "slug": "default-and-list", "default_reasoning_level": "medium",
+                  "supported_reasoning_levels": [ { "effort": "low" }, { "effort": "high" } ] },
+                { "slug": "explicitly-none", "default_reasoning_level": "none",
+                  "supported_reasoning_levels": [] },
+                { "slug": "said-nothing" }
+            ] }"#,
+            "p",
+        )
+        .unwrap();
+        let by_id: std::collections::HashMap<&str, &DiscoveredModel> =
+            parsed.iter().map(|(m, _)| (m.model.as_str(), m)).collect();
+
+        assert_eq!(
+            by_id["default-only"].reasoning_efforts.as_deref(),
+            Some(&["medium".to_string()][..]),
+            "a default with no alternatives is the sole effort"
+        );
+        assert_eq!(
+            by_id["default-and-list"].reasoning_efforts.as_deref(),
+            Some(&["low".to_string(), "high".to_string()][..]),
+            "alternatives win when present; the default is not appended"
+        );
+        assert_eq!(
+            by_id["explicitly-none"].reasoning_efforts.as_deref(),
+            Some(&[][..]),
+            "`none` is not an effort, and an empty list is still an answer"
+        );
+        assert_eq!(
+            by_id["said-nothing"].reasoning_efforts, None,
+            "no keys at all is silence, which the harness catalog may fill"
+        );
+    }
+
+    /// Codex resolves a model's window as `context_window.or(max_context_window)`
+    /// (`ModelInfo::resolved_context_window`, with a test of its own upstream), so an entry
+    /// carrying only the maximum has a window — not the conservative fallback this whole shape
+    /// exists to avoid.
+    #[test]
+    fn a_catalog_window_falls_back_to_max_context_window() {
+        let parsed = parse_models_body(
+            br#"{ "models": [
+                { "slug": "both", "context_window": 262144, "max_context_window": 400000 },
+                { "slug": "max-only", "max_context_window": 400000 },
+                { "slug": "neither" },
+                { "slug": "bad-window-good-max", "context_window": "lots",
+                  "max_context_window": 400000 }
+            ] }"#,
+            "p",
+        )
+        .unwrap();
+        let by_id: std::collections::HashMap<&str, &(DiscoveredModel, bool)> = parsed
+            .iter()
+            .map(|entry| (entry.0.model.as_str(), entry))
+            .collect();
+
+        assert_eq!(
+            by_id["both"].0.context_window,
+            Some(262_144),
+            "the specific window wins over the maximum"
+        );
+        assert_eq!(by_id["max-only"].0.context_window, Some(400_000));
+        assert_eq!(by_id["neither"].0.context_window, None);
+        assert_eq!(
+            by_id["bad-window-good-max"].0.context_window,
+            Some(400_000),
+            "an unusable window still falls back"
+        );
+        assert!(
+            by_id["bad-window-good-max"].1,
+            "but the unusable field is still reported rather than hidden by the fallback"
+        );
+    }
+
+    /// The last structurally-typed field: a `supported_reasoning_levels` that is not a list must
+    /// cost that field, not the model — and must read as silence, since suppressing the harness
+    /// overlay on the strength of a malformed value is worse than filling it.
+    #[test]
+    fn a_non_list_effort_field_is_silence_not_a_dropped_model() {
+        let parsed = parse_models_body(
+            br#"{ "models": [
+                { "slug": "kept", "context_window": 262144,
+                  "supported_reasoning_levels": "high" }
+            ] }"#,
+            "p",
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 1, "the model survives");
+        assert_eq!(parsed[0].0.context_window, Some(262_144));
+        assert_eq!(
+            parsed[0].0.reasoning_efforts, None,
+            "a malformed field is not an answer about efforts"
+        );
+    }
+
+    /// Codex sorts the catalog by `priority` before building its picker list, so a provider serving
+    /// that shape is stating an order. Ties and unprioritized entries keep the listed order.
+    #[test]
+    fn a_stated_priority_orders_the_catalog() {
+        let parsed = parse_models_body(
+            br#"{ "models": [
+                { "slug": "third", "priority": 30 },
+                { "slug": "first", "priority": 10 },
+                { "slug": "unranked-a" },
+                { "slug": "second", "priority": 20 },
+                { "slug": "unranked-b" }
+            ] }"#,
+            "p",
+        )
+        .unwrap();
+        let ids: Vec<&str> = parsed.iter().map(|(m, _)| m.model.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["first", "second", "third", "unranked-a", "unranked-b"],
+            "ranked models come first in priority order, the rest keep the provider's order"
+        );
+    }
+
+    /// Field-by-field tolerance has to hold inside an entry too: a `display_name` that arrives as a
+    /// number costs the name, not the model.
+    #[test]
+    fn malformed_optional_metadata_costs_only_that_field() {
+        let parsed = parse_models_body(
+            br#"{ "models": [ {
+                "slug": "kept",
+                "display_name": 7,
+                "visibility": 1,
+                "priority": "high",
+                "context_window": 262144,
+                "supported_reasoning_levels": [ "low", { "effort": "high" }, { "nope": 1 } ]
+            } ] }"#,
+            "p",
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 1, "the entry survives its bad fields");
+        let model = &parsed[0].0;
+        assert_eq!(model.model, "kept");
+        assert_eq!(
+            model.context_window,
+            Some(262_144),
+            "the good fields still land"
+        );
+        assert_eq!(model.display_name, None, "a non-string name is no name");
+        assert_eq!(
+            model.reasoning_efforts.as_deref(),
+            Some(&["high".to_string()][..]),
+            "unreadable levels are skipped, the readable one is kept"
+        );
+        assert_eq!(
+            model.priority, None,
+            "a non-numeric priority is no priority"
+        );
+    }
+
+    /// The OpenAI-compatible shape still parses, and still carries only what it carried before.
+    #[test]
+    fn an_openai_body_still_parses() {
+        let body = br#"{ "data": [
+            { "id": "plain" },
+            { "id": "sized", "max_input_tokens": 131072 }
+        ] }"#;
+        let parsed = parse_models_body(body, "litellm").expect("the OpenAI shape should parse");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].0.model, "plain");
+        assert_eq!(parsed[0].0.context_window, None);
+        assert_eq!(parsed[0].0.display_name, None);
+        assert_eq!(
+            parsed[0].0.reasoning_efforts, None,
+            "the OpenAI shape says nothing about efforts"
+        );
+        assert_eq!(parsed[1].0.context_window, Some(131_072));
+    }
+
+    /// Capacity metadata that is present but unusable is reported, not silently dropped — in the
+    /// catalog shape the same way as in the OpenAI one.
+    #[test]
+    fn unusable_capacity_metadata_is_flagged_in_either_shape() {
+        let catalog = parse_models_body(
+            br#"{ "models": [ { "slug": "m", "context_window": "lots" } ] }"#,
+            "p",
+        )
+        .unwrap();
+        assert!(catalog[0].1, "catalog: invalid capacity should be flagged");
+        assert_eq!(catalog[0].0.context_window, None);
+
+        let openai = parse_models_body(
+            br#"{ "data": [ { "id": "m", "context_window": "lots" } ] }"#,
+            "p",
+        )
+        .unwrap();
+        assert!(openai[0].1, "openai: invalid capacity should be flagged");
+        assert_eq!(openai[0].0.context_window, None);
+    }
+
+    /// Asking for the catalog does not guarantee one, and `data`/`models` are different keys, so a
+    /// provider may answer both. Neither list may be dropped: the catalog refines, it does not
+    /// replace.
+    #[test]
+    fn both_lists_combine_with_the_catalog_taking_precedence() {
+        let body = br#"{
+            "data": [
+                { "id": "shared", "context_window": 8192 },
+                { "id": "openai-only", "max_input_tokens": 4096 }
+            ],
+            "models": [
+                {
+                    "slug": "shared",
+                    "display_name": "Shared",
+                    "context_window": 262144,
+                    "supported_reasoning_levels": [ { "effort": "high", "description": "d" } ]
+                },
+                { "slug": "catalog-only", "display_name": "Catalog Only" }
+            ]
+        }"#;
+        let parsed = parse_models_body(body, "opencodex").expect("both lists should parse");
+        let by_id: std::collections::HashMap<&str, &DiscoveredModel> =
+            parsed.iter().map(|(m, _)| (m.model.as_str(), m)).collect();
+        assert_eq!(by_id.len(), 3, "no model may be dropped: {parsed:?}");
+
+        // Present in both ⇒ the catalog's richer values win.
+        let shared = by_id["shared"];
+        assert_eq!(shared.context_window, Some(262_144));
+        assert_eq!(shared.display_name.as_deref(), Some("Shared"));
+        assert_eq!(
+            shared.reasoning_efforts.as_deref(),
+            Some(&["high".to_string()][..])
+        );
+
+        // Present only in `data` ⇒ kept as it was.
+        let openai_only = by_id["openai-only"];
+        assert_eq!(openai_only.context_window, Some(4096));
+        assert_eq!(openai_only.display_name, None);
+
+        // Present only in `models` ⇒ added.
+        assert_eq!(
+            by_id["catalog-only"].display_name.as_deref(),
+            Some("Catalog Only")
+        );
+
+        // The provider's ordering survives, with a refined entry staying where it first appeared.
+        let ids: Vec<&str> = parsed.iter().map(|(m, _)| m.model.as_str()).collect();
+        assert_eq!(ids, ["shared", "openai-only", "catalog-only"]);
+    }
+
+    /// "Precedence" is per field, not wholesale: a catalog entry that says nothing about a window
+    /// must not erase one the OpenAI entry supplied.
+    #[test]
+    fn a_silent_catalog_field_does_not_erase_the_openai_value() {
+        let body = br#"{
+            "data": [ { "id": "m", "context_window": 8192 } ],
+            "models": [ { "slug": "m", "display_name": "M" } ]
+        }"#;
+        let parsed = parse_models_body(body, "p").unwrap();
+        assert_eq!(
+            parsed[0].0.context_window,
+            Some(8192),
+            "the window survives"
+        );
+        assert_eq!(parsed[0].0.display_name.as_deref(), Some("M"));
+    }
+
+    /// Hidden in the catalog means hidden, even when the OpenAI list named the same model.
+    #[test]
+    fn a_catalog_hidden_model_is_dropped_from_the_openai_list_too() {
+        let body = br#"{
+            "data": [ { "id": "internal" }, { "id": "public" } ],
+            "models": [ { "slug": "internal", "visibility": "hide" } ]
+        }"#;
+        let parsed = parse_models_body(body, "p").unwrap();
+        let ids: Vec<&str> = parsed.iter().map(|(m, _)| m.model.as_str()).collect();
+        assert_eq!(ids, ["public"]);
+    }
+
+    /// The two lists are independent claims. One unreadable entry — or a key a provider happens to
+    /// use for something else — must not take the other list down with it.
+    #[test]
+    fn a_bad_entry_or_key_does_not_discard_the_other_list() {
+        // `models` is not a list at all; `data` still serves.
+        let parsed = parse_models_body(
+            br#"{ "models": { "count": 2 }, "data": [ { "id": "kept" } ] }"#,
+            "p",
+        )
+        .expect("a non-list `models` should not fail the body");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0.model, "kept");
+
+        // One catalog entry is unreadable (no `slug`); its siblings and `data` survive.
+        let parsed = parse_models_body(
+            br#"{
+                "models": [ { "no_slug": true }, { "slug": "good" } ],
+                "data": [ { "id": "from-data" } ]
+            }"#,
+            "p",
+        )
+        .expect("one bad entry should not fail the body");
+        let ids: Vec<&str> = parsed.iter().map(|(m, _)| m.model.as_str()).collect();
+        assert_eq!(ids, ["from-data", "good"]);
+
+        // Same in the other direction: an entry with no `id` does not cost the catalog.
+        let parsed = parse_models_body(
+            br#"{ "data": [ { "nope": 1 } ], "models": [ { "slug": "good" } ] }"#,
+            "p",
+        )
+        .expect("one bad data entry should not fail the body");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0.model, "good");
+    }
+
+    #[test]
+    fn a_body_in_neither_shape_is_an_error() {
+        parse_models_body(br#"{ "unexpected": true }"#, "p")
+            .expect_err("neither shape ⇒ report it rather than silently finding no models");
+    }
+
+    /// Discovery metadata reaches the picker: a catalog-sourced model arrives with its window,
+    /// name, and effort list rather than the conservative default.
+    #[test]
+    fn merge_carries_catalog_metadata_onto_new_models() {
+        let discovered = DiscoveredModel {
+            provider: "opencodex".into(),
+            model: "gpt-5.5".into(),
+            context_window: Some(262_144),
+            display_name: Some("GPT-5.5".into()),
+            reasoning_efforts: Some(vec!["low".into(), "high".into()]),
+            priority: None,
+        };
+        let merged = merge_models(Vec::new(), std::slice::from_ref(&discovered));
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].context_window, 262_144);
+        assert_eq!(merged[0].display_name.as_deref(), Some("GPT-5.5"));
+        assert!(merged[0].supports_reasoning_effort);
+        assert_eq!(merged[0].reasoning_efforts, ["low", "high"]);
+    }
+
+    #[test]
     fn merge_keeps_static_and_adds_dynamic() {
         let base = list_descriptors(&config_with_glm()); // one static config entry
         let dynamic = vec![
@@ -544,18 +1338,21 @@ model_listing = true
                 provider: "cloudflare-litellm".into(),
                 model: "@cf/z-ai/glm-4.7".into(),
                 context_window: Some(1),
+                ..DiscoveredModel::default()
             },
             // New id with no metadata ⇒ added with a conservative descriptor.
             DiscoveredModel {
                 provider: "cloudflare-litellm".into(),
                 model: "@cf/meta/llama-4".into(),
                 context_window: None,
+                ..DiscoveredModel::default()
             },
             // A provider-advertised context window is retained for a new model.
             DiscoveredModel {
                 provider: "cloudflare-litellm".into(),
                 model: "provider-sized".into(),
                 context_window: Some(258_400),
+                ..DiscoveredModel::default()
             },
         ];
         let merged = merge_models(base, &dynamic);
@@ -626,7 +1423,7 @@ model_listing = true
             },
         ];
 
-        let merged = apply_harness_metadata(base, &harness, &config);
+        let merged = apply_harness_metadata(base, &harness, &config, &HashSet::new());
 
         // Not config-declared: name filled and the catalog's exact efforts applied.
         let gpt = merged.iter().find(|d| d.model == "gpt-5.5").unwrap();
@@ -645,6 +1442,117 @@ model_listing = true
         assert_eq!(glm.display_name.as_deref(), Some("GLM-4.7"));
         assert!(!glm.supports_reasoning_effort);
         assert!(glm.reasoning_efforts.is_empty());
+    }
+
+    /// A provider's own catalog outranks `model/list` on effort levels, per §8.3: `model/list` is
+    /// keyed by model id and knows nothing about providers, so it must not replace the levels a
+    /// specific provider advertised for its own model. Without this, the whole point of reading the
+    /// richer shape is undone for any model whose id the harness happens to share.
+    #[test]
+    fn discovered_efforts_survive_the_harness_overlay() {
+        let config: Config = toml::from_str("").unwrap();
+        // What discovery produced: the provider advertised three levels for its own model.
+        let discovered = ModelDescriptor {
+            provider: "opencodex".into(),
+            model: "gpt-5.5".into(),
+            context_window: 262_144,
+            supports_reasoning_effort: true,
+            reasoning_efforts: vec!["low".into(), "high".into(), "xhigh".into()],
+            display_name: Some("GPT-5.5".into()),
+            is_default: false,
+        };
+        // What `model/list` says about a model with the same id, under no provider at all.
+        let harness = vec![ModelDescriptor {
+            provider: String::new(),
+            model: "gpt-5.5".into(),
+            context_window: 0,
+            supports_reasoning_effort: true,
+            reasoning_efforts: vec!["low".into(), "medium".into()],
+            display_name: Some("Other".into()),
+            is_default: false,
+        }];
+
+        // Discovery spoke about this pair, so the overlay must leave its efforts alone.
+        let stated = HashSet::from([("opencodex".to_string(), "gpt-5.5".to_string())]);
+        let out = apply_harness_metadata(vec![discovered], &harness, &config, &stated);
+        assert_eq!(
+            out[0].reasoning_efforts,
+            ["low", "high", "xhigh"],
+            "the provider's advertised levels must survive"
+        );
+        assert!(out[0].supports_reasoning_effort);
+        assert_eq!(
+            out[0].display_name.as_deref(),
+            Some("GPT-5.5"),
+            "and its name, which was already guarded"
+        );
+    }
+
+    /// A provider that says a model has *no* effort levels is making a statement, not leaving a
+    /// gap. The harness catalog must not answer it — `model/list` is keyed by model id and would
+    /// hand the model levels its own provider just disclaimed.
+    #[test]
+    fn a_provider_saying_no_efforts_is_not_a_gap_to_fill() {
+        let config: Config = toml::from_str("").unwrap();
+        let discovered = ModelDescriptor {
+            provider: "opencodex".into(),
+            model: "gpt-5.5".into(),
+            context_window: 262_144,
+            supports_reasoning_effort: false,
+            reasoning_efforts: Vec::new(),
+            display_name: None,
+            is_default: false,
+        };
+        let harness = vec![ModelDescriptor {
+            provider: String::new(),
+            model: "gpt-5.5".into(),
+            context_window: 0,
+            supports_reasoning_effort: true,
+            reasoning_efforts: vec!["low".into(), "medium".into()],
+            display_name: None,
+            is_default: false,
+        }];
+
+        let stated = HashSet::from([("opencodex".to_string(), "gpt-5.5".to_string())]);
+        let out = apply_harness_metadata(vec![discovered], &harness, &config, &stated);
+        assert!(
+            out[0].reasoning_efforts.is_empty(),
+            "an explicit 'none' must not be topped up: {:?}",
+            out[0].reasoning_efforts
+        );
+        assert!(
+            !out[0].supports_reasoning_effort,
+            "and the selector stays hidden"
+        );
+    }
+
+    /// The gap-filling still works: a model discovery only named takes the harness's levels.
+    #[test]
+    fn the_harness_overlay_still_fills_an_empty_effort_list() {
+        let config: Config = toml::from_str("").unwrap();
+        let discovered = ModelDescriptor {
+            provider: "litellm".into(),
+            model: "gpt-5.5".into(),
+            context_window: 128_000,
+            supports_reasoning_effort: false,
+            reasoning_efforts: Vec::new(),
+            display_name: None,
+            is_default: false,
+        };
+        let harness = vec![ModelDescriptor {
+            provider: String::new(),
+            model: "gpt-5.5".into(),
+            context_window: 0,
+            supports_reasoning_effort: true,
+            reasoning_efforts: vec!["low".into(), "medium".into()],
+            display_name: Some("GPT-5.5".into()),
+            is_default: false,
+        }];
+
+        let out = apply_harness_metadata(vec![discovered], &harness, &config, &HashSet::new());
+        assert_eq!(out[0].reasoning_efforts, ["low", "medium"]);
+        assert!(out[0].supports_reasoning_effort);
+        assert_eq!(out[0].display_name.as_deref(), Some("GPT-5.5"));
     }
 
     #[test]
@@ -704,7 +1612,7 @@ model_listing = true
             // no entry for "unknown-to-harness"
         ];
 
-        let merged = apply_harness_metadata(base, &harness, &config);
+        let merged = apply_harness_metadata(base, &harness, &config, &HashSet::new());
         let get = |m: &str| merged.iter().find(|d| d.model == m).cloned().unwrap();
 
         // Declared + config name: name kept; efforts NOT overlaid (config wins for declared models).
@@ -757,7 +1665,7 @@ model_listing = true
             display_name: Some("GPT-5.5".into()),
             is_default: false,
         }];
-        let merged = apply_harness_metadata(base.clone(), &unsupported, &config);
+        let merged = apply_harness_metadata(base.clone(), &unsupported, &config, &HashSet::new());
         assert!(!merged[0].supports_reasoning_effort);
         assert!(merged[0].reasoning_efforts.is_empty());
 
@@ -770,7 +1678,7 @@ model_listing = true
             display_name: Some("GPT-5.5".into()),
             is_default: false,
         }];
-        let merged = apply_harness_metadata(base, &default_only, &config);
+        let merged = apply_harness_metadata(base, &default_only, &config, &HashSet::new());
         assert!(merged[0].supports_reasoning_effort);
         assert!(merged[0].reasoning_efforts.is_empty());
     }
@@ -864,7 +1772,7 @@ model_listing = true
             is_default: false,
         }];
 
-        let merged = apply_harness_metadata(base, &harness, &config);
+        let merged = apply_harness_metadata(base, &harness, &config, &HashSet::new());
         assert!(merged[0].supports_reasoning_effort);
         assert_eq!(merged[0].reasoning_efforts, vec!["focused"]);
     }

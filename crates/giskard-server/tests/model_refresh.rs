@@ -29,6 +29,8 @@ struct DiffFactory {
     providers: Vec<HarnessProvider>,
     /// The model the harness reports for a thread imported by native id, when a test asserts on it.
     imported_model: Option<giskard_core::model::ModelRef>,
+    /// The version the harness reports, sent to a provider's `/models` as `client_version`.
+    client_version: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -45,6 +47,10 @@ impl HarnessFactory for DiffFactory {
         };
         let harness = match &self.imported_model {
             Some(model) => harness.with_imported_model(model.clone()),
+            None => harness,
+        };
+        let harness = match &self.client_version {
+            Some(version) => harness.with_client_version(version.clone()),
             None => harness,
         };
         Ok(Arc::new(harness))
@@ -168,7 +174,7 @@ async fn dynamic_model_refresh_merges_provider_listing() {
     let mock_addr = mock_listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(mock_listener, mock).await.unwrap() });
 
-    let port = 19201;
+    let (listener, port) = ephemeral_listener().await;
     let tmp = tempfile::TempDir::new().unwrap();
     let hash = password_hash("testpass");
     // Provider points at the mock; model_listing enabled; one static model.
@@ -214,13 +220,11 @@ model_listing = true
                 base_url: Some(format!("http://{mock_addr}")),
                 auth: None,
             }],
+            client_version: None,
         }),
         (0..32u8).collect(),
     );
     let app = build_app(state);
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     let base = format!("http://127.0.0.1:{port}");
@@ -350,7 +354,7 @@ async fn dynamic_model_refresh_sends_api_key() {
     let mock_addr = mock_listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(mock_listener, mock).await.unwrap() });
 
-    let port = 19209;
+    let (listener, port) = ephemeral_listener().await;
     let tmp = tempfile::TempDir::new().unwrap();
     let hash = password_hash("testpass");
     tokio::fs::write(
@@ -379,6 +383,7 @@ model_listing = true
         Arc::new(DiffFactory {
             fixture: make_fixture(),
             imported_model: None,
+            client_version: None,
             providers: vec![HarnessProvider {
                 id: "secured".into(),
                 name: Some("Secured".into()),
@@ -389,9 +394,6 @@ model_listing = true
         (0..32u8).collect(),
     );
     let app = build_app(state);
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     let base = format!("http://127.0.0.1:{port}");
@@ -437,7 +439,7 @@ async fn dynamic_model_refresh_reports_failure() {
     let mock_addr = mock_listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(mock_listener, mock).await.unwrap() });
 
-    let port = 19210;
+    let (listener, port) = ephemeral_listener().await;
     let tmp = tempfile::TempDir::new().unwrap();
     let hash = password_hash("testpass");
     // model_listing enabled but the harness reports no key env var ⇒ the mock rejects with 401.
@@ -467,6 +469,7 @@ model_listing = true
         Arc::new(DiffFactory {
             fixture: make_fixture(),
             imported_model: None,
+            client_version: None,
             providers: vec![HarnessProvider {
                 id: "secured".into(),
                 name: Some("Secured".into()),
@@ -477,9 +480,6 @@ model_listing = true
         (0..32u8).collect(),
     );
     let app = build_app(state);
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     let base = format!("http://127.0.0.1:{port}");
@@ -517,7 +517,7 @@ model_listing = true
 /// point: the alternative is a provider-side `model_not_found` in the middle of a turn.
 #[tokio::test]
 async fn unknown_provider_id_is_reported_against_the_harness_table() {
-    let port = 19211;
+    let (listener, port) = ephemeral_listener().await;
     let tmp = tempfile::TempDir::new().unwrap();
     let hash = password_hash("testpass");
     tokio::fs::write(
@@ -548,6 +548,7 @@ session_days = 30
         Arc::new(DiffFactory {
             fixture: make_fixture(),
             imported_model: None,
+            client_version: None,
             // The harness knows "openai" — nothing named "typoed".
             providers: vec![HarnessProvider {
                 id: "openai".into(),
@@ -559,9 +560,6 @@ session_days = 30
         (0..32u8).collect(),
     );
     let app = build_app(state);
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     let base = format!("http://127.0.0.1:{port}");
@@ -606,7 +604,7 @@ session_days = 30
 /// every configured id as unknown: no table is not the same as an empty table.
 #[tokio::test]
 async fn provider_ids_are_not_validated_without_a_harness_table() {
-    let port = 19212;
+    let (listener, port) = ephemeral_listener().await;
     let tmp = tempfile::TempDir::new().unwrap();
     let hash = password_hash("testpass");
     tokio::fs::write(
@@ -638,14 +636,12 @@ session_days = 30
         Arc::new(DiffFactory {
             fixture: make_fixture(),
             imported_model: None,
+            client_version: None,
             providers: Vec::new(),
         }),
         (0..32u8).collect(),
     );
     let app = build_app(state);
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     let base = format!("http://127.0.0.1:{port}");
@@ -676,7 +672,7 @@ session_days = 30
 /// a short list with no explanation is the failure mode this warning exists to prevent.
 #[tokio::test]
 async fn model_listing_without_a_harness_table_explains_why_discovery_did_not_run() {
-    let port = 19213;
+    let (listener, port) = ephemeral_listener().await;
     let tmp = tempfile::TempDir::new().unwrap();
     let hash = password_hash("testpass");
     tokio::fs::write(
@@ -709,14 +705,12 @@ model_listing = true
         Arc::new(DiffFactory {
             fixture: make_fixture(),
             imported_model: None,
+            client_version: None,
             providers: Vec::new(),
         }),
         (0..32u8).collect(),
     );
     let app = build_app(state);
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     let base = format!("http://127.0.0.1:{port}");
@@ -785,7 +779,6 @@ async fn dynamic_model_refresh_runs_a_provider_auth_command() {
 
     // The trailing newline `echo` adds must not reach the header: the token is trimmed.
     let ids = discover_with_auth(
-        19214,
         mock_addr,
         ProviderAuth::Command(ProviderAuthCommand {
             command: "sh".into(),
@@ -823,7 +816,6 @@ async fn a_failing_provider_auth_command_is_reported() {
     tokio::spawn(async move { axum::serve(mock_listener, mock).await.unwrap() });
 
     let (ids, warnings) = discover_with_auth(
-        19215,
         mock_addr,
         ProviderAuth::Command(ProviderAuthCommand {
             command: "sh".into(),
@@ -853,13 +845,25 @@ async fn a_failing_provider_auth_command_is_reported() {
     }
 }
 
+/// A listener on a port the OS picked, and that port.
+///
+/// The mock providers here already bind `:0`; the server under test used to take a hard-coded one,
+/// which fails whenever anything else on the machine happens to hold it. Bound before the config is
+/// written so the real port can go into `[server] bind` — inert for these tests, which serve on
+/// this listener directly, but worth keeping honest.
+async fn ephemeral_listener() -> (tokio::net::TcpListener, u16) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    (listener, port)
+}
+
 /// Stand up a server whose single `model_listing` provider authenticates the given way, and return
 /// the discovered model ids plus the catalog warnings.
 async fn discover_with_auth(
-    port: u16,
     mock_addr: std::net::SocketAddr,
     auth: ProviderAuth,
 ) -> (Vec<String>, Vec<String>) {
+    let (listener, port) = ephemeral_listener().await;
     let tmp = tempfile::TempDir::new().unwrap();
     let hash = password_hash("testpass");
     tokio::fs::write(
@@ -888,6 +892,7 @@ model_listing = true
         Arc::new(DiffFactory {
             fixture: make_fixture(),
             imported_model: None,
+            client_version: None,
             providers: vec![HarnessProvider {
                 id: "secured".into(),
                 name: Some("Secured".into()),
@@ -898,9 +903,6 @@ model_listing = true
         (0..32u8).collect(),
     );
     let app = build_app(state);
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     let base = format!("http://127.0.0.1:{port}");
@@ -931,4 +933,182 @@ model_listing = true
         })
         .unwrap_or_default();
     (ids, warnings)
+}
+
+/// End to end: a provider serving the harness catalog needs no `[[providers.<id>.models]]` at all.
+/// The context window, display name, and effort list all come from the endpoint — the window in
+/// particular is the field no harness reports over its own protocol, which is the whole reason
+/// Giskard asks for this shape rather than reading it back from `model/list`.
+#[tokio::test]
+async fn a_harness_catalog_provider_needs_no_declared_models() {
+    let seen_query = Arc::new(std::sync::Mutex::new(None::<String>));
+    let recorder = seen_query.clone();
+    let mock = Router::new().route(
+        "/models",
+        get(move |uri: axum::http::Uri| {
+            let recorder = recorder.clone();
+            async move {
+                *recorder.lock().unwrap() = uri.query().map(str::to_string);
+                AxumJson(serde_json::json!({
+                    "models": [
+                        {
+                            "slug": "gpt-5.5",
+                            "display_name": "GPT-5.5",
+                            "context_window": 262144,
+                            "supported_reasoning_levels": [
+                                { "effort": "low", "description": "fast" },
+                                { "effort": "high", "description": "thorough" }
+                            ],
+                            "visibility": "list"
+                        },
+                        { "slug": "internal-eval", "visibility": "hide" }
+                    ]
+                }))
+            }
+        }),
+    );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(mock_listener, mock).await.unwrap() });
+
+    let (models, warnings) = discover_catalog(mock_addr, None).await;
+    assert!(
+        warnings.is_empty(),
+        "nothing should have gone wrong: {warnings:?}"
+    );
+
+    let ids: Vec<&str> = models
+        .iter()
+        .map(|m| m["model"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        ["gpt-5.5"],
+        "a hidden model stays out of the picker: {ids:?}"
+    );
+
+    let model = &models[0];
+    assert_eq!(model["context_window"], 262_144);
+    assert_eq!(model["display_name"], "GPT-5.5");
+    assert_eq!(
+        model["reasoning_efforts"],
+        serde_json::json!(["low", "high"])
+    );
+    assert_eq!(model["supports_reasoning_effort"], true);
+
+    // The replay harness reports no version, so nothing is claimed on its behalf.
+    assert_eq!(
+        seen_query.lock().unwrap().clone(),
+        None,
+        "a harness that does not know its version must not have one invented for it"
+    );
+}
+
+/// Stand up a server whose single `model_listing` provider declares no models, and return the
+/// composed catalog plus warnings.
+async fn discover_catalog(
+    mock_addr: std::net::SocketAddr,
+    client_version: Option<&str>,
+) -> (Vec<serde_json::Value>, Vec<String>) {
+    let (listener, port) = ephemeral_listener().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let hash = password_hash("testpass");
+    tokio::fs::write(
+        tmp.path().join("config.toml"),
+        format!(
+            r#"
+[server]
+bind = "127.0.0.1:{port}"
+secure_cookies = false
+
+[auth]
+password_hash = "{hash}"
+session_days = 30
+
+[providers.opencodex]
+model_listing = true
+"#
+        ),
+    )
+    .await
+    .unwrap();
+
+    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
+    let state = AppState::new(
+        store,
+        Arc::new(DiffFactory {
+            fixture: make_fixture(),
+            imported_model: None,
+            providers: vec![HarnessProvider {
+                id: "opencodex".into(),
+                name: Some("OpenCodex".into()),
+                base_url: Some(format!("http://{mock_addr}")),
+                auth: None,
+            }],
+            client_version: client_version.map(str::to_string),
+        }),
+        (0..32u8).collect(),
+    );
+    let app = build_app(state);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let base = format!("http://127.0.0.1:{port}");
+    let (client, cookie) = login(&base).await;
+    let project = create_project(&client, &base, &cookie).await;
+    let body: serde_json::Value = client
+        .get(format!("{base}/api/projects/{project}/models"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let models = body["models"].as_array().cloned().unwrap_or_default();
+    let warnings = body["warnings"]
+        .as_array()
+        .map(|w| {
+            w.iter()
+                .map(|e| e["message"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    (models, warnings)
+}
+
+/// A harness that knows its own version identifies itself on the discovery request, the way the
+/// harness would: a provider decides whether to serve its richer catalog from `client_version`.
+#[tokio::test]
+async fn a_known_harness_version_is_sent_as_client_version() {
+    let seen_query = Arc::new(std::sync::Mutex::new(None::<String>));
+    let recorder = seen_query.clone();
+    let mock = Router::new().route(
+        "/models",
+        get(move |uri: axum::http::Uri| {
+            let recorder = recorder.clone();
+            async move {
+                *recorder.lock().unwrap() = uri.query().map(str::to_string);
+                AxumJson(serde_json::json!({ "models": [ { "slug": "gpt-5.5" } ] }))
+            }
+        }),
+    );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(mock_listener, mock).await.unwrap() });
+
+    let (models, warnings) = discover_catalog(mock_addr, Some("0.58.0")).await;
+    assert!(
+        warnings.is_empty(),
+        "nothing should have gone wrong: {warnings:?}"
+    );
+    assert_eq!(
+        models.len(),
+        1,
+        "the catalog should have been read: {models:?}"
+    );
+    assert_eq!(
+        seen_query.lock().unwrap().clone(),
+        Some("client_version=0.58.0".to_string())
+    );
 }

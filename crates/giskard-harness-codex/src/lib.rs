@@ -759,6 +759,10 @@ pub struct CodexHarness {
     /// Kept so `list_providers` can resolve Codex's config for this project's directory: config is
     /// layered per-cwd, so the provider table is only correct when asked for the right root.
     workspace_root: PathBuf,
+    /// The running Codex's version, read from the initialize handshake's user agent. Sent as
+    /// `client_version` on `/models` discovery so a provider serving Codex's catalog answers
+    /// Giskard the way it would answer Codex (§8.3). `None` when the user agent did not parse.
+    client_version: Option<String>,
     cmd_tx: mpsc::Sender<QueuedHarnessCommand>,
     control_tx: mpsc::Sender<QueuedControlCommand>,
     senders: SenderMap,
@@ -770,9 +774,10 @@ pub struct CodexHarness {
 impl CodexHarness {
     pub async fn start(workspace_root: PathBuf) -> Result<Arc<Self>, HarnessError> {
         let workspace_root = normalize_workspace_root(workspace_root)?;
-        let mut client = start_codex_client(codex_codes::AppServerBuilder::new()).await?;
+        let (mut client, client_version) =
+            start_codex_client(codex_codes::AppServerBuilder::new()).await?;
         let writable_roots = configured_workspace_write_roots(&mut client, &workspace_root).await;
-        Self::spawn_harness(client, workspace_root, writable_roots)
+        Self::spawn_harness(client, workspace_root, writable_roots, client_version)
     }
 
     pub async fn start_with(
@@ -781,15 +786,16 @@ impl CodexHarness {
     ) -> Result<Arc<Self>, HarnessError> {
         let workspace_root = normalize_workspace_root(workspace_root)?;
         let builder = codex_codes::cli::AppServerBuilder::new().command(codex_path);
-        let mut client = start_codex_client(builder).await?;
+        let (mut client, client_version) = start_codex_client(builder).await?;
         let writable_roots = configured_workspace_write_roots(&mut client, &workspace_root).await;
-        Self::spawn_harness(client, workspace_root, writable_roots)
+        Self::spawn_harness(client, workspace_root, writable_roots, client_version)
     }
 
     fn spawn_harness<C>(
         client: C,
         workspace_root: PathBuf,
         writable_roots: Vec<PathBuf>,
+        client_version: Option<String>,
     ) -> Result<Arc<Self>, HarnessError>
     where
         C: CodexTransport + 'static,
@@ -801,6 +807,7 @@ impl CodexHarness {
 
         let harness = Arc::new(Self {
             workspace_root: workspace_root.clone(),
+            client_version,
             cmd_tx,
             control_tx,
             senders: senders.clone(),
@@ -883,15 +890,55 @@ fn normalize_workspace_root(workspace_root: PathBuf) -> Result<PathBuf, HarnessE
 
 async fn start_codex_client(
     builder: codex_codes::AppServerBuilder,
-) -> Result<codex_codes::AsyncClient, HarnessError> {
+) -> Result<(codex_codes::AsyncClient, Option<String>), HarnessError> {
     let mut client = codex_codes::AsyncClient::spawn(builder)
         .await
         .map_err(|e| HarnessError::Spawn(e.to_string()))?;
-    client
+    let response = client
         .initialize(&build_initialize_params())
         .await
         .map_err(|e| HarnessError::Spawn(e.to_string()))?;
-    Ok(client)
+    let version = codex_version_from_user_agent(&response.user_agent);
+    if version.is_none() {
+        warn!(
+            user_agent = %response.user_agent,
+            action = "start_codex_client",
+            "could not read a Codex version out of the app-server user agent; \
+             /models discovery will not identify a client version"
+        );
+    }
+    Ok((client, version))
+}
+
+/// Pull the Codex version out of the user agent the app-server reports at initialize, in the form
+/// Codex would send it as `client_version`.
+///
+/// Codex builds the user agent as `{originator}/{version} ({os}…) …`, so the version is the tail of
+/// the first token. This is the only place the running Codex states its own version over the
+/// protocol.
+///
+/// It is **not** used verbatim. The user agent carries the full `CARGO_PKG_VERSION`, while Codex's
+/// own `client_version_to_whole` reduces the same version to `MAJOR.MINOR.PATCH` — its doc gives
+/// `"1.2.3-alpha.4" -> "1.2.3"`. Forwarding the pre-release suffix would make Giskard ask a
+/// provider a question Codex never asks, so the suffix is dropped here to send exactly what Codex
+/// sends. Anything that does not reduce to three numeric components yields `None`, and discovery
+/// omits the parameter rather than guessing.
+fn codex_version_from_user_agent(user_agent: &str) -> Option<String> {
+    let (_originator, version) = user_agent.split_whitespace().next()?.rsplit_once('/')?;
+    // Pre-release (`-alpha.4`) and build metadata (`+abc`) are both suffixes on the whole version.
+    let whole = version
+        .split_once(['-', '+'])
+        .map_or(version, |(whole, _suffix)| whole);
+    let mut parts = whole.split('.');
+    let (major, minor, patch) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    let numeric = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    if !numeric(major) || !numeric(minor) || !numeric(patch) {
+        return None;
+    }
+    Some(format!("{major}.{minor}.{patch}"))
 }
 
 fn build_initialize_params() -> codex_codes::InitializeParams {
@@ -961,6 +1008,10 @@ async fn configured_workspace_write_roots(
 impl AgentHarness for CodexHarness {
     fn capabilities(&self) -> HarnessCapabilities {
         self.capabilities
+    }
+
+    fn client_version(&self) -> Option<String> {
+        self.client_version.clone()
     }
 
     async fn list_models(&self) -> Result<Vec<ModelDescriptor>, HarnessError> {
@@ -3801,8 +3852,13 @@ mod tests {
 
     fn spawn_fake_harness() -> (Arc<CodexHarness>, FakeCodexController) {
         let (transport, controller) = fake_codex();
-        let harness = CodexHarness::spawn_harness(transport, PathBuf::from("/tmp"), Vec::new())
-            .expect("fake harness should spawn");
+        let harness = CodexHarness::spawn_harness(
+            transport,
+            PathBuf::from("/tmp"),
+            Vec::new(),
+            Some("1.2.3".into()),
+        )
+        .expect("fake harness should spawn");
         (harness, controller)
     }
 
@@ -5485,6 +5541,56 @@ mod tests {
             mapped.resource_templates[0].uri_template,
             "jira://issue/{key}"
         );
+    }
+
+    /// Codex's app-server states its version exactly once over the protocol, in the initialize
+    /// handshake's user agent, and that is the value it would send as `client_version` — both come
+    /// from the same workspace version.
+    #[test]
+    fn codex_version_is_read_out_of_the_user_agent() {
+        assert_eq!(
+            codex_version_from_user_agent(
+                "codex_cli_rs/0.58.0 (Linux 6.1.0; x86_64) codex_vscode/1.2.3"
+            )
+            .as_deref(),
+            Some("0.58.0")
+        );
+        // A pre-release reduces to the whole version, because that is what Codex sends: its
+        // `client_version_to_whole` documents `"1.2.3-alpha.4" -> "1.2.3"`, while the user agent
+        // carries the full `CARGO_PKG_VERSION`. Forwarding the suffix would ask a question Codex
+        // never asks.
+        assert_eq!(
+            codex_version_from_user_agent("codex_cli_rs/0.59.0-alpha.1 (Mac)").as_deref(),
+            Some("0.59.0")
+        );
+        // Build metadata is a suffix on the whole version too.
+        assert_eq!(
+            codex_version_from_user_agent("codex_cli_rs/1.2.3+build.7 (Mac)").as_deref(),
+            Some("1.2.3")
+        );
+        // An originator containing a slash: the version is the tail, not the head.
+        assert_eq!(
+            codex_version_from_user_agent("vendor/codex_cli_rs/1.0.0 (Linux)").as_deref(),
+            Some("1.0.0")
+        );
+
+        // Anything that is not shaped like `{originator}/{version}` yields nothing, and discovery
+        // then omits the parameter rather than forwarding a stray token.
+        for unparseable in [
+            "",
+            "codex_cli_rs",
+            "   ",
+            "codex_cli_rs/ (Linux)",
+            "codex_cli_rs/1.2 (Linux)",     // not three components
+            "codex_cli_rs/1.2.3.4 (Linux)", // four
+            "codex_cli_rs/1.2.x (Linux)",   // not numeric
+        ] {
+            assert_eq!(
+                codex_version_from_user_agent(unparseable),
+                None,
+                "{unparseable:?} should not yield a version"
+            );
+        }
     }
 
     #[test]

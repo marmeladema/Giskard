@@ -3340,11 +3340,28 @@ async fn refresh_project_model_catalog(
                 .into(),
         });
     }
-    let (base, discovery_warnings) =
-        crate::models::discover_models(config, harness_providers.as_deref().unwrap_or(&[])).await;
-    warnings.extend(discovery_warnings);
-    let (models, harness_warning) =
-        overlay_harness_metadata(state, project_config, config, base).await;
+    // Only worth asking when something will actually be fetched; a project with no listing
+    // provider should not start a harness just to read its version.
+    let client_version = if config.providers.values().any(|p| p.model_listing) {
+        state.registry.client_version(project_config).await
+    } else {
+        None
+    };
+    let discovery = crate::models::discover_models(
+        config,
+        harness_providers.as_deref().unwrap_or(&[]),
+        client_version.as_deref(),
+    )
+    .await;
+    warnings.extend(discovery.warnings);
+    let (models, harness_warning) = overlay_harness_metadata(
+        state,
+        project_config,
+        config,
+        discovery.models,
+        &discovery.efforts_from_discovery,
+    )
+    .await;
     if let Some(warning) = harness_warning {
         warnings.push(warning);
     }
@@ -3413,6 +3430,7 @@ async fn overlay_harness_metadata(
     project_config: &ProjectConfig,
     config: &Config,
     base: Vec<ModelDescriptor>,
+    efforts_from_discovery: &std::collections::HashSet<(String, String)>,
 ) -> (Vec<ModelDescriptor>, Option<ModelListingWarning>) {
     match state.registry.capabilities(project_config).await {
         Ok(caps) if !caps.model_listing => return (base, None),
@@ -3435,7 +3453,12 @@ async fn overlay_harness_metadata(
     }
     match state.registry.list_models(project_config).await {
         Ok(harness_models) => (
-            crate::models::apply_harness_metadata(base, &harness_models, config),
+            crate::models::apply_harness_metadata(
+                base,
+                &harness_models,
+                config,
+                efforts_from_discovery,
+            ),
             None,
         ),
         Err(e) => {

@@ -1047,6 +1047,14 @@ impl HarnessRegistry {
         harness.list_providers().await
     }
 
+    /// The harness's own version, for identifying it to a provider's `/models` endpoint (§8.3).
+    pub async fn client_version(&self, config: &ProjectConfig) -> Option<String> {
+        // A version is a nicety, not a reason to fail a catalog refresh: an unreachable harness is
+        // already reported by the calls that need one.
+        let harness = self.get_or_create_harness(config.id, config).await.ok()?;
+        harness.client_version()
+    }
+
     pub async fn capabilities(
         &self,
         config: &ProjectConfig,

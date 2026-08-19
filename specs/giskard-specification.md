@@ -1388,8 +1388,12 @@ Codex advertises all Codex-backed capabilities as `true`, including `model_listi
 maps the app-server `model/list` RPC and Giskard overlays that metadata — friendly display names and
 each model's advertised reasoning efforts — onto its config/provider model list, by model id (§8.3).
 Context window still comes from Giskard's config/provider metadata (`model/list` omits it, and
-carries no provider either, which is why `[providers.<id>]` still declares the pairs). `provider_listing`
-is likewise `true`: the adapter reads Codex's `[model_providers]` table out of `config/read` (§8.2).
+carries no provider either, which is why `[[providers.<id>.models]]` still declares the pairs —
+unless the provider serves the harness catalog shape on discovery, which does carry both, §8.3).
+`provider_listing` is likewise `true`: the adapter reads Codex's `[model_providers]` table out of
+`config/read` (§8.2). `client_version` comes from the `user_agent` in the initialize handshake — the
+only place Codex states its own version — and identifies Giskard to a provider's `/models` endpoint
+as the harness.
 A future
 Claude Code adapter would likely set `live_approvals`,
 `structured_diffs`, `mcp_status`, and possibly `plan_build_modes` to `false` or a degraded form,
@@ -2444,22 +2448,69 @@ are wrong.
   endpoint to query until a harness can name one. A provider whose harness entry carries no
   `base_url` contributes no discovery and says so as a warning. A manual "refresh models" action
   triggers this; results are cached in memory per project.
+- **Two response shapes, combined.** The same endpoint answers differently depending on who is
+  asking, so Giskard reads both:
+  - the OpenAI-compatible `{"data": [{"id": …}]}`, which usually names ids and little else;
+  - the **harness catalog** `{"models": [{"slug", "display_name", "context_window",
+    "supported_reasoning_levels", "visibility", …}]}`, which a provider serves to a caller that
+    identified itself.
+
+  Asking for the catalog does not guarantee one — a provider may answer the OpenAI shape regardless,
+  and since `data` and `models` are different keys it may answer both at once. Both lists are read
+  and combined per model id, the catalog winning **field by field**: where it says nothing, the
+  OpenAI entry's value stands rather than being discarded. A model the catalog marks hidden is
+  dropped even if the OpenAI list named it. A body carrying neither key is an error, not an empty
+  listing.
+
+  The second is worth asking for because it answers what nothing else can: `context_window` exists
+  in the harness's own catalog but is dropped before its protocol, so a harness cannot report it
+  even in principle (§4.3). A provider serving this shape needs **no** `[[providers.<id>.models]]`
+  entries at all — the endpoint supplies the windows, names, and effort levels config would
+  otherwise have to state. Models marked `visibility: "hide"` or `"none"` are not offered; an
+  absent `visibility` is treated as listed rather than silently emptying the picker. Where the
+  catalog states a `priority`, it is stating an order and the models are offered in it — within
+  that provider, so the picker's top-level order stays the `[providers.<id>]` declaration order.
+
+  A stated effort list is an answer even when it is empty, and is kept apart from having said
+  nothing: a provider that reports a model has no reasoning levels must not have levels handed back
+  to it by the harness catalog. A non-`none` `default_reasoning_level` with no alternatives is that
+  default, matching how the harness's own catalog is read (§4.3). The window is resolved the way the
+  harness resolves it — `context_window`, else `max_context_window` — so an entry carrying only the
+  maximum is not left on the conservative fallback.
+- **Identifying the harness.** Discovery sends `client_version={harness version}` when the harness
+  reports one (`AgentHarness::client_version`, §4.3), because that is how a provider is asked for
+  the harness catalog. It is sent to every `model_listing` provider, not only those known to serve
+  that shape: an OpenAI-compatible endpoint ignores a query parameter it does not recognise, and
+  gating on how a provider authenticates would deny the richer catalog to one that serves it with a
+  plain `env_key`. A harness that cannot state its version has none invented for it — the
+  parameter is simply omitted, as it is for a version that could not go in a query string as-is.
 - Each model entry resolves to a `ModelDescriptor { provider, model, context_window,
   supports_reasoning_effort, display_name }`. `context_window` drives the thread context gauge
   (§10.3); `supports_reasoning_effort` drives whether the effort selector is shown (§8.5).
 - **Metadata source precedence** (first hit wins) for `context_window` and
   `supports_reasoning_effort`:
   1. the typed `[[providers.<id>.models]]` entry in config;
-  2. the `/v1/models` response, **if** it includes the field (many OpenAI-compatible
-     endpoints, including LiteLLM, return `context_window`/`max_input_tokens` and capability
-     hints — use them when present);
-  3. a **conservative fallback** (`context_window = 128000`, `supports_reasoning_effort =
+  2. the **provider's** `/v1/models` response, **if** it includes the field — both of its lists
+     combined as above: the harness catalog shape carries `context_window` and
+     `supported_reasoning_levels` outright, and many OpenAI-compatible endpoints, including
+     LiteLLM, return `context_window`/`max_input_tokens` and capability hints;
+  3. the **harness's own catalog** (Codex's `model/list`), overlaid per project as described
+     below — for `supports_reasoning_effort` and the effort list only, since it carries no context
+     window;
+  4. a **conservative fallback** (`context_window = 128000`, `supports_reasoning_effort =
      false`), so an unknown model is still usable until provider or runtime metadata is available.
+
+  Steps 2 and 3 are distinct sources and their order matters. The provider's response describes a
+  model *under that provider*; the harness catalog is keyed by model id alone and knows nothing
+  about providers, so it can only describe what some model of that name supports. It therefore
+  fills what discovery left unsaid and never replaces it — otherwise a level a provider advertised
+  for its own model would be overwritten by a same-named model's.
 
   Giskard must not maintain a model-name defaults table. Model metadata changes independently of
   Giskard releases and must come from configuration, provider discovery, or the active harness.
 
-  `display_name` follows the same config-first order, plus per-project harness metadata as below.
+  `display_name` follows the same four steps, with the harness catalog filling a name the config
+  and the provider both left unset.
 - **Per-project model list + harness metadata.** When a project is open, the picker list is served
   **per project** by `GET /api/projects/{id}/models`: the configured models, merged with each
   `model_listing` provider's `/v1/models` discovery, with the project harness's metadata overlaid on
