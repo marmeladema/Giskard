@@ -66,10 +66,27 @@ kind = "codex"
 idle_shutdown_secs = 0
 
 # ---- Providers ----
-# Which (provider, model) pairs the picker offers, and which of them to top up from the provider's
-# GET /v1/models. Nothing else: a provider's display name, base_url, and API key live in Codex's
-# own ~/.codex/config.toml, and Giskard reads them back from Codex rather than asking for them
-# twice. Each `id` here must name a provider Codex knows — a built-in (`openai`, `amazon-bedrock`,
+# This whole section is OPTIONAL, and most setups need none of it.
+#
+# Models are found without it. Every provider Codex has a base_url for is discovered from that
+# provider's GET /v1/models, and the provider Codex routes to (`model_provider`, or the openai
+# built-in) also contributes its own model/list catalog. Display name, base_url, and API key
+# already live in Codex's own ~/.codex/config.toml, and Giskard reads them back from Codex rather
+# than asking for them twice — so a provider you have already declared to Codex needs no mention
+# here at all.
+#
+# A built-in Codex has no endpoint for and does not route to — `ollama` or `lmstudio` when you use
+# neither — has nothing to contribute and will not appear. Declaring models for it is how you put
+# it in the picker.
+#
+# What this section is for:
+#   * turning discovery off for a provider  (model_listing = false)
+#   * declaring models by hand, for an endpoint that serves no /v1/models
+#   * overriding metadata a provider reports badly, or does not report
+#   * pinning picker order — declared providers come first, in the order written here; everything
+#     else follows by id
+#
+# Each `id` must name a provider Codex knows — a built-in (`openai`, `amazon-bedrock`,
 # `amazon-bedrock-runtime`, `ollama`, `lmstudio`) or one of your `[model_providers.<id>]` entries.
 # An id Codex has never heard of is reported as a warning on the picker rather than failing later
 # with a provider-side model_not_found.
@@ -78,11 +95,13 @@ idle_shutdown_secs = 0
 # [model_providers.<id>.auth] names a command whose stdout is the bearer token — Giskard runs it
 # each time it needs one. Nothing to configure here either way.
 
-# The table is keyed by the routing id, mirroring Codex's own `[model_providers.<id>]`. Providers
-# are offered to the picker in the order declared here. An id that is not a bare TOML key — one
-# with a dot in it, say — must be quoted: [providers."openrouter.ai"], since the unquoted form
-# would read as a provider "openrouter" with a sub-table. Unrecognised keys are rejected.
+# The table is keyed by the routing id, mirroring Codex's own `[model_providers.<id>]`. An id that
+# is not a bare TOML key — one with a dot in it, say — must be quoted: [providers."openrouter.ai"],
+# since the unquoted form would read as a provider "openrouter" with a sub-table. Unrecognised keys
+# are rejected.
 
+# Turn discovery off for one provider. Then only the models declared here are offered, which is
+# what you want for an endpoint that serves turns but has no /v1/models route.
 [providers.openai]
 model_listing = false
   [[providers.openai.models]]
@@ -93,13 +112,14 @@ model_listing = false
   context_window = 262144
 
 # Matches `[model_providers.cloudflare-litellm]` in ~/.codex/config.toml, which supplies the
-# base_url discovery queries and the env var holding its key.
+# base_url discovery queries and the env var holding its key. Discovery is on without saying so;
+# this entry exists only to add metadata and to put the provider first in the picker.
+#
+# Declare a model only to give it something the endpoint does not report. context_window is the
+# usual reason: a provider serving the plain OpenAI shape often omits it, and Codex's model/list
+# has none to give, so such a model starts on the conservative 128k fallback. A provider serving
+# the richer catalog shape reports its own windows and needs nothing here.
 [providers.cloudflare-litellm]
-model_listing = true
-# With model_listing = true you can omit the models list entirely and let the models come from
-# the endpoint; declare entries only to give a model metadata the endpoint does not report.
-# context_window is the one field nothing else can supply: Codex's model/list omits it, so an
-# undeclared model starts on the conservative 128k fallback until the harness reports otherwise.
   [[providers.cloudflare-litellm.models]]
   id = "@cf/z-ai/glm-4.7"
   context_window = 131072

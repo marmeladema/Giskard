@@ -661,7 +661,13 @@ async fn open_thread(
                 );
                 let context = ReadOnlyProviderContext {
                     provider: current_model.provider.clone(),
-                    configured: app_config.providers.contains_key(&current_model.provider),
+                    configured: provider_is_known(
+                        &state,
+                        &project_config,
+                        Some(&app_config),
+                        &current_model.provider,
+                    )
+                    .await,
                 };
                 return Ok(Json(OpenThreadResponse {
                     thread_id,
@@ -1086,7 +1092,7 @@ fn resolve_initial_thread_model(
     catalog: &[ModelDescriptor],
     model: ModelRef,
 ) -> (ModelRef, ModelDescriptor) {
-    let mut model = crate::models::normalize_model_ref(config, &model);
+    let mut model = crate::models::normalize_model_ref(config, catalog, &model);
     let descriptor = crate::models::resolve_catalog_descriptor(catalog, config, &model);
     if !descriptor.supports_reasoning_effort {
         model.reasoning_effort = None;
@@ -3293,7 +3299,8 @@ async fn normalize_persisted_thread_model(
     state
         .store
         .update_thread(project_id, thread_id, |thread| {
-            let current_model = crate::models::normalize_model_ref(config, &thread.current_model);
+            let current_model =
+                crate::models::normalize_model_ref(config, catalog, &thread.current_model);
             let descriptor =
                 crate::models::resolve_catalog_descriptor(catalog, config, &current_model);
             let context_window = crate::models::context_window_with_runtime(
@@ -3327,7 +3334,15 @@ async fn refresh_project_model_catalog(
     }
     // Discovery needs endpoints only the harness can name. Without a table it cannot run at all,
     // and a provider configured for listing would otherwise come back short with no explanation.
-    if harness_providers.is_none() && config.providers.values().any(|p| p.model_listing) {
+    // Only an explicit `model_listing = true` earns this. Listing is on by default now, and a
+    // harness that cannot introspect its providers is a capability gap rather than a failure —
+    // announcing it on every refresh would be noise for everyone who never asked.
+    if harness_providers.is_none()
+        && config
+            .providers
+            .values()
+            .any(|p| p.model_listing == Some(true))
+    {
         warn!(
             project_id = %project_config.id,
             harness = %project_config.harness,
@@ -3336,13 +3351,19 @@ async fn refresh_project_model_catalog(
         );
         warnings.push(ModelListingWarning {
             source: format!("harness:{}", project_config.harness),
-            message: "model discovery needs the provider endpoints this harness cannot report;                       only declared models are offered"
+            message: "model discovery needs the provider endpoints this harness cannot report; \
+                      only declared models are offered"
                 .into(),
         });
     }
-    // Only worth asking when something will actually be fetched; a project with no listing
-    // provider should not start a harness just to read its version.
-    let client_version = if config.providers.values().any(|p| p.model_listing) {
+    // Only worth asking when something will actually be fetched. Keyed off the providers the
+    // harness reports rather than off config: with listing on by default, config is usually empty,
+    // and testing it would have quietly stopped sending `client_version` — costing the richer
+    // catalog on exactly the setups it was built for.
+    let client_version = if crate::models::will_query_any_provider(
+        config,
+        harness_providers.as_deref().unwrap_or(&[]),
+    ) {
         state.registry.client_version(project_config).await
     } else {
         None
@@ -3354,7 +3375,7 @@ async fn refresh_project_model_catalog(
     )
     .await;
     warnings.extend(discovery.warnings);
-    let (models, harness_warning) = overlay_harness_metadata(
+    let (composed, harness_warning) = overlay_harness_metadata(
         state,
         project_config,
         config,
@@ -3362,8 +3383,30 @@ async fn refresh_project_model_catalog(
         &discovery.efforts_from_discovery,
     )
     .await;
+    // Ordered once, after every source has contributed: config's declared models, discovery, and
+    // the harness catalog each land at a different point (§8.3).
+    let models = crate::models::order_for_picker(composed, config);
     if let Some(warning) = harness_warning {
         warnings.push(warning);
+    }
+    // An empty picker is never a normal outcome, and it used to arrive in silence — no models, no
+    // explanation, nothing to act on. Only when nothing else spoke up, though: a provider that
+    // already reported its own 401 has named the cause, and following it with a vaguer message
+    // about the harness would point away from the answer the user already has.
+    if models.is_empty() && warnings.is_empty() {
+        warn!(
+            project_id = %project_config.id,
+            harness = %project_config.harness,
+            action = "refresh_project_model_catalog",
+            "composed model catalog is empty"
+        );
+        warnings.push(ModelListingWarning {
+            source: format!("harness:{}", project_config.harness),
+            message: "no models are available for this project: the harness reported no catalog \
+                      and no provider offered one. Check that the harness starts, and that its \
+                      providers are reachable."
+                .into(),
+        });
     }
     state
         .model_catalogs
@@ -4209,8 +4252,11 @@ async fn handle_client_msg(
             let tf = state
                 .store
                 .update_thread(project_id, thread_id, |tf| {
-                    let normalized =
-                        crate::models::normalize_model_ref(&app_config, &tf.current_model);
+                    let normalized = crate::models::normalize_model_ref(
+                        &app_config,
+                        &catalog,
+                        &tf.current_model,
+                    );
                     let descriptor = crate::models::resolve_catalog_descriptor(
                         &catalog,
                         &app_config,
@@ -4310,7 +4356,7 @@ async fn handle_client_msg(
                     .action("select_model")
                 })?;
             let catalog = project_model_catalog(state, &project_config, &config).await;
-            let model_ref = crate::models::normalize_model_ref(&config, &model_ref);
+            let model_ref = crate::models::normalize_model_ref(&config, &catalog, &model_ref);
 
             if state
                 .registry
@@ -4929,16 +4975,110 @@ async fn read_only_provider_context(
         .ok()??
         .current_model
         .provider;
-    let configured = state
-        .store
-        .load_config()
-        .await
-        .map(|config| config.providers.contains_key(&provider))
-        .unwrap_or(true); // Unknown config ⇒ don't claim the provider is missing.
+    let config = state.store.load_config().await.ok();
+    // Without the project we cannot ask its harness which providers exist, so config is all there
+    // is — and config alone can no longer convict a provider.
+    let configured = match state.store.load_project(project_id).await.ok().flatten() {
+        Some(project_config) => {
+            provider_is_known(state, &project_config, config.as_ref(), &provider).await
+        }
+        None => true,
+    };
     Some(ReadOnlyProviderContext {
         provider,
         configured,
     })
+}
+
+/// Whether a provider is one this project can actually route to, for the read-only warning.
+///
+/// Absence from `[providers.*]` used to prove a provider was gone. It no longer does: model
+/// listing is on by default and most configs name no providers at all, so testing config alone
+/// would tell nearly every user their provider "is no longer configured" whenever a harness failed
+/// to attach for some unrelated reason.
+///
+/// The harness table is the authority (§8.2), but this runs on a path where the harness has just
+/// failed, so it often cannot answer. Only a table that *does* answer, and does not list the
+/// provider, convicts it; anything else is treated as known, leaving the generic attach-failure
+/// wording to explain what actually happened.
+async fn provider_is_known(
+    state: &AppState,
+    project_config: &ProjectConfig,
+    config: Option<&Config>,
+    provider: &str,
+) -> bool {
+    if config.is_some_and(|config| config.providers.contains_key(provider)) {
+        return true;
+    }
+    // Bounded, because asking the harness costs more than the answer is worth here. Both registry
+    // calls go through `get_or_create_harness`, which will *spawn* one — on a path that exists
+    // precisely because a harness just failed, where a spawn that hangs would hold up opening the
+    // thread. All this buys is a more precise warning, so it gets a short deadline and gives up.
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+    match tokio::time::timeout(
+        PROBE_TIMEOUT,
+        harness_knows_provider(state, project_config, provider),
+    )
+    .await
+    {
+        Ok(known) => known,
+        Err(_) => {
+            warn!(
+                project_id = %project_config.id,
+                harness = %project_config.harness,
+                %provider,
+                action = "provider_is_known",
+                timeout_ms = PROBE_TIMEOUT.as_millis() as u64,
+                "harness did not answer in time; treating the provider as known"
+            );
+            true
+        }
+    }
+}
+
+/// The harness half of [`provider_is_known`]: does its provider table list this id?
+///
+/// Every failure answers "known". This runs to decide whether a warning may accuse the provider,
+/// and an accusation made on a failed lookup is worse than a vague message — but the failure is
+/// logged, because this is exactly when an operator needs to tell a capabilities failure from a
+/// listing failure from a table that answered and omitted the provider.
+async fn harness_knows_provider(
+    state: &AppState,
+    project_config: &ProjectConfig,
+    provider: &str,
+) -> bool {
+    // The capability gate matters as much as the call: a harness that does not support provider
+    // listing may still answer with an empty table, and taking that as gospel would convict every
+    // provider — the very accusation this function exists to stop making.
+    match state.registry.capabilities(project_config).await {
+        Ok(caps) if !caps.provider_listing => return true,
+        Err(error) => {
+            warn!(
+                project_id = %project_config.id,
+                harness = %project_config.harness,
+                %provider,
+                %error,
+                action = "provider_is_known",
+                "cannot read harness capabilities; treating the provider as known"
+            );
+            return true;
+        }
+        Ok(_) => {}
+    }
+    match state.registry.list_providers(project_config).await {
+        Ok(table) => table.iter().any(|known| known.id == provider),
+        Err(error) => {
+            warn!(
+                project_id = %project_config.id,
+                harness = %project_config.harness,
+                %provider,
+                %error,
+                action = "provider_is_known",
+                "harness provider listing failed; treating the provider as known"
+            );
+            true
+        }
+    }
 }
 
 /// Build the non-fatal warning shown when a thread loads read-only because its harness could not
