@@ -415,6 +415,15 @@ pub trait AgentHarness: Send + Sync {
         ))
     }
 
+    /// The harness's own version, when it knows it.
+    ///
+    /// Only used to identify Giskard to a provider's `/models` endpoint as the harness would
+    /// (§8.3): a provider that serves the harness's richer catalog keys off the *harness* version,
+    /// not Giskard's, so this is the harness answering for itself rather than Giskard guessing.
+    fn client_version(&self) -> Option<String> {
+        None
+    }
+
     /// List configured MCP servers and their visible tools/resources.
     async fn list_mcp_servers(&self) -> Result<Vec<McpServerStatus>, HarnessError> {
         Err(HarnessError::Unsupported(

@@ -96,6 +96,9 @@ pub struct ReplayHarness {
     providers: Vec<HarnessProvider>,
     /// When set, `list_providers` fails with this message instead of returning `providers`.
     providers_error: Option<String>,
+    /// Version reported by `client_version`, standing in for a real harness's own. `None` by
+    /// default: a harness that cannot say must not have one invented for it.
+    client_version: Option<String>,
     /// The model reported for a thread imported by native id, where the caller names none and a
     /// real harness answers from the thread's own record. Defaults to `openai/gpt-5.5`; a test
     /// whose config does not offer that model sets its own with
@@ -133,6 +136,7 @@ impl ReplayHarness {
             models_error: None,
             providers: Vec::new(),
             providers_error: None,
+            client_version: None,
             imported_model: ModelRef {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
@@ -155,6 +159,13 @@ impl ReplayHarness {
     pub fn with_failing_models(mut self, message: impl Into<String>) -> Self {
         self.capabilities.model_listing = true;
         self.models_error = Some(message.into());
+        self
+    }
+
+    /// Report a harness version, as Codex does from its initialize handshake. Discovery sends it
+    /// to a provider's `/models` endpoint as `client_version` (§8.3).
+    pub fn with_client_version(mut self, version: impl Into<String>) -> Self {
+        self.client_version = Some(version.into());
         self
     }
 
@@ -221,6 +232,10 @@ impl Default for ReplayHarness {
 impl AgentHarness for ReplayHarness {
     fn capabilities(&self) -> HarnessCapabilities {
         self.capabilities
+    }
+
+    fn client_version(&self) -> Option<String> {
+        self.client_version.clone()
     }
 
     async fn list_models(&self) -> Result<Vec<ModelDescriptor>, HarnessError> {

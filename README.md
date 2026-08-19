@@ -243,12 +243,31 @@ sent as the bearer token, recomputed each time rather than cached. A key set inl
 `experimental_bearer_token` is deliberately not read — discovery against such a provider needs
 `env_key` or `auth` instead.
 
-Giskard has no model-name defaults table. Initial context-window metadata comes from an explicit
-`[[providers.<id>.models]]` entry or a model object's `context_window` / `max_input_tokens` field
-in the provider's `/models` response; otherwise the picker starts with the conservative 128k
-fallback.
-`display_name` and reasoning-effort support are supplied by Codex's own model catalog, so declaring
-them is only necessary to override it.
+Discovery reads both shapes the endpoint may answer with — the OpenAI-compatible
+`{"data": [...]}` and the richer catalog (`{"models": [...]}`) a provider serves to a caller that
+identifies itself — and combines them per model, the catalog winning field by field. Asking for the
+catalog does not guarantee one, and a provider may return both at once. A provider serving the
+richer shape needs **no** `[[providers.<id>.models]]` entries at all: it supplies the context
+windows, display names, and reasoning levels you would otherwise have to declare, including the
+context window Codex cannot report over its own protocol.
+
+To ask for it, Giskard identifies itself the way Codex does, sending `client_version` with the
+version Codex would send — the `MAJOR.MINOR.PATCH` of the running app-server, read from its
+handshake and reduced the way Codex reduces it (`1.2.3-alpha.4` → `1.2.3`). When that version
+cannot be read, the parameter is left off rather than guessed.
+
+Giskard has no model-name defaults table. Model metadata comes from three sources, in this order:
+
+1. an explicit `[[providers.<id>.models]]` entry in `config.toml`, which always wins;
+2. the **provider's** `/models` response, for a model that entry did not describe;
+3. **Codex's own catalog** (`model/list`), which fills what is still missing — display names and
+   effort levels only; it has no context window to give.
+
+The last two are different things and are not interchangeable. Codex's catalog is keyed by model id
+and carries no provider, so it can only ever say what *some* model of that name supports — it fills
+gaps rather than overriding what a specific provider advertised about its own model, and it has no
+context window to offer at all. Anything still unknown falls back to a conservative 128k window with
+the effort selector hidden.
 
 Discovery and Codex's catalog both need a running project harness, so they apply to a project's
 picker. Creating a project therefore does not ask you to pick a model: there is no harness yet, so
@@ -260,7 +279,8 @@ matching it.
 
 Models with `supports_reasoning_effort = true` expose a thread-header **Effort** selector next to
 the model picker. Choose `Default` to omit the effort parameter, or select one of the exact effort
-levels advertised by the project harness. Effort values are model-defined strings; familiar models
+levels advertised for that model — by the provider's own catalog where it lists them, otherwise by
+Codex's. Effort values are model-defined strings; familiar models
 commonly offer `minimal`, `low`, `medium`, `high`, or `xhigh`, while other values are passed through
 unchanged. Reloading the picker refreshes provider discovery and harness metadata; non-fatal
 failures are shown as warnings while the usable portion of the model list remains available.

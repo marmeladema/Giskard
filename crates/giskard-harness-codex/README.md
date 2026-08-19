@@ -380,6 +380,23 @@ generated `codex-codes` types omit it, which is why it is deserialized locally.
 - **Empty is absence** — Codex defaults an omitted `name` to `""`; the adapter
   normalizes empty strings to `None`.
 
+## Version, for `/models` discovery
+
+`initialize` answers with a `user_agent` like `codex_cli_rs/0.58.0 (Linux …) …`. The adapter keeps
+the version out of it and reports it as `client_version()`.
+
+This is the only place the running Codex states its own version over the protocol. It is not used
+verbatim: the user agent carries the full `CARGO_PKG_VERSION`, while Codex's own
+`client_version_to_whole` reduces the same version to `MAJOR.MINOR.PATCH` (its doc gives
+`"1.2.3-alpha.4" -> "1.2.3"`). The suffix is dropped here so Giskard sends exactly what Codex
+sends. Giskard sends it on discovery so a provider serving Codex's richer catalog
+(`{"models": [...]}`, with `context_window` and `supported_reasoning_levels`) answers Giskard the
+way it would answer Codex. Codex asks for that catalog whenever the provider uses command auth or
+Codex's own backend; the metadata never reaches Giskard through `model/list`, which carries no
+context window at all — hence fetching it directly.
+
+A user agent that does not parse yields `None`, and the parameter is omitted rather than guessed.
+
 ## Resume does not name a model
 
 `thread/resume` treats `model`/`modelProvider` as *overrides*: Codex's
