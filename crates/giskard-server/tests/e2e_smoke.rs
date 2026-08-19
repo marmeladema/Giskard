@@ -7225,10 +7225,9 @@ async fn notice_event_is_delivered_to_client() {
 #[tokio::test]
 async fn open_thread_normalizes_stale_provider_from_configured_model() {
     let extra_config = r#"
-[[providers]]
-id = "proxy"
+[providers.proxy]
 
-  [[providers.models]]
+  [[providers.proxy.models]]
   id = "gpt-5.5"
   display_name = "GPT-5.5"
   context_window = 262144
@@ -7347,10 +7346,9 @@ id = "proxy"
 #[tokio::test]
 async fn open_thread_normalization_reuses_live_handle() {
     let extra_config = r#"
-[[providers]]
-id = "proxy"
+[providers.proxy]
 
-  [[providers.models]]
+  [[providers.proxy.models]]
   id = "gpt-5.5"
   display_name = "GPT-5.5"
   context_window = 262144
@@ -7483,19 +7481,17 @@ async fn blank_thread_creation_without_resume_is_rejected() {
 #[tokio::test]
 async fn start_thread_with_initial_message_uses_selected_provider_and_starts_turn() {
     let extra_config = r#"
-[[providers]]
-id = "openai"
+[providers.openai]
 
-  [[providers.models]]
+  [[providers.openai.models]]
   id = "gpt-5.5"
   display_name = "GPT-5.5"
   context_window = 262144
   supports_reasoning_effort = true
 
-[[providers]]
-id = "proxy"
+[providers.proxy]
 
-  [[providers.models]]
+  [[providers.proxy.models]]
   id = "glm-5.2-workers-ai"
   display_name = "GLM Workers"
   context_window = 131072
@@ -7608,19 +7604,17 @@ async fn start_thread_turn_rejection_cleans_up_new_thread() {
 #[tokio::test]
 async fn select_model_rejects_provider_change_on_non_empty_thread() {
     let extra_config = r#"
-[[providers]]
-id = "openai"
+[providers.openai]
 
-  [[providers.models]]
+  [[providers.openai.models]]
   id = "gpt-5.5"
   display_name = "GPT-5.5"
   context_window = 262144
   supports_reasoning_effort = true
 
-[[providers]]
-id = "proxy"
+[providers.proxy]
 
-  [[providers.models]]
+  [[providers.proxy.models]]
   id = "glm-5.2-workers-ai"
   display_name = "GLM Workers"
   context_window = 131072
@@ -7704,19 +7698,17 @@ id = "proxy"
 #[tokio::test]
 async fn send_input_rejects_persisted_provider_mismatch_on_non_empty_thread() {
     let extra_config = r#"
-[[providers]]
-id = "openai"
+[providers.openai]
 
-  [[providers.models]]
+  [[providers.openai.models]]
   id = "gpt-5.5"
   display_name = "GPT-5.5"
   context_window = 262144
   supports_reasoning_effort = true
 
-[[providers]]
-id = "proxy"
+[providers.proxy]
 
-  [[providers.models]]
+  [[providers.proxy.models]]
   id = "glm-5.2-workers-ai"
   display_name = "GLM Workers"
   context_window = 131072

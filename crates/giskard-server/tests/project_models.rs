@@ -178,16 +178,14 @@ secure_cookies = false
 password_hash = "{hash}"
 session_days = 30
 
-[[providers]]
-id = "openai"
-  [[providers.models]]
+[providers.openai]
+  [[providers.openai.models]]
   id = "gpt-5.5"
   display_name = "GPT-5.5"
   context_window = 262144
   supports_reasoning_effort = false
 
-[[providers]]
-id = "mock"
+[providers.mock]
 model_listing = true
 "#
         ),

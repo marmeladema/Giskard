@@ -156,10 +156,9 @@ session_days = 30
 default_dir = "docs"
 filename_template = "plan-{{slug}}-{{ts}}.md"
 
-[[providers]]
-id = "cloudflare-litellm"
+[providers.cloudflare-litellm]
 model_listing = false
-  [[providers.models]]
+  [[providers.cloudflare-litellm.models]]
   id = "@cf/z-ai/glm-4.7"
   display_name = "GLM-4.7"
   context_window = 131072

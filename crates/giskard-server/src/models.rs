@@ -1,7 +1,7 @@
 //! Model descriptor resolution & listing (spec §8.3).
 //!
 //! Applies the metadata-source precedence for a `(provider, model)` pair:
-//! 1. the typed `[[providers.models]]` config entry;
+//! 1. the typed `[[providers.<id>.models]]` config entry;
 //! 2. the `/v1/models` dynamic listing (merged over the static list by [`discover_models`]);
 //! 3. a conservative fallback (`context_window = 128000`, no reasoning effort).
 
@@ -44,7 +44,7 @@ impl ProjectModelCatalogStore {
 
 /// Build a `ModelDescriptor` from a typed config entry, if the provider + model are declared.
 fn from_config(config: &Config, provider: &str, model: &str) -> Option<ModelDescriptor> {
-    let p = config.providers.iter().find(|p| p.id == provider)?;
+    let p = config.providers.get(provider)?;
     let m = p.models.iter().find(|m| m.id == model)?;
     Some(ModelDescriptor {
         provider: provider.to_string(),
@@ -86,15 +86,15 @@ pub fn normalize_model_ref(config: &Config, model: &ModelRef) -> ModelRef {
         return model.clone();
     }
 
-    let mut matches = config.providers.iter().filter_map(|provider| {
+    let mut matches = config.providers.iter().filter_map(|(id, provider)| {
         provider
             .models
             .iter()
             .find(|candidate| candidate.id == model.model)
-            .map(|candidate| (provider, candidate))
+            .map(|candidate| (id, candidate))
     });
 
-    let Some((provider, candidate)) = matches.next() else {
+    let Some((provider_id, candidate)) = matches.next() else {
         return model.clone();
     };
     if matches.next().is_some() {
@@ -102,7 +102,7 @@ pub fn normalize_model_ref(config: &Config, model: &ModelRef) -> ModelRef {
     }
 
     let mut normalized = model.clone();
-    normalized.provider = provider.id.clone();
+    normalized.provider = provider_id.clone();
     if !candidate.supports_reasoning_effort {
         normalized.reasoning_effort = None;
     }
@@ -130,13 +130,13 @@ pub fn context_window_with_runtime(
 }
 
 /// The full static model list offered by the model picker (§8.3): every declared
-/// `[[providers.models]]` entry, resolved to a `ModelDescriptor`.
+/// `[[providers.<id>.models]]` entry, resolved to a `ModelDescriptor`.
 pub fn list_descriptors(config: &Config) -> Vec<ModelDescriptor> {
     let mut out = Vec::new();
-    for p in &config.providers {
+    for (id, p) in &config.providers {
         for m in &p.models {
             out.push(ModelDescriptor {
-                provider: p.id.clone(),
+                provider: id.clone(),
                 model: m.id.clone(),
                 context_window: m.context_window,
                 supports_reasoning_effort: m.supports_reasoning_effort,
@@ -153,11 +153,11 @@ pub fn list_descriptors(config: &Config) -> Vec<ModelDescriptor> {
 /// (provider-independent — Codex's `model/list` carries no provider):
 ///
 /// - **Display names** fill a descriptor whose `display_name` is unset, so an explicit
-///   `[[providers.models]] display_name` always wins.
+///   `[[providers.<id>.models]] display_name` always wins.
 /// - **`is_default`** marks the model the harness would start from, used only to seed a project's
 ///   default (§8.3). Config has no way to express it, so the catalog is its only source.
 /// - **Reasoning efforts** (the exact levels a model advertises) are applied only to models the
-///   config did **not** explicitly declare. A `[[providers.models]]` entry keeps its configured
+///   config did **not** explicitly declare. A `[[providers.<id>.models]]` entry keeps its configured
 ///   effort setting; for discovery-only models the catalog is the source of truth.
 ///
 /// The harness never supplies context window (Codex's `model/list` omits it).
@@ -174,7 +174,7 @@ pub fn apply_harness_metadata(
     let declared: HashSet<(&str, &str)> = config
         .providers
         .iter()
-        .flat_map(|p| p.models.iter().map(|m| (p.id.as_str(), m.id.as_str())))
+        .flat_map(|(id, p)| p.models.iter().map(|m| (id.as_str(), m.id.as_str())))
         .collect();
     for d in &mut base {
         let Some(h) = by_id.get(d.model.as_str()) else {
@@ -273,16 +273,16 @@ pub fn validate_provider_ids(
     config
         .providers
         .iter()
-        .filter(|p| !harness_providers.iter().any(|known| known.id == p.id))
-        .map(|p| {
+        .filter(|(id, _)| !harness_providers.iter().any(|known| &known.id == *id))
+        .map(|(id, _)| {
             warn!(
-                provider = %p.id,
+                provider = %id,
                 harness = %harness_kind,
                 action = "validate_provider_ids",
                 "configured provider is not one the harness knows; its models cannot be routed"
             );
             ModelListingWarning {
-                source: format!("provider:{}", p.id),
+                source: format!("provider:{id}"),
                 message: format!(
                     "provider id is not configured in {harness_kind}; models under it cannot \
                      be routed until it is added there"
@@ -323,23 +323,23 @@ pub async fn discover_models(
     };
 
     let mut dynamic: Vec<DiscoveredModel> = Vec::new();
-    for p in &config.providers {
+    for (id, p) in &config.providers {
         if !p.model_listing {
             continue;
         }
         // An unknown id already warned in `validate_provider_ids`; skipping quietly here keeps one
         // problem to one message.
-        let Some(known) = harness_providers.iter().find(|known| known.id == p.id) else {
+        let Some(known) = harness_providers.iter().find(|known| &known.id == id) else {
             continue;
         };
         let Some(base_url) = known.base_url.as_deref() else {
             warn!(
-                provider = %p.id,
+                provider = %id,
                 action = "discover_models",
                 "provider requests model listing but the harness reports no base_url for it"
             );
             warnings.push(ModelListingWarning {
-                source: format!("provider:{}", p.id),
+                source: format!("provider:{id}"),
                 message: "model_listing is on but the harness reports no base_url for this \
                           provider; only declared models are offered"
                     .into(),
@@ -355,9 +355,9 @@ pub async fn discover_models(
         }
 
         let mut fail = |message: String| {
-            warn!(provider = %p.id, %url, %message, "model discovery failed; skipping provider");
+            warn!(provider = %id, %url, %message, "model discovery failed; skipping provider");
             warnings.push(ModelListingWarning {
-                source: format!("provider:{}", p.id),
+                source: format!("provider:{id}"),
                 message,
             });
         };
@@ -385,7 +385,7 @@ pub async fn discover_models(
                                 parse_discovered_capacity(model.max_input_tokens.as_ref());
                             if context_window.is_err() || max_input_tokens.is_err() {
                                 warn!(
-                                    provider = %p.id,
+                                    provider = %id,
                                     model = %model.id,
                                     context_window = ?model.context_window,
                                     max_input_tokens = ?model.max_input_tokens,
@@ -394,7 +394,7 @@ pub async fn discover_models(
                                 invalid_metadata_models.push(model.id.clone());
                             }
                             dynamic.push(DiscoveredModel {
-                                provider: p.id.clone(),
+                                provider: id.clone(),
                                 model: model.id,
                                 context_window: context_window
                                     .ok()
@@ -410,7 +410,7 @@ pub async fn discover_models(
         }
         if !invalid_metadata_models.is_empty() {
             warnings.push(ModelListingWarning {
-                source: format!("provider:{}", p.id),
+                source: format!("provider:{id}"),
                 message: format!(
                     "ignored invalid context capacity metadata for {} model(s)",
                     invalid_metadata_models.len()
@@ -428,10 +428,9 @@ mod tests {
 
     fn config_with_glm() -> Config {
         let toml = r#"
-[[providers]]
-id = "cloudflare-litellm"
+[providers.cloudflare-litellm]
 model_listing = true
-  [[providers.models]]
+  [[providers.cloudflare-litellm.models]]
   id = "@cf/z-ai/glm-4.7"
   display_name = "GLM-4.7"
   context_window = 131072
@@ -630,14 +629,13 @@ model_listing = true
         // config declares two models: one with a name, one without. Both have efforts off.
         let config: Config = toml::from_str(
             r#"
-[[providers]]
-id = "p"
-  [[providers.models]]
+[providers.p]
+  [[providers.p.models]]
   id = "declared-named"
   display_name = "Config Name"
   context_window = 1000
   supports_reasoning_effort = false
-  [[providers.models]]
+  [[providers.p.models]]
   id = "declared-noname"
   context_window = 1000
   supports_reasoning_effort = false
@@ -822,15 +820,13 @@ id = "p"
     fn configured_effort_precedence_is_scoped_to_provider_and_model() {
         let config: Config = toml::from_str(
             r#"
-[[providers]]
-id = "configured"
-  [[providers.models]]
+[providers.configured]
+  [[providers.configured.models]]
   id = "shared-model"
   context_window = 1000
   supports_reasoning_effort = false
 
-[[providers]]
-id = "discovered"
+[providers.discovered]
 "#,
         )
         .unwrap();
@@ -869,16 +865,18 @@ id = "discovered"
     #[test]
     fn does_not_normalize_ambiguous_model_provider() {
         let mut config = config_with_glm();
-        config.providers.push(giskard_persist::ProviderConfig {
-            id: "other".into(),
-            model_listing: false,
-            models: vec![giskard_persist::ModelConfig {
-                id: "@cf/z-ai/glm-4.7".into(),
-                display_name: None,
-                context_window: 131_072,
-                supports_reasoning_effort: false,
-            }],
-        });
+        config.providers.insert(
+            "other".into(),
+            giskard_persist::ProviderConfig {
+                model_listing: false,
+                models: vec![giskard_persist::ModelConfig {
+                    id: "@cf/z-ai/glm-4.7".into(),
+                    display_name: None,
+                    context_window: 131_072,
+                    supports_reasoning_effort: false,
+                }],
+            },
+        );
         let original = ModelRef {
             provider: "openai".into(),
             model: "@cf/z-ai/glm-4.7".into(),

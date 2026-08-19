@@ -661,10 +661,7 @@ async fn open_thread(
                 );
                 let context = ReadOnlyProviderContext {
                     provider: current_model.provider.clone(),
-                    configured: app_config
-                        .providers
-                        .iter()
-                        .any(|p| p.id == current_model.provider),
+                    configured: app_config.providers.contains_key(&current_model.provider),
                 };
                 return Ok(Json(OpenThreadResponse {
                     thread_id,
@@ -3330,7 +3327,7 @@ async fn refresh_project_model_catalog(
     }
     // Discovery needs endpoints only the harness can name. Without a table it cannot run at all,
     // and a provider configured for listing would otherwise come back short with no explanation.
-    if harness_providers.is_none() && config.providers.iter().any(|p| p.model_listing) {
+    if harness_providers.is_none() && config.providers.values().any(|p| p.model_listing) {
         warn!(
             project_id = %project_config.id,
             harness = %project_config.harness,
@@ -4913,7 +4910,7 @@ async fn read_only_provider_context(
         .store
         .load_config()
         .await
-        .map(|config| config.providers.iter().any(|p| p.id == provider))
+        .map(|config| config.providers.contains_key(&provider))
         .unwrap_or(true); // Unknown config ⇒ don't claim the provider is missing.
     Some(ReadOnlyProviderContext {
         provider,

@@ -901,7 +901,7 @@
 
 **Changelog (1.0 → 1.1), from review:**
 - Resolved thread token schema vs §10.2: thread `tokens` now carries `total` + `by_model` (§5.3).
-- Config models are now **typed** `[[providers.models]]` entries with a documented metadata
+- Config models are now **typed** `[[providers.<id>.models]]` entries with a documented metadata
   precedence + conservative fallback (§8.3, App. C), fixing the missing `context_window` /
   `supports_reasoning_effort` source.
 - `AgentHarness::shutdown` is now `&self` (object-safe for `Arc<dyn AgentHarness>`); added an
@@ -1388,7 +1388,7 @@ Codex advertises all Codex-backed capabilities as `true`, including `model_listi
 maps the app-server `model/list` RPC and Giskard overlays that metadata — friendly display names and
 each model's advertised reasoning efforts — onto its config/provider model list, by model id (§8.3).
 Context window still comes from Giskard's config/provider metadata (`model/list` omits it, and
-carries no provider either, which is why `[[providers]]` still declares the pairs). `provider_listing`
+carries no provider either, which is why `[providers.<id>]` still declares the pairs). `provider_listing`
 is likewise `true`: the adapter reads Codex's `[model_providers]` table out of `config/read` (§8.2).
 A future
 Claude Code adapter would likely set `live_approvals`,
@@ -2363,10 +2363,18 @@ UI always shows provider + model together.
 
 ### 8.2 Provider configuration
 
-Providers are declared in `config.toml` (§16.3). A declaration carries only what the harness
-cannot supply: an `id`, whether to run model-list discovery, and the models to offer. Example
-providers relevant here: OpenAI direct (Codex's built-in), and a LiteLLM gateway fronting
+Providers are declared in `config.toml` (§16.3) as a table keyed by routing id —
+`[providers.<id>]`, the same shape Codex uses for `[model_providers.<id>]`. A declaration carries
+only what the harness cannot supply: whether to run model-list discovery, and the models to offer.
+Example providers relevant here: OpenAI direct (Codex's built-in), and a LiteLLM gateway fronting
 Cloudflare Workers AI.
+
+Keying by id rather than listing entries makes a repeated id a TOML parse error instead of a silent
+first-wins duplicate, and declaration order is preserved as the picker's order (§8.3). It also makes
+the id a TOML key rather than a string value, so an id that is not a bare key must be quoted —
+`[providers."openrouter.ai"]`. Unrecognised keys within a declaration are rejected, which is what
+turns the unquoted form (a provider `openrouter` with a stray sub-table) into an error naming the
+offending segment rather than a provider silently offering no models.
 
 **The harness owns provider configuration.** A provider's display name, endpoint, and key
 location already exist in the harness's own configuration, and Giskard reads them back through
@@ -2380,7 +2388,7 @@ harness may hold one (Codex's `experimental_bearer_token`), but copying it into 
 spread a credential into another process's memory and logs to no end; discovery against such a
 provider requires the env-var form instead.
 
-**Id validation.** A `[[providers]] id` is the routing key sent to the harness, so an id the
+**Id validation.** A `[providers.<id>]` key is the routing id sent to the harness, so an id the
 harness does not know cannot route. Giskard checks the configured ids against the harness's
 provider table whenever it composes a project's model list, and reports each unknown id as a
 warning (§8.3) naming the provider. The models stay in the picker — the harness may be
@@ -2406,10 +2414,10 @@ are wrong.
 
 - A **static list** in config is always available (works offline, deterministic for tests).
   Each static entry is a **typed model definition**, not a bare string, so it can supply the
-  `ModelDescriptor` fields the UI needs (see the `[[providers.models]]` tables in Appendix C):
+  `ModelDescriptor` fields the UI needs (see the `[[providers.<id>.models]]` tables in Appendix C):
 
   ```toml
-  [[providers.models]]
+  [[providers.openai.models]]
   id = "gpt-5.5"
   display_name = "GPT-5.5"
   context_window = 262144
@@ -2426,7 +2434,7 @@ are wrong.
   (§10.3); `supports_reasoning_effort` drives whether the effort selector is shown (§8.5).
 - **Metadata source precedence** (first hit wins) for `context_window` and
   `supports_reasoning_effort`:
-  1. the typed `[[providers.models]]` entry in config;
+  1. the typed `[[providers.<id>.models]]` entry in config;
   2. the `/v1/models` response, **if** it includes the field (many OpenAI-compatible
      endpoints, including LiteLLM, return `context_window`/`max_input_tokens` and capability
      hints — use them when present);
@@ -2448,7 +2456,7 @@ are wrong.
   - **`display_name`** — applied when the config left one unset, so an explicit config name wins.
   - **`reasoning_efforts`** — the exact effort levels the model advertises, used to populate the
     effort selector (§8.5). Applied only when the exact `(provider, model)` pair is not explicitly
-    declared; a `[[providers.models]]` entry under another provider does not suppress the overlay.
+    declared; a `[[providers.<id>.models]]` entry under another provider does not suppress the overlay.
     A catalog entry's `supports_reasoning_effort` flag and effort list are authoritative for an
     undeclared pair. An empty effort list can therefore describe either an unsupported model or a
     reasoning model without model-specific selectable levels; §8.5 defines the browser fallback for
@@ -3467,23 +3475,23 @@ filename_template = "plan-{slug}-{ts}.md"
 cost_estimation = false
 # [tokens.rates."openai/gpt-5.5"]  input_per_mtok_eur = …  output_per_mtok_eur = …
 
-# `id` must name a provider the harness knows (§8.2). Name, endpoint, and key location are read
-# back from the harness, not restated here.
-[[providers]]
-id = "openai"
+# Keyed by routing id, mirroring Codex's own `[model_providers.<id>]`. The id must name a provider
+# the harness knows (§8.2); name, endpoint, and key location are read back from the harness rather
+# than restated here. Declaration order is the picker's order.
+[providers.openai]
 model_listing = false
   # typed model entries supply what no harness reports (§8.3):
-  [[providers.models]]
+  [[providers.openai.models]]
   id = "gpt-5.5"
   context_window = 262144
-  [[providers.models]]
+  [[providers.openai.models]]
   id = "gpt-5.4"
   context_window = 262144
 
-[[providers]]
-id = "cloudflare-litellm"  # ⇒ [model_providers.cloudflare-litellm] in ~/.codex/config.toml
+# ⇒ [model_providers.cloudflare-litellm] in ~/.codex/config.toml
+[providers.cloudflare-litellm]
 model_listing = true            # discovery against the base_url the harness reports for it
-  [[providers.models]]          # static fallback; dynamic listing may add/refine
+  [[providers.cloudflare-litellm.models]]   # static fallback; dynamic listing may add/refine
   id = "@cf/z-ai/glm-4.7"
   context_window = 131072
   # display_name / supports_reasoning_effort may be set to override the harness catalog (§8.3)

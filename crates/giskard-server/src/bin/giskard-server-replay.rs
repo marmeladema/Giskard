@@ -793,10 +793,9 @@ password_hash = "{password_hash}"
 [harness]
 kind = "replay"
 
-[[providers]]
-id = "replay"
+[providers.replay]
 model_listing = false
-  [[providers.models]]
+  [[providers.replay.models]]
   id = "replay-model"
   display_name = "Replay Model"
   context_window = 131072
@@ -949,7 +948,7 @@ fn run_git_seed<const N: usize>(workspace: &Path, args: [&str; N]) -> Result<(),
 /// from the thread itself; an import names no model, so the fake stands in with a fixed one rather
 /// than claiming not to know.
 fn fake_native_model() -> giskard_core::model::ModelRef {
-    // The identity this server actually advertises, in `[[providers]]` and `list_providers` alike.
+    // The identity this server actually advertises, in `[providers.<id>]` and `list_providers` alike.
     // Reporting anything else would bind an imported thread to a provider the picker never offers.
     giskard_core::model::ModelRef {
         provider: "replay".into(),

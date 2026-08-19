@@ -219,7 +219,7 @@ service does not silently run with an empty provider list.
 | `[history]` | `initial` / `page` | `5` / `5` | Turns fetched on open (topped up client-side to ~2 screens) / per scroll-up page. |
 | `[harness]` | `kind` | `codex` | Agent harness (v1: `codex`). |
 | | `idle_shutdown_secs` | `0` (keep alive) | Terminate an idle project's harness after N seconds. |
-| `[[providers]]` | `id`, `model_listing`, `[[providers.models]]` | — | Which `(provider, model)` pairs the picker offers. `id` must name a provider Codex knows (see below). With `model_listing = true` the list is topped up from `GET {base_url}/models` — using the endpoint and key Codex has for that provider — so `[[providers.models]]` becomes optional. |
+| `[providers.<id>]` | `model_listing`, `[[providers.<id>.models]]` | — | Which `(provider, model)` pairs the picker offers, keyed by routing id the same way Codex keys `[model_providers.<id>]`. The id must name a provider Codex knows (see below). With `model_listing = true` the list is topped up from `GET {base_url}/models` — using the endpoint and key Codex has for that provider — so the models list becomes optional. Providers appear in the picker in the order declared. |
 
 Provider config governs the **picker** and optional `/v1/models` discovery only — Codex itself
 reads `~/.codex/config.toml` for real provider/auth, so any model you select must be one Codex can
@@ -227,8 +227,11 @@ actually reach.
 
 Because Codex already owns that file, Giskard does not ask you to restate any of it. A provider's
 display name, `base_url`, and the environment variable holding its key are read back from Codex, so
-a `[[providers]]` entry declares only its `id`, whether to run discovery, and the models to offer.
-The `id` must match a provider Codex knows: a built-in (`openai`, `amazon-bedrock`,
+a `[providers.<id>]` table declares only whether to run discovery and which models to offer — the id
+is the table key, quoted if it is not a bare TOML key (`[providers."openrouter.ai"]`, since the
+unquoted form would read as a provider `openrouter` with a sub-table). Keys Giskard does not
+recognise are rejected rather than ignored. The id must match a provider Codex knows: a built-in
+(`openai`, `amazon-bedrock`,
 `amazon-bedrock-runtime`, `ollama`, `lmstudio`) or one of your own `[model_providers.<id>]` tables.
 Giskard checks this when it composes a project's model list and shows a warning naming any id Codex
 has never heard of — its models stay in the picker, but they cannot be routed until you add the
@@ -236,8 +239,9 @@ provider to Codex. A key set inline in Codex as `experimental_bearer_token` is d
 read; discovery against such a provider needs `env_key` instead.
 
 Giskard has no model-name defaults table. Initial context-window metadata comes from an explicit
-`[[providers.models]]` entry or a model object's `context_window` / `max_input_tokens` field in the
-provider's `/models` response; otherwise the picker starts with the conservative 128k fallback.
+`[[providers.<id>.models]]` entry or a model object's `context_window` / `max_input_tokens` field
+in the provider's `/models` response; otherwise the picker starts with the conservative 128k
+fallback.
 `display_name` and reasoning-effort support are supplied by Codex's own model catalog, so declaring
 them is only necessary to override it.
 

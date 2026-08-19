@@ -74,25 +74,28 @@ idle_shutdown_secs = 0
 # An id Codex has never heard of is reported as a warning on the picker rather than failing later
 # with a provider-side model_not_found.
 
-[[providers]]
-id = "openai"
+# The table is keyed by the routing id, mirroring Codex's own `[model_providers.<id>]`. Providers
+# are offered to the picker in the order declared here. An id that is not a bare TOML key — one
+# with a dot in it, say — must be quoted: [providers."openrouter.ai"], since the unquoted form
+# would read as a provider "openrouter" with a sub-table. Unrecognised keys are rejected.
+
+[providers.openai]
 model_listing = false
-  [[providers.models]]
+  [[providers.openai.models]]
   id = "gpt-5.5"
   context_window = 262144
-  [[providers.models]]
+  [[providers.openai.models]]
   id = "gpt-5.4"
   context_window = 262144
 
 # Matches `[model_providers.cloudflare-litellm]` in ~/.codex/config.toml, which supplies the
 # base_url discovery queries and the env var holding its key.
-[[providers]]
-id = "cloudflare-litellm"
+[providers.cloudflare-litellm]
 model_listing = true
-# With model_listing = true you can omit [[providers.models]] entirely and let the models come from
+# With model_listing = true you can omit the models list entirely and let the models come from
 # the endpoint; declare entries only to give a model metadata the endpoint does not report.
 # context_window is the one field nothing else can supply: Codex's model/list omits it, so an
 # undeclared model starts on the conservative 128k fallback until the harness reports otherwise.
-  [[providers.models]]
+  [[providers.cloudflare-litellm.models]]
   id = "@cf/z-ai/glm-4.7"
   context_window = 131072

@@ -59,7 +59,7 @@ pub struct HarnessCapabilities {
 /// across another process's memory and logs for no benefit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessProvider {
-    /// Routing id. A Giskard `[[providers]] id` must match one of these to be reachable.
+    /// Routing id. A Giskard `[providers.<id>]` key must match one of these to be reachable.
     pub id: String,
     /// Friendly name for the picker, when the harness supplies one.
     pub name: Option<String>,
