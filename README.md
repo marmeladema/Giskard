@@ -239,9 +239,16 @@ provider to Codex.
 
 Discovery authenticates the way Codex does. A provider with `env_key` has its key read from that
 environment variable; one with `[model_providers.<id>.auth]` has its command run and the stdout
-sent as the bearer token, recomputed each time rather than cached. A key set inline as
-`experimental_bearer_token` is deliberately not read — discovery against such a provider needs
-`env_key` or `auth` instead.
+sent as the bearer token, recomputed each time rather than cached. A provider with
+`env_http_headers` also gets those headers, each value read from the environment variable the table
+names — which is what makes a gateway that admits on a header of its own (`x-…-api-key`) rather
+than `Authorization` listable, not just routable. An unset or empty variable simply contributes no
+header, as it does for Codex.
+
+Values written inline are deliberately not read: neither `experimental_bearer_token` nor the
+`http_headers` table reaches Giskard, because an inline value may be a secret and Giskard reads
+only where a value lives, never the value itself. Discovery against a provider configured that way
+needs `env_key`, `auth`, or `env_http_headers` instead.
 
 Giskard has no model-name defaults table. Initial context-window metadata comes from an explicit
 `[[providers.<id>.models]]` entry or a model object's `context_window` / `max_input_tokens` field

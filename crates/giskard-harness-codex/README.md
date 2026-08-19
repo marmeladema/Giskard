@@ -370,6 +370,13 @@ generated `codex-codes` types omit it, which is why it is deserialized locally.
   Giskard can run it when it needs a discovery token.
   `experimental_bearer_token` is not reported: an inline secret stays in Codex's
   config rather than being copied into another process.
+- **Header locations too** — `env_http_headers` becomes `ProviderHeader` entries
+  (header name + the environment variable holding its value), sorted by header
+  name so two reads of an unchanged config compare equal, with entries naming an
+  empty header or an empty variable dropped. They are what makes a gateway that
+  admits on its own header instead of `Authorization` listable and not merely
+  routable. The inline `http_headers` sibling is not reported, on the same rule
+  as `experimental_bearer_token`.
 - **`auth` wins over `env_key`** — Codex's own `ModelProviderInfo::validate`
   rejects a provider declaring both, so at most one is ever present. Preferring
   `auth` keeps a config Codex would refuse to load from authenticating discovery

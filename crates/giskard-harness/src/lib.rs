@@ -69,6 +69,9 @@ pub struct HarnessProvider {
     pub base_url: Option<String>,
     /// Where this provider's discovery key comes from, when the harness names a source.
     pub auth: Option<ProviderAuth>,
+    /// Extra headers the harness sends this provider on every request, each naming the
+    /// environment variable its value comes from. Empty when the harness names none.
+    pub headers: Vec<ProviderHeader>,
 }
 
 /// Where a provider's discovery key comes from.
@@ -82,6 +85,27 @@ pub enum ProviderAuth {
     Env(String),
     /// The key is whatever this command prints to stdout.
     Command(ProviderAuthCommand),
+}
+
+/// A header the harness sends a provider on every request, whose value lives in an environment
+/// variable (Codex's `[model_providers.<id>] env_http_headers`).
+///
+/// A key is not the only way an endpoint admits a caller. A gateway fronting several backends may
+/// take its own credential in a dedicated header and treat `Authorization` as the *upstream's*
+/// credential, so a provider reachable that way is one Giskard could not list models from while it
+/// only knew how to send a bearer: discovery is Giskard's own HTTP request, not one the harness
+/// makes for it (§8.2).
+///
+/// As with a key, only the **location** is read. Codex's sibling `http_headers` table holds literal
+/// values and is deliberately not read, for the same reason `experimental_bearer_token` is not: a
+/// value written inline may be a secret, and copying it into Giskard would spread it across another
+/// process's memory and logs to no end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderHeader {
+    /// Header name, as the harness spells it.
+    pub name: String,
+    /// Environment variable holding the value.
+    pub env_var: String,
 }
 
 /// A command whose stdout is a provider's bearer token (Codex's `[model_providers.<id>.auth]`).
@@ -139,6 +163,15 @@ impl ProviderAuthError {
             reason: reason.into(),
         }
     }
+
+    /// Names the header as well as the variable: a provider may name several, and a message that
+    /// only blamed the variable would leave the user grepping their harness config for it.
+    fn header(header: &str, var: &str, reason: impl Into<String>) -> Self {
+        Self {
+            origin: format!("environment variable ${var}, which supplies header `{header}`,"),
+            reason: reason.into(),
+        }
+    }
 }
 
 impl HarnessProvider {
@@ -165,20 +198,52 @@ impl HarnessProvider {
             Some(ProviderAuth::Command(auth)) => run_auth_command(auth).await.map(Some),
         }
     }
+
+    /// Resolve the extra headers discovery should send, in the order the harness reported them.
+    ///
+    /// A variable that is unset or holds only whitespace contributes no header rather than a blank
+    /// one, which is what Codex does with the same table: a provider that does not need the header
+    /// is then tried without it instead of being told the value is empty. A value that cannot be a
+    /// header is `Err` for the same reason a bad key is — the request is not attempted, so the
+    /// cause is reported as itself rather than as the 401 that would follow.
+    ///
+    /// Values are trimmed, like a key from either source: a variable set from a file or a here-doc
+    /// routinely carries a trailing newline, which no header value may contain.
+    pub fn resolve_headers(&self) -> Result<Vec<(String, String)>, ProviderAuthError> {
+        let mut resolved = Vec::with_capacity(self.headers.len());
+        for header in &self.headers {
+            let Some(value) = std::env::var(&header.env_var).ok() else {
+                continue;
+            };
+            match usable_token(value.trim()) {
+                Ok(Some(value)) => resolved.push((header.name.clone(), value)),
+                Ok(None) => continue,
+                Err(tail) => {
+                    return Err(ProviderAuthError::header(
+                        &header.name,
+                        &header.env_var,
+                        format!("holds a value that {tail}"),
+                    ));
+                }
+            }
+        }
+        Ok(resolved)
+    }
 }
 
 /// Vet a candidate token, whichever source produced it.
 ///
-/// `Ok(None)` is "there is no token here". `Err` carries why a non-empty one is unusable: it goes
-/// out verbatim in an `Authorization` header, which cannot hold control characters or non-ASCII, so
-/// letting it through would surface as an opaque HTTP-client "builder error" that reads as if the
-/// provider were unreachable — from either source, which is why both go through here.
+/// `Ok(None)` is "there is no value here". `Err` carries why a non-empty one is unusable: it goes
+/// out verbatim in an HTTP header, which cannot hold control characters or non-ASCII, so letting it
+/// through would surface as an opaque HTTP-client "builder error" that reads as if the provider
+/// were unreachable — from either key source and from a header variable, which is why they all go
+/// through here.
 fn usable_token(candidate: &str) -> Result<Option<String>, &'static str> {
     if candidate.is_empty() {
         return Ok(None);
     }
     if candidate.bytes().any(|b| !(0x20..=0x7e).contains(&b)) {
-        return Err("is not plain visible ASCII, so it cannot be sent in an Authorization header");
+        return Err("is not plain visible ASCII, so it cannot be sent in an HTTP header");
     }
     Ok(Some(candidate.to_string()))
 }
@@ -537,6 +602,7 @@ mod tests {
                 cwd: None,
                 timeout,
             })),
+            headers: Vec::new(),
         }
     }
 
@@ -670,7 +736,97 @@ mod tests {
             name: None,
             base_url: None,
             auth: Some(ProviderAuth::Env(var.into())),
+            headers: Vec::new(),
         }
+    }
+
+    fn header_provider(headers: &[(&str, &str)]) -> HarnessProvider {
+        HarnessProvider {
+            id: "gateway".into(),
+            name: None,
+            base_url: None,
+            auth: None,
+            headers: headers
+                .iter()
+                .map(|(name, env_var)| ProviderHeader {
+                    name: (*name).to_string(),
+                    env_var: (*env_var).to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    /// The whole point of the table: a provider whose endpoint admits on a header other than
+    /// `Authorization` is reachable, and the value is trimmed like a key from the same source.
+    #[test]
+    fn a_header_value_comes_from_its_variable_trimmed() {
+        let provider = header_provider(&[
+            ("x-gateway-api-key", "GISKARD_TEST_PADDED_KEY"),
+            ("x-tenant", "GISKARD_TEST_DISCOVERY_KEY"),
+        ]);
+        assert_eq!(
+            provider.resolve_headers().unwrap(),
+            vec![
+                ("x-gateway-api-key".to_string(), "padded-key".to_string()),
+                ("x-tenant".to_string(), "secret-key".to_string()),
+            ],
+            "headers keep the harness's order and shed surrounding whitespace"
+        );
+    }
+
+    /// An unset variable is not an error: the header is simply not sent, which is what the harness
+    /// itself does with it. Failing here would make an optional header mandatory.
+    #[test]
+    fn an_unset_header_variable_contributes_no_header() {
+        let provider = header_provider(&[
+            ("x-absent", "GISKARD_TEST_NO_SUCH_VARIABLE"),
+            ("x-tenant", "GISKARD_TEST_DISCOVERY_KEY"),
+        ]);
+        assert_eq!(
+            provider.resolve_headers().unwrap(),
+            vec![("x-tenant".to_string(), "secret-key".to_string())],
+            "the absent one drops out and the rest still go"
+        );
+    }
+
+    /// Same vetting as a key, and the message has to name both the variable and the header it
+    /// feeds — a provider may name several variables, and only one of them is the problem.
+    #[test]
+    fn a_header_value_that_cannot_be_sent_names_the_variable_and_the_header() {
+        let provider = header_provider(&[("x-gateway-api-key", "GISKARD_TEST_UNUSABLE_KEY")]);
+        let err = provider
+            .resolve_headers()
+            .expect_err("a value with an interior newline cannot be sent")
+            .to_string();
+        assert!(
+            err.contains("environment variable $GISKARD_TEST_UNUSABLE_KEY"),
+            "the variable should be named: {err}"
+        );
+        assert!(
+            err.contains("`x-gateway-api-key`"),
+            "the header should be named: {err}"
+        );
+    }
+
+    /// Headers and a key are independent sources: a provider may name both, either, or neither.
+    #[tokio::test]
+    async fn headers_and_a_key_do_not_stand_in_for_each_other() {
+        let mut provider = header_provider(&[("x-tenant", "GISKARD_TEST_DISCOVERY_KEY")]);
+        assert_eq!(
+            provider.resolve_api_key().await.unwrap(),
+            None,
+            "a provider that names only headers has no key"
+        );
+        provider.auth = Some(ProviderAuth::Env("GISKARD_TEST_PADDED_KEY".into()));
+        assert_eq!(
+            provider.resolve_api_key().await.unwrap(),
+            Some("padded-key".to_string())
+        );
+        assert_eq!(
+            provider.resolve_headers().unwrap(),
+            vec![("x-tenant".to_string(), "secret-key".to_string())],
+            "naming a key does not withdraw the headers"
+        );
     }
 
     /// An environment-supplied key gets the same treatment as a command's stdout: a variable set
@@ -723,7 +879,9 @@ mod tests {
             name: None,
             base_url: None,
             auth: None,
+            headers: Vec::new(),
         };
         assert_eq!(provider.resolve_api_key().await.unwrap(), None);
+        assert!(provider.resolve_headers().unwrap().is_empty());
     }
 }

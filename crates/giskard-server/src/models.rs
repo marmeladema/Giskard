@@ -368,9 +368,22 @@ pub async fn discover_models(
                 continue;
             }
         };
+        // The same headers the harness sends this provider on every request. A gateway that
+        // admits on a dedicated header rather than `Authorization` would answer 401 without them,
+        // and a provider may name headers with no key at all.
+        let headers = match known.resolve_headers() {
+            Ok(headers) => headers,
+            Err(e) => {
+                fail(e.to_string());
+                continue;
+            }
+        };
         let mut request = client.get(&url);
         if let Some(key) = key {
             request = request.bearer_auth(key);
+        }
+        for (name, value) in headers {
+            request = request.header(name, value);
         }
 
         match request.send().await {
@@ -391,6 +404,20 @@ pub async fn discover_models(
                                 " — `{}` produced a token the provider rejected",
                                 auth.command
                             ),
+                            // Naming the header variables matters most in exactly this case: a
+                            // provider admitted by header has no key to check, and a hint that
+                            // said so and stopped would point at nothing.
+                            None if !known.headers.is_empty() => {
+                                let vars = known
+                                    .headers
+                                    .iter()
+                                    .map(|header| format!("${}", header.env_var))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                format!(
+                                    " — the harness names no key for this provider, only                                      header(s) from {vars}"
+                                )
+                            }
                             None => " — the harness names no key for this provider".to_string(),
                         }
                     } else {

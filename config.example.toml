@@ -74,9 +74,12 @@ idle_shutdown_secs = 0
 # An id Codex has never heard of is reported as a warning on the picker rather than failing later
 # with a provider-side model_not_found.
 #
-# Discovery authenticates however Codex says to: `env_key` names an environment variable, and
+# Discovery authenticates however Codex says to: `env_key` names an environment variable,
 # [model_providers.<id>.auth] names a command whose stdout is the bearer token — Giskard runs it
-# each time it needs one. Nothing to configure here either way.
+# each time it needs one — and `env_http_headers` names a variable per extra header, which is how a
+# gateway admitting on its own `x-…-api-key` header instead of `Authorization` stays listable.
+# Nothing to configure here either way. Inline values (`experimental_bearer_token`, `http_headers`)
+# are not read: Giskard reads where a value lives, never the value.
 
 # The table is keyed by the routing id, mirroring Codex's own `[model_providers.<id>]`. Providers
 # are offered to the picker in the order declared here. An id that is not a bare TOML key — one

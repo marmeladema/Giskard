@@ -2389,6 +2389,16 @@ of an environment variable holding it, or a command whose stdout is the token (C
 declaring both. An inline secret (Codex's `experimental_bearer_token`) is not read at all: copying
 it into Giskard would spread a credential into another process's memory and logs to no end.
 
+A key is not the only way an endpoint admits a caller, so a harness also reports the **extra
+headers** it sends a provider, each as the name of the environment variable holding its value
+(Codex's `env_http_headers`). A gateway fronting several backends may take its own credential in a
+dedicated header and leave `Authorization` to mean the *upstream's* credential; such a provider
+routes turns fine — the harness sends the header — but discovery is Giskard's own request, so
+without the same header it can only ever be answered with a 401. An unset or empty variable
+contributes no header rather than a blank one, matching what the harness does with it. The inline
+sibling (Codex's `http_headers`) is not read, on the same rule as `experimental_bearer_token`: a
+value written inline may be a secret.
+
 Giskard runs that command itself, because `/v1/models` discovery is its own HTTP request rather
 than one the harness makes. A harness may only report a command it read from configuration the
 *user* controls, never from the project directory: opening a project points the harness at a
@@ -2400,8 +2410,9 @@ The token is recomputed whenever discovery needs it rather than cached: discover
 project's model list is composed, which is rare enough that a cache would mostly hold a stale
 token. A command that fails, times out, or prints nothing is reported as itself and the request is
 not attempted — sending it unauthenticated would bury the cause under a 401 blaming the endpoint.
-The same vetting applies to a key read from an environment variable: either source is trimmed and
-must be usable as a header value, and the failure names whichever one it came from.
+The same vetting applies to a key read from an environment variable, and to a header value: every
+source is trimmed and must be usable as a header value, and the failure names whichever one it came
+from — for a header, both the variable and the header it feeds, since a provider may name several.
 
 **Id validation.** A `[providers.<id>]` key is the routing id sent to the harness, so an id the
 harness does not know cannot route. Giskard checks the configured ids against the harness's

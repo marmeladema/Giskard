@@ -38,7 +38,8 @@ use giskard_core::turn::{PermissionPreset, TurnOverrides, TurnStatus, TurnStatus
 use giskard_core::{AttachmentKind, UserAttachment, UserInput};
 use giskard_harness::{
     AgentEventStream, AgentHarness, HarnessCapabilities, HarnessNotice, HarnessProvider,
-    OpenThreadOptions, ProviderAuth, ProviderAuthCommand, ResumePolicy, ThreadHandle,
+    OpenThreadOptions, ProviderAuth, ProviderAuthCommand, ProviderHeader, ResumePolicy,
+    ThreadHandle,
 };
 
 use mapping::CodexMapper;
@@ -100,6 +101,13 @@ struct CodexModelProvider {
     /// `[model_providers.<id>.auth]` — a command whose stdout is the provider's bearer token.
     #[serde(default)]
     auth: Option<CodexProviderAuth>,
+    /// `[model_providers.<id>] env_http_headers` — header name → the environment variable holding
+    /// its value. Codex sends these on every request to the provider, so discovery must too.
+    ///
+    /// Its sibling `http_headers` holds literal values and is deliberately not read, on the same
+    /// rule that leaves `experimental_bearer_token` where it is: an inline value may be a secret.
+    #[serde(default)]
+    env_http_headers: Option<HashMap<String, String>>,
 }
 
 /// Codex's `ModelProviderAuthInfo`. `refresh_interval_ms` is not read: Giskard reruns the command
@@ -151,6 +159,28 @@ impl CodexModelProvider {
             }));
         }
         non_empty(self.env_key).map(ProviderAuth::Env)
+    }
+
+    /// The `env_http_headers` entries discovery can act on, in a stable order.
+    ///
+    /// Codex's table is a `HashMap`, whose iteration order varies from run to run; sorting by
+    /// header name keeps two `list_providers` calls on an unchanged config comparable. An entry
+    /// naming an empty header or an empty variable is dropped rather than carried: neither can
+    /// produce a header, and Codex itself skips a header it cannot build.
+    fn env_headers(&self) -> Vec<ProviderHeader> {
+        let mut headers: Vec<ProviderHeader> = self
+            .env_http_headers
+            .iter()
+            .flatten()
+            .filter_map(|(name, env_var)| {
+                Some(ProviderHeader {
+                    name: non_empty(Some(name.clone()))?,
+                    env_var: non_empty(Some(env_var.clone()))?,
+                })
+            })
+            .collect();
+        headers.sort_by(|a, b| a.name.cmp(&b.name));
+        headers
     }
 }
 
@@ -3063,6 +3093,7 @@ async fn handle_list_providers(
             name: None,
             base_url: None,
             auth: None,
+            headers: Vec::new(),
         })
         .collect();
 
@@ -3071,6 +3102,8 @@ async fn handle_list_providers(
             id: id.clone(),
             name: non_empty(provider.name.clone()),
             base_url: non_empty(provider.base_url.clone()),
+            // Read before `auth`, which consumes the entry.
+            headers: provider.env_headers(),
             auth: provider.auth(),
         };
         match providers.iter_mut().find(|existing| existing.id == id) {
@@ -3655,6 +3688,19 @@ mod tests {
                                                 "timeout_ms": 2500,
                                                 "refresh_interval_ms": 300000,
                                                 "cwd": "/tmp"
+                                            }
+                                        },
+                                        "header-gateway": {
+                                            "name": "Header Gateway",
+                                            "base_url": "http://127.0.0.1:6000/v1",
+                                            "env_http_headers": {
+                                                "x-proxy-api-key": "PROXY_KEY",
+                                                "x-tenant": "PROXY_TENANT",
+                                                "": "IGNORED_KEY",
+                                                "x-blank": ""
+                                            },
+                                            "http_headers": {
+                                                "x-inline": "not-read"
                                             }
                                         }
                                     }
@@ -4781,6 +4827,33 @@ mod tests {
             unfamiliar.base_url.as_deref(),
             Some("http://127.0.0.1:7000/v1"),
             "the rest of the entry survives"
+        );
+
+        // `env_http_headers` names *where* each header's value lives, the same contract as
+        // `env_key`, so discovery can reach a gateway that admits on its own header instead of
+        // `Authorization`. The inline `http_headers` sibling is deliberately not reported.
+        let gateway = by_id("header-gateway");
+        assert_eq!(
+            gateway.headers,
+            vec![
+                ProviderHeader {
+                    name: "x-proxy-api-key".into(),
+                    env_var: "PROXY_KEY".into(),
+                },
+                ProviderHeader {
+                    name: "x-tenant".into(),
+                    env_var: "PROXY_TENANT".into(),
+                },
+            ],
+            "usable entries only, ordered by header name so two reads compare equal"
+        );
+        assert_eq!(
+            gateway.auth, None,
+            "headers are not a key; this provider names no key at all"
+        );
+        assert!(
+            litellm.headers.is_empty(),
+            "a provider with no env_http_headers reports none"
         );
 
         let requests = controller.requests().await;

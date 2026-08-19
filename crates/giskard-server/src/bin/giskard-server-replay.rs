@@ -375,6 +375,7 @@ impl AgentHarness for ScriptedHarness {
             name: Some("Replay (scripted)".into()),
             base_url: None,
             auth: None,
+            headers: Vec::new(),
         }])
     }
 

@@ -16,7 +16,9 @@ use giskard_core::ids::{ItemId, ProjectId, ThreadId, TurnId};
 use giskard_core::item::{Item, ItemKind, ItemPayload, ItemStart};
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnStatus, TurnStatusKind};
-use giskard_harness::{AgentHarness, HarnessProvider, ProviderAuth, ProviderAuthCommand};
+use giskard_harness::{
+    AgentHarness, HarnessProvider, ProviderAuth, ProviderAuthCommand, ProviderHeader,
+};
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 use giskard_persist::store::ProjectConfig;
 use giskard_server::{AppState, HarnessFactory, build_app};
@@ -213,6 +215,7 @@ model_listing = true
                 name: Some("Mock".into()),
                 base_url: Some(format!("http://{mock_addr}")),
                 auth: None,
+                headers: Vec::new(),
             }],
         }),
         (0..32u8).collect(),
@@ -384,6 +387,7 @@ model_listing = true
                 name: Some("Secured".into()),
                 base_url: Some(format!("http://{mock_addr}")),
                 auth: Some(ProviderAuth::Env(KEY_ENV.into())),
+                headers: Vec::new(),
             }],
         }),
         (0..32u8).collect(),
@@ -417,6 +421,122 @@ model_listing = true
     assert!(
         ids.contains(&"secured-model"),
         "authorized discovery should list the model (bearer key sent): {ids:?}"
+    );
+}
+
+/// A provider whose endpoint admits on its own header rather than `Authorization` — an
+/// OpenAI-compatible gateway that reserves the bearer for the *upstream* it fronts — is listed
+/// too: discovery sends the `env_http_headers` the harness names, resolved from the environment
+/// the same way a key is (§8.2). Without this such a provider can route turns but never list
+/// models.
+#[tokio::test]
+async fn dynamic_model_refresh_sends_env_http_headers() {
+    // Same rule as the bearer test above: the value has to already exist in the environment,
+    // because a test cannot safely put it there (`set_var` races every other reader).
+    const HEADER_ENV: &str = "GISKARD_TEST_DISCOVERY_KEY";
+    let key = std::env::var(HEADER_ENV).unwrap_or_else(|_| {
+        panic!("{HEADER_ENV} must be set for this test; cargo supplies it from .cargo/config.toml")
+    });
+    // The mock answers only on the dedicated header, and only when no bearer stands in for it.
+    let mock = Router::new().route(
+        "/models",
+        get(|headers: axum::http::HeaderMap| async move {
+            let admitted = headers
+                .get("x-gateway-api-key")
+                .and_then(|v| v.to_str().ok())
+                == Some(&*key);
+            let data = if admitted {
+                serde_json::json!([{ "id": "gateway-model" }])
+            } else {
+                serde_json::json!([])
+            };
+            AxumJson(serde_json::json!({ "data": data }))
+        }),
+    );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(mock_listener, mock).await.unwrap() });
+
+    let port = 19214;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let hash = password_hash("testpass");
+    tokio::fs::write(
+        tmp.path().join("config.toml"),
+        format!(
+            r#"
+[server]
+bind = "127.0.0.1:{port}"
+secure_cookies = false
+
+[auth]
+password_hash = "{hash}"
+session_days = 30
+
+[providers.gateway]
+model_listing = true
+"#
+        ),
+    )
+    .await
+    .unwrap();
+
+    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
+    let state = AppState::new(
+        store,
+        Arc::new(DiffFactory {
+            fixture: make_fixture(),
+            imported_model: None,
+            providers: vec![HarnessProvider {
+                id: "gateway".into(),
+                name: Some("Gateway".into()),
+                base_url: Some(format!("http://{mock_addr}")),
+                // No key at all: the header is the whole credential, which is the case that used
+                // to be unreachable.
+                auth: None,
+                headers: vec![ProviderHeader {
+                    name: "x-gateway-api-key".into(),
+                    env_var: HEADER_ENV.into(),
+                }],
+            }],
+        }),
+        (0..32u8).collect(),
+    );
+    let app = build_app(state);
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let base = format!("http://127.0.0.1:{port}");
+    let (client, cookie) = login(&base).await;
+    let project = create_project(&client, &base, &cookie).await;
+
+    let refreshed: serde_json::Value = client
+        .get(format!("{base}/api/projects/{project}/models"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let ids: Vec<&str> = refreshed["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["model"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&"gateway-model"),
+        "the harness-named header should admit discovery: {ids:?}"
+    );
+    assert!(
+        refreshed["warnings"]
+            .as_array()
+            .is_none_or(|warnings| warnings.is_empty()),
+        "an admitted listing has nothing to warn about: {:?}",
+        refreshed["warnings"]
     );
 }
 
@@ -472,6 +592,7 @@ model_listing = true
                 name: Some("Secured".into()),
                 base_url: Some(format!("http://{mock_addr}")),
                 auth: None,
+                headers: Vec::new(),
             }],
         }),
         (0..32u8).collect(),
@@ -554,6 +675,7 @@ session_days = 30
                 name: None,
                 base_url: None,
                 auth: None,
+                headers: Vec::new(),
             }],
         }),
         (0..32u8).collect(),
@@ -893,6 +1015,7 @@ model_listing = true
                 name: Some("Secured".into()),
                 base_url: Some(format!("http://{mock_addr}")),
                 auth: Some(auth),
+                headers: Vec::new(),
             }],
         }),
         (0..32u8).collect(),
