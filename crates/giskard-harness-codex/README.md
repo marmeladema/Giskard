@@ -349,15 +349,34 @@ type forwards every key it does not model itself. `[model_providers]` therefore
 arrives as an unmodeled key, which the adapter's own `CodexConfig` picks up — the
 generated `codex-codes` types omit it, which is why it is deserialized locally.
 
-- **Per-directory** — the request carries the project's workspace root, because a
-  project layer can declare providers the home config does not.
+- **Per-directory, but the table is not** — the request carries the project's
+  workspace root, as every other `config/read` here does. It does not change the
+  provider table: `model_provider` and `model_providers` are both on Codex's
+  `PROJECT_LOCAL_CONFIG_DENYLIST`, so a project-local `.codex/config.toml` has
+  them stripped (with a startup warning) before the layers are merged, trusted
+  directory or not. Providers therefore always come from the user-level,
+  packaged-default, or enterprise-managed layers.
+
+  That is what makes running `auth.command` safe to do here: a checked-in config
+  in a cloned repository cannot introduce a provider, so it cannot introduce a
+  command for Giskard to run.
 - **Built-ins are added** — `[model_providers]` holds only user-declared entries,
   so `CODEX_BUILT_IN_PROVIDER_IDS` (`openai`, `amazon-bedrock`,
   `amazon-bedrock-runtime`, `ollama`, `lmstudio`) is merged in. Without them a
   project pinned to `openai` would look like an unknown provider.
-- **Env-var names only** — a provider's `env_key` is reported, never
-  `experimental_bearer_token`. An inline secret stays in Codex's config rather
-  than being copied into another process.
+- **Key location, never the key** — a provider's `env_key` becomes
+  `ProviderAuth::Env`, and `[model_providers.<id>.auth]` becomes
+  `ProviderAuth::Command`, carrying the command, args, cwd and timeout so
+  Giskard can run it when it needs a discovery token.
+  `experimental_bearer_token` is not reported: an inline secret stays in Codex's
+  config rather than being copied into another process.
+- **`auth` wins over `env_key`** — Codex's own `ModelProviderInfo::validate`
+  rejects a provider declaring both, so at most one is ever present. Preferring
+  `auth` keeps a config Codex would refuse to load from authenticating discovery
+  differently than it would authenticate a turn.
+- **`refresh_interval_ms` is not read** — Giskard reruns the command whenever it
+  needs a token instead of caching one, so there is no cached token for an
+  interval to age out. `timeout_ms` *is* read, defaulting to Codex's own 5 s.
 - **Empty is absence** — Codex defaults an omitted `name` to `""`; the adapter
   normalizes empty strings to `None`.
 

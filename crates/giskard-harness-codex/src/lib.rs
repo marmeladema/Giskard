@@ -38,7 +38,7 @@ use giskard_core::turn::{PermissionPreset, TurnOverrides, TurnStatus, TurnStatus
 use giskard_core::{AttachmentKind, UserAttachment, UserInput};
 use giskard_harness::{
     AgentEventStream, AgentHarness, HarnessCapabilities, HarnessNotice, HarnessProvider,
-    OpenThreadOptions, ResumePolicy, ThreadHandle,
+    OpenThreadOptions, ProviderAuth, ProviderAuthCommand, ResumePolicy, ThreadHandle,
 };
 
 use mapping::CodexMapper;
@@ -97,6 +97,61 @@ struct CodexModelProvider {
     base_url: Option<String>,
     #[serde(default)]
     env_key: Option<String>,
+    /// `[model_providers.<id>.auth]` — a command whose stdout is the provider's bearer token.
+    #[serde(default)]
+    auth: Option<CodexProviderAuth>,
+}
+
+/// Codex's `ModelProviderAuthInfo`. `refresh_interval_ms` is not read: Giskard reruns the command
+/// each time it needs a token rather than caching one (see [`HarnessProvider::resolve_api_key`]),
+/// so there is no cached token for an interval to age out.
+///
+/// Every field is optional even though Codex requires `command`, because this type is only ever
+/// deserialized from *Codex's* output and a required field here would make one unfamiliar provider
+/// entry fail the whole `config/read`. That response is shared: the same call supplies
+/// `sandbox_workspace_write.writable_roots`, so a parse failure would silently narrow the sandbox
+/// as a side effect of a model-discovery field. An `auth` table Giskard cannot make sense of is
+/// treated as no command auth instead.
+#[derive(Debug, Deserialize)]
+struct CodexProviderAuth {
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    cwd: Option<PathBuf>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+/// Codex's own default when `[model_providers.<id>.auth] timeout_ms` is unset
+/// (`DEFAULT_PROVIDER_AUTH_TIMEOUT_MS`). `config/read` reports the effective config, so the field
+/// should always arrive; this covers a Codex that stops serializing its defaults.
+const DEFAULT_PROVIDER_AUTH_TIMEOUT_MS: u64 = 5_000;
+
+impl CodexModelProvider {
+    /// Codex rejects a provider declaring both `auth` and `env_key`, so at most one arm applies;
+    /// preferring `auth` keeps a config Codex would refuse to load from silently authenticating
+    /// discovery a different way than turns.
+    fn auth(self) -> Option<ProviderAuth> {
+        // Codex rejects an empty `auth.command`, so an absent or blank one is not a provider to
+        // authenticate by command — fall through rather than queue up a command that cannot run.
+        if let Some(auth) = self.auth
+            && let Some(command) = non_empty(auth.command)
+        {
+            return Some(ProviderAuth::Command(ProviderAuthCommand {
+                command,
+                args: auth.args,
+                cwd: auth.cwd,
+                timeout: Duration::from_millis(
+                    auth.timeout_ms
+                        .filter(|ms| *ms > 0)
+                        .unwrap_or(DEFAULT_PROVIDER_AUTH_TIMEOUT_MS),
+                ),
+            }));
+        }
+        non_empty(self.env_key).map(ProviderAuth::Env)
+    }
 }
 
 /// Provider ids Codex ships built in. They never appear in the `[model_providers]` table (which
@@ -3007,16 +3062,16 @@ async fn handle_list_providers(
             id: (*id).to_string(),
             name: None,
             base_url: None,
-            api_key_env: None,
+            auth: None,
         })
         .collect();
 
     for (id, provider) in response.config.model_providers {
         let entry = HarnessProvider {
             id: id.clone(),
-            name: non_empty(provider.name),
-            base_url: non_empty(provider.base_url),
-            api_key_env: non_empty(provider.env_key),
+            name: non_empty(provider.name.clone()),
+            base_url: non_empty(provider.base_url.clone()),
+            auth: provider.auth(),
         };
         match providers.iter_mut().find(|existing| existing.id == id) {
             Some(existing) => *existing = entry,
@@ -3582,6 +3637,25 @@ mod tests {
                                         "unnamed": {
                                             "name": "",
                                             "base_url": "http://127.0.0.1:9000/v1"
+                                        },
+                                        "unfamiliar-auth": {
+                                            "base_url": "http://127.0.0.1:7000/v1",
+                                            "env_key": "FALLBACK_KEY",
+                                            "auth": {
+                                                "args": ["--whatever"],
+                                                "some_future_key": true
+                                            }
+                                        },
+                                        "opencodex": {
+                                            "name": "OpenCodex",
+                                            "base_url": "http://127.0.0.1:5000/v1",
+                                            "auth": {
+                                                "command": "sh",
+                                                "args": ["-c", "printf %s \"$OPENCODEX_KEY\""],
+                                                "timeout_ms": 2500,
+                                                "refresh_interval_ms": 300000,
+                                                "cwd": "/tmp"
+                                            }
                                         }
                                     }
                                 },
@@ -4670,12 +4744,44 @@ mod tests {
             litellm.base_url.as_deref(),
             Some("http://127.0.0.1:4000/v1")
         );
-        assert_eq!(litellm.api_key_env.as_deref(), Some("LITELLM_KEY"));
+        assert_eq!(
+            litellm.auth,
+            Some(ProviderAuth::Env("LITELLM_KEY".into())),
+            "env_key should map to the env arm"
+        );
 
         // Codex defaults an omitted `name` to "", which is absence, not a display name.
         let unnamed = by_id("unnamed");
         assert_eq!(unnamed.name, None);
-        assert_eq!(unnamed.api_key_env, None);
+        assert_eq!(unnamed.auth, None);
+
+        // `[model_providers.opencodex.auth]` — a command whose stdout is the bearer token.
+        let opencodex = by_id("opencodex");
+        assert_eq!(
+            opencodex.auth,
+            Some(ProviderAuth::Command(ProviderAuthCommand {
+                command: "sh".into(),
+                args: vec!["-c".into(), "printf %s \"$OPENCODEX_KEY\"".into()],
+                cwd: Some(PathBuf::from("/tmp")),
+                timeout: Duration::from_millis(2500),
+            })),
+            "the auth table should map to the command arm, timeout included"
+        );
+
+        // An `auth` table Giskard cannot make sense of must not fail the whole `config/read`: the
+        // same response carries `sandbox_workspace_write.writable_roots`, so a strict parse here
+        // would silently narrow the sandbox. The provider still resolves by its `env_key`.
+        let unfamiliar = by_id("unfamiliar-auth");
+        assert_eq!(
+            unfamiliar.auth,
+            Some(ProviderAuth::Env("FALLBACK_KEY".into())),
+            "an auth table with no usable command falls back rather than failing the read"
+        );
+        assert_eq!(
+            unfamiliar.base_url.as_deref(),
+            Some("http://127.0.0.1:7000/v1"),
+            "the rest of the entry survives"
+        );
 
         let requests = controller.requests().await;
         assert!(

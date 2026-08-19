@@ -13,7 +13,7 @@ use tracing::warn;
 
 use giskard_core::ids::ProjectId;
 use giskard_core::model::{ModelDescriptor, ModelRef};
-use giskard_harness::HarnessProvider;
+use giskard_harness::{HarnessProvider, ProviderAuth};
 use giskard_persist::Config;
 use giskard_proto::ModelListingWarning;
 
@@ -347,12 +347,6 @@ pub async fn discover_models(
             continue;
         };
         let url = format!("{}/models", base_url.trim_end_matches('/'));
-        // Attach the provider's discovery key for endpoints that require auth — e.g. a LiteLLM
-        // proxy with a master key returns 401 otherwise.
-        let mut request = client.get(&url);
-        if let Some(key) = known.resolve_api_key() {
-            request = request.bearer_auth(key);
-        }
 
         let mut fail = |message: String| {
             warn!(provider = %id, %url, %message, "model discovery failed; skipping provider");
@@ -363,15 +357,44 @@ pub async fn discover_models(
         };
         let mut invalid_metadata_models = Vec::new();
 
+        // Attach the provider's discovery key for endpoints that require auth — e.g. a LiteLLM
+        // proxy with a master key returns 401 otherwise. A command-backed key that cannot be
+        // produced is reported as itself: sending the request unauthenticated would bury the real
+        // cause under a 401 blaming the endpoint.
+        let key = match known.resolve_api_key().await {
+            Ok(key) => key,
+            Err(e) => {
+                fail(e.to_string());
+                continue;
+            }
+        };
+        let mut request = client.get(&url);
+        if let Some(key) = key {
+            request = request.bearer_auth(key);
+        }
+
         match request.send().await {
             Ok(resp) => {
                 let status = resp.status();
                 if !status.is_success() {
-                    // A 401/403 almost always means the discovery key is missing or wrong.
+                    // A 401/403 is about the key, so point at whichever source this provider
+                    // actually names rather than assuming an environment variable.
                     let hint = if status.as_u16() == 401 || status.as_u16() == 403 {
-                        " — check the env var the harness names for this provider's key"
+                        match &known.auth {
+                            Some(ProviderAuth::Env(var)) => {
+                                format!(
+                                    " — check ${var}, the env var the harness names for this \
+                                         provider's key"
+                                )
+                            }
+                            Some(ProviderAuth::Command(auth)) => format!(
+                                " — `{}` produced a token the provider rejected",
+                                auth.command
+                            ),
+                            None => " — the harness names no key for this provider".to_string(),
+                        }
                     } else {
-                        ""
+                        String::new()
                     };
                     fail(format!("model listing returned HTTP {status}{hint}"));
                     continue;

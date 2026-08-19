@@ -23,13 +23,13 @@ fn harness_providers(mock_addr: &str) -> Vec<HarnessProvider> {
             id: "openai".into(),
             name: Some("OpenAI".into()),
             base_url: None,
-            api_key_env: None,
+            auth: None,
         },
         HarnessProvider {
             id: "mock".into(),
             name: Some("Mock".into()),
             base_url: Some(format!("http://{mock_addr}")),
-            api_key_env: None,
+            auth: None,
         },
     ]
 }

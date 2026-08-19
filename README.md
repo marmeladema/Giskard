@@ -226,17 +226,22 @@ reads `~/.codex/config.toml` for real provider/auth, so any model you select mus
 actually reach.
 
 Because Codex already owns that file, Giskard does not ask you to restate any of it. A provider's
-display name, `base_url`, and the environment variable holding its key are read back from Codex, so
-a `[providers.<id>]` table declares only whether to run discovery and which models to offer — the id
+display name, `base_url`, and where its key comes from are read back from Codex, so a
+`[providers.<id>]` table declares only whether to run discovery and which models to offer — the id
 is the table key, quoted if it is not a bare TOML key (`[providers."openrouter.ai"]`, since the
 unquoted form would read as a provider `openrouter` with a sub-table). Keys Giskard does not
 recognise are rejected rather than ignored. The id must match a provider Codex knows: a built-in
-(`openai`, `amazon-bedrock`,
-`amazon-bedrock-runtime`, `ollama`, `lmstudio`) or one of your own `[model_providers.<id>]` tables.
+(`openai`, `amazon-bedrock`, `amazon-bedrock-runtime`, `ollama`, `lmstudio`) or one of your own
+`[model_providers.<id>]` tables.
 Giskard checks this when it composes a project's model list and shows a warning naming any id Codex
 has never heard of — its models stay in the picker, but they cannot be routed until you add the
-provider to Codex. A key set inline in Codex as `experimental_bearer_token` is deliberately not
-read; discovery against such a provider needs `env_key` instead.
+provider to Codex.
+
+Discovery authenticates the way Codex does. A provider with `env_key` has its key read from that
+environment variable; one with `[model_providers.<id>.auth]` has its command run and the stdout
+sent as the bearer token, recomputed each time rather than cached. A key set inline as
+`experimental_bearer_token` is deliberately not read — discovery against such a provider needs
+`env_key` or `auth` instead.
 
 Giskard has no model-name defaults table. Initial context-window metadata comes from an explicit
 `[[providers.<id>.models]]` entry or a model object's `context_window` / `max_input_tokens` field

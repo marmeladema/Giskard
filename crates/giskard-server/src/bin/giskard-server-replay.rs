@@ -374,7 +374,7 @@ impl AgentHarness for ScriptedHarness {
             id: "replay".into(),
             name: Some("Replay (scripted)".into()),
             base_url: None,
-            api_key_env: None,
+            auth: None,
         }])
     }
 
