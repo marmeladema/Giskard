@@ -32,7 +32,7 @@ outright — most often because the thread's provider is no longer in its own co
 the server is fine and the state is user-fixable, so it is neither a 500 nor an error-level log.
 
 `GET /api/projects/{id}/models` is the only model-listing endpoint: the declared
-`[[providers.models]]` entries, plus each listing-enabled provider's `/v1/models` discovery and the
+`[[providers.<id>.models]]` entries, plus each listing-enabled provider's `/v1/models` discovery and the
 harness's own catalog, with unknown provider ids and per-provider discovery failures reported in
 `warnings`. There is no project-less equivalent. Both discovery and the harness catalog need a
 provider's endpoint, which only a harness knows, and there is no harness until a project is open —

@@ -1,5 +1,6 @@
 //! Configuration loading from `config.toml` (spec Appendix C).
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 /// Global application configuration (spec Appendix C).
@@ -13,7 +14,11 @@ pub struct Config {
     pub tokens: TokensConfig,
     pub viz: VizConfig,
     pub history: HistoryConfig,
-    pub providers: Vec<ProviderConfig>,
+    /// Declared providers, keyed by routing id — the same shape Codex uses for
+    /// `[model_providers.<id>]`. An `IndexMap` rather than a `HashMap` because the declaration
+    /// order is the model picker's order (§8.3): a hashed order would reshuffle the picker on
+    /// every restart and change which model a draft starts on when none is marked default.
+    pub providers: IndexMap<String, ProviderConfig>,
     pub harness: HarnessConfig,
 }
 
@@ -140,11 +145,15 @@ impl Default for VizConfig {
 /// `AgentHarness::list_providers` rather than asking for them a second time here. What is left is
 /// what no harness can supply — which `(provider, model)` pairs to offer, and the context window
 /// for each (§8.3).
+///
+/// Unknown keys are rejected: this file is written by hand, so a key Giskard does not recognise is
+/// a typo, an `id` left over from the array-of-tables form this replaced, or — the one the table
+/// key introduced — an id with a dot in it left unquoted, where `[providers.openrouter.ai]` is a
+/// provider `openrouter` with a sub-table rather than a provider `openrouter.ai`. Reporting the
+/// key beats silently offering no models under a provider the user did not name.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
-    /// Routing id. Must match a provider the harness knows (§8.2); Giskard validates this against
-    /// the harness's own provider table and warns when it does not.
-    pub id: String,
     /// Whether to merge `GET {base_url}/models` discovery over the declared models, using the
     /// endpoint the harness reports for this provider.
     #[serde(default)]
@@ -205,27 +214,25 @@ filename_template = "plan-{slug}-{ts}.md"
 [tokens]
 cost_estimation = false
 
-[[providers]]
-id = "openai"
+[providers.openai]
 model_listing = false
 
-  [[providers.models]]
+  [[providers.openai.models]]
   id = "gpt-5.5"
   display_name = "GPT-5.5"
   context_window = 262144
   supports_reasoning_effort = true
 
-  [[providers.models]]
+  [[providers.openai.models]]
   id = "gpt-5.4"
   display_name = "GPT-5.4"
   context_window = 262144
   supports_reasoning_effort = true
 
-[[providers]]
-id = "cloudflare-litellm"
+[providers.cloudflare-litellm]
 model_listing = true
 
-  [[providers.models]]
+  [[providers.cloudflare-litellm.models]]
   id = "@cf/z-ai/glm-4.7"
   display_name = "GLM-4.7 (Workers AI)"
   context_window = 131072
@@ -238,13 +245,94 @@ idle_shutdown_secs = 0
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.server.bind, "127.0.0.1:8787");
         assert_eq!(config.browse.roots, vec!["/home/user/dev"]);
-        assert_eq!(config.providers.len(), 2);
-        assert_eq!(config.providers[0].models.len(), 2);
-        assert_eq!(config.providers[0].models[0].context_window, 262144);
-        assert!(config.providers[0].models[0].supports_reasoning_effort);
-        assert_eq!(config.providers[1].models[0].id, "@cf/z-ai/glm-4.7");
-        assert!(!config.providers[1].models[0].supports_reasoning_effort);
+        // Declaration order, not hash order: the picker lists providers as the file does.
+        assert_eq!(
+            config.providers.keys().collect::<Vec<_>>(),
+            ["openai", "cloudflare-litellm"]
+        );
+        let openai = &config.providers["openai"];
+        assert_eq!(openai.models.len(), 2);
+        assert_eq!(openai.models[0].context_window, 262144);
+        assert!(openai.models[0].supports_reasoning_effort);
+        let litellm = &config.providers["cloudflare-litellm"];
+        assert_eq!(litellm.models[0].id, "@cf/z-ai/glm-4.7");
+        assert!(!litellm.models[0].supports_reasoning_effort);
         assert_eq!(config.harness.kind, "codex");
+    }
+
+    /// Two providers with the same routing id is a config mistake, and keying the table by id
+    /// makes TOML itself catch it. The array-of-tables form this replaced accepted the duplicate
+    /// and silently used whichever came first.
+    #[test]
+    fn a_duplicate_provider_id_is_a_parse_error() {
+        let err = toml::from_str::<Config>(
+            r#"
+[providers.openai]
+model_listing = false
+
+[providers.openai]
+model_listing = true
+"#,
+        )
+        .expect_err("a repeated provider id must not parse");
+        assert!(
+            err.to_string().contains("openai"),
+            "the error should name the duplicated id: {err}"
+        );
+    }
+
+    /// A provider id that is not a bare TOML key has to be quoted, and the unquoted form is a
+    /// dotted path rather than an id: `[providers.openrouter.ai]` declares a provider `openrouter`
+    /// with a sub-table `ai`. `deny_unknown_fields` on [`ProviderConfig`] is what turns that into
+    /// an error pointing at the offending segment instead of a provider silently missing its
+    /// models. (The array-of-tables form this replaced carried the id as a string value, where a
+    /// dot meant nothing.)
+    #[test]
+    fn a_dotted_provider_id_must_be_quoted() {
+        let err = toml::from_str::<Config>(
+            r#"
+[providers.openrouter.ai]
+model_listing = true
+"#,
+        )
+        .expect_err("an unquoted dotted id must not be read as a provider named `openrouter`");
+        assert!(
+            err.to_string().contains("unknown field `ai`"),
+            "the error should name the stray path segment: {err}"
+        );
+
+        let config: Config = toml::from_str(
+            r#"
+[providers."openrouter.ai"]
+model_listing = true
+  [[providers."openrouter.ai".models]]
+  id = "z-ai/glm-4.7"
+  context_window = 131072
+"#,
+        )
+        .expect("the quoted form is the way to write it");
+        let provider = &config.providers["openrouter.ai"];
+        assert!(provider.model_listing);
+        assert_eq!(provider.models.len(), 1);
+    }
+
+    /// `config.toml` is written by hand, so an unrecognised key is a mistake worth reporting rather
+    /// than ignoring — including an `id` left behind by a config half-converted from the
+    /// array-of-tables form, which would otherwise be silently dropped while the table key it
+    /// disagrees with is what actually routes.
+    #[test]
+    fn an_unknown_provider_key_is_a_parse_error() {
+        for src in [
+            "[providers.openai]\nid = \"totally-different\"\n",
+            "[providers.openai]\nmodel_listings = true\n",
+        ] {
+            let err = toml::from_str::<Config>(src)
+                .expect_err("an unrecognised provider key must not parse");
+            assert!(
+                err.to_string().contains("unknown field"),
+                "expected an unknown-field error for {src:?}, got: {err}"
+            );
+        }
     }
 
     #[test]

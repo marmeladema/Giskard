@@ -228,19 +228,17 @@ secure_cookies = false
 password_hash = "{hash}"
 session_days = 30
 
-[[providers]]
-id = "{NEW_PROVIDER}"
+[providers.{NEW_PROVIDER}]
 model_listing = false
-  [[providers.models]]
+  [[providers.{NEW_PROVIDER}.models]]
   id = "glm-5.2"
   display_name = "GLM-5.2"
   context_window = 262144
   supports_reasoning_effort = false
 
-[[providers]]
-id = "openai"
+[providers.openai]
 model_listing = false
-  [[providers.models]]
+  [[providers.openai.models]]
   id = "gpt-5.5"
   display_name = "GPT-5.5"
   context_window = 262144

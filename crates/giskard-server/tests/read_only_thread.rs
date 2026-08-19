@@ -107,7 +107,7 @@ fn seeded_thread(project_id: ProjectId, thread_id: ThreadId) -> ThreadFile {
 async fn subscribe_to_thread_with_missing_provider_loads_read_only() {
     let tmp = tempfile::TempDir::new().unwrap();
     let hash = password_hash("testpass");
-    // Note: no `[[providers]]` — the thread's provider is intentionally absent from config.
+    // Note: no `[providers]` table — the thread's provider is intentionally absent from config.
     tokio::fs::write(
         tmp.path().join("config.toml"),
         format!(

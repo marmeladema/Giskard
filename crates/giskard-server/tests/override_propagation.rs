@@ -209,9 +209,8 @@ secure_cookies = false
 password_hash = "{hash}"
 session_days = 30
 
-[[providers]]
-id = "openai"
-  [[providers.models]]
+[providers.openai]
+  [[providers.openai.models]]
   id = "gpt-5.5"
   context_window = 258400
   supports_reasoning_effort = true

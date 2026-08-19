@@ -183,10 +183,9 @@ secure_cookies = false
 password_hash = "{hash}"
 session_days = 30
 
-[[providers]]
-id = "mock"
+[providers.mock]
 model_listing = true
-  [[providers.models]]
+  [[providers.mock.models]]
   id = "static-model"
   context_window = 65536
   supports_reasoning_effort = false
@@ -365,8 +364,7 @@ secure_cookies = false
 password_hash = "{hash}"
 session_days = 30
 
-[[providers]]
-id = "secured"
+[providers.secured]
 model_listing = true
 "#
         ),
@@ -454,8 +452,7 @@ secure_cookies = false
 password_hash = "{hash}"
 session_days = 30
 
-[[providers]]
-id = "secured"
+[providers.secured]
 model_listing = true
 "#
         ),
@@ -528,9 +525,8 @@ secure_cookies = false
 password_hash = "{hash}"
 session_days = 30
 
-[[providers]]
-id = "typoed"
-  [[providers.models]]
+[providers.typoed]
+  [[providers.typoed.models]]
   id = "some-model"
   context_window = 65536
 "#
@@ -618,9 +614,8 @@ secure_cookies = false
 password_hash = "{hash}"
 session_days = 30
 
-[[providers]]
-id = "unverifiable"
-  [[providers.models]]
+[providers.unverifiable]
+  [[providers.unverifiable.models]]
   id = "some-model"
   context_window = 65536
 "#
@@ -689,10 +684,9 @@ secure_cookies = false
 password_hash = "{hash}"
 session_days = 30
 
-[[providers]]
-id = "wants-discovery"
+[providers.wants-discovery]
 model_listing = true
-  [[providers.models]]
+  [[providers.wants-discovery.models]]
   id = "declared-only"
   context_window = 65536
 "#
