@@ -19,10 +19,10 @@ use giskard_core::turn::{Mode, PermissionPreset, Turn, TurnStatus, TurnStatusKin
 use giskard_harness::{
     AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
 };
-use giskard_persist::store::{ProjectConfig, ThreadFile};
+use giskard_persist::store::{ProjectConfig, ThreadFile, ThreadGitWorkspace, ThreadWorktree};
 use giskard_proto::ClientMessage;
 use giskard_server::{AppState, HarnessFactory, build_app};
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex, broadcast};
 
 use common::fake_native_model;
 
@@ -34,6 +34,7 @@ const NEW_PROVIDER: &str = "opencodex";
 /// Codex ignoring the override (the loaded-thread rejoin behavior the verification must catch).
 struct SwitchHarness {
     report_provider: Option<String>,
+    opened_workspace_roots: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait::async_trait]
@@ -47,6 +48,10 @@ impl AgentHarness for SwitchHarness {
     }
 
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
+        self.opened_workspace_roots
+            .lock()
+            .await
+            .push(opts.workspace_root.to_string_lossy().into_owned());
         // An import names no model, so the fake answers with the one it is already on —
         // the same thing a real harness reports from its own record.
         let mut effective = opts.initial_model.clone().unwrap_or_else(fake_native_model);
@@ -60,13 +65,14 @@ impl AgentHarness for SwitchHarness {
         if let Some(provider) = &self.report_provider {
             effective.provider = provider.clone();
         }
+        let thread = opts.thread.unwrap_or_default();
         Ok(ThreadHandle {
-            thread: opts.thread.unwrap_or_default(),
-            harness_thread_id: opts.resume.unwrap_or_else(|| "fresh".into()),
-            warning: None,
             resumed_model: Some(effective),
-            agent_name: None,
-            parent_harness_thread_id: None,
+            ..ThreadHandle::opened(
+                thread,
+                opts.resume.unwrap_or_else(|| "fresh".into()),
+                opts.workspace_root.clone(),
+            )
         })
     }
 
@@ -113,6 +119,7 @@ impl AgentHarness for SwitchHarness {
 
 struct SwitchFactory {
     report_provider: Option<String>,
+    opened_workspace_roots: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait::async_trait]
@@ -120,6 +127,7 @@ impl HarnessFactory for SwitchFactory {
     async fn create(&self, _config: &ProjectConfig) -> Result<Arc<dyn AgentHarness>, HarnessError> {
         Ok(Arc::new(SwitchHarness {
             report_provider: self.report_provider.clone(),
+            opened_workspace_roots: self.opened_workspace_roots.clone(),
         }))
     }
 }
@@ -177,7 +185,11 @@ fn make_turn(text: &str) -> Turn {
     }
 }
 
-fn seeded_thread(project_id: ProjectId, thread_id: ThreadId) -> ThreadFile {
+fn seeded_thread(
+    project_id: ProjectId,
+    thread_id: ThreadId,
+    git_workspace: Option<ThreadGitWorkspace>,
+) -> ThreadFile {
     let now = Utc::now();
     ThreadFile {
         version: 1,
@@ -198,7 +210,7 @@ fn seeded_thread(project_id: ProjectId, thread_id: ThreadId) -> ThreadFile {
         created_at: now,
         updated_at: now,
         archived: false,
-        git_workspace: None,
+        git_workspace,
     }
 }
 
@@ -208,12 +220,22 @@ struct TestServer {
     port: u16,
     pid: ProjectId,
     tid: ThreadId,
+    opened_workspace_roots: Arc<Mutex<Vec<String>>>,
     _tmp: tempfile::TempDir,
     _proj_dir: tempfile::TempDir,
+    _worktree_dir: Option<tempfile::TempDir>,
 }
 
 /// Server whose config declares only the *new* providers; the thread is seeded under the dead one.
 async fn start_server(report_provider: Option<String>) -> TestServer {
+    start_server_inner(report_provider, false).await
+}
+
+async fn start_server_with_worktree(report_provider: Option<String>) -> TestServer {
+    start_server_inner(report_provider, true).await
+}
+
+async fn start_server_inner(report_provider: Option<String>, seed_worktree: bool) -> TestServer {
     let tmp = tempfile::TempDir::new().unwrap();
     let hash = password_hash("testpass");
     tokio::fs::write(
@@ -254,12 +276,25 @@ model_listing = false
     let pid = ProjectId::new();
     let tid = ThreadId::new();
     let proj_dir = tempfile::TempDir::new().unwrap();
+    let worktree_dir = seed_worktree.then(|| tempfile::TempDir::new().unwrap());
+    let git_workspace = worktree_dir.as_ref().map(|worktree_dir| {
+        let path = worktree_dir.path().to_string_lossy().into_owned();
+        ThreadGitWorkspace::Worktree(ThreadWorktree {
+            path,
+            workspace: None,
+            branch: "giskard/worktree-test".into(),
+            base_commit: None,
+            repo_root: "/repo".into(),
+            common_dir: "/repo/.git".into(),
+            git_dir: "/repo/.git/worktrees/test".into(),
+        })
+    });
     store
         .create_project(pid, "proj", &proj_dir.path().to_string_lossy())
         .await
         .unwrap();
     store
-        .save_thread(pid, &seeded_thread(pid, tid))
+        .save_thread(pid, &seeded_thread(pid, tid, git_workspace))
         .await
         .unwrap();
     store
@@ -267,9 +302,13 @@ model_listing = false
         .await
         .unwrap();
 
+    let opened_workspace_roots = Arc::new(Mutex::new(Vec::new()));
     let state = AppState::new(
         store,
-        Arc::new(SwitchFactory { report_provider }),
+        Arc::new(SwitchFactory {
+            report_provider,
+            opened_workspace_roots: opened_workspace_roots.clone(),
+        }),
         (0..32u8).collect(),
     );
     let app = build_app(state.clone());
@@ -284,8 +323,10 @@ model_listing = false
         port,
         pid,
         tid,
+        opened_workspace_roots,
         _tmp: tmp,
         _proj_dir: proj_dir,
+        _worktree_dir: worktree_dir,
     }
 }
 
@@ -424,6 +465,64 @@ async fn cold_provider_switch_succeeds_and_binds_the_thread() {
     next_matching(&mut ws, |v| v["code"] == "thread_provider_locked")
         .await
         .expect("warm thread rejects a second provider change");
+}
+
+#[tokio::test]
+async fn cold_provider_switch_reopens_worktree_thread_in_its_worktree() {
+    let srv = start_server_with_worktree(None).await;
+    let thread = srv
+        .state
+        .store
+        .load_thread(srv.pid, srv.tid)
+        .await
+        .unwrap()
+        .unwrap();
+    let worktree_root = thread
+        .git_workspace
+        .as_ref()
+        .unwrap()
+        .workspace_root()
+        .to_string();
+    let project_root = srv._proj_dir.path().to_string_lossy().into_owned();
+    let cookie = login_cookie(&srv.base).await;
+    let mut ws = connect_ws(srv.port, &cookie).await;
+
+    send_msg(
+        &mut ws,
+        &ClientMessage::Subscribe {
+            thread_id: srv.tid,
+            since: None,
+        },
+    )
+    .await;
+    next_matching(&mut ws, |v| v["code"] == "thread_read_only")
+        .await
+        .expect("read-only warning");
+
+    send_msg(
+        &mut ws,
+        &ClientMessage::SelectModel {
+            thread_id: srv.tid,
+            model_ref: new_model(),
+        },
+    )
+    .await;
+    next_matching(&mut ws, |v| {
+        v["type"] == "thread_state" && v["state"]["current_model"]["provider"] == NEW_PROVIDER
+    })
+    .await
+    .expect("thread state under the new provider");
+
+    let opened_roots = srv.opened_workspace_roots.lock().await.clone();
+    assert_eq!(
+        opened_roots,
+        vec![worktree_root.clone(), worktree_root],
+        "both the failed dead-provider attach and the confirmed provider-switch reopen must use the worktree"
+    );
+    assert!(
+        !opened_roots.contains(&project_root),
+        "provider switch must not reopen a worktree thread in the project checkout"
+    );
 }
 
 #[tokio::test]

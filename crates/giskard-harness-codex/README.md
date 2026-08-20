@@ -295,15 +295,18 @@ profile and permission preset:
 Codex treats those fields as mutually exclusive.
 
 After initialization, the adapter calls `config/read` with the project's
-effective working directory and caches
+effective working directory and caches the configured extra
 `sandbox_workspace_write.writable_roots` for that app-server process. Auto
-Approve turns send those paths as `runtimeWorkspaceRoots` alongside
-`permissions: ":workspace"`, so configured Cargo, sccache, Docker, and similar
-external workspace roots remain writable. The project working directory is
-included explicitly because `runtimeWorkspaceRoots` replaces Codex's runtime
-root set. A failed or unsupported config read is logged as a warning and omits
-the override, leaving Codex's current thread roots unchanged. Ask First remains
-read-only, and Full Access does not need additional roots.
+Approve turns send `runtimeWorkspaceRoots` alongside `permissions:
+":workspace"` because Codex binds the symbolic `:workspace_roots` entries in
+that profile to the runtime roots supplied by the client. The runtime roots are
+rebuilt per turn from the thread's opened workspace root plus those configured
+extras, so an isolated worktree thread remains writable in its worktree rather
+than in the project's checkout, while configured Cargo, sccache, Docker, and
+similar external roots remain writable. A failed or unsupported config read is
+logged as a warning and only omits configured extra roots; the thread workspace
+root is still sent for Auto Approve. Ask First remains read-only, and Full
+Access does not need additional roots.
 
 ## Model catalog (`model/list`)
 

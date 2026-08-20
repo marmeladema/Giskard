@@ -579,7 +579,7 @@ async fn open_thread(
         .load_project(project_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let ws_root = project_config
+    let project_ws_root = project_config
         .workspace_root
         .as_deref()
         .unwrap_or(&project_config.dir);
@@ -732,12 +732,13 @@ async fn open_thread(
             if let Some(handle) = state.registry.get_thread_handle(existing.id).await {
                 (handle, None)
             } else {
+                let ws_root = thread_workspace_root(&state, &project_config, &existing).await?;
                 let handle = if existing.kind == ThreadKind::Subagent {
                     state
                         .registry
                         .open_linked_thread(
                             &project_config,
-                            ws_root,
+                            &ws_root,
                             Some(existing.id),
                             existing.harness_thread_id.clone(),
                             existing.current_model.clone(),
@@ -748,7 +749,7 @@ async fn open_thread(
                         .registry
                         .open_thread(
                             &project_config,
-                            ws_root,
+                            &ws_root,
                             Some(existing.id),
                             Some(existing.harness_thread_id.clone()),
                             Some(existing.current_model.clone()),
@@ -787,7 +788,7 @@ async fn open_thread(
     // persisted model — so it would silently move an existing conversation onto another model.
     let handle = state
         .registry
-        .open_thread(&project_config, ws_root, None, Some(resume), None)
+        .open_thread(&project_config, project_ws_root, None, Some(resume), None)
         .await
         // Not `Internal`: the usual reason is that this thread's provider is no longer in the
         // harness's config, which is a conflict with the current state of the world and fixable by
@@ -5178,10 +5179,13 @@ async fn switch_provider_cold(
             .thread(thread_id)
             .action("select_model")
         })?;
-    let ws_root = project_config
-        .workspace_root
-        .as_deref()
-        .unwrap_or(&project_config.dir);
+    let ws_root = thread_workspace_root(state, &project_config, &thread_file)
+        .await
+        .map_err(|e| {
+            WsError::new("workspace_unavailable", ErrorSeverity::Error, e.to_string())
+                .thread(thread_id)
+                .action("select_model")
+        })?;
 
     info!(
         %project_id,
@@ -5198,7 +5202,7 @@ async fn switch_provider_cold(
             .registry
             .open_linked_thread(
                 &project_config,
-                ws_root,
+                &ws_root,
                 Some(thread_id),
                 thread_file.harness_thread_id.clone(),
                 requested.clone(),
@@ -5209,7 +5213,7 @@ async fn switch_provider_cold(
             .registry
             .open_thread(
                 &project_config,
-                ws_root,
+                &ws_root,
                 Some(thread_id),
                 Some(thread_file.harness_thread_id.clone()),
                 Some(requested.clone()),
