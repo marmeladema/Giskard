@@ -619,6 +619,21 @@ impl Harnessed {
         self.harness.opened_workspace_roots.lock().await.clone()
     }
 
+    async fn thread_summaries(&self) -> serde_json::Value {
+        self.client
+            .get(format!(
+                "{}/api/projects/{}/threads",
+                self.base, self.project_id
+            ))
+            .header("cookie", &self.cookie)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
     /// Persist a sub-agent under `parent`, the way the registry materializes one from linked
     /// activity: same project and model, no worktree record of its own.
     async fn persist_subagent(&self, parent: ThreadId) -> ThreadId {
@@ -823,6 +838,19 @@ async fn a_thread_started_with_worktree_runs_in_it() {
 
     // The whole point: the harness works in the worktree, not the project's checkout.
     assert_eq!(server.workspace_roots().await, vec![worktree.path.clone()]);
+    let listed = server.thread_summaries().await;
+    let thread_id_string = thread_id.to_string();
+    let summary = listed["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|thread| thread["id"].as_str() == Some(thread_id_string.as_str()))
+        .expect("started thread appears in list");
+    assert_eq!(
+        summary["workspace_root"].as_str(),
+        Some(worktree.path.as_str()),
+        "thread summaries must expose the workspace root the browser strips from file-change paths"
+    );
     assert!(
         !worktree
             .path

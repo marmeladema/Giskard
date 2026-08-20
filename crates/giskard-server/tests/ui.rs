@@ -1468,9 +1468,9 @@ async fn index_page_is_served_and_public() {
         "UI passes linkified line targets into the source overlay"
     );
     assert!(
-        body.contains("displayPathForProject(c.path)")
-            && body.contains("makePathLink(c.path || \"\", displayPathForProject(c.path), null)"),
-        "UI displays project-local file-change paths relatively while preserving source targets"
+        body.contains("displayPathForWorkspace(c.path)")
+            && body.contains("makePathLink(c.path || \"\", displayPathForWorkspace(c.path), null)"),
+        "UI displays workspace-local file-change paths relatively while preserving source targets"
     );
     assert!(
         body.contains("return value === \"/\" ? value : value.replace")
@@ -3091,6 +3091,22 @@ fn browser_displays_root_project_file_changes_relatively() {
     assert!(
         display.contains("if (root === \"/\") return value.slice(1);"),
         "absolute files under a / project root should display without the leading slash"
+    );
+}
+
+#[test]
+fn browser_displays_worktree_file_changes_relatively() {
+    let source = app_js();
+    let display = between(
+        source,
+        "function currentThreadWorkspaceRoot() {",
+        "function fileChangeEntries(p) {",
+    );
+    assert!(
+        display.contains("state.threadIndex.get(String(state.threadId))")
+            && display.contains("meta.thread.workspace_root")
+            && display.contains("|| currentProjectDir()"),
+        "file-change display should strip the active thread workspace root, falling back to the project root"
     );
 }
 

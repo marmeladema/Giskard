@@ -547,7 +547,16 @@ async fn list_threads(
             );
         }
     }
-    let mut threads = loaded.iter().map(thread_summary).collect::<Vec<_>>();
+    let project = state
+        .store
+        .load_project(project_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let mut threads = Vec::with_capacity(loaded.len());
+    for thread in &loaded {
+        let workspace_root = thread_workspace_root(&state, &project, thread).await?;
+        threads.push(thread_summary(thread, workspace_root));
+    }
     threads.sort_by_key(|t| std::cmp::Reverse(t.updated_at));
     Ok(Json(ListThreadsResponse { threads }))
 }
@@ -1763,10 +1772,11 @@ async fn cleanup_new_thread_after_start_failure(
     }
 }
 
-fn thread_summary(tf: &ThreadFile) -> ThreadSummary {
+fn thread_summary(tf: &ThreadFile, workspace_root: String) -> ThreadSummary {
     ThreadSummary {
         id: tf.id,
         title: tf.title.clone(),
+        workspace_root,
         parent_thread_id: tf.parent_thread_id,
         spawned_by_turn_id: tf.spawned_by_turn_id,
         kind: tf.kind,
@@ -1858,7 +1868,8 @@ async fn archive_thread(
         .await?
         .ok_or(ApiError::NotFound)?;
 
-    Ok(Json(thread_summary(&tf)))
+    let workspace_root = thread_workspace_root(&state, &project_config, &tf).await?;
+    Ok(Json(thread_summary(&tf, workspace_root)))
 }
 
 async fn rename_thread(
@@ -1878,7 +1889,8 @@ async fn rename_thread(
         .await?
         .ok_or(ApiError::NotFound)?;
     if thread_file.title == title {
-        return Ok(Json(thread_summary(&thread_file)));
+        let workspace_root = thread_workspace_root(&state, &project_config, &thread_file).await?;
+        return Ok(Json(thread_summary(&thread_file, workspace_root)));
     }
 
     state
@@ -1901,7 +1913,8 @@ async fn rename_thread(
         .ok_or(ApiError::NotFound)?;
     broadcast_thread_state(&state, thread_id, &tf).await;
 
-    Ok(Json(thread_summary(&tf)))
+    let workspace_root = thread_workspace_root(&state, &project_config, &tf).await?;
+    Ok(Json(thread_summary(&tf, workspace_root)))
 }
 
 /// `GET /api/projects/{id}/threads/{thread_id}/deletion-impact` — what deleting this thread would
