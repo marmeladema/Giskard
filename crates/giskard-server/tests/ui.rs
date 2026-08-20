@@ -86,7 +86,7 @@ async fn index_page_is_served_and_public() {
     );
     assert!(
         body.contains(
-            "case \"token_update\":\n      if (msg.scope === \"thread\") renderTokens(msg.ledger);"
+            "case \"token_update\":\n      if (msg.scope === \"thread\") applyThreadTokenUpdate(msg);"
         ),
         "only thread-scoped token updates render into the thread usage menu"
     );
@@ -2324,11 +2324,7 @@ fn browser_incremental_resync_reconciles_in_flight_turn() {
         body.contains("if (state.pendingLiveSnapshotReconcile) {\n    state.pendingLiveSnapshotReconcile = false;\n    reconcileInFlightTurn();"),
         "live snapshot should reconcile the stale live block synchronously just before replay"
     );
-    let turn_started = between(
-        body,
-        "case \"turn_started\":",
-        "case \"context_window_updated\":",
-    );
+    let turn_started = between(body, "case \"turn_started\":", "case \"item_started\":");
     assert!(
         turn_started.contains("state.pendingLiveSnapshotReconcile = false;"),
         "a normal live stream taking over must clear deferred snapshot reconciliation"
@@ -3064,12 +3060,68 @@ fn browser_offers_the_git_strategy_choice_on_drafts_only() {
 }
 
 #[test]
-fn browser_applies_harness_context_window_updates_to_the_gauge() {
+fn browser_reconciles_context_window_updates_by_revision() {
     let source = app_js();
-    assert!(source.contains("case \"context_window_updated\":"));
-    assert!(source.contains("ev.model.provider === state.currentModel.provider"));
-    assert!(source.contains("ev.model.model === state.currentModel.model"));
-    assert!(source.contains("updateGauge(state.contextUsed, ev.context_window);"));
+    assert!(source.contains(
+        "case \"thread_context_window_updated\": applyThreadContextWindowUpdate(msg); break;"
+    ));
+    let update = between(
+        source,
+        "function applyThreadContextWindowUpdate(msg) {",
+        "function reconcilePendingContextWindowUpdate() {",
+    );
+    assert!(update.contains("if (revision < state.contextWindowRevision) return;"));
+    assert!(update.contains("retainPendingContextWindowUpdate(msg, revision);"));
+    assert!(update.contains("sameContextWindowModel(msg.model, state.currentModel)"));
+    assert!(update.contains("state.contextWindowRevision = revision;"));
+    assert!(update.contains("state.modelRevision = Math.max(state.modelRevision, revision);"));
+    assert!(!update.contains("state.threadRevision = revision;"));
+    assert!(update.contains("updateGauge(state.contextUsed, msg.context_window);"));
+
+    let reconcile = between(
+        source,
+        "function reconcilePendingContextWindowUpdate() {",
+        "function applyPersistedThreadState(s) {",
+    );
+    assert!(reconcile.contains("!sameContextWindowModel(pending.model, state.currentModel)"));
+    assert!(reconcile.contains("applyThreadContextWindowUpdate(pending);"));
+
+    let snapshot = between(
+        source,
+        "function applyPersistedThreadState(s) {",
+        "function renderThreadState(s, activeTurn) {",
+    );
+    assert!(snapshot.contains("if (revision < state.threadRevision) return false;"));
+    assert!(snapshot.contains("if (s.current_model && revision >= state.modelRevision) {"));
+    assert!(snapshot.contains("state.modelRevision = revision;"));
+    assert!(snapshot.contains("if (revision >= state.contextWindowRevision) {"));
+    assert!(snapshot.contains("if (revision >= state.tokenRevision) {"));
+    assert!(snapshot.contains("state.tokenRevision = revision;"));
+    assert!(snapshot.contains("if (s.tokens) renderTokens(s.tokens);"));
+    let token_update = between(
+        source,
+        "function applyThreadTokenUpdate(msg) {",
+        "function renderThreadState(s, activeTurn) {",
+    );
+    assert!(token_update.contains("if (revision < state.tokenRevision) return;"));
+    assert!(token_update.contains("state.tokenRevision = revision;"));
+    assert!(token_update.contains("renderTokens(msg.ledger);"));
+    assert!(source.contains("if (applyPersistedThreadState(s)) {"));
+    assert!(source.contains(
+        "state.pendingModelBeforeSelect = null;\n          reconcilePendingContextWindowUpdate();"
+    ));
+    assert!(source.contains("state.threadRevision = 0;"));
+    assert!(source.contains("state.modelRevision = 0;"));
+    assert!(source.contains("state.contextWindowRevision = 0;"));
+    assert!(source.contains("state.tokenRevision = 0;"));
+    assert!(source.contains("state.pendingContextWindowUpdate = null;"));
+
+    let events = between(
+        source,
+        "function handleEvent(ev) {",
+        "function errorBubble(message)",
+    );
+    assert!(!events.contains("case \"context_window_updated\":"));
 }
 
 #[test]

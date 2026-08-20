@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, warn};
 
 use giskard_core::approval::ApprovalDecision;
@@ -309,6 +309,51 @@ pub struct OpenThreadOptions {
     /// would silently move an existing conversation onto a different model. Starting a fresh
     /// thread, and reopening one Giskard already tracks, both pass `Some`.
     pub initial_model: Option<ModelRef>,
+    /// Sink for metadata that becomes available asynchronously after the native open response.
+    pub updates: ThreadUpdateSink,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadUpdate {
+    ContextWindowRestored {
+        model: ModelRef,
+        context_window: u32,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct ThreadUpdateSink {
+    tx: mpsc::Sender<ThreadUpdate>,
+}
+
+impl ThreadUpdateSink {
+    pub fn send(&self, update: ThreadUpdate) -> Result<(), ThreadUpdateSendError> {
+        self.tx.try_send(update).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(update) => ThreadUpdateSendError::Full(update),
+            mpsc::error::TrySendError::Closed(update) => ThreadUpdateSendError::Closed(update),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadUpdateSendError {
+    Full(ThreadUpdate),
+    Closed(ThreadUpdate),
+}
+
+pub struct ThreadUpdateStream {
+    rx: mpsc::Receiver<ThreadUpdate>,
+}
+
+impl ThreadUpdateStream {
+    pub async fn recv(&mut self) -> Option<ThreadUpdate> {
+        self.rx.recv().await
+    }
+}
+
+pub fn thread_update_channel() -> (ThreadUpdateSink, ThreadUpdateStream) {
+    let (tx, rx) = mpsc::channel(1);
+    (ThreadUpdateSink { tx }, ThreadUpdateStream { rx })
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -534,6 +579,32 @@ pub trait AgentHarness: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn restored_context_window() -> ThreadUpdate {
+        ThreadUpdate::ContextWindowRestored {
+            model: ModelRef {
+                provider: "openai".into(),
+                model: "gpt-5.6-sol".into(),
+                reasoning_effort: None,
+            },
+            context_window: 258_400,
+        }
+    }
+
+    #[test]
+    fn thread_update_send_distinguishes_full_and_closed_channels() {
+        let (sink, stream) = thread_update_channel();
+        sink.send(restored_context_window()).unwrap();
+        assert!(matches!(
+            sink.send(restored_context_window()),
+            Err(ThreadUpdateSendError::Full(_))
+        ));
+        drop(stream);
+        assert!(matches!(
+            sink.send(restored_context_window()),
+            Err(ThreadUpdateSendError::Closed(_))
+        ));
+    }
 
     fn command_provider(args: &[&str], timeout: Duration) -> HarnessProvider {
         HarnessProvider {

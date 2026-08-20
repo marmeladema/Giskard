@@ -89,6 +89,11 @@ pub struct ThreadFile {
     /// model switches without making Giskard maintain model-specific built-in metadata.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub model_context_windows: HashMap<String, HashMap<String, u32>>,
+    /// Monotonic version of persisted thread state. Clients use it to reject an older bootstrap
+    /// snapshot after applying a newer live state update. Independent from `updated_at`, which
+    /// represents user-visible thread activity and recent-thread ordering.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub revision: u64,
     /// Per-thread permission preset (P3).
     #[serde(
         alias = "approval_policy",
@@ -110,6 +115,30 @@ pub struct ThreadFile {
     /// ordinary threads, which work in the project's own workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_workspace: Option<ThreadGitWorkspace>,
+}
+
+impl ThreadFile {
+    /// Record a harness-reported window for `model`, updating the visible cache when it is selected.
+    pub fn record_model_context_window(&mut self, model: &ModelRef, context_window: u32) {
+        self.model_context_windows
+            .entry(model.provider.clone())
+            .or_default()
+            .insert(model.model.clone(), context_window);
+        if self.current_model.provider == model.provider
+            && self.current_model.model == model.model
+            && self.context_window != context_window
+        {
+            self.context_window = context_window;
+        }
+    }
+
+    /// Replace the selected model and its effective window as one client-visible unit.
+    pub fn set_current_model_context_window(&mut self, model: ModelRef, context_window: u32) {
+        if self.current_model != model || self.context_window != context_window {
+            self.current_model = model;
+            self.context_window = context_window;
+        }
+    }
 }
 
 /// A Git workspace a thread owns, tagged by the strategy that produced it.
@@ -200,6 +229,10 @@ impl ThreadWorktree {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 fn is_primary_thread(value: &ThreadKind) -> bool {
@@ -659,7 +692,14 @@ impl PersistStore {
         let Some(mut tf) = self.load_thread(project, thread).await? else {
             return Ok(None);
         };
+        let previous_revision = tf.revision;
         f(&mut tf);
+        if tf.revision <= previous_revision {
+            // Every persisted mutation gets a new ordering identity. Closures may repair caches or
+            // decide there is nothing to change, but allocating a harmless gap is safer than
+            // requiring every current and future caller to classify its visible fields perfectly.
+            tf.revision = previous_revision.saturating_add(1);
+        }
         self.save_thread(project, &tf).await?;
         Ok(Some(tf))
     }
@@ -1082,6 +1122,7 @@ mod tests {
             current_model: test_model(),
             context_window: 262_144,
             model_context_windows: HashMap::new(),
+            revision: 0,
             permission_preset: PermissionPreset::AskFirst,
             model_efforts: HashMap::new(),
             tokens: TokenLedger::default(),
@@ -1096,12 +1137,73 @@ mod tests {
         assert_eq!(loaded.title, "Fix auth");
         assert_eq!(loaded.harness_thread_id, "th_abc");
         assert_eq!(loaded.mode, Mode::Build);
+        assert_eq!(loaded.revision, 0);
 
         let raw = tokio::fs::read_to_string(store.thread_json_path(pid, tid))
             .await
             .unwrap();
         assert!(raw.contains("\"permission_preset\""));
         assert!(!raw.contains("\"approval_policy\""));
+        assert!(!raw.contains("\"revision\""));
+
+        let updated = store
+            .update_thread(pid, tid, |thread| thread.mode = Mode::Plan)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.revision, 1);
+    }
+
+    #[test]
+    fn model_context_window_helpers_update_one_visible_pair() {
+        let now = Utc::now();
+        let selected = test_model();
+        let other = ModelRef {
+            provider: "other".into(),
+            model: "model".into(),
+            reasoning_effort: None,
+        };
+        let mut thread = ThreadFile {
+            version: SCHEMA_VERSION,
+            id: ThreadId::new(),
+            project_id: ProjectId::new(),
+            title: "thread".into(),
+            harness_thread_id: "native".into(),
+            parent_thread_id: None,
+            spawned_by_turn_id: None,
+            kind: ThreadKind::Primary,
+            mode: Mode::Build,
+            current_model: selected.clone(),
+            context_window: 128_000,
+            model_context_windows: HashMap::new(),
+            revision: 0,
+            permission_preset: PermissionPreset::AskFirst,
+            model_efforts: HashMap::new(),
+            tokens: TokenLedger::default(),
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            git_workspace: None,
+        };
+
+        thread.record_model_context_window(&other, 64_000);
+        assert_eq!(thread.context_window, 128_000);
+        assert_eq!(thread.model_context_windows["other"]["model"], 64_000);
+
+        thread.record_model_context_window(&selected, 258_400);
+        assert_eq!(thread.context_window, 258_400);
+        assert_eq!(thread.updated_at, now);
+        thread.record_model_context_window(&selected, 258_400);
+
+        thread.set_current_model_context_window(other.clone(), 64_000);
+        assert_eq!(thread.current_model, other);
+        assert_eq!(thread.context_window, 64_000);
+        thread.set_current_model_context_window(thread.current_model.clone(), 64_000);
+        let mut with_effort = thread.current_model.clone();
+        with_effort.reasoning_effort = Some(Effort("high".into()));
+        thread.set_current_model_context_window(with_effort.clone(), 64_000);
+        assert_eq!(thread.current_model, with_effort);
+        assert_eq!(thread.revision, 0, "the store owns persisted revisions");
     }
 
     #[tokio::test]
@@ -1172,6 +1274,7 @@ mod tests {
             current_model: test_model(),
             context_window: 262_144,
             model_context_windows: HashMap::new(),
+            revision: 0,
             permission_preset: PermissionPreset::AskFirst,
             model_efforts: HashMap::new(),
             tokens: TokenLedger::default(),
@@ -1228,6 +1331,7 @@ mod tests {
             current_model: test_model(),
             context_window: 262_144,
             model_context_windows: HashMap::new(),
+            revision: 0,
             permission_preset: PermissionPreset::AskFirst,
             model_efforts: HashMap::new(),
             tokens: TokenLedger::default(),
@@ -1278,6 +1382,7 @@ mod tests {
                 current_model: test_model(),
                 context_window: 128_000,
                 model_context_windows: HashMap::new(),
+                revision: 0,
                 permission_preset: PermissionPreset::AskFirst,
                 model_efforts: HashMap::new(),
                 tokens: TokenLedger::default(),
@@ -1454,6 +1559,7 @@ mod tests {
                     current_model: test_model(),
                     context_window: 0,
                     model_context_windows: HashMap::new(),
+                    revision: 0,
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: HashMap::new(),
                     tokens: TokenLedger::default(),
@@ -1635,6 +1741,7 @@ mod tests {
                     current_model: test_model(),
                     context_window: 0,
                     model_context_windows: HashMap::new(),
+                    revision: 0,
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: HashMap::new(),
                     tokens: TokenLedger::default(),
@@ -1678,6 +1785,7 @@ mod tests {
                     current_model: test_model(),
                     context_window: 0,
                     model_context_windows: HashMap::new(),
+                    revision: 0,
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: HashMap::new(),
                     tokens: TokenLedger::default(),
@@ -1708,5 +1816,6 @@ mod tests {
 
         let tf = store.load_thread(pid, tid).await.unwrap().unwrap();
         assert_eq!(tf.context_window, 20, "all concurrent increments must land");
+        assert_eq!(tf.revision, 20);
     }
 }

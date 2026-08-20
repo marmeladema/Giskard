@@ -20,7 +20,7 @@ use tracing::{debug, error, info, warn};
 
 use futures::{SinkExt, StreamExt};
 use giskard_core::error::{HarnessError, PersistError};
-use giskard_core::ids::{ProjectId, ThreadId};
+use giskard_core::ids::{ProjectId, ThreadId, TurnId};
 use giskard_core::model::{ModelDescriptor, ModelRef};
 use giskard_core::text::trimmed_non_empty;
 use giskard_core::thread::ThreadKind;
@@ -822,6 +822,7 @@ async fn open_thread(
         current_model: current_model.clone(),
         context_window,
         model_context_windows: std::collections::HashMap::new(),
+        revision: 0,
         permission_preset: PermissionPreset::AskFirst,
         model_efforts: std::collections::HashMap::new(),
         tokens: giskard_core::token::TokenLedger::default(),
@@ -1014,6 +1015,7 @@ async fn start_thread_with_message(
         current_model: model_ref.clone(),
         context_window: model_descriptor.context_window,
         model_context_windows: std::collections::HashMap::new(),
+        revision: 0,
         permission_preset: req.permission_preset,
         model_efforts: std::collections::HashMap::new(),
         tokens: giskard_core::token::TokenLedger::default(),
@@ -3309,8 +3311,7 @@ async fn normalize_persisted_thread_model(
                 &thread.model_context_windows,
             );
             if current_model != thread.current_model || context_window != thread.context_window {
-                thread.current_model = current_model;
-                thread.context_window = context_window;
+                thread.set_current_model_context_window(current_model, context_window);
                 thread.updated_at = Utc::now();
             }
         })
@@ -4052,124 +4053,8 @@ async fn handle_client_msg(
                     )
                 }
             };
-            // Registering before the snapshot below is built is what makes the snapshot's
-            // `active_turn` safe to act on: a turn that ends after this line broadcasts its
-            // `TurnCompleted` to this client, and one that ended before it is already out of the
-            // turn gate. Build the snapshot first and a turn ending in between would be reported
-            // live by a client that then never hears it finish.
-            state.hub.subscribe(thread_id, client_id, tx.clone()).await;
-
-            if let Some(warning) = notice {
-                let _ = tx.send(ServerMessage::Error { error: warning }).await;
-            }
-
-            let tf = state
-                .store
-                .recompute_aggregates(project_id, thread_id)
-                .await
-                .map_err(|e| WsError::from_persist(e, "subscribe", Some(thread_id)))?
-                .ok_or_else(|| {
-                    WsError::new(
-                        "thread_not_found",
-                        ErrorSeverity::Error,
-                        "Thread not found.",
-                    )
-                    .thread(thread_id)
-                    .action("subscribe")
-                })?;
-            let thread_state = serde_json::to_value(&tf).map_err(|e| {
-                WsError::new(
-                    "thread_state_serialize_failed",
-                    ErrorSeverity::Error,
-                    "Thread state could not be serialized.",
-                )
-                .detail(e.to_string())
-                .thread(thread_id)
-                .action("subscribe")
-            })?;
-            let _ = tx
-                .send(ServerMessage::ThreadState(giskard_proto::ThreadState {
-                    thread_id,
-                    state: thread_state,
-                    active_turn: state.registry.thread_has_active_turn(thread_id).await,
-                }))
-                .await;
-
-            // Two snapshot shapes, distinguished by whether the client sent a resync cursor:
-            //
-            // * Resync (`since` present): history-first ordering. Send the persisted history — a
-            //   `HistoryDelta` of the turns after the cursor when we can resolve it, or a full
-            //   `HistoryPage` when we can't (stale cursor) — *before* the live turn and tasks. The
-            //   client reconciles or rebuilds the transcript while it still owns it, then the live
-            //   turn appends on top. The browser may keep a stale live DOM block visible until the
-            //   replacement snapshot arrives, so delta rows still need to be inserted before that
-            //   retained live block on the UI side.
-            // * Fresh (`since` absent): live-first ordering. The in-flight turn (H5) isn't in the
-            //   JSONL yet, so reconstruct it from the live buffer and send it — with its tasks —
-            //   before the history page, for the fastest first paint. The browser prepends older
-            //   history above it.
-            let resync_delta = match since {
-                Some(cursor) => state
-                    .store
-                    .load_turns_after(project_id, thread_id, cursor)
-                    .await
-                    .map_err(|e| WsError::from_persist(e, "subscribe_resync", Some(thread_id)))?,
-                None => None,
-            };
-
-            // The persisted-history message: a delta after a resolvable cursor, otherwise a full
-            // initial page (fresh open, or a stale cursor that fell back to a full rebuild).
-            let history_message = if let Some(turns) = resync_delta {
-                ServerMessage::HistoryDelta {
-                    thread_id,
-                    turns: turns.into_iter().map(Into::into).collect(),
-                }
-            } else {
-                // H4/H6: the most recent page of persisted history (not the whole thread). The
-                // initial page is deliberately small (see `HistoryConfig::initial`); the browser
-                // tops it up to fill the viewport. Older pages are fetched via `LoadHistory`.
-                let limit = history_limit_or_default(
-                    state,
-                    thread_id,
-                    "subscribe_history",
-                    |config| config.history.initial,
-                    5,
-                )
-                .await;
-                let (turns, has_more) = state
-                    .store
-                    .load_history(project_id, thread_id, None, limit)
-                    .await
-                    .map_err(|e| WsError::from_persist(e, "subscribe_history", Some(thread_id)))?;
-                ServerMessage::HistoryPage {
-                    thread_id,
-                    turns: turns.into_iter().map(Into::into).collect(),
-                    has_more,
-                }
-            };
-
-            // The live turn (H5) isn't in the JSONL yet — reconstruct it from the live buffer — and
-            // its running tasks. On a fresh open (`since` absent) these go first, for the fastest
-            // first paint. On a resync (`since` present, delta or stale-cursor rebuild) the history
-            // goes first so the client can reconcile or rebuild before handling the live turn. The
-            // browser may still insert delta rows before a retained stale live block to avoid a
-            // visible gap before the replacement live snapshot arrives.
-            let live_snapshot = state.live_buffers.snapshot(thread_id).await;
-            let tasks = state.running_commands.snapshot(thread_id).await;
-            let running_tasks = ServerMessage::RunningTasks { thread_id, tasks };
-            if since.is_some() {
-                let _ = tx.send(history_message).await;
-                if let Some(snap) = live_snapshot {
-                    let _ = tx.send(ServerMessage::LiveTurnSnapshot(snap)).await;
-                }
-                let _ = tx.send(running_tasks).await;
-            } else {
-                if let Some(snap) = live_snapshot {
-                    let _ = tx.send(ServerMessage::LiveTurnSnapshot(snap)).await;
-                }
-                let _ = tx.send(running_tasks).await;
-                let _ = tx.send(history_message).await;
-            }
+            send_subscribe_bootstrap(state, client_id, tx, project_id, thread_id, since, notice)
+                .await?;
         }
         ClientMessage::LoadHistory {
             thread_id,
@@ -4262,12 +4147,12 @@ async fn handle_client_msg(
                         &app_config,
                         &normalized,
                     );
-                    tf.context_window = crate::models::context_window_with_runtime(
+                    let context_window = crate::models::context_window_with_runtime(
                         &normalized,
                         &descriptor,
                         &tf.model_context_windows,
                     );
-                    tf.current_model = normalized;
+                    tf.set_current_model_context_window(normalized, context_window);
                     tf.updated_at = chrono::Utc::now();
                 })
                 .await
@@ -4437,12 +4322,12 @@ async fn handle_client_msg(
                         new_model.reasoning_effort = None;
                     }
 
-                    tf.context_window = crate::models::context_window_with_runtime(
+                    let context_window = crate::models::context_window_with_runtime(
                         &new_model,
                         &new_descriptor,
                         &tf.model_context_windows,
                     );
-                    tf.current_model = new_model;
+                    tf.set_current_model_context_window(new_model, context_window);
                     tf.updated_at = chrono::Utc::now();
                 })
                 .await
@@ -4724,6 +4609,122 @@ async fn handle_client_msg(
         }
     }
     Ok(())
+}
+
+async fn send_subscribe_bootstrap(
+    state: &AppState,
+    client_id: usize,
+    tx: &mpsc::Sender<ServerMessage>,
+    project_id: ProjectId,
+    thread_id: ThreadId,
+    since: Option<TurnId>,
+    notice: Option<ErrorInfo>,
+) -> Result<(), WsError> {
+    // Subscribe before reading snapshots so live events cannot fall into the read window.
+    state
+        .hub
+        .subscribe_buffered(thread_id, client_id, tx.clone())
+        .await;
+
+    let bootstrap_result = async {
+        if let Some(warning) = notice {
+            let _ = tx.send(ServerMessage::Error { error: warning }).await;
+        }
+        let thread = state
+            .store
+            .recompute_aggregates(project_id, thread_id)
+            .await
+            .map_err(|error| WsError::from_persist(error, "subscribe", Some(thread_id)))?
+            .ok_or_else(|| {
+                WsError::new(
+                    "thread_not_found",
+                    ErrorSeverity::Error,
+                    "Thread not found.",
+                )
+                .thread(thread_id)
+                .action("subscribe")
+            })?;
+        let thread_state = serde_json::to_value(&thread).map_err(|error| {
+            WsError::new(
+                "thread_state_serialize_failed",
+                ErrorSeverity::Error,
+                "Thread state could not be serialized.",
+            )
+            .detail(error.to_string())
+            .thread(thread_id)
+            .action("subscribe")
+        })?;
+        let _ = tx
+            .send(ServerMessage::ThreadState(giskard_proto::ThreadState {
+                thread_id,
+                state: thread_state,
+                active_turn: state.registry.thread_has_active_turn(thread_id).await,
+            }))
+            .await;
+
+        let resync_delta = match since {
+            Some(cursor) => state
+                .store
+                .load_turns_after(project_id, thread_id, cursor)
+                .await
+                .map_err(|error| {
+                    WsError::from_persist(error, "subscribe_resync", Some(thread_id))
+                })?,
+            None => None,
+        };
+        let history = if let Some(turns) = resync_delta {
+            ServerMessage::HistoryDelta {
+                thread_id,
+                turns: turns.into_iter().map(Into::into).collect(),
+            }
+        } else {
+            let limit = history_limit_or_default(
+                state,
+                thread_id,
+                "subscribe_history",
+                |config| config.history.initial,
+                5,
+            )
+            .await;
+            let (turns, has_more) = state
+                .store
+                .load_history(project_id, thread_id, None, limit)
+                .await
+                .map_err(|error| {
+                    WsError::from_persist(error, "subscribe_history", Some(thread_id))
+                })?;
+            ServerMessage::HistoryPage {
+                thread_id,
+                turns: turns.into_iter().map(Into::into).collect(),
+                has_more,
+            }
+        };
+        let live = state.live_buffers.snapshot(thread_id).await;
+        let running = ServerMessage::RunningTasks {
+            thread_id,
+            tasks: state.running_commands.snapshot(thread_id).await,
+        };
+
+        // Resync reconciles persisted history before live state; a fresh open paints live state
+        // first and prepends its initial history page afterward.
+        if since.is_some() {
+            let _ = tx.send(history).await;
+            if let Some(snapshot) = live {
+                let _ = tx.send(ServerMessage::LiveTurnSnapshot(snapshot)).await;
+            }
+            let _ = tx.send(running).await;
+        } else {
+            if let Some(snapshot) = live {
+                let _ = tx.send(ServerMessage::LiveTurnSnapshot(snapshot)).await;
+            }
+            let _ = tx.send(running).await;
+            let _ = tx.send(history).await;
+        }
+        Ok(())
+    }
+    .await;
+    state.hub.finish_subscribe(thread_id, client_id).await;
+    bootstrap_result
 }
 
 struct ThreadAccess {
@@ -5403,7 +5404,7 @@ async fn broadcast_thread_state(
     let active_turn = state.registry.thread_has_active_turn(thread_id).await;
     state
         .hub
-        .broadcast(
+        .broadcast_reliably(
             thread_id,
             ServerMessage::ThreadState(giskard_proto::ThreadState {
                 thread_id,

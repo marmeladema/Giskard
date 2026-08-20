@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use serde::Serialize;
 use serde_json::{Value, json};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalMetadata, ApprovalRequest};
 use giskard_core::diff::{DiffHunk, DiffLine, FileDiff};
@@ -298,6 +298,15 @@ impl CodexMapper {
             Notification::ThreadTokenUsageUpdated(n) => {
                 let thread = self.resolve_thread(&n.thread_id, fallback_thread)?;
                 if n.turn_id.is_empty() {
+                    return None;
+                }
+                if self.active_turns.get(&thread) != Some(&n.turn_id) {
+                    debug!(
+                        native_thread_id = %n.thread_id,
+                        native_turn_id = %n.turn_id,
+                        active_native_turn_id = ?self.active_turns.get(&thread),
+                        "ignoring Codex token usage for an inactive native turn"
+                    );
                     return None;
                 }
                 let key = (thread, n.turn_id.clone());
@@ -3183,6 +3192,7 @@ mod tests {
     fn invalid_context_window_does_not_hide_token_usage() {
         let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
         let fallback = ThreadId::new();
+        mapper.register_active_turn(fallback, "t1");
         let usage_notif = Notification::ThreadTokenUsageUpdated(
             serde_json::from_value(serde_json::json!({
                 "threadId": "th1",
@@ -3223,6 +3233,8 @@ mod tests {
         let second_thread = ThreadId::new();
         mapper.register_thread("th1".into(), first_thread);
         mapper.register_thread("th2".into(), second_thread);
+        mapper.register_active_turn(first_thread, "reused_turn");
+        mapper.register_active_turn(second_thread, "reused_turn");
         let usage_notification = |thread_id: &str, input_tokens: u64| {
             Notification::ThreadTokenUsageUpdated(
                 serde_json::from_value(serde_json::json!({
@@ -3291,6 +3303,92 @@ mod tests {
             .input,
             20
         );
+    }
+
+    #[test]
+    fn token_usage_for_an_inactive_turn_is_not_cached() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let thread = ThreadId::new();
+        mapper.register_thread("known".into(), thread);
+
+        let usage_notif = Notification::ThreadTokenUsageUpdated(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "known",
+                "turnId": "historical-turn",
+                "tokenUsage": {
+                    "last": {
+                        "cachedInputTokens": 0, "inputTokens": 123,
+                        "outputTokens": 45, "reasoningOutputTokens": 0, "totalTokens": 168
+                    },
+                    "total": {
+                        "cachedInputTokens": 0, "inputTokens": 123,
+                        "outputTokens": 45, "reasoningOutputTokens": 0, "totalTokens": 168
+                    },
+                    "modelContextWindow": 258400
+                }
+            }))
+            .unwrap(),
+        );
+        assert!(mapper.map_notification(&usage_notif, thread).is_none());
+        let historical_key = (thread, "historical-turn".to_string());
+        assert!(!mapper.turn_usage.contains_key(&historical_key));
+        assert!(!mapper.turn_context_windows.contains_key(&historical_key));
+        assert!(!mapper.missing_context_model_turns.contains(&historical_key));
+
+        let completed = Notification::TurnCompleted(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "known",
+                "turn": { "id": "historical-turn", "status": "completed" }
+            }))
+            .unwrap(),
+        );
+        match mapper.map_notification(&completed, thread).unwrap() {
+            AgentEvent::TurnCompleted { usage, .. } => assert_eq!(usage, TokenUsage::default()),
+            other => panic!("expected TurnCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn active_turn_without_a_model_still_preserves_usage() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let thread = ThreadId::new();
+        mapper.register_thread("known".into(), thread);
+        mapper.register_active_turn(thread, "external-turn");
+
+        let usage_notif = Notification::ThreadTokenUsageUpdated(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "known",
+                "turnId": "external-turn",
+                "tokenUsage": {
+                    "last": {
+                        "cachedInputTokens": 0, "inputTokens": 25,
+                        "outputTokens": 5, "reasoningOutputTokens": 0, "totalTokens": 30
+                    },
+                    "total": {
+                        "cachedInputTokens": 0, "inputTokens": 25,
+                        "outputTokens": 5, "reasoningOutputTokens": 0, "totalTokens": 30
+                    },
+                    "modelContextWindow": 258400
+                }
+            }))
+            .unwrap(),
+        );
+        assert!(mapper.map_notification(&usage_notif, thread).is_none());
+        let external_key = (thread, "external-turn".to_string());
+        assert!(mapper.turn_usage.contains_key(&external_key));
+        assert!(mapper.missing_context_model_turns.contains(&external_key));
+
+        let completed = Notification::TurnCompleted(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "known",
+                "turn": { "id": "external-turn", "status": "completed" }
+            }))
+            .unwrap(),
+        );
+        match mapper.map_notification(&completed, thread).unwrap() {
+            AgentEvent::TurnCompleted { usage, .. } => assert_eq!(usage.total, 30),
+            other => panic!("expected TurnCompleted, got {other:?}"),
+        }
     }
 
     #[test]

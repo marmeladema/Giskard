@@ -10,6 +10,7 @@
 mod mapping;
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, Weak};
@@ -38,7 +39,7 @@ use giskard_core::turn::{PermissionPreset, TurnOverrides, TurnStatus, TurnStatus
 use giskard_core::{AttachmentKind, UserAttachment, UserInput};
 use giskard_harness::{
     AgentEventStream, AgentHarness, HarnessCapabilities, HarnessNotice, HarnessProvider,
-    OpenThreadOptions, ProviderAuth, ProviderAuthCommand, ResumePolicy, ThreadHandle,
+    OpenThreadOptions, ProviderAuth, ProviderAuthCommand, ResumePolicy, ThreadHandle, ThreadUpdate,
 };
 
 use mapping::CodexMapper;
@@ -58,8 +59,33 @@ const CODEX_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(50);
 const WORKER_QUEUE_WARN_AFTER: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const WORKER_QUEUE_WARN_AFTER: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
+const RESUME_USAGE_REPLAY_TTL: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const RESUME_USAGE_REPLAY_TTL: Duration = Duration::from_millis(50);
 const THREAD_BACKGROUND_TERMINALS_TERMINATE: &str = "thread/backgroundTerminals/terminate";
 const CODEX_UPLOAD_DIR_NAME: &str = "giskard-codex-uploads";
+
+struct PendingResumeUsage {
+    project: ProjectId,
+    thread: ThreadId,
+    harness_thread_id: String,
+    model: giskard_core::model::ModelRef,
+    updates: giskard_harness::ThreadUpdateSink,
+    started_at: Instant,
+    deadline: Instant,
+}
+
+struct OpenThreadResult {
+    handle: ThreadHandle,
+    resume_usage_replay: ResumeUsageReplay,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResumeUsageReplay {
+    Monitor,
+    None,
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1304,14 +1330,19 @@ async fn background_task<C>(
 {
     let mut mapper = CodexMapper::new(workspace_root.clone());
     let mut pending_compactions: HashMap<ThreadId, PendingCompaction> = HashMap::new();
+    let mut pending_resume_usage: HashMap<String, PendingResumeUsage> = HashMap::new();
     let mut active_turns: ActiveTurns = HashMap::new();
     let mut first_event_warn_tick = tokio::time::interval(Duration::from_secs(1));
+    let mut resume_usage_cleanup_tick =
+        tokio::time::interval(RESUME_USAGE_REPLAY_TTL.min(Duration::from_secs(1)));
 
     loop {
         tokio::select! {
-            msg = client.next_message(), if should_poll_codex_messages(&mapper, &active_turns, &pending_compactions) => {
+            msg = client.next_message(), if should_poll_codex_messages(&mapper, &active_turns, &pending_compactions)
+                || !pending_resume_usage.is_empty() => {
                 match msg {
                     Ok(Some(msg)) => {
+                        observe_pending_resume_usage(&mut pending_resume_usage, &msg);
                         match handle_background_server_message(
                                 &mut client,
                                 &mut mapper,
@@ -1416,7 +1447,36 @@ async fn background_task<C>(
                     HarnessCommand::OpenThread { opts, response } => {
                         let result =
                             handle_open_thread(&mut client, &mut mapper, &opts, &senders).await;
-                        let _ = response.send(result);
+                        match result {
+                            Ok(opened) => {
+                                let handle = opened.handle;
+                                let restoration_model = handle
+                                    .resumed_model
+                                    .clone()
+                                    .or_else(|| opts.initial_model.clone());
+                                if opened.resume_usage_replay == ResumeUsageReplay::Monitor
+                                    && let Some(model) = restoration_model
+                                {
+                                    let started_at = Instant::now();
+                                    pending_resume_usage.insert(
+                                        handle.harness_thread_id.clone(),
+                                        PendingResumeUsage {
+                                            project: opts.project,
+                                            thread: handle.thread,
+                                            harness_thread_id: handle.harness_thread_id.clone(),
+                                            model,
+                                            updates: opts.updates.clone(),
+                                            started_at,
+                                            deadline: started_at + RESUME_USAGE_REPLAY_TTL,
+                                        },
+                                    );
+                                }
+                                let _ = response.send(Ok(handle));
+                            }
+                            Err(error) => {
+                                let _ = response.send(Err(error));
+                            }
+                        }
                     }
                     HarnessCommand::StartTurn {
                         thread,
@@ -1435,6 +1495,11 @@ async fn background_task<C>(
                         .await
                         {
                             Ok(started) => {
+                                cancel_pending_resume_usage(
+                                    &mut pending_resume_usage,
+                                    &thread,
+                                    ResumeUsageCancellationReason::TurnStarted,
+                                );
                                 let _ = response.send(Ok(started.turn));
                             active_turns.insert(
                                 thread.thread,
@@ -1463,6 +1528,7 @@ async fn background_task<C>(
                         &mut mapper,
                         &senders,
                         &mut pending_compactions,
+                        &mut pending_resume_usage,
                         &active_turns,
                         Some(queued.command),
                     )
@@ -1476,6 +1542,9 @@ async fn background_task<C>(
             }
             _ = first_event_warn_tick.tick(), if !active_turns.is_empty() => {
                 warn_slow_first_events(&mut active_turns);
+            }
+            _ = resume_usage_cleanup_tick.tick(), if !pending_resume_usage.is_empty() => {
+                expire_pending_resume_usage(&mut pending_resume_usage);
             }
         }
     }
@@ -1549,6 +1618,125 @@ impl ActiveTurn {
 }
 
 type ActiveTurns = HashMap<ThreadId, ActiveTurn>;
+
+fn observe_pending_resume_usage(
+    pending_usage: &mut HashMap<String, PendingResumeUsage>,
+    message: &codex_codes::ServerMessage,
+) {
+    let codex_codes::ServerMessage::Notification(notification) = message else {
+        return;
+    };
+    if let codex_codes::messages::Notification::TurnStarted(started) = notification {
+        pending_usage.remove(&started.thread_id);
+        return;
+    }
+    let codex_codes::messages::Notification::ThreadTokenUsageUpdated(notification) = notification
+    else {
+        return;
+    };
+    let Entry::Occupied(pending_entry) = pending_usage.entry(notification.thread_id.clone()) else {
+        return;
+    };
+    let pending = pending_entry.get();
+    let reported = notification.token_usage.model_context_window;
+    let context_window = reported
+        .and_then(|window| u32::try_from(window).ok())
+        .filter(|window| *window > 0);
+    let Some(context_window) = context_window else {
+        if reported.is_some() {
+            warn!(
+                project_id = %pending.project,
+                thread_id = %pending.thread,
+                harness_thread_id = %pending.harness_thread_id,
+                native_turn_id = %notification.turn_id,
+                context_window = ?reported,
+                "ignoring invalid Codex context window while restoring resumed thread"
+            );
+        }
+        return;
+    };
+    let pending = pending_entry.remove();
+    info!(
+        project_id = %pending.project,
+        thread_id = %pending.thread,
+        harness_thread_id = %pending.harness_thread_id,
+        native_turn_id = %notification.turn_id,
+        provider = %pending.model.provider,
+        model = %pending.model.model,
+        context_window,
+        elapsed_ms = pending.started_at.elapsed().as_millis(),
+        "restoring Codex context window after thread resume"
+    );
+    match pending.updates.send(ThreadUpdate::ContextWindowRestored {
+        model: pending.model,
+        context_window,
+    }) {
+        Ok(()) => {}
+        Err(giskard_harness::ThreadUpdateSendError::Full(_)) => warn!(
+            project_id = %pending.project,
+            thread_id = %pending.thread,
+            harness_thread_id = %pending.harness_thread_id,
+            "resume context-window update channel was unexpectedly full"
+        ),
+        Err(giskard_harness::ThreadUpdateSendError::Closed(_)) => debug!(
+            project_id = %pending.project,
+            thread_id = %pending.thread,
+            harness_thread_id = %pending.harness_thread_id,
+            "resume context-window receiver was dropped"
+        ),
+    }
+}
+
+fn expire_pending_resume_usage(pending_usage: &mut HashMap<String, PendingResumeUsage>) {
+    let now = Instant::now();
+    pending_usage.retain(|_, pending| {
+        let retain = pending.deadline > now;
+        if !retain {
+            debug!(
+                project_id = %pending.project,
+                thread_id = %pending.thread,
+                harness_thread_id = %pending.harness_thread_id,
+                elapsed_ms = pending.started_at.elapsed().as_millis(),
+                "Codex did not replay a valid context window after thread resume"
+            );
+        }
+        retain
+    });
+}
+
+#[derive(Clone, Copy)]
+enum ResumeUsageCancellationReason {
+    TurnStarted,
+    ManualCompactionAccepted,
+}
+
+impl ResumeUsageCancellationReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TurnStarted => "turn_started",
+            Self::ManualCompactionAccepted => "manual_compaction_accepted",
+        }
+    }
+}
+
+/// Stop adapter-side polling promptly when resume restoration is no longer useful. The server's
+/// lifecycle generation remains the authoritative guard against committing a late update; this is
+/// only early cleanup for the Codex receiver and pending replay state.
+fn cancel_pending_resume_usage(
+    pending_usage: &mut HashMap<String, PendingResumeUsage>,
+    thread: &ThreadHandle,
+    reason: ResumeUsageCancellationReason,
+) {
+    if let Some(pending) = pending_usage.remove(&thread.harness_thread_id) {
+        debug!(
+            project_id = %pending.project,
+            thread_id = %pending.thread,
+            harness_thread_id = %pending.harness_thread_id,
+            reason = reason.as_str(),
+            "stopping resume context-window restoration because the thread lifecycle advanced"
+        );
+    }
+}
 
 struct StartedTurn {
     turn: TurnId,
@@ -1701,6 +1889,7 @@ async fn handle_control_command(
     mapper: &mut CodexMapper,
     senders: &SenderMap,
     pending_compactions: &mut HashMap<ThreadId, PendingCompaction>,
+    pending_resume_usage: &mut HashMap<String, PendingResumeUsage>,
     active_turns: &ActiveTurns,
     control: Option<ControlCommand>,
 ) -> StreamOutcome {
@@ -1785,6 +1974,11 @@ async fn handle_control_command(
             let result = handle_compact_thread(client, &thread).await;
             match &result {
                 Ok(()) => {
+                    cancel_pending_resume_usage(
+                        pending_resume_usage,
+                        &thread,
+                        ResumeUsageCancellationReason::ManualCompactionAccepted,
+                    );
                     pending_compactions.insert(thread.thread, PendingCompaction::new(started));
                     info!(
                         thread = %thread.thread,
@@ -2059,13 +2253,14 @@ async fn handle_open_thread(
     mapper: &mut CodexMapper,
     opts: &OpenThreadOptions,
     senders: &SenderMap,
-) -> Result<ThreadHandle, HarnessError> {
+) -> Result<OpenThreadResult, HarnessError> {
     let cwd = opts.workspace_root.to_string_lossy().to_string();
     let thread_id = opts.thread.unwrap_or_default();
 
     // Track whether resume-by-id failed and we fell back to a fresh native thread (C5), so we can
     // warn the caller that agent context was lost while keeping the Giskard-side history.
     let mut resume_warning = None;
+    let mut resume_usage_replay = ResumeUsageReplay::None;
 
     let opened = if let Some(ref resume_id) = opts.resume {
         let context = CodexOperationContext::for_project("thread_resume", opts.project)
@@ -2081,7 +2276,10 @@ async fn handle_open_thread(
         )
         .await
         {
-            Ok(opened) => opened,
+            Ok(opened) => {
+                resume_usage_replay = ResumeUsageReplay::Monitor;
+                opened
+            }
             Err(error) if opts.resume_policy == ResumePolicy::RequireExisting => {
                 return Err(error);
             }
@@ -2133,13 +2331,16 @@ async fn handle_open_thread(
         .await;
     }
 
-    Ok(ThreadHandle {
-        thread: thread_id,
-        harness_thread_id: opened.harness_thread_id,
-        warning: resume_warning,
-        resumed_model: opened.model,
-        agent_name: opened.agent_name,
-        parent_harness_thread_id: opened.parent_harness_thread_id,
+    Ok(OpenThreadResult {
+        handle: ThreadHandle {
+            thread: thread_id,
+            harness_thread_id: opened.harness_thread_id,
+            warning: resume_warning,
+            resumed_model: opened.model,
+            agent_name: opened.agent_name,
+            parent_harness_thread_id: opened.parent_harness_thread_id,
+        },
+        resume_usage_replay,
     })
 }
 
@@ -3512,6 +3713,7 @@ mod tests {
         command_exec_terminate_error: Option<String>,
         thread_delete_error: Option<String>,
         thread_resume_missing_rollout_failures: usize,
+        thread_resume_omits_model: bool,
         model_list_error: Option<String>,
         config_read_error: Option<String>,
         /// `model_provider` in the `config/read` payload; `None` omits the key, as a config that
@@ -3599,6 +3801,10 @@ mod tests {
                 .thread_resume_missing_rollout_failures = failures;
         }
 
+        async fn omit_thread_resume_model(&self) {
+            self.state.lock().await.thread_resume_omits_model = true;
+        }
+
         async fn fail_model_list(&self, message: &str) {
             self.state.lock().await.model_list_error = Some(message.into());
         }
@@ -3681,6 +3887,10 @@ mod tests {
                                     .unwrap_or("resumed-provider"),
                             );
                             response["reasoningEffort"] = json!("high");
+                            if state.thread_resume_omits_model {
+                                response["model"] = json!("");
+                                response["modelProvider"] = json!("");
+                            }
                             Ok(response)
                         }
                     }
@@ -3911,6 +4121,7 @@ mod tests {
             resume: resume.map(str::to_owned),
             resume_policy: ResumePolicy::AllowFreshFallback,
             initial_model: Some(test_model(None)),
+            updates: giskard_harness::thread_update_channel().0,
         }
     }
 
@@ -4087,6 +4298,35 @@ mod tests {
                 .expect("test user input request should deserialize"),
             ),
         }
+    }
+
+    fn token_usage_message(
+        native_thread_id: &str,
+        native_turn_id: &str,
+        context_window: i64,
+    ) -> codex_codes::ServerMessage {
+        codex_codes::ServerMessage::Notification(
+            codex_codes::messages::Notification::ThreadTokenUsageUpdated(
+                serde_json::from_value(json!({
+                    "threadId": native_thread_id,
+                    "turnId": native_turn_id,
+                    "tokenUsage": {
+                        "last": {
+                            "cachedInputTokens": 10, "inputTokens": 100,
+                            "outputTokens": 40, "reasoningOutputTokens": 5,
+                            "totalTokens": 140
+                        },
+                        "total": {
+                            "cachedInputTokens": 10, "inputTokens": 100,
+                            "outputTokens": 40, "reasoningOutputTokens": 5,
+                            "totalTokens": 140
+                        },
+                        "modelContextWindow": context_window
+                    }
+                }))
+                .expect("test token usage should deserialize"),
+            ),
+        )
     }
 
     fn command_approval_request(
@@ -4466,6 +4706,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_worker_restores_context_window_after_resume() {
+        let (harness, controller) = spawn_fake_harness();
+        let thread = ThreadId::new();
+        let mut opts = open_opts(Some(thread), Some("native-existing"));
+        let (updates, mut update_stream) = giskard_harness::thread_update_channel();
+        opts.updates = updates;
+
+        let handle = harness.open_thread(opts).await.unwrap();
+        let resumed_model = handle.resumed_model.clone().unwrap();
+        controller
+            .send_server_message(token_usage_message(
+                &handle.harness_thread_id,
+                "historical-turn",
+                258_400,
+            ))
+            .await;
+
+        let update = timeout(Duration::from_secs(1), update_stream.recv())
+            .await
+            .expect("resume update should arrive")
+            .expect("resume update stream should remain open");
+        assert_eq!(
+            update,
+            ThreadUpdate::ContextWindowRestored {
+                model: resumed_model,
+                context_window: 258_400,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_worker_uses_requested_model_when_resume_response_omits_it() {
+        let (harness, controller) = spawn_fake_harness();
+        controller.omit_thread_resume_model().await;
+        let thread = ThreadId::new();
+        let mut opts = open_opts(Some(thread), Some("native-existing"));
+        let expected_model = opts.initial_model.clone().unwrap();
+        let (updates, mut update_stream) = giskard_harness::thread_update_channel();
+        opts.updates = updates;
+
+        let handle = harness.open_thread(opts).await.unwrap();
+        assert!(handle.resumed_model.is_none());
+        controller
+            .send_server_message(token_usage_message(
+                &handle.harness_thread_id,
+                "historical-turn",
+                258_400,
+            ))
+            .await;
+
+        assert_eq!(
+            timeout(Duration::from_secs(1), update_stream.recv())
+                .await
+                .expect("resume update should arrive")
+                .expect("resume update stream should remain open"),
+            ThreadUpdate::ContextWindowRestored {
+                model: expected_model,
+                context_window: 258_400,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_worker_stops_resume_restoration_when_a_new_turn_starts() {
+        let (harness, _controller) = spawn_fake_harness();
+        let thread = ThreadId::new();
+        let mut opts = open_opts(Some(thread), Some("native-existing"));
+        let (updates, mut update_stream) = giskard_harness::thread_update_channel();
+        opts.updates = updates;
+        let handle = harness.open_thread(opts).await.unwrap();
+
+        harness
+            .start_turn(&handle, UserInput::text("new turn"), build_turn_overrides())
+            .await
+            .unwrap();
+
+        assert!(
+            timeout(Duration::from_secs(1), update_stream.recv())
+                .await
+                .expect("resume update stream should close")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_worker_stops_resume_restoration_when_compaction_is_accepted() {
+        let (harness, _controller) = spawn_fake_harness();
+        let thread = ThreadId::new();
+        let mut opts = open_opts(Some(thread), Some("native-existing"));
+        let (updates, mut update_stream) = giskard_harness::thread_update_channel();
+        opts.updates = updates;
+        let handle = harness.open_thread(opts).await.unwrap();
+
+        harness.compact_thread(&handle).await.unwrap();
+
+        assert!(
+            timeout(Duration::from_secs(1), update_stream.recv())
+                .await
+                .expect("resume update stream should close")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_worker_expires_resume_restoration_without_blocking_the_thread() {
+        let (harness, _controller) = spawn_fake_harness();
+        let thread = ThreadId::new();
+        let mut opts = open_opts(Some(thread), Some("native-existing"));
+        let (updates, mut update_stream) = giskard_harness::thread_update_channel();
+        opts.updates = updates;
+
+        timeout(Duration::from_secs(1), harness.open_thread(opts))
+            .await
+            .expect("resume must not wait for usage replay")
+            .unwrap();
+        assert!(
+            timeout(Duration::from_secs(1), update_stream.recv())
+                .await
+                .expect("expired resume update stream should close")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn codex_worker_resumes_thread_while_turn_is_active() {
         let (harness, controller) = spawn_fake_harness();
         let first = harness.open_thread(open_opts(None, None)).await.unwrap();
@@ -4562,11 +4926,11 @@ mod tests {
     async fn normal_resume_keeps_fresh_thread_recovery_after_missing_rollout() {
         let (harness, controller) = spawn_fake_harness();
         controller.fail_thread_resume_missing_rollout(1).await;
+        let mut opts = open_opts(None, Some("native-missing"));
+        let (updates, mut update_stream) = giskard_harness::thread_update_channel();
+        opts.updates = updates;
 
-        let opened = harness
-            .open_thread(open_opts(None, Some("native-missing")))
-            .await
-            .unwrap();
+        let opened = harness.open_thread(opts).await.unwrap();
 
         assert_eq!(opened.harness_thread_id, "native-thread-1");
         assert_eq!(
@@ -4587,6 +4951,12 @@ mod tests {
                 .filter(|request| request.method == codex_codes::protocol::methods::THREAD_START)
                 .count(),
             1
+        );
+        assert!(
+            timeout(Duration::from_secs(1), update_stream.recv())
+                .await
+                .expect("fresh fallback must not retain a resume monitor")
+                .is_none()
         );
     }
 
@@ -4801,6 +5171,7 @@ mod tests {
                 resume: Some("native-existing".into()),
                 resume_policy: ResumePolicy::AllowFreshFallback,
                 initial_model: None,
+                updates: giskard_harness::thread_update_channel().0,
             }),
         )
         .await

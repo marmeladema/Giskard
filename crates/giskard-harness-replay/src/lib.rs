@@ -552,6 +552,7 @@ mod tests {
                     model: "gpt-5.5".into(),
                     reasoning_effort: None,
                 }),
+                updates: giskard_harness::thread_update_channel().0,
             })
             .await
             .unwrap();
@@ -615,6 +616,7 @@ mod tests {
                     model: "gpt-5.5".into(),
                     reasoning_effort: None,
                 }),
+                updates: giskard_harness::thread_update_channel().0,
             })
             .await
             .unwrap();

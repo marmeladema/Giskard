@@ -254,6 +254,7 @@ mod tests {
             },
             context_window: 1,
             model_context_windows: HashMap::new(),
+            revision: 0,
             permission_preset: PermissionPreset::AskFirst,
             model_efforts: HashMap::new(),
             tokens: TokenLedger::default(),

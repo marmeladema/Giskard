@@ -19,6 +19,17 @@ WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticke
 /api/projects/{id}/mcp/oauth-login`. Wire types are defined once in `giskard-proto`. See
 [§13.6](../specs/giskard-specification.md) for the message protocol.
 
+The server sends `thread_context_window_updated { thread_id, model, context_window, revision }`
+after persisting a live or resume-time effective runtime capacity. It is thread-scoped and
+model-validated server-side. The monotonic revision also appears in persisted `ThreadState`; clients
+track complete state, selected-model/context-window, and token revisions separately, so a newer
+partial update protects the fields it proves without suppressing unrelated fields from an older
+complete snapshot. During
+subscribe/resync, the server retains intervening live messages until the authoritative snapshots
+are queued; this buffer has no message-count overflow that can disconnect a busy socket. It remains
+active while captured messages drain through the bounded outbound queue at socket-writer
+throughput, which can extend beyond the snapshot reads when live output is arriving quickly.
+
 `POST /api/projects` takes a name and a directory; there is no `default_model`. A project record
 stores no model at all. The model a new thread starts on is derived from the project's catalog when
 the draft opens (the harness's default when it marks one, else the first entry), so it tracks the

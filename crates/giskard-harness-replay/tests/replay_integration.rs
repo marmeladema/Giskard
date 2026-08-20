@@ -120,6 +120,7 @@ async fn open_thread_one_turn_assert_state() {
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
             }),
+            updates: giskard_harness::thread_update_channel().0,
         })
         .await
         .expect("open_thread failed");
@@ -256,6 +257,7 @@ async fn replay_persisted_state_roundtrip() {
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
             }),
+            updates: giskard_harness::thread_update_channel().0,
         })
         .await
         .unwrap();
@@ -315,6 +317,7 @@ async fn replay_persisted_state_roundtrip() {
         },
         context_window: 262_144,
         model_context_windows: Default::default(),
+        revision: 0,
         permission_preset: PermissionPreset::AskFirst,
         model_efforts: std::collections::HashMap::new(),
         tokens: giskard_core::token::TokenLedger {

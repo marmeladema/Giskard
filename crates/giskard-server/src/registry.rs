@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, Weak};
 use std::time::{Duration, Instant};
 
@@ -25,7 +27,7 @@ use giskard_core::turn::{Mode, Turn, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
     AgentHarness, HarnessCapabilities, HarnessProvider, OpenThreadOptions, ResumePolicy,
-    ThreadHandle,
+    ThreadHandle, ThreadUpdate, ThreadUpdateSink, thread_update_channel,
 };
 use giskard_persist::PersistStore;
 use giskard_persist::store::{ProjectConfig, ThreadFile};
@@ -125,6 +127,10 @@ type PassiveMonitorTasks = Arc<PassiveMonitorTaskTracker>;
 type ProjectLifecycleLocks = Arc<Mutex<HashMap<ProjectId, Weak<Mutex<()>>>>>;
 const ACTIVE_SUBAGENT_PRE_TURN_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const PASSIVE_MONITOR_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+// A resumed harness can report metadata before the new Giskard thread file is saved. Retry that
+// store-creation race for about ten seconds without tying this policy to the adapter replay TTL.
+const RESTORED_CONTEXT_WINDOW_STORE_RETRY_LIMIT: u16 = 200;
+const RESTORED_CONTEXT_WINDOW_STORE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 struct PassiveMonitorTaskTracker {
     counts: Mutex<HashMap<ThreadId, usize>>,
@@ -418,6 +424,16 @@ struct RegistryShared {
     running_commands: Arc<RunningTaskStore>,
     store: Arc<PersistStore>,
     ledger: LedgerHandle,
+    /// Advances when a new turn starts so delayed resume metadata cannot overwrite live metadata.
+    /// Entries remain for archived/open threads and are removed on thread or project deletion, so
+    /// this map is bounded by the number of threads known during the process lifetime.
+    resume_update_lifecycles: Arc<StdMutex<HashMap<ThreadId, Arc<ResumeUpdateLifecycle>>>>,
+}
+
+#[derive(Default)]
+struct ResumeUpdateLifecycle {
+    generation: std::sync::atomic::AtomicU64,
+    commit: Mutex<()>,
 }
 
 impl RegistryShared {
@@ -444,8 +460,68 @@ impl RegistryShared {
             running_commands,
             store,
             ledger,
+            resume_update_lifecycles: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
+}
+
+enum ThreadUpdateDisposition<T> {
+    Forward { thread_id: ThreadId, value: T },
+    Discard(T),
+}
+
+/// Own update-channel setup around a harness open operation. The callback decides only after its
+/// identity checks and persistence work whether queued updates are safe to forward.
+async fn with_thread_updates<T, F, Fut>(
+    shared: &RegistryShared,
+    project_id: ProjectId,
+    operation: F,
+) -> Result<T, HarnessError>
+where
+    F: FnOnce(ThreadUpdateSink) -> Fut,
+    Fut: Future<Output = Result<ThreadUpdateDisposition<T>, HarnessError>>,
+{
+    let (updates, update_stream) = thread_update_channel();
+    match operation(updates).await? {
+        ThreadUpdateDisposition::Forward { thread_id, value } => {
+            // Dropping this JoinHandle does not cancel the task. It exits when the harness drops
+            // the sink and the stream closes.
+            spawn_thread_update_forwarder(
+                project_id,
+                thread_id,
+                update_stream,
+                shared.store.clone(),
+                shared.hub.clone(),
+                shared.resume_update_lifecycles.clone(),
+            );
+            Ok(value)
+        }
+        ThreadUpdateDisposition::Discard(value) => Ok(value),
+    }
+}
+
+fn validate_open_thread_identity(
+    handle: &ThreadHandle,
+    requested_thread_id: Option<ThreadId>,
+    required_native_id: Option<&str>,
+) -> Result<(), HarnessError> {
+    if let Some(required_native_id) = required_native_id
+        && handle.harness_thread_id != required_native_id
+    {
+        return Err(HarnessError::Protocol(format!(
+            "linked-thread resume returned native thread {} instead of {}",
+            handle.harness_thread_id, required_native_id
+        )));
+    }
+    if let Some(requested_thread_id) = requested_thread_id
+        && handle.thread != requested_thread_id
+    {
+        return Err(HarnessError::Protocol(format!(
+            "linked-thread resume returned Giskard thread {} instead of {}",
+            handle.thread, requested_thread_id
+        )));
+    }
+    Ok(())
 }
 
 impl HarnessRegistry {
@@ -561,57 +637,58 @@ impl HarnessRegistry {
         );
         let harness = self.get_or_create_harness(config.id, config).await?;
         let requested_native_id = resume.clone();
+        let shared = self.shared.clone();
+        let operation_shared = shared.clone();
+        with_thread_updates(&shared, config.id, |updates| async move {
+            let handle = harness
+                .open_thread(OpenThreadOptions {
+                    project: config.id,
+                    thread,
+                    workspace_root: workspace_root.into(),
+                    resume,
+                    resume_policy,
+                    initial_model: initial_model.clone(),
+                    updates,
+                })
+                .await?;
 
-        let handle = harness
-            .open_thread(OpenThreadOptions {
-                project: config.id,
-                thread,
-                workspace_root: workspace_root.into(),
-                resume,
-                resume_policy,
-                initial_model: initial_model.clone(),
+            // This is the harness-neutral identity boundary. Individual adapters may enforce the
+            // same contract internally, but the registry cannot rely on adapter validation.
+            let required_native_id = (resume_policy == ResumePolicy::RequireExisting)
+                .then_some(requested_native_id.as_deref().unwrap_or_default());
+            validate_open_thread_identity(&handle, thread, required_native_id)?;
+
+            // Bind the model the harness reports as effective when it says so — Codex can ignore
+            // resume overrides for a loaded thread, and the binding must reflect reality, not the
+            // request (spec: model-provider-switching analysis).
+            let native_model = handle
+                .resumed_model
+                .clone()
+                .or_else(|| initial_model.clone());
+            operation_shared.threads.lock().await.insert(
+                handle.thread,
+                ThreadBinding {
+                    project: config.id,
+                    handle: handle.clone(),
+                    native_model,
+                },
+            );
+            debug!(
+                project_id = %config.id,
+                thread_id = %handle.thread,
+                harness_thread_id = %handle.harness_thread_id,
+                provider = initial_model.as_ref().map(|m| m.provider.as_str()).unwrap_or("<harness>"),
+                model = initial_model.as_ref().map(|m| m.model.as_str()).unwrap_or("<harness>"),
+                warning = handle.warning.as_ref().map(|w| w.code.as_str()).unwrap_or(""),
+                "harness thread opened"
+            );
+
+            Ok(ThreadUpdateDisposition::Forward {
+                thread_id: handle.thread,
+                value: handle,
             })
-            .await?;
-
-        // This is the harness-neutral identity boundary. Individual adapters may enforce the same
-        // contract internally, but the registry must not rely on adapter-specific validation.
-        if resume_policy == ResumePolicy::RequireExisting
-            && requested_native_id.as_deref() != Some(handle.harness_thread_id.as_str())
-        {
-            return Err(HarnessError::Protocol(format!(
-                "linked-thread resume returned native thread {} instead of {}",
-                handle.harness_thread_id,
-                requested_native_id.as_deref().unwrap_or_default()
-            )));
-        }
-
-        // Bind the model the harness reports as effective when it says so — Codex can ignore
-        // resume overrides for a loaded thread, and the binding must reflect reality, not the
-        // request (spec: model-provider-switching analysis).
-        let native_model = handle
-            .resumed_model
-            .clone()
-            .or_else(|| initial_model.clone());
-        let mut threads = self.shared.threads.lock().await;
-        threads.insert(
-            handle.thread,
-            ThreadBinding {
-                project: config.id,
-                handle: handle.clone(),
-                native_model,
-            },
-        );
-        debug!(
-            project_id = %config.id,
-            thread_id = %handle.thread,
-            harness_thread_id = %handle.harness_thread_id,
-            provider = initial_model.as_ref().map(|m| m.provider.as_str()).unwrap_or("<harness>"),
-            model = initial_model.as_ref().map(|m| m.model.as_str()).unwrap_or("<harness>"),
-            warning = handle.warning.as_ref().map(|w| w.code.as_str()).unwrap_or(""),
-            "harness thread opened"
-        );
-
-        Ok(handle)
+        })
+        .await
     }
 
     pub async fn start_turn(
@@ -671,37 +748,42 @@ impl HarnessRegistry {
         let shared = self.shared.clone();
 
         let stream = harness.subscribe(&handle);
-        let turn_id = match harness.start_turn(&handle, input, overrides).await {
-            Ok(turn_id) => {
-                info!(
-                    %project_id,
-                    %thread_id,
-                    %turn_id,
-                    harness_thread_id = %handle.harness_thread_id,
-                    mode = ?ctx.mode,
-                    provider = %ctx.model.provider,
-                    model = %ctx.model.model,
-                    ack_elapsed_ms = request_started.elapsed().as_millis(),
-                    "harness accepted turn start request"
-                );
-                turn_gate.acknowledge_turn(turn_id);
-                turn_id
-            }
-            Err(error) => {
-                warn!(
-                    %project_id,
-                    %thread_id,
-                    harness_thread_id = %handle.harness_thread_id,
-                    mode = ?ctx.mode,
-                    provider = %ctx.model.provider,
-                    model = %ctx.model.model,
-                    error = %error,
-                    ack_elapsed_ms = request_started.elapsed().as_millis(),
-                    "harness rejected turn start request"
-                );
-                return Err(error);
-            }
-        };
+        let turn_id =
+            match accept_turn_lifecycle(&self.shared.resume_update_lifecycles, thread_id, || {
+                harness.start_turn(&handle, input, overrides)
+            })
+            .await
+            {
+                Ok(turn_id) => {
+                    info!(
+                        %project_id,
+                        %thread_id,
+                        %turn_id,
+                        harness_thread_id = %handle.harness_thread_id,
+                        mode = ?ctx.mode,
+                        provider = %ctx.model.provider,
+                        model = %ctx.model.model,
+                        ack_elapsed_ms = request_started.elapsed().as_millis(),
+                        "harness accepted turn start request"
+                    );
+                    turn_gate.acknowledge_turn(turn_id);
+                    turn_id
+                }
+                Err(error) => {
+                    warn!(
+                        %project_id,
+                        %thread_id,
+                        harness_thread_id = %handle.harness_thread_id,
+                        mode = ?ctx.mode,
+                        provider = %ctx.model.provider,
+                        model = %ctx.model.model,
+                        error = %error,
+                        ack_elapsed_ms = request_started.elapsed().as_millis(),
+                        "harness rejected turn start request"
+                    );
+                    return Err(error);
+                }
+            };
 
         tokio::spawn(async move {
             forward_events(shared, thread_id, project_id, stream, ctx, Some(turn_gate)).await;
@@ -881,7 +963,10 @@ impl HarnessRegistry {
         let shared = self.shared.clone();
 
         let stream = harness.subscribe(&handle);
-        harness.compact_thread(&handle).await?;
+        accept_turn_lifecycle(&self.shared.resume_update_lifecycles, thread_id, || {
+            harness.compact_thread(&handle)
+        })
+        .await?;
         info!(
             %project_id,
             %thread_id,
@@ -1173,8 +1258,19 @@ impl HarnessRegistry {
     }
 
     pub async fn forget_thread(&self, thread_id: ThreadId) {
+        advance_resume_update_generation(&self.shared.resume_update_lifecycles, thread_id).await;
         let mut threads = self.shared.threads.lock().await;
         threads.remove(&thread_id);
+        drop(threads);
+        self.shared.hub.clear_thread(thread_id).await;
+        match self.shared.resume_update_lifecycles.lock() {
+            Ok(mut generations) => {
+                generations.remove(&thread_id);
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().remove(&thread_id);
+            }
+        }
     }
 
     pub async fn delete_project(&self, project_id: ProjectId) -> Result<(), HarnessError> {
@@ -1211,6 +1307,19 @@ impl HarnessRegistry {
         };
 
         if !removed_thread_ids.is_empty() {
+            for thread_id in &removed_thread_ids {
+                advance_resume_update_generation(&self.shared.resume_update_lifecycles, *thread_id)
+                    .await;
+                match self.shared.resume_update_lifecycles.lock() {
+                    Ok(mut generations) => {
+                        generations.remove(thread_id);
+                    }
+                    Err(poisoned) => {
+                        poisoned.into_inner().remove(thread_id);
+                    }
+                }
+                self.shared.hub.clear_thread(*thread_id).await;
+            }
             let mut approvals = self.shared.approvals.lock().await;
             approvals.retain(|_, thread_id| !removed_thread_ids.contains(thread_id));
 
@@ -1864,80 +1973,91 @@ async fn materialize_subagent_thread(
     // and applied on its next cold resume, moving the thread out of the worktree its own earlier
     // work is in.
     let workspace_root = subagent_workspace_root(&shared, &project_config, &parent_file).await?;
-    let handle = harness
-        .open_thread(OpenThreadOptions {
-            project: project_id,
-            thread: None,
-            workspace_root: workspace_root.into(),
-            resume: Some(info.native_thread_id.clone()),
-            resume_policy: ResumePolicy::RequireExisting,
-            initial_model: Some(model.clone()),
-        })
-        .await?;
-    // This path calls the harness directly rather than `open_thread_with_resume_policy`, so retain
-    // the registry's harness-neutral strict-resume check even when the adapter also validates it.
-    if handle.harness_thread_id != info.native_thread_id {
-        return Err(HarnessError::Protocol(format!(
-            "linked-thread resume returned native thread {} instead of {}",
-            handle.harness_thread_id, info.native_thread_id
-        )));
-    }
-    if let Some(native_parent) = handle.parent_harness_thread_id.as_deref()
-        && native_parent != parent_file.harness_thread_id
-    {
-        warn!(
-            %project_id,
-            %parent_thread_id,
-            proposed_parent_harness_thread_id = %parent_file.harness_thread_id,
-            reported_parent_harness_thread_id = %native_parent,
-            linked_harness_thread_id = %handle.harness_thread_id,
-            "refusing to materialize a native thread under a mismatched parent"
+    let requested_native_id = info.native_thread_id.clone();
+    let parent_harness_thread_id = parent_file.harness_thread_id.clone();
+    let operation_shared = shared.clone();
+    let opened = with_thread_updates(&shared, project_id, |updates| async move {
+        let handle = harness
+            .open_thread(OpenThreadOptions {
+                project: project_id,
+                thread: None,
+                workspace_root: workspace_root.into(),
+                resume: Some(requested_native_id.clone()),
+                resume_policy: ResumePolicy::RequireExisting,
+                initial_model: Some(model.clone()),
+                updates,
+            })
+            .await?;
+        validate_open_thread_identity(&handle, None, Some(&requested_native_id))?;
+        if let Some(native_parent) = handle.parent_harness_thread_id.as_deref()
+            && native_parent != parent_harness_thread_id
+        {
+            warn!(
+                %project_id,
+                %parent_thread_id,
+                proposed_parent_harness_thread_id = %parent_harness_thread_id,
+                reported_parent_harness_thread_id = %native_parent,
+                linked_harness_thread_id = %handle.harness_thread_id,
+                "refusing to materialize a native thread under a mismatched parent"
+            );
+            return Ok(ThreadUpdateDisposition::Discard(None));
+        }
+        let current_model = handle.resumed_model.clone().unwrap_or(model);
+        let info = subagent_info_with_agent_name(info, handle.agent_name.clone());
+        let now = Utc::now();
+        operation_shared
+            .store
+            .save_thread(
+                project_id,
+                &ThreadFile {
+                    version: 1,
+                    id: handle.thread,
+                    project_id,
+                    title: subagent_thread_title(&info),
+                    harness_thread_id: handle.harness_thread_id.clone(),
+                    parent_thread_id: Some(parent_thread_id),
+                    spawned_by_turn_id: Some(spawned_by_turn_id),
+                    kind: ThreadKind::Subagent,
+                    mode,
+                    current_model: current_model.clone(),
+                    context_window,
+                    model_context_windows,
+                    revision: 0,
+                    permission_preset,
+                    model_efforts,
+                    tokens: giskard_core::token::TokenLedger::default(),
+                    created_at: now,
+                    updated_at: now,
+                    archived: false,
+                    git_workspace: None,
+                },
+            )
+            .await
+            .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+        // Publish the binding only after persistence succeeds. From insertion through forwarder
+        // attachment there is no await, so a turn cannot advance the lifecycle generation between
+        // the native open and the forwarder's initial generation sample.
+        operation_shared.threads.lock().await.insert(
+            handle.thread,
+            ThreadBinding {
+                project: project_id,
+                handle: handle.clone(),
+                native_model: Some(current_model.clone()),
+            },
         );
+        Ok(ThreadUpdateDisposition::Forward {
+            thread_id: handle.thread,
+            value: Some((handle.thread, current_model, info)),
+        })
+    })
+    .await?;
+    let Some((subagent_thread_id, current_model, info)) = opened else {
         return Ok(None);
-    }
-    let current_model = handle.resumed_model.clone().unwrap_or(model);
-    let info = subagent_info_with_agent_name(info, handle.agent_name.clone());
-    let native_model = Some(current_model.clone());
-    shared.threads.lock().await.insert(
-        handle.thread,
-        ThreadBinding {
-            project: project_id,
-            handle: handle.clone(),
-            native_model,
-        },
-    );
-
-    let now = Utc::now();
-    let thread_file = ThreadFile {
-        version: 1,
-        id: handle.thread,
-        project_id,
-        title: subagent_thread_title(&info),
-        harness_thread_id: handle.harness_thread_id.clone(),
-        parent_thread_id: Some(parent_thread_id),
-        spawned_by_turn_id: Some(spawned_by_turn_id),
-        kind: ThreadKind::Subagent,
-        mode,
-        current_model: current_model.clone(),
-        context_window,
-        model_context_windows,
-        permission_preset,
-        model_efforts,
-        tokens: giskard_core::token::TokenLedger::default(),
-        created_at: now,
-        updated_at: now,
-        archived: false,
-        git_workspace: None,
     };
-    shared
-        .store
-        .save_thread(project_id, &thread_file)
-        .await
-        .map_err(|error| HarnessError::Protocol(error.to_string()))?;
     let policy = subagent_monitor_policy(Some(info.action), info.status);
     observe_external_subagent_with_context(
         project_id,
-        handle.thread,
+        subagent_thread_id,
         SubagentObservation {
             effective_model: current_model,
             mode,
@@ -1948,7 +2068,7 @@ async fn materialize_subagent_thread(
         shared,
     )
     .await?;
-    Ok(Some(handle.thread))
+    Ok(Some(subagent_thread_id))
 }
 
 async fn enqueue_subagent_materialization(
@@ -2067,40 +2187,44 @@ async fn ensure_subagent_thread_open(
     // Reopening a persisted sub-agent is that cold resume: resolve from the chain, not from the
     // child's own record, which never names a worktree.
     let workspace_root = subagent_workspace_root(shared, project_config, thread_file).await?;
-    let handle = harness
-        .open_thread(OpenThreadOptions {
-            project: project_config.id,
-            thread: Some(thread_file.id),
-            workspace_root: workspace_root.into(),
-            resume: Some(thread_file.harness_thread_id.clone()),
-            resume_policy: ResumePolicy::RequireExisting,
-            initial_model: Some(thread_file.current_model.clone()),
+    with_thread_updates(shared, project_config.id, |updates| async move {
+        let handle = harness
+            .open_thread(OpenThreadOptions {
+                project: project_config.id,
+                thread: Some(thread_file.id),
+                workspace_root: workspace_root.into(),
+                resume: Some(thread_file.harness_thread_id.clone()),
+                resume_policy: ResumePolicy::RequireExisting,
+                initial_model: Some(thread_file.current_model.clone()),
+                updates,
+            })
+            .await?;
+        validate_open_thread_identity(
+            &handle,
+            Some(thread_file.id),
+            Some(&thread_file.harness_thread_id),
+        )?;
+        let native_model = Some(
+            handle
+                .resumed_model
+                .clone()
+                .unwrap_or_else(|| thread_file.current_model.clone()),
+        );
+        let agent_name = handle.agent_name.clone();
+        shared.threads.lock().await.insert(
+            handle.thread,
+            ThreadBinding {
+                project: project_config.id,
+                handle,
+                native_model,
+            },
+        );
+        Ok(ThreadUpdateDisposition::Forward {
+            thread_id: thread_file.id,
+            value: agent_name,
         })
-        .await?;
-    // This path calls the harness directly rather than `open_thread_with_resume_policy`, so retain
-    // the registry's harness-neutral strict-resume check even when the adapter also validates it.
-    if handle.harness_thread_id != thread_file.harness_thread_id {
-        return Err(HarnessError::Protocol(format!(
-            "linked-thread resume returned native thread {} instead of {}",
-            handle.harness_thread_id, thread_file.harness_thread_id
-        )));
-    }
-    let native_model = Some(
-        handle
-            .resumed_model
-            .clone()
-            .unwrap_or_else(|| thread_file.current_model.clone()),
-    );
-    let agent_name = handle.agent_name.clone();
-    shared.threads.lock().await.insert(
-        handle.thread,
-        ThreadBinding {
-            project: project_config.id,
-            handle,
-            native_model,
-        },
-    );
-    Ok(agent_name)
+    })
+    .await
 }
 
 async fn start_passive_subagent_monitor(
@@ -2503,6 +2627,189 @@ async fn passive_pre_turn_recv(
     }
 }
 
+fn resume_update_lifecycle(
+    lifecycles: &StdMutex<HashMap<ThreadId, Arc<ResumeUpdateLifecycle>>>,
+    thread_id: ThreadId,
+) -> Arc<ResumeUpdateLifecycle> {
+    let mut lifecycles = match lifecycles.lock() {
+        Ok(lifecycles) => lifecycles,
+        Err(poisoned) => {
+            warn!(%thread_id, "resume-update generation lock was poisoned; recovering state");
+            poisoned.into_inner()
+        }
+    };
+    lifecycles.entry(thread_id).or_default().clone()
+}
+
+async fn advance_resume_update_generation(
+    lifecycles: &StdMutex<HashMap<ThreadId, Arc<ResumeUpdateLifecycle>>>,
+    thread_id: ThreadId,
+) {
+    let lifecycle = resume_update_lifecycle(lifecycles, thread_id);
+    let _commit = lifecycle.commit.lock().await;
+    lifecycle.generation.fetch_add(1, Ordering::AcqRel);
+}
+
+async fn accept_turn_lifecycle<T, F, Fut>(
+    lifecycles: &StdMutex<HashMap<ThreadId, Arc<ResumeUpdateLifecycle>>>,
+    thread_id: ThreadId,
+    operation: F,
+) -> Result<T, HarnessError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, HarnessError>>,
+{
+    let lifecycle = resume_update_lifecycle(lifecycles, thread_id);
+    let _commit = lifecycle.commit.lock().await;
+    let accepted = operation().await?;
+    lifecycle.generation.fetch_add(1, Ordering::AcqRel);
+    Ok(accepted)
+}
+
+fn spawn_thread_update_forwarder(
+    project_id: ProjectId,
+    thread_id: ThreadId,
+    mut updates: giskard_harness::ThreadUpdateStream,
+    store: Arc<PersistStore>,
+    hub: Arc<Hub>,
+    lifecycles: Arc<StdMutex<HashMap<ThreadId, Arc<ResumeUpdateLifecycle>>>>,
+) -> tokio::task::JoinHandle<()> {
+    let lifecycle = resume_update_lifecycle(&lifecycles, thread_id);
+    let opened_generation = lifecycle.generation.load(Ordering::Acquire);
+    tokio::spawn(async move {
+        while let Some(update) = updates.recv().await {
+            let ThreadUpdate::ContextWindowRestored {
+                model,
+                context_window,
+            } = update;
+            if context_window == 0 {
+                warn!(%project_id, %thread_id, "ignoring zero context window restored by harness");
+                continue;
+            }
+            let mut attempt = 0u16;
+            loop {
+                let restored_model = model.clone();
+                let update_result = {
+                    let _commit = lifecycle.commit.lock().await;
+                    if lifecycle.generation.load(Ordering::Acquire) != opened_generation {
+                        debug!(
+                            %project_id,
+                            %thread_id,
+                            "ignoring restored context window because lifecycle advanced"
+                        );
+                        break;
+                    }
+                    store
+                        .update_thread(project_id, thread_id, move |thread| {
+                            thread.record_model_context_window(&restored_model, context_window);
+                        })
+                        .await
+                };
+                match update_result {
+                    Ok(Some(thread)) => {
+                        info!(
+                            %project_id,
+                            %thread_id,
+                            provider = %model.provider,
+                            model = %model.model,
+                            context_window,
+                            "persisted context window restored after harness resume"
+                        );
+                        if thread.current_model.provider == model.provider
+                            && thread.current_model.model == model.model
+                        {
+                            hub.broadcast_reliably(
+                                thread_id,
+                                ServerMessage::ThreadContextWindowUpdated {
+                                    thread_id,
+                                    model: model.clone(),
+                                    context_window,
+                                    revision: thread.revision,
+                                },
+                            )
+                            .await;
+                        }
+                        break;
+                    }
+                    Ok(None) if attempt < RESTORED_CONTEXT_WINDOW_STORE_RETRY_LIMIT => {
+                        attempt += 1;
+                        tokio::time::sleep(RESTORED_CONTEXT_WINDOW_STORE_RETRY_INTERVAL).await;
+                    }
+                    Ok(None) => {
+                        warn!(
+                            %project_id,
+                            %thread_id,
+                            context_window,
+                            "thread file did not become available for restored context window"
+                        );
+                        broadcast_context_window_restore_warning_if_current(
+                            &lifecycle,
+                            opened_generation,
+                            &hub,
+                            thread_id,
+                            context_window_restore_warning(
+                                thread_id,
+                                "The thread file did not become available before restoration timed out."
+                                    .into(),
+                            ),
+                        )
+                        .await;
+                        break;
+                    }
+                    Err(error) => {
+                        error!(
+                            %project_id,
+                            %thread_id,
+                            context_window,
+                            %error,
+                            "failed to persist context window restored by harness"
+                        );
+                        broadcast_context_window_restore_warning_if_current(
+                            &lifecycle,
+                            opened_generation,
+                            &hub,
+                            thread_id,
+                            context_window_restore_warning(thread_id, error.to_string()),
+                        )
+                        .await;
+                        break;
+                    }
+                }
+            }
+        }
+    })
+}
+
+async fn broadcast_context_window_restore_warning_if_current(
+    lifecycle: &ResumeUpdateLifecycle,
+    opened_generation: u64,
+    hub: &Hub,
+    thread_id: ThreadId,
+    warning: ServerMessage,
+) {
+    let _commit = lifecycle.commit.lock().await;
+    if lifecycle.generation.load(Ordering::Acquire) != opened_generation {
+        return;
+    }
+    // Keep the generation commit locked through retention. Forget/delete advances the generation
+    // before clearing retained warnings, so it cannot leave this warning behind.
+    hub.broadcast_or_retain_warning(thread_id, warning).await;
+}
+
+fn context_window_restore_warning(thread_id: ThreadId, detail: String) -> ServerMessage {
+    ServerMessage::Error {
+        error: giskard_proto::ErrorInfo {
+            code: "thread_context_window_persist_failed".into(),
+            severity: giskard_proto::ErrorSeverity::Warning,
+            message: "The restored context window could not be saved.".into(),
+            detail: Some(detail),
+            thread_id: Some(thread_id),
+            action: Some("restore_context_window".into()),
+            process_id: None,
+        },
+    }
+}
+
 async fn forward_events(
     shared: Arc<RegistryShared>,
     thread_id: ThreadId,
@@ -2884,6 +3191,8 @@ async fn forward_events(
                 let command_state_changed =
                     apply_running_command_event(&running_commands, &event).await;
 
+                let is_context_window_update =
+                    matches!(event, AgentEvent::ContextWindowUpdated { .. });
                 if let AgentEvent::ContextWindowUpdated {
                     turn,
                     model,
@@ -2904,7 +3213,7 @@ async fn forward_events(
                         );
                         continue;
                     }
-                    persist_model_context_window(
+                    if let Some(persisted) = persist_model_context_window(
                         &store,
                         project_id,
                         thread_id,
@@ -2912,11 +3221,39 @@ async fn forward_events(
                         model,
                         *context_window,
                     )
-                    .await;
+                    .await
+                    {
+                        if persisted.selected {
+                            hub.broadcast_reliably(
+                                thread_id,
+                                ServerMessage::ThreadContextWindowUpdated {
+                                    thread_id,
+                                    model: model.clone(),
+                                    context_window: *context_window,
+                                    revision: persisted.revision,
+                                },
+                            )
+                            .await;
+                        } else {
+                            debug!(
+                                %project_id,
+                                %thread_id,
+                                turn = %turn,
+                                provider = %model.provider,
+                                model = %model.model,
+                                "cached context-window update for a model that is no longer selected"
+                            );
+                        }
+                    }
                 }
 
                 match &event {
                     AgentEvent::TurnStarted { turn, .. } => {
+                        advance_resume_update_generation(
+                            &shared.resume_update_lifecycles,
+                            thread_id,
+                        )
+                        .await;
                         turn_id = Some(*turn);
                         started_at = Utc::now();
                         current_turn_items.rebuild_indexes();
@@ -3078,7 +3415,10 @@ async fn forward_events(
                         append_to_live_buffer = false;
                     }
                 }
-                if append_to_live_buffer && live_buffers.is_active(thread_id).await {
+                if append_to_live_buffer
+                    && !is_context_window_update
+                    && live_buffers.is_active(thread_id).await
+                {
                     live_buffers.append(thread_id, event.clone()).await;
                 }
 
@@ -3143,7 +3483,9 @@ async fn forward_events(
                 }
 
                 broadcast_thread_activity(&hub, thread_id, &event, true).await;
-                broadcast_event_with_context(&hub, thread_id, event, &ctx).await;
+                if !is_context_window_update {
+                    broadcast_event_with_context(&hub, thread_id, event, &ctx).await;
+                }
 
                 if is_turn_start && let Some(turn) = event_turn {
                     synthesize_passive_subagent_prompt_item(
@@ -3974,6 +4316,11 @@ async fn persisted_turn_ids(
 }
 
 /// Persist an effective context window reported by the harness for a turn's model.
+struct PersistedContextWindow {
+    revision: u64,
+    selected: bool,
+}
+
 async fn persist_model_context_window(
     store: &PersistStore,
     project_id: ProjectId,
@@ -3981,53 +4328,56 @@ async fn persist_model_context_window(
     turn_id: TurnId,
     model: &ModelRef,
     context_window: u32,
-) {
-    let provider = model.provider.clone();
-    let model_id = model.model.clone();
-    let stored_provider = provider.clone();
-    let stored_model_id = model_id.clone();
+) -> Option<PersistedContextWindow> {
+    let stored_model = model.clone();
     match store
         .update_thread(project_id, thread_id, move |tf| {
-            tf.model_context_windows
-                .entry(stored_provider.clone())
-                .or_default()
-                .insert(stored_model_id.clone(), context_window);
-            if tf.current_model.provider == stored_provider
-                && tf.current_model.model == stored_model_id
-            {
-                tf.context_window = context_window;
-            }
+            tf.record_model_context_window(&stored_model, context_window);
         })
         .await
     {
-        Ok(Some(_)) => info!(
-            %project_id,
-            %thread_id,
-            %turn_id,
-            provider = %provider,
-            model = %model_id,
-            context_window,
-            "persisted harness-reported model context window"
-        ),
-        Ok(None) => warn!(
-            %project_id,
-            %thread_id,
-            %turn_id,
-            provider = %provider,
-            model = %model_id,
-            context_window,
-            "thread file missing while persisting model context window"
-        ),
-        Err(error) => error!(
-            %project_id,
-            %thread_id,
-            %turn_id,
-            provider = %provider,
-            model = %model_id,
-            context_window,
-            %error,
-            "failed to persist harness-reported model context window"
-        ),
+        Ok(Some(thread)) => {
+            info!(
+                %project_id,
+                %thread_id,
+                %turn_id,
+                provider = %model.provider,
+                model = %model.model,
+                context_window,
+                revision = thread.revision,
+                "persisted harness-reported model context window"
+            );
+            Some(PersistedContextWindow {
+                revision: thread.revision,
+                selected: thread.current_model.provider == model.provider
+                    && thread.current_model.model == model.model,
+            })
+        }
+        Ok(None) => {
+            warn!(
+                %project_id,
+                %thread_id,
+                %turn_id,
+                provider = %model.provider,
+                model = %model.model,
+                context_window,
+                "thread file missing while persisting model context window"
+            );
+            None
+        }
+        Err(error) => {
+            error!(
+                %project_id,
+                %thread_id,
+                %turn_id,
+                provider = %model.provider,
+                model = %model.model,
+                context_window,
+                %error,
+                "failed to persist harness-reported model context window"
+            );
+            None
+        }
     }
 }
 
@@ -4152,11 +4502,12 @@ async fn persist_turn(
 
     // Push a thread-scoped token update to subscribers (§13.6).
     if let Ok(ledger_json) = serde_json::to_value(&tf.tokens) {
-        hub.broadcast(
+        hub.broadcast_reliably(
             thread_id,
             ServerMessage::TokenUpdate {
                 scope: TokenScope::Thread,
                 thread_id: Some(thread_id),
+                revision: Some(tf.revision),
                 ledger: ledger_json,
             },
         )
@@ -4171,8 +4522,10 @@ async fn persist_turn(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-    use std::sync::Arc;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::Duration;
 
     use chrono::Utc;
     use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalRequest};
@@ -4185,23 +4538,28 @@ mod tests {
     };
     use giskard_core::model::ModelRef;
     use giskard_core::server_request::ServerRequest;
+    use giskard_core::thread::ThreadKind;
     use giskard_core::token::{TokenLedger, TokenUsage};
     use giskard_core::turn::{Mode, PermissionPreset, Turn, TurnStatus, TurnStatusKind};
     use giskard_core::user_input::UserInput;
-    use giskard_harness::{AgentEventStream, ThreadHandle};
+    use giskard_harness::{AgentEventStream, ThreadHandle, ThreadUpdate, thread_update_channel};
     use giskard_persist::PersistStore;
     use giskard_persist::store::{ProjectConfig, ThreadFile};
     use giskard_proto::{ServerMessage, ThreadActivityKind, WireAgentEvent};
     use tokio::sync::{Mutex, broadcast, mpsc};
     use tokio::task::JoinHandle;
+    use tokio::time::timeout;
 
     use super::{
-        ActiveTurnOwner, CurrentTurnItems, ThreadTurnGate, TurnContext, TurnContextKind,
-        command_completion_is_normal_success, command_status_is_running, forward_events,
+        ActiveTurnOwner, CurrentTurnItems, ResumeUpdateLifecycle, ThreadTurnGate, TurnContext,
+        TurnContextKind, advance_resume_update_generation,
+        broadcast_context_window_restore_warning_if_current, command_completion_is_normal_success,
+        command_status_is_running, context_window_restore_warning, forward_events,
         passive_subagent_prompt_text, persist_subagent_fallback_transcript,
-        should_refresh_subagent_title, subagent_monitor_policy, subagent_path_leaf,
-        take_passive_subagent_monitor_metadata, thread_activity_from_event, track_item_identity,
-        update_passive_subagent_metadata,
+        resume_update_lifecycle, should_refresh_subagent_title, spawn_thread_update_forwarder,
+        subagent_monitor_policy, subagent_path_leaf, take_passive_subagent_monitor_metadata,
+        thread_activity_from_event, track_item_identity, update_passive_subagent_metadata,
+        validate_open_thread_identity,
     };
     use crate::hub::Hub;
     use crate::ledger;
@@ -4234,6 +4592,29 @@ mod tests {
         ));
         assert!(!command_completion_is_normal_success("failed", Some(0)));
         assert!(!command_completion_is_normal_success("interrupted", None));
+    }
+
+    #[test]
+    fn open_thread_identity_always_preserves_the_giskard_thread() {
+        let requested = ThreadId::new();
+        let handle = ThreadHandle {
+            thread: requested,
+            harness_thread_id: "native-new".into(),
+            warning: None,
+            resumed_model: None,
+            agent_name: None,
+            parent_harness_thread_id: None,
+        };
+
+        assert!(validate_open_thread_identity(&handle, Some(requested), None).is_ok());
+        assert!(
+            validate_open_thread_identity(&handle, Some(ThreadId::new()), None).is_err(),
+            "fresh-fallback opens must preserve the requested logical thread"
+        );
+        assert!(
+            validate_open_thread_identity(&handle, Some(requested), Some("native-old")).is_err(),
+            "strict resumes must also preserve the native identity"
+        );
     }
 
     #[test]
@@ -4302,6 +4683,277 @@ mod tests {
 
         ctx.passive_input_is_fallback = true;
         assert_eq!(passive_subagent_prompt_text(&ctx), None);
+    }
+
+    #[tokio::test]
+    async fn resume_context_window_is_persisted_and_new_turns_invalidate_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.6-sol".into(),
+            reasoning_effort: None,
+        };
+        store
+            .create_project(project_id, "proj", "/tmp/test")
+            .await
+            .unwrap();
+        let now = Utc::now();
+        store
+            .save_thread(
+                project_id,
+                &ThreadFile {
+                    version: 1,
+                    id: thread_id,
+                    project_id,
+                    title: "t".into(),
+                    harness_thread_id: "native".into(),
+                    parent_thread_id: None,
+                    spawned_by_turn_id: None,
+                    kind: ThreadKind::Primary,
+                    mode: Mode::Build,
+                    current_model: model.clone(),
+                    context_window: 128_000,
+                    model_context_windows: Default::default(),
+                    revision: 0,
+                    permission_preset: PermissionPreset::AskFirst,
+                    model_efforts: Default::default(),
+                    tokens: TokenLedger::default(),
+                    created_at: now,
+                    updated_at: now,
+                    archived: false,
+                    git_workspace: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let hub = Arc::new(Hub::new());
+        let (client_tx, mut client_rx) = mpsc::channel(4);
+        hub.subscribe(thread_id, 1, client_tx).await;
+        let generations = Arc::new(StdMutex::new(HashMap::new()));
+        let (updates, stream) = thread_update_channel();
+        let forwarder = spawn_thread_update_forwarder(
+            project_id,
+            thread_id,
+            stream,
+            store.clone(),
+            hub,
+            generations.clone(),
+        );
+        updates
+            .send(ThreadUpdate::ContextWindowRestored {
+                model: model.clone(),
+                context_window: 258_400,
+            })
+            .unwrap();
+
+        let message = timeout(Duration::from_secs(1), client_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            message,
+            ServerMessage::ThreadContextWindowUpdated {
+                context_window: 258_400,
+                revision: 1,
+                ..
+            }
+        ));
+        let persisted = store
+            .load_thread(project_id, thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.context_window, 258_400);
+        assert_eq!(persisted.revision, 1);
+        assert_eq!(
+            persisted.model_context_windows["openai"]["gpt-5.6-sol"],
+            258_400
+        );
+        drop(updates);
+        timeout(Duration::from_secs(1), forwarder)
+            .await
+            .expect("forwarder should stop after its sender closes")
+            .expect("forwarder should not panic");
+
+        let (stale_updates, stale_stream) = thread_update_channel();
+        let stale_forwarder = spawn_thread_update_forwarder(
+            project_id,
+            thread_id,
+            stale_stream,
+            store.clone(),
+            Arc::new(Hub::new()),
+            generations.clone(),
+        );
+        advance_resume_update_generation(&generations, thread_id).await;
+        stale_updates
+            .send(ThreadUpdate::ContextWindowRestored {
+                model,
+                context_window: 400_000,
+            })
+            .unwrap();
+        drop(stale_updates);
+        timeout(Duration::from_secs(1), stale_forwarder)
+            .await
+            .expect("stale forwarder should consume the update and stop")
+            .expect("stale forwarder should not panic");
+        let persisted = store
+            .load_thread(project_id, thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.context_window, 258_400);
+    }
+
+    #[tokio::test]
+    async fn stale_resume_generation_does_not_retain_a_warning() {
+        let thread_id = ThreadId::new();
+        let lifecycle = ResumeUpdateLifecycle::default();
+        lifecycle.generation.store(1, Ordering::Release);
+        let hub = Hub::new();
+
+        broadcast_context_window_restore_warning_if_current(
+            &lifecycle,
+            0,
+            &hub,
+            thread_id,
+            context_window_restore_warning(thread_id, "stale".into()),
+        )
+        .await;
+        let (first_tx, mut first_rx) = mpsc::channel(1);
+        hub.subscribe(thread_id, 1, first_tx).await;
+        assert!(first_rx.try_recv().is_err());
+
+        broadcast_context_window_restore_warning_if_current(
+            &lifecycle,
+            1,
+            &hub,
+            thread_id,
+            context_window_restore_warning(thread_id, "current".into()),
+        )
+        .await;
+        assert!(matches!(
+            first_rx.recv().await,
+            Some(ServerMessage::Error { error })
+                if error.code == "thread_context_window_persist_failed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_advance_clears_a_warning_retained_just_before_forget() {
+        let thread_id = ThreadId::new();
+        let lifecycle = Arc::new(ResumeUpdateLifecycle::default());
+        let lifecycles = Arc::new(StdMutex::new(HashMap::from([(
+            thread_id,
+            lifecycle.clone(),
+        )])));
+        let hub = Arc::new(Hub::new());
+        let commit = lifecycle.commit.lock().await;
+
+        let retaining = {
+            let lifecycle = lifecycle.clone();
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                broadcast_context_window_restore_warning_if_current(
+                    &lifecycle,
+                    0,
+                    &hub,
+                    thread_id,
+                    context_window_restore_warning(thread_id, "current".into()),
+                )
+                .await;
+            })
+        };
+        tokio::task::yield_now().await;
+        let forgetting = {
+            let lifecycles = lifecycles.clone();
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                advance_resume_update_generation(&lifecycles, thread_id).await;
+                hub.clear_thread(thread_id).await;
+            })
+        };
+        drop(commit);
+        retaining.await.unwrap();
+        forgetting.await.unwrap();
+
+        let (tx, mut rx) = mpsc::channel(1);
+        hub.subscribe(thread_id, 1, tx).await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn missing_thread_restore_retries_do_not_block_turn_lifecycle() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        store
+            .create_project(project_id, "proj", "/tmp/test")
+            .await
+            .unwrap();
+        let generations = Arc::new(StdMutex::new(HashMap::new()));
+        let (updates, stream) = thread_update_channel();
+        let forwarder = spawn_thread_update_forwarder(
+            project_id,
+            thread_id,
+            stream,
+            store,
+            Arc::new(Hub::new()),
+            generations.clone(),
+        );
+        updates
+            .send(ThreadUpdate::ContextWindowRestored {
+                model: ModelRef {
+                    provider: "openai".into(),
+                    model: "gpt-5.6-sol".into(),
+                    reasoning_effort: None,
+                },
+                context_window: 258_400,
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        timeout(
+            Duration::from_millis(100),
+            advance_resume_update_generation(&generations, thread_id),
+        )
+        .await
+        .expect("retry backoff must not hold the lifecycle commit lock");
+        drop(updates);
+        timeout(Duration::from_secs(1), forwarder)
+            .await
+            .expect("invalidated forwarder should stop")
+            .expect("forwarder should not panic");
+    }
+
+    #[tokio::test]
+    async fn restoration_commit_serializes_with_turn_lifecycle_advance() {
+        let thread_id = ThreadId::new();
+        let generations = Arc::new(StdMutex::new(HashMap::new()));
+        let lifecycle = resume_update_lifecycle(&generations, thread_id);
+        let commit = lifecycle.commit.lock().await;
+        let advancing = tokio::spawn({
+            let generations = generations.clone();
+            async move {
+                advance_resume_update_generation(&generations, thread_id).await;
+            }
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !advancing.is_finished(),
+            "turn lifecycle must wait until the restoration commit boundary closes"
+        );
+        drop(commit);
+        timeout(Duration::from_secs(1), advancing)
+            .await
+            .expect("turn lifecycle should advance after restoration releases the lock")
+            .expect("advance task should not panic");
+        assert_eq!(lifecycle.generation.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test]
@@ -4455,6 +5107,7 @@ mod tests {
                 current_model: model.clone(),
                 context_window: 128_000,
                 model_context_windows: Default::default(),
+                revision: 0,
                 permission_preset: PermissionPreset::AskFirst,
                 model_efforts: Default::default(),
                 tokens: TokenLedger::default(),
@@ -4608,6 +5261,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
+                    revision: 0,
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
@@ -4997,6 +5651,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
+                    revision: 0,
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
@@ -5113,6 +5768,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
+                    revision: 0,
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
@@ -5187,26 +5843,33 @@ mod tests {
             Some(&258_400)
         );
 
-        let mut matching_updates = 0;
+        let mut canonical_updates = 0;
         while let Ok(message) = client_rx.try_recv() {
-            if let ServerMessage::Event { agent_event, .. } = message
-                && let WireAgentEvent::ContextWindowUpdated {
-                    thread,
-                    turn,
-                    model: event_model,
-                    context_window,
-                } = *agent_event
+            if let ServerMessage::ThreadContextWindowUpdated {
+                thread_id: event_thread,
+                model: event_model,
+                context_window,
+                revision,
+            } = message
             {
-                matching_updates += 1;
-                assert_eq!(thread, thread_id);
-                assert_eq!(turn, turn_id);
+                canonical_updates += 1;
+                assert_eq!(event_thread, thread_id);
                 assert_eq!(event_model, model);
                 assert_eq!(context_window, 258_400);
+                assert!(revision > 0 && revision <= persisted.revision);
+            } else if let ServerMessage::Event { agent_event, .. } = message {
+                assert!(
+                    !matches!(
+                        agent_event.as_ref(),
+                        WireAgentEvent::ContextWindowUpdated { .. }
+                    ),
+                    "the canonical revisioned message replaces the generic context event"
+                );
             }
         }
         assert_eq!(
-            matching_updates, 1,
-            "matching update must be broadcast once"
+            canonical_updates, 1,
+            "matching update must be broadcast once through the canonical message"
         );
     }
 
@@ -5243,6 +5906,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
+                    revision: 0,
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
@@ -5367,6 +6031,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
+                    revision: 0,
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
@@ -5522,6 +6187,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
+                    revision: 0,
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
@@ -5647,6 +6313,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
+                    revision: 0,
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
@@ -5779,6 +6446,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
+                    revision: 0,
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
@@ -5935,6 +6603,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
+                    revision: 0,
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
@@ -6034,6 +6703,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
+                    revision: 0,
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
@@ -6203,6 +6873,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
+                    revision: 0,
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
@@ -6430,6 +7101,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
+                    revision: 0,
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
@@ -6544,6 +7216,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
+                    revision: 0,
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
@@ -6804,6 +7477,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
+                    revision: 0,
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
@@ -7003,6 +7677,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
+                    revision: 0,
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),
@@ -7212,6 +7887,7 @@ mod tests {
                     current_model: model.clone(),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
+                    revision: 0,
                     permission_preset: PermissionPreset::AskFirst,
                     model_efforts: Default::default(),
                     tokens: TokenLedger::default(),

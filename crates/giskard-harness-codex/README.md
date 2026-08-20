@@ -452,8 +452,18 @@ accepted values per `(provider, model)` so they survive reloads and model switch
 Existing threads initialize the gauge from Giskard's latest persisted runtime value
 for the selected model. If none has been observed, they use provider/config metadata
 or the conservative fallback. Codex may replay historical token usage after
-`thread/resume`; that replay is not a new turn observation and is not folded into
-Giskard's ledgers or context-window metadata.
+`thread/resume`. The adapter treats that as resume metadata rather than turn activity: it
+does not cache or ledger the historical token totals, but it sends the effective context
+window with the model confirmed by the resume response through a thread-level update. Older
+app-server responses that omit the model use the requested resume model, matching the registry's
+existing compatibility fallback; model-less native imports cannot be attributed and are not
+restored. The server persists the value for that exact `(provider, model)` and updates the gauge
+only if the same model is still selected. A successful new turn or manual-compaction start cancels
+the pending restoration on both the adapter and server sides, so delayed replay cannot overwrite
+newer live metadata.
+
+A context window for an active turn without a registered model remains a warning: that
+indicates a distinct live lifecycle whose model attribution still needs to be resolved.
 
 ## Restart and unload behavior
 

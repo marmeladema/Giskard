@@ -271,7 +271,9 @@
 - **C9:** the Codex adapter maps
   `thread/tokenUsage/updated.tokenUsage.modelContextWindow`, rejects invalid values with a warning,
   and suppresses consecutive unchanged reports within a turn. Resume-time historical usage replay
-  is not treated as a new runtime observation.
+  does not enter turn token caches or ledgers. Its effective context window is instead delivered as
+  model-attributed thread metadata, persisted only while no newer turn lifecycle has superseded the
+  resume, and broadcast to the selected thread's gauge.
 
 **Changelog (1.52 → 1.53), project model-catalog consistency:**
 - **M8:** the server caches the composed model descriptors per project and uses that same catalog
@@ -1595,7 +1597,12 @@ pub struct OpenThreadOptions {
     pub thread: Option<ThreadId>,     // Some(existing id) ⇒ resume/attach to persisted thread
     pub workspace_root: PathBuf,      // effective sandbox root (§6.3)
     pub resume: Option<String>,       // Some(native id) ⇒ resume; None ⇒ fresh thread
-    pub initial_model: ModelRef,
+    pub initial_model: Option<ModelRef>,
+    pub updates: ThreadUpdateSink,   // asynchronous metadata established before native open
+}
+
+pub enum ThreadUpdate {
+    ContextWindowRestored { model: ModelRef, context_window: u32 },
 }
 
 pub struct TurnStatus {              // outcome of a completed turn
@@ -1995,6 +2002,8 @@ All defined in `giskard-core`, serialized by `giskard-persist`. Illustrative sha
   "model_context_windows": {             // C8: harness-reported effective windows retained by
     "openai": { "gpt-5.5": 258400 }      //   exact provider/model for reloads and model switches.
   },
+  "revision": 7,                         // monotonic persisted-state version; omitted while zero
+                                         //   and independent of updated_at/recent-thread ordering.
   "permission_preset": "ask_first",        // permission preset (§9)
   "archived": false,                     // hidden from the active thread group when true
   "model_efforts": {                     // C7: per-model effort retention. Maps "provider/model"
@@ -2032,6 +2041,11 @@ All defined in `giskard-core`, serialized by `giskard-persist`. Illustrative sha
 > entry whenever its model changes mid-thread (§8.4). `context_window` is a cache (C4): catalog or
 > config metadata supplies its initial value, while `model_context_windows` retains authoritative
 > effective values reported by the harness for exact provider/model pairs.
+> `revision` advances centrally for every `update_thread` write. Clients keep separate high-water
+> marks for complete `ThreadState` snapshots, selected-model/context-window state, and token
+> updates: a newer partial update protects the fields it proves without suppressing unrelated
+> fields from an older complete snapshot. `updated_at` remains the separate user-activity clock
+> that controls recent-thread ordering.
 
 ```jsonc
 // projects/<id>/tokens.json  and  tokens-global.json
@@ -3169,6 +3183,17 @@ signal still shows what is blocked; a separate message so clients can tell a rep
 event and apply SB6's alert-once-per-session rule),
 `ThreadState { thread_id, state, active_turn }` (persisted snapshot on subscribe/resync;
 `active_turn` is live server state rather than part of the persisted snapshot — see §13.6),
+`ThreadContextWindowUpdated { thread_id, model, context_window, revision }` (a
+model-attributed, thread-scoped runtime-capacity update delivered after live persistence or
+asynchronously after native resume; `ThreadState.state` carries the same persisted revision. The
+browser retains a pre-snapshot context update until the snapshot identifies the selected model and
+uses selected-model and context-specific high-water marks so an older full snapshot can still
+supply unrelated persisted fields without replacing the newer model/capacity pair.
+Subscribe/resubscribe also retains all
+intervening live messages until its snapshots are queued because transcript events require strict
+snapshot-first ordering. That buffer has no message-count overflow or reconnect failure mode; it
+remains active until captured messages drain through the bounded outbound queue at socket-writer
+throughput, so it can outlive the snapshot reads under sustained output),
 `LiveTurnSnapshot { thread_id, turn_id, user_input?, accumulated,
 answered_approvals, answered_server_requests }` (in-flight turn reconstruction on reconnect,
 carrying the turn input when the server synthesized the turn context, the `WireAgentEvent`s of the
@@ -3184,13 +3209,15 @@ routes a stale id to the harness, which errors — and `answered_server_requests
 (SR6), since a harness's own resolved event may be late or absent),
 `RunningTasks { thread_id, tasks: [RunningTask] }` (commands and tool/MCP calls still known to be
 running, including commands that outlived an interrupted turn),
-`TokenUpdate { scope, thread_id?, ledger }`, `ApprovalRequest { thread_id, request }` (a
+`TokenUpdate { scope, thread_id?, revision?, ledger }`, `ApprovalRequest { thread_id, request }` (a
 `WireApprovalRequest`), `ApprovalResolved { thread_id, request_id, decision }`,
 `Error { code, severity, message, detail?, thread_id?, action? }`, `Pong`.
 
-For `TokenUpdate`, `thread_id` is required when `scope = "thread"` and omitted for non-thread
-ledger scopes. The browser must only apply a thread-scoped token update to the thread usage menu
-when the message `thread_id` matches the active thread.
+For `TokenUpdate`, `thread_id` and the persisted thread `revision` are required when
+`scope = "thread"` and omitted for non-thread ledger scopes. The browser must only apply a
+thread-scoped token update when the message `thread_id` matches the active thread and its revision
+is not older than the token-specific high-water mark. A token update does not advance the complete
+thread-state high-water mark because it does not carry unrelated persisted fields.
 
 `OpenThreadResponse` may also carry `warning: ErrorInfo?` with the same `code` / `severity` /
 `message` shape when the requested thread was opened but degraded (for example, Codex resume

@@ -274,6 +274,14 @@ pub enum ServerMessage {
         activities: Vec<ThreadActivity>,
     },
     ThreadState(ThreadState),
+    /// Persisted effective runtime capacity reported during a live turn or native-thread resume.
+    ThreadContextWindowUpdated {
+        thread_id: ThreadId,
+        model: ModelRef,
+        context_window: u32,
+        #[serde(default)]
+        revision: u64,
+    },
     /// A page of persisted history (H6), oldest-first; `has_more` if older turns exist before it.
     HistoryPage {
         thread_id: ThreadId,
@@ -298,6 +306,9 @@ pub enum ServerMessage {
         /// to a previously selected thread.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thread_id: Option<ThreadId>,
+        /// Persisted thread revision for thread-scoped updates. Absent for broader scopes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revision: Option<u64>,
         ledger: serde_json::Value,
     },
     ApprovalRequest {
@@ -912,11 +923,51 @@ mod tests {
     }
 
     #[test]
+    fn restored_context_window_update_round_trips() {
+        let thread_id = ThreadId::new();
+        let json = serde_json::to_string(&ServerMessage::ThreadContextWindowUpdated {
+            thread_id,
+            model: ModelRef {
+                provider: "openai".into(),
+                model: "gpt-5.6-sol".into(),
+                reasoning_effort: None,
+            },
+            context_window: 258_400,
+            revision: 7,
+        })
+        .unwrap();
+        assert!(json.contains("\"type\":\"thread_context_window_updated\""));
+        match serde_json::from_str::<ServerMessage>(&json).unwrap() {
+            ServerMessage::ThreadContextWindowUpdated {
+                thread_id: got_thread,
+                model,
+                context_window,
+                revision,
+            } => {
+                assert_eq!(got_thread, thread_id);
+                assert_eq!(model.provider, "openai");
+                assert_eq!(model.model, "gpt-5.6-sol");
+                assert_eq!(context_window, 258_400);
+                assert_eq!(revision, 7);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        let mut legacy = serde_json::from_str::<serde_json::Value>(&json).unwrap();
+        legacy.as_object_mut().unwrap().remove("revision");
+        assert!(matches!(
+            serde_json::from_value::<ServerMessage>(legacy).unwrap(),
+            ServerMessage::ThreadContextWindowUpdated { revision: 0, .. }
+        ));
+    }
+
+    #[test]
     fn server_message_thread_token_update_carries_thread_id() {
         let tid = ThreadId::new();
         let msg = ServerMessage::TokenUpdate {
             scope: TokenScope::Thread,
             thread_id: Some(tid),
+            revision: Some(7),
             ledger: serde_json::json!({
                 "total": { "input": 10, "output": 5, "total": 15 }
             }),
@@ -926,21 +977,30 @@ mod tests {
         assert_eq!(json["type"], "token_update");
         assert_eq!(json["scope"], "thread");
         assert_eq!(json["thread_id"], tid.to_string());
+        assert_eq!(json["revision"], 7);
         assert_eq!(json["ledger"]["total"]["total"], 15);
 
+        let mut legacy = json.clone();
+        legacy.as_object_mut().unwrap().remove("revision");
         let back: ServerMessage = serde_json::from_value(json).unwrap();
         match back {
             ServerMessage::TokenUpdate {
                 scope,
                 thread_id,
+                revision,
                 ledger,
             } => {
                 assert_eq!(scope, TokenScope::Thread);
                 assert_eq!(thread_id, Some(tid));
+                assert_eq!(revision, Some(7));
                 assert_eq!(ledger["total"]["input"], 10);
             }
             _ => panic!("wrong variant"),
         }
+        assert!(matches!(
+            serde_json::from_value::<ServerMessage>(legacy).unwrap(),
+            ServerMessage::TokenUpdate { revision: None, .. }
+        ));
     }
 
     #[test]

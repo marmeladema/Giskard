@@ -2622,6 +2622,9 @@ async fn wait_for_thread_activity(
                             "approval request card should belong to subscribed thread"
                         );
                     }
+                    ServerMessage::ThreadContextWindowUpdated { thread_id, .. } => {
+                        assert_eq!(thread_id, active_thread);
+                    }
                     // Sent once on connect and carries only lightweight `ThreadActivity`, so it is
                     // allowed to mention the unsubscribed thread — that is the point of it. It can
                     // never carry transcript traffic, which is what this loop guards.
@@ -3334,6 +3337,9 @@ async fn inactive_thread_progress_sends_activity_without_full_event_subscription
                             thread_id, inactive_thread,
                             "inactive completed turn may update only lightweight token state"
                         );
+                    }
+                    ServerMessage::ThreadContextWindowUpdated { thread_id, .. } => {
+                        assert_eq!(thread_id, inactive_thread);
                     }
                     // Connect-time replay of lightweight activity. Unlike the live `ThreadActivity`
                     // arm above it is not asserted against the inactive thread's turn lifecycle:
@@ -6457,6 +6463,7 @@ async fn subscribe_reopens_persisted_thread() {
                     "openai".into(),
                     HashMap::from([("gpt-5.5".into(), 258_400)]),
                 )]),
+                revision: 0,
                 permission_preset: PermissionPreset::AskFirst,
                 model_efforts: Default::default(),
                 tokens: Default::default(),
@@ -6592,6 +6599,7 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
                 current_model: model.clone(),
                 context_window: 128_000,
                 model_context_windows: Default::default(),
+                revision: 0,
                 permission_preset: PermissionPreset::AskFirst,
                 model_efforts: Default::default(),
                 tokens: Default::default(),
@@ -6750,6 +6758,7 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
                 current_model: model.clone(),
                 context_window: 128_000,
                 model_context_windows: Default::default(),
+                revision: 0,
                 permission_preset: PermissionPreset::AskFirst,
                 model_efforts: Default::default(),
                 tokens: Default::default(),
@@ -6981,6 +6990,7 @@ async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
                 current_model: model.clone(),
                 context_window: 128_000,
                 model_context_windows: Default::default(),
+                revision: 0,
                 permission_preset: PermissionPreset::AskFirst,
                 model_efforts: Default::default(),
                 tokens: Default::default(),
@@ -7462,6 +7472,7 @@ async fn open_thread_normalizes_stale_provider_from_configured_model() {
                 },
                 context_window: 128_000,
                 model_context_windows: Default::default(),
+                revision: 0,
                 permission_preset: PermissionPreset::AskFirst,
                 model_efforts: Default::default(),
                 tokens: Default::default(),
@@ -7563,6 +7574,7 @@ async fn open_thread_normalization_reuses_live_handle() {
                 current_model: stale_model.clone(),
                 context_window: 128_000,
                 model_context_windows: Default::default(),
+                revision: 0,
                 permission_preset: PermissionPreset::AskFirst,
                 model_efforts: Default::default(),
                 tokens: Default::default(),

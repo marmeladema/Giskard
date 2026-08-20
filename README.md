@@ -285,9 +285,9 @@ commonly offer `minimal`, `low`, `medium`, `high`, or `xhigh`, while other value
 unchanged. Reloading the picker refreshes provider discovery and harness metadata; non-fatal
 failures are shown as warnings while the usable portion of the model list remains available.
 
-When a harness reports the effective context window used for a turn, that runtime value replaces
-the initial descriptor value and is retained per `(provider, model)` across reloads and model
-switches. Codex supplies this through
+When a harness reports or restores an effective runtime context window, that value replaces the
+initial descriptor value and is retained per `(provider, model)` across reloads and model switches.
+Codex supplies live-turn observations and resume-time restoration through
 `thread/tokenUsage/updated.tokenUsage.modelContextWindow`; its value may be lower than a model's
 raw advertised maximum because Codex reserves context headroom.
 

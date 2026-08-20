@@ -39,6 +39,7 @@ fn test_thread(
         current_model: test_model(),
         context_window: 262_144,
         model_context_windows: Default::default(),
+        revision: 0,
         permission_preset: PermissionPreset::AskFirst,
         model_efforts: HashMap::new(),
         tokens: TokenLedger::default(),

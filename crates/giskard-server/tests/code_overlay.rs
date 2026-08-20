@@ -160,6 +160,7 @@ fn thread_file(pid: ProjectId, tid: ThreadId) -> giskard_persist::store::ThreadF
         },
         context_window: 1,
         model_context_windows: std::collections::HashMap::new(),
+        revision: 0,
         permission_preset: giskard_core::turn::PermissionPreset::AskFirst,
         model_efforts: std::collections::HashMap::new(),
         tokens: giskard_core::token::TokenLedger::default(),

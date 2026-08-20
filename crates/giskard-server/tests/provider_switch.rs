@@ -192,6 +192,7 @@ fn seeded_thread(project_id: ProjectId, thread_id: ThreadId) -> ThreadFile {
         current_model: dead_model(),
         context_window: 131_072,
         model_context_windows: Default::default(),
+        revision: 0,
         permission_preset: PermissionPreset::AskFirst,
         model_efforts: HashMap::new(),
         tokens: TokenLedger::default(),

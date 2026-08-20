@@ -162,7 +162,7 @@ let state = {
   activeTaskGroup:null, taskGroupSeq:0, taskItemSeq:0, taskGroupsById:new Map(), taskGroupsByItemId:new Map(),
   expandedTaskGroups:new Set(), manuallyToggledTaskGroups:new Set(), expandedTaskDetails:new Map(),
   linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, codeOverlaySource:null, outputOverlay:null, activeTurn:false, interruptPending:false, compactPending:false,
-  awaitingInitialThreadState:false, awaitingThreadResync:false, awaitingIncrementalResync:false, resyncStickBottom:false, contextWindow:0, contextUsed:null, permissionPreset:"ask_first", currentModel:null,
+  awaitingInitialThreadState:false, awaitingThreadResync:false, awaitingIncrementalResync:false, resyncStickBottom:false, contextWindow:0, contextUsed:null, threadRevision:0, modelRevision:0, contextWindowRevision:0, tokenRevision:0, pendingContextWindowUpdate:null, permissionPreset:"ask_first", currentModel:null,
   pendingLiveSnapshotReconcile:false,
   diffOverlayText:null,
   gitStatus:null, gitLoading:false, gitError:null, gitRequestSeq:0,
@@ -1743,6 +1743,11 @@ function clearThreadView(tid) {
   state.pendingUserEl = null; state.pendingUserText = null;
   state.compactPending = false;
   state.currentModel = null;
+  state.threadRevision = 0;
+  state.modelRevision = 0;
+  state.contextWindowRevision = 0;
+  state.tokenRevision = 0;
+  state.pendingContextWindowUpdate = null;
   $("effortControl").hidden = true;
   setTurnActive(false);
   state.awaitingInitialThreadState = false;
@@ -2113,6 +2118,11 @@ function openDraftThread(pid) {
   state.pendingUserText = null;
   state.compactPending = false;
   state.currentModel = null;
+  state.threadRevision = 0;
+  state.modelRevision = 0;
+  state.contextWindowRevision = 0;
+  state.tokenRevision = 0;
+  state.pendingContextWindowUpdate = null;
   prepareProjectModelCatalog(pid);
   resetGitState();
   state.mcpServers = []; state.mcpError = null; state.expandedMcps = new Set();
@@ -2193,6 +2203,11 @@ async function openThread(pid, tid, title, opts) {
   state.draftThread = null;
   state.compactPending = false;
   state.currentModel = null;
+  state.threadRevision = 0;
+  state.modelRevision = 0;
+  state.contextWindowRevision = 0;
+  state.tokenRevision = 0;
+  state.pendingContextWindowUpdate = null;
   prepareProjectModelCatalog(pid);
   $("effortControl").hidden = true;
   resetGitState();
@@ -2650,6 +2665,7 @@ function isThreadScopedServerMessage(msg) {
   if (!msg) return false;
   switch (msg.type) {
     case "thread_state":
+    case "thread_context_window_updated":
     case "history_page":
     case "history_delta":
     case "live_turn_snapshot":
@@ -2693,6 +2709,7 @@ function handleServer(msg, ws) {
   recordReconnectMessageReceived(ws, messageType);
   switch (msg.type) {
     case "thread_state": renderThreadState(msg.state, msg.active_turn); break;
+    case "thread_context_window_updated": applyThreadContextWindowUpdate(msg); break;
     case "history_page": renderHistoryPage(msg); break;
     case "history_delta": renderHistoryDelta(msg); break;
     case "live_turn_snapshot": renderLiveTurnSnapshot(msg); break;
@@ -2704,7 +2721,7 @@ function handleServer(msg, ws) {
       break;
     case "event": handleEvent(msg.agent_event); break;
     case "token_update":
-      if (msg.scope === "thread") renderTokens(msg.ledger);
+      if (msg.scope === "thread") applyThreadTokenUpdate(msg);
       break;
     case "approval_request":
       handleIncomingApprovalRequest(msg.request, msg.thread_id || state.threadId, {
@@ -2730,6 +2747,7 @@ function handleServer(msg, ws) {
         if (state.pendingModelBeforeSelect) {
           state.currentModel = state.pendingModelBeforeSelect;
           state.pendingModelBeforeSelect = null;
+          reconcilePendingContextWindowUpdate();
           syncModelControls();
         }
       }
@@ -3144,6 +3162,76 @@ function handleIncomingApprovalRequest(request, tid, opts) {
   renderApprovalRequest(request);
 }
 
+function parsedThreadRevision(value) {
+  const revision = Number(value || 0);
+  return Number.isSafeInteger(revision) && revision >= 0 ? revision : 0;
+}
+function sameContextWindowModel(left, right) {
+  return !!left && !!right && left.provider === right.provider && left.model === right.model;
+}
+function retainPendingContextWindowUpdate(msg, revision) {
+  const pending = state.pendingContextWindowUpdate;
+  if (!pending || revision >= parsedThreadRevision(pending.revision)) {
+    state.pendingContextWindowUpdate = msg;
+  }
+}
+function applyThreadContextWindowUpdate(msg) {
+  if (!msg || !msg.model || !Number.isFinite(msg.context_window) || msg.context_window <= 0) return;
+  const revision = parsedThreadRevision(msg.revision);
+  if (revision < state.contextWindowRevision) return;
+  if (!sameContextWindowModel(msg.model, state.currentModel)) {
+    if (!state.currentModel || revision > state.contextWindowRevision) {
+      retainPendingContextWindowUpdate(msg, revision);
+    }
+    return;
+  }
+  state.modelRevision = Math.max(state.modelRevision, revision);
+  state.contextWindowRevision = revision;
+  if (state.pendingContextWindowUpdate &&
+      parsedThreadRevision(state.pendingContextWindowUpdate.revision) <= revision) {
+    state.pendingContextWindowUpdate = null;
+  }
+  updateGauge(state.contextUsed, msg.context_window);
+}
+function reconcilePendingContextWindowUpdate() {
+  const pending = state.pendingContextWindowUpdate;
+  if (!pending) return;
+  const pendingRevision = parsedThreadRevision(pending.revision);
+  if (pendingRevision < state.contextWindowRevision) {
+    state.pendingContextWindowUpdate = null;
+  } else if (pendingRevision === state.contextWindowRevision &&
+             !sameContextWindowModel(pending.model, state.currentModel)) {
+    state.pendingContextWindowUpdate = null;
+  } else {
+    applyThreadContextWindowUpdate(pending);
+  }
+}
+function applyPersistedThreadState(s) {
+  const revision = parsedThreadRevision(s.revision);
+  if (revision < state.threadRevision) return false;
+  if (s.current_model && revision >= state.modelRevision) {
+    state.currentModel = s.current_model;
+    state.modelRevision = revision;
+  }
+  state.threadRevision = revision;
+  if (revision >= state.contextWindowRevision) {
+    state.contextWindowRevision = revision;
+    updateGauge(state.contextUsed, s.context_window || 0);
+  }
+  if (revision >= state.tokenRevision) {
+    state.tokenRevision = revision;
+    if (s.tokens) renderTokens(s.tokens);
+  }
+  reconcilePendingContextWindowUpdate();
+  return true;
+}
+function applyThreadTokenUpdate(msg) {
+  const revision = parsedThreadRevision(msg && msg.revision);
+  if (revision < state.tokenRevision) return;
+  state.tokenRevision = revision;
+  renderTokens(msg.ledger);
+}
+
 function renderThreadState(s, activeTurn) {
   if (!s) return;
   const shouldResetTranscript = state.awaitingInitialThreadState || state.awaitingThreadResync;
@@ -3152,34 +3240,33 @@ function renderThreadState(s, activeTurn) {
   if (state.awaitingIncrementalResync) state.resyncStickBottom = transcriptShouldStickToBottom();
   state.awaitingInitialThreadState = false;
   state.awaitingThreadResync = false;
-  setMode(s.mode || "build");
-  setPermissionPreset(s.permission_preset || "ask_first");
-  if (s.current_model) {
-    state.currentModel = s.current_model;
-    state.pendingModelBeforeSelect = null;
-    if (state.threadReadOnly) {
-      if (!state.readOnlyProvider) {
-        state.readOnlyProvider = s.current_model.provider;
-      } else if (s.current_model.provider !== state.readOnlyProvider) {
-        // The verified cold-resume switch landed: the thread is live again under the new
-        // provider, so normal provider-lock rules apply from here on.
-        state.threadReadOnly = false;
-        state.readOnlyProvider = null;
-        state.readOnlyMessage = null;
-        updateReadOnlyBanner();
-        updateComposerControls();
-        notice(`Thread resumed under provider ${s.current_model.provider}.`);
+  if (applyPersistedThreadState(s)) {
+    setMode(s.mode || "build");
+    setPermissionPreset(s.permission_preset || "ask_first");
+    if (state.currentModel) {
+      state.pendingModelBeforeSelect = null;
+      if (state.threadReadOnly) {
+        if (!state.readOnlyProvider) {
+          state.readOnlyProvider = state.currentModel.provider;
+        } else if (state.currentModel.provider !== state.readOnlyProvider) {
+          // The verified cold-resume switch landed: the thread is live again under the new
+          // provider, so normal provider-lock rules apply from here on.
+          state.threadReadOnly = false;
+          state.readOnlyProvider = null;
+          state.readOnlyMessage = null;
+          updateReadOnlyBanner();
+          updateComposerControls();
+          notice(`Thread resumed under provider ${state.currentModel.provider}.`);
+        }
       }
+      if (projectModelCatalogReady()) syncModelControls();
+      else renderModelSelect();
     }
-    if (projectModelCatalogReady()) syncModelControls();
-    else renderModelSelect();
+    if (s.title) {
+      updateThreadRowTitle(s.id || s.thread_id || state.threadId, s.title);
+      setThreadTitle(s.title);
+    }
   }
-  if (s.title) {
-    updateThreadRowTitle(s.id || s.thread_id || state.threadId, s.title);
-    setThreadTitle(s.title);
-  }
-  if (s.tokens) renderTokens(s.tokens);
-  updateGauge(state.contextUsed, s.context_window || 0);
   if (shouldResetTranscript) {
     resetTranscriptForAuthoritativeSnapshot();
   }
@@ -3641,14 +3728,6 @@ function handleEvent(ev) {
       renderLiveTurnUserInput(ev.turn, ev.user_input);
       setTurnActive(true);
       setActiveThreadActivity("progress", true, "Turn running");
-      break;
-    case "context_window_updated":
-      if (ev.model && state.currentModel &&
-          ev.model.provider === state.currentModel.provider &&
-          ev.model.model === state.currentModel.model &&
-          Number.isFinite(ev.context_window) && ev.context_window > 0) {
-        updateGauge(state.contextUsed, ev.context_window);
-      }
       break;
     case "item_started":
       if (ev.item) {
