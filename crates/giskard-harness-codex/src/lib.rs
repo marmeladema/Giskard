@@ -958,6 +958,7 @@ fn build_initialize_params() -> codex_codes::InitializeParams {
         },
         capabilities: Some(codex_codes::InitializeCapabilities {
             experimental_api: Some(true),
+            extensions: None,
             mcp_server_openai_form_elicitation: None,
             opt_out_notification_methods: None,
             request_attestation: None,
@@ -2245,16 +2246,13 @@ async fn resume_thread(
     // own persisted model the moment either is present (`merge_persisted_resume_metadata` returns
     // early on `has_model_resume_override`). Omitting them is how a caller says "keep whatever this
     // thread was already using".
-    let mut params_json = serde_json::json!({
-        "threadId": resume_id,
-        "cwd": cwd,
-    });
-    if let Some(model) = model {
-        params_json["model"] = serde_json::Value::String(model.model.clone());
-        params_json["modelProvider"] = serde_json::Value::String(model.provider.clone());
-    }
-    let params: codex_codes::ThreadResumeParams =
-        serde_json::from_value(params_json).map_err(|e| HarnessError::Protocol(e.to_string()))?;
+    let params = codex_codes::ThreadResumeParams {
+        thread_id: resume_id.to_owned(),
+        cwd: Some(cwd.to_owned()),
+        model: model.map(|model| model.model.clone()),
+        model_provider: model.map(|model| model.provider.clone()),
+        ..Default::default()
+    };
     let resp: codex_codes::ThreadResumeResponse = codex_request(
         client,
         context,
@@ -2302,12 +2300,12 @@ async fn start_thread(
     cwd: &str,
     initial_model: &giskard_core::model::ModelRef,
 ) -> Result<OpenedNativeThread, HarnessError> {
-    let params: codex_codes::ThreadStartParams = serde_json::from_value(serde_json::json!({
-        "cwd": cwd,
-        "model": initial_model.model,
-        "modelProvider": initial_model.provider,
-    }))
-    .map_err(|e| HarnessError::Protocol(e.to_string()))?;
+    let params = codex_codes::ThreadStartParams {
+        cwd: Some(cwd.to_owned()),
+        model: Some(initial_model.model.clone()),
+        model_provider: Some(initial_model.provider.clone()),
+        ..Default::default()
+    };
     let resp: codex_codes::ThreadStartResponse = codex_request(
         client,
         context,
@@ -3327,6 +3325,7 @@ fn map_mcp_server_status(status: codex_codes::McpServerStatus) -> McpServerStatu
 
 fn map_mcp_auth_status(status: codex_codes::McpAuthStatus) -> McpAuthStatus {
     match status {
+        codex_codes::McpAuthStatus::Unknown => McpAuthStatus::Unknown,
         codex_codes::McpAuthStatus::Unsupported => McpAuthStatus::Unsupported,
         codex_codes::McpAuthStatus::NotLoggedIn => McpAuthStatus::NotLoggedIn,
         codex_codes::McpAuthStatus::BearerToken => McpAuthStatus::BearerToken,
@@ -5656,6 +5655,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn maps_unknown_mcp_auth_status() {
+        assert_eq!(
+            map_mcp_auth_status(codex_codes::McpAuthStatus::Unknown),
+            McpAuthStatus::Unknown
+        );
+    }
+
     /// Codex's app-server states its version exactly once over the protocol, in the initialize
     /// handshake's user agent, and that is the value it would send as `client_version` — both come
     /// from the same workspace version.
@@ -5712,6 +5719,7 @@ mod tests {
 
         assert_eq!(params["clientInfo"]["name"], "giskard");
         assert_eq!(params["capabilities"]["experimentalApi"], true);
+        assert!(params["capabilities"].get("extensions").is_none());
     }
 
     #[test]
