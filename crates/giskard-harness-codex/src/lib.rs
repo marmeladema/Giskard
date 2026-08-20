@@ -206,7 +206,7 @@ enum HarnessCommand {
         response: oneshot::Sender<Result<ThreadHandle, HarnessError>>,
     },
     StartTurn {
-        thread: ThreadHandle,
+        thread: Box<ThreadHandle>,
         input: UserInput,
         overrides: TurnOverrides,
         response: oneshot::Sender<Result<TurnId, HarnessError>>,
@@ -1003,7 +1003,7 @@ async fn configured_workspace_write_roots(
 
     match response {
         Ok(config) => {
-            let mut roots = vec![workspace_root.to_path_buf()];
+            let mut roots = Vec::new();
             if let Some(sandbox) = config.sandbox_workspace_write {
                 for root in sandbox.writable_roots {
                     if root.is_absolute() {
@@ -1025,7 +1025,7 @@ async fn configured_workspace_write_roots(
             warn!(
                 workspace_root = %workspace_root.display(),
                 error = %error,
-                "Could not read Codex workspace-write roots; omitting runtimeWorkspaceRoots override and leaving Codex root selection unchanged"
+                "Could not read Codex workspace-write roots; omitting configured extra runtime workspace roots"
             );
             Vec::new()
         }
@@ -1127,7 +1127,7 @@ impl AgentHarness for CodexHarness {
         self.enqueue_command(
             "start_turn",
             HarnessCommand::StartTurn {
-                thread: thread.clone(),
+                thread: Box::new(thread.clone()),
                 input,
                 overrides,
                 response: tx,
@@ -1437,11 +1437,11 @@ async fn background_task<C>(
                         {
                             Ok(started) => {
                                 let _ = response.send(Ok(started.turn));
-                            active_turns.insert(
-                                thread.thread,
-                                    ActiveTurn::new(thread, started.turn)
+                                active_turns.insert(
+                                    thread.thread,
+                                    ActiveTurn::new(*thread, started.turn)
                                         .with_upload_dir(started.upload_dir),
-                            );
+                                );
                             }
                             Err(error) => {
                                 let _ = response.send(Err(error));
@@ -2135,12 +2135,15 @@ async fn handle_open_thread(
     }
 
     Ok(ThreadHandle {
-        thread: thread_id,
-        harness_thread_id: opened.harness_thread_id,
         warning: resume_warning,
         resumed_model: opened.model,
         agent_name: opened.agent_name,
         parent_harness_thread_id: opened.parent_harness_thread_id,
+        ..ThreadHandle::opened(
+            thread_id,
+            opened.harness_thread_id,
+            opts.workspace_root.clone(),
+        )
     })
 }
 
@@ -2571,7 +2574,7 @@ fn build_turn_start_params(
     thread: &ThreadHandle,
     input: &UserInput,
     overrides: &TurnOverrides,
-    writable_roots: &[PathBuf],
+    configured_writable_roots: &[PathBuf],
 ) -> Result<serde_json::Value, HarnessError> {
     let codex_input = mapping::map_user_input(input);
     let codex_approval_policy =
@@ -2596,10 +2599,10 @@ fn build_turn_start_params(
         ));
     };
 
-    if overrides.permission_preset == PermissionPreset::AutoApprove && !writable_roots.is_empty() {
+    if overrides.permission_preset == PermissionPreset::AutoApprove {
         map.insert(
             "runtimeWorkspaceRoots".into(),
-            serde_json::to_value(writable_roots)
+            serde_json::to_value(runtime_workspace_roots(thread, configured_writable_roots))
                 .map_err(|error| HarnessError::Protocol(error.to_string()))?,
         );
     }
@@ -2623,6 +2626,18 @@ fn build_turn_start_params(
     }
 
     Ok(params)
+}
+
+fn runtime_workspace_roots(
+    thread: &ThreadHandle,
+    configured_writable_roots: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut roots = Vec::with_capacity(configured_writable_roots.len() + 1);
+    roots.push(thread.workspace_root.clone());
+    roots.extend(configured_writable_roots.iter().cloned());
+    roots.sort();
+    roots.dedup();
+    roots
 }
 
 async fn broadcast_event<F: FnOnce() -> AgentEvent>(senders: &SenderMap, thread: ThreadId, f: F) {
@@ -3451,14 +3466,11 @@ mod tests {
     use tokio::time::timeout;
 
     fn test_thread() -> ThreadHandle {
-        ThreadHandle {
-            thread: ThreadId::new(),
-            harness_thread_id: "native-thread".into(),
-            warning: None,
-            resumed_model: None,
-            agent_name: None,
-            parent_harness_thread_id: None,
-        }
+        ThreadHandle::opened(
+            ThreadId::new(),
+            "native-thread".into(),
+            PathBuf::from("/tmp/test-workspace"),
+        )
     }
 
     fn test_model(effort: Option<Effort>) -> ModelRef {
@@ -4289,14 +4301,11 @@ mod tests {
     #[test]
     fn active_turn_table_completes_only_matching_thread_and_turn() {
         let first_thread = test_thread();
-        let second_thread = ThreadHandle {
-            thread: ThreadId::new(),
-            harness_thread_id: "native-thread-2".into(),
-            warning: None,
-            resumed_model: None,
-            agent_name: None,
-            parent_harness_thread_id: None,
-        };
+        let second_thread = ThreadHandle::opened(
+            ThreadId::new(),
+            "native-thread-2".into(),
+            PathBuf::from("/tmp/test-workspace-2"),
+        );
         let first_turn = TurnId::new();
         let second_turn = TurnId::new();
         let stale_turn = TurnId::new();
@@ -5731,19 +5740,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_read_resolves_absolute_workspace_write_roots_for_project_cwd() {
+    async fn config_read_resolves_extra_workspace_write_roots_for_project_cwd() {
         let (mut transport, controller) = fake_codex();
         let workspace = PathBuf::from("/tmp/project");
 
         let roots = configured_workspace_write_roots(&mut transport, &workspace).await;
 
-        assert_eq!(
-            roots,
-            vec![
-                PathBuf::from("/home/test/.cache/sccache"),
-                PathBuf::from("/tmp/project")
-            ]
-        );
+        assert_eq!(roots, vec![PathBuf::from("/home/test/.cache/sccache")]);
         let requests = controller.requests().await;
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].method, "config/read");
@@ -5752,7 +5755,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_read_failure_omits_runtime_workspace_override() {
+    async fn config_read_failure_omits_configured_extra_workspace_roots() {
         let (mut transport, controller) = fake_codex();
         controller.fail_config_read("unsupported method").await;
 
@@ -5764,7 +5767,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_approve_turn_includes_configured_workspace_roots() {
+    fn auto_approve_turn_includes_thread_workspace_root_and_configured_roots() {
         let roots = [
             PathBuf::from("/home/test/.cache/cargo"),
             PathBuf::from("/home/test/.cache/sccache"),
@@ -5783,7 +5786,11 @@ mod tests {
         assert_eq!(params["permissions"], ":workspace");
         assert_eq!(
             params["runtimeWorkspaceRoots"],
-            json!(["/home/test/.cache/cargo", "/home/test/.cache/sccache"])
+            json!([
+                "/home/test/.cache/cargo",
+                "/home/test/.cache/sccache",
+                "/tmp/test-workspace"
+            ])
         );
 
         overrides.permission_preset = PermissionPreset::AskFirst;
@@ -5816,7 +5823,31 @@ mod tests {
         .unwrap();
         assert_eq!(
             params["runtimeWorkspaceRoots"],
-            json!(["/home/test/.cache/cargo", "/home/test/.cache/sccache"])
+            json!([
+                "/home/test/.cache/cargo",
+                "/home/test/.cache/sccache",
+                "/tmp/test-workspace"
+            ])
+        );
+    }
+
+    #[test]
+    fn auto_approve_turn_includes_thread_workspace_root_without_configured_roots() {
+        let mut overrides = turn_overrides(Mode::Build, None);
+        overrides.permission_preset = PermissionPreset::AutoApprove;
+
+        let params = build_turn_start_params(
+            &test_thread(),
+            &UserInput::text("implement it"),
+            &overrides,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(params["permissions"], ":workspace");
+        assert_eq!(
+            params["runtimeWorkspaceRoots"],
+            json!(["/tmp/test-workspace"])
         );
     }
 

@@ -86,15 +86,15 @@ impl AgentHarness for CapturingHarness {
             .unwrap()
             .push(opts.initial_model.clone());
         Ok(ThreadHandle {
-            thread: tid,
-            harness_thread_id: opts.resume.unwrap_or_else(|| "cap".into()),
-            warning: None,
             resumed_model: opts
                 .initial_model
                 .clone()
                 .or_else(|| Some(fake_native_model())),
-            agent_name: None,
-            parent_harness_thread_id: None,
+            ..ThreadHandle::opened(
+                tid,
+                opts.resume.unwrap_or_else(|| "cap".into()),
+                opts.workspace_root.clone(),
+            )
         })
     }
 

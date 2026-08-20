@@ -270,15 +270,15 @@ impl AgentHarness for RecordingHarness {
         let (tx, _) = tokio::sync::broadcast::channel(16);
         self.threads.lock().unwrap().push((thread, tx));
         Ok(ThreadHandle {
-            thread,
-            harness_thread_id: opts.resume.unwrap_or_else(|| format!("native-{thread}")),
-            warning: None,
             resumed_model: opts
                 .initial_model
                 .clone()
                 .or_else(|| Some(fake_native_model())),
-            agent_name: None,
-            parent_harness_thread_id: None,
+            ..ThreadHandle::opened(
+                thread,
+                opts.resume.unwrap_or_else(|| format!("native-{thread}")),
+                opts.workspace_root.clone(),
+            )
         })
     }
 

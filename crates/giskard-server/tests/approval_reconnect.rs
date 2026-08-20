@@ -82,15 +82,15 @@ impl AgentHarness for ApprovalHarness {
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
         let thread = opts.thread.unwrap_or_default();
         Ok(ThreadHandle {
-            thread,
-            harness_thread_id: opts.resume.unwrap_or_else(|| "approval_harness".into()),
-            warning: None,
             resumed_model: opts
                 .initial_model
                 .clone()
                 .or_else(|| Some(fake_native_model())),
-            agent_name: None,
-            parent_harness_thread_id: None,
+            ..ThreadHandle::opened(
+                thread,
+                opts.resume.unwrap_or_else(|| "approval_harness".into()),
+                opts.workspace_root.clone(),
+            )
         })
     }
 

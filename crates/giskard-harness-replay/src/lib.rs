@@ -291,9 +291,6 @@ impl AgentHarness for ReplayHarness {
         ));
 
         Ok(ThreadHandle {
-            thread: thread_id,
-            harness_thread_id,
-            warning: None,
             // A deterministic replay applies exactly the requested model, so echo it as
             // effective — this is what lets server tests exercise verified provider switches.
             // An import names no model, and a harness answers that from the thread itself, so
@@ -303,8 +300,7 @@ impl AgentHarness for ReplayHarness {
                     .clone()
                     .unwrap_or_else(|| self.imported_model.clone()),
             ),
-            agent_name: None,
-            parent_harness_thread_id: None,
+            ..ThreadHandle::opened(thread_id, harness_thread_id, opts.workspace_root.clone())
         })
     }
 

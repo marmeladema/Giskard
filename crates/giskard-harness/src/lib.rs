@@ -323,6 +323,10 @@ pub enum ResumePolicy {
 pub struct ThreadHandle {
     pub thread: ThreadId,
     pub harness_thread_id: String,
+    /// Workspace root the harness opened this thread against. Turns must use this exact runtime
+    /// root when rebinding workspace-scoped permissions; for isolated threads it is the worktree,
+    /// not the project's checkout.
+    pub workspace_root: PathBuf,
     pub warning: Option<HarnessNotice>,
     /// The model/provider the harness reports as *effective* for the opened thread, when the
     /// native protocol exposes it (Codex `thread/resume` echoes `model`/`modelProvider`). Callers
@@ -341,11 +345,25 @@ pub struct ThreadHandle {
 }
 
 impl ThreadHandle {
+    /// Build a handle for an opened, turn-capable harness thread.
+    pub fn opened(thread: ThreadId, harness_thread_id: String, workspace_root: PathBuf) -> Self {
+        Self {
+            thread,
+            harness_thread_id,
+            workspace_root,
+            warning: None,
+            resumed_model: None,
+            agent_name: None,
+            parent_harness_thread_id: None,
+        }
+    }
+
     /// Build a minimal handle for native operations on a persisted thread that is not attached.
     pub fn detached(thread: ThreadId, harness_thread_id: String) -> Self {
         Self {
             thread,
             harness_thread_id,
+            workspace_root: PathBuf::new(),
             warning: None,
             resumed_model: None,
             agent_name: None,

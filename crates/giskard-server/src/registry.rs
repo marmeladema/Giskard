@@ -6577,14 +6577,11 @@ mod tests {
             passive_pre_turn_timeout: None,
         };
         let gate = ThreadTurnGate::default();
-        let handle = ThreadHandle {
-            thread: thread_id,
-            harness_thread_id: "native-test-thread".into(),
-            resumed_model: None,
-            warning: None,
-            agent_name: None,
-            parent_harness_thread_id: None,
-        };
+        let handle = ThreadHandle::opened(
+            thread_id,
+            "native-test-thread".into(),
+            std::path::PathBuf::from("/tmp/test-workspace"),
+        );
         let lease = gate
             .reserve(thread_id, ActiveTurnOwner::new(project_id, &handle, &ctx))
             .unwrap();

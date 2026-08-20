@@ -409,9 +409,6 @@ impl AgentHarness for ScriptedHarness {
         }
 
         Ok(ThreadHandle {
-            thread,
-            harness_thread_id,
-            warning: None,
             resumed_model: opts
                 .initial_model
                 .clone()
@@ -424,6 +421,7 @@ impl AgentHarness for ScriptedHarness {
                 }
             }),
             parent_harness_thread_id,
+            ..ThreadHandle::opened(thread, harness_thread_id, opts.workspace_root.clone())
         })
     }
 

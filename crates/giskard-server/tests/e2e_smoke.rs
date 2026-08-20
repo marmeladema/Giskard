@@ -578,15 +578,15 @@ impl AgentHarness for UnsupportedCompactionHarness {
         let (tx, _) = tokio::sync::broadcast::channel(16);
         self.threads.lock().await.insert(thread, tx);
         Ok(ThreadHandle {
-            thread,
-            harness_thread_id: opts.resume.unwrap_or_else(|| format!("test_{thread}")),
-            warning: None,
             resumed_model: opts
                 .initial_model
                 .clone()
                 .or_else(|| Some(fake_native_model())),
-            agent_name: None,
-            parent_harness_thread_id: None,
+            ..ThreadHandle::opened(
+                thread,
+                opts.resume.unwrap_or_else(|| format!("test_{thread}")),
+                opts.workspace_root.clone(),
+            )
         })
     }
 
@@ -671,15 +671,15 @@ impl AgentHarness for SlowCompactionHarness {
         let (tx, _) = tokio::sync::broadcast::channel(32);
         self.threads.lock().await.insert(thread, tx);
         Ok(ThreadHandle {
-            thread,
-            harness_thread_id: opts.resume.unwrap_or_else(|| format!("test_{thread}")),
-            warning: None,
             resumed_model: opts
                 .initial_model
                 .clone()
                 .or_else(|| Some(fake_native_model())),
-            agent_name: None,
-            parent_harness_thread_id: None,
+            ..ThreadHandle::opened(
+                thread,
+                opts.resume.unwrap_or_else(|| format!("test_{thread}")),
+                opts.workspace_root.clone(),
+            )
         })
     }
 
@@ -857,15 +857,13 @@ impl AgentHarness for ActivityHarness {
             _ => None,
         };
         Ok(ThreadHandle {
-            thread,
-            harness_thread_id,
-            warning: None,
             resumed_model: opts
                 .initial_model
                 .clone()
                 .or_else(|| Some(fake_native_model())),
             agent_name,
             parent_harness_thread_id,
+            ..ThreadHandle::opened(thread, harness_thread_id, opts.workspace_root.clone())
         })
     }
 
@@ -1333,15 +1331,15 @@ impl AgentHarness for SlowStartHarness {
         let (tx, _) = tokio::sync::broadcast::channel(32);
         self.threads.lock().await.insert(thread, tx);
         Ok(ThreadHandle {
-            thread,
-            harness_thread_id: opts.resume.unwrap_or_else(|| format!("test_{thread}")),
-            warning: None,
             resumed_model: opts
                 .initial_model
                 .clone()
                 .or_else(|| Some(fake_native_model())),
-            agent_name: None,
-            parent_harness_thread_id: None,
+            ..ThreadHandle::opened(
+                thread,
+                opts.resume.unwrap_or_else(|| format!("test_{thread}")),
+                opts.workspace_root.clone(),
+            )
         })
     }
 
@@ -1468,17 +1466,16 @@ impl AgentHarness for CountingOpenHarness {
         let (tx, _) = tokio::sync::broadcast::channel(16);
         self.threads.lock().await.insert(thread, tx);
         Ok(ThreadHandle {
-            thread,
-            harness_thread_id: opts
-                .resume
-                .unwrap_or_else(|| format!("count_{thread}_{open_call}")),
-            warning: None,
             resumed_model: opts
                 .initial_model
                 .clone()
                 .or_else(|| Some(fake_native_model())),
-            agent_name: None,
-            parent_harness_thread_id: None,
+            ..ThreadHandle::opened(
+                thread,
+                opts.resume
+                    .unwrap_or_else(|| format!("count_{thread}_{open_call}")),
+                opts.workspace_root.clone(),
+            )
         })
     }
 
