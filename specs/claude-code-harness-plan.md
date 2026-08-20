@@ -209,20 +209,19 @@ while `--settings` can add configuration for one child that exists nowhere on di
 - **The hook route's open mechanical question is answered** (§9.4): a per-child `--settings` payload is
   a viable way to install a hook ephemerally, without writing to the user's settings files.
 
-**There is no provider registry.** Unlike Codex — where `[[providers]]` and `model_providers` name
-endpoints and wire APIs — Claude Code selects its backend entirely through **environment variables**:
+**There is no provider registry.** Unlike Codex — whose `[model_providers.<id>]` tables name endpoints
+and key sources — Claude Code selects its backend entirely through **environment variables**:
 `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY` for first-party clouds,
 and `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_MODEL`,
 `ANTHROPIC_SMALL_FAST_MODEL` for a gateway or proxy. These can be set in the child's environment
 directly or through the `env` key of a `--settings` payload.
 
-This shapes what a Giskard "provider" means for this harness. For Codex a provider is a per-request
-routing choice; for Claude Code it is **a property of how the child process was launched**. A
-subscription-backed `anthropic` provider and a hypothetical `bedrock` provider would both have
-`harness = "claude"` and differ only in the environment their children receive — which fits §5.1's
-provider→harness lookup without changing it, but means the provider must be resolved at spawn time and
-cannot change within a live child. Only the *model* can (§3.3). Nothing in the MVP needs this; it is
-recorded so the provider field is not mistaken for something the protocol carries.
+This shapes what a Giskard "provider" means for this harness. For Codex a provider is a routing choice
+recorded in `~/.codex/config.toml`; for Claude Code it is **a property of how the child process was
+launched**. The environment is the provider configuration, which is what the adapter reports through
+`list_providers` (§5.1). Two consequences: a provider is fixed at spawn and cannot change within a live
+child — only the model can (§3.3) — and a subscription-backed `anthropic` provider differs from a
+Bedrock one only in the environment its children receive, not in anything the protocol carries.
 
 ### 3.6 User attachments
 
@@ -273,7 +272,8 @@ history cache applies unchanged: `UserInput`'s serializer already drops `data_ba
 | `reasoning_effort` | **true (verified), and dynamic** | `--effort low\|medium\|high\|xhigh\|max` at spawn, then `apply_flag_settings{effortLevel}` mid-session — verified to change `low` → `high` on a live child, and confirmable through `get_settings.applied.effort` (§3.3). An unknown value is accepted and ignored silently, so the adapter validates against the catalog and may read back. `Effort` is already an open string newtype, so the differing value set costs nothing |
 | `structured_diffs` | **false (v1)** | no native diff feed |
 | `resumable_threads` | **true (verified)** | a fresh process launched with `--resume=<uuid>` recovered the earlier conversation's content and kept the same session id (no fork). cwd-scoped — §2 |
-| `model_listing` | **true (static)** | no RPC; adapter returns a built-in catalog of Claude models |
+| `model_listing` | **true (static)** | no RPC; adapter returns a built-in catalog of Claude models, with `provider` set so entries land under the right provider (§6) |
+| `provider_listing` | **true (synthetic)** | no provider registry exists, but the child's backend is environment-selected, so the adapter reports what a child would route to (§5.1). This is also what tells Giskard which harness owns a provider id |
 | `token_usage` | **true (observed)** | `result.usage` on every turn, plus per-model totals in `result.modelUsage` — §6 |
 | `mcp_status` | **true (read-only)** at the harness level [unverified with servers configured] | `system/init.mcp_servers` carries the inventory; only ever seen empty here. The project-scoped MCP *endpoints* stay Codex-only in v1 (§5.4) |
 | `mcp_reload` | **false (v1)** | only the interactive `/mcp reconnect` |
@@ -287,48 +287,53 @@ history cache applies unchanged: `UserInput`'s serializer already drops `data_ba
 
 ## 5. Multi-harness architecture
 
-### 5.1 Harness identity comes from the provider
+### 5.1 Harness identity comes from the provider table
 
-Add an optional `harness` field to `ProviderConfig` (`crates/giskard-persist/src/config.rs`),
-defaulting to `"codex"` so every existing `config.toml` keeps working:
+**This section was rewritten after the provider rework on `main`** (`4dfc72a` *Let the harness own
+provider configuration*, `cfc4625` *Key the provider table by routing id*, `8e00156` *Drop the unused
+wire_api provider field*). The earlier plan proposed adding a `harness` field to `ProviderConfig`.
+That is now both impossible and unnecessary.
 
-```toml
-[[providers]]
-id = "anthropic"
-name = "Anthropic (Claude Code)"
-harness = "claude"          # new
-wire_api = "anthropic"      # required by the struct; read by nothing (see below)
-model_listing = false       # no GET /v1/models to discover from
-  [[providers.models]]
-  id = "claude-sonnet-5"
-  display_name = "Sonnet 5"
-  context_window = 1000000  # observed via result.modelUsage; refined at runtime by §6
-  supports_reasoning_effort = true
-```
+Impossible, because `ProviderConfig` is deliberately minimal and `#[serde(deny_unknown_fields)]`: a
+declaration is keyed by routing id (`[providers.<id>]`) and carries only `model_listing` and `models`.
+Everything else — display name, endpoint, key location — is **the harness's** configuration, read back
+through `AgentHarness::list_providers` behind the new `provider_listing` capability.
 
-The two remaining fields deserve a note, because they are not symmetrical:
+Unnecessary, because that same table already answers "which harness owns this provider":
 
-- **`model_listing` is real.** It gates the optional `GET {base_url}/v1/models` discovery in
-  `refresh_models`. It is unrelated to the harness's own `list_models` capability, and `false` is
-  correct here because Claude Code exposes no such endpoint.
-- **`wire_api` is inert — for every harness, not just this one.** `ProviderConfig` declares it
-  (`config.rs:143`) and **no code reads it**; the only other occurrence in the tree is a test fixture.
-  Per spec §8.2 it documents which Codex wire API (`responses` / `chat`) the provider speaks, but Codex
-  learns that from its own `~/.codex/config.toml`, and Giskard's copy is declarative parity rather than
-  a setting with an effect. Giskard's provider block governs only what the model picker offers and
-  whether `/v1/models` discovery runs.
+> **The harness that reports a provider id owns threads on it.**
 
-Removing `wire_api` is being handled as separate work, ahead of and independently of this plan, so the
-example above shows the field only because today's struct requires it. Once it is gone the Claude
-provider block loses that line and nothing else changes.
+No config surface, no second source of truth, and it reuses the machinery `main` just built —
+`harness_knows_provider` (`routes.rs:5054`) already asks exactly this question to validate configured
+ids. Multi-harness turns a per-project lookup into a per-project *aggregation*: ask each harness the
+project can use, and the union is the picker's provider set.
 
-Then `harness_for(model: &ModelRef, config) -> HarnessKind` is a pure lookup, and the rule "a thread
-runs on the harness of its current model's provider" needs no new UI — the model picker is already the
-only place the choice is expressed, since project creation asks for a `default_model` and nothing else.
+**What the Claude adapter reports.** §3.5 found that Claude Code has no provider registry — its
+backend is selected by environment variable. That maps onto `HarnessProvider` without straining:
+the environment *is* the configuration, so the adapter inspects its own and reports what a child would
+actually route to.
 
-`ProjectConfig.harness` is therefore redundant for routing. It exists today but is hardcoded to
-`"codex"` at creation (`store.rs:578`) and never chosen by anyone; under this design it would carry at
-most the project's default and a label for warnings. Whether to keep or drop it is open question 1.
+| Environment | Reported `HarnessProvider` |
+| --- | --- |
+| default (subscription OAuth) | `{ id: "anthropic", name: Some("Anthropic (Claude Code)"), base_url: None, auth: None }` |
+| `ANTHROPIC_BASE_URL` set | the same id with that `base_url`, so Giskard's `/v1/models` discovery can reach a gateway |
+| `CLAUDE_CODE_USE_BEDROCK` / `_VERTEX` / `_FOUNDRY` | the corresponding id, no `base_url` |
+
+`base_url: None` simply means no discovery to run, which §8.3 already treats as unremarkable for a
+defaulted-on provider. `auth` stays `None`: the subscription credential is an OAuth session in
+`~/.claude.json` (§3.5), not an environment variable or a command, and `HarnessProvider` deliberately
+carries only a key's *location*. There is no inline secret to leak because there is nothing to report.
+
+**A Claude provider therefore needs no `config.toml` entry at all**, which is the same promise the
+provider rework makes for Codex. A `[providers.anthropic]` block remains optional, for pinning picker
+order or declaring models by hand.
+
+**Open: id collisions across harnesses.** With one harness per project the table is unambiguous. With
+two, both could report the same id — Codex can be configured with an `anthropic` `[model_providers]`
+entry, and then `anthropic/claude-opus-5` names a route both harnesses claim. A rule is required
+before this ships; the cheapest is that the project's default harness wins and the loser is reported
+as a picker warning, which is also the one concrete job left for `ProjectConfig.harness` (open
+question 1).
 
 ### 5.2 Registry re-keying
 
@@ -381,6 +386,7 @@ silently assumes a project has exactly one harness:
 | --- | --- |
 | `registry.capabilities(&project_config)` (`routes.rs:3374`, `:3425`, `:3474`, `:3518`) | capabilities of *the* project harness |
 | `registry.list_models(&project_config)` (`routes.rs:3393`) | catalog overlay for `GET /api/projects/{id}/models` |
+| `registry.list_providers(&project_config)` (`routes.rs:3447`, `:5068`) | the provider table behind discovery and id validation |
 | `registry.list_mcp_servers` / `reload_mcp_servers` / `start_mcp_oauth_login` | MCP endpoints, per project |
 
 With two harnesses in one project each needs a defined rule:
@@ -394,6 +400,12 @@ With two harnesses in one project each needs a defined rule:
 - **Model catalogs merge rather than choose.** Each harness's catalog should overlay only the models
   whose provider maps to it, so a project offering both Codex and Claude models gets accurate metadata
   for both instead of one harness's view of the other's models.
+- **Provider tables union.** `list_providers` becomes an aggregation across the project's harnesses
+  (§5.1), and the union is what discovery and id validation run against. `harness_knows_provider`
+  (`routes.rs:5054`) must consult every harness before calling an id unknown, or configuring a Claude
+  provider would be reported as a mistake by the Codex harness that has never heard of it. Its
+  existing "every failure answers known" caution extends unchanged: one harness's silence must not
+  convict an id another harness knows.
 - **MCP endpoints need an explicit decision**, deferred with the rest of MCP (§10): Claude's MCP status
   is per-child and read-only, so the honest v1 answer is that the MCP endpoints describe the Codex
   harness and report nothing for Claude threads.
@@ -457,10 +469,12 @@ server change, not an adapter workaround, and it needs error-path tests per `AGE
 ## 6. Models, context windows, tokens, cost
 
 - **Catalog.** `list_models` returns a built-in list (`claude-opus-5`, `claude-sonnet-5`,
-  `claude-haiku-4-5`, …) with display names and the `--effort` levels. `models.rs:159`
-  (`apply_harness_metadata`) already overlays names/efforts by model id and deliberately ignores
-  harness context windows — keep that; windows come from `[[providers.models]]` and from runtime
-  events.
+  `claude-haiku-4-5`, …) with display names and the `--effort` levels. Since the provider rework a
+  `ModelDescriptor` carries `provider` and `is_default`, and `apply_harness_metadata` honours the
+  default only when the provider matches or is empty — so the Claude catalog should **set
+  `provider: "anthropic"`** rather than leaving it blank as the Codex `model/list` catalog does,
+  which keeps a same-named model under another provider from inheriting the default flag. Context
+  windows still come from declarations and runtime events, not from the catalog.
 - **Context window.** Emit `ContextWindowUpdated` from `autocompact_state.effective_window`, falling
   back to `result.modelUsage[<model>].contextWindow`. This is the effective, post-headroom number,
   which is exactly what the spec's context gauge (§10.3) wants.
@@ -872,7 +886,7 @@ two-harness test with no CLI involved.
 | **P1** | **Soft `Unsupported` for `set_thread_name` / `set_thread_archived` / `delete_thread`** (§5.6) | **Resolves a contradiction inside the current design.** `AgentHarness` declares these optional — its default implementations return `Unsupported` — while the server turns `Unsupported` into a user-visible HTTP 400 (`routes.rs:3549`). The trait says "may be absent", the server says "must exist". Nothing trips it today (Codex implements all three; `ReplayHarness` overrides them with `Ok`), so this is a consistency fix rather than a bug fix — but it is the contract that decides whether a harness can decline an operation at all. | — |
 | **P2** | **Thread-scoped capabilities** (§5.4) | **Corrects the shape, before it has consequences.** Capabilities belong to the harness serving a thread, not to a project; today the two coincide, so there is no user-visible symptom — which is precisely why it is cheap now and expensive once a project can hold two harnesses. The capability-driven UI (spec §13.5) is the consumer. | — |
 | **P3** | **`HarnessKind` newtype** replacing the bare `String` on `ProjectConfig.harness`, `config.toml`, and the factory | One place parses and validates a harness name instead of string comparisons scattered across the binary and the store. Pure typing; no behaviour change. | — |
-| **P4** | **`ProviderConfig.harness` + `harness_for(&ModelRef, &Config)`** (§5.1) | Additive config field defaulting to `"codex"`; every existing `config.toml` keeps working and the lookup returns `codex` for everything. Establishes provider→harness as the single source of truth before anything depends on it. | P3 |
+| **P4** | **`harness_for(&ModelRef)` resolved from the aggregated provider table** (§5.1) | No config change: the answer comes from `list_providers`, which `main` already added. With one harness the aggregation is the current behaviour, so this is a refactor of `harness_knows_provider` and the discovery path from "the project's harness" to "every harness the project can use". | P6 |
 | **P5** | **Dispatching `HarnessFactory`** — a table keyed by `HarnessKind` instead of `bin/giskard-server.rs:19`'s `if config.harness != "codex"` | Turns a hardcoded rejection into an extension point, and lets the replay binary register its own kind by the same mechanism the real binary uses. | P3 |
 | **P6** | **Registry re-keying to `(ProjectId, HarnessKind)`** plus the `HarnessKind` on `ThreadBinding` (§5.2) | The structural centre of the work, and the riskiest to combine with adapter development. Landing it alone keeps behaviour identical with one kind while making the two-harness test possible. | P3, P5 |
 | **P7** | **`ThreadFile.harness` + `harness_thread_ids`, default-on-read** (§5.3) | A forward-compatible persistence migration. Landing it early means existing installations are already writing files that carry the field before any feature reads it, so the Claude work never needs a migration step of its own. | P3 |
@@ -933,8 +947,8 @@ and it should be decided against a working harness rather than designed in advan
 
 `specs/giskard-specification.md` (§4.1/4.2 capability wording, new §4.8 Claude
 mapping, §4.7 → per-harness process lifecycle, §6.4, §8.2/8.3, §9.1, §12.2, §13.5); `README.md`
-(one-process-per-project claim at line 60, crate list, setup); `config.example.toml` (provider
-`harness` key, `[[providers]]` block for Anthropic); `docs/subagents.md` (state that linked children
+(one-process-per-project claim at line 60, crate list, setup); `config.example.toml` (only if a
+`[providers.anthropic]` block is worth showing — §5.1 makes one optional); `docs/subagents.md` (state that linked children
 are Codex-only); `AGENTS.md` (9 crates); new `crates/giskard-harness-claude/README.md` mirroring the
 Codex adapter's identifier/lifecycle contract.
 
@@ -959,7 +973,8 @@ Codex adapter's identifier/lifecycle contract.
 
 1. Does `ProjectConfig.harness` still earn its place? Project creation never asked for a harness — it
    takes a `default_model` and the field is hardcoded to `"codex"` (`store.rs:578`). Once the harness
-   is derived from a thread's model provider (§5.1), the field is redundant for routing and survives
-   only as the project's default and as a label in warnings (`routes.rs:3387`). Keep it as a
-   derived-and-persisted default, or drop it and derive everything from `default_model`?
+   is derived from the provider table (§5.1), the field is redundant for routing. It does have one
+   concrete job left: breaking a tie when two harnesses report the same provider id. Keep it as a
+   derived-and-persisted default that also serves as that tie-breaker, or drop it and find another
+   rule?
 
