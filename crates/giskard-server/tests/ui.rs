@@ -1603,6 +1603,10 @@ async fn index_page_is_served_and_public() {
         "Codex unsupported auth status is not shown as a failed MCP server"
     );
     assert!(
+        body.contains("if (status === \"unknown\") return \"Unknown\";"),
+        "Codex unknown auth status is rendered as a neutral MCP auth state"
+    );
+    assert!(
         body.contains("Resource templates"),
         "expanded MCP details label resource template lists"
     );

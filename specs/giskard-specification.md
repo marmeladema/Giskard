@@ -9,7 +9,7 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.64
+**Version:** 1.65
 
 > **Amendment — frontend approach (supersedes the Dioxus/WASM design below).**
 > This document was written targeting a **Dioxus fullstack / WebAssembly** frontend (`giskard-ui`),
@@ -22,6 +22,15 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.64 → 1.65), refresh Codex protocol SDK:**
+- **CP1:** The Codex harness now builds against `codex-codes` 0.146.4. The update brings the
+  schema snapshot back in line with newer Codex app-server releases and exposes newer typed surfaces
+  such as account/auth helpers, local auth status reads, thread sections, app/plugin protocol
+  methods, and generated defaults. Giskard currently consumes only the compatibility-relevant
+  changes: `InitializeCapabilities.extensions` is explicitly unset, and Codex's new `unknown` MCP
+  auth status is preserved as a neutral harness state instead of being collapsed into another
+  status.
 
 **Changelog (1.63 → 1.64), Send offers only what it can do:**
 - **LT10:** Send is unavailable when there is nothing to send — no non-whitespace composer text and
@@ -1258,8 +1267,8 @@ A single Cargo workspace with focused crates. Names are prefixed `giskard-`.
   bearer token; see §12.
 - **Codex client:** prefer an existing crate over hand-rolling. Verified options on crates.io
   (versions checked against the pinned Codex CLI 0.142.5 at implementation time):
-  - **`codex-codes`** (v0.143.0) — **recommended first choice.** Typed Rust SDK for the Codex
-    CLI app-server JSON-RPC protocol, tested against Codex CLI 0.143.0 (≈ installed 0.142.5).
+  - **`codex-codes`** (v0.146.4) — **recommended first choice.** Typed Rust SDK for the Codex
+    CLI app-server JSON-RPC protocol, tested against Codex CLI 0.146.x.
     Provides `AsyncClient` (Tokio) with `start()` (process spawn), `thread_start`, `turn_start`
     (accepting `model`, `reasoning_effort`, `sandbox_policy` — mapping onto `TurnOverrides`
     + `ModelRef.reasoning_effort`, P1),
@@ -3520,7 +3529,7 @@ Artifacts are version-pinned to the Codex binary that produced them; regenerate 
 > inside `ModelRef.reasoning_effort` (P1: no standalone effort field on `TurnOverrides`).
 > `TurnOverrides.permission_preset` is the thread preset snapshot (P3/AP1: not a per-turn override).
 
-**Client library:** use `codex-codes` (v0.143.0, tested against Codex CLI 0.143.0) with the
+**Client library:** use `codex-codes` (v0.146.4, tested against Codex CLI 0.146.x) with the
 `async-client` feature — its `AsyncClient` API (`spawn`, `initialize`, `thread_start`, generic
 `request`, `next_message`, `respond`, `shutdown`) maps onto the `AgentHarness` trait. The Codex
 `turn/start` call uses the generic `request` path while `codex-codes`' typed `TurnStartParams`

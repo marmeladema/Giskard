@@ -7438,6 +7438,7 @@ function mcpAuthLabel(status) {
   if (status === "bearer_token") return "Bearer token";
   if (status === "oauth") return "OAuth";
   if (status === "unsupported") return "No auth";
+  if (status === "unknown") return "Unknown";
   return status || "Unknown";
 }
 $("mcpBtn").onclick = (e) => { e.stopPropagation(); toggleMcpMenu(); };
