@@ -1,8 +1,8 @@
 mod common;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use futures_util::{SinkExt, StreamExt};
 use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalRequest};
@@ -28,8 +28,99 @@ use giskard_proto::{
     ClientMessage, ErrorSeverity, ServerMessage, ThreadActivity, ThreadActivityKind, WireAgentEvent,
 };
 use giskard_server::{AppState, HarnessFactory, build_app};
+use tracing::Subscriber;
+use tracing_subscriber::Layer;
+use tracing_subscriber::layer::Context;
+use tracing_subscriber::prelude::*;
 
 use common::fake_native_model;
+
+#[derive(Clone, Debug)]
+struct CapturedRegistryEvent {
+    level: tracing::Level,
+    message: String,
+    project_id: String,
+}
+
+#[derive(Default)]
+struct RegistryEventVisitor {
+    message: String,
+    project_id: String,
+}
+
+impl tracing::field::Visit for RegistryEventVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let value = format!("{value:?}");
+        match field.name() {
+            "message" => self.message = value.trim_matches('"').to_owned(),
+            "project_id" => self.project_id = value.trim_matches('"').to_owned(),
+            _ => {}
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        match field.name() {
+            "message" => self.message = value.to_owned(),
+            "project_id" => self.project_id = value.to_owned(),
+            _ => {}
+        }
+    }
+}
+
+struct RegistryEventCapture;
+
+static REGISTRY_EVENTS: OnceLock<StdMutex<Vec<CapturedRegistryEvent>>> = OnceLock::new();
+static REGISTRY_CAPTURE_INSTALLED: OnceLock<()> = OnceLock::new();
+
+impl<S> Layer<S> for RegistryEventCapture
+where
+    S: Subscriber,
+{
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        if event.metadata().target() != "giskard_server::registry" {
+            return;
+        }
+        let mut visitor = RegistryEventVisitor::default();
+        event.record(&mut visitor);
+        if !matches!(
+            visitor.message.as_str(),
+            "recognized reverse sub-agent activity targeting the existing parent"
+                | "ignoring sub-agent materialization for an existing thread with incompatible ownership"
+        ) {
+            return;
+        }
+        REGISTRY_EVENTS
+            .get_or_init(|| StdMutex::new(Vec::new()))
+            .lock()
+            .unwrap()
+            .push(CapturedRegistryEvent {
+                level: *event.metadata().level(),
+                message: visitor.message,
+                project_id: visitor.project_id,
+            });
+    }
+}
+
+fn install_registry_event_capture() {
+    REGISTRY_CAPTURE_INSTALLED.get_or_init(|| {
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::registry().with(RegistryEventCapture),
+        )
+        .expect("registry event capture should be the only global test subscriber");
+    });
+}
+
+fn captured_registry_events(project_id: ProjectId) -> Vec<CapturedRegistryEvent> {
+    let project_id = project_id.to_string();
+    REGISTRY_EVENTS
+        .get_or_init(|| StdMutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.project_id == project_id)
+        .cloned()
+        .collect()
+}
 
 struct TestFactory {
     fixture: ReplayFixture,
@@ -4994,6 +5085,7 @@ async fn persisted_or_interrupted_subagent_does_not_restart_passive_monitor() {
 
 #[tokio::test]
 async fn reverse_subagent_activity_preserves_parent_and_uses_one_forwarder() {
+    install_registry_event_capture();
     let harness = Arc::new(ActivityHarness::default());
     let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
     let base = format!("http://127.0.0.1:{port}");
@@ -5136,6 +5228,30 @@ async fn reverse_subagent_activity_preserves_parent_and_uses_one_forwarder() {
     assert_eq!(completions, 1, "child completion should be broadcast once");
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    let registry_events = loop {
+        let events = captured_registry_events(project_id);
+        if events.iter().any(|event| {
+            event.message == "recognized reverse sub-agent activity targeting the existing parent"
+        }) {
+            break events;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "reverse activity was not classified as targeting the existing parent"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    };
+    assert!(registry_events.iter().any(|event| {
+        event.level == tracing::Level::DEBUG
+            && event.message
+                == "recognized reverse sub-agent activity targeting the existing parent"
+    }));
+    assert!(registry_events.iter().all(|event| {
+        event.message
+            != "ignoring sub-agent materialization for an existing thread with incompatible ownership"
+    }));
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     loop {
         let turns = state
             .store
@@ -5208,6 +5324,54 @@ async fn reverse_subagent_activity_preserves_parent_and_uses_one_forwarder() {
         .unwrap();
     assert_eq!(saved_parent.kind, giskard_core::ThreadKind::Primary);
     assert_eq!(saved_parent.parent_thread_id, None);
+
+    // A direct-parent shape inside a malformed live graph must not take the reverse-link fast path.
+    // This reproduces the state that used to classify differently before and after a restart.
+    state
+        .store
+        .update_thread(project_id, parent_id, |thread| {
+            thread.kind = giskard_core::ThreadKind::Subagent;
+            thread.parent_thread_id = Some(child.id);
+        })
+        .await
+        .unwrap();
+    state
+        .registry
+        .start_turn(
+            child.id,
+            UserInput::text("reverse parent activity"),
+            TurnOverrides {
+                model: Some(child.current_model.clone()),
+                mode: child.mode,
+                permission_preset: child.permission_preset,
+            },
+            child.current_model.clone(),
+        )
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        if captured_registry_events(project_id).iter().any(|event| {
+            event.level == tracing::Level::WARN
+                && event.message
+                    == "ignoring sub-agent materialization for an existing thread with incompatible ownership"
+        }) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "malformed live ownership was not reported as incompatible"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+    state
+        .store
+        .update_thread(project_id, parent_id, |thread| {
+            thread.kind = giskard_core::ThreadKind::Primary;
+            thread.parent_thread_id = None;
+        })
+        .await
+        .unwrap();
 
     harness.complete_turn(parent_id, parent_turn).await.unwrap();
 }

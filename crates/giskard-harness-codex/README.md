@@ -103,12 +103,14 @@ the adapter. Both native spawning protocols are supported:
   the adapter reads only the linked receiver's state. Single-child `sendInput`, `wait`,
   `resumeAgent`, and `closeAgent` calls also carry lifecycle links, while a multi-child `wait`
   remains unlinked rather than attributing aggregate state to one child; and
-- current collaboration v2 is exposed as a completed `subAgentActivity` with `kind = started`; the
-  adapter preserves its child thread id and agent path. Its activity title uses the final non-empty
-  path component as the task name and does not expose the native child id; the complete path and id
-  remain in link metadata. This event does not contain the delegated prompt, so the server uses its
-  explicit `Sub-agent turn` fallback rather than misidentifying an inherited parent turn as the
-  task.
+- current collaboration v2 is exposed as a completed `subAgentActivity`; the adapter preserves its
+  related thread id, agent path, and action. The referenced thread is normally a child when the
+  event has `kind = started`, but reverse activity in a child's transcript can reference its
+  parent; the server resolves that direction from persisted ownership. Its activity title uses the
+  final non-empty path component as the task name and does not expose the native child id; the
+  complete path and id remain in link metadata. This event does not contain the delegated prompt,
+  so the server uses its explicit `Sub-agent turn` fallback rather than misidentifying an inherited
+  parent turn as the task.
 
 The server imports the child from either representation and passively monitors only lifecycle
 evidence that can denote active work (`spawned`, `started`, `interacted`, `pending`, or `running`).
