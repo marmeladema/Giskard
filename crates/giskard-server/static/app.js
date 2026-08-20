@@ -6776,15 +6776,19 @@ function makePathLink(path, label, line) {
 function currentProjectDir() {
   return (state.projectDirs && state.projectId && state.projectDirs[state.projectId]) || "";
 }
+function currentThreadWorkspaceRoot() {
+  const meta = state.threadId && state.threadIndex && state.threadIndex.get(String(state.threadId));
+  return (meta && meta.thread && meta.thread.workspace_root) || currentProjectDir();
+}
 function trimTrailingSlash(path) {
   const value = String(path || "");
   return value === "/" ? value : value.replace(/\/+$/,"");
 }
-function displayPathForProject(path) {
+function displayPathForWorkspace(path) {
   const value = String(path || "");
   if (!value) return "";
   if (!value.startsWith("/")) return value;
-  const root = trimTrailingSlash(currentProjectDir());
+  const root = trimTrailingSlash(currentThreadWorkspaceRoot());
   if (!root || !root.startsWith("/")) return value;
   if (value === root) return ".";
   if (root === "/") return value.slice(1);
@@ -6873,7 +6877,7 @@ function renderFileChange(body, p) {
     const kind = document.createElement("span");
     kind.className = "mono";
     kind.textContent = c.change || "modified";
-    row.append(kind, document.createTextNode(" "), makePathLink(c.path || "", displayPathForProject(c.path), null));
+    row.append(kind, document.createTextNode(" "), makePathLink(c.path || "", displayPathForWorkspace(c.path), null));
     if (c.diff) {
       row.append(document.createTextNode(" "));
       const diffBtn = document.createElement("button");

@@ -446,6 +446,9 @@ pub struct CreateProjectResponse {
 pub struct ThreadSummary {
     pub id: ThreadId,
     pub title: String,
+    /// Workspace root this thread reads and writes through. For isolated threads this is the
+    /// worktree workspace, inherited by sub-agents; otherwise it is the project's workspace.
+    pub workspace_root: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<ThreadId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

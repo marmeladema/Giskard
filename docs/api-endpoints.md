@@ -61,7 +61,10 @@ it never writes uploads into the project workspace.
 imports/resumes a native harness thread when `resume` is provided. Linked transcript items use the
 dedicated parent/item endpoint above; the server resolves native routing, ownership, provenance,
 prompt, and lifecycle evidence from its authoritative item rather than accepting those fields from
-the browser. Thread summaries and browser-facing sub-agent payloads omit native harness thread IDs.
+the browser. Thread summaries include the effective `workspace_root` the thread uses for file
+reads, Git status and diffs — the project's workspace for shared threads, the inherited worktree
+workspace for isolated threads and their sub-agents. Thread summaries and browser-facing sub-agent
+payloads omit native harness thread IDs.
 See [Sub-agent threads](subagents.md) for the full contract.
 
 If you open a thread whose agent can no longer be started — most often because its
