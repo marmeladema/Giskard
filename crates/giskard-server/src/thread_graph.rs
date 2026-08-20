@@ -10,6 +10,7 @@ use tracing::warn;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExistingLinkDisposition {
     OwnedChild,
+    Parent,
     SelfLink,
     PrimaryThread,
     DifferentParent,
@@ -20,6 +21,7 @@ impl ExistingLinkDisposition {
     pub(crate) fn reason(self) -> &'static str {
         match self {
             Self::OwnedChild => "existing sub-agent already belongs to this parent",
+            Self::Parent => "linked thread is the source thread's parent",
             Self::SelfLink => "thread cannot be its own child",
             Self::PrimaryThread => "existing primary thread cannot be reclassified as a sub-agent",
             Self::DifferentParent => "existing sub-agent belongs to a different parent",
@@ -104,6 +106,13 @@ pub(crate) fn classify_existing_link(
 ) -> ExistingLinkDisposition {
     if existing.id == proposed_parent {
         return ExistingLinkDisposition::SelfLink;
+    }
+    if graph
+        .get(&proposed_parent)
+        .is_some_and(|source| source.parent_thread_id == Some(existing.id))
+        && parent_chain_is_valid(graph, proposed_parent)
+    {
+        return ExistingLinkDisposition::Parent;
     }
     if existing.kind == ThreadKind::Primary || existing.parent_thread_id.is_none() {
         return ExistingLinkDisposition::PrimaryThread;
@@ -368,6 +377,10 @@ mod tests {
         );
         assert_eq!(
             classify_existing_link(&graph, child, graph.get(&root).unwrap()),
+            ExistingLinkDisposition::Parent
+        );
+        assert_eq!(
+            classify_existing_link(&graph, child, graph.get(&other_root).unwrap()),
             ExistingLinkDisposition::PrimaryThread
         );
         assert_eq!(

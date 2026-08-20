@@ -97,10 +97,14 @@ pub struct ToolCallStart {
     pub started_at_ms: Option<i64>,
 }
 
-/// Harness-neutral link from a transcript item to a child sub-agent thread.
+/// Harness-neutral link from a transcript item to a related agent thread.
+///
+/// The owning thread and referenced thread may be related in either direction. Harness events do
+/// not always state that direction, so the registry resolves it from authoritative persisted
+/// ownership before materializing a child or navigating to a parent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubagentLink {
-    /// Harness-native thread id to resume/import as a Giskard child thread.
+    /// Harness-native thread id of the related agent thread.
     pub harness_thread_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,

@@ -3734,13 +3734,13 @@ async fn ws_handler(
 
 #[derive(Debug, Clone)]
 struct WsError {
-    info: ErrorInfo,
+    info: Box<ErrorInfo>,
 }
 
 impl WsError {
     fn new(code: impl Into<String>, severity: ErrorSeverity, message: impl Into<String>) -> Self {
         Self {
-            info: ErrorInfo {
+            info: Box::new(ErrorInfo {
                 code: code.into(),
                 severity,
                 message: message.into(),
@@ -3748,7 +3748,7 @@ impl WsError {
                 thread_id: None,
                 action: None,
                 process_id: None,
-            },
+            }),
         }
     }
 
@@ -3821,7 +3821,7 @@ impl WsError {
     }
 
     fn into_server_message(self) -> ServerMessage {
-        ServerMessage::Error { error: self.info }
+        ServerMessage::Error { error: *self.info }
     }
 }
 

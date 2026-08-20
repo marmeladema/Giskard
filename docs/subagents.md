@@ -18,6 +18,12 @@ button follows `parent_thread_id`, so it also works after a reload and for neste
 A reverse activity from a child to its parent navigates to the existing parent. It never creates a
 second thread or changes ownership.
 
+The harness-neutral activity link is intentionally direction-neutral: Codex identifies the related
+native thread but does not reliably label the relationship from the source thread's perspective.
+Giskard resolves the direction from its persisted ownership graph. Automatic activity aimed at the
+direct parent is therefore treated as navigation-only rather than as a failed child import;
+genuinely incompatible ownership remains a warning.
+
 The browser opens a transcript link with the Giskard parent-thread and item IDs. The server reads
 the authoritative live or persisted item, extracts the native routing ID and lifecycle evidence,
 and idempotently returns the linked Giskard thread. Native harness thread IDs are not included in

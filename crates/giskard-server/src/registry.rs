@@ -1530,12 +1530,19 @@ fn subagent_thread_title(info: &SubagentActivityInfo) -> String {
         .map(|name| format!("Sub-agent: {name}"))
         .or_else(|| {
             info.agent_path
-                .as_ref()
+                .as_deref()
+                .and_then(subagent_path_leaf)
                 .map(|path| format!("Sub-agent: {path}"))
         })
         .or_else(|| info.title.clone())
         .unwrap_or_else(|| "Sub-agent".to_string());
     normalize_subagent_title(raw)
+}
+
+fn subagent_path_leaf(path: &str) -> Option<&str> {
+    path.rsplit('/')
+        .map(str::trim)
+        .find(|part| !part.is_empty())
 }
 
 fn normalize_subagent_title(raw: String) -> String {
@@ -1713,7 +1720,7 @@ async fn materialize_subagent_thread(
                 && binding.handle.harness_thread_id == info.native_thread_id)
                 .then_some(*thread_id)
         });
-    let (graph, existing) = if let Some(existing_id) = live_existing_id {
+    let (mut graph, existing) = if let Some(existing_id) = live_existing_id {
         let existing = shared
             .store
             .load_thread(project_id, existing_id)
@@ -1732,6 +1739,17 @@ async fn materialize_subagent_thread(
     };
 
     if let Some(existing) = existing {
+        // A reverse link is uncommon and needs the complete graph to distinguish a valid direct
+        // parent from the same direct fields inside a dangling or cyclic ownership chain. Keep the
+        // hot path for repeated child activity cheap, but make reverse classification identical
+        // before and after a restart.
+        if graph.is_none() && parent_file.parent_thread_id == Some(existing.id) {
+            graph = Some(
+                load_thread_graph(&shared.store, project_id)
+                    .await
+                    .map_err(|error| HarnessError::Protocol(error.to_string()))?,
+            );
+        }
         // A live binding has already passed the full ownership validation while it was imported.
         // Repeated `interacted` activity can therefore use its immutable direct ownership fields
         // instead of re-reading every thread file on the parent forwarder's hot path.
@@ -1746,6 +1764,16 @@ async fn materialize_subagent_thread(
             }
             None => ExistingLinkDisposition::OwnedChild,
         };
+        if disposition == ExistingLinkDisposition::Parent {
+            debug!(
+                %project_id,
+                source_thread_id = %parent_thread_id,
+                parent_thread_id = %existing.id,
+                linked_harness_thread_id = %info.native_thread_id,
+                "recognized reverse sub-agent activity targeting the existing parent"
+            );
+            return Ok(None);
+        }
         if disposition != ExistingLinkDisposition::OwnedChild {
             warn!(
                 %project_id,
@@ -4171,7 +4199,7 @@ mod tests {
         ActiveTurnOwner, CurrentTurnItems, ThreadTurnGate, TurnContext, TurnContextKind,
         command_completion_is_normal_success, command_status_is_running, forward_events,
         passive_subagent_prompt_text, persist_subagent_fallback_transcript,
-        should_refresh_subagent_title, subagent_monitor_policy,
+        should_refresh_subagent_title, subagent_monitor_policy, subagent_path_leaf,
         take_passive_subagent_monitor_metadata, thread_activity_from_event, track_item_identity,
         update_passive_subagent_metadata,
     };
@@ -4385,6 +4413,124 @@ mod tests {
             "My reviewer",
             "Sub-agent: Linnaeus"
         ));
+    }
+
+    #[test]
+    fn subagent_thread_path_uses_its_final_non_empty_component() {
+        assert_eq!(
+            subagent_path_leaf("/root/nested_reload_parent"),
+            Some("nested_reload_parent")
+        );
+        assert_eq!(subagent_path_leaf("///"), None);
+    }
+
+    #[tokio::test]
+    async fn reverse_parent_materialization_is_navigation_only_when_bound_or_cold() {
+        for parent_is_bound in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+            let project_id = ProjectId::new();
+            store
+                .create_project(project_id, "project", "/tmp/project")
+                .await
+                .unwrap();
+            let parent_id = ThreadId::new();
+            let child_id = ThreadId::new();
+            let model = ModelRef {
+                provider: "openai".into(),
+                model: "gpt-5.5".into(),
+                reasoning_effort: None,
+            };
+            let now = Utc::now();
+            let thread = |id, harness_thread_id: &str, kind, parent_thread_id| ThreadFile {
+                version: 1,
+                id,
+                project_id,
+                title: "thread".into(),
+                harness_thread_id: harness_thread_id.into(),
+                parent_thread_id,
+                spawned_by_turn_id: None,
+                kind,
+                mode: Mode::Build,
+                current_model: model.clone(),
+                context_window: 128_000,
+                model_context_windows: Default::default(),
+                permission_preset: PermissionPreset::AskFirst,
+                model_efforts: Default::default(),
+                tokens: TokenLedger::default(),
+                created_at: now,
+                updated_at: now,
+                archived: false,
+                git_workspace: None,
+            };
+            let parent = thread(
+                parent_id,
+                "native-parent",
+                giskard_core::ThreadKind::Primary,
+                None,
+            );
+            let child = thread(
+                child_id,
+                "native-child",
+                giskard_core::ThreadKind::Subagent,
+                Some(parent_id),
+            );
+            store.save_thread(project_id, &parent).await.unwrap();
+            store.save_thread(project_id, &child).await.unwrap();
+
+            let shared = Arc::new(super::RegistryShared::new(
+                Arc::new(Hub::new()),
+                Arc::new(LiveBufferStore::new()),
+                Arc::new(RunningTaskStore::new()),
+                store.clone(),
+                ledger::spawn(store.clone()),
+            ));
+            if parent_is_bound {
+                shared.threads.lock().await.insert(
+                    parent_id,
+                    super::ThreadBinding {
+                        project: project_id,
+                        handle: ThreadHandle::detached(parent_id, "native-parent".into()),
+                        native_model: Some(model.clone()),
+                    },
+                );
+            }
+
+            let result = super::materialize_subagent_thread(
+                child_id,
+                project_id,
+                TurnId::new(),
+                super::SubagentActivityInfo {
+                    native_thread_id: "native-parent".into(),
+                    agent_name: None,
+                    agent_path: Some("/root".into()),
+                    initial_prompt: None,
+                    title: Some("Sub-agent root interacted".into()),
+                    action: SubagentAction::Interacted,
+                    status: None,
+                    fallback: None,
+                },
+                shared,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(result, None);
+            let saved_parent = store
+                .load_thread(project_id, parent_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved_parent.kind, giskard_core::ThreadKind::Primary);
+            assert_eq!(saved_parent.parent_thread_id, None);
+            let saved_child = store
+                .load_thread(project_id, child_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved_child.kind, giskard_core::ThreadKind::Subagent);
+            assert_eq!(saved_child.parent_thread_id, Some(parent_id));
+        }
     }
 
     #[tokio::test]
