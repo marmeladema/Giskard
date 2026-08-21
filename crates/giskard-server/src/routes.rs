@@ -31,10 +31,12 @@ use giskard_git_parser::{
 };
 use giskard_harness::HarnessProvider;
 use giskard_persist::Config;
-use giskard_persist::store::{ProjectConfig, ThreadFile, ThreadGitWorkspace, ThreadWorktree};
+use giskard_persist::store::{
+    ProjectConfig, ThreadFile, ThreadGitWorkspace, ThreadRecency, ThreadWorktree,
+};
 use giskard_proto::*;
 use tokio::process::Command as TokioCommand;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::AppState;
 use crate::auth::{
@@ -700,10 +702,9 @@ async fn open_thread(
 
         if handle.harness_thread_id != thread_file.harness_thread_id {
             state
-                .store
-                .update_thread(project_id, thread_id, |tf| {
+                .thread_metadata
+                .mutate(project_id, thread_id, |tf| {
                     tf.harness_thread_id = handle.harness_thread_id.clone();
-                    tf.updated_at = Utc::now();
                 })
                 .await?;
         }
@@ -820,6 +821,7 @@ async fn open_thread(
     let now = Utc::now();
     let title = "New thread".to_owned();
     let thread_file = ThreadFile {
+        revision: 0,
         version: 1,
         id: handle.thread,
         project_id,
@@ -840,7 +842,14 @@ async fn open_thread(
         archived: false,
         git_workspace: None,
     };
-    state.store.save_thread(project_id, &thread_file).await?;
+    let thread_file = state
+        .thread_metadata
+        .create(project_id, thread_file)
+        .await?;
+    state
+        .thread_metadata
+        .publish_created(project_id, &thread_file)
+        .await;
 
     let warning = handle.warning.as_ref().map(|warning| {
         warning_info(
@@ -1012,6 +1021,7 @@ async fn start_thread_with_message(
         thread_title_from_first_prompt(&text)
     };
     let thread_file = ThreadFile {
+        revision: 0,
         version: 1,
         id: thread_id,
         project_id,
@@ -1033,19 +1043,22 @@ async fn start_thread_with_message(
         git_workspace: worktree.clone().map(ThreadGitWorkspace::Worktree),
     };
 
-    if let Err(error) = state.store.save_thread(project_id, &thread_file).await {
-        cleanup_new_thread_after_start_failure(
-            &state,
-            &project_config,
-            thread_id,
-            handle.harness_thread_id.clone(),
-            false,
-            "save_thread",
-        )
-        .await;
-        remove_worktree_after_start_failure(worktree.as_ref(), thread_id, "save_thread").await;
-        return Err(ApiError::Internal(error.to_string()));
-    }
+    let thread_file = match state.thread_metadata.create(project_id, thread_file).await {
+        Ok(thread_file) => thread_file,
+        Err(error) => {
+            cleanup_new_thread_after_start_failure(
+                &state,
+                &project_config,
+                thread_id,
+                handle.harness_thread_id.clone(),
+                false,
+                "save_thread",
+            )
+            .await;
+            remove_worktree_after_start_failure(worktree.as_ref(), thread_id, "save_thread").await;
+            return Err(ApiError::Internal(error.to_string()));
+        }
+    };
 
     let overrides = TurnOverrides {
         model: Some(model_ref.clone()),
@@ -1087,6 +1100,11 @@ async fn start_thread_with_message(
             "start_thread",
         )
     });
+
+    state
+        .thread_metadata
+        .publish_created(project_id, &thread_file)
+        .await;
 
     Ok(Json(StartThreadResponse {
         thread_id,
@@ -1775,6 +1793,7 @@ async fn cleanup_new_thread_after_start_failure(
 fn thread_summary(tf: &ThreadFile, workspace_root: String) -> ThreadSummary {
     ThreadSummary {
         id: tf.id,
+        revision: tf.revision,
         title: tf.title.clone(),
         workspace_root,
         parent_thread_id: tf.parent_thread_id,
@@ -1810,19 +1829,14 @@ async fn refresh_route_imported_subagent_title(
         return Ok(());
     };
     let desired = normalize_thread_title(&format!("Sub-agent: {agent_name}"))?;
-    let Some(thread) = state.store.load_thread(project_id, thread_id).await? else {
-        return Ok(());
-    };
-    if thread.kind != ThreadKind::Subagent
-        || !should_refresh_subagent_title(&thread.title, &desired)
-    {
-        return Ok(());
-    }
     state
-        .store
-        .update_thread(project_id, thread_id, |thread| {
-            thread.title = desired.clone();
-            thread.updated_at = Utc::now();
+        .thread_metadata
+        .mutate(project_id, thread_id, |thread| {
+            if thread.kind == ThreadKind::Subagent
+                && should_refresh_subagent_title(&thread.title, &desired)
+            {
+                thread.title = desired.clone();
+            }
         })
         .await?;
     Ok(())
@@ -1860,12 +1874,12 @@ async fn archive_thread(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     let tf = state
-        .store
-        .update_thread(project_id, thread_id, |tf| {
-            tf.archived = req.archived;
-            tf.updated_at = Utc::now();
+        .thread_metadata
+        .mutate_with_recency(project_id, thread_id, ThreadRecency::TouchIfChanged, |tf| {
+            tf.archived = req.archived
         })
         .await?
+        .into_current()
         .ok_or(ApiError::NotFound)?;
 
     let workspace_root = thread_workspace_root(&state, &project_config, &tf).await?;
@@ -1904,14 +1918,13 @@ async fn rename_thread(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     let tf = state
-        .store
-        .update_thread(project_id, thread_id, |tf| {
-            tf.title = title;
-            tf.updated_at = Utc::now();
+        .thread_metadata
+        .mutate_with_recency(project_id, thread_id, ThreadRecency::TouchIfChanged, |tf| {
+            tf.title = title
         })
         .await?
+        .into_current()
         .ok_or(ApiError::NotFound)?;
-    broadcast_thread_state(&state, thread_id, &tf).await;
 
     let workspace_root = thread_workspace_root(&state, &project_config, &tf).await?;
     Ok(Json(thread_summary(&tf, workspace_root)))
@@ -2117,7 +2130,7 @@ async fn delete_thread(
                 "failed to delete thread subtree after deleting {deleted_count} thread(s): {error}"
             )));
         }
-        if let Err(error) = state.store.delete_thread(project_id, *candidate).await {
+        if let Err(error) = state.thread_metadata.delete(project_id, *candidate).await {
             error!(
                 %project_id,
                 root_thread_id = %thread_id,
@@ -3311,8 +3324,8 @@ async fn normalize_persisted_thread_model(
     catalog: &[ModelDescriptor],
 ) -> Result<Option<ThreadFile>, PersistError> {
     state
-        .store
-        .update_thread(project_id, thread_id, |thread| {
+        .thread_metadata
+        .mutate(project_id, thread_id, |thread| {
             let current_model =
                 crate::models::normalize_model_ref(config, catalog, &thread.current_model);
             let descriptor =
@@ -3325,10 +3338,10 @@ async fn normalize_persisted_thread_model(
             if current_model != thread.current_model || context_window != thread.context_window {
                 thread.current_model = current_model;
                 thread.context_window = context_window;
-                thread.updated_at = Utc::now();
             }
         })
         .await
+        .map(|mutation| mutation.into_current())
 }
 
 async fn refresh_project_model_catalog(
@@ -3761,6 +3774,7 @@ impl WsError {
                 detail: None,
                 thread_id: None,
                 action: None,
+                request_id: None,
                 process_id: None,
             }),
         }
@@ -3863,6 +3877,7 @@ fn warning_info(
         detail,
         thread_id: Some(thread_id),
         action: Some(action.to_string()),
+        request_id: None,
         process_id: None,
     }
 }
@@ -3956,11 +3971,14 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
+    let replacements = state.hub.register_client(client_id, tx.clone()).await;
+    let (writer_done_tx, mut writer_done_rx) = oneshot::channel();
+
     // Order matters, and is load-bearing in both directions:
     //
-    // 1. Drain first. Registering publishes this channel to every broadcaster, and the bootstrap
-    //    below is an awaited send. With no receiver yet, a burst of concurrent broadcasts that
-    //    fills the queue would park that send forever and wedge the connection.
+    // 1. Start draining before the awaited bootstrap send below. Registration itself does not
+    //    await client capacity, so the short registration-to-spawn interval cannot park a domain
+    //    producer or this connection.
     // 2. Register before computing the bootstrap, not after. Anything that changes between the
     //    snapshot and its delivery then also reaches this client as a live event, so a badge cannot
     //    be left showing state that resolved in the gap.
@@ -3969,27 +3987,59 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
     // claims the notification dedup key, so the replay for the same approval is suppressed rather
     // than alerting twice.
     let send_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
+        loop {
+            // Replacement state bypasses the ordered FIFO. It stays latest-by-key until the
+            // socket writer actually selects it, so obsolete metadata cannot consume event
+            // capacity or make a domain producer wait on a slow peer.
+            let msg = tokio::select! {
+                ordered = rx.recv() => {
+                    let Some(message) = ordered else { break; };
+                    message
+                }
+                replacement = replacements.recv() => replacement,
+            };
             let json = match serde_json::to_string(&msg) {
                 Ok(json) => json,
                 Err(e) => {
-                    error!("failed to serialize WS message: {e}");
+                    error!(
+                        %client_id,
+                        action = "serialize_ws_message",
+                        error = %e,
+                        "failed to serialize WebSocket message"
+                    );
                     continue;
                 }
             };
-            if ws_sender.send(Message::Text(json.into())).await.is_err() {
+            if let Err(e) = ws_sender.send(Message::Text(json.into())).await {
+                debug!(
+                    %client_id,
+                    action = "write_ws_message",
+                    error = %e,
+                    "WebSocket writer stopped"
+                );
                 break;
             }
         }
+        let _ = writer_done_tx.send(());
     });
 
-    state.hub.register_client(client_id, tx.clone()).await;
     send_activity_bootstrap(&state, client_id, &tx).await;
 
     let hub = state.hub.clone();
 
     loop {
-        match ws_receiver.next().await {
+        let incoming = tokio::select! {
+            incoming = ws_receiver.next() => incoming,
+            _ = &mut writer_done_rx => {
+                debug!(
+                    %client_id,
+                    action = "stop_ws_receiver",
+                    "WebSocket writer ended; stopping receive loop"
+                );
+                break;
+            }
+        };
+        match incoming {
             Some(Ok(Message::Text(text))) => {
                 let msg: ClientMessage = match serde_json::from_str(&text) {
                     Ok(m) => m,
@@ -4010,7 +4060,16 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
                         continue;
                     }
                 };
-                if let Err(e) = handle_client_msg(&state, client_id, &tx, msg).await {
+                let metadata_request_id = match &msg {
+                    ClientMessage::SwitchMode { request_id, .. }
+                    | ClientMessage::SelectModel { request_id, .. }
+                    | ClientMessage::SetPermissionPreset { request_id, .. } => {
+                        Some(request_id.clone())
+                    }
+                    _ => None,
+                };
+                if let Err(mut e) = handle_client_msg(&state, client_id, &tx, msg).await {
+                    e.info.request_id = metadata_request_id;
                     error!(
                         code = %e.info.code,
                         severity = ?e.info.severity,
@@ -4033,7 +4092,9 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
     }
 
     hub.disconnect(client_id).await;
-    send_task.abort();
+    if !send_task.is_finished() {
+        send_task.abort();
+    }
 }
 
 async fn handle_client_msg(
@@ -4071,17 +4132,26 @@ async fn handle_client_msg(
             // `TurnCompleted` to this client, and one that ended before it is already out of the
             // turn gate. Build the snapshot first and a turn ending in between would be reported
             // live by a client that then never hears it finish.
-            state.hub.subscribe(thread_id, client_id, tx.clone()).await;
+            if !state.hub.subscribe(thread_id, client_id).await {
+                return Err(WsError::new(
+                    "ws_client_not_registered",
+                    ErrorSeverity::Error,
+                    "WebSocket client registration was lost; reconnect to continue.",
+                )
+                .thread(thread_id)
+                .action("subscribe"));
+            }
 
             if let Some(warning) = notice {
                 let _ = tx.send(ServerMessage::Error { error: warning }).await;
             }
 
             let tf = state
-                .store
+                .thread_metadata
                 .recompute_aggregates(project_id, thread_id)
                 .await
-                .map_err(|e| WsError::from_persist(e, "subscribe", Some(thread_id)))?
+                .map_err(|e| WsError::from_persist(e, "subscribe_history", Some(thread_id)))?
+                .into_current()
                 .ok_or_else(|| {
                     WsError::new(
                         "thread_not_found",
@@ -4091,22 +4161,13 @@ async fn handle_client_msg(
                     .thread(thread_id)
                     .action("subscribe")
                 })?;
-            let thread_state = serde_json::to_value(&tf).map_err(|e| {
-                WsError::new(
-                    "thread_state_serialize_failed",
-                    ErrorSeverity::Error,
-                    "Thread state could not be serialized.",
-                )
-                .detail(e.to_string())
-                .thread(thread_id)
-                .action("subscribe")
-            })?;
             let _ = tx
-                .send(ServerMessage::ThreadState(giskard_proto::ThreadState {
-                    thread_id,
-                    state: thread_state,
-                    active_turn: state.registry.thread_has_active_turn(thread_id).await,
-                }))
+                .send(ServerMessage::ThreadState(
+                    crate::thread_metadata::ThreadMetadataService::thread_state(
+                        &tf,
+                        Some(state.registry.thread_has_active_turn(thread_id).await),
+                    ),
+                ))
                 .await;
 
             // Two snapshot shapes, distinguished by whether the client sent a resync cursor:
@@ -4264,8 +4325,8 @@ async fn handle_client_msg(
             let catalog = project_model_catalog(state, &project_config, &app_config).await;
             // RMW under the per-thread lock: bump activity and read back the resolved state.
             let tf = state
-                .store
-                .update_thread(project_id, thread_id, |tf| {
+                .thread_metadata
+                .mutate(project_id, thread_id, |tf| {
                     let normalized = crate::models::normalize_model_ref(
                         &app_config,
                         &catalog,
@@ -4282,10 +4343,10 @@ async fn handle_client_msg(
                         &tf.model_context_windows,
                     );
                     tf.current_model = normalized;
-                    tf.updated_at = chrono::Utc::now();
                 })
                 .await
                 .map_err(|e| WsError::from_persist(e, "send_input", Some(thread_id)))?
+                .into_current()
                 .ok_or_else(|| {
                     WsError::new(
                         "thread_not_found",
@@ -4321,16 +4382,20 @@ async fn handle_client_msg(
                 .await
                 .map_err(|e| WsError::from_harness(e, "send_input", Some(thread_id)))?;
         }
-        ClientMessage::SwitchMode { thread_id, mode } => {
+        ClientMessage::SwitchMode {
+            thread_id,
+            request_id,
+            mode,
+        } => {
             let project_id = project_for(state, thread_id, "switch_mode").await?;
             let tf = state
-                .store
-                .update_thread(project_id, thread_id, |tf| {
-                    tf.mode = mode;
-                    tf.updated_at = chrono::Utc::now();
+                .thread_metadata
+                .mutate_with_recency(project_id, thread_id, ThreadRecency::TouchIfChanged, |tf| {
+                    tf.mode = mode
                 })
                 .await
                 .map_err(|e| WsError::from_persist(e, "switch_mode", Some(thread_id)))?
+                .into_current()
                 .ok_or_else(|| {
                     WsError::new(
                         "thread_not_found",
@@ -4340,10 +4405,16 @@ async fn handle_client_msg(
                     .thread(thread_id)
                     .action("switch_mode")
                 })?;
-            broadcast_thread_state(state, thread_id, &tf).await;
+            let _ = tx
+                .send(ServerMessage::ThreadMetadataResult {
+                    request_id,
+                    metadata: crate::thread_metadata::ThreadMetadataService::metadata(&tf),
+                })
+                .await;
         }
         ClientMessage::SelectModel {
             thread_id,
+            request_id,
             model_ref,
         } => {
             // Resolve the project without forcing a harness attach: model selection must work on
@@ -4422,45 +4493,51 @@ async fn handle_client_msg(
             // All model/effort resolution happens inside the RMW closure so it sees the
             // authoritative current model under the per-thread lock (§5.4, C7 effort retention).
             let tf = state
-                .store
-                .update_thread(project_id, thread_id, move |tf| {
-                    let old = crate::models::resolve_catalog_descriptor(
-                        &catalog,
-                        &config,
-                        &tf.current_model,
-                    );
-                    if old.supports_reasoning_effort
-                        && let Some(effort) = tf.current_model.reasoning_effort.clone()
-                    {
-                        tf.model_efforts.insert(tf.current_model.key(), effort);
-                    }
-
-                    let new_descriptor =
-                        crate::models::resolve_catalog_descriptor(&catalog, &config, &model_ref);
-                    let mut new_model = model_ref.clone();
-                    let same_model = tf.current_model.provider == new_model.provider
-                        && tf.current_model.model == new_model.model;
-                    if new_descriptor.supports_reasoning_effort {
-                        if same_model && new_model.reasoning_effort.is_none() {
-                            tf.model_efforts.remove(&new_model.key());
-                        } else if new_model.reasoning_effort.is_none() {
-                            new_model.reasoning_effort =
-                                tf.model_efforts.get(&new_model.key()).cloned();
+                .thread_metadata
+                .mutate_with_recency(
+                    project_id,
+                    thread_id,
+                    ThreadRecency::TouchIfChanged,
+                    move |tf| {
+                        let old = crate::models::resolve_catalog_descriptor(
+                            &catalog,
+                            &config,
+                            &tf.current_model,
+                        );
+                        if old.supports_reasoning_effort
+                            && let Some(effort) = tf.current_model.reasoning_effort.clone()
+                        {
+                            tf.model_efforts.insert(tf.current_model.key(), effort);
                         }
-                    } else {
-                        new_model.reasoning_effort = None;
-                    }
 
-                    tf.context_window = crate::models::context_window_with_runtime(
-                        &new_model,
-                        &new_descriptor,
-                        &tf.model_context_windows,
-                    );
-                    tf.current_model = new_model;
-                    tf.updated_at = chrono::Utc::now();
-                })
+                        let new_descriptor = crate::models::resolve_catalog_descriptor(
+                            &catalog, &config, &model_ref,
+                        );
+                        let mut new_model = model_ref.clone();
+                        let same_model = tf.current_model.provider == new_model.provider
+                            && tf.current_model.model == new_model.model;
+                        if new_descriptor.supports_reasoning_effort {
+                            if same_model && new_model.reasoning_effort.is_none() {
+                                tf.model_efforts.remove(&new_model.key());
+                            } else if new_model.reasoning_effort.is_none() {
+                                new_model.reasoning_effort =
+                                    tf.model_efforts.get(&new_model.key()).cloned();
+                            }
+                        } else {
+                            new_model.reasoning_effort = None;
+                        }
+
+                        tf.context_window = crate::models::context_window_with_runtime(
+                            &new_model,
+                            &new_descriptor,
+                            &tf.model_context_windows,
+                        );
+                        tf.current_model = new_model;
+                    },
+                )
                 .await
                 .map_err(|e| WsError::from_persist(e, "select_model", Some(thread_id)))?
+                .into_current()
                 .ok_or_else(|| {
                     WsError::new(
                         "thread_not_found",
@@ -4470,18 +4547,27 @@ async fn handle_client_msg(
                     .thread(thread_id)
                     .action("select_model")
                 })?;
-            broadcast_thread_state(state, thread_id, &tf).await;
+            let _ = tx
+                .send(ServerMessage::ThreadMetadataResult {
+                    request_id,
+                    metadata: crate::thread_metadata::ThreadMetadataService::metadata(&tf),
+                })
+                .await;
         }
-        ClientMessage::SetPermissionPreset { thread_id, preset } => {
+        ClientMessage::SetPermissionPreset {
+            thread_id,
+            request_id,
+            preset,
+        } => {
             let project_id = project_for(state, thread_id, "set_permission_preset").await?;
             let tf = state
-                .store
-                .update_thread(project_id, thread_id, |tf| {
-                    tf.permission_preset = preset;
-                    tf.updated_at = chrono::Utc::now();
+                .thread_metadata
+                .mutate_with_recency(project_id, thread_id, ThreadRecency::TouchIfChanged, |tf| {
+                    tf.permission_preset = preset
                 })
                 .await
                 .map_err(|e| WsError::from_persist(e, "set_permission_preset", Some(thread_id)))?
+                .into_current()
                 .ok_or_else(|| {
                     WsError::new(
                         "thread_not_found",
@@ -4491,7 +4577,12 @@ async fn handle_client_msg(
                     .thread(thread_id)
                     .action("set_permission_preset")
                 })?;
-            broadcast_thread_state(state, thread_id, &tf).await;
+            let _ = tx
+                .send(ServerMessage::ThreadMetadataResult {
+                    request_id,
+                    metadata: crate::thread_metadata::ThreadMetadataService::metadata(&tf),
+                })
+                .await;
         }
         ClientMessage::ApprovalDecision {
             request_id,
@@ -4700,6 +4791,7 @@ async fn handle_client_msg(
                                 )),
                                 thread_id: Some(thread_id),
                                 action: Some("terminate_command".into()),
+                                request_id: None,
                                 process_id: Some(process_id_for_state),
                             },
                         })
@@ -4850,10 +4942,9 @@ async fn ensure_thread_open(
     if handle.harness_thread_id != thread_file.harness_thread_id {
         let harness_thread_id = handle.harness_thread_id.clone();
         state
-            .store
-            .update_thread(project_config.id, thread_id, |tf| {
+            .thread_metadata
+            .mutate(project_config.id, thread_id, |tf| {
                 tf.harness_thread_id = harness_thread_id;
-                tf.updated_at = Utc::now();
             })
             .await
             .map_err(|e| WsError::from_persist(e, action, Some(thread_id)))?;
@@ -5129,6 +5220,7 @@ fn read_only_info(
         detail,
         thread_id: Some(thread_id),
         action: Some(action.to_string()),
+        request_id: None,
         process_id: None,
     }
 }
@@ -5272,10 +5364,9 @@ async fn switch_provider_cold(
     // the persisted mapping in sync exactly like the normal open path does.
     if handle.harness_thread_id != thread_file.harness_thread_id {
         state
-            .store
-            .update_thread(project_id, thread_id, |tf| {
+            .thread_metadata
+            .mutate(project_id, thread_id, |tf| {
                 tf.harness_thread_id = handle.harness_thread_id.clone();
-                tf.updated_at = Utc::now();
             })
             .await
             .map_err(|e| WsError::from_persist(e, "select_model", Some(thread_id)))?;
@@ -5402,33 +5493,6 @@ async fn load_thread(
         .map_err(|e| e.to_string())?
         .ok_or("thread not found")?;
     Ok((project_id, tf))
-}
-
-/// Push the updated persisted thread snapshot to all subscribers (§13.6).
-async fn broadcast_thread_state(
-    state: &AppState,
-    thread_id: giskard_core::ids::ThreadId,
-    tf: &ThreadFile,
-) {
-    let value = match serde_json::to_value(tf) {
-        Ok(value) => value,
-        Err(e) => {
-            error!(%thread_id, "failed to serialize thread state: {e}");
-            return;
-        }
-    };
-    let active_turn = state.registry.thread_has_active_turn(thread_id).await;
-    state
-        .hub
-        .broadcast(
-            thread_id,
-            ServerMessage::ThreadState(giskard_proto::ThreadState {
-                thread_id,
-                state: value,
-                active_turn,
-            }),
-        )
-        .await;
 }
 
 async fn broadcast_running_commands(state: &AppState, thread_id: ThreadId) {

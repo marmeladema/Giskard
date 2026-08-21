@@ -64,7 +64,17 @@ prompt, and lifecycle evidence from its authoritative item rather than accepting
 the browser. Thread summaries include the effective `workspace_root` the thread uses for file
 reads, Git status and diffs — the project's workspace for shared threads, the inherited worktree
 workspace for isolated threads and their sub-agents. Thread summaries and browser-facing sub-agent
-payloads omit native harness thread IDs.
+payloads omit native harness thread IDs. Every summary carries the thread's durable metadata
+`revision`. The WebSocket's typed `ThreadState` carries the same revision with title, mode, selected
+model, effective context window, permission preset, and thread token aggregates; it never exposes
+the persisted native harness id or internal per-model/worktree caches. A committed catalog change
+sends `ThreadCatalogChanged`, which coalesces into serialized refetches of the known project thread
+catalogs. Metadata and catalog invalidations use a coalescing replacement lane, so a full socket
+queue neither blocks the committing task nor permanently drops the latest value. Replacements go
+directly from that lane to the socket writer and do not consume ordered event capacity. Mode,
+model, and permission messages require a `request_id`; the initiating browser receives a correlated
+`ThreadMetadataResult` after commit, including for no-op changes, or an `Error` carrying that id.
+`TokenUpdate` no longer exists; thread totals use the revisioned metadata snapshot.
 See [Sub-agent threads](subagents.md) for the full contract.
 
 If you open a thread whose agent can no longer be started — most often because its

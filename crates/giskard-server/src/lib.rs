@@ -1,5 +1,6 @@
 pub mod app;
 pub mod auth;
+mod delivery;
 pub mod headers;
 pub mod highlight;
 pub mod hub;
@@ -13,6 +14,7 @@ pub mod registry;
 pub mod routes;
 pub mod running_commands;
 mod thread_graph;
+pub mod thread_metadata;
 pub mod throttle;
 pub mod tokens;
 pub mod worktree;

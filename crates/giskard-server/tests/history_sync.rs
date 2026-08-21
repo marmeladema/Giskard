@@ -539,7 +539,7 @@ async fn subscribe_corrupt_history_returns_structured_error() {
                 assert_eq!(error.code, "persistence_error");
                 assert_eq!(error.severity, ErrorSeverity::Error);
                 assert_eq!(error.thread_id, Some(tid));
-                assert_eq!(error.action.as_deref(), Some("subscribe"));
+                assert_eq!(error.action.as_deref(), Some("subscribe_history"));
                 assert!(error.detail.unwrap_or_default().contains("line 1"));
                 return;
             }

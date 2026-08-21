@@ -85,10 +85,9 @@ async fn index_page_is_served_and_public() {
         "thread-scoped server messages are gated by the active thread before rendering"
     );
     assert!(
-        body.contains(
-            "case \"token_update\":\n      if (msg.scope === \"thread\") renderTokens(msg.ledger);"
-        ),
-        "only thread-scoped token updates render into the thread usage menu"
+        !body.contains("case \"token_update\":")
+            && body.contains("if (effective.tokens) renderTokens(effective.tokens);"),
+        "thread tokens come only from revisioned thread metadata"
     );
     assert!(body.contains("send_input"), "composer wired to SendInput");
     assert!(
@@ -160,11 +159,13 @@ async fn index_page_is_served_and_public() {
         "permission preset selector uses the wire values and action-oriented labels"
     );
     assert!(
-        body.contains("type:\"set_permission_preset\", thread_id: state.threadId, preset"),
+        body.contains(
+            "type:\"set_permission_preset\", request_id:requestId, thread_id:state.threadId, preset"
+        ),
         "permission preset changes target the active thread"
     );
     assert!(
-        body.contains("setPermissionPreset(s.permission_preset || \"ask_first\")"),
+        body.contains("setPermissionPreset(effective.permission_preset || \"ask_first\")"),
         "thread state hydrates the permission preset selector"
     );
     assert!(
@@ -435,10 +436,10 @@ async fn index_page_is_served_and_public() {
         "the composer is disabled with an actionable placeholder on read-only threads"
     );
     assert!(
-        body.contains("state.pendingModelBeforeSelect")
-            && body.contains("if (msg.action===\"select_model\")")
-            && body.contains("state.currentModel = state.pendingModelBeforeSelect"),
-        "failed async model selection restores the previous selected model"
+        body.contains("pendingMetadataActions:new Map()")
+            && body.contains("finishMetadataAction(msg.request_id);")
+            && body.contains("case \"thread_metadata_result\":"),
+        "metadata controls keep pending display separate and settle it by request id"
     );
     assert!(
         body.contains("id=\"compactBtn\"")
@@ -559,11 +560,11 @@ async fn index_page_is_served_and_public() {
     );
     assert!(
         body.contains(
-            "const shouldResetTranscript = state.awaitingInitialThreadState || state.awaitingThreadResync"
-        ) && body.contains("state.awaitingThreadResync = false")
-            && body.contains(
-                "if (shouldResetTranscript) {\n    resetTranscriptForAuthoritativeSnapshot();\n  }"
-            ),
+            "const appliesBootstrap = Object.prototype.hasOwnProperty.call(s, \"active_turn\");"
+        ) && body.contains("const shouldResetTranscript = appliesBootstrap &&")
+            && body.contains("if (appliesBootstrap) {")
+            && body
+                .contains("if (shouldResetTranscript) resetTranscriptForAuthoritativeSnapshot();"),
         "UI only clears the transcript for initial snapshots or subscribe resyncs"
     );
     assert!(
@@ -584,12 +585,14 @@ async fn index_page_is_served_and_public() {
         "thread rename is persisted through the server API"
     );
     assert!(
-        body.contains("if (state.threadId === tid) setThreadTitle(savedTitle)"),
-        "renaming the open thread updates the header/mobile title after save"
+        body.contains("const reconciled = applyThreadSummary(pid, updated);"),
+        "rename responses enter the revisioned summary reconciler"
     );
     assert!(
-        body.contains("updateThreadRowTitle(s.id || s.thread_id || state.threadId, s.title)"),
-        "thread_state title broadcasts update the sidebar row as well as the header"
+        body.contains(
+            "if (result.commonValueChanged || result.equalRevision) syncDerivedThreadCommon(result.threadId);"
+        ),
+        "thread detail updates derive sidebar and header titles from one authority"
     );
     assert!(
         !body.contains(
@@ -613,7 +616,7 @@ async fn index_page_is_served_and_public() {
     );
     assert!(
         body.contains("projectThreads:new Map()")
-            && body.contains("function rememberProjectThreads(pid, threads)")
+            && body.contains("function rememberProjectThreads(pid, threads")
             && body.contains("function isManagedSubagentThread(t, threads)")
             && body.contains("function subagentThreadsForActiveProject()")
             && body.contains("function renderSubagentsButton()"),
@@ -746,12 +749,9 @@ async fn index_page_is_served_and_public() {
          ownership chain for every row"
     );
     assert!(
-        body.contains(
-            "      appendThreadRows(box, pid, archived);\n    }\n    // Rebuilding the rows discards \
-             the selection highlight"
-        ) && body.contains(
-            "    syncActiveThreadHighlight();\n    return true;\n  } catch {\n    return false;"
-        ),
+        body.contains("function renderProjectThreads(pid) {")
+            && body.contains("appendThreadRows(box, pid, archived);")
+            && body.contains("syncActiveThreadHighlight();"),
         "reloading a project's threads re-derives the selection highlight, so a reload not driven \
          by opening a thread cannot leave the sidebar with nothing selected"
     );
@@ -1271,7 +1271,8 @@ async fn index_page_is_served_and_public() {
         "UI opens harness-neutral sub-agent links through trusted item coordinates"
     );
     assert!(
-        body.contains("!isManagedSubagentThread(t, threads)") && body.contains("subagent-open-btn"),
+        body.contains("!isManagedSubagentThread(t, renderedThreads)")
+            && body.contains("subagent-open-btn"),
         "UI hides valid managed sub-agents while keeping malformed graphs recoverable"
     );
     assert!(
@@ -1761,8 +1762,8 @@ fn browser_has_no_model_list_outside_a_project() {
 
     let thread_state = between(
         body,
-        "function renderThreadState(s, activeTurn) {",
-        "function resetTranscriptForAuthoritativeSnapshot()",
+        "function renderCurrentThreadMetadata() {",
+        "function applyThreadMetadata(s, recoverConflict) {",
     );
     assert!(
         thread_state.contains("if (projectModelCatalogReady()) syncModelControls();")
@@ -1860,13 +1861,15 @@ fn browser_resubscribe_replaces_transient_transcript_state() {
         "function resetTranscriptForAuthoritativeSnapshot() {",
     );
     assert!(render_thread_state.contains(
-        "const shouldResetTranscript = state.awaitingInitialThreadState || state.awaitingThreadResync"
+        "const appliesBootstrap = Object.prototype.hasOwnProperty.call(s, \"active_turn\");"
     ));
+    assert!(render_thread_state.contains("const shouldResetTranscript = appliesBootstrap &&"));
     assert!(render_thread_state.contains("state.awaitingInitialThreadState = false;"));
     assert!(render_thread_state.contains("state.awaitingThreadResync = false;"));
-    assert!(render_thread_state.contains(
-        "if (shouldResetTranscript) {\n    resetTranscriptForAuthoritativeSnapshot();\n  }"
-    ));
+    assert!(
+        render_thread_state
+            .contains("if (shouldResetTranscript) resetTranscriptForAuthoritativeSnapshot();")
+    );
     assert!(
         !render_thread_state.contains("$(\"transcript\").innerHTML=\"\""),
         "metadata-only ThreadState updates must not clear the transcript directly"
@@ -2328,11 +2331,7 @@ fn browser_incremental_resync_reconciles_in_flight_turn() {
         body.contains("if (state.pendingLiveSnapshotReconcile) {\n    state.pendingLiveSnapshotReconcile = false;\n    reconcileInFlightTurn();"),
         "live snapshot should reconcile the stale live block synchronously just before replay"
     );
-    let turn_started = between(
-        body,
-        "case \"turn_started\":",
-        "case \"context_window_updated\":",
-    );
+    let turn_started = between(body, "case \"turn_started\":", "case \"item_started\":");
     assert!(
         turn_started.contains("state.pendingLiveSnapshotReconcile = false;"),
         "a normal live stream taking over must clear deferred snapshot reconciliation"
@@ -2795,7 +2794,6 @@ fn sidebar_activity_notifications_target_approval_rows() {
         "if (opts.notify !== false) notifyIncomingApproval(request, tid, { source: opts.source });"
     ));
     assert!(body.contains("source: \"agent_event_approval_requested\""));
-    assert!(body.contains("source: \"server_message_approval_request\""));
     assert!(body.contains("source: \"live_turn_snapshot_outstanding_approval\""));
     // Live events default to "thread_activity"; a connect replay overrides it so the notification
     // gate can tell the two apart.
@@ -3068,12 +3066,108 @@ fn browser_offers_the_git_strategy_choice_on_drafts_only() {
 }
 
 #[test]
-fn browser_applies_harness_context_window_updates_to_the_gauge() {
+fn browser_applies_revisioned_thread_metadata_to_the_gauge() {
     let source = app_js();
-    assert!(source.contains("case \"context_window_updated\":"));
-    assert!(source.contains("ev.model.provider === state.currentModel.provider"));
-    assert!(source.contains("ev.model.model === state.currentModel.model"));
-    assert!(source.contains("updateGauge(state.contextUsed, ev.context_window);"));
+    let reconcile = between(
+        source,
+        "function reconcileThreadProjection(kind, payload) {",
+        "function composedThreadSummary(tid) {",
+    );
+    let render = between(
+        source,
+        "function renderThreadState(s, activeTurn) {",
+        "function resetTranscriptForAuthoritativeSnapshot() {",
+    );
+    assert!(reconcile.contains("if (prior && revision < prior.revision)"));
+    assert!(reconcile.contains("revision === prior.revision && !sameThreadProjection"));
+    assert!(reconcile.contains("authority[kind] = { revision"));
+    assert!(source.contains("updateGauge(state.contextUsed, effective.context_window || 0);"));
+    assert!(!source.contains("case \"context_window_updated\":"));
+    assert!(render.contains(
+        "const appliesBootstrap = Object.prototype.hasOwnProperty.call(s, \"active_turn\");"
+    ));
+    assert!(render.contains("if (appliesBootstrap) {"));
+    assert!(render.contains("releaseFirstTurnLockIfIdle(activeTurn);"));
+}
+
+#[test]
+fn browser_serializes_project_catalog_invalidation_and_repairs_reconnects() {
+    let source = app_js();
+    let load = between(
+        source,
+        "async function loadThreads(pid) {",
+        "function scheduleProjectThreadRetry(pid, refresh) {",
+    );
+    let run = between(
+        source,
+        "function runProjectThreadRefresh(pid, refresh) {",
+        "function renderProjectThreads(pid) {",
+    );
+    assert!(load.contains("refresh.wantedGeneration++;"));
+    assert!(run.contains("if (generation !== refresh.wantedGeneration) continue;"));
+    assert!(run.contains("scheduleProjectThreadRetry(pid, refresh);"));
+    assert!(source.contains("msg.type === \"thread_catalog_changed\""));
+
+    let onopen = between(source, "ws.onopen = () => {", "  };\n  ws.onmessage");
+    assert!(onopen.contains("refreshKnownThreadLists();"));
+    assert!(source.contains("authority = { common:null, detail:null, summary:null }"));
+    assert!(source.contains("revision < authority.common.revision"));
+}
+
+#[test]
+fn browser_projection_conflict_and_malformed_catalog_recovery_is_bounded() {
+    let source = app_js();
+    let apply_detail = between(
+        source,
+        "function applyThreadMetadata(s, recoverConflict) {",
+        "function renderThreadState(s, activeTurn) {",
+    );
+    assert!(
+        apply_detail.contains("state.pendingDetailConflictResyncs.add(result.threadId);")
+            && apply_detail.contains("resetThreadAuthorityForDetailResync(result.threadId);")
+            && apply_detail.contains("send(request);")
+            && !apply_detail.contains("state.ws.close(")
+            && apply_detail.contains("resetThreadAuthorityForDetailResync(identity.threadId);")
+            && apply_detail.contains("state.pendingDetailConflictResyncs.delete(result.threadId);")
+    );
+
+    let remember = between(
+        source,
+        "function rememberProjectThreads(pid, threads, conflictThreadIds) {",
+        "function knownProjectThreads(pid) {",
+    );
+    assert!(
+        remember
+            .contains("summaries.some(summary => !validThreadProjection(\"summary\", summary))")
+            && remember.contains("return { stale:false, malformed:true, conflicts:new Set() };")
+            && remember.contains("resetThreadSummaryForCatalogResync(originalSummary)")
+            && remember.contains("state.threadAuthorities.delete(removedThreadId);")
+            && remember.contains("openDraftThread(projectId);")
+    );
+
+    let refresh = between(
+        source,
+        "function runProjectThreadRefresh(pid, refresh) {",
+        "function renderProjectThreads(pid) {",
+    );
+    assert!(
+        refresh.contains("for (const threadId of reconciliation.conflicts)")
+            && refresh.contains("refresh.conflictThreadIds.add(threadId);")
+            && refresh.contains("if (reconciliation.malformed)")
+            && refresh.contains("scheduleProjectThreadRetry(pid, refresh);")
+    );
+
+    let projects = between(
+        source,
+        "async function loadProjects() {",
+        "function restoreLastThread() {",
+    );
+    assert!(
+        projects.contains(
+            "if (String(state.projectId || \"\") === projectId) clearProjectView(projectId);"
+        ) && projects.contains("state.threadAuthorities.delete(tid);")
+            && projects.contains("state.pendingDetailConflictResyncs.delete(tid);")
+    );
 }
 
 #[test]

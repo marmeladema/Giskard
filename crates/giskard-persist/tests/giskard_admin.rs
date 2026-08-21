@@ -27,6 +27,7 @@ fn test_thread(
 ) -> ThreadFile {
     let now = Utc::now();
     ThreadFile {
+        revision: 0,
         version: 1,
         id: thread_id,
         project_id,

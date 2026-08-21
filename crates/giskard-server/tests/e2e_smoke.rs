@@ -2433,7 +2433,7 @@ async fn wait_for_thread_state(
         match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
                 if let Ok(ServerMessage::ThreadState(state)) = serde_json::from_str(&text)
-                    && state.thread_id == thread_id
+                    && state.metadata.thread_id == thread_id
                 {
                     return state;
                 }
@@ -2613,18 +2613,13 @@ async fn wait_for_thread_activity(
                             "live snapshot should belong to subscribed thread"
                         );
                     }
-                    ServerMessage::ApprovalRequest { thread_id, .. } => {
-                        assert_eq!(
-                            thread_id, active_thread,
-                            "approval request card should belong to subscribed thread"
-                        );
-                    }
                     // Sent once on connect and carries only lightweight `ThreadActivity`, so it is
                     // allowed to mention the unsubscribed thread — that is the point of it. It can
                     // never carry transcript traffic, which is what this loop guards.
                     ServerMessage::ThreadActivityBootstrap { .. } => {}
                     ServerMessage::ThreadState(_)
-                    | ServerMessage::TokenUpdate { .. }
+                    | ServerMessage::ThreadMetadataResult { .. }
+                    | ServerMessage::ThreadCatalogChanged
                     | ServerMessage::ApprovalResolved { .. }
                     | ServerMessage::Error { .. }
                     | ServerMessage::Pong => {}
@@ -2785,7 +2780,7 @@ async fn subscribe_thread_state_reports_a_turn_that_ended_before_the_socket_atta
 
     let thread_state = wait_for_thread_state(&mut ws, thread_id).await;
     assert!(
-        !thread_state.active_turn,
+        thread_state.active_turn == Some(false),
         "a turn that finished before this socket subscribed must be reported as done"
     );
 }
@@ -2848,7 +2843,7 @@ async fn subscribe_thread_state_reports_a_turn_the_harness_has_not_streamed_yet(
 
     let thread_state = wait_for_thread_state(&mut latecomer, thread_id).await;
     assert!(
-        thread_state.active_turn,
+        thread_state.active_turn == Some(true),
         "a turn the harness has accepted is running, even before it streams anything"
     );
 
@@ -3272,7 +3267,7 @@ async fn inactive_thread_progress_sends_activity_without_full_event_subscription
                 let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
                 match server_msg {
                     ServerMessage::ThreadState(state) => {
-                        if state.thread_id == active_thread {
+                        if state.metadata.thread_id == active_thread {
                             saw_active_state = true;
                         }
                     }
@@ -3323,26 +3318,15 @@ async fn inactive_thread_progress_sends_activity_without_full_event_subscription
                             "live snapshot should belong to the subscribed thread"
                         );
                     }
-                    ServerMessage::TokenUpdate {
-                        thread_id: Some(thread_id),
-                        ..
-                    } => {
-                        assert_eq!(
-                            thread_id, inactive_thread,
-                            "inactive completed turn may update only lightweight token state"
-                        );
-                    }
                     // Connect-time replay of lightweight activity. Unlike the live `ThreadActivity`
                     // arm above it is not asserted against the inactive thread's turn lifecycle:
                     // it reports only what is still outstanding, so a completed turn contributes
                     // nothing to it.
                     ServerMessage::ThreadActivityBootstrap { .. } => {}
-                    ServerMessage::TokenUpdate {
-                        thread_id: None, ..
-                    }
+                    ServerMessage::ThreadCatalogChanged
+                    | ServerMessage::ThreadMetadataResult { .. }
                     | ServerMessage::ApprovalResolved { .. }
                     | ServerMessage::Error { .. }
-                    | ServerMessage::ApprovalRequest { .. }
                     | ServerMessage::Pong => {}
                 }
                 if saw_inactive_start && saw_inactive_progress && saw_inactive_completed {
@@ -6028,6 +6012,7 @@ async fn threads_in_a_project_keep_independent_permission_presets() {
         ws.send(tokio_tungstenite::tungstenite::Message::Text(
             serde_json::to_string(&ClientMessage::SetPermissionPreset {
                 thread_id,
+                request_id: "set-permission".into(),
                 preset: policy,
             })
             .unwrap()
@@ -6439,6 +6424,7 @@ async fn subscribe_reopens_persisted_thread() {
         .save_thread(
             pid,
             &giskard_persist::store::ThreadFile {
+                revision: 0,
                 version: 1,
                 id: tid,
                 project_id: pid,
@@ -6500,8 +6486,8 @@ async fn subscribe_reopens_persisted_thread() {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
                 let server_msg: ServerMessage = serde_json::from_str(&t).unwrap();
                 if let ServerMessage::ThreadState(state) = server_msg {
-                    assert_eq!(state.thread_id, tid);
-                    assert_eq!(state.state["context_window"], 258_400);
+                    assert_eq!(state.metadata.thread_id, tid);
+                    assert_eq!(state.metadata.context_window, 258_400);
                     got_thread_state = true;
                     break;
                 }
@@ -6577,6 +6563,7 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
         .save_thread(
             pid,
             &giskard_persist::store::ThreadFile {
+                revision: 0,
                 version: 1,
                 id: tid,
                 project_id: pid,
@@ -6735,6 +6722,7 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
         .save_thread(
             pid,
             &giskard_persist::store::ThreadFile {
+                revision: 0,
                 version: 1,
                 id: tid,
                 project_id: pid,
@@ -6966,6 +6954,7 @@ async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
         .save_thread(
             pid,
             &giskard_persist::store::ThreadFile {
+                revision: 0,
                 version: 1,
                 id: tid,
                 project_id: pid,
@@ -7443,6 +7432,7 @@ async fn open_thread_normalizes_stale_provider_from_configured_model() {
         .save_thread(
             pid,
             &giskard_persist::store::ThreadFile {
+                revision: 0,
                 version: 1,
                 id: tid,
                 project_id: pid,
@@ -7548,6 +7538,7 @@ async fn open_thread_normalization_reuses_live_handle() {
         .save_thread(
             pid,
             &giskard_persist::store::ThreadFile {
+                revision: 0,
                 version: 1,
                 id: tid,
                 project_id: pid,
@@ -7835,6 +7826,7 @@ async fn select_model_rejects_provider_change_on_non_empty_thread() {
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::SelectModel {
             thread_id: tid,
+            request_id: "select-model".into(),
             model_ref: proxy_model,
         })
         .unwrap()
@@ -7930,6 +7922,7 @@ async fn send_input_rejects_persisted_provider_mismatch_on_non_empty_thread() {
         })
         .await
         .unwrap()
+        .into_current()
         .unwrap();
 
     let mut ws = connect_ws(port, &cookie).await;

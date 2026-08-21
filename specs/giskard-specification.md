@@ -9,7 +9,7 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.65
+**Version:** 1.66
 
 > **Amendment — frontend approach (supersedes the Dioxus/WASM design below).**
 > This document was written targeting a **Dioxus fullstack / WebAssembly** frontend (`giskard-ui`),
@@ -22,6 +22,27 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.65 → 1.66), explicit client-state authorities:**
+- **ST1:** Every client-visible state projection names one authority, one clock, and one delivery
+  class. Persisted thread metadata is a typed snapshot ordered by a per-thread durable revision;
+  runtime/transcript/task/request state keeps its own process-local clocks. A clock never orders a
+  different authority. New wire state must extend the authority table in §13.6 rather than adding
+  a field-local ordering rule.
+- **ST2:** Thread metadata mutations compare domain state under the per-thread store lock. A no-op
+  neither writes nor advances the revision. Recency is explicit: user-visible mutations touch it,
+  turn completion records activity, ordinary background/cache mutations preserve it, and crash
+  repair may restore recency from the latest persisted turn without using the repair time.
+- **ST3:** Browser thread state is an audited `ThreadMetadata` projection rather than serialized
+  `ThreadFile`. Project thread rows carry the same revision, and committed catalog changes publish
+  one coalescible catalog invalidation for authoritative HTTP refetches.
+- **ST4:** Authoritative metadata and catalog invalidations use a per-connection replacement lane
+  outside the bounded ordered-event FIFO. Metadata coalesces by subscribed thread and catalog
+  changes coalesce into one global dirty signal, so metadata producers never wait for a slow
+  browser and the latest committed value is not dropped.
+- **ST5:** Metadata actions carry a browser request id and receive an authoritative direct result
+  even when the mutation is a no-op. The browser reconciles WebSocket detail, HTTP summaries, and
+  action results through one revision authority, and retries raced or failed catalog refetches.
 
 **Changelog (1.64 → 1.65), refresh Codex protocol SDK:**
 - **CP1:** The Codex harness now builds against `codex-codes` 0.146.4. The update brings the
@@ -599,11 +620,9 @@
 - **WS1:** Browser clients must reject stale messages from a replaced WebSocket connection and must
   ignore any thread-scoped server message whose `thread_id` does not match the currently selected
   thread. This guard applies before rendering or mutating transcript state for `ThreadState`,
-  `HistoryPage`, `LiveTurnSnapshot`, `RunningTasks`, `Event`, `ApprovalRequest`, thread-scoped
-  `TokenUpdate`, and thread-scoped `Error`.
-- **WS2:** Thread-scoped `TokenUpdate` messages include `thread_id` on the wire. The browser only
-  renders token ledgers into the active thread usage menu when that `thread_id` matches the active
-  thread; project/global token updates must not be rendered as thread totals.
+  `HistoryPage`, `LiveTurnSnapshot`, `RunningTasks`, `Event`, and thread-scoped `Error`.
+- **WS2 (superseded by ST1–ST3):** Thread token totals now travel only in revisioned
+  `ThreadMetadata`; the standalone `TokenUpdate` message and `TokenScope` were removed.
 - **WS3:** Event forwarders must verify that each incoming `AgentEvent.thread` matches the
   forwarder's owning `ThreadId` before attaching to a turn, updating live buffers, broadcasting, or
   persisting. Harness stream leakage across native subscriptions must therefore be ignored rather
@@ -1038,7 +1057,7 @@
   in full on every turn — so listing/restoring parsed whole histories and per-turn write cost was
   O(history). The `.jsonl` (formerly "disposable") is now the **authoritative** history and the
   `.json` a small metadata/aggregates file.
-- **H1:** Two files. `<thread_id>.json` = metadata only (version, id, project_id, title,
+- **H1:** Two files. `<thread_id>.json` = metadata only (version, id, project_id, revision, title,
   harness_thread_id, mode, current_model, context_window cache, token aggregates, timestamps — no
   `turns[]`). `<thread_id>.jsonl` = authoritative history, **one `Turn` per line**, append-only
   (§5.2, §5.3, §5.4).
@@ -1994,6 +2013,7 @@ All defined in `giskard-core`, serialized by `giskard-persist`. Illustrative sha
   "version": 1,
   "id": "01J…",
   "project_id": "01J…",
+  "revision": 42,                       // durable per-thread metadata ordering clock
   "title": "Fix Qobuz OAuth refresh",
   "harness_thread_id": "th_abc123",     // native id used for resume
   "mode": "build",                       // "plan" | "build"
@@ -2079,7 +2099,11 @@ there is one source of truth to correct if needed.
   scope (§1.2). After appending, the server updates `<thread_id>.json` (token aggregates,
   `updated_at`) — history-first, so a crash between the two leaves the turn recoverable and the
   aggregates rebuildable from the JSONL (`recompute_aggregates`, treating aggregates as a cache like
-  `context_window`, C4). The metadata `.json` never holds `turns[]`. The server may cache the parsed
+  `context_window`, C4). A per-thread persistence lock spans the append and metadata fold and also
+  spans repair's history read and metadata replacement. The history write remains first, but repair
+  cannot race a live completion and overwrite or double-count its usage. Repair also restores the
+  latest durable turn timestamp as recency; it does not use the repair time and make an old thread
+  look newly active. The metadata `.json` never holds `turns[]`. The server may cache the parsed
   history in memory for the process lifetime, but the cache is never authoritative: reads validate
   file metadata before reuse, disk append succeeds before in-memory append, and delete/repair paths
   invalidate stale entries. Transient attachment bytes are redacted before a turn is added to this
@@ -2296,10 +2320,11 @@ Auto-generate an initial title from the first user message (truncated); user-edi
   Switching mode takes effect on the next turn; the UI makes this explicit.
 - **Durable switch (P2).** `SwitchMode` and `SelectModel` **persist immediately**: the new
   `mode` / `current_model` is written to `<thread_id>.json` before the server acknowledges, then
-  a `ThreadState` is broadcast to all connected tabs so they stay in sync. This satisfies the §5
-  "same state after restart" requirement — a switch is not lost if the app restarts before the user
-  sends the next message. The sandbox/model *effect* still takes hold at the next turn (Codex
-  accepts these per `turn/start`); only the stored *intent* is durable now.
+  a metadata-only `ThreadState` is published to subscribed tabs so they stay in sync. The initiating
+  request also receives a correlated `ThreadMetadataResult`, including for a no-op. This satisfies
+  the §5 "same state after restart" requirement — a switch is not lost if the app restarts before
+  the user sends the next message. The sandbox/model *effect* still takes hold at the next turn
+  (Codex accepts these per `turn/start`); only the stored *intent* is durable now.
 - **Switching back and forth** is fully supported (Plan → Build → Plan …).
 
 #### 7.4.1 Plan dump to markdown
@@ -2689,9 +2714,9 @@ presets:
 The preset is a **thread-level** setting, **not** a per-project or per-turn override (P3/AP1). Project
 creation does not ask for it. New thread drafts default to `ask_first`, and the selected draft preset
 is persisted when the first message creates the thread. On existing threads, the preset is settable via
-the `SetPermissionPreset` client message (§13.6), which persists immediately and echoes a
-`ThreadState` to all connected tabs — the same durable-switch pattern as
-`SwitchMode`/`SelectModel` (P2).
+the `SetPermissionPreset` client message (§13.6), which persists immediately, publishes a
+metadata-only `ThreadState` to subscribed tabs, and returns a correlated metadata result to the
+initiator — the same durable-switch pattern as `SwitchMode`/`SelectModel` (P2).
 
 **Interaction with Plan mode.** Mode (Plan/Build) and permission preset are **orthogonal
 settings**. Plan mode changes Codex collaboration behavior (`plan` vs `default`) but does not force
@@ -3086,6 +3111,49 @@ This guarantees a coherent experience when a future, less-capable harness is plu
 
 ### 13.6 Client ↔ server protocol (single multiplexed WebSocket)
 
+#### 13.6.1 State authorities, clocks, and delivery classes
+
+Client-visible state must belong to exactly one authority in this table. A clock orders only the
+projection in its own row; comparing clocks from different rows has no meaning. Before adding a
+wire message, its specification must name its authority, clock, and delivery class here.
+
+The metadata and catalog rows are implemented by ST1–ST3. The remaining rows are normative target
+authorities for the staged runtime/bootstrap redesign; they describe the required end state rather
+than claiming that the current transitional stores already provide those clocks.
+
+| State | Authority | Clock | Delivery class |
+| --- | --- | --- | --- |
+| Persisted thread metadata | thread metadata service | durable thread revision | revisioned replacement |
+| Project thread catalog | persisted thread files | each row's thread revision | invalidation + HTTP replacement |
+| Completed transcript | history JSONL | ordered `TurnId` | bootstrap/page |
+| Active transcript | thread runtime registry | process-local event sequence | ordered journal |
+| Active-turn ownership | thread runtime registry | runtime transition order | bootstrap/runtime replacement |
+| Running tasks | thread runtime registry | process-local task revision | revisioned replacement |
+| Requests | thread runtime registry | request state transition | ordered + runtime replacement |
+| Cross-thread runtime overview | thread runtime registry | process-local overview revision | revisioned replacement |
+| Direct action result | action handler | domain identity | direct control response |
+| Background notice | notice authority | notice identity/revision | revisioned replacement |
+
+Persisted thread revisions survive a server restart. Event, task, and overview counters do not;
+their bootstrap establishes a new per-connection baseline. A metadata revision does not order
+`active_turn`, transcript events, tasks, requests, or notices.
+
+`ThreadMetadata` is the only browser projection of persisted thread detail. It contains the thread
+id, revision, title, mode, current model, effective context window, permission preset, and token
+aggregates. Native harness ids, per-model caches for unselected models, ownership internals, and Git
+workspace records remain server-side. Every project thread-summary row carries that thread's same
+revision so WebSocket detail and HTTP catalog results can be compared without treating their
+different field sets as interchangeable.
+
+The metadata store owns revision allocation and no-op detection under the existing per-thread
+write lock. A mutation which changes no durable domain value performs no write and advances no
+revision. Because the paired browser compares JSON numbers, allocation stops at JavaScript's
+maximum safe integer; revision exhaustion is an error, never a wrap or saturation. Recency is an
+explicit mutation intent: successful user-visible setting changes touch `updated_at`; successful
+turn completion records activity; normalization, imports, native-id repair, model cache updates,
+and context-window restoration preserve it. Crash aggregate repair may advance recency only to the
+latest persisted turn timestamp; it never uses the repair time.
+
 - **One WebSocket per browser client**, multiplexing all projects/threads (chosen for lowest
   CPU/memory: one connection, one server-side fan-out task, no per-thread sockets).
 - Messages are tagged with `project_id` / `thread_id`. Defined once in `giskard-proto`.
@@ -3117,8 +3185,10 @@ deletion; all other native deletion errors stop the cascade before deleting that
 
 **Client → server** (examples): `Subscribe { thread_id, since? }` (`since` is the incremental-resync
 cursor, H8), `Unsubscribe { thread_id }`,
-`SendInput { thread_id, text, attachments? }`, `SwitchMode { thread_id, mode }`,
-`SelectModel { thread_id, model_ref }`, `SetPermissionPreset { thread_id, preset }`,
+`SendInput { thread_id, text, attachments? }`,
+`SwitchMode { thread_id, request_id, mode }`,
+`SelectModel { thread_id, request_id, model_ref }`,
+`SetPermissionPreset { thread_id, request_id, preset }`,
 `Interrupt { thread_id }`, `CompactContext { thread_id }`,
 `TerminateCommand { thread_id, process_id }`,
 `ApprovalDecision { request_id, decision }`, `SavePlan { thread_id, path }`.
@@ -3148,8 +3218,10 @@ interactive forwarder owns the turn gate, the passive subscriber yields before b
 
 > **Durable settings switches (P2/P3).** `SwitchMode`, `SelectModel`, and `SetPermissionPreset`
 > persist immediately to `<thread_id>.json` before the server acknowledges, then broadcast a
-> `ThreadState` to all connected tabs. This guarantees the §5 "same state after restart"
-> requirement: a switch is not lost if the app restarts before the user sends the next message.
+> metadata-only `ThreadState` to subscribed tabs. The initiating browser receives
+> `ThreadMetadataResult { request_id, ...ThreadMetadata }` after commit even when the requested
+> value was already current; failures carry the same request id in `Error`. This guarantees the §5
+> "same state after restart" requirement without leaving an optimistic control pending on a no-op.
 > The permissions/model/mode *effect* still takes hold at the next turn; only the stored *intent* is
 > durable now. Draft-thread setting changes are local until the first message creates the thread;
 > they become durable as part of `POST /threads/start`.
@@ -3176,8 +3248,12 @@ interactive forwarder owns the turn gate, the passive subscriber yields before b
 above, sent once to a connecting client only and never broadcast, so a browser that missed the live
 signal still shows what is blocked; a separate message so clients can tell a replay from a live
 event and apply SB6's alert-once-per-session rule),
-`ThreadState { thread_id, state, active_turn }` (persisted snapshot on subscribe/resync;
-`active_turn` is live server state rather than part of the persisted snapshot — see §13.6),
+`ThreadState { ...ThreadMetadata, active_turn? }` (typed persisted snapshot; subscribe/resync
+includes `active_turn`, while live metadata publication omits it because runtime liveness has a
+different authority and clock),
+`ThreadMetadataResult { request_id, ...ThreadMetadata }` (direct correlated result for a metadata
+action, including a no-op),
+`ThreadCatalogChanged` (coalescible invalidation for authoritative HTTP thread-list refetches),
 `LiveTurnSnapshot { thread_id, turn_id, user_input?, accumulated,
 answered_approvals, answered_server_requests }` (in-flight turn reconstruction on reconnect,
 carrying the turn input when the server synthesized the turn context, the `WireAgentEvent`s of the
@@ -3193,13 +3269,8 @@ routes a stale id to the harness, which errors — and `answered_server_requests
 (SR6), since a harness's own resolved event may be late or absent),
 `RunningTasks { thread_id, tasks: [RunningTask] }` (commands and tool/MCP calls still known to be
 running, including commands that outlived an interrupted turn),
-`TokenUpdate { scope, thread_id?, ledger }`, `ApprovalRequest { thread_id, request }` (a
-`WireApprovalRequest`), `ApprovalResolved { thread_id, request_id, decision }`,
+`ApprovalResolved { thread_id, request_id, decision }`,
 `Error { code, severity, message, detail?, thread_id?, action? }`, `Pong`.
-
-For `TokenUpdate`, `thread_id` is required when `scope = "thread"` and omitted for non-thread
-ledger scopes. The browser must only apply a thread-scoped token update to the thread usage menu
-when the message `thread_id` matches the active thread.
 
 `OpenThreadResponse` may also carry `warning: ErrorInfo?` with the same `code` / `severity` /
 `message` shape when the requested thread was opened but degraded (for example, Codex resume
@@ -3257,7 +3328,7 @@ streamed deltas before completion. On reconnect, the client replays `LiveTurnSna
 events through the same event handler used for live WebSocket events.
 
 > **Wire types (C1/§3.5).** Everything the server emits that could carry a filesystem path
-> (`Event`, `ApprovalRequest`, the `LiveTurnSnapshot` contents) is mapped `core → Wire*` at the
+> (`Event` and the `LiveTurnSnapshot` contents) is mapped `core → Wire*` at the
 > fan-out boundary, so paths are UTF-8 `String`s on the wire. Client→server messages are path-free
 > (`SendInput` is text; `SavePlan.path` is a `String` re-validated server-side).
 > Started and completed sub-agent items use `WireSubagentLink`, which retains display/prompt/
@@ -3320,12 +3391,17 @@ events through the same event handler used for live WebSocket events.
 
   Step 2 is conditional, so its *absence* carries no information: a turn that is over and a turn
   the harness has accepted but not yet streamed both produce no `LiveTurnSnapshot`. The
-  `ThreadState` of step 1 therefore states turn liveness outright in `active_turn`, answered from
+  subscribe `ThreadState` of step 1 therefore states turn liveness outright in `active_turn`,
+  answered from
   the server's active-turn gate — held from before `POST /threads/start` returns until the turn
   ends, so it covers the window where the live buffer is still empty. This is what a client needs
   when it starts a turn over HTTP and subscribes afterwards (§7.1): if that turn finishes first,
   its `TurnCompleted` was broadcast to a thread with no subscribers, and without `active_turn` the
   client would keep its composer locked on a turn that is already done.
+
+  A later live `ThreadState` is metadata-only and omits `active_turn`. The browser applies its
+  fields only when its revision is newer, but always applies subscribe/resync bootstrap effects and
+  an explicitly present runtime-liveness value independently of metadata staleness.
 
   This means a reconnected client sees the full in-progress turn, including still-pending
   approval and server-request prompts. The live buffer is bounded
@@ -3549,11 +3625,12 @@ supports, including `collaborationMode` and `item/tool/requestUserInput`.
 ```jsonc
 // client → server
 { "type": "SendInput", "thread_id": "01J…", "text": "Refactor the auth module" }
-{ "type": "SwitchMode", "thread_id": "01J…", "mode": "build" }
-{ "type": "SelectModel", "thread_id": "01J…",
+{ "type": "SwitchMode", "thread_id": "01J…", "request_id": "meta_1", "mode": "build" }
+{ "type": "SelectModel", "thread_id": "01J…", "request_id": "meta_2",
   "model_ref": { "provider": "cloudflare-litellm", "model": "@cf/z-ai/glm-4.7",
                  "reasoning_effort": null } }
-{ "type": "SetPermissionPreset", "thread_id": "01J…", "preset": "auto_approve" }
+{ "type": "SetPermissionPreset", "thread_id": "01J…", "request_id": "meta_3",
+  "preset": "auto_approve" }
 { "type": "ApprovalDecision", "request_id": "ap_7", "decision": "accept_for_session" }
 { "type": "SavePlan", "thread_id": "01J…", "path": "docs/plan-auth-20260706-1030.md" }
 
@@ -3561,10 +3638,11 @@ supports, including `collaborationMode` and `item/tool/requestUserInput`.
 { "type": "Event", "thread_id": "01J…",
   "agent_event": { "kind": "ItemDelta", "item_id": "it_3",
                    "delta": { "text": "I'll start by reading auth.rs…" } } }
-{ "type": "ApprovalRequest", "thread_id": "01J…",
-  "request": { "id": "ap_7", "kind": "command_execution",
-               "command": "cargo test", "cwd": "/home/user/dev/x",
-               "decisions": ["accept","accept_for_session","decline","cancel"] } }
+{ "type": "Event", "thread_id": "01J…",
+  "agent_event": { "kind": "ApprovalRequested",
+    "request": { "id": "ap_7", "kind": "command_execution",
+                 "command": "cargo test", "cwd": "/home/user/dev/x",
+                 "decisions": ["accept","accept_for_session","decline","cancel"] } } }
 { "type": "Event", "thread_id": "01J…",
   "agent_event": { "kind": "TurnCompleted",
                    "usage": { "input": 1200, "output": 340, "total": 1540 },

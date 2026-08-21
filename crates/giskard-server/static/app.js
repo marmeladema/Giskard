@@ -142,6 +142,8 @@ const MAX_TOTAL_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const MAX_ATTACHMENT_NAME_BYTES = 255;
 const MAX_ATTACHMENT_MIME_BYTES = 127;
 const THREAD_DELETE_TIMEOUT_MS = 30000;
+const THREAD_LIST_RETRY_BASE_MS = 500;
+const THREAD_LIST_RETRY_MAX_MS = 10000;
 let state = {
   projectId:null, threadId:null, mode:"build", ws:null, wsStatus:"closed", wsConnectId:0,
   wsReconnectTimer:null, wsReconnectAttempt:0, wsStatusDetail:"WebSocket disconnected",
@@ -153,7 +155,7 @@ let state = {
   // streamed); `newestPersistedTurnId` is the id of the newest turn known to have completed — the
   // high-water mark a future resync will use as its "give me turns after this" cursor.
   currentRenderTurnId:null, newestPersistedTurnId:null,
-  models:[], modelsProject:null, modelsLoadingProject:null, pendingModelBeforeSelect:null, streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null,
+  models:[], modelsProject:null, modelsLoadingProject:null, streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null,
   streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), renderedItemBodyByKey:new Map(), itemKindsByItemId:new Map(),
   pendingApprovals:new Map(), answeredApprovals:new Map(), answeredApprovalsById:new Map(), renderedApprovalStateKeys:new Set(), pendingServerRequests:new Map(), answeredServerRequests:new Set(),
   runningCommands:new Map(), commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null,
@@ -163,6 +165,8 @@ let state = {
   expandedTaskGroups:new Set(), manuallyToggledTaskGroups:new Set(), expandedTaskDetails:new Map(),
   linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, codeOverlaySource:null, outputOverlay:null, activeTurn:false, interruptPending:false, compactPending:false,
   awaitingInitialThreadState:false, awaitingThreadResync:false, awaitingIncrementalResync:false, resyncStickBottom:false, contextWindow:0, contextUsed:null, permissionPreset:"ask_first", currentModel:null,
+  threadAuthorities:new Map(), pendingDetailConflictResyncs:new Set(),
+  pendingMetadataActions:new Map(), threadListRefreshes:new Map(),
   pendingLiveSnapshotReconcile:false,
   diffOverlayText:null,
   gitStatus:null, gitLoading:false, gitError:null, gitRequestSeq:0,
@@ -755,6 +759,25 @@ async function loadProjects() {
   state.projectNames = {};   // id → name, for the mobile "project / thread" breadcrumb
   state.projectDirs = {};     // id → workspace root, for display-only relative file-change paths
   const pending = [];
+  const listedProjectIds = new Set(projects.map(p => String(p.id)));
+  for (const projectId of Array.from(state.projectThreads.keys())) {
+    if (listedProjectIds.has(projectId)) continue;
+    if (String(state.projectId || "") === projectId) clearProjectView(projectId);
+    const refresh = state.threadListRefreshes.get(projectId);
+    if (refresh) {
+      refresh.retired = true;
+      if (refresh.retryTimer) clearTimeout(refresh.retryTimer);
+    }
+    state.threadListRefreshes.delete(projectId);
+    const removed = state.projectThreads.get(projectId) || [];
+    state.projectThreads.delete(projectId);
+    for (const thread of removed) {
+      const tid = String(thread.id);
+      state.threadIndex.delete(tid);
+      state.threadAuthorities.delete(tid);
+      state.pendingDetailConflictResyncs.delete(tid);
+    }
+  }
   for (const p of projects) {
     state.projectNames[p.id] = p.name;
     state.projectDirs[p.id] = p.dir || "";
@@ -828,42 +851,358 @@ function restoreLastThread() {
   openThread(last.pid, last.tid, el ? currentThreadTitle(el) : (meta.title || "Thread"), { silent:true });
 }
 
-async function loadThreads(pid) {
-  const box = $("threads-"+pid); if (!box) return false;
-  try {
-    const { threads } = await api("GET",`/api/projects/${pid}/threads`);
-    rememberProjectThreads(pid, threads);
-    box.innerHTML="";
-    appendThreadRows(box, pid, threads.filter(t => !t.archived && !isManagedSubagentThread(t, threads)));
-    const archived = threads.filter(t => t.archived && !isManagedSubagentThread(t, threads));
-    if (archived.length) {
-      const label = document.createElement("div");
-      label.className = "thread-section-label";
-      label.textContent = "Archived";
-      box.append(label);
-      appendThreadRows(box, pid, archived);
-    }
-    // Rebuilding the rows discards the selection highlight with the old DOM. Callers that reload as
-    // part of opening a thread re-derive it themselves, but a reload triggered by anything else
-    // (say, catching up on a sub-agent the server just materialized) would otherwise leave the list
-    // with no visibly selected thread.
-    syncActiveThreadHighlight();
-    return true;
-  } catch {
-    return false;
-  }
+function validThreadRevision(value) {
+  const revision = Number(value);
+  return Number.isSafeInteger(revision) && revision >= 0 ? revision : null;
 }
 
-function rememberProjectThreads(pid, threads) {
-  if (!pid || !Array.isArray(threads)) return;
+function threadAuthority(tid) {
+  const key = String(tid || "");
+  if (!key) return null;
+  let authority = state.threadAuthorities.get(key);
+  if (!authority) {
+    authority = { common:null, detail:null, summary:null };
+    state.threadAuthorities.set(key, authority);
+  }
+  return authority;
+}
+
+// Detail and catalog snapshots have the same durable clock but are partial projections. Track each
+// independently. `title` and `mode` are deliberately the complete intersection of the server's
+// ThreadDetailProjection and ThreadCatalogProjection; keep this common set synchronized with both
+// Rust projections when adding a browser-visible field.
+function normalizedThreadProjection(kind, payload, threadId, revision) {
+  if (kind === "detail") {
+    return {
+      thread_id:threadId,
+      revision,
+      title:payload.title,
+      mode:payload.mode,
+      current_model:payload.current_model,
+      context_window:payload.context_window,
+      permission_preset:payload.permission_preset,
+      tokens:payload.tokens
+    };
+  }
+  return {
+    id:threadId,
+    revision,
+    title:payload.title,
+    workspace_root:payload.workspace_root,
+    parent_thread_id:payload.parent_thread_id || null,
+    spawned_by_turn_id:payload.spawned_by_turn_id || null,
+    kind:payload.kind,
+    mode:payload.mode,
+    archived:payload.archived,
+    created_at:payload.created_at,
+    updated_at:payload.updated_at
+  };
+}
+
+function sameThreadProjection(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function validThreadProjection(kind, payload) {
+  if (!payload || (kind !== "detail" && kind !== "summary")) return null;
+  const rawThreadId = kind === "detail" ? payload.thread_id : payload.id;
+  const threadId = rawThreadId === undefined || rawThreadId === null ? "" : String(rawThreadId);
+  const revision = validThreadRevision(payload.revision);
+  if (!threadId || revision === null || typeof payload.title !== "string" ||
+      (payload.mode !== "build" && payload.mode !== "plan")) return null;
+  return { threadId, revision };
+}
+
+function reconcileThreadProjection(kind, payload) {
+  const identity = validThreadProjection(kind, payload);
+  if (!identity) {
+    console.warn("Ignoring thread projection without a valid identity or revision", payload);
+    return { accepted:false, malformed:true };
+  }
+  const { threadId, revision } = identity;
+  const authority = threadAuthority(threadId);
+  const prior = authority[kind];
+  if (prior && revision < prior.revision) {
+    return { accepted:false, stale:true, authority, threadId };
+  }
+  const projection = normalizedThreadProjection(kind, payload, threadId, revision);
+  const title = projection.title;
+  const mode = projection.mode;
+  const previousCommon = authority.common;
+  if (prior && revision === prior.revision && !sameThreadProjection(prior.value, projection)) {
+    console.error("Conflicting thread snapshots for one projection revision", {
+      thread_id:threadId, revision, kind
+    });
+    return { accepted:false, conflict:true, authority, threadId };
+  }
+  if (authority.common && revision === authority.common.revision &&
+      (title !== authority.common.title || mode !== authority.common.mode)) {
+    console.error("Conflicting thread projections at the same revision", {
+      thread_id:threadId, revision, kind
+    });
+    return { accepted:false, conflict:true, authority, threadId };
+  }
+  authority[kind] = { revision, value:projection };
+  if (!authority.common || revision > authority.common.revision) {
+    authority.common = { revision, title, mode };
+  }
+  return {
+    accepted:true,
+    stale:!!authority.common && revision < authority.common.revision,
+    conflict:false,
+    equalRevision:!!prior && revision === prior.revision,
+    commonValueChanged:!previousCommon ||
+      previousCommon.title !== authority.common.title || previousCommon.mode !== authority.common.mode,
+    authority,
+    threadId
+  };
+}
+
+function resetThreadAuthorityForDetailResync(tid) {
+  const threadId = String(tid || "");
+  if (!threadId) return;
+  state.threadAuthorities.delete(threadId);
+}
+
+function resetThreadSummaryForCatalogResync(summary) {
+  const identity = validThreadProjection("summary", summary);
+  if (!identity) return summary;
+  const authority = state.threadAuthorities.get(identity.threadId);
+  if (!authority) return summary;
+
+  // The HTTP list is authoritative for summary-only fields. Detail is authoritative for the
+  // shared title/mode when it already holds this exact durable revision; preserving those values
+  // makes a genuine server-side cross-projection disagreement stable instead of bouncing forever
+  // between the WebSocket and HTTP lanes.
+  authority.summary = null;
+  if (authority.detail) {
+    authority.common = {
+      revision:authority.detail.revision,
+      title:authority.detail.value.title,
+      mode:authority.detail.value.mode
+    };
+  } else {
+    authority.common = null;
+  }
+  if (authority.common && authority.common.revision === identity.revision) {
+    return Object.assign({}, summary, {
+      title:authority.common.title,
+      mode:authority.common.mode
+    });
+  }
+  return summary;
+}
+
+function composedThreadSummary(tid) {
+  const authority = state.threadAuthorities.get(String(tid || ""));
+  if (!authority || !authority.summary) return null;
+  const summary = Object.assign({}, authority.summary.value);
+  if (authority.common && authority.common.revision >= authority.summary.revision) {
+    summary.title = authority.common.title;
+    summary.mode = authority.common.mode;
+  }
+  return summary;
+}
+
+function composedThreadDetail(tid) {
+  const authority = state.threadAuthorities.get(String(tid || ""));
+  if (!authority || !authority.detail) return null;
+  const detail = Object.assign({}, authority.detail.value);
+  if (authority.common && authority.common.revision >= authority.detail.revision) {
+    detail.title = authority.common.title;
+    detail.mode = authority.common.mode;
+  }
+  return detail;
+}
+
+function projectThreadRefresh(pid) {
   const projectId = String(pid);
-  const normalized = threads.map(t => Object.assign({}, t, {
-    id:String(t.id),
-    parent_thread_id:t.parent_thread_id ? String(t.parent_thread_id) : null,
-    spawned_by_turn_id:t.spawned_by_turn_id ? String(t.spawned_by_turn_id) : null
+  let refresh = state.threadListRefreshes.get(projectId);
+  if (!refresh) {
+    refresh = {
+      wantedGeneration:0, appliedGeneration:0, promise:null,
+      retryTimer:null, retryAttempt:0, failureNoticed:false, retired:false,
+      conflictThreadIds:new Set()
+    };
+    state.threadListRefreshes.set(projectId, refresh);
+  }
+  return refresh;
+}
+
+async function loadThreads(pid) {
+  const projectId = String(pid);
+  const refresh = projectThreadRefresh(projectId);
+  refresh.wantedGeneration++;
+  if (refresh.retryTimer) {
+    clearTimeout(refresh.retryTimer);
+    refresh.retryTimer = null;
+  }
+  return runProjectThreadRefresh(projectId, refresh);
+}
+
+function scheduleProjectThreadRetry(pid, refresh) {
+  if (refresh.retired || refresh.retryTimer ||
+      refresh.appliedGeneration >= refresh.wantedGeneration) return;
+  const delay = Math.min(
+    THREAD_LIST_RETRY_MAX_MS,
+    THREAD_LIST_RETRY_BASE_MS * Math.pow(2, refresh.retryAttempt++)
+  );
+  refresh.retryTimer = setTimeout(() => {
+    refresh.retryTimer = null;
+    void runProjectThreadRefresh(pid, refresh);
+  }, delay);
+}
+
+function failProjectThreadRefresh(refresh, logMessage, context, invalidResponse) {
+  console.warn(logMessage, context);
+  if (!refresh.failureNoticed) {
+    refresh.failureNoticed = true;
+    notice(
+      invalidResponse
+        ? "The thread list response was invalid. Giskard will retry."
+        : "Could not refresh the thread list. Giskard will retry.",
+      "warning"
+    );
+  }
+  return false;
+}
+
+function runProjectThreadRefresh(pid, refresh) {
+  if (refresh.promise) return refresh.promise;
+  refresh.promise = (async () => {
+    let staleCatchupAttempted = false;
+    while (refresh.appliedGeneration < refresh.wantedGeneration) {
+      if (refresh.retired) return false;
+      const generation = refresh.wantedGeneration;
+      let response;
+      try {
+        response = await api("GET",`/api/projects/${pid}/threads`);
+      } catch (error) {
+        return failProjectThreadRefresh(
+          refresh, "Could not refresh project threads; retrying", { project_id:pid, error }, false
+        );
+      }
+      if (!response || !Array.isArray(response.threads)) {
+        return failProjectThreadRefresh(
+          refresh, "Project thread response was malformed; retrying", { project_id:pid }, true
+        );
+      }
+      if (refresh.retired) return false;
+      // A response describes membership as well as rows. If an invalidation raced the request,
+      // applying it even briefly could resurrect a deleted thread or hide a new one.
+      if (generation !== refresh.wantedGeneration) continue;
+      const reconciliation = rememberProjectThreads(
+        pid, response.threads, refresh.conflictThreadIds
+      );
+      if (reconciliation.malformed) {
+        return failProjectThreadRefresh(
+          refresh, "Project thread response contained an invalid row; retrying",
+          { project_id:pid }, true
+        );
+      }
+      for (const threadId of reconciliation.conflicts) {
+        refresh.conflictThreadIds.add(threadId);
+      }
+      refresh.appliedGeneration = generation;
+      refresh.failureNoticed = false;
+      if (reconciliation.stale) {
+        refresh.wantedGeneration++;
+        if (staleCatchupAttempted) return false;
+        staleCatchupAttempted = true;
+      } else {
+        refresh.retryAttempt = 0;
+      }
+    }
+    return true;
+  })().finally(() => {
+    refresh.promise = null;
+    scheduleProjectThreadRetry(pid, refresh);
+  });
+  return refresh.promise;
+}
+
+function renderProjectThreads(pid) {
+  const box = $("threads-"+pid); if (!box) return;
+  const renderedThreads = knownProjectThreads(pid);
+  box.innerHTML="";
+  appendThreadRows(box, pid, renderedThreads.filter(
+    t => !t.archived && !isManagedSubagentThread(t, renderedThreads)
+  ));
+  const archived = renderedThreads.filter(
+    t => t.archived && !isManagedSubagentThread(t, renderedThreads)
+  );
+  if (archived.length) {
+    const label = document.createElement("div");
+    label.className = "thread-section-label";
+    label.textContent = "Archived";
+    box.append(label);
+    appendThreadRows(box, pid, archived);
+  }
+  syncActiveThreadHighlight();
+}
+
+function rememberProjectThreads(pid, threads, conflictThreadIds) {
+  if (!pid || !Array.isArray(threads)) {
+    return { stale:false, malformed:true, conflicts:new Set() };
+  }
+  const projectId = String(pid);
+  const summaries = threads.map(raw => Object.assign({}, raw || {}, {
+    id:raw && raw.id !== undefined && raw.id !== null ? String(raw.id) : "",
+    parent_thread_id:raw && raw.parent_thread_id ? String(raw.parent_thread_id) : null,
+    spawned_by_turn_id:raw && raw.spawned_by_turn_id ? String(raw.spawned_by_turn_id) : null
   }));
+  if (summaries.some(summary => !validThreadProjection("summary", summary))) {
+    return { stale:false, malformed:true, conflicts:new Set() };
+  }
+  const previousThreadIds = new Set(knownProjectThreads(projectId).map(t => String(t.id)));
+  let stale = false;
+  let activeCommonChanged = false;
+  const conflicts = new Set();
+  const normalized = [];
+  for (const originalSummary of summaries) {
+    const recoverConflict = conflictThreadIds && conflictThreadIds.has(originalSummary.id);
+    const summary = recoverConflict
+      ? resetThreadSummaryForCatalogResync(originalSummary)
+      : originalSummary;
+    const result = reconcileThreadProjection("summary", summary);
+    if (!result.accepted) {
+      stale = stale || !!result.stale || !!result.conflict;
+      if (result.conflict) conflicts.add(result.threadId);
+      const existing = composedThreadSummary(summary.id);
+      const common = result.authority && result.authority.common;
+      normalized.push(existing || (common ? Object.assign({}, summary, {
+        title:common.title, mode:common.mode
+      }) : summary));
+      continue;
+    }
+    if (recoverConflict) conflictThreadIds.delete(originalSummary.id);
+    stale = stale || result.stale || result.conflict;
+    if (result.commonValueChanged && String(state.threadId || "") === result.threadId) {
+      activeCommonChanged = true;
+    }
+    normalized.push(composedThreadSummary(summary.id) || summary);
+  }
   state.projectThreads.set(projectId, normalized);
   reindexProjectThreads(projectId, normalized);
+  for (const thread of normalized) previousThreadIds.delete(String(thread.id));
+  let removedActiveThread = null;
+  for (const removedThreadId of previousThreadIds) {
+    state.pendingDetailConflictResyncs.delete(removedThreadId);
+    if (String(state.projectId || "") === projectId &&
+        String(state.threadId || "") === removedThreadId) {
+      removedActiveThread = removedThreadId;
+    }
+    state.threadAuthorities.delete(removedThreadId);
+  }
+  if (removedActiveThread) {
+    // Membership is authoritative. Retire the vanished thread's detail authority and transition
+    // the active surface in the same reconciliation step, so no caller can observe a selected
+    // thread that the catalog no longer contains. A draft keeps the user in the same project and
+    // is also the normal destination after deleting the open thread locally.
+    try { localStorage.removeItem("giskard.lastThread"); } catch {}
+    openDraftThread(projectId);
+    notice("The open thread was removed in another browser session.", "warning");
+  }
 
   // Link results are browser-local accelerators only. Discard them when the authoritative thread
   // list reloads; a later click resolves the trusted item coordinates idempotently on the server.
@@ -873,6 +1212,9 @@ function rememberProjectThreads(pid, threads) {
   }
   renderParentThreadButton();
   renderSubagentsButton();
+  renderProjectThreads(projectId);
+  if (activeCommonChanged) renderCurrentThreadMetadata();
+  return { stale, malformed:false, conflicts };
 }
 
 function knownProjectThreads(pid) {
@@ -1036,26 +1378,6 @@ function applyThreadTitleToElement(el, pid, tid, title) {
   el.dataset.tid = tid;
   el.onclick = () => openThread(pid, tid, title);
   renderThreadActivityIndicator(tid);
-}
-
-function updateThreadRowTitle(tid, title) {
-  if (!tid || !title) return;
-  document.querySelectorAll(".thread").forEach((el) => {
-    if (el.dataset.tid !== tid) return;
-    const pid = el.dataset.pid || state.projectId;
-    applyThreadTitleToElement(el, pid, tid, title);
-  });
-  updateKnownThreadTitle(tid, title);
-}
-
-function updateKnownThreadTitle(tid, title) {
-  const key = String(tid || "");
-  if (!key || !title) return;
-  for (const threads of state.projectThreads.values()) {
-    const thread = threads.find(t => String(t.id) === key);
-    if (thread) thread.title = title;
-  }
-  renderSubagentsButton();
 }
 
 function currentThreadTitle(el) {
@@ -1480,9 +1802,9 @@ function beginRenameThread(el, pid, tid) {
     input.disabled = true;
     try {
       const updated = await renameThread(pid, tid, nextTitle);
-      const savedTitle = updated && updated.title ? updated.title : nextTitle;
+      const reconciled = applyThreadSummary(pid, updated);
+      const savedTitle = reconciled && reconciled.title ? reconciled.title : currentTitle;
       restore(savedTitle);
-      if (state.threadId === tid) setThreadTitle(savedTitle);
     } catch (e) {
       finished = false;
       input.disabled = false;
@@ -1518,9 +1840,9 @@ document.addEventListener("click", closeThreadMenus);
 
 async function setThreadArchived(pid, tid, archived) {
   try {
-    await api("POST", `/api/projects/${pid}/threads/${tid}/archive`, { archived });
+    const updated = await api("POST", `/api/projects/${pid}/threads/${tid}/archive`, { archived });
+    applyThreadSummary(pid, updated);
     if (state.threadId === tid && archived) clearThreadView(tid);
-    await loadThreads(pid);
   } catch (e) {
     notice((archived ? "Archive" : "Unarchive") + " thread failed: " + e.message, "error");
   }
@@ -1528,6 +1850,32 @@ async function setThreadArchived(pid, tid, archived) {
 
 async function renameThread(pid, tid, title) {
   return api("PATCH", `/api/projects/${pid}/threads/${tid}/title`, { title });
+}
+
+function applyThreadSummary(pid, summary) {
+  const result = reconcileThreadProjection("summary", summary);
+  if (!result.accepted) {
+    if (result.stale || result.conflict) void loadThreads(pid);
+    return composedThreadSummary(summary && summary.id);
+  }
+  const projectId = String(pid);
+  const threads = knownProjectThreads(projectId).slice();
+  const index = threads.findIndex(t => String(t.id) === result.threadId);
+  if (index < 0) {
+    void loadThreads(projectId);
+    return composedThreadSummary(result.threadId);
+  }
+  threads[index] = composedThreadSummary(result.threadId) || threads[index];
+  state.projectThreads.set(projectId, threads);
+  reindexProjectThreads(projectId, threads);
+  renderProjectThreads(projectId);
+  renderParentThreadButton();
+  renderSubagentsButton();
+  if (state.threadId && String(state.threadId) === result.threadId) {
+    renderCurrentThreadMetadata();
+  }
+  if (result.stale || result.conflict) void loadThreads(projectId);
+  return threads[index];
 }
 
 function threadDescendantIds(pid, tid) {
@@ -1677,7 +2025,9 @@ $("removeThreadConfirm").onclick = async () => {
     // or another project meanwhile, and an unrelated active view must never be cleared.
     const activeThread = state.threadId ? String(state.threadId) : null;
     const sameProject = String(state.projectId || "") === String(pid);
-    let openedDraft = false;
+    // Catalog reconciliation owns the active-thread removal transition. It may already have
+    // opened this draft while `loadThreads` was applying the response.
+    let openedDraft = sameProject && isDraftThread();
     if (
       activeThread && sameProject &&
       (deletedIds.has(activeThread) ||
@@ -1732,6 +2082,7 @@ function clearThreadView(tid) {
   clearWsProbeTimer();
   const ws = state.ws;
   state.ws = null;
+  clearPendingMetadataActions();
   if (ws) {
     ws._giskardExpectedClose = true;
     try { ws.close(); } catch {}
@@ -2096,6 +2447,7 @@ function openDraftThread(pid) {
   clearWsProbeTimer();
   const oldWs = state.ws;
   state.ws = null;
+  clearPendingMetadataActions();
   if (oldWs) {
     oldWs._giskardExpectedClose = true;
     try { oldWs.close(); } catch {}
@@ -2193,6 +2545,7 @@ async function openThread(pid, tid, title, opts) {
   state.draftThread = null;
   state.compactPending = false;
   state.currentModel = null;
+  clearPendingMetadataActions();
   prepareProjectModelCatalog(pid);
   $("effortControl").hidden = true;
   resetGitState();
@@ -2343,6 +2696,7 @@ async function connectWs(opts) {
   state.wsProbeToken++;
   const oldWs = state.ws;
   state.ws = null;
+  clearPendingMetadataActions();
   if (oldWs) {
     oldWs._giskardExpectedClose = true;
     try { oldWs.close(); } catch {}
@@ -2395,6 +2749,7 @@ async function connectWs(opts) {
     setWsStatus("open", "Connected to agent.");
     markWsForegroundRecovered(ws);
     recordReconnectDiagnostic(ws, "ws_socket_open", { ready_state:wsReadyStateLabel(ws) });
+    refreshKnownThreadLists();
     // Incremental resync: if we already have persisted history rendered, ask only for the turns
     // after our newest one (`since`). The server replies with a HistoryDelta and we keep the
     // immutable completed-turn DOM. If a live snapshot follows, the stale live DOM stays visible
@@ -2433,6 +2788,7 @@ async function connectWs(opts) {
     if (state.ws !== ws) return;
     clearWsProbeTimer();
     state.ws = null;
+    clearPendingMetadataActions();
     if (ws._giskardExpectedClose) return;
     const reason = ev.reason ? ` ${ev.reason}` : "";
     const code = ev.code ? ` (${ev.code})` : "";
@@ -2510,9 +2866,10 @@ function updateComposerControls() {
   $("stopBtn").setAttribute("aria-label", stopLabel);
   $("attachBtn").disabled = !attachmentInputAllowed;
   const modelCatalogReady = projectModelCatalogReady();
-  $("modelSel").disabled = !hasThreadSurface || !modelCatalogReady || (!ready && !draft);
-  $("modelPickerBtn").disabled = !hasThreadSurface || !modelCatalogReady || (!ready && !draft);
-  $("effortSel").disabled = !hasThreadSurface || !modelCatalogReady || (!ready && !draft);
+  const modelMutationPending = !draft && pendingMetadataGroup(state.threadId, "model");
+  $("modelSel").disabled = !hasThreadSurface || !modelCatalogReady || modelMutationPending || (!ready && !draft);
+  $("modelPickerBtn").disabled = !hasThreadSurface || !modelCatalogReady || modelMutationPending || (!ready && !draft);
+  $("effortSel").disabled = !hasThreadSurface || !modelCatalogReady || modelMutationPending || (!ready && !draft);
   const compactBtn = $("compactBtn");
   if (compactBtn) {
     compactBtn.disabled = !state.threadId || draft || state.activeTurn || state.compactPending || !ready;
@@ -2527,8 +2884,10 @@ function updateComposerControls() {
     state.wsStatus==="connecting" ? "Connecting to agent…" :
     state.wsStatus==="reconnecting" ? "Reconnecting… keep drafting here." :
     "Disconnected from agent.";
-  $("permissionPresetSel").disabled = !hasThreadSurface || (!ready && !draft);
-  $("modeSel").disabled = !hasThreadSurface || (!ready && !draft);
+  $("permissionPresetSel").disabled = !hasThreadSurface ||
+    (!draft && pendingMetadataGroup(state.threadId, "permission")) || (!ready && !draft);
+  $("modeSel").disabled = !hasThreadSurface ||
+    (!draft && pendingMetadataGroup(state.threadId, "mode")) || (!ready && !draft);
   $("turnPickerBtn").disabled = !hasThreadSurface || (!ready && !draft);
 }
 function setTurnActive(active) {
@@ -2641,25 +3000,20 @@ function serverMessageThreadId(msg) {
   if (msg.error && msg.error.thread_id !== undefined && msg.error.thread_id !== null) {
     return String(msg.error.thread_id);
   }
-  if (msg.state && msg.state.thread_id !== undefined && msg.state.thread_id !== null) {
-    return String(msg.state.thread_id);
-  }
   return null;
 }
 function isThreadScopedServerMessage(msg) {
   if (!msg) return false;
   switch (msg.type) {
     case "thread_state":
+    case "thread_metadata_result":
     case "history_page":
     case "history_delta":
     case "live_turn_snapshot":
     case "running_tasks":
     case "event":
-    case "approval_request":
     case "approval_resolved":
       return true;
-    case "token_update":
-      return msg.scope === "thread";
     case "error":
       return serverMessageThreadId(msg) !== null;
     default:
@@ -2687,12 +3041,20 @@ function handleServer(msg, ws) {
     handleThreadActivity(msg);
     return;
   }
+  if (msg && msg.type === "thread_catalog_changed") {
+    refreshKnownThreadLists();
+    return;
+  }
   if (!isCurrentThreadServerMessage(msg)) return;
   const messageType = msg && msg.type ? msg.type : "unknown";
   const renderStartedAtMs = browserNowMs();
   recordReconnectMessageReceived(ws, messageType);
   switch (msg.type) {
-    case "thread_state": renderThreadState(msg.state, msg.active_turn); break;
+    case "thread_state": renderThreadState(msg, msg.active_turn); break;
+    case "thread_metadata_result":
+      applyThreadMetadata(msg);
+      finishMetadataAction(msg.request_id);
+      break;
     case "history_page": renderHistoryPage(msg); break;
     case "history_delta": renderHistoryDelta(msg); break;
     case "live_turn_snapshot": renderLiveTurnSnapshot(msg); break;
@@ -2703,18 +3065,11 @@ function handleServer(msg, ws) {
       if (state.resyncStickBottom) { state.resyncStickBottom = false; keepTranscriptAtBottom(true); }
       break;
     case "event": handleEvent(msg.agent_event); break;
-    case "token_update":
-      if (msg.scope === "thread") renderTokens(msg.ledger);
-      break;
-    case "approval_request":
-      handleIncomingApprovalRequest(msg.request, msg.thread_id || state.threadId, {
-        source: "server_message_approval_request"
-      });
-      break;
     case "approval_resolved":
       resolveApprovalRequest(msg.request_id, msg.decision);
       break;
     case "error":
+      finishMetadataAction(msg.request_id);
       if (msg.code === "thread_read_only") {
         state.threadReadOnly = true;
         state.readOnlyMessage = msg.message || state.readOnlyMessage || "This thread is read-only.";
@@ -2725,13 +3080,6 @@ function handleServer(msg, ws) {
         syncModelOptionAvailability();
         updateComposerControls();
         break;   // the persistent banner replaces the transient toast
-      }
-      if (msg.action==="select_model") {
-        if (state.pendingModelBeforeSelect) {
-          state.currentModel = state.pendingModelBeforeSelect;
-          state.pendingModelBeforeSelect = null;
-          syncModelControls();
-        }
       }
       if (msg.action==="send_input" && state.pendingUserEl) {
         failPendingUserMessage(null);
@@ -3144,46 +3492,165 @@ function handleIncomingApprovalRequest(request, tid, opts) {
   renderApprovalRequest(request);
 }
 
-function renderThreadState(s, activeTurn) {
-  if (!s) return;
-  const shouldResetTranscript = state.awaitingInitialThreadState || state.awaitingThreadResync;
-  // An incremental resync keeps the transcript. Remember whether the viewport was pinned to the
-  // bottom now, before the in-flight turn is repainted, so we can restore that afterwards.
-  if (state.awaitingIncrementalResync) state.resyncStickBottom = transcriptShouldStickToBottom();
-  state.awaitingInitialThreadState = false;
-  state.awaitingThreadResync = false;
-  setMode(s.mode || "build");
-  setPermissionPreset(s.permission_preset || "ask_first");
-  if (s.current_model) {
-    state.currentModel = s.current_model;
-    state.pendingModelBeforeSelect = null;
+function pendingMetadataOverlay(tid) {
+  const threadId = String(tid || "");
+  const overlay = {};
+  for (const pending of state.pendingMetadataActions.values()) {
+    if (pending.threadId === threadId) Object.assign(overlay, pending.overlay);
+  }
+  return overlay;
+}
+
+function pendingMetadataGroup(tid, group) {
+  const threadId = String(tid || "");
+  for (const pending of state.pendingMetadataActions.values()) {
+    if (pending.threadId === threadId && pending.group === group) return true;
+  }
+  return false;
+}
+
+function nextMetadataRequestId() {
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function beginMetadataAction(group, overlay) {
+  const requestId = nextMetadataRequestId();
+  state.pendingMetadataActions.set(requestId, {
+    threadId:String(state.threadId), group, overlay
+  });
+  renderCurrentThreadMetadata();
+  return requestId;
+}
+
+function finishMetadataAction(requestId) {
+  if (!requestId || !state.pendingMetadataActions.delete(String(requestId))) return false;
+  renderCurrentThreadMetadata();
+  return true;
+}
+
+function clearPendingMetadataActions() {
+  if (!state.pendingMetadataActions.size) return;
+  state.pendingMetadataActions.clear();
+  renderCurrentThreadMetadata();
+}
+
+function syncDerivedThreadCommon(tid) {
+  const threadId = String(tid || "");
+  const authority = state.threadAuthorities.get(threadId);
+  if (!authority || !authority.common) return;
+  for (const [pid, threads] of state.projectThreads) {
+    const index = threads.findIndex(t => String(t.id) === threadId);
+    if (index < 0) continue;
+    const next = threads.slice();
+    next[index] = Object.assign({}, next[index], {
+      title:authority.common.title,
+      mode:authority.common.mode
+    });
+    state.projectThreads.set(pid, next);
+    reindexProjectThreads(pid, next);
+    renderProjectThreads(pid);
+  }
+  renderParentThreadButton();
+  renderSubagentsButton();
+}
+
+function renderCurrentThreadMetadata() {
+  if (!state.threadId || isDraftThread()) return;
+  const threadId = String(state.threadId);
+  const detail = composedThreadDetail(threadId);
+  if (!detail) return;
+  const effective = Object.assign({}, detail, pendingMetadataOverlay(threadId));
+  setMode(effective.mode || "build");
+  setPermissionPreset(effective.permission_preset || "ask_first");
+  if (effective.current_model) {
+    state.currentModel = effective.current_model;
     if (state.threadReadOnly) {
       if (!state.readOnlyProvider) {
-        state.readOnlyProvider = s.current_model.provider;
-      } else if (s.current_model.provider !== state.readOnlyProvider) {
-        // The verified cold-resume switch landed: the thread is live again under the new
-        // provider, so normal provider-lock rules apply from here on.
-        state.threadReadOnly = false;
-        state.readOnlyProvider = null;
-        state.readOnlyMessage = null;
-        updateReadOnlyBanner();
-        updateComposerControls();
-        notice(`Thread resumed under provider ${s.current_model.provider}.`);
+        state.readOnlyProvider = effective.current_model.provider;
       }
     }
     if (projectModelCatalogReady()) syncModelControls();
     else renderModelSelect();
   }
-  if (s.title) {
-    updateThreadRowTitle(s.id || s.thread_id || state.threadId, s.title);
-    setThreadTitle(s.title);
+  if (effective.title) setThreadTitle(effective.title);
+  if (effective.tokens) renderTokens(effective.tokens);
+  updateGauge(state.contextUsed, effective.context_window || 0);
+  updateComposerControls();
+}
+
+function applyThreadMetadata(s, recoverConflict) {
+  const identity = validThreadProjection("detail", s);
+  if (recoverConflict && identity) {
+    resetThreadAuthorityForDetailResync(identity.threadId);
   }
-  if (s.tokens) renderTokens(s.tokens);
-  updateGauge(state.contextUsed, s.context_window || 0);
-  if (shouldResetTranscript) {
-    resetTranscriptForAuthoritativeSnapshot();
+  const prior = s && composedThreadDetail(s.thread_id);
+  const result = reconcileThreadProjection("detail", s);
+  if (!result.accepted) {
+    if (result.conflict && state.ws && state.ws.readyState === WebSocket.OPEN) {
+      if (!state.pendingDetailConflictResyncs.has(result.threadId)) {
+        state.pendingDetailConflictResyncs.add(result.threadId);
+        resetThreadAuthorityForDetailResync(result.threadId);
+        if (String(state.threadId || "") === result.threadId) {
+          const request = { type:"subscribe", thread_id:result.threadId };
+          if (state.newestPersistedTurnId) {
+            request.since = state.newestPersistedTurnId;
+            state.awaitingIncrementalResync = true;
+            state.awaitingThreadResync = false;
+          } else {
+            state.awaitingThreadResync = true;
+            state.awaitingIncrementalResync = false;
+          }
+          send(request);
+        } else {
+          state.pendingDetailConflictResyncs.delete(result.threadId);
+        }
+      }
+    }
+    return result;
   }
-  releaseFirstTurnLockIfIdle(activeTurn);
+  if (recoverConflict) state.pendingDetailConflictResyncs.delete(result.threadId);
+  const current = composedThreadDetail(result.threadId);
+  if (state.threadReadOnly && state.readOnlyProvider && current && current.current_model &&
+      current.current_model.provider !== state.readOnlyProvider &&
+      (!prior || !prior.current_model ||
+       prior.current_model.provider !== current.current_model.provider)) {
+    state.threadReadOnly = false;
+    state.readOnlyProvider = null;
+    state.readOnlyMessage = null;
+    updateReadOnlyBanner();
+    notice(`Thread resumed under provider ${current.current_model.provider}.`);
+  }
+  if (result.commonValueChanged || result.equalRevision) syncDerivedThreadCommon(result.threadId);
+  if (state.threadId && String(state.threadId) === result.threadId) {
+    renderCurrentThreadMetadata();
+  }
+  return result;
+}
+
+function renderThreadState(s, activeTurn) {
+  if (!s) return;
+  const appliesBootstrap = Object.prototype.hasOwnProperty.call(s, "active_turn");
+  const recoverConflict = appliesBootstrap &&
+    state.pendingDetailConflictResyncs.has(String(s.thread_id || ""));
+  const shouldResetTranscript = appliesBootstrap &&
+    (state.awaitingInitialThreadState || state.awaitingThreadResync);
+  // An incremental resync keeps the transcript. Remember whether the viewport was pinned to the
+  // bottom now, before the in-flight turn is repainted, so we can restore that afterwards.
+  if (appliesBootstrap && state.awaitingIncrementalResync) {
+    state.resyncStickBottom = transcriptShouldStickToBottom();
+  }
+  if (appliesBootstrap) {
+    state.awaitingInitialThreadState = false;
+    state.awaitingThreadResync = false;
+  }
+  applyThreadMetadata(s, recoverConflict);
+  if (appliesBootstrap) {
+    if (shouldResetTranscript) resetTranscriptForAuthoritativeSnapshot();
+    releaseFirstTurnLockIfIdle(activeTurn);
+  }
 }
 
 // The first turn of a draft thread is started over HTTP, before this thread's socket exists, so the
@@ -3641,14 +4108,6 @@ function handleEvent(ev) {
       renderLiveTurnUserInput(ev.turn, ev.user_input);
       setTurnActive(true);
       setActiveThreadActivity("progress", true, "Turn running");
-      break;
-    case "context_window_updated":
-      if (ev.model && state.currentModel &&
-          ev.model.provider === state.currentModel.provider &&
-          ev.model.model === state.currentModel.model &&
-          Number.isFinite(ev.context_window) && ev.context_window > 0) {
-        updateGauge(state.contextUsed, ev.context_window);
-      }
       break;
     case "item_started":
       if (ev.item) {
@@ -8476,39 +8935,37 @@ function compactContext() {
 }
 
 $("modeSel").onchange = () => {
-  const previous = state.mode || "build";
   const mode = $("modeSel").value === "plan" ? "plan" : "build";
   if (isDraftThread()) {
     setMode(mode);
     return;
   }
   if (!state.threadId) {
-    setMode(previous);
+    setMode("build");
     return;
   }
-  if (send({ type:"switch_mode", thread_id: state.threadId, mode })) {
-    setMode(mode);
-  } else {
-    setMode(previous);
+  const requestId = beginMetadataAction("mode", { mode });
+  if (!send({ type:"switch_mode", request_id:requestId, thread_id:state.threadId, mode })) {
+    finishMetadataAction(requestId);
     notice(`Mode not changed: WebSocket is ${state.wsStatus}.`, "error");
   }
 };
 
 $("permissionPresetSel").onchange = () => {
-  const previous = state.permissionPreset || "ask_first";
   const preset = $("permissionPresetSel").value || "ask_first";
   if (isDraftThread()) {
     setPermissionPreset(preset);
     return;
   }
   if (!state.threadId) {
-    setPermissionPreset(previous);
+    setPermissionPreset("ask_first");
     return;
   }
-  if (send({ type:"set_permission_preset", thread_id: state.threadId, preset })) {
-    setPermissionPreset(preset);
-  } else {
-    setPermissionPreset(previous);
+  const requestId = beginMetadataAction("permission", { permission_preset:preset });
+  if (!send({
+    type:"set_permission_preset", request_id:requestId, thread_id:state.threadId, preset
+  })) {
+    finishMetadataAction(requestId);
     notice(`Permission preset not changed: WebSocket is ${state.wsStatus}.`, "error");
   }
 };
@@ -8650,42 +9107,44 @@ function sendSelectedModel() {
     syncEffortControl();
     return;
   }
-  const previous = state.currentModel;
   if (modelProviderLocked(model.provider)) {
     syncModelControls();
     notice(`Create a new thread to use models from provider ${model.provider}.`, "warning");
     return;
   }
   const next = { provider:model.provider, model:model.model, reasoning_effort:null };
-  state.currentModel = next;
-  pinDraftModel();
-  syncEffortControl();
-  if (isDraftThread()) return;
+  if (isDraftThread()) {
+    state.currentModel = next;
+    pinDraftModel();
+    syncEffortControl();
+    return;
+  }
   if (!state.threadId) return;
-  state.pendingModelBeforeSelect = previous ? { ...previous } : null;
-  if (!send({ type:"select_model", thread_id: state.threadId, model_ref:next })) {
-    state.pendingModelBeforeSelect = null;
-    state.currentModel = previous;
-    syncModelControls();
+  const requestId = beginMetadataAction("model", { current_model:next });
+  if (!send({
+    type:"select_model", request_id:requestId, thread_id:state.threadId, model_ref:next
+  })) {
+    finishMetadataAction(requestId);
     notice(`Model not changed: WebSocket is ${state.wsStatus}.`, "error");
   }
 }
 function sendSelectedEffort() {
   const model = selectedModelFromControl();
   if (!model) return;
-  const previous = state.currentModel;
   const effort = $("effortSel").value || null;
   const next = { provider:model.provider, model:model.model, reasoning_effort:effort };
-  state.currentModel = next;
-  pinDraftModel();
-  syncEffortControl();
-  if (isDraftThread()) return;
+  if (isDraftThread()) {
+    state.currentModel = next;
+    pinDraftModel();
+    syncEffortControl();
+    return;
+  }
   if (!state.threadId) return;
-  state.pendingModelBeforeSelect = previous ? { ...previous } : null;
-  if (!send({ type:"select_model", thread_id: state.threadId, model_ref:next })) {
-    state.pendingModelBeforeSelect = null;
-    state.currentModel = previous;
-    syncModelControls();
+  const requestId = beginMetadataAction("model", { current_model:next });
+  if (!send({
+    type:"select_model", request_id:requestId, thread_id:state.threadId, model_ref:next
+  })) {
+    finishMetadataAction(requestId);
     notice(`Reasoning effort not changed: WebSocket is ${state.wsStatus}.`, "error");
   }
 }

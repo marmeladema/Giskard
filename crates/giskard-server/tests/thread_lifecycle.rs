@@ -145,6 +145,7 @@ async fn thread_lifecycle_native_failure_preserves_local_thread() {
         .save_thread(
             pid,
             &ThreadFile {
+                revision: 0,
                 version: 1,
                 id: tid,
                 project_id: pid,

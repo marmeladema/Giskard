@@ -200,8 +200,12 @@ impl LiveBufferStore {
                     _ => None,
                 })
                 .collect();
-            let accumulated: Vec<WireAgentEvent> =
-                turn.events.iter().cloned().map(Into::into).collect();
+            let accumulated: Vec<WireAgentEvent> = turn
+                .events
+                .iter()
+                .cloned()
+                .filter_map(WireAgentEvent::from_agent_event)
+                .collect();
             // Answered requests still ride along in `accumulated` as `ServerRequestReceived`, and
             // replaying that renders an actionable card. Naming them lets the client render those
             // resolved instead, exactly as `answered_approvals` does.

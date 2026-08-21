@@ -28,9 +28,9 @@ use giskard_harness::{
     ThreadHandle,
 };
 use giskard_persist::PersistStore;
-use giskard_persist::store::{ProjectConfig, ThreadFile};
+use giskard_persist::store::{ProjectConfig, ThreadFile, ThreadMutation, TurnCommitOutcome};
 use giskard_proto::{
-    RunningTask, ServerMessage, ThreadActivity, ThreadActivityKind, TokenScope, WireAgentEvent,
+    RunningTask, ServerMessage, ThreadActivity, ThreadActivityKind, WireAgentEvent,
 };
 
 use crate::hub::Hub;
@@ -41,6 +41,7 @@ use crate::thread_graph::{
     ExistingLinkDisposition, classify_existing_link, load_thread_graph, parent_chain_is_valid,
     should_refresh_subagent_title,
 };
+use crate::thread_metadata::ThreadMetadataService;
 
 #[async_trait]
 pub trait HarnessFactory: Send + Sync {
@@ -417,6 +418,7 @@ struct RegistryShared {
     live_buffers: Arc<LiveBufferStore>,
     running_commands: Arc<RunningTaskStore>,
     store: Arc<PersistStore>,
+    thread_metadata: Arc<ThreadMetadataService>,
     ledger: LedgerHandle,
 }
 
@@ -428,6 +430,7 @@ impl RegistryShared {
         store: Arc<PersistStore>,
         ledger: LedgerHandle,
     ) -> Self {
+        let thread_metadata = Arc::new(ThreadMetadataService::new(store.clone(), hub.clone()));
         Self {
             harnesses: Arc::new(Mutex::new(HashMap::new())),
             threads: Arc::new(Mutex::new(HashMap::new())),
@@ -443,6 +446,7 @@ impl RegistryShared {
             live_buffers,
             running_commands,
             store,
+            thread_metadata,
             ledger,
         }
     }
@@ -467,6 +471,10 @@ impl HarnessRegistry {
             )),
             factory,
         }
+    }
+
+    pub(crate) fn thread_metadata_service(&self) -> Arc<ThreadMetadataService> {
+        self.shared.thread_metadata.clone()
     }
 
     /// Serialize persisted thread-graph mutations within one project. Child imports may originate
@@ -1803,12 +1811,11 @@ async fn materialize_subagent_thread(
         let desired_title = subagent_thread_title(&refreshed_info);
         if should_refresh_subagent_title(&existing.title, &desired_title) {
             shared
-                .store
-                .update_thread(project_id, existing.id, |thread| {
+                .thread_metadata
+                .mutate(project_id, existing.id, |thread| {
                     if should_refresh_subagent_title(&thread.title, &desired_title) {
                         thread.title = desired_title.clone();
                     }
-                    thread.updated_at = Utc::now();
                 })
                 .await
                 .map_err(|error| HarnessError::Protocol(error.to_string()))?;
@@ -1897,18 +1904,9 @@ async fn materialize_subagent_thread(
     }
     let current_model = handle.resumed_model.clone().unwrap_or(model);
     let info = subagent_info_with_agent_name(info, handle.agent_name.clone());
-    let native_model = Some(current_model.clone());
-    shared.threads.lock().await.insert(
-        handle.thread,
-        ThreadBinding {
-            project: project_id,
-            handle: handle.clone(),
-            native_model,
-        },
-    );
-
     let now = Utc::now();
     let thread_file = ThreadFile {
+        revision: 0,
         version: 1,
         id: handle.thread,
         project_id,
@@ -1929,11 +1927,26 @@ async fn materialize_subagent_thread(
         archived: false,
         git_workspace: None,
     };
-    shared
-        .store
-        .save_thread(project_id, &thread_file)
+    let thread_file = shared
+        .thread_metadata
+        .create(project_id, thread_file)
         .await
         .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+    let native_model = Some(current_model.clone());
+    shared.threads.lock().await.insert(
+        handle.thread,
+        ThreadBinding {
+            project: project_id,
+            handle: handle.clone(),
+            native_model,
+        },
+    );
+    // The thread and binding are durable even if observation setup below fails. Publish the
+    // creation now so a retry cannot leave the catalog unaware of an already-existing child.
+    shared
+        .thread_metadata
+        .publish_created(project_id, &thread_file)
+        .await;
     let policy = subagent_monitor_policy(Some(info.action), info.status);
     observe_external_subagent_with_context(
         project_id,
@@ -1945,7 +1958,7 @@ async fn materialize_subagent_thread(
             policy,
             fallback: info.fallback,
         },
-        shared,
+        shared.clone(),
     )
     .await?;
     Ok(Some(handle.thread))
@@ -2385,7 +2398,16 @@ async fn broadcast_event_with_user_input(
             turn,
             user_input,
         },
-        other => other.into(),
+        other => {
+            let Some(agent_event) = WireAgentEvent::from_agent_event(other) else {
+                warn!(
+                    %thread_id,
+                    "refusing to broadcast a metadata-only event on the transcript stream"
+                );
+                return;
+            };
+            agent_event
+        }
     };
     hub.broadcast(
         thread_id,
@@ -2905,7 +2927,7 @@ async fn forward_events(
                         continue;
                     }
                     persist_model_context_window(
-                        &store,
+                        &shared.thread_metadata,
                         project_id,
                         thread_id,
                         *turn,
@@ -2913,6 +2935,7 @@ async fn forward_events(
                         *context_window,
                     )
                     .await;
+                    continue;
                 }
 
                 match &event {
@@ -3388,8 +3411,7 @@ async fn persist_subagent_fallback_transcript(
         completed_at: Some(Utc::now()),
     };
     let outcome = persist_turn(
-        &shared.store,
-        &shared.hub,
+        &shared.thread_metadata,
         &shared.ledger,
         project_id,
         thread_id,
@@ -3491,8 +3513,7 @@ async fn complete_forwarded_turn(
         completed_at: Some(Utc::now()),
     };
     let persist_outcome = persist_turn(
-        &shared.store,
-        &shared.hub,
+        &shared.thread_metadata,
         &shared.ledger,
         project_id,
         thread_id,
@@ -3975,7 +3996,7 @@ async fn persisted_turn_ids(
 
 /// Persist an effective context window reported by the harness for a turn's model.
 async fn persist_model_context_window(
-    store: &PersistStore,
+    thread_metadata: &ThreadMetadataService,
     project_id: ProjectId,
     thread_id: ThreadId,
     turn_id: TurnId,
@@ -3984,32 +4005,34 @@ async fn persist_model_context_window(
 ) {
     let provider = model.provider.clone();
     let model_id = model.model.clone();
-    let stored_provider = provider.clone();
-    let stored_model_id = model_id.clone();
-    match store
-        .update_thread(project_id, thread_id, move |tf| {
-            tf.model_context_windows
-                .entry(stored_provider.clone())
-                .or_default()
-                .insert(stored_model_id.clone(), context_window);
-            if tf.current_model.provider == stored_provider
-                && tf.current_model.model == stored_model_id
-            {
-                tf.context_window = context_window;
-            }
+    let stored_model = model.clone();
+    match thread_metadata
+        .mutate(project_id, thread_id, move |tf| {
+            tf.record_model_context_window(&stored_model, context_window);
         })
         .await
     {
-        Ok(Some(_)) => info!(
+        Ok(ThreadMutation::Changed { after, .. }) => info!(
             %project_id,
             %thread_id,
             %turn_id,
+            metadata_revision = after.revision,
             provider = %provider,
             model = %model_id,
             context_window,
             "persisted harness-reported model context window"
         ),
-        Ok(None) => warn!(
+        Ok(ThreadMutation::Unchanged { current }) => debug!(
+            %project_id,
+            %thread_id,
+            %turn_id,
+            metadata_revision = current.revision,
+            provider = %provider,
+            model = %model_id,
+            context_window,
+            "harness-reported model context window was already current"
+        ),
+        Ok(ThreadMutation::Missing) => warn!(
             %project_id,
             %thread_id,
             %turn_id,
@@ -4041,8 +4064,7 @@ struct PersistTurnOutcome {
 }
 
 async fn persist_turn(
-    store: &PersistStore,
-    hub: &Hub,
+    thread_metadata: &ThreadMetadataService,
     ledger: &LedgerHandle,
     project_id: ProjectId,
     thread_id: ThreadId,
@@ -4067,19 +4089,25 @@ async fn persist_turn(
     // H3 ordering: append the turn to the authoritative JSONL history FIRST, then update the
     // metadata aggregates. A crash between the two leaves the turn in history but not yet in the
     // aggregates cache — recoverable via `recompute_aggregates`.
-    if let Err(e) = store.append_turn(project_id, thread_id, &turn).await {
-        warn!(
-            %project_id,
-            %thread_id,
-            turn = %turn_id,
-            status = ?status_kind,
-            item_count,
-            diff_count,
-            %e,
-            "failed to append turn to history; skipping metadata update"
-        );
-        return PersistTurnOutcome::default();
-    }
+    let commit = match thread_metadata
+        .append_turn(project_id, thread_id, &turn)
+        .await
+    {
+        Ok(commit) => commit,
+        Err(e) => {
+            warn!(
+                %project_id,
+                %thread_id,
+                turn = %turn_id,
+                status = ?status_kind,
+                item_count,
+                diff_count,
+                %e,
+                "failed to append turn to history; skipping metadata update"
+            );
+            return PersistTurnOutcome::default();
+        }
+    };
     info!(
         %project_id,
         %thread_id,
@@ -4092,22 +4120,11 @@ async fn persist_turn(
         "appended completed turn to history"
     );
 
-    // Metadata-only RMW under the per-thread lock (§5.4): fold usage into the aggregates cache.
-    // Context-window updates are persisted when the harness reports them; recomputing here would
-    // replace authoritative runtime metadata with a catalog fallback.
-    let updated = store
-        .update_thread(project_id, thread_id, move |tf| {
-            if should_record {
-                tf.tokens
-                    .record(&turn.model.provider, &turn.model.model, &turn.usage);
-            }
-            tf.updated_at = Utc::now();
-        })
-        .await;
-
-    let tf = match updated {
-        Ok(Some(tf)) => tf,
-        Ok(None) => {
+    match commit {
+        TurnCommitOutcome::MetadataMutation(
+            ThreadMutation::Changed { .. } | ThreadMutation::Unchanged { .. },
+        ) => {}
+        TurnCommitOutcome::MetadataMutation(ThreadMutation::Missing) => {
             warn!(
                 %project_id,
                 %thread_id,
@@ -4119,7 +4136,7 @@ async fn persist_turn(
                 metadata_updated: false,
             };
         }
-        Err(e) => {
+        TurnCommitOutcome::MetadataFailed(e) => {
             warn!(
                 %project_id,
                 %thread_id,
@@ -4132,7 +4149,7 @@ async fn persist_turn(
                 metadata_updated: false,
             };
         }
-    };
+    }
     info!(
         %project_id,
         %thread_id,
@@ -4148,19 +4165,6 @@ async fn persist_turn(
         ledger
             .record(project_id, date, provider, model, usage)
             .await;
-    }
-
-    // Push a thread-scoped token update to subscribers (§13.6).
-    if let Ok(ledger_json) = serde_json::to_value(&tf.tokens) {
-        hub.broadcast(
-            thread_id,
-            ServerMessage::TokenUpdate {
-                scope: TokenScope::Thread,
-                thread_id: Some(thread_id),
-                ledger: ledger_json,
-            },
-        )
-        .await;
     }
 
     PersistTurnOutcome {
@@ -4443,6 +4447,7 @@ mod tests {
             };
             let now = Utc::now();
             let thread = |id, harness_thread_id: &str, kind, parent_thread_id| ThreadFile {
+                revision: 0,
                 version: 1,
                 id,
                 project_id,
@@ -4596,6 +4601,7 @@ mod tests {
             .save_thread(
                 project_id,
                 &ThreadFile {
+                    revision: 0,
                     version: 1,
                     id: thread_id,
                     project_id,
@@ -4622,7 +4628,8 @@ mod tests {
 
         let hub = Arc::new(Hub::new());
         let (client_tx, mut client_rx) = mpsc::channel(8);
-        hub.subscribe(thread_id, 1, client_tx).await;
+        let _replacements = hub.register_client(1, client_tx).await;
+        assert!(hub.subscribe(thread_id, 1).await);
         let shared = Arc::new(super::RegistryShared::new(
             hub,
             Arc::new(LiveBufferStore::new()),
@@ -4985,6 +4992,7 @@ mod tests {
             .save_thread(
                 project_id,
                 &ThreadFile {
+                    revision: 0,
                     version: 1,
                     id: thread_id,
                     project_id,
@@ -5011,8 +5019,9 @@ mod tests {
 
         let (tx, _) = broadcast::channel(16);
         let hub = Arc::new(Hub::new());
-        let (client_tx, mut client_rx) = mpsc::channel(16);
-        hub.subscribe(thread_id, 1, client_tx).await;
+        let (client_tx, _client_rx) = mpsc::channel(16);
+        let replacements = hub.register_client(1, client_tx.clone()).await;
+        assert!(hub.subscribe(thread_id, 1).await);
         let ledger = ledger::spawn(store.clone());
         let handle = spawn_forwarder_handle(
             thread_id,
@@ -5071,12 +5080,10 @@ mod tests {
             persisted.model_context_windows.is_empty(),
             "a mismatched turn model must not be persisted"
         );
-        while let Ok(message) = client_rx.try_recv() {
-            assert!(
-                !matches!(message, ServerMessage::Event { agent_event, .. }
-                    if matches!(agent_event.as_ref(), WireAgentEvent::ContextWindowUpdated { .. })),
-                "a mismatched turn model must not be broadcast"
-            );
+        while let Some(message) = replacements.try_recv() {
+            if let ServerMessage::ThreadState(state) = message {
+                assert_ne!(state.metadata.context_window, 400_000);
+            }
         }
     }
 
@@ -5101,6 +5108,7 @@ mod tests {
             .save_thread(
                 project_id,
                 &ThreadFile {
+                    revision: 0,
                     version: 1,
                     id: thread_id,
                     project_id,
@@ -5127,8 +5135,9 @@ mod tests {
 
         let (tx, _) = broadcast::channel(16);
         let hub = Arc::new(Hub::new());
-        let (client_tx, mut client_rx) = mpsc::channel(16);
-        hub.subscribe(thread_id, 1, client_tx).await;
+        let (client_tx, _client_rx) = mpsc::channel(16);
+        let replacements = hub.register_client(1, client_tx.clone()).await;
+        assert!(hub.subscribe(thread_id, 1).await);
         let ledger = ledger::spawn(store.clone());
         let handle = spawn_forwarder_handle(
             thread_id,
@@ -5187,26 +5196,22 @@ mod tests {
             Some(&258_400)
         );
 
-        let mut matching_updates = 0;
-        while let Ok(message) = client_rx.try_recv() {
-            if let ServerMessage::Event { agent_event, .. } = message
-                && let WireAgentEvent::ContextWindowUpdated {
-                    thread,
-                    turn,
-                    model: event_model,
-                    context_window,
-                } = *agent_event
-            {
-                matching_updates += 1;
-                assert_eq!(thread, thread_id);
-                assert_eq!(turn, turn_id);
-                assert_eq!(event_model, model);
-                assert_eq!(context_window, 258_400);
+        let mut matching_states = 0;
+        while let Some(message) = replacements.try_recv() {
+            if let ServerMessage::ThreadState(state) = message {
+                assert_eq!(state.metadata.thread_id, thread_id);
+                assert!(state.metadata.revision <= persisted.revision);
+                assert_eq!(state.active_turn, None);
+                if state.metadata.context_window == 258_400 {
+                    matching_states += 1;
+                    assert_eq!(state.metadata.revision, persisted.revision);
+                    assert_eq!(state.metadata.current_model, model);
+                }
             }
         }
         assert_eq!(
-            matching_updates, 1,
-            "matching update must be broadcast once"
+            matching_states, 1,
+            "matching update must survive coalescing into the latest committed thread state"
         );
     }
 
@@ -5231,6 +5236,7 @@ mod tests {
             .save_thread(
                 project_id,
                 &ThreadFile {
+                    revision: 0,
                     version: 1,
                     id: thread_id,
                     project_id,
@@ -5355,6 +5361,7 @@ mod tests {
             .save_thread(
                 project_id,
                 &ThreadFile {
+                    revision: 0,
                     version: 1,
                     id: thread_id,
                     project_id,
@@ -5510,6 +5517,7 @@ mod tests {
             .save_thread(
                 project_id,
                 &ThreadFile {
+                    revision: 0,
                     version: 1,
                     id: thread_id,
                     project_id,
@@ -5635,6 +5643,7 @@ mod tests {
             .save_thread(
                 project_id,
                 &ThreadFile {
+                    revision: 0,
                     version: 1,
                     id: thread_id,
                     project_id,
@@ -5767,6 +5776,7 @@ mod tests {
             .save_thread(
                 project_id,
                 &ThreadFile {
+                    revision: 0,
                     version: 1,
                     id: thread_id,
                     project_id,
@@ -5833,7 +5843,8 @@ mod tests {
         let (tx, _) = broadcast::channel(16);
         let hub = Arc::new(Hub::new());
         let (client_tx, mut client_rx) = mpsc::channel(16);
-        hub.subscribe(thread_id, 1, client_tx).await;
+        let _replacements = hub.register_client(1, client_tx).await;
+        assert!(hub.subscribe(thread_id, 1).await);
         let live_buffers = Arc::new(LiveBufferStore::new());
         let running_commands = Arc::new(RunningTaskStore::new());
         let approvals = Arc::new(Mutex::new(Default::default()));
@@ -5923,6 +5934,7 @@ mod tests {
             .save_thread(
                 project_id,
                 &ThreadFile {
+                    revision: 0,
                     version: 1,
                     id: thread_id,
                     project_id,
@@ -5955,7 +5967,8 @@ mod tests {
         let server_requests = Arc::new(Mutex::new(Default::default()));
         let ledger = ledger::spawn(store.clone());
         let (client_tx, mut client_rx) = mpsc::channel(16);
-        hub.subscribe(thread_id, 1, client_tx).await;
+        let _replacements = hub.register_client(1, client_tx).await;
+        assert!(hub.subscribe(thread_id, 1).await);
 
         spawn_forwarder(
             thread_id,
@@ -6022,6 +6035,7 @@ mod tests {
             .save_thread(
                 project_id,
                 &ThreadFile {
+                    revision: 0,
                     version: 1,
                     id: thread_id,
                     project_id,
@@ -6054,7 +6068,8 @@ mod tests {
         let server_requests = Arc::new(Mutex::new(Default::default()));
         let ledger = ledger::spawn(store.clone());
         let (client_tx, mut client_rx) = mpsc::channel(16);
-        hub.subscribe(thread_id, 1, client_tx).await;
+        let _replacements = hub.register_client(1, client_tx).await;
+        assert!(hub.subscribe(thread_id, 1).await);
 
         spawn_forwarder(
             thread_id,
@@ -6191,6 +6206,7 @@ mod tests {
             .save_thread(
                 project_id,
                 &ThreadFile {
+                    revision: 0,
                     version: 1,
                     id: thread_id,
                     project_id,
@@ -6223,7 +6239,8 @@ mod tests {
         let server_requests = Arc::new(Mutex::new(Default::default()));
         let ledger = ledger::spawn(store.clone());
         let (client_tx, mut client_rx) = mpsc::channel(16);
-        hub.subscribe(thread_id, 1, client_tx).await;
+        let _replacements = hub.register_client(1, client_tx).await;
+        assert!(hub.subscribe(thread_id, 1).await);
 
         spawn_forwarder(
             thread_id,
@@ -6255,21 +6272,29 @@ mod tests {
         })
         .unwrap();
 
-        let received = tokio::time::timeout(tokio::time::Duration::from_secs(2), client_rx.recv())
-            .await
-            .expect("broadcast")
-            .expect("message");
-        match received {
-            ServerMessage::Event { agent_event, .. } => match *agent_event {
-                WireAgentEvent::ServerRequestReceived { turn, request, .. } => {
-                    assert!(turn.is_none());
-                    assert_eq!(request.id, request_id);
-                    assert_eq!(request.method, "mcpServer/elicitation/request");
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
+            loop {
+                match client_rx
+                    .recv()
+                    .await
+                    .expect("subscriber should remain connected")
+                {
+                    ServerMessage::Event { agent_event, .. } => match *agent_event {
+                        WireAgentEvent::ServerRequestReceived { turn, request, .. } => {
+                            assert!(turn.is_none());
+                            assert_eq!(request.id, request_id);
+                            assert_eq!(request.method, "mcpServer/elicitation/request");
+                            break;
+                        }
+                        other => panic!("expected turnless server request event, got {other:?}"),
+                    },
+                    ServerMessage::ThreadActivity(_) => {}
+                    other => panic!("expected turnless server request event, got {other:?}"),
                 }
-                other => panic!("expected turnless server request event, got {other:?}"),
-            },
-            other => panic!("expected turnless server request event, got {other:?}"),
-        }
+            }
+        })
+        .await
+        .expect("normal forwarder should broadcast the turnless request");
 
         assert_eq!(
             server_requests.lock().await.get(&request_id).copied(),
@@ -6309,7 +6334,8 @@ mod tests {
         let passive_stream = AgentEventStream::new(tx.subscribe());
         let hub = Arc::new(Hub::new());
         let (client_tx, mut client_rx) = mpsc::channel(16);
-        hub.subscribe(thread_id, 1, client_tx).await;
+        let _replacements = hub.register_client(1, client_tx).await;
+        assert!(hub.subscribe(thread_id, 1).await);
         let shared = Arc::new(super::RegistryShared::new(
             hub,
             Arc::new(LiveBufferStore::new()),
@@ -6371,19 +6397,41 @@ mod tests {
         })
         .unwrap();
 
-        let first = tokio::time::timeout(tokio::time::Duration::from_secs(1), client_rx.recv())
-            .await
-            .expect("normal forwarder should broadcast the turnless notice")
-            .expect("subscriber should remain connected");
-        assert!(matches!(
-            first,
-            ServerMessage::Event { agent_event, .. }
-                if matches!(*agent_event, WireAgentEvent::Notice { .. })
-        ));
+        tokio::time::timeout(tokio::time::Duration::from_secs(1), async {
+            loop {
+                match client_rx
+                    .recv()
+                    .await
+                    .expect("subscriber should remain connected")
+                {
+                    ServerMessage::Event { agent_event, .. }
+                        if matches!(*agent_event, WireAgentEvent::Notice { .. }) =>
+                    {
+                        break;
+                    }
+                    ServerMessage::ThreadActivity(_) => {}
+                    other => panic!("expected turnless notice event, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("normal forwarder should broadcast the turnless notice");
+        let duplicate = tokio::time::timeout(tokio::time::Duration::from_millis(100), async {
+            loop {
+                match client_rx.recv().await {
+                    Some(ServerMessage::Event { agent_event, .. })
+                        if matches!(*agent_event, WireAgentEvent::Notice { .. }) =>
+                    {
+                        return true;
+                    }
+                    Some(_) => {}
+                    None => return false,
+                }
+            }
+        })
+        .await;
         assert!(
-            tokio::time::timeout(tokio::time::Duration::from_millis(100), client_rx.recv())
-                .await
-                .is_err(),
+            duplicate.is_err() || matches!(duplicate, Ok(false)),
             "passive and user forwarders must not both broadcast the same turnless event"
         );
 
@@ -6418,6 +6466,7 @@ mod tests {
             .save_thread(
                 project_id,
                 &ThreadFile {
+                    revision: 0,
                     version: 1,
                     id: thread_id,
                     project_id,
@@ -6445,7 +6494,8 @@ mod tests {
         let (tx, _) = broadcast::channel(64);
         let hub = Arc::new(Hub::new());
         let (client_tx, mut client_rx) = mpsc::channel(16);
-        hub.subscribe(thread_id, 1, client_tx).await;
+        let _replacements = hub.register_client(1, client_tx).await;
+        assert!(hub.subscribe(thread_id, 1).await);
         let live_buffers = Arc::new(LiveBufferStore::new());
         let running_commands = Arc::new(RunningTaskStore::new());
         let approvals = Arc::new(Mutex::new(Default::default()));
@@ -6532,6 +6582,7 @@ mod tests {
             .save_thread(
                 project_id,
                 &ThreadFile {
+                    revision: 0,
                     version: 1,
                     id: thread_id,
                     project_id,
@@ -6559,7 +6610,8 @@ mod tests {
         let (tx, _) = broadcast::channel(64);
         let hub = Arc::new(Hub::new());
         let (client_tx, mut client_rx) = mpsc::channel(16);
-        hub.subscribe(thread_id, 1, client_tx).await;
+        let _replacements = hub.register_client(1, client_tx).await;
+        assert!(hub.subscribe(thread_id, 1).await);
         let live_buffers = Arc::new(LiveBufferStore::new());
         let running_commands = Arc::new(RunningTaskStore::new());
         let approvals = Arc::new(Mutex::new(Default::default()));
@@ -6789,6 +6841,7 @@ mod tests {
             .save_thread(
                 project_id,
                 &ThreadFile {
+                    revision: 0,
                     version: 1,
                     id: thread_id,
                     project_id,
@@ -6852,7 +6905,8 @@ mod tests {
         let (tx, _) = broadcast::channel(64);
         let hub = Arc::new(Hub::new());
         let (client_tx, mut client_rx) = mpsc::channel(64);
-        hub.subscribe(thread_id, 1, client_tx).await;
+        let _replacements = hub.register_client(1, client_tx).await;
+        assert!(hub.subscribe(thread_id, 1).await);
         let live_buffers = Arc::new(LiveBufferStore::new());
         let running_commands = Arc::new(RunningTaskStore::new());
         let approvals = Arc::new(Mutex::new(Default::default()));
@@ -6988,6 +7042,7 @@ mod tests {
             .save_thread(
                 project_id,
                 &ThreadFile {
+                    revision: 0,
                     version: 1,
                     id: thread_id,
                     project_id,
@@ -7049,7 +7104,8 @@ mod tests {
         let (tx, _) = broadcast::channel(64);
         let hub = Arc::new(Hub::new());
         let (client_tx, mut client_rx) = mpsc::channel(64);
-        hub.subscribe(thread_id, 1, client_tx).await;
+        let _replacements = hub.register_client(1, client_tx).await;
+        assert!(hub.subscribe(thread_id, 1).await);
         let live_buffers = Arc::new(LiveBufferStore::new());
         let running_commands = Arc::new(RunningTaskStore::new());
         let approvals = Arc::new(Mutex::new(Default::default()));
@@ -7197,6 +7253,7 @@ mod tests {
             .save_thread(
                 project_id,
                 &ThreadFile {
+                    revision: 0,
                     version: 1,
                     id: thread_id,
                     project_id,
@@ -7224,7 +7281,8 @@ mod tests {
         let (tx, _) = broadcast::channel(64);
         let hub = Arc::new(Hub::new());
         let (client_tx, mut client_rx) = mpsc::channel(64);
-        hub.subscribe(thread_id, 1, client_tx).await;
+        let _replacements = hub.register_client(1, client_tx).await;
+        assert!(hub.subscribe(thread_id, 1).await);
         let live_buffers = Arc::new(LiveBufferStore::new());
         let running_commands = Arc::new(RunningTaskStore::new());
         let approvals = Arc::new(Mutex::new(Default::default()));

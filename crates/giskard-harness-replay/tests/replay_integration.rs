@@ -299,6 +299,7 @@ async fn replay_persisted_state_roundtrip() {
 
     let now = Utc::now();
     let thread_file = giskard_persist::store::ThreadFile {
+        revision: 0,
         version: 1,
         id: thread_id,
         project_id: pid,

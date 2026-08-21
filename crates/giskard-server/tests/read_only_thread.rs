@@ -173,6 +173,7 @@ fn make_turn(text: &str) -> Turn {
 fn seeded_thread(project_id: ProjectId, thread_id: ThreadId) -> ThreadFile {
     let now = Utc::now();
     ThreadFile {
+        revision: 0,
         version: 1,
         id: thread_id,
         project_id,

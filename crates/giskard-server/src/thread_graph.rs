@@ -238,6 +238,7 @@ mod tests {
 
     fn thread(id: ThreadId, kind: ThreadKind, parent: Option<ThreadId>) -> ThreadFile {
         ThreadFile {
+            revision: 0,
             version: 1,
             id,
             project_id: ProjectId::new(),
