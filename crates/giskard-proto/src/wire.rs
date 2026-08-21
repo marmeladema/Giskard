@@ -45,12 +45,6 @@ pub enum WireAgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         user_input: Option<UserInput>,
     },
-    ContextWindowUpdated {
-        thread: ThreadId,
-        turn: TurnId,
-        model: ModelRef,
-        context_window: u32,
-    },
     ItemStarted {
         thread: ThreadId,
         turn: TurnId,
@@ -314,9 +308,13 @@ pub enum WireApprovalMetadata {
 
 // ---- core → wire conversions (lossy path narrowing happens here, server-side) ----
 
-impl From<AgentEvent> for WireAgentEvent {
-    fn from(e: AgentEvent) -> Self {
-        match e {
+impl WireAgentEvent {
+    /// Convert a harness event that belongs on the browser's transcript stream.
+    ///
+    /// Context-window updates mutate revisioned thread metadata instead, so they deliberately
+    /// have no wire-event representation.
+    pub fn from_agent_event(e: AgentEvent) -> Option<Self> {
+        let event = match e {
             AgentEvent::ThreadOpened {
                 thread,
                 harness_thread_id,
@@ -329,17 +327,7 @@ impl From<AgentEvent> for WireAgentEvent {
                 turn,
                 user_input: None,
             },
-            AgentEvent::ContextWindowUpdated {
-                thread,
-                turn,
-                model,
-                context_window,
-            } => Self::ContextWindowUpdated {
-                thread,
-                turn,
-                model,
-                context_window,
-            },
+            AgentEvent::ContextWindowUpdated { .. } => return None,
             AgentEvent::ItemStarted { thread, turn, item } => Self::ItemStarted {
                 thread,
                 turn,
@@ -422,7 +410,8 @@ impl From<AgentEvent> for WireAgentEvent {
                 turn,
                 message,
             },
-        }
+        };
+        Some(event)
     }
 }
 
@@ -804,11 +793,26 @@ mod tests {
             turn: None,
             error: HarnessError::Protocol("bad frame".into()),
         };
-        let wire: WireAgentEvent = core.into();
+        let wire = WireAgentEvent::from_agent_event(core).unwrap();
         let json = serde_json::to_value(&wire).unwrap();
         assert_eq!(json["kind"], "error");
         assert_eq!(json["error"]["code"], "harness_protocol_error");
         assert_eq!(json["error"]["message"], "protocol error: bad frame");
+    }
+
+    #[test]
+    fn context_window_update_has_no_transcript_wire_variant() {
+        let event = AgentEvent::ContextWindowUpdated {
+            thread: ThreadId::new(),
+            turn: TurnId::new(),
+            model: ModelRef {
+                provider: "openai".into(),
+                model: "gpt-5.5".into(),
+                reasoning_effort: None,
+            },
+            context_window: 258_400,
+        };
+        assert!(WireAgentEvent::from_agent_event(event).is_none());
     }
 
     #[test]
@@ -825,7 +829,7 @@ mod tests {
             status: Some(SubagentStatus::Running),
             message: None,
         };
-        let started: WireAgentEvent = AgentEvent::ItemStarted {
+        let started = WireAgentEvent::from_agent_event(AgentEvent::ItemStarted {
             thread,
             turn,
             item: ItemStart {
@@ -843,9 +847,9 @@ mod tests {
                     started_at_ms: None,
                 }),
             },
-        }
-        .into();
-        let completed: WireAgentEvent = AgentEvent::ItemCompleted {
+        })
+        .unwrap();
+        let completed = WireAgentEvent::from_agent_event(AgentEvent::ItemCompleted {
             thread,
             turn,
             item: Item {
@@ -859,8 +863,8 @@ mod tests {
                 },
                 created_at: Utc::now(),
             },
-        }
-        .into();
+        })
+        .unwrap();
 
         for event in [started, completed] {
             let json = serde_json::to_value(event).unwrap();

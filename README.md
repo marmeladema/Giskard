@@ -397,7 +397,10 @@ From the checkout without installing, use
 The browser (and any client) drives everything through a small REST surface plus one
 multiplexed WebSocket; the full endpoint inventory and behavior notes live in
 [`docs/api-endpoints.md`](docs/api-endpoints.md). Wire types are defined once in
-`giskard-proto`; see [§13.6](specs/giskard-specification.md) for the message protocol.
+`giskard-proto`; see [§13.6](specs/giskard-specification.md) for the message protocol. The embedded
+browser UI is version-paired with the server rather than backward-compatible with other wire
+versions. Persisted thread detail uses a typed, revisioned snapshot; catalog changes invalidate and
+refetch the authoritative HTTP thread list.
 
 ---
 

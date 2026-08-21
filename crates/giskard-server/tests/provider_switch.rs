@@ -192,6 +192,7 @@ fn seeded_thread(
 ) -> ThreadFile {
     let now = Utc::now();
     ThreadFile {
+        revision: 0,
         version: 1,
         id: thread_id,
         project_id,
@@ -419,6 +420,7 @@ async fn cold_provider_switch_succeeds_and_binds_the_thread() {
         &mut ws,
         &ClientMessage::SelectModel {
             thread_id: srv.tid,
+            request_id: "select-model-1".into(),
             model_ref: new_model(),
         },
     )
@@ -426,11 +428,11 @@ async fn cold_provider_switch_succeeds_and_binds_the_thread() {
 
     // …and the broadcast thread state reports the new provider.
     let state_msg = next_matching(&mut ws, |v| {
-        v["type"] == "thread_state" && v["state"]["current_model"]["provider"] == NEW_PROVIDER
+        v["type"] == "thread_state" && v["current_model"]["provider"] == NEW_PROVIDER
     })
     .await
     .expect("thread state under the new provider");
-    assert_eq!(state_msg["state"]["current_model"]["model"], "glm-5.2");
+    assert_eq!(state_msg["current_model"]["model"], "glm-5.2");
 
     // Persisted and natively bound.
     let tf = srv
@@ -454,6 +456,7 @@ async fn cold_provider_switch_succeeds_and_binds_the_thread() {
         &mut ws,
         &ClientMessage::SelectModel {
             thread_id: srv.tid,
+            request_id: "select-model-2".into(),
             model_ref: ModelRef {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
@@ -462,9 +465,10 @@ async fn cold_provider_switch_succeeds_and_binds_the_thread() {
         },
     )
     .await;
-    next_matching(&mut ws, |v| v["code"] == "thread_provider_locked")
+    let error = next_matching(&mut ws, |v| v["code"] == "thread_provider_locked")
         .await
         .expect("warm thread rejects a second provider change");
+    assert_eq!(error["request_id"], "select-model-2");
 }
 
 #[tokio::test]
@@ -503,12 +507,13 @@ async fn cold_provider_switch_reopens_worktree_thread_in_its_worktree() {
         &mut ws,
         &ClientMessage::SelectModel {
             thread_id: srv.tid,
+            request_id: "select-model-3".into(),
             model_ref: new_model(),
         },
     )
     .await;
     next_matching(&mut ws, |v| {
-        v["type"] == "thread_state" && v["state"]["current_model"]["provider"] == NEW_PROVIDER
+        v["type"] == "thread_state" && v["current_model"]["provider"] == NEW_PROVIDER
     })
     .await
     .expect("thread state under the new provider");
@@ -549,6 +554,7 @@ async fn unconfirmed_provider_switch_is_rejected_and_persists_nothing() {
         &mut ws,
         &ClientMessage::SelectModel {
             thread_id: srv.tid,
+            request_id: "select-model-4".into(),
             model_ref: new_model(),
         },
     )

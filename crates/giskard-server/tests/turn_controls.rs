@@ -281,6 +281,7 @@ async fn modes_models_approvals_and_plan_dump() {
     // --- SwitchMode -> Plan (persisted) ---
     ws.send(ws_text(&ClientMessage::SwitchMode {
         thread_id: tid,
+        request_id: "switch-mode".into(),
         mode: Mode::Plan,
     }))
     .await
@@ -291,6 +292,7 @@ async fn modes_models_approvals_and_plan_dump() {
     // --- SelectModel -> glm (context window loaded from the configured descriptor) ---
     ws.send(ws_text(&ClientMessage::SelectModel {
         thread_id: tid,
+        request_id: "select-model".into(),
         model_ref: ModelRef {
             provider: "cloudflare-litellm".into(),
             model: "@cf/z-ai/glm-4.7".into(),

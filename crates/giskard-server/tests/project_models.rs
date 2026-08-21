@@ -400,6 +400,7 @@ async fn catalog_effort_survives_new_thread_creation() {
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::SelectModel {
             thread_id,
+            request_id: "select-model".into(),
             model_ref: ModelRef {
                 provider: "mock".into(),
                 model: "glm-5.2".into(),

@@ -317,6 +317,7 @@ session_days = 30
     // Select a reasoning model with High effort (gpt-5.5 is declared in this test's config).
     ws.send(ws_text(&ClientMessage::SelectModel {
         thread_id,
+        request_id: "select-model-1".into(),
         model_ref: ModelRef {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
@@ -328,6 +329,7 @@ session_days = 30
     // Switch to Plan mode.
     ws.send(ws_text(&ClientMessage::SwitchMode {
         thread_id,
+        request_id: "switch-mode-1".into(),
         mode: Mode::Plan,
     }))
     .await
@@ -361,6 +363,7 @@ session_days = 30
     // Now set the thread permission preset and send again.
     ws.send(ws_text(&ClientMessage::SetPermissionPreset {
         thread_id,
+        request_id: "set-permission-1".into(),
         preset: PermissionPreset::FullAccess,
     }))
     .await
@@ -400,6 +403,7 @@ session_days = 30
     // remembered effort".
     ws.send(ws_text(&ClientMessage::SelectModel {
         thread_id,
+        request_id: "select-model-2".into(),
         model_ref: ModelRef {
             provider: "openai".into(),
             model: "gpt-5.5".into(),

@@ -3,10 +3,10 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tokio::sync::{Mutex, RwLock};
 
 use giskard_core::ids::{ProjectId, ThreadId, TurnId};
@@ -65,12 +65,18 @@ pub struct ProjectConfig {
 }
 
 /// `projects/<id>/threads/<thread_id>.json` — thread metadata and recomputable caches (§5.3/H1).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ThreadFile {
     pub version: u32,
     pub id: ThreadId,
     pub project_id: ProjectId,
+    /// Monotonic revision of this thread's durable metadata.
+    ///
+    /// Existing files predate the field and start at zero. The first real mutation advances to
+    /// one under the same per-thread lock that commits the change.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub revision: u64,
     pub title: String,
     pub harness_thread_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -110,6 +116,74 @@ pub struct ThreadFile {
     /// ordinary threads, which work in the project's own workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_workspace: Option<ThreadGitWorkspace>,
+}
+
+/// Whether and how a metadata mutation affects the thread's sidebar recency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadRecency {
+    /// Background repair, normalization, imports, and cache updates preserve ordering.
+    Preserve,
+    /// A user-visible mutation touches recency only when another durable field changed.
+    TouchIfChanged,
+    /// A completed turn is itself visible activity, even when no aggregate changed.
+    RecordActivity,
+    /// Crash repair restores the latest durable turn time without moving an old thread to now.
+    RestoreActivity(DateTime<Utc>),
+}
+
+/// Largest metadata revision represented exactly by the paired JavaScript client.
+///
+/// Revisions are JSON numbers on the wire. Advancing past JavaScript's maximum safe integer would
+/// make distinct durable revisions compare equal in the browser, so exhaustion is deliberately
+/// earlier than `u64::MAX`.
+const MAX_THREAD_REVISION: u64 = 9_007_199_254_740_991;
+
+/// Result of an attempted metadata mutation under the per-thread store lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadMutation {
+    Missing,
+    Unchanged {
+        current: Box<ThreadFile>,
+    },
+    Changed {
+        before: Box<ThreadFile>,
+        after: Box<ThreadFile>,
+    },
+}
+
+/// Result after a turn was appended to authoritative history.
+///
+/// A metadata failure is distinct from an append failure because the history line remains durable
+/// and must be repaired from JSONL later.
+#[derive(Debug)]
+pub enum TurnCommitOutcome {
+    MetadataMutation(ThreadMutation),
+    MetadataFailed(PersistError),
+}
+
+impl ThreadMutation {
+    pub fn into_current(self) -> Option<ThreadFile> {
+        match self {
+            Self::Missing => None,
+            Self::Unchanged { current } => Some(*current),
+            Self::Changed { after, .. } => Some(*after),
+        }
+    }
+}
+
+impl ThreadFile {
+    /// Record a harness-reported window for an exact model and update the visible capacity only
+    /// when that provider/model is selected. Reasoning effort is not part of capacity identity.
+    pub fn record_model_context_window(&mut self, model: &ModelRef, context_window: u32) {
+        self.model_context_windows
+            .entry(model.provider.clone())
+            .or_default()
+            .insert(model.model.clone(), context_window);
+        if self.current_model.provider == model.provider && self.current_model.model == model.model
+        {
+            self.context_window = context_window;
+        }
+    }
 }
 
 /// A Git workspace a thread owns, tagged by the strategy that produced it.
@@ -202,6 +276,20 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+fn next_recency(previous: DateTime<Utc>) -> Result<DateTime<Utc>, PersistError> {
+    let now = Utc::now();
+    if now > previous {
+        return Ok(now);
+    }
+    previous
+        .checked_add_signed(TimeDelta::nanoseconds(1))
+        .ok_or_else(|| PersistError::Invalid("thread recency timestamp exhausted".into()))
+}
+
 fn is_primary_thread(value: &ThreadKind) -> bool {
     *value == ThreadKind::Primary
 }
@@ -282,7 +370,7 @@ pub struct PersistStore {
     config: Mutex<Option<Config>>,
     project_index_lock: Mutex<()>,
     /// Per-thread-id write locks so read-modify-write of a thread file is single-writer (§5.4).
-    thread_locks: Mutex<HashMap<ThreadId, Arc<Mutex<()>>>>,
+    thread_locks: Mutex<HashMap<ThreadId, Weak<Mutex<()>>>>,
     /// Parsed JSONL history cache, keyed by `(project, thread)`.
     ///
     /// The JSONL remains authoritative. This per-process cache only avoids reparsing unchanged
@@ -626,17 +714,55 @@ impl PersistStore {
         project: ProjectId,
         thread: &ThreadFile,
     ) -> Result<(), PersistError> {
+        let lock = self.thread_lock(thread.id).await;
+        let _guard = lock.lock().await;
+        self.save_thread_unlocked(project, thread).await
+    }
+
+    async fn save_thread_unlocked(
+        &self,
+        project: ProjectId,
+        thread: &ThreadFile,
+    ) -> Result<(), PersistError> {
         atomic_write_json(&self.thread_json_path(project, thread.id), thread).await
+    }
+
+    /// Create a thread without overwriting an existing record. New durable records begin at
+    /// revision one; revision zero is reserved for files written before revisions existed.
+    pub async fn create_thread(
+        &self,
+        project: ProjectId,
+        mut thread: ThreadFile,
+    ) -> Result<ThreadFile, PersistError> {
+        if thread.project_id != project {
+            return Err(PersistError::Invalid(format!(
+                "thread {} belongs to project {}, not {project}",
+                thread.id, thread.project_id
+            )));
+        }
+        let lock = self.thread_lock(thread.id).await;
+        let _guard = lock.lock().await;
+        if self.load_thread(project, thread.id).await?.is_some() {
+            return Err(PersistError::Invalid(format!(
+                "thread {} already exists in project {project}",
+                thread.id
+            )));
+        }
+        thread.revision = 1;
+        self.save_thread_unlocked(project, &thread).await?;
+        Ok(thread)
     }
 
     /// Acquire (creating if needed) the per-thread write lock.
     async fn thread_lock(&self, thread: ThreadId) -> Arc<Mutex<()>> {
-        self.thread_locks
-            .lock()
-            .await
-            .entry(thread)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+        let mut locks = self.thread_locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&thread).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(thread, Arc::downgrade(&lock));
+        lock
     }
 
     /// Atomically read-modify-write a thread file under its per-thread lock (spec §5.4
@@ -644,24 +770,98 @@ impl PersistStore {
     /// back atomically before the lock is released, so concurrent mutations (a turn completing
     /// while the user switches model/mode/preset) cannot lose each other's updates.
     ///
-    /// Returns the updated file, or `Ok(None)` if the thread file does not exist.
+    /// Background mutations preserve recency by default. User actions and turn completion must
+    /// use [`Self::update_thread_with_recency`] with the appropriate explicit intent.
     pub async fn update_thread<F>(
         &self,
         project: ProjectId,
         thread: ThreadId,
         f: F,
-    ) -> Result<Option<ThreadFile>, PersistError>
+    ) -> Result<ThreadMutation, PersistError>
+    where
+        F: FnOnce(&mut ThreadFile),
+    {
+        self.update_thread_with_recency(project, thread, ThreadRecency::Preserve, f)
+            .await
+    }
+
+    /// Atomically mutate thread metadata, allocate its revision, and apply an explicit recency
+    /// policy. No-op mutations perform no write and do not advance either field.
+    pub async fn update_thread_with_recency<F>(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+        recency: ThreadRecency,
+        f: F,
+    ) -> Result<ThreadMutation, PersistError>
     where
         F: FnOnce(&mut ThreadFile),
     {
         let lock = self.thread_lock(thread).await;
         let _guard = lock.lock().await;
-        let Some(mut tf) = self.load_thread(project, thread).await? else {
-            return Ok(None);
+        self.update_thread_with_recency_unlocked(project, thread, recency, f)
+            .await
+    }
+
+    async fn update_thread_with_recency_unlocked<F>(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+        recency: ThreadRecency,
+        f: F,
+    ) -> Result<ThreadMutation, PersistError>
+    where
+        F: FnOnce(&mut ThreadFile),
+    {
+        let Some(before) = self.load_thread(project, thread).await? else {
+            return Ok(ThreadMutation::Missing);
         };
-        f(&mut tf);
-        self.save_thread(project, &tf).await?;
-        Ok(Some(tf))
+        let mut after = before.clone();
+        f(&mut after);
+
+        // The store, not mutation closures, owns both ordering fields.
+        after.revision = before.revision;
+        after.updated_at = before.updated_at;
+        if after.id != before.id
+            || after.project_id != before.project_id
+            || after.version != before.version
+            || after.created_at != before.created_at
+        {
+            return Err(PersistError::Invalid(format!(
+                "thread metadata mutation attempted to change store-owned identity for {thread}"
+            )));
+        }
+        let durable_fields_changed = after != before;
+        match recency {
+            ThreadRecency::Preserve => {}
+            ThreadRecency::TouchIfChanged if durable_fields_changed => {
+                after.updated_at = next_recency(before.updated_at)?;
+            }
+            ThreadRecency::RecordActivity => after.updated_at = next_recency(before.updated_at)?,
+            ThreadRecency::RestoreActivity(activity_at) if activity_at > before.updated_at => {
+                after.updated_at = activity_at;
+            }
+            ThreadRecency::RestoreActivity(_) => {}
+            ThreadRecency::TouchIfChanged => {}
+        }
+
+        if after == before {
+            return Ok(ThreadMutation::Unchanged {
+                current: Box::new(before),
+            });
+        }
+        after.revision = before
+            .revision
+            .checked_add(1)
+            .filter(|revision| *revision <= MAX_THREAD_REVISION)
+            .ok_or_else(|| {
+                PersistError::Invalid(format!("thread metadata revision exhausted for {thread}"))
+            })?;
+        self.save_thread_unlocked(project, &after).await?;
+        Ok(ThreadMutation::Changed {
+            before: Box::new(before),
+            after: Box::new(after),
+        })
     }
 
     // ---- Authoritative turn history (`<thread_id>.jsonl`, one Turn per line, spec §5.4 H1) ----
@@ -670,11 +870,22 @@ impl PersistStore {
     ///
     /// The pre-serialized `JSON + "\n"` is written with a **single** `write_all` to a file opened
     /// `O_APPEND`, so on a local POSIX filesystem the offset-seek + write is atomic against
-    /// concurrent writers and a process kill leaves the line all-or-nothing (no app lock needed for
-    /// append ordering). This does not survive power loss (page cache) — the tolerant loader
-    /// (`load_all_turns`) handles a torn final line. On NFS/network storage the atomicity guarantee
-    /// does not hold (out of scope, §1.2 local-first).
+    /// concurrent writers and a process kill leaves the line all-or-nothing. The per-thread lock is
+    /// still used to order appends against aggregate repair. This does not survive power loss (page
+    /// cache) — the tolerant loader (`load_all_turns`) handles a torn final line. On NFS/network
+    /// storage the atomicity guarantee does not hold (out of scope, §1.2 local-first).
     pub async fn append_turn(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+        turn: &Turn,
+    ) -> Result<(), PersistError> {
+        let lock = self.thread_lock(thread).await;
+        let _guard = lock.lock().await;
+        self.append_turn_unlocked(project, thread, turn).await
+    }
+
+    async fn append_turn_unlocked(
         &self,
         project: ProjectId,
         thread: ThreadId,
@@ -717,6 +928,46 @@ impl PersistStore {
         )
         .await;
         Ok(())
+    }
+
+    /// Append a completed turn and fold its usage into metadata under one per-thread lock.
+    ///
+    /// The JSONL append still happens first (H3). If the following atomic metadata write fails,
+    /// the returned outcome records that history was appended so callers can report the degraded
+    /// state accurately and a later aggregate repair can recover it.
+    pub async fn append_turn_and_update_aggregates(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+        turn: &Turn,
+    ) -> Result<TurnCommitOutcome, PersistError> {
+        let lock = self.thread_lock(thread).await;
+        let _guard = lock.lock().await;
+        self.append_turn_unlocked(project, thread, turn).await?;
+
+        let should_record = matches!(
+            turn.status.kind,
+            giskard_core::turn::TurnStatusKind::Completed
+                | giskard_core::turn::TurnStatusKind::Interrupted
+        );
+        let model = turn.model.clone();
+        let usage = turn.usage;
+        let mutation = self
+            .update_thread_with_recency_unlocked(
+                project,
+                thread,
+                ThreadRecency::RecordActivity,
+                move |thread| {
+                    if should_record {
+                        thread.tokens.record(&model.provider, &model.model, &usage);
+                    }
+                },
+            )
+            .await;
+        Ok(match mutation {
+            Ok(mutation) => TurnCommitOutcome::MetadataMutation(mutation),
+            Err(error) => TurnCommitOutcome::MetadataFailed(error),
+        })
     }
 
     async fn load_all_turns_uncached(
@@ -812,9 +1063,18 @@ impl PersistStore {
         &self,
         project: ProjectId,
         thread: ThreadId,
-    ) -> Result<Option<ThreadFile>, PersistError> {
+    ) -> Result<ThreadMutation, PersistError> {
+        let lock = self.thread_lock(thread).await;
+        let _guard = lock.lock().await;
         let turns = self.load_all_turns(project, thread).await?;
-        self.update_thread(project, thread, move |tf| {
+        let latest_activity = turns
+            .iter()
+            .map(|turn| turn.completed_at.unwrap_or(turn.started_at))
+            .max();
+        let recency = latest_activity
+            .map(ThreadRecency::RestoreActivity)
+            .unwrap_or(ThreadRecency::Preserve);
+        self.update_thread_with_recency_unlocked(project, thread, recency, move |tf| {
             let mut ledger = TokenLedger::default();
             for t in &turns {
                 if matches!(
@@ -861,10 +1121,14 @@ impl PersistStore {
         project: ProjectId,
         thread: ThreadId,
     ) -> Result<(), PersistError> {
-        // Remove both the metadata and the authoritative history (H1).
+        let lock = self.thread_lock(thread).await;
+        let _guard = lock.lock().await;
+        // Remove history first and metadata last. The catalog is derived from metadata, so a
+        // partial failure must leave the thread visible and retryable rather than deleting the
+        // catalog record while an undeleted history file remains.
         for path in [
-            self.thread_json_path(project, thread),
             self.thread_jsonl_path(project, thread),
+            self.thread_json_path(project, thread),
         ] {
             match tokio::fs::remove_file(&path).await {
                 Ok(_) => {}
@@ -999,6 +1263,216 @@ mod tests {
         }
     }
 
+    fn test_thread(project_id: ProjectId, thread_id: ThreadId) -> ThreadFile {
+        let now = Utc::now();
+        ThreadFile {
+            revision: 0,
+            version: SCHEMA_VERSION,
+            id: thread_id,
+            project_id,
+            title: "Thread".into(),
+            harness_thread_id: "native-thread".into(),
+            parent_thread_id: None,
+            spawned_by_turn_id: None,
+            kind: ThreadKind::Primary,
+            mode: Mode::Build,
+            current_model: test_model(),
+            context_window: 128_000,
+            model_context_windows: HashMap::new(),
+            permission_preset: PermissionPreset::AskFirst,
+            model_efforts: HashMap::new(),
+            tokens: TokenLedger::default(),
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            git_workspace: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_thread_allocates_revision_one_and_rejects_collision() {
+        let (_tmp, store) = make_store();
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let created = store
+            .create_thread(project_id, test_thread(project_id, thread_id))
+            .await
+            .unwrap();
+        assert_eq!(created.revision, 1);
+
+        let error = store
+            .create_thread(project_id, test_thread(project_id, thread_id))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PersistError::Invalid(_)));
+        assert_eq!(
+            store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_thread_keeps_metadata_when_history_removal_fails() {
+        let (_tmp, store) = make_store();
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        store
+            .create_thread(project_id, test_thread(project_id, thread_id))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(store.thread_jsonl_path(project_id, thread_id))
+            .await
+            .unwrap();
+
+        let error = store
+            .delete_thread(project_id, thread_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PersistError::Io(_)));
+        assert!(
+            store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "a partial delete must leave the catalog record visible for retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_op_mutation_does_not_write_or_advance_revision() {
+        let (_tmp, store) = make_store();
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        store
+            .create_thread(project_id, test_thread(project_id, thread_id))
+            .await
+            .unwrap();
+        let path = store.thread_json_path(project_id, thread_id);
+        let before = tokio::fs::read(&path).await.unwrap();
+
+        let mutation = store
+            .update_thread(project_id, thread_id, |_| {})
+            .await
+            .unwrap();
+        assert!(matches!(
+            mutation,
+            ThreadMutation::Unchanged { ref current } if current.revision == 1
+        ));
+        assert_eq!(tokio::fs::read(path).await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn recency_policy_is_monotonic_and_revision_is_checked() {
+        let (_tmp, store) = make_store();
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let mut thread = test_thread(project_id, thread_id);
+        thread.updated_at = Utc::now() + TimeDelta::days(1);
+        store.create_thread(project_id, thread).await.unwrap();
+
+        let preserved = store
+            .update_thread(project_id, thread_id, |thread| {
+                thread.title = "Background".into()
+            })
+            .await
+            .unwrap();
+        let preserved = preserved.into_current().unwrap();
+        let original_recency = preserved.updated_at;
+        assert_eq!(preserved.revision, 2);
+
+        let touched = store
+            .update_thread_with_recency(
+                project_id,
+                thread_id,
+                ThreadRecency::TouchIfChanged,
+                |thread| thread.mode = Mode::Plan,
+            )
+            .await
+            .unwrap()
+            .into_current()
+            .unwrap();
+        assert!(touched.updated_at > original_recency);
+        assert_eq!(touched.revision, 3);
+
+        let activity = store
+            .update_thread_with_recency(
+                project_id,
+                thread_id,
+                ThreadRecency::RecordActivity,
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .into_current()
+            .unwrap();
+        assert!(activity.updated_at > touched.updated_at);
+        assert_eq!(activity.revision, 4);
+
+        let mut exhausted = activity;
+        exhausted.revision = MAX_THREAD_REVISION - 1;
+        store.save_thread(project_id, &exhausted).await.unwrap();
+        let last = store
+            .update_thread(project_id, thread_id, |thread| {
+                thread.title = "Last exact revision".into()
+            })
+            .await
+            .unwrap()
+            .into_current()
+            .unwrap();
+        assert_eq!(last.revision, MAX_THREAD_REVISION);
+        let error = store
+            .update_thread(project_id, thread_id, |thread| {
+                thread.title = "Overflow".into()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PersistError::Invalid(_)));
+    }
+
+    #[tokio::test]
+    async fn mutation_rejects_store_owned_identity_changes() {
+        let (_tmp, store) = make_store();
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        store
+            .create_thread(project_id, test_thread(project_id, thread_id))
+            .await
+            .unwrap();
+        let error = store
+            .update_thread(project_id, thread_id, |thread| thread.id = ThreadId::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PersistError::Invalid(_)));
+        assert!(
+            store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn non_selected_model_window_is_cached_without_changing_visible_capacity() {
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let mut thread = test_thread(project_id, thread_id);
+        let other = ModelRef {
+            provider: "proxy".into(),
+            model: "other".into(),
+            reasoning_effort: None,
+        };
+        thread.record_model_context_window(&other, 64_000);
+        assert_eq!(thread.context_window, 128_000);
+        assert_eq!(thread.model_context_windows["proxy"]["other"], 64_000);
+    }
+
     #[tokio::test]
     async fn create_and_load_project() {
         let (_tmp, store) = make_store();
@@ -1070,6 +1544,7 @@ mod tests {
         let tid = ThreadId::new();
         let now = Utc::now();
         let thread = ThreadFile {
+            revision: 0,
             version: SCHEMA_VERSION,
             id: tid,
             project_id: pid,
@@ -1091,8 +1566,13 @@ mod tests {
             git_workspace: None,
         };
         store.save_thread(pid, &thread).await.unwrap();
+        let raw = tokio::fs::read_to_string(store.thread_json_path(pid, tid))
+            .await
+            .unwrap();
+        assert!(!raw.contains("\"revision\""));
 
         let loaded = store.load_thread(pid, tid).await.unwrap().unwrap();
+        assert_eq!(loaded.revision, 0);
         assert_eq!(loaded.title, "Fix auth");
         assert_eq!(loaded.harness_thread_id, "th_abc");
         assert_eq!(loaded.mode, Mode::Build);
@@ -1160,6 +1640,7 @@ mod tests {
         let tid = ThreadId::new();
         let now = Utc::now();
         let thread = ThreadFile {
+            revision: 0,
             version: SCHEMA_VERSION,
             id: tid,
             project_id: pid,
@@ -1216,6 +1697,7 @@ mod tests {
         let tid = ThreadId::new();
         let now = Utc::now();
         let thread = ThreadFile {
+            revision: 0,
             version: SCHEMA_VERSION,
             id: tid,
             project_id: pid,
@@ -1266,6 +1748,7 @@ mod tests {
         let now = Utc::now();
         for tid in [t1, t2] {
             let thread = ThreadFile {
+                revision: 0,
                 version: SCHEMA_VERSION,
                 id: tid,
                 project_id: pid,
@@ -1393,6 +1876,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn turn_commit_and_aggregate_repair_share_the_thread_lock() {
+        use giskard_core::token::TokenUsage;
+        use tokio::time::{Duration, timeout};
+
+        let (_tmp, store) = make_store();
+        let store = Arc::new(store);
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        store
+            .create_thread(project_id, test_thread(project_id, thread_id))
+            .await
+            .unwrap();
+
+        let lock = store.thread_lock(thread_id).await;
+        let guard = lock.lock().await;
+        let turn = make_turn(TokenUsage::new(100, 10));
+        let commit = tokio::spawn({
+            let store = store.clone();
+            let turn = turn.clone();
+            async move {
+                store
+                    .append_turn_and_update_aggregates(project_id, thread_id, &turn)
+                    .await
+            }
+        });
+        tokio::pin!(commit);
+        assert!(
+            timeout(Duration::from_millis(20), &mut commit)
+                .await
+                .is_err(),
+            "turn history must not append outside the aggregate transaction lock"
+        );
+        assert!(
+            store
+                .load_all_turns(project_id, thread_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        drop(guard);
+        assert!(matches!(
+            commit.await.unwrap().unwrap(),
+            TurnCommitOutcome::MetadataMutation(ThreadMutation::Changed { .. })
+        ));
+
+        // Model a crash after the JSONL append but before its metadata fold became durable.
+        let mut stale = store
+            .load_thread(project_id, thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        stale.tokens = TokenLedger::default();
+        stale.updated_at = turn.started_at - TimeDelta::days(1);
+        store.save_thread(project_id, &stale).await.unwrap();
+
+        let guard = lock.lock().await;
+        let repair = tokio::spawn({
+            let store = store.clone();
+            async move { store.recompute_aggregates(project_id, thread_id).await }
+        });
+        tokio::pin!(repair);
+        assert!(
+            timeout(Duration::from_millis(20), &mut repair)
+                .await
+                .is_err(),
+            "aggregate repair must not read history outside the transaction lock"
+        );
+        drop(guard);
+        let repaired = repair.await.unwrap().unwrap().into_current().unwrap();
+        assert_eq!(repaired.tokens.total, turn.usage);
+        assert!(repaired.updated_at >= turn.completed_at.unwrap());
+    }
+
+    #[tokio::test]
+    async fn turn_commit_reports_metadata_failure_after_durable_history_append() {
+        use giskard_core::token::TokenUsage;
+
+        let (_tmp, store) = make_store();
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let mut thread = store
+            .create_thread(project_id, test_thread(project_id, thread_id))
+            .await
+            .unwrap();
+        thread.revision = u64::MAX;
+        store.save_thread(project_id, &thread).await.unwrap();
+
+        let turn = make_turn(TokenUsage::new(100, 10));
+        assert!(matches!(
+            store
+                .append_turn_and_update_aggregates(project_id, thread_id, &turn)
+                .await
+                .unwrap(),
+            TurnCommitOutcome::MetadataFailed(PersistError::Invalid(_))
+        ));
+        assert_eq!(
+            store
+                .load_all_turns(project_id, thread_id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|turn| turn.id)
+                .collect::<Vec<_>>(),
+            vec![turn.id]
+        );
+        assert_eq!(
+            store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .tokens,
+            TokenLedger::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn inactive_thread_locks_are_pruned() {
+        let (_tmp, store) = make_store();
+        let project_id = ProjectId::new();
+        let first = ThreadId::new();
+        let second = ThreadId::new();
+
+        store
+            .create_thread(project_id, test_thread(project_id, first))
+            .await
+            .unwrap();
+        assert_eq!(store.thread_locks.lock().await.len(), 1);
+
+        store
+            .create_thread(project_id, test_thread(project_id, second))
+            .await
+            .unwrap();
+        let locks = store.thread_locks.lock().await;
+        assert_eq!(locks.len(), 1);
+        assert!(!locks.contains_key(&first));
+        assert!(locks.contains_key(&second));
+    }
+
+    #[tokio::test]
     async fn jsonl_history_append_load_page_and_recompute() {
         use giskard_core::token::TokenUsage;
         let (_tmp, store) = make_store();
@@ -1442,6 +2065,7 @@ mod tests {
             .save_thread(
                 pid,
                 &ThreadFile {
+                    revision: 0,
                     version: SCHEMA_VERSION,
                     id: tid,
                     project_id: pid,
@@ -1465,7 +2089,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let tf = store.recompute_aggregates(pid, tid).await.unwrap().unwrap();
+        let tf = store
+            .recompute_aggregates(pid, tid)
+            .await
+            .unwrap()
+            .into_current()
+            .unwrap();
         // 100+200+300 input, 30 output.
         assert_eq!(tf.tokens.total.input, 600);
         assert_eq!(tf.tokens.total.output, 30);
@@ -1623,6 +2252,7 @@ mod tests {
             .save_thread(
                 pid,
                 &ThreadFile {
+                    revision: 0,
                     version: SCHEMA_VERSION,
                     id: tid,
                     project_id: pid,
@@ -1646,7 +2276,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let tf = store.recompute_aggregates(pid, tid).await.unwrap().unwrap();
+        let tf = store
+            .recompute_aggregates(pid, tid)
+            .await
+            .unwrap()
+            .into_current()
+            .unwrap();
         assert_eq!(tf.tokens.total.input, 300);
         assert_eq!(tf.tokens.total.output, 30);
     }
@@ -1666,6 +2301,7 @@ mod tests {
             .save_thread(
                 pid,
                 &ThreadFile {
+                    revision: 0,
                     version: SCHEMA_VERSION,
                     id: tid,
                     project_id: pid,
@@ -1708,5 +2344,9 @@ mod tests {
 
         let tf = store.load_thread(pid, tid).await.unwrap().unwrap();
         assert_eq!(tf.context_window, 20, "all concurrent increments must land");
+        assert_eq!(
+            tf.revision, 20,
+            "each committed increment gets one revision"
+        );
     }
 }

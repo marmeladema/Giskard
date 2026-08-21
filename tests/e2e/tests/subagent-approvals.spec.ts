@@ -172,10 +172,22 @@ test.describe("sub-agent blocked on an approval", () => {
       // A synthetic project: root (the only thread with a sidebar row) → child → grandchild, plus a
       // self-referential record standing in for corrupted ownership metadata.
       app.rememberProjectThreads("synthetic-project", [
-        { id: "root", kind: "primary", parent_thread_id: null, title: "Root" },
-        { id: "child", kind: "subagent", parent_thread_id: "root", title: "Sub-agent: Child" },
-        { id: "grandchild", kind: "subagent", parent_thread_id: "child", title: "Sub-agent: Grandchild" },
-        { id: "loop", kind: "subagent", parent_thread_id: "loop", title: "Sub-agent: Loop" },
+        {
+          id: "root", revision: 1, kind: "primary", mode: "build",
+          parent_thread_id: null, title: "Root",
+        },
+        {
+          id: "child", revision: 1, kind: "subagent", mode: "build",
+          parent_thread_id: "root", title: "Sub-agent: Child",
+        },
+        {
+          id: "grandchild", revision: 1, kind: "subagent", mode: "build",
+          parent_thread_id: "child", title: "Sub-agent: Grandchild",
+        },
+        {
+          id: "loop", revision: 1, kind: "subagent", mode: "build",
+          parent_thread_id: "loop", title: "Sub-agent: Loop",
+        },
       ]);
       const row = document.createElement("div");
       row.className = "thread";

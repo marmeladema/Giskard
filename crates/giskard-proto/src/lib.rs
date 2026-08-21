@@ -64,14 +64,17 @@ pub enum ClientMessage {
     },
     SwitchMode {
         thread_id: ThreadId,
+        request_id: String,
         mode: Mode,
     },
     SelectModel {
         thread_id: ThreadId,
+        request_id: String,
         model_ref: ModelRef,
     },
     SetPermissionPreset {
         thread_id: ThreadId,
+        request_id: String,
         preset: PermissionPreset,
     },
     Interrupt {
@@ -110,13 +113,26 @@ pub enum ClientMessage {
 
 // ---- Server → Client ----
 
-/// A persisted thread snapshot sent on subscribe/resync (spec §13.6).
+/// Audited browser projection of persisted thread metadata (spec §13.6.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadMetadata {
+    pub thread_id: ThreadId,
+    pub revision: u64,
+    pub title: String,
+    pub mode: Mode,
+    pub current_model: ModelRef,
+    pub context_window: u32,
+    pub permission_preset: PermissionPreset,
+    pub tokens: TokenLedger,
+}
+
+/// A persisted thread snapshot sent on subscribe/resync or after a committed metadata mutation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadState {
-    pub thread_id: ThreadId,
-    pub state: serde_json::Value,
+    #[serde(flatten)]
+    pub metadata: ThreadMetadata,
     /// Whether a turn is in flight for this thread *right now*, answered from the server's turn
-    /// gate rather than from anything persisted in `state`.
+    /// gate rather than from anything persisted in [`Self::metadata`].
     ///
     /// A turn can be started over HTTP (`POST /threads/start`) before the browser's socket for that
     /// thread exists, so the client cannot always learn a turn's liveness from the event stream: if
@@ -125,7 +141,10 @@ pub struct ThreadState {
     /// whole turn — reserved before the start request returns, released when the turn ends — so it
     /// also covers the window before the harness emits its first event, where the live buffer is
     /// still empty but the turn is very much running.
-    pub active_turn: bool,
+    /// Live metadata publications omit this field because the metadata revision cannot order a
+    /// runtime transition. Subscribe/resync snapshots always include it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_turn: Option<bool>,
 }
 
 /// Lightweight cross-thread activity update for sidebar badges and browser notifications. This is
@@ -249,6 +268,9 @@ pub struct ErrorInfo {
     pub thread_id: Option<ThreadId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
+    /// Correlates a failed direct metadata action with its browser-side pending overlay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     /// Command process the error refers to, when the failing action targeted a specific command
     /// (e.g. `terminate_command`). Lets the client scope any recovery to that one command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -274,6 +296,16 @@ pub enum ServerMessage {
         activities: Vec<ThreadActivity>,
     },
     ThreadState(ThreadState),
+    /// Authoritative result of a browser-initiated metadata mutation. This is sent even when the
+    /// mutation is a no-op, so pending UI state never depends on a revision changing.
+    ThreadMetadataResult {
+        request_id: String,
+        #[serde(flatten)]
+        metadata: ThreadMetadata,
+    },
+    /// A committed thread-catalog projection changed. The browser refetches the authoritative
+    /// project list; repeated invalidations coalesce client-side.
+    ThreadCatalogChanged,
     /// A page of persisted history (H6), oldest-first; `has_more` if older turns exist before it.
     HistoryPage {
         thread_id: ThreadId,
@@ -292,18 +324,6 @@ pub enum ServerMessage {
         thread_id: ThreadId,
         tasks: Vec<RunningTask>,
     },
-    TokenUpdate {
-        scope: TokenScope,
-        /// Present for thread-scoped token updates so clients can reject stale frames that belong
-        /// to a previously selected thread.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        thread_id: Option<ThreadId>,
-        ledger: serde_json::Value,
-    },
-    ApprovalRequest {
-        thread_id: ThreadId,
-        request: WireApprovalRequest,
-    },
     ApprovalResolved {
         thread_id: ThreadId,
         request_id: String,
@@ -314,15 +334,6 @@ pub enum ServerMessage {
         error: ErrorInfo,
     },
     Pong,
-}
-
-/// Which level of token ledger was updated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TokenScope {
-    Thread,
-    Project,
-    Global,
 }
 
 // ---- HTTP API types ----
@@ -445,6 +456,8 @@ pub struct CreateProjectResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct ThreadSummary {
     pub id: ThreadId,
+    /// Same durable metadata revision carried by `ThreadState`.
+    pub revision: u64,
     pub title: String,
     /// Workspace root this thread reads and writes through. For isolated threads this is the
     /// worktree workspace, inherited by sub-agents; otherwise it is the project's workspace.
@@ -807,6 +820,7 @@ mod tests {
         let tid = ThreadId::new();
         let msg = ClientMessage::SetPermissionPreset {
             thread_id: tid,
+            request_id: "metadata-1".into(),
             preset: PermissionPreset::AskFirst,
         };
         let json = serde_json::to_value(&msg).unwrap();
@@ -815,10 +829,22 @@ mod tests {
         assert_eq!(json["preset"], "ask_first");
         assert!(json.get("project_id").is_none());
 
+        let mut missing_request_id = json.clone();
+        missing_request_id
+            .as_object_mut()
+            .unwrap()
+            .remove("request_id");
+        assert!(serde_json::from_value::<ClientMessage>(missing_request_id).is_err());
+
         let back: ClientMessage = serde_json::from_value(json).unwrap();
         match back {
-            ClientMessage::SetPermissionPreset { thread_id, preset } => {
+            ClientMessage::SetPermissionPreset {
+                thread_id,
+                request_id,
+                preset,
+            } => {
                 assert_eq!(thread_id, tid);
+                assert_eq!(request_id, "metadata-1");
                 assert_eq!(preset, PermissionPreset::AskFirst);
             }
             _ => panic!("wrong variant"),
@@ -915,32 +941,90 @@ mod tests {
     }
 
     #[test]
-    fn server_message_thread_token_update_carries_thread_id() {
+    fn thread_catalog_invalidation_is_one_global_signal() {
+        let json = serde_json::to_string(&ServerMessage::ThreadCatalogChanged).unwrap();
+        assert_eq!(json, "{\"type\":\"thread_catalog_changed\"}");
+        assert!(matches!(
+            serde_json::from_str::<ServerMessage>(&json).unwrap(),
+            ServerMessage::ThreadCatalogChanged
+        ));
+    }
+
+    #[test]
+    fn server_message_thread_state_is_a_typed_revisioned_projection() {
         let tid = ThreadId::new();
-        let msg = ServerMessage::TokenUpdate {
-            scope: TokenScope::Thread,
-            thread_id: Some(tid),
-            ledger: serde_json::json!({
-                "total": { "input": 10, "output": 5, "total": 15 }
-            }),
-        };
+        let msg = ServerMessage::ThreadState(ThreadState {
+            metadata: ThreadMetadata {
+                thread_id: tid,
+                revision: 7,
+                title: "Typed state".into(),
+                mode: Mode::Build,
+                current_model: ModelRef {
+                    provider: "openai".into(),
+                    model: "gpt-5.5".into(),
+                    reasoning_effort: None,
+                },
+                context_window: 258_400,
+                permission_preset: PermissionPreset::AskFirst,
+                tokens: TokenLedger::default(),
+            },
+            active_turn: None,
+        });
 
         let json = serde_json::to_value(&msg).unwrap();
-        assert_eq!(json["type"], "token_update");
-        assert_eq!(json["scope"], "thread");
+        assert_eq!(json["type"], "thread_state");
         assert_eq!(json["thread_id"], tid.to_string());
-        assert_eq!(json["ledger"]["total"]["total"], 15);
+        assert_eq!(json["revision"], 7);
+        assert_eq!(json["context_window"], 258_400);
+        assert!(json.get("active_turn").is_none());
 
         let back: ServerMessage = serde_json::from_value(json).unwrap();
         match back {
-            ServerMessage::TokenUpdate {
-                scope,
-                thread_id,
-                ledger,
+            ServerMessage::ThreadState(state) => {
+                assert_eq!(state.metadata.thread_id, tid);
+                assert_eq!(state.metadata.revision, 7);
+                assert_eq!(state.active_turn, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn metadata_action_result_is_correlated_and_authoritative() {
+        let tid = ThreadId::new();
+        let msg = ServerMessage::ThreadMetadataResult {
+            request_id: "metadata-7".into(),
+            metadata: ThreadMetadata {
+                thread_id: tid,
+                revision: 7,
+                title: "Committed state".into(),
+                mode: Mode::Plan,
+                current_model: ModelRef {
+                    provider: "openai".into(),
+                    model: "gpt-5.5".into(),
+                    reasoning_effort: None,
+                },
+                context_window: 258_400,
+                permission_preset: PermissionPreset::AskFirst,
+                tokens: TokenLedger::default(),
+            },
+        };
+
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "thread_metadata_result");
+        assert_eq!(json["request_id"], "metadata-7");
+        assert_eq!(json["thread_id"], tid.to_string());
+        assert_eq!(json["revision"], 7);
+
+        let back: ServerMessage = serde_json::from_value(json).unwrap();
+        match back {
+            ServerMessage::ThreadMetadataResult {
+                request_id,
+                metadata,
             } => {
-                assert_eq!(scope, TokenScope::Thread);
-                assert_eq!(thread_id, Some(tid));
-                assert_eq!(ledger["total"]["input"], 10);
+                assert_eq!(request_id, "metadata-7");
+                assert_eq!(metadata.thread_id, tid);
+                assert_eq!(metadata.revision, 7);
             }
             _ => panic!("wrong variant"),
         }
@@ -1102,6 +1186,7 @@ mod tests {
                 detail: Some("missing".into()),
                 thread_id: Some(tid),
                 action: Some("subscribe".into()),
+                request_id: None,
                 process_id: None,
             },
         };

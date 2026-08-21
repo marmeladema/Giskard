@@ -13,6 +13,7 @@ use crate::models::ProjectModelCatalogStore;
 use crate::registry::{HarnessFactory, HarnessRegistry};
 use crate::routes::{protected_routes, public_routes};
 use crate::running_commands::RunningTaskStore;
+use crate::thread_metadata::ThreadMetadataService;
 use crate::throttle::LoginThrottle;
 
 /// Shared application state passed to all Axum handlers and middleware.
@@ -23,6 +24,7 @@ use crate::throttle::LoginThrottle;
 pub struct AppState {
     pub store: Arc<PersistStore>,
     pub hub: Arc<Hub>,
+    pub thread_metadata: Arc<ThreadMetadataService>,
     pub registry: Arc<HarnessRegistry>,
     pub live_buffers: Arc<LiveBufferStore>,
     pub running_commands: Arc<RunningTaskStore>,
@@ -71,9 +73,11 @@ impl AppState {
             store.clone(),
             ledger.clone(),
         ));
+        let thread_metadata = registry.thread_metadata_service();
         Self {
             store,
             hub,
+            thread_metadata,
             registry,
             live_buffers,
             running_commands,

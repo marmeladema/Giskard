@@ -144,6 +144,7 @@ session_days = 30
 
 fn thread_file(pid: ProjectId, tid: ThreadId) -> giskard_persist::store::ThreadFile {
     giskard_persist::store::ThreadFile {
+        revision: 0,
         version: 1,
         id: tid,
         project_id: pid,
