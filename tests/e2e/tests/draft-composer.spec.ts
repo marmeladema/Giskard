@@ -271,6 +271,57 @@ test.describe("draft composer", () => {
       page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY }),
     ).toHaveCount(2);
   });
+
+  test("exact runtime replacements settle the current composer", async ({ page }) => {
+    await page.locator(".proj", { hasText: "Demo" }).locator(".project-add").click();
+    await page.locator("#input").fill("Create a thread for runtime reconciliation");
+    await page.locator("#sendBtn").click();
+    await expect(
+      page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY }),
+    ).toBeVisible();
+    const tid = await page.locator(".thread.active").getAttribute("data-tid");
+    expect(tid).toBeTruthy();
+
+    const applyTurnState = (state: "active" | "persistence_blocked" | null) =>
+      page.evaluate(
+        ({ tid, state }) => {
+          const app = window as unknown as {
+            applyRuntimeOverview: (message: Record<string, unknown>) => void;
+          };
+          const revision = state === "active"
+            ? Number.MAX_SAFE_INTEGER - 2
+            : state === "persistence_blocked"
+              ? Number.MAX_SAFE_INTEGER - 1
+              : Number.MAX_SAFE_INTEGER;
+          app.applyRuntimeOverview({
+            revision,
+            threads: state === null ? [] : [{
+              thread_id: tid,
+              turn_state: state === "active"
+                ? { state }
+                : { state, turn_id: "unpersisted-turn", error: "Persistence failed" },
+              outstanding_requests: [],
+            }],
+          });
+        },
+        { tid: tid!, state },
+      );
+
+    await applyTurnState("active");
+    await expect(page.locator("#stopBtn")).toBeVisible();
+    await expect(page.locator("#sendBtn")).toBeHidden();
+
+    await applyTurnState("persistence_blocked");
+    await expect(page.locator("#persistenceRecovery")).toContainText("Persistence failed");
+    await expect(page.locator("#stopBtn")).toBeVisible();
+
+    // A successful discard removes the thread from the exact runtime replacement. Absence must
+    // release the active-turn controls without waiting for a transcript event or another bootstrap.
+    await applyTurnState(null);
+    await expect(page.locator("#persistenceRecovery")).toHaveCount(0);
+    await expect(page.locator("#stopBtn")).toBeHidden();
+    await expect(page.locator("#sendBtn")).toBeVisible();
+  });
 });
 
 // `openThread` has the same save/await/restore shape as the draft opening that lost a message, and

@@ -411,9 +411,11 @@ async fn cold_provider_switch_succeeds_and_binds_the_thread() {
         },
     )
     .await;
-    next_matching(&mut ws, |v| v["code"] == "thread_read_only")
-        .await
-        .expect("read-only warning");
+    next_matching(&mut ws, |v| {
+        v["type"] == "thread_bootstrap" && v["frame"]["phase"] == "commit"
+    })
+    .await
+    .expect("read-only bootstrap");
 
     // Selecting a model from a configured provider triggers the verified cold re-resume…
     send_msg(
@@ -426,12 +428,12 @@ async fn cold_provider_switch_succeeds_and_binds_the_thread() {
     )
     .await;
 
-    // …and the broadcast thread state reports the new provider.
+    // …and the authoritative metadata reports the new provider.
     let state_msg = next_matching(&mut ws, |v| {
-        v["type"] == "thread_state" && v["current_model"]["provider"] == NEW_PROVIDER
+        v["type"] == "thread_metadata" && v["current_model"]["provider"] == NEW_PROVIDER
     })
     .await
-    .expect("thread state under the new provider");
+    .expect("thread metadata under the new provider");
     assert_eq!(state_msg["current_model"]["model"], "glm-5.2");
 
     // Persisted and natively bound.
@@ -499,9 +501,11 @@ async fn cold_provider_switch_reopens_worktree_thread_in_its_worktree() {
         },
     )
     .await;
-    next_matching(&mut ws, |v| v["code"] == "thread_read_only")
-        .await
-        .expect("read-only warning");
+    next_matching(&mut ws, |v| {
+        v["type"] == "thread_bootstrap" && v["frame"]["phase"] == "commit"
+    })
+    .await
+    .expect("read-only bootstrap");
 
     send_msg(
         &mut ws,
@@ -513,10 +517,10 @@ async fn cold_provider_switch_reopens_worktree_thread_in_its_worktree() {
     )
     .await;
     next_matching(&mut ws, |v| {
-        v["type"] == "thread_state" && v["current_model"]["provider"] == NEW_PROVIDER
+        v["type"] == "thread_metadata" && v["current_model"]["provider"] == NEW_PROVIDER
     })
     .await
-    .expect("thread state under the new provider");
+    .expect("thread metadata under the new provider");
 
     let opened_roots = srv.opened_workspace_roots.lock().await.clone();
     assert_eq!(
@@ -546,9 +550,11 @@ async fn unconfirmed_provider_switch_is_rejected_and_persists_nothing() {
         },
     )
     .await;
-    next_matching(&mut ws, |v| v["code"] == "thread_read_only")
-        .await
-        .expect("read-only warning");
+    next_matching(&mut ws, |v| {
+        v["type"] == "thread_bootstrap" && v["frame"]["phase"] == "commit"
+    })
+    .await
+    .expect("read-only bootstrap");
 
     send_msg(
         &mut ws,

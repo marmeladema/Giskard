@@ -79,10 +79,9 @@ pub struct TurnRecord {
     pub completed_at: Option<DateTime<Utc>>,
     /// The item count **as of this record** — a display hint, never a cross-file invariant.
     ///
-    /// Nothing in this format appends to a payload file after its turn commits, so today the count
-    /// cannot go stale. The semantics are pinned now so the scheduled amendment work inherits a
-    /// field that already means something: a superseding turn record carries the current count, and
-    /// no payload append is forced to touch the index just to keep a counter honest.
+    /// A late payload amendment may make this stale by adding a genuinely new item. Amendments do
+    /// not touch the bounded index merely to refresh a display hint, and replacements normally
+    /// preserve the count.
     ///
     /// Two rules keep it from becoming a consistency trap: never validate against it (a mismatch is
     /// logged and the payload file wins), and never let corruption detection depend on it.
@@ -273,10 +272,11 @@ fn line_of<T: Serialize>(value: &T) -> Result<String, PersistError> {
     Ok(line)
 }
 
-/// Serialize a turn's whole payload file, header first.
+/// Serialize a turn's initial whole payload file, header first.
 ///
-/// Written with temp file + fsync + rename, so a payload is complete or absent — never the torn
-/// half-line a shared append-only file can leave behind.
+/// This initial value is written with temp file + fsync + rename, so a committed turn starts with a
+/// complete payload or no payload. Late completed-item replacements use the append protocol in the
+/// store and can leave an ignored unterminated tail after an interrupted write.
 pub fn payload_file_bytes(turn: &Turn) -> Result<Vec<u8>, PersistError> {
     let mut out = line_of(&PayloadLine::TurnHeader {
         format: TURN_PAYLOAD_FORMAT,
@@ -297,6 +297,15 @@ pub fn payload_file_bytes(turn: &Turn) -> Result<Vec<u8>, PersistError> {
     Ok(out.into_bytes())
 }
 
+/// Serialize one ordinary item record, newline included.
+///
+/// Late item amendments use the exact same record shape as the initial payload. Keeping this
+/// constructor beside [`payload_file_bytes`] prevents the amendment path from acquiring a second,
+/// subtly different JSON representation.
+pub(crate) fn payload_item_line(index: usize, item: &Item) -> Result<String, PersistError> {
+    line_of(&PayloadLine::Item { index, item })
+}
+
 /// The `kind` of a JSONL record, or `None` when the line is not a tagged object.
 fn record_kind(value: &serde_json::Value) -> Option<&str> {
     value.get("kind")?.as_str()
@@ -305,10 +314,9 @@ fn record_kind(value: &serde_json::Value) -> Option<&str> {
 /// Parse the bounded history index.
 ///
 /// Turn records fold by turn id, **first-wins**: a repeated id is a turn that is already durable,
-/// and the first durable record stays authoritative. (Superseding records — a later record that
-/// *replaces* an earlier one — arrive with the amendment work, which is out of scope here; until a
-/// producer exists, silently preferring a later duplicate would change how today's duplicates
-/// resolve.) The same first-wins rule is what the format 1 reader applies.
+/// and the first durable record stays authoritative. Payload amendments deliberately do not write
+/// another index record, so silently preferring a later duplicate would only change how ambiguous
+/// append retries resolve. The same first-wins rule is what the format 1 reader applies.
 pub fn parse_history_index(path: &Path, data: &str) -> Result<Vec<TurnRecord>, PersistError> {
     let lines: Vec<&str> = data.lines().filter(|l| !l.trim().is_empty()).collect();
     let last = lines.len().saturating_sub(1);
@@ -418,14 +426,22 @@ pub fn parse_history_index(path: &Path, data: &str) -> Result<Vec<TurnRecord>, P
 ///   identity: keying a collection by position would let two records at one index collide while the
 ///   same subject at two indices survived twice.
 /// - **Singletons** — `turn_header`, `user_input`, `status` — fold **last-wins, with a warning**.
-///   Last-wins because a late `status` is the amendment case this format is meant to absorb; the
-///   warning because nothing today writes a payload file twice, so a duplicate is a corruption
-///   signal and must not vanish silently.
+///   Last-wins keeps a damaged-but-readable file deterministic; the warning remains because the
+///   amendment writer adds only ordinary `item` records, so no valid writer duplicates a singleton.
 ///
 /// The history index folds turn records *first*-wins, which is not an inconsistency: that answers
 /// "which turn record is authoritative when an append is retried", a question about the index's own
 /// retry safety that does not arise inside a payload file.
 pub fn parse_turn_payload(path: &Path, data: &str) -> Result<TurnPayload, PersistError> {
+    parse_turn_payload_bytes(path, data.as_bytes())
+}
+
+/// Byte-oriented payload parser used by disk reads and amendments.
+///
+/// A torn append can stop inside a multi-byte UTF-8 character. Decoding the whole file would then
+/// hide every earlier valid record, so record boundaries are found in bytes first and UTF-8 is
+/// validated independently for each newline-terminated record.
+pub fn parse_turn_payload_bytes(path: &Path, data: &[u8]) -> Result<TurnPayload, PersistError> {
     let mut user_input = None;
     let mut status = None;
     // Insertion order is preserved so a replacement that carries no index of its own keeps the slot
@@ -452,19 +468,67 @@ pub fn parse_turn_payload(path: &Path, data: &str) -> Result<TurnPayload, Persis
         }};
     }
 
-    for (i, line) in data.lines().enumerate() {
-        if line.trim().is_empty() {
+    /// Decode a known record without letting one malformed line hide the rest of the turn.
+    macro_rules! payload_record {
+        ($value:expr, $ty:ty, $kind:literal, $line:expr) => {{
+            match serde_json::from_value::<$ty>($value) {
+                Ok(record) => record,
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        line = $line,
+                        kind = $kind,
+                        %error,
+                        "skipping malformed record in turn payload"
+                    );
+                    continue;
+                }
+            }
+        }};
+    }
+
+    for (i, raw_line) in data.split_inclusive(|byte| *byte == b'\n').enumerate() {
+        if !raw_line.ends_with(b"\n") {
+            tracing::warn!(
+                path = %path.display(),
+                line = i + 1,
+                "ignoring unterminated final record in turn payload"
+            );
+            break;
+        }
+        let line = &raw_line[..raw_line.len() - 1];
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let value: serde_json::Value = serde_json::from_str(line).map_err(|e| {
-            PersistError::Corrupt(format!("{}: line {}: {}", path.display(), i + 1, e))
-        })?;
+        let line = match std::str::from_utf8(line) {
+            Ok(line) => line,
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    line = i + 1,
+                    %error,
+                    "skipping non-UTF-8 record in turn payload"
+                );
+                continue;
+            }
+        };
+        let value: serde_json::Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    line = i + 1,
+                    %error,
+                    "skipping malformed JSON record in turn payload"
+                );
+                continue;
+            }
+        };
 
         match record_kind(&value) {
             Some("turn_header") => {
-                let header: PayloadTurnHeader = serde_json::from_value(value).map_err(|e| {
-                    PersistError::Corrupt(format!("{}: line {}: {}", path.display(), i + 1, e))
-                })?;
+                let header = payload_record!(value, PayloadTurnHeader, "turn_header", i + 1);
                 // A payload newer than this build understands fails **that one turn**; the index
                 // and every other turn stay readable. That containment is the point of per-file
                 // headers.
@@ -486,21 +550,15 @@ pub fn parse_turn_payload(path: &Path, data: &str) -> Result<TurnPayload, Persis
                 header_seen = true;
             }
             Some("user_input") => {
-                let record: PayloadUserInput = serde_json::from_value(value).map_err(|e| {
-                    PersistError::Corrupt(format!("{}: line {}: {}", path.display(), i + 1, e))
-                })?;
+                let record = payload_record!(value, PayloadUserInput, "user_input", i + 1);
                 set_singleton!(user_input, record.user_input, i + 1);
             }
             Some("status") => {
-                let record: PayloadStatus = serde_json::from_value(value).map_err(|e| {
-                    PersistError::Corrupt(format!("{}: line {}: {}", path.display(), i + 1, e))
-                })?;
+                let record = payload_record!(value, PayloadStatus, "status", i + 1);
                 set_singleton!(status, record.status, i + 1);
             }
             Some("item") => {
-                let record: PayloadItem = serde_json::from_value(value).map_err(|e| {
-                    PersistError::Corrupt(format!("{}: line {}: {}", path.display(), i + 1, e))
-                })?;
+                let record = payload_record!(value, PayloadItem, "item", i + 1);
                 match item_slots.get(&record.item.id) {
                     Some(&slot) => {
                         if let Some(index) = record.index {
@@ -516,9 +574,7 @@ pub fn parse_turn_payload(path: &Path, data: &str) -> Result<TurnPayload, Persis
                 }
             }
             Some("diff") => {
-                let record: PayloadDiff = serde_json::from_value(value).map_err(|e| {
-                    PersistError::Corrupt(format!("{}: line {}: {}", path.display(), i + 1, e))
-                })?;
+                let record = payload_record!(value, PayloadDiff, "diff", i + 1);
                 // Keyed by path, the only identity a `FileDiff` has. The same reasoning as items:
                 // `index` is where it renders, not which diff it is.
                 match diff_slots.get(&record.diff.path) {
@@ -593,32 +649,14 @@ pub fn parse_turn_payload(path: &Path, data: &str) -> Result<TurnPayload, Persis
 /// Read one turn's payload file.
 ///
 /// `Ok(None)` means the file is absent — a turn record whose payload never landed, or was removed.
-/// A file that will not parse is quarantined to `<path>.corrupt-<ts>` exactly as unreadable JSON is
-/// elsewhere, which leaves the bad bytes on disk for inspection and fails that one turn.
+/// Malformed newline-terminated records and an unterminated final record are preserved and skipped
+/// with a warning. A payload still fails its turn when no committed `user_input` record survives.
 pub async fn read_turn_payload(path: &Path) -> Result<Option<TurnPayload>, PersistError> {
-    let data = match fs::read_to_string(path).await {
+    let data = match fs::read(path).await {
         Ok(data) => data,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(PersistError::Io(e.to_string())),
     };
 
-    match parse_turn_payload(path, &data) {
-        Ok(payload) => Ok(Some(payload)),
-        // A newer format is not damage: leave the file alone so a later build can read it.
-        Err(e @ PersistError::Invalid(_)) => Err(e),
-        Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "corrupt turn payload, quarantining");
-            let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
-            let corrupt_path = PathBuf::from(format!("{}.corrupt-{ts}", path.display()));
-            if let Err(rename_error) = fs::rename(path, &corrupt_path).await {
-                tracing::warn!(
-                    path = %path.display(),
-                    quarantine_path = %corrupt_path.display(),
-                    error = %rename_error,
-                    "failed to quarantine corrupt turn payload"
-                );
-            }
-            Err(e)
-        }
-    }
+    parse_turn_payload_bytes(path, &data).map(Some)
 }

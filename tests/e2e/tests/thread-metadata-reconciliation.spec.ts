@@ -7,7 +7,10 @@ async function createThread(page: Page, message: string): Promise<string> {
   await page.locator("#sendBtn").click();
   await expect(page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY })).toBeVisible();
   const tid = await page.locator(".thread.active").getAttribute("data-tid");
+  const projectId = await page.locator(".thread.active").getAttribute("data-pid");
   expect(tid).toBeTruthy();
+  expect(projectId).toBeTruthy();
+  await page.evaluate((pid) => (window as any).loadThreads(pid), projectId);
   return tid as string;
 }
 

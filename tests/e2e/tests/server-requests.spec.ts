@@ -13,11 +13,10 @@ import {
 // Server requests (`requestUserInput` and friends) had no browser coverage at all, despite having
 // real UI: a card, per-question controls, Continue/Cancel, and a resolved state.
 //
-// The gap that matters is the one already fixed for approvals. A request is cleared from the live
-// buffer by the harness's own resolved event, which arrives on the harness's schedule and may never
-// arrive. Answering used to record nothing server-side, so a reload in that window replayed the
-// request as actionable — and answering a second time routes a stale id to the harness, which
-// errors. The scripted harness deliberately never resolves, so this is exactly that window.
+// The gap that matters is the one already fixed for approvals. Answering used to record nothing
+// server-side, so a reload could reconstruct the request as actionable — and answering a second
+// time routed a stale id to the harness, which errored. The ordered request chronology and final
+// runtime state must instead agree that the request was answered.
 test.describe("server requests", () => {
   test.beforeEach(async ({ page }) => {
     await stubNotifications(page);
@@ -48,13 +47,14 @@ test.describe("server requests", () => {
     await answer.selectOption("develop");
     await continueBtn.click();
 
-    // Answering disables the controls and records what was sent. The harness never emits a resolved
-    // event, so this is as far as the live UI goes.
-    await expect(request.locator(".server-request-sent")).toHaveText("Sent: Continue");
-    await expect(continueBtn).toBeDisabled();
+    // The transient sent marker can be replaced immediately by the authoritative `resolved` state.
+    // Wait for that state before reloading so this test does not race the response round trip.
+    await expect(request).toHaveClass(/\bresolved\b/);
+    await expect(request.locator(".server-request-sent")).toHaveText("Resolved");
+    await expect(continueBtn).toHaveCount(0);
 
     // Reload: in-memory state is wiped, so the resolved state has to be reconstructed entirely from
-    // the server's live-turn snapshot.
+    // ordered request chronology and the authoritative runtime state.
     await page.reload();
     await expect(page.locator("#app")).toHaveClass(/open/);
 
@@ -62,8 +62,8 @@ test.describe("server requests", () => {
     await expect(after).toBeVisible();
     await expect(after).toHaveClass(/\bresolved\b/);
     // Never actionable again — re-answering would route a stale id to the harness.
-    await expect(after.getByRole("button", { name: "Continue", exact: true })).toBeDisabled();
-    await expect(after.getByRole("button", { name: "Cancel", exact: true })).toBeDisabled();
+    await expect(after.getByRole("button", { name: "Continue", exact: true })).toHaveCount(0);
+    await expect(after.getByRole("button", { name: "Cancel", exact: true })).toHaveCount(0);
     await expect(page.locator("#transcript .msg.error")).toHaveCount(0);
     // The turn is still in flight, so the thread legitimately still shows activity — but it must no
     // longer claim to be waiting on the user for input they already gave.
@@ -130,7 +130,7 @@ test.describe("server requests", () => {
     expect(title).toBe("Giskard: input needed");
   });
 
-  // The reconnect snapshot replays every ServerRequestReceived, answered ones included. An answered
+  // Reconciliation includes the whole request chronology, answered requests included. An answered
   // one must not re-alert: the user already dealt with it. The approval path has always guarded
   // this; without the same guard here a backgrounded tab gets pinged for work already done.
   test("an answered request does not re-notify on reconnect", async ({ page }) => {
@@ -151,7 +151,8 @@ test.describe("server requests", () => {
     await request.getByRole("button", { name: "Continue", exact: true }).click();
     await expect(request.locator(".server-request-sent")).toBeVisible();
 
-    // The scripted harness never resolves, so the answer is known only from the server's record.
+    // Reload only after the authoritative server state has resolved the request.
+    await expect(request).toHaveClass(/\bresolved\b/);
     await page.reload();
     await expect(page.locator("#app")).toHaveClass(/open/);
     await expect(page.locator("#transcript .msg.server-request")).toHaveClass(/\bresolved\b/);
@@ -190,12 +191,9 @@ test.describe("server requests", () => {
   });
 });
 
-// The reconnect snapshot re-asserts what the turn is still waiting on *after* replaying the
-// accumulated events, mirroring the approval path. An `error` declares the turn inactive, so a
-// turn blocked on a server request that then errored would come back reading "errored, idle" —
-// no sidebar glyph, no waiting rank — while the request sat in the transcript with nothing
-// pointing at it. Re-asserting the outstanding server requests last gives the waiting state the
-// last word, so it outranks the error.
+// The replacement runtime overview is authoritative for what the turn is still waiting on. A later
+// transcript `error` must not strand an outstanding request in a thread that reads as idle: the
+// runtime request state still gives the waiting activity precedence.
 test.describe("a still-blocked turn survives a reload that replays a later error", () => {
   test.beforeEach(async ({ page }) => {
     await login(page);

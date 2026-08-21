@@ -145,6 +145,15 @@ as the best available proxy for "how full is the active conversation?" Clicking 
 card with both the current context footprint and cumulative input/output/total tokens. Those
 cumulative totals can legitimately exceed the model's context window over a long thread.
 
+If a tab falls behind or reconnects, Giskard rebuilds that thread from one staged history/runtime
+snapshot and resumes ordered updates on the same WebSocket; another thread on the connection is not
+disconnected to repair it. Running-task snapshots update only the **Tasks** menu—the transcript is
+created by history and ordered agent events. If a completed turn cannot be saved after bounded
+retries, the thread stays blocked with **Retry save** and confirmed **Discard turn** actions instead
+of silently releasing the turn or pretending it was persisted. A background command which finishes
+after that turn was saved is amended into the existing payload before its completion is published.
+If that amendment fails, its separate recovery card does not block a newer active turn.
+
 > **Common gotcha:** with `secure_cookies = true` over plain HTTP, the browser drops the session
 > cookie — login appears to succeed but nothing loads. Use `false` for local HTTP; set `true` only
 > behind HTTPS/TLS (e.g. an Nginx terminator).
@@ -359,7 +368,7 @@ $GISKARD_DATA_DIR/
 │   ├── threads/<thread_id>/
 │   │   ├── thread.json           # thread metadata, permission preset, token cache
 │   │   ├── history.jsonl         # turn index — a header line, then one bounded record per turn
-│   │   ├── turns/<turn_id>.jsonl # that turn's prompt, items and diffs — written atomically
+│   │   ├── turns/<turn_id>.jsonl # prompt/items/diffs — atomic initial write; appended amendments
 │   │   └── legacy/               # pre-migration originals, retained until you prune them
 │   ├── worktrees/<thread_id>/    # Git worktree for a thread started isolated (docs/git-worktrees.md)
 │   └── tokens.json               # per-project token ledger (total, by_day, by_model)
@@ -369,9 +378,18 @@ $GISKARD_DATA_DIR/
 Thread **history** is split by how the two halves grow. `history.jsonl` is the index: one record per
 turn, holding only bounded fields (ids, model, status, usage, timestamps, a capped prompt preview,
 attachment descriptors) — so it stays small no matter what the agent did, and it is appended to.
-`turns/<turn_id>.jsonl` holds the unbounded half — the full prompt, the full status message, the
-items, the diffs — and is
-written with an atomic temp-file+fsync+rename, so a payload is complete or absent rather than torn.
+`turns/<turn_id>.jsonl` holds the agent-sized half — the full prompt, the full status message, the
+items, and the diffs. Completed command output is the one retained field with an explicit display
+limit: Giskard keeps its head and tail and records the exact omitted byte count. Other payload
+fields, including tool JSON and diffs, remain unbounded. A payload's initial write uses an atomic
+temp-file+fsync+rename, so the committed turn starts complete or absent rather than torn. A
+background command which finishes later appends one newline-terminated replacement item record
+under the thread lock; `history.jsonl`, usage aggregates, and recency are unchanged. Completing the
+append is the process-level commit; `sync_data` is attempted as best-effort crash hardening, but a
+failure is warned and does not fail the live completion. An unterminated amendment tail is preserved
+and ignored. The next amendment adds its missing newline before writing a complete record: valid
+JSON missing only that delimiter is recovered, while genuinely partial JSON remains malformed and
+is skipped with a warning. Existing bytes are never truncated or rewritten.
 A turn commits payload first, index last: a crash between them leaves a file no record references,
 which every read path simply cannot see. `thread.json` is small metadata + token aggregates that can
 be rebuilt from the index alone.
@@ -419,7 +437,7 @@ dies, so a crash leaves nothing to clean up and the file is never deleted.
 | `dump-thread <project_id> <thread_id>` | Pretty-print a thread's metadata JSON. |
 | `delete-thread <project_id> <thread_id>` | Delete a thread (metadata + history). |
 | `delete-project <project_id>` | Delete a project and its threads. |
-| `validate` | Parse every stored file and report corruption (history is checked line-by-line, and an unreadable turn payload is reported per turn). |
+| `validate` | Parse every stored file and report structural corruption. Turn payload records are checked independently: malformed or unterminated records stay in place and are skipped with warnings, while a payload with no committed user input is reported for that turn. |
 | `migrate-storage [--dry-run]` | Migrate every thread to the current storage layout. Happens automatically per thread on open; this only does it in bulk. Non-destructive — the originals are retained under `legacy/`. |
 | `prune-legacy [--dry-run]` | Delete the retained pre-migration originals. **This destroys transcript history** — run it only once the new layout is trusted. |
 | `sweep-orphan-payloads [--dry-run]` | Delete turn payload files that no history record references. Such files are invisible to every read path, so this only reclaims space. Skips (and exits non-zero for) any thread whose index is missing, references no turns, or would have more than a handful swept at once — a large sweep set is evidence of a truncated index beside recoverable payloads, not of orphaned commits. `--dry-run` reports those refusals too, and lists the files each one is about. |
@@ -434,7 +452,9 @@ multiplexed WebSocket; the full endpoint inventory and behavior notes live in
 `giskard-proto`; see [§13.6](specs/giskard-specification.md) for the message protocol. The embedded
 browser UI is version-paired with the server rather than backward-compatible with other wire
 versions. Persisted thread detail uses a typed, revisioned snapshot; catalog changes invalidate and
-refetch the authoritative HTTP thread list.
+refetch the authoritative HTTP thread list. Initial history is part of the staged WebSocket
+bootstrap; older-page pagination uses the authenticated thread-history HTTP endpoint so it cannot
+compete with ordered live events or a subscription generation.
 
 ---
 

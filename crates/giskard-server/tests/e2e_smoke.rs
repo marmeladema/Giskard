@@ -1,9 +1,11 @@
 mod common;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use futures_util::{SinkExt, StreamExt};
 use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalRequest};
 use giskard_core::error::HarnessError;
@@ -25,7 +27,9 @@ use giskard_harness::{
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 use giskard_persist::store::ProjectConfig;
 use giskard_proto::{
-    ClientMessage, ErrorSeverity, ServerMessage, ThreadActivity, ThreadActivityKind, WireAgentEvent,
+    BootstrapSection, ClientMessage, ErrorSeverity, RequestKind, RequestPayload, RequestResolution,
+    RequestStatus, RuntimeTurnState, ServerMessage, ThreadBootstrapFrame, ThreadBootstrapPayload,
+    ThreadEventPayload, ThreadRuntimeSummary, WireAgentEvent,
 };
 use giskard_server::{AppState, HarnessFactory, build_app};
 use tracing::Subscriber;
@@ -2237,15 +2241,14 @@ async fn wait_for_live_item_id(
 ) -> ItemId {
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     loop {
-        if let Some(item_id) = state
-            .live_buffers
-            .snapshot(thread_id)
-            .await
-            .and_then(|snapshot| {
-                snapshot
-                    .accumulated
-                    .into_iter()
-                    .find_map(|event| match event {
+        let item_id = state
+            .runtime
+            .capture_live_cut(thread_id)
+            .ok()
+            .and_then(|cut| cut.live)
+            .and_then(|live| {
+                live.events.into_iter().find_map(|event| match event {
+                    ThreadEventPayload::Agent { agent_event } => match *agent_event {
                         WireAgentEvent::ItemStarted { item, .. }
                             if item.harness_item_id.starts_with(harness_item_prefix) =>
                         {
@@ -2257,9 +2260,11 @@ async fn wait_for_live_item_id(
                             Some(item.id)
                         }
                         _ => None,
-                    })
-            })
-        {
+                    },
+                    ThreadEventPayload::Request { .. } => None,
+                })
+            });
+        if let Some(item_id) = item_id {
             return item_id;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -2347,12 +2352,17 @@ async fn wait_for_turn_completed(
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
-                if let Ok(ServerMessage::Event {
+                if let Ok(ServerMessage::ThreadEvent {
                     thread_id: event_thread,
-                    agent_event,
+                    event,
+                    ..
                 }) = serde_json::from_str(&text)
                     && event_thread == thread_id
-                    && matches!(*agent_event, WireAgentEvent::TurnCompleted { .. })
+                    && matches!(
+                        event.event,
+                        ThreadEventPayload::Agent { agent_event }
+                            if matches!(*agent_event, WireAgentEvent::TurnCompleted { .. })
+                    )
                 {
                     return;
                 }
@@ -2376,11 +2386,13 @@ async fn wait_for_turn_started(
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
-                if let Ok(ServerMessage::Event {
+                if let Ok(ServerMessage::ThreadEvent {
                     thread_id: event_thread,
-                    agent_event,
+                    event,
+                    ..
                 }) = serde_json::from_str(&text)
                     && event_thread == thread_id
+                    && let ThreadEventPayload::Agent { agent_event } = event.event
                     && let WireAgentEvent::TurnStarted { turn, .. } = *agent_event
                 {
                     return turn;
@@ -2403,11 +2415,13 @@ async fn wait_for_turn_started_with_input(
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
-                if let Ok(ServerMessage::Event {
+                if let Ok(ServerMessage::ThreadEvent {
                     thread_id: event_thread,
-                    agent_event,
+                    event,
+                    ..
                 }) = serde_json::from_str(&text)
                     && event_thread == thread_id
+                    && let ThreadEventPayload::Agent { agent_event } = event.event
                     && let WireAgentEvent::TurnStarted {
                         turn, user_input, ..
                     } = *agent_event
@@ -2427,15 +2441,63 @@ async fn wait_for_thread_state(
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
     thread_id: ThreadId,
-) -> giskard_proto::ThreadState {
+) -> ThreadBootstrapPayload {
+    wait_for_bootstrap(ws, thread_id).await
+}
+
+async fn wait_for_bootstrap(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    thread_id: ThreadId,
+) -> ThreadBootstrapPayload {
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    let mut generation = None;
+    let mut expected = HashMap::new();
+    let mut chunks: HashMap<BootstrapSection, BTreeMap<u32, Vec<u8>>> = HashMap::new();
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
-                if let Ok(ServerMessage::ThreadState(state)) = serde_json::from_str(&text)
-                    && state.metadata.thread_id == thread_id
-                {
-                    return state;
+                let Ok(ServerMessage::ThreadBootstrap {
+                    thread_id: message_thread_id,
+                    subscription_generation,
+                    frame,
+                }) = serde_json::from_str(&text)
+                else {
+                    continue;
+                };
+                if message_thread_id != thread_id {
+                    continue;
+                }
+                match frame {
+                    ThreadBootstrapFrame::Start { sections } => {
+                        generation = Some(subscription_generation);
+                        expected = sections
+                            .into_iter()
+                            .map(|section| (section.section, section.chunk_count))
+                            .collect();
+                        chunks.clear();
+                    }
+                    ThreadBootstrapFrame::Chunk {
+                        section,
+                        index,
+                        payload_base64,
+                    } if generation == Some(subscription_generation) => {
+                        chunks
+                            .entry(section)
+                            .or_default()
+                            .insert(index, BASE64.decode(payload_base64).unwrap());
+                    }
+                    ThreadBootstrapFrame::Commit if generation == Some(subscription_generation) => {
+                        for (section, count) in &expected {
+                            assert_eq!(
+                                chunks.get(section).map(BTreeMap::len),
+                                Some(*count as usize)
+                            );
+                        }
+                        return decode_bootstrap_sections(&mut chunks);
+                    }
+                    ThreadBootstrapFrame::Chunk { .. } | ThreadBootstrapFrame::Commit => {}
                 }
             }
             Ok(Some(Ok(_))) => {}
@@ -2443,6 +2505,35 @@ async fn wait_for_thread_state(
         }
     }
     panic!("thread state for {thread_id} was not observed");
+}
+
+fn decode_bootstrap_sections(
+    chunks: &mut HashMap<BootstrapSection, BTreeMap<u32, Vec<u8>>>,
+) -> ThreadBootstrapPayload {
+    ThreadBootstrapPayload {
+        metadata: take_bootstrap_section(chunks, BootstrapSection::Metadata),
+        history: take_bootstrap_section(chunks, BootstrapSection::History),
+        live_turn: take_bootstrap_section(chunks, BootstrapSection::LiveTurn),
+        ordered_suffix: take_bootstrap_section(chunks, BootstrapSection::OrderedSuffix),
+        final_runtime: take_bootstrap_section(chunks, BootstrapSection::FinalRuntime),
+        notices: take_bootstrap_section(chunks, BootstrapSection::Notices),
+    }
+}
+
+fn take_bootstrap_section<T>(
+    chunks: &mut HashMap<BootstrapSection, BTreeMap<u32, Vec<u8>>>,
+    section: BootstrapSection,
+) -> T
+where
+    T: serde::de::DeserializeOwned,
+{
+    let section_chunks = chunks.remove(&section).unwrap();
+    let mut encoded = Vec::new();
+    for (expected, (index, chunk)) in section_chunks.into_iter().enumerate() {
+        assert_eq!(index as usize, expected);
+        encoded.extend(chunk);
+    }
+    serde_json::from_slice(&encoded).unwrap()
 }
 
 async fn wait_for_agent_message_item(
@@ -2456,11 +2547,13 @@ async fn wait_for_agent_message_item(
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
-                if let Ok(ServerMessage::Event {
+                if let Ok(ServerMessage::ThreadEvent {
                     thread_id: event_thread,
-                    agent_event,
+                    event,
+                    ..
                 }) = serde_json::from_str(&text)
                     && event_thread == thread_id
+                    && let ThreadEventPayload::Agent { agent_event } = event.event
                     && let WireAgentEvent::ItemCompleted { turn, item, .. } = *agent_event
                     && matches!(
                         item.payload,
@@ -2489,11 +2582,13 @@ async fn wait_for_command_started(
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
-                if let Ok(ServerMessage::Event {
+                if let Ok(ServerMessage::ThreadEvent {
                     thread_id: event_thread,
-                    agent_event,
+                    event,
+                    ..
                 }) = serde_json::from_str(&text)
                     && event_thread == thread_id
+                    && let ThreadEventPayload::Agent { agent_event } = event.event
                     && let WireAgentEvent::ItemStarted { turn, item, .. } = *agent_event
                     && item.kind == ItemKind::CommandExecution
                     && matches!(
@@ -2521,14 +2616,17 @@ async fn wait_for_approval_request(
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
-                if let Ok(ServerMessage::Event {
+                if let Ok(ServerMessage::ThreadEvent {
                     thread_id: event_thread,
-                    agent_event,
+                    event,
+                    ..
                 }) = serde_json::from_str(&text)
                     && event_thread == thread_id
-                    && let WireAgentEvent::ApprovalRequested { request, .. } = *agent_event
+                    && let ThreadEventPayload::Request { request } = event.event
+                    && matches!(request.status, RequestStatus::Pending)
+                    && matches!(request.payload, RequestPayload::Approval { .. })
                 {
-                    return request.id.to_string();
+                    return request.request_id;
                 }
             }
             Ok(Some(Ok(_))) => {}
@@ -2549,13 +2647,17 @@ async fn wait_for_approval_resolved(
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
-                if let Ok(ServerMessage::ApprovalResolved {
+                if let Ok(ServerMessage::ThreadEvent {
                     thread_id: resolved_thread,
-                    request_id: resolved_request,
-                    decision,
+                    event,
+                    ..
                 }) = serde_json::from_str(&text)
                     && resolved_thread == thread_id
-                    && resolved_request == request_id
+                    && let ThreadEventPayload::Request { request } = event.event
+                    && request.request_id == request_id
+                    && let RequestStatus::Resolved {
+                        resolution: RequestResolution::Approval { decision },
+                    } = request.status
                 {
                     return decision;
                 }
@@ -2573,9 +2675,9 @@ async fn wait_for_thread_activity(
     >,
     active_thread: ThreadId,
     inactive_thread: ThreadId,
-    expected: fn(&ThreadActivityKind) -> bool,
+    expected: fn(&ThreadRuntimeSummary) -> bool,
     expected_name: &str,
-) -> ThreadActivity {
+) -> ThreadRuntimeSummary {
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
@@ -2584,43 +2686,56 @@ async fn wait_for_thread_activity(
                     continue;
                 };
                 match server_msg {
-                    ServerMessage::ThreadActivity(activity)
-                        if activity.thread_id == inactive_thread && expected(&activity.kind) =>
-                    {
-                        return activity;
+                    ServerMessage::ThreadRuntimeOverview(overview) => {
+                        if let Some(summary) = overview
+                            .threads
+                            .iter()
+                            .find(|summary| {
+                                summary.thread_id == inactive_thread && expected(summary)
+                            })
+                            .cloned()
+                        {
+                            return summary;
+                        }
+                        let idle = ThreadRuntimeSummary {
+                            thread_id: inactive_thread,
+                            turn_state: RuntimeTurnState::Idle,
+                            history_recovery: None,
+                            outstanding_requests: Vec::new(),
+                        };
+                        if !overview
+                            .threads
+                            .iter()
+                            .any(|summary| summary.thread_id == inactive_thread)
+                            && expected(&idle)
+                        {
+                            return idle;
+                        }
                     }
-                    ServerMessage::ThreadActivity(_) => {}
-                    ServerMessage::Event {
-                        thread_id,
-                        agent_event,
+                    ServerMessage::ThreadEvent {
+                        thread_id, event, ..
                     } if thread_id == inactive_thread => {
-                        panic!(
-                            "inactive thread full event leaked without subscription: {agent_event:?}"
-                        );
+                        panic!("inactive thread full event leaked without subscription: {event:?}");
                     }
-                    ServerMessage::Event { thread_id, .. }
-                    | ServerMessage::HistoryPage { thread_id, .. }
-                    | ServerMessage::HistoryDelta { thread_id, .. }
-                    | ServerMessage::RunningTasks { thread_id, .. } => {
+                    ServerMessage::ThreadEvent { thread_id, .. }
+                    | ServerMessage::ThreadTasks(giskard_proto::ThreadTaskSnapshot {
+                        thread_id,
+                        ..
+                    }) => {
                         assert_eq!(
                             thread_id, active_thread,
                             "thread-scoped message should belong to subscribed thread"
                         );
                     }
-                    ServerMessage::LiveTurnSnapshot(snapshot) => {
-                        assert_eq!(
-                            snapshot.thread_id, active_thread,
-                            "live snapshot should belong to subscribed thread"
-                        );
-                    }
-                    // Sent once on connect and carries only lightweight `ThreadActivity`, so it is
-                    // allowed to mention the unsubscribed thread — that is the point of it. It can
-                    // never carry transcript traffic, which is what this loop guards.
-                    ServerMessage::ThreadActivityBootstrap { .. } => {}
-                    ServerMessage::ThreadState(_)
+                    ServerMessage::ThreadBootstrap { thread_id, .. } => assert_eq!(
+                        thread_id, active_thread,
+                        "bootstrap should belong to the subscribed thread"
+                    ),
+                    ServerMessage::ThreadMetadata(_)
                     | ServerMessage::ThreadMetadataResult { .. }
                     | ServerMessage::ThreadCatalogChanged
-                    | ServerMessage::ApprovalResolved { .. }
+                    | ServerMessage::ThreadNotices(_)
+                    | ServerMessage::ResyncRequired { .. }
                     | ServerMessage::Error { .. }
                     | ServerMessage::Pong => {}
                 }
@@ -2632,16 +2747,26 @@ async fn wait_for_thread_activity(
     panic!("thread activity {expected_name} for {inactive_thread} was not observed");
 }
 
-fn is_approval_requested_activity(kind: &ThreadActivityKind) -> bool {
-    matches!(kind, ThreadActivityKind::ApprovalRequested { .. })
+fn is_approval_requested_activity(summary: &ThreadRuntimeSummary) -> bool {
+    summary
+        .outstanding_requests
+        .iter()
+        .any(|request| request.kind == RequestKind::Approval)
 }
 
-fn is_server_request_received_activity(kind: &ThreadActivityKind) -> bool {
-    matches!(kind, ThreadActivityKind::ServerRequestReceived { .. })
+fn is_server_request_received_activity(summary: &ThreadRuntimeSummary) -> bool {
+    summary
+        .outstanding_requests
+        .iter()
+        .any(|request| request.kind == RequestKind::Server)
 }
 
-fn is_turn_completed_activity(kind: &ThreadActivityKind) -> bool {
-    matches!(kind, ThreadActivityKind::TurnCompleted)
+fn is_turn_active_activity(summary: &ThreadRuntimeSummary) -> bool {
+    matches!(summary.turn_state, RuntimeTurnState::Active { .. })
+}
+
+fn is_turn_completed_activity(summary: &ThreadRuntimeSummary) -> bool {
+    matches!(summary.turn_state, RuntimeTurnState::Idle)
 }
 
 #[tokio::test]
@@ -2722,12 +2847,11 @@ async fn send_input_rejects_second_turn_before_turn_started() {
 
 /// A thread's first turn is started over HTTP (`POST /threads/start`), before the browser has a
 /// socket for that thread. If that turn finishes before the subscribe lands, nothing else on the
-/// socket describes it: the `TurnCompleted` was broadcast to a thread nobody was subscribed to, and
-/// a turn that is over leaves no `LiveTurnSnapshot` behind. The subscribe's `ThreadState` is then
-/// the only place the browser can learn the turn is done — without it the composer stays locked on
-/// a turn that ended before it was ever watched.
+/// socket describes it: the completion was published while nobody was subscribed, and the turn is
+/// no longer in the live projection. The committed bootstrap's final runtime is then the only place
+/// the browser can learn the turn is done, or the composer would stay locked.
 #[tokio::test]
-async fn subscribe_thread_state_reports_a_turn_that_ended_before_the_socket_attached() {
+async fn subscribe_bootstrap_reports_a_turn_that_ended_before_the_socket_attached() {
     let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
@@ -2780,17 +2904,18 @@ async fn subscribe_thread_state_reports_a_turn_that_ended_before_the_socket_atta
 
     let thread_state = wait_for_thread_state(&mut ws, thread_id).await;
     assert!(
-        thread_state.active_turn == Some(false),
+        matches!(
+            thread_state.final_runtime.turn_state,
+            RuntimeTurnState::Idle
+        ),
         "a turn that finished before this socket subscribed must be reported as done"
     );
 }
 
-/// The counterpart: a turn the harness has accepted but not yet said anything about. The live
-/// buffer is still empty here — there is no `TurnStarted` to put in it — so a liveness answer read
-/// from the buffer would wrongly say "idle" and unlock a composer whose turn is about to stream.
-/// The turn gate, reserved before the start request returns, is what covers this window.
+/// The counterpart: a turn the harness has accepted but not yet streamed. The live projection is
+/// still empty, so the reserved turn lease is what keeps the bootstrap runtime active.
 #[tokio::test]
-async fn subscribe_thread_state_reports_a_turn_the_harness_has_not_streamed_yet() {
+async fn subscribe_bootstrap_reports_a_turn_the_harness_has_not_streamed_yet() {
     let harness = Arc::new(SlowStartHarness::new());
     let (_tmp, state, port) = start_slow_start_server_on_available_port(harness.clone()).await;
     let base = format!("http://127.0.0.1:{port}");
@@ -2824,8 +2949,13 @@ async fn subscribe_thread_state_reports_a_turn_the_harness_has_not_streamed_yet(
         .unwrap();
     harness.wait_for_start_calls(1).await;
     assert!(
-        !state.live_buffers.is_active(thread_id).await,
-        "the harness is still inside start_turn, so there is nothing buffered for this turn"
+        state
+            .runtime
+            .capture_live_cut(thread_id)
+            .unwrap()
+            .live
+            .is_none(),
+        "the harness has not streamed an event, so there is no live projection yet"
     );
 
     let mut latecomer = connect_ws(port, &cookie).await;
@@ -2843,7 +2973,10 @@ async fn subscribe_thread_state_reports_a_turn_the_harness_has_not_streamed_yet(
 
     let thread_state = wait_for_thread_state(&mut latecomer, thread_id).await;
     assert!(
-        thread_state.active_turn == Some(true),
+        matches!(
+            thread_state.final_runtime.turn_state,
+            RuntimeTurnState::Active { .. }
+        ),
         "a turn the harness has accepted is running, even before it streams anything"
     );
 
@@ -2879,7 +3012,7 @@ async fn send_input_rejects_same_thread_during_compaction() {
     .unwrap();
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-    while !state.live_buffers.is_active(thread_id).await {
+    while !state.runtime.is_active(thread_id) {
         if tokio::time::Instant::now() >= deadline {
             panic!("compaction thread did not become active");
         }
@@ -2938,7 +3071,9 @@ async fn compact_context_streams_and_persists_compaction_turn() {
         match tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
                 let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
-                if let ServerMessage::Event { agent_event, .. } = server_msg {
+                if let ServerMessage::ThreadEvent { event, .. } = server_msg
+                    && let ThreadEventPayload::Agent { agent_event } = event.event
+                {
                     match *agent_event {
                         WireAgentEvent::ItemCompleted { item, .. } => {
                             if let giskard_proto::WireItemPayload::Activity { title, .. } =
@@ -2994,12 +3129,10 @@ async fn compact_context_streams_and_persists_compaction_turn() {
     );
 }
 
-/// The turn id the browser receives on the wire (`TurnStarted` / `LiveTurnSnapshot`) is the id it
-/// stamps transcript rows with. Incremental reconnect uses the *persisted* turn id as its "give me
-/// turns after this" cursor, so the two must be the same value — otherwise a resync would re-render
-/// the in-flight turn instead of skipping it. This is not tautological: the replay harness returns a
-/// fresh id from `start_turn` that differs from the id it streams, so this also pins the registry to
-/// the streamed/persisted id rather than the harness return value.
+/// The turn id the browser receives in an ordered event or bootstrap is the id it stamps transcript
+/// rows with. Incremental reconnect uses the persisted turn id as its cursor, so the two must be the
+/// same value. The replay harness returns a fresh id from `start_turn` that differs from the id it
+/// streams, so this pins the registry to the streamed and persisted id.
 #[tokio::test]
 async fn wire_turn_id_matches_persisted_turn_id() {
     let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
@@ -3057,21 +3190,18 @@ async fn wire_turn_id_matches_persisted_turn_id() {
 }
 
 #[tokio::test]
-async fn new_turn_start_replaces_stale_live_buffer_without_dropping_events() {
+async fn new_turn_start_replaces_stale_runtime_projection_without_dropping_events() {
     let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
     let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
     let stale_turn = TurnId::new();
-    state
-        .live_buffers
-        .replace_turn_with_user_input(
-            thread_id,
-            stale_turn,
-            Some(UserInput::text("stale interrupted turn")),
-        )
-        .await;
+    state.runtime.replace_turn_with_user_input(
+        thread_id,
+        stale_turn,
+        Some(UserInput::text("stale interrupted turn")),
+    );
     let mut ws = connect_ws(port, &cookie).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -3096,7 +3226,14 @@ async fn new_turn_start_replaces_stale_live_buffer_without_dropping_events() {
     let new_turn = wait_for_turn_started(&mut ws, thread_id).await;
     assert_ne!(new_turn, stale_turn);
     wait_for_turn_completed(&mut ws, thread_id).await;
-    assert!(state.live_buffers.snapshot(thread_id).await.is_none());
+    assert!(
+        state
+            .runtime
+            .capture_live_cut(thread_id)
+            .unwrap()
+            .live
+            .is_none()
+    );
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     loop {
         if state
@@ -3110,7 +3247,7 @@ async fn new_turn_start_replaces_stale_live_buffer_without_dropping_events() {
             break;
         }
         if tokio::time::Instant::now() >= deadline {
-            panic!("new turn was not persisted after replacing its stale live buffer");
+            panic!("new turn was not persisted after replacing its stale runtime projection");
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     }
@@ -3152,7 +3289,7 @@ async fn compact_context_does_not_block_turns_on_other_threads_or_projects() {
     .unwrap();
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-    while !state.live_buffers.is_active(compacting_thread).await {
+    while !state.runtime.is_active(compacting_thread) {
         if tokio::time::Instant::now() >= deadline {
             panic!("compaction thread did not become active");
         }
@@ -3190,11 +3327,14 @@ async fn compact_context_does_not_block_turns_on_other_threads_or_projects() {
         match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
                 let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
-                if let ServerMessage::Event {
-                    thread_id,
-                    agent_event,
+                if let ServerMessage::ThreadEvent {
+                    thread_id, event, ..
                 } = server_msg
-                    && matches!(*agent_event, WireAgentEvent::TurnCompleted { .. })
+                    && matches!(
+                        event.event,
+                        ThreadEventPayload::Agent { agent_event }
+                            if matches!(*agent_event, WireAgentEvent::TurnCompleted { .. })
+                    )
                 {
                     if thread_id == other_thread {
                         other_completed = true;
@@ -3217,13 +3357,13 @@ async fn compact_context_does_not_block_turns_on_other_threads_or_projects() {
         "a compaction turn must not block another project from completing work"
     );
     assert!(
-        state.live_buffers.is_active(compacting_thread).await,
+        state.runtime.is_active(compacting_thread),
         "precondition check: compaction should still be active while the other thread completed"
     );
 }
 
 #[tokio::test]
-async fn inactive_thread_progress_sends_activity_without_full_event_subscription() {
+async fn inactive_thread_runtime_overview_does_not_leak_transcript_events() {
     let (_tmp, _state, port) = start_slow_compaction_server_on_available_port().await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
@@ -3243,6 +3383,8 @@ async fn inactive_thread_progress_sends_activity_without_full_event_subscription
     ))
     .await
     .unwrap();
+    let bootstrap = wait_for_thread_state(&mut ws, active_thread).await;
+    assert_eq!(bootstrap.metadata.thread_id, active_thread);
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::SendInput {
@@ -3256,104 +3398,25 @@ async fn inactive_thread_progress_sends_activity_without_full_event_subscription
     .await
     .unwrap();
 
-    let mut saw_inactive_start = false;
-    let mut saw_inactive_progress = false;
-    let mut saw_inactive_completed = false;
-    let mut saw_active_state = false;
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-    while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
-            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
-                let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
-                match server_msg {
-                    ServerMessage::ThreadState(state) => {
-                        if state.metadata.thread_id == active_thread {
-                            saw_active_state = true;
-                        }
-                    }
-                    ServerMessage::ThreadActivity(activity) => {
-                        if activity.thread_id == inactive_thread {
-                            match activity.kind {
-                                ThreadActivityKind::TurnStarted => {
-                                    assert!(activity.active_turn);
-                                    saw_inactive_start = true;
-                                }
-                                ThreadActivityKind::Progress => {
-                                    assert!(activity.active_turn);
-                                    saw_inactive_progress = true;
-                                }
-                                ThreadActivityKind::TurnCompleted => {
-                                    assert!(!activity.active_turn);
-                                    saw_inactive_completed = true;
-                                }
-                                other => panic!("unexpected inactive-thread activity: {other:?}"),
-                            }
-                        }
-                    }
-                    ServerMessage::Event {
-                        thread_id,
-                        agent_event,
-                    } if thread_id == inactive_thread => {
-                        panic!(
-                            "inactive thread full event leaked without subscription: {agent_event:?}"
-                        );
-                    }
-                    ServerMessage::Event { thread_id, .. } => {
-                        assert_eq!(
-                            thread_id, active_thread,
-                            "only the subscribed thread may deliver full events"
-                        );
-                    }
-                    ServerMessage::HistoryPage { thread_id, .. }
-                    | ServerMessage::HistoryDelta { thread_id, .. }
-                    | ServerMessage::RunningTasks { thread_id, .. } => {
-                        assert_eq!(
-                            thread_id, active_thread,
-                            "snapshots should belong to the subscribed thread"
-                        );
-                    }
-                    ServerMessage::LiveTurnSnapshot(snapshot) => {
-                        assert_eq!(
-                            snapshot.thread_id, active_thread,
-                            "live snapshot should belong to the subscribed thread"
-                        );
-                    }
-                    // Connect-time replay of lightweight activity. Unlike the live `ThreadActivity`
-                    // arm above it is not asserted against the inactive thread's turn lifecycle:
-                    // it reports only what is still outstanding, so a completed turn contributes
-                    // nothing to it.
-                    ServerMessage::ThreadActivityBootstrap { .. } => {}
-                    ServerMessage::ThreadCatalogChanged
-                    | ServerMessage::ThreadMetadataResult { .. }
-                    | ServerMessage::ApprovalResolved { .. }
-                    | ServerMessage::Error { .. }
-                    | ServerMessage::Pong => {}
-                }
-                if saw_inactive_start && saw_inactive_progress && saw_inactive_completed {
-                    break;
-                }
-            }
-            Ok(Some(Ok(_))) => {}
-            _ => {}
-        }
-    }
+    let active = wait_for_thread_activity(
+        &mut ws,
+        active_thread,
+        inactive_thread,
+        is_turn_active_activity,
+        "active",
+    )
+    .await;
+    assert!(matches!(active.turn_state, RuntimeTurnState::Active { .. }));
 
-    assert!(
-        saw_active_state,
-        "subscribe should return active thread state"
-    );
-    assert!(
-        saw_inactive_start,
-        "inactive thread should announce turn start activity"
-    );
-    assert!(
-        saw_inactive_progress,
-        "inactive thread should announce progress activity"
-    );
-    assert!(
-        saw_inactive_completed,
-        "inactive thread should announce completion activity"
-    );
+    let completed = wait_for_thread_activity(
+        &mut ws,
+        active_thread,
+        inactive_thread,
+        is_turn_completed_activity,
+        "idle",
+    )
+    .await;
+    assert!(matches!(completed.turn_state, RuntimeTurnState::Idle));
 }
 
 #[tokio::test]
@@ -3399,13 +3462,20 @@ async fn inactive_thread_requests_send_activity_and_route_responses() {
         "approval_requested",
     )
     .await;
-    assert!(approval_activity.active_turn);
-    let ThreadActivityKind::ApprovalRequested { approval_id } = approval_activity.kind else {
-        panic!("approval activity should carry approval_id");
-    };
+    assert!(matches!(
+        approval_activity.turn_state,
+        RuntimeTurnState::Active { .. }
+    ));
+    let approval_id = approval_activity
+        .outstanding_requests
+        .iter()
+        .find(|request| request.kind == RequestKind::Approval)
+        .map(|request| request.request_id.clone())
+        .expect("runtime overview should carry the approval id");
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::ApprovalDecision {
+            thread_id: inactive_thread,
             request_id: approval_id.clone(),
             decision: ApprovalDecision::Accept,
         })
@@ -3426,7 +3496,10 @@ async fn inactive_thread_requests_send_activity_and_route_responses() {
         "turn_completed",
     )
     .await;
-    assert!(!completion_activity.active_turn);
+    assert!(matches!(
+        completion_activity.turn_state,
+        RuntimeTurnState::Idle
+    ));
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::SendInput {
@@ -3448,14 +3521,20 @@ async fn inactive_thread_requests_send_activity_and_route_responses() {
         "server_request_received",
     )
     .await;
-    assert!(request_activity.active_turn);
-    let ThreadActivityKind::ServerRequestReceived { server_request_id } = request_activity.kind
-    else {
-        panic!("server-request activity should carry server_request_id");
-    };
+    assert!(matches!(
+        request_activity.turn_state,
+        RuntimeTurnState::Active { .. }
+    ));
+    let server_request_id = request_activity
+        .outstanding_requests
+        .iter()
+        .find(|request| request.kind == RequestKind::Server)
+        .map(|request| request.request_id.clone())
+        .expect("runtime overview should carry the server request id");
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::ServerRequestResponse {
+            thread_id: inactive_thread,
             request_id: server_request_id.clone(),
             response: ServerRequestResponse::result(serde_json::json!({
                 "answers": { "confirm": "Yes" }
@@ -3483,7 +3562,10 @@ async fn inactive_thread_requests_send_activity_and_route_responses() {
         "turn_completed",
     )
     .await;
-    assert!(!completion_activity.active_turn);
+    assert!(matches!(
+        completion_activity.turn_state,
+        RuntimeTurnState::Idle
+    ));
 }
 
 #[tokio::test]
@@ -3530,6 +3612,7 @@ async fn approval_decision_broadcasts_resolution_to_other_tabs() {
     first_ws
         .send(tokio_tungstenite::tungstenite::Message::Text(
             serde_json::to_string(&ClientMessage::ApprovalDecision {
+                thread_id,
                 request_id: first_approval_id.clone(),
                 decision: ApprovalDecision::Accept,
             })
@@ -3563,30 +3646,15 @@ async fn compact_context_unsupported_harness_returns_structured_error() {
     .await
     .unwrap();
 
-    let msg = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
-        panic!("expected text WS frame");
-    };
-    let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
-    match server_msg {
-        ServerMessage::Error { error } => {
-            assert_eq!(error.code, "harness_unsupported");
-            assert_eq!(error.severity, ErrorSeverity::Error);
-            assert_eq!(error.thread_id, Some(thread_id));
-            assert_eq!(error.action.as_deref(), Some("compact_context"));
-            assert!(
-                error
-                    .detail
-                    .as_deref()
-                    .is_some_and(|detail| detail.contains("context compaction is not supported"))
-            );
-        }
-        other => panic!("expected structured compaction error, got {other:?}"),
-    }
+    let error = wait_for_ws_error(&mut ws, "compact_context", "harness_unsupported").await;
+    assert_eq!(error.severity, ErrorSeverity::Error);
+    assert_eq!(error.thread_id, Some(thread_id));
+    assert!(
+        error
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("context compaction is not supported"))
+    );
 }
 
 #[tokio::test]
@@ -4194,19 +4262,20 @@ async fn passive_subagent_command_start_streams_before_completion() {
     assert_eq!(streamed_turn, external_turn);
 
     let snapshot = state
-        .live_buffers
-        .snapshot(child_id)
-        .await
+        .runtime
+        .capture_live_cut(child_id)
+        .unwrap()
+        .live
         .expect("sub-agent live turn should remain buffered before completion");
-    assert_eq!(snapshot.thread_id, child_id);
     assert_eq!(snapshot.turn_id, external_turn);
-    assert!(snapshot.accumulated.iter().any(|event| {
+    assert!(snapshot.events.iter().any(|event| {
         matches!(
             event,
-            WireAgentEvent::ItemStarted { item, .. }
+            ThreadEventPayload::Agent { agent_event }
+                if matches!(&**agent_event, WireAgentEvent::ItemStarted { item, .. }
                 if item.id == command_item_id
                     && item.kind == ItemKind::CommandExecution
-                    && matches!(&item.command, Some(start) if start.command == command)
+                    && matches!(&item.command, Some(start) if start.command == command))
         )
     }));
     assert!(
@@ -4662,9 +4731,10 @@ async fn server_resolved_subagent_link_uses_agent_name_prompt_and_turn() {
         Some("investigate")
     );
     let snapshot = state
-        .live_buffers
-        .snapshot(child_id)
-        .await
+        .runtime
+        .capture_live_cut(child_id)
+        .unwrap()
+        .live
         .expect("server-resolved sub-agent live turn should remain buffered before completion");
     assert_eq!(
         snapshot.user_input.as_ref().and_then(UserInput::as_text),
@@ -5178,9 +5248,8 @@ async fn reverse_subagent_activity_preserves_parent_and_uses_one_forwarder() {
         else {
             continue;
         };
-        let Ok(ServerMessage::Event {
-            thread_id,
-            agent_event,
+        let Ok(ServerMessage::ThreadEvent {
+            thread_id, event, ..
         }) = serde_json::from_str(&text)
         else {
             continue;
@@ -5188,6 +5257,9 @@ async fn reverse_subagent_activity_preserves_parent_and_uses_one_forwarder() {
         if thread_id != child.id {
             continue;
         }
+        let ThreadEventPayload::Agent { agent_event } = event.event else {
+            continue;
+        };
         match *agent_event {
             WireAgentEvent::ItemCompleted { turn, item, .. }
                 if turn == child_turn
@@ -5802,12 +5874,22 @@ async fn project_remove_returns_not_found_for_missing_project() {
 
 #[tokio::test]
 async fn thread_archive_and_delete_reject_active_turns() {
-    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
+    let (_tmp, state, port) = start_slow_compaction_server_on_available_port().await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
     let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
-    state.live_buffers.start_turn(thread_id).await;
+    let mut ws = connect_ws(port, &cookie).await;
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::CompactContext { thread_id })
+            .unwrap()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    while !state.runtime.is_active(thread_id) {
+        tokio::task::yield_now().await;
+    }
 
     let archive = client
         .post(format!(
@@ -5833,12 +5915,22 @@ async fn thread_archive_and_delete_reject_active_turns() {
 
 #[tokio::test]
 async fn project_remove_rejects_active_turns() {
-    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
+    let (_tmp, state, port) = start_slow_compaction_server_on_available_port().await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
     let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
-    state.live_buffers.start_turn(thread_id).await;
+    let mut ws = connect_ws(port, &cookie).await;
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientMessage::CompactContext { thread_id })
+            .unwrap()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    while !state.runtime.is_active(thread_id) {
+        tokio::task::yield_now().await;
+    }
 
     let resp = client
         .delete(format!("{base}/api/projects/{project_id}"))
@@ -5857,8 +5949,8 @@ async fn project_remove_rejects_active_turns() {
     );
 }
 
-/// A running command must block archive/delete even when there is no live turn: the guard checks
-/// the running-command registry independently of the live buffer (§7 / `reject_thread_mutation_if_live`).
+/// A running command must block archive/delete even when there is no active turn: the guard checks
+/// the unified runtime's task authority independently of its turn lease.
 #[tokio::test]
 async fn thread_archive_and_delete_reject_running_commands() {
     let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
@@ -5869,9 +5961,9 @@ async fn thread_archive_and_delete_reject_running_commands() {
 
     // Track a running command without starting a turn, so only the running-command branch of the
     // guard can trip (not the live-turn branch).
-    let tracked = state
-        .running_commands
-        .apply_event(&AgentEvent::ItemStarted {
+    let tracked = state.runtime.apply_event(
+        thread_id,
+        AgentEvent::ItemStarted {
             thread: thread_id,
             turn: TurnId::new(),
             item: ItemStart {
@@ -5887,11 +5979,12 @@ async fn thread_archive_and_delete_reject_running_commands() {
                 }),
                 tool: None,
             },
-        })
-        .await;
-    assert!(tracked, "command should be tracked as running");
+        },
+        None,
+    );
+    assert!(tracked.is_ok(), "command should be tracked as running");
     assert!(
-        !state.live_buffers.is_active(thread_id).await,
+        !state.runtime.is_active(thread_id),
         "precondition: no live turn — only a running command"
     );
 
@@ -5925,9 +6018,9 @@ async fn project_remove_rejects_running_commands() {
     let cookie = login_cookie(&client, &base).await;
     let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
 
-    let tracked = state
-        .running_commands
-        .apply_event(&AgentEvent::ItemStarted {
+    let tracked = state.runtime.apply_event(
+        thread_id,
+        AgentEvent::ItemStarted {
             thread: thread_id,
             turn: TurnId::new(),
             item: ItemStart {
@@ -5943,9 +6036,10 @@ async fn project_remove_rejects_running_commands() {
                 }),
                 tool: None,
             },
-        })
-        .await;
-    assert!(tracked, "command should be tracked as running");
+        },
+        None,
+    );
+    assert!(tracked.is_ok(), "command should be tracked as running");
 
     let resp = client
         .delete(format!("{base}/api/projects/{project_id}"))
@@ -6141,25 +6235,10 @@ async fn subscribe_unknown_thread_returns_structured_error() {
     .await
     .unwrap();
 
-    let msg = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
-        panic!("expected text WS frame");
-    };
-    let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
-    match server_msg {
-        ServerMessage::Error { error } => {
-            assert_eq!(error.code, "thread_not_found");
-            assert_eq!(error.severity, ErrorSeverity::Error);
-            assert_eq!(error.thread_id, Some(tid));
-            assert_eq!(error.action.as_deref(), Some("subscribe"));
-            assert!(!error.message.is_empty());
-        }
-        other => panic!("expected structured error, got {other:?}"),
-    }
+    let error = wait_for_ws_error(&mut ws, "subscribe", "thread_not_found").await;
+    assert_eq!(error.severity, ErrorSeverity::Error);
+    assert_eq!(error.thread_id, Some(tid));
+    assert!(!error.message.is_empty());
 }
 
 #[tokio::test]
@@ -6222,16 +6301,21 @@ async fn websocket_accepts_ticket_without_cookie_header() {
     .await
     .unwrap();
 
-    let msg = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
-        panic!("expected text WS frame");
-    };
-    let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
-    assert!(matches!(server_msg, ServerMessage::Pong));
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        let message = tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next())
+            .await
+            .ok()
+            .flatten()
+            .transpose()
+            .unwrap();
+        if let Some(tokio_tungstenite::tungstenite::Message::Text(text)) = message
+            && matches!(serde_json::from_str(&text), Ok(ServerMessage::Pong))
+        {
+            return;
+        }
+    }
+    panic!("ticket-authenticated websocket did not answer ping");
 }
 
 #[tokio::test]
@@ -6319,49 +6403,44 @@ async fn websocket_serializes_harness_error_events() {
     .await
     .unwrap();
 
-    let msg = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert!(matches!(
-        serde_json::from_str::<ServerMessage>(msg.to_text().unwrap()).unwrap(),
-        ServerMessage::ThreadState(_)
-    ));
+    wait_for_thread_state(&mut ws, tid).await;
 
-    state
-        .hub
-        .broadcast_event(
+    let applied = state
+        .runtime
+        .apply_event(
             tid,
             AgentEvent::Error {
                 thread: tid,
                 turn: None,
                 error: HarnessError::Protocol("bad frame".into()),
             },
+            None,
         )
+        .unwrap();
+    state
+        .hub
+        .publish_thread_event(tid, applied.stream_event.unwrap().event)
         .await;
 
-    // Skip the snapshot messages sent on subscribe and wait for the broadcast Error event.
-    loop {
-        let msg = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        match serde_json::from_str::<ServerMessage>(msg.to_text().unwrap()).unwrap() {
-            ServerMessage::Event { agent_event, .. } => match *agent_event {
+    let msg = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    match serde_json::from_str::<ServerMessage>(msg.to_text().unwrap()).unwrap() {
+        ServerMessage::ThreadEvent { event, .. } => match event.event {
+            ThreadEventPayload::Agent { agent_event } => match *agent_event {
                 WireAgentEvent::Error { error, .. } => {
                     assert_eq!(error.code, "harness_protocol_error");
                     assert_eq!(error.message, "protocol error: bad frame");
-                    break;
                 }
                 other => panic!("expected error event, got {other:?}"),
             },
-            ServerMessage::HistoryPage { .. }
-            | ServerMessage::LiveTurnSnapshot(_)
-            | ServerMessage::RunningTasks { .. } => continue,
-            other => panic!("expected event, got {other:?}"),
-        }
+            ThreadEventPayload::Request { request } => {
+                panic!("expected error event, got request {request:?}")
+            }
+        },
+        other => panic!("expected event, got {other:?}"),
     }
 }
 
@@ -6479,25 +6558,9 @@ async fn subscribe_reopens_persisted_thread() {
     .await
     .unwrap();
 
-    let mut got_thread_state = false;
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-    while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(tokio::time::Duration::from_secs(2), ws.next()).await {
-            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
-                let server_msg: ServerMessage = serde_json::from_str(&t).unwrap();
-                if let ServerMessage::ThreadState(state) = server_msg {
-                    assert_eq!(state.metadata.thread_id, tid);
-                    assert_eq!(state.metadata.context_window, 258_400);
-                    got_thread_state = true;
-                    break;
-                }
-            }
-            Ok(Some(Ok(_))) => {}
-            _ => break,
-        }
-    }
-
-    assert!(got_thread_state, "subscribe should return ThreadState");
+    let bootstrap = wait_for_thread_state(&mut ws, tid).await;
+    assert_eq!(bootstrap.metadata.thread_id, tid);
+    assert_eq!(bootstrap.metadata.context_window, 258_400);
     let persisted = state.store.load_thread(pid, tid).await.unwrap().unwrap();
     assert_eq!(persisted.context_window, 258_400);
     assert_eq!(state.registry.get_project_for_thread(tid).await, Some(pid));
@@ -6645,8 +6708,12 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
         match tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
                 let server_msg: ServerMessage = serde_json::from_str(&t).unwrap();
-                if let ServerMessage::Event { agent_event, .. } = server_msg
-                    && matches!(*agent_event, WireAgentEvent::TurnCompleted { .. })
+                if let ServerMessage::ThreadEvent { event, .. } = server_msg
+                    && matches!(
+                        event.event,
+                        ThreadEventPayload::Agent { agent_event }
+                            if matches!(*agent_event, WireAgentEvent::TurnCompleted { .. })
+                    )
                 {
                     saw_completed = true;
                     break;
@@ -6843,7 +6910,9 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
         match tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
                 let server_msg: ServerMessage = serde_json::from_str(&t).unwrap();
-                if let ServerMessage::Event { agent_event, .. } = server_msg {
+                if let ServerMessage::ThreadEvent { event, .. } = server_msg
+                    && let ThreadEventPayload::Agent { agent_event } = event.event
+                {
                     match *agent_event {
                         WireAgentEvent::ItemCompleted { item, .. } => match item.payload {
                             giskard_proto::WireItemPayload::AgentMessage { text }
@@ -7066,7 +7135,8 @@ async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
         match tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
                 let server_msg: ServerMessage = serde_json::from_str(&t).unwrap();
-                if let ServerMessage::Event { agent_event, .. } = server_msg
+                if let ServerMessage::ThreadEvent { event, .. } = server_msg
+                    && let ThreadEventPayload::Agent { agent_event } = event.event
                     && let WireAgentEvent::TurnCompleted { turn, .. } = *agent_event
                     && turn == new_turn
                 {
@@ -7212,8 +7282,9 @@ async fn failed_turn_is_persisted_with_error_message() {
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
-                if let ServerMessage::Event { agent_event, .. } =
+                if let ServerMessage::ThreadEvent { event, .. } =
                     serde_json::from_str::<ServerMessage>(&t).unwrap()
+                    && let ThreadEventPayload::Agent { agent_event } = event.event
                 {
                     match *agent_event {
                         WireAgentEvent::Error { error, .. } => {
@@ -7350,8 +7421,9 @@ async fn notice_event_is_delivered_to_client() {
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
-                if let ServerMessage::Event { agent_event, .. } =
+                if let ServerMessage::ThreadEvent { event, .. } =
                     serde_json::from_str::<ServerMessage>(&t).unwrap()
+                    && let ThreadEventPayload::Agent { agent_event } = event.event
                 {
                     match *agent_event {
                         WireAgentEvent::Notice { message, .. } => {
@@ -8052,23 +8124,7 @@ async fn login_project_thread_message() {
     .await
     .unwrap();
 
-    // Wait for ThreadState snapshot
-    let mut got_thread_state = false;
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-    while !got_thread_state && tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(tokio::time::Duration::from_secs(2), ws.next()).await {
-            Ok(Some(Ok(msg))) => {
-                if let tokio_tungstenite::tungstenite::Message::Text(t) = msg {
-                    let server_msg: ServerMessage = serde_json::from_str(&t).unwrap();
-                    if matches!(server_msg, ServerMessage::ThreadState(_)) {
-                        got_thread_state = true;
-                    }
-                }
-            }
-            _ => break,
-        }
-    }
-    assert!(got_thread_state, "should receive ThreadState");
+    wait_for_thread_state(&mut ws, thread_id.parse().unwrap()).await;
 
     // Send input
     let send_input = serde_json::to_string(&ClientMessage::SendInput {
@@ -8091,7 +8147,9 @@ async fn login_project_thread_message() {
             Ok(Some(Ok(msg))) => {
                 if let tokio_tungstenite::tungstenite::Message::Text(t) = msg {
                     let server_msg: ServerMessage = serde_json::from_str(&t).unwrap();
-                    if let ServerMessage::Event { agent_event, .. } = server_msg {
+                    if let ServerMessage::ThreadEvent { event, .. } = server_msg
+                        && let ThreadEventPayload::Agent { agent_event } = event.event
+                    {
                         let is_done = matches!(*agent_event, WireAgentEvent::TurnCompleted { .. });
                         events.push(agent_event);
                         if is_done {

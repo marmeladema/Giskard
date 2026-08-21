@@ -1,15 +1,17 @@
 //! The persistence store: load/save projects, threads, token ledgers (spec §5).
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, Weak};
 use tokio::sync::{Mutex, RwLock};
 
 use giskard_core::ids::{ProjectId, ThreadId, TurnId};
+use giskard_core::item::Item;
 use giskard_core::model::{Effort, ModelRef};
 use giskard_core::thread::ThreadKind;
 use giskard_core::token::{DailyTokenLedger, TokenLedger};
@@ -141,6 +143,9 @@ pub enum ThreadRecency {
 /// earlier than `u64::MAX`.
 const MAX_THREAD_REVISION: u64 = 9_007_199_254_740_991;
 
+/// Largest amendment sequence represented exactly by the paired JavaScript client.
+const MAX_AMENDMENT_SEQUENCE: u64 = 9_007_199_254_740_991;
+
 /// How many unreferenced payload files one thread can plausibly have accumulated honestly.
 ///
 /// A turn commit writes its payload, then appends its index record; only a crash landing between
@@ -186,6 +191,44 @@ pub struct OrphanSweep {
 pub enum TurnCommitOutcome {
     MetadataMutation(ThreadMutation),
     MetadataFailed(PersistError),
+}
+
+/// Process-scoped completed-history cursor.
+///
+/// Payload amendments deliberately do not touch the bounded history index. `newest_turn_id`
+/// therefore clocks append order while `(server_epoch, amendment_sequence)` clocks payload
+/// replacement within that order. A new store process gets a fresh epoch, making a restart an
+/// explicit authoritative-reset boundary without scanning every payload for a durable revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryCursor {
+    pub newest_turn_id: Option<TurnId>,
+    pub server_epoch: String,
+    pub amendment_sequence: u64,
+}
+
+/// Why a coherent completed-history snapshot selected its turns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistorySnapshotKind {
+    FullPage,
+    Delta { after: TurnId },
+    CursorReset { requested_after: Option<TurnId> },
+}
+
+/// One coherent completed-history selection and the cursor that clocks it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistorySnapshot {
+    pub cursor: HistoryCursor,
+    pub kind: HistorySnapshotKind,
+    pub turns: Vec<Turn>,
+    pub has_more: bool,
+}
+
+/// Result of appending a completed-item replacement to one persisted turn payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ItemAmendmentOutcome {
+    MissingTurn,
+    Unchanged { cursor: HistoryCursor },
+    Changed { cursor: HistoryCursor },
 }
 
 impl ThreadMutation {
@@ -435,6 +478,19 @@ async fn is_dir(path: &Path) -> bool {
     matches!(tokio::fs::metadata(path).await, Ok(meta) if meta.is_dir())
 }
 
+fn append_payload_record(path: &Path, bytes: &[u8]) -> Result<Option<PersistError>, PersistError> {
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(|error| PersistError::Io(format!("{}: {error}", path.display())))?;
+    file.write_all(bytes)
+        .map_err(|error| PersistError::Io(format!("{}: {error}", path.display())))?;
+    Ok(file
+        .sync_data()
+        .err()
+        .map(|error| PersistError::Io(format!("{}: {error}", path.display()))))
+}
+
 // ---- Store ----
 
 /// The flat-file persistence store.
@@ -444,6 +500,13 @@ async fn is_dir(path: &Path) -> bool {
 /// files are serialized per id via [`PersistStore::update_thread`].
 pub struct PersistStore {
     data_dir: PathBuf,
+    /// Fresh for every store process. Together with the per-thread amendment sequence this clocks
+    /// payload-only history mutations without adding a persisted revision to every turn.
+    server_epoch: String,
+    /// Current committed payload-amendment sequence per thread. Entries intentionally outlive the
+    /// corresponding runtime entry; reusing a sequence within one epoch could falsely validate an
+    /// older browser cursor.
+    amendment_sequences: StdMutex<HashMap<(ProjectId, ThreadId), u64>>,
     config: Mutex<Option<Config>>,
     project_index_lock: Mutex<()>,
     /// Per-thread-id write locks so read-modify-write of a thread file is single-writer (§5.4).
@@ -478,6 +541,8 @@ impl PersistStore {
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
             data_dir,
+            server_epoch: ulid::Ulid::new().to_string(),
+            amendment_sequences: StdMutex::new(HashMap::new()),
             config: Mutex::new(None),
             project_index_lock: Mutex::new(()),
             thread_locks: Mutex::new(HashMap::new()),
@@ -488,6 +553,24 @@ impl PersistStore {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// Epoch shared by every completed-history cursor produced by this store process.
+    pub fn server_epoch(&self) -> &str {
+        &self.server_epoch
+    }
+
+    fn lock_amendment_sequences(&self) -> StdMutexGuard<'_, HashMap<(ProjectId, ThreadId), u64>> {
+        match self.amendment_sequences.lock() {
+            Ok(sequences) => sequences,
+            Err(poisoned) => {
+                tracing::error!(
+                    action = "lock_history_amendment_sequences",
+                    "history amendment sequence lock was poisoned; recovering state"
+                );
+                poisoned.into_inner()
+            }
+        }
     }
 
     // ---- Config ----
@@ -675,10 +758,10 @@ impl PersistStore {
 
     /// The parsed history for a thread, reusing the cache when the index file is unchanged.
     ///
-    /// Cache validity is keyed on the **index** file's metadata alone. That is sound because
-    /// nothing appends to a payload file after its turn commits, so a turn's payload cannot change
-    /// under a cache entry the index still validates. When amendments start appending to payload
-    /// files, this key has to grow with them.
+    /// The caller must hold this thread's store lock. The index metadata detects ordinary appends;
+    /// the lock orders cache loads and installs against payload-only amendments. In particular, a
+    /// cache miss cannot read an old payload, lose a race with an amendment append, and then
+    /// install the old turn after the amendment invalidated the cache.
     ///
     /// Note what this trades away. Caching whole `Turn` values keeps a warm `load_all_turns` at
     /// zero payload opens, but it also keeps resident memory per open thread *unbounded*, exactly
@@ -727,6 +810,26 @@ impl PersistStore {
             .write()
             .await
             .retain(|(cached_project, _)| *cached_project != project);
+        self.lock_amendment_sequences()
+            .retain(|(cached_project, _), _| *cached_project != project);
+    }
+
+    async fn history_cursor_unlocked(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+        newest_turn_id: Option<TurnId>,
+    ) -> HistoryCursor {
+        let amendment_sequence = self
+            .lock_amendment_sequences()
+            .get(&(project, thread))
+            .copied()
+            .unwrap_or(0);
+        HistoryCursor {
+            newest_turn_id,
+            server_epoch: self.server_epoch.clone(),
+            amendment_sequence,
+        }
     }
 
     async fn update_history_cache_after_append(
@@ -1091,7 +1194,8 @@ impl PersistStore {
     //
     // Split across two files by how their size behaves. `history.jsonl` is the **index**: one
     // strictly bounded record per turn, appended. `turns/<turn_id>.jsonl` is the **payload**:
-    // everything whose size is a function of what the agent did, written atomically.
+    // everything whose size is a function of what the agent did. Its initial commit is atomic;
+    // later completed-item replacements use the recoverable append protocol below.
     //
     // The split closes a live corruption path. A whole turn appended with one `write_all` can be
     // torn by a crash or a full disk; the next append concatenates onto the partial line, the
@@ -1234,6 +1338,120 @@ impl PersistStore {
         Ok(())
     }
 
+    /// Append one completed-item replacement to an already-committed turn payload.
+    ///
+    /// The bounded history index is deliberately untouched: amendments change neither turn order,
+    /// usage, recency, nor aggregate authority. Existing payload bytes are retained verbatim and
+    /// one ordinary newline-terminated `item` record is appended under the thread lock.
+    /// Existing bytes, including malformed records and an unterminated tail, are never rewritten.
+    pub async fn amend_turn_item(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+        turn_id: TurnId,
+        replacement: &Item,
+    ) -> Result<ItemAmendmentOutcome, PersistError> {
+        self.ensure_migrated(project, thread).await;
+        let lock = self.thread_lock(thread).await;
+        let _guard = lock.lock().await;
+
+        let paths = self.thread_paths(project, thread).await;
+        if paths.layout() != ThreadLayout::Directory {
+            return Err(PersistError::Invalid(format!(
+                "cannot amend turn {turn_id}: thread {thread} is still in the legacy storage layout"
+            )));
+        }
+
+        let records = self.load_turn_records_unlocked(project, thread).await?;
+        let newest_turn_id = records.last().map(|record| record.turn_id);
+        if !records.iter().any(|record| record.turn_id == turn_id) {
+            return Ok(ItemAmendmentOutcome::MissingTurn);
+        }
+
+        let payload_path = paths.turn_payload(turn_id);
+        let original = tokio::fs::read(&payload_path)
+            .await
+            .map_err(|error| PersistError::Io(format!("{}: {error}", payload_path.display())))?;
+        let payload = history::parse_turn_payload_bytes(&payload_path, &original)?;
+
+        let current = payload
+            .items
+            .iter()
+            .enumerate()
+            .find(|(_, item)| item.id == replacement.id);
+        if current.is_some_and(|(_, item)| item == replacement) {
+            return Ok(ItemAmendmentOutcome::Unchanged {
+                cursor: self
+                    .history_cursor_unlocked(project, thread, newest_turn_id)
+                    .await,
+            });
+        }
+        let display_index = current
+            .map(|(index, _)| index)
+            .unwrap_or(payload.items.len());
+        let appended = history::payload_item_line(display_index, replacement)?;
+
+        let next_sequence = {
+            let sequences = self.lock_amendment_sequences();
+            sequences
+                .get(&(project, thread))
+                .copied()
+                .unwrap_or(0)
+                .checked_add(1)
+                .filter(|sequence| *sequence <= MAX_AMENDMENT_SEQUENCE)
+                .ok_or_else(|| {
+                    PersistError::Invalid(format!(
+                        "history amendment sequence exhausted for thread {thread}"
+                    ))
+                })?
+        };
+
+        let separator_len = usize::from(!original.is_empty() && !original.ends_with(b"\n"));
+        let mut append_bytes = Vec::with_capacity(separator_len.saturating_add(appended.len()));
+        if !original.is_empty() && !original.ends_with(b"\n") {
+            // Preserve the tail and terminate it before starting the next record. If it contains a
+            // complete JSON value missing only its newline, the reader recovers it; a genuinely
+            // partial or malformed value remains invalid and is skipped with a warning.
+            append_bytes.push(b'\n');
+        }
+        append_bytes.extend_from_slice(appended.as_bytes());
+
+        // Invalidate before writing. The append and best-effort sync below are synchronous while
+        // this thread lock is held, so cancellation cannot release the lock while a detached write
+        // continues, and no reader can install a stale whole-turn cache entry in between.
+        self.invalidate_history_cache(project, thread).await;
+        let sync_error = append_payload_record(&payload_path, &append_bytes)?;
+        self.lock_amendment_sequences()
+            .insert((project, thread), next_sequence);
+        let cursor = HistoryCursor {
+            newest_turn_id,
+            server_epoch: self.server_epoch.clone(),
+            amendment_sequence: next_sequence,
+        };
+        tracing::debug!(
+            %project,
+            %thread,
+            %turn_id,
+            item_id = %replacement.id,
+            amendment_sequence = next_sequence,
+            action = "amend_turn_item",
+            "appended a persisted turn item replacement"
+        );
+        if let Some(error) = sync_error {
+            tracing::warn!(
+                %project,
+                %thread,
+                %turn_id,
+                item_id = %replacement.id,
+                path = %payload_path.display(),
+                %error,
+                action = "sync_turn_item_amendment",
+                "turn item replacement was appended but could not be synced"
+            );
+        }
+        Ok(ItemAmendmentOutcome::Changed { cursor })
+    }
+
     /// Append a completed turn and fold its usage into metadata under one per-thread lock.
     ///
     /// The JSONL append still happens first (H3). If the following atomic metadata write fails,
@@ -1339,6 +1557,21 @@ impl PersistStore {
         }
     }
 
+    /// Load the bounded history-index rows without opening any per-turn payload files.
+    ///
+    /// Callers which need only turn identity, count, ordering, aggregate fields, or timestamps must
+    /// use this instead of materializing whole turns. Format 1 threads expose the same projection
+    /// after their normal lazy migration, or derive it from the legacy history when migration was
+    /// impossible.
+    pub async fn load_turn_records(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+    ) -> Result<Vec<TurnRecord>, PersistError> {
+        self.ensure_migrated(project, thread).await;
+        self.load_turn_records_unlocked(project, thread).await
+    }
+
     /// Load every persisted turn from the JSONL history, in order (H4).
     ///
     /// Tolerates a single unparseable **final** line (a torn append after power loss): it is
@@ -1349,6 +1582,8 @@ impl PersistStore {
         thread: ThreadId,
     ) -> Result<Vec<Turn>, PersistError> {
         self.ensure_migrated(project, thread).await;
+        let lock = self.thread_lock(thread).await;
+        let _guard = lock.lock().await;
         self.load_all_turns_unlocked(project, thread).await
     }
 
@@ -1376,6 +1611,8 @@ impl PersistStore {
         limit: usize,
     ) -> Result<(Vec<Turn>, bool), PersistError> {
         self.ensure_migrated(project, thread).await;
+        let lock = self.thread_lock(thread).await;
+        let _guard = lock.lock().await;
         let Some(entry) = self.current_history_cache_entry(project, thread).await? else {
             return Ok((vec![], false));
         };
@@ -1386,6 +1623,30 @@ impl PersistStore {
         };
         let start = end.saturating_sub(limit);
         Ok((all[start..end].to_vec(), start > 0))
+    }
+
+    /// Load the persisted suffix beginning at `from`, oldest-first.
+    ///
+    /// Returns `None` when the turn is not indexed. This deliberately reads through the existing
+    /// whole-turn cache for now, but clones only the requested suffix. Keeping the query behind a
+    /// store boundary lets the cache move to bounded index rows later without changing bootstrap.
+    pub async fn load_history_from(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+        from: TurnId,
+    ) -> Result<Option<(Vec<Turn>, bool)>, PersistError> {
+        self.ensure_migrated(project, thread).await;
+        let lock = self.thread_lock(thread).await;
+        let _guard = lock.lock().await;
+        let Some(entry) = self.current_history_cache_entry(project, thread).await? else {
+            return Ok(None);
+        };
+        let all = entry.turns.read().await;
+        Ok(all
+            .iter()
+            .position(|turn| turn.id == from)
+            .map(|index| (all[index..].to_vec(), index > 0)))
     }
 
     /// Load the turns persisted strictly after the `after` cursor (a `TurnId`), oldest-first — the
@@ -1399,6 +1660,8 @@ impl PersistStore {
         after: TurnId,
     ) -> Result<Option<Vec<Turn>>, PersistError> {
         self.ensure_migrated(project, thread).await;
+        let lock = self.thread_lock(thread).await;
+        let _guard = lock.lock().await;
         let Some(entry) = self.current_history_cache_entry(project, thread).await? else {
             return Ok(None);
         };
@@ -1407,6 +1670,109 @@ impl PersistStore {
             Some(index) => Ok(Some(all[index + 1..].to_vec())),
             None => Ok(None),
         }
+    }
+
+    /// Select completed history and its process-scoped amendment cursor as one store snapshot.
+    ///
+    /// `required_turn` is the turn captured by the runtime live cut, if any. When it is persisted
+    /// but falls outside the ordinary selection, the snapshot expands from that turn and becomes
+    /// authoritative instead of allowing bootstrap to combine two separately-timed store reads.
+    pub async fn load_history_snapshot(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+        requested: Option<HistoryCursor>,
+        required_turn: Option<TurnId>,
+        limit: usize,
+    ) -> Result<HistorySnapshot, PersistError> {
+        self.ensure_migrated(project, thread).await;
+        let lock = self.thread_lock(thread).await;
+        let _guard = lock.lock().await;
+
+        let entry = self.current_history_cache_entry(project, thread).await?;
+        let Some(entry) = entry else {
+            let cursor = self.history_cursor_unlocked(project, thread, None).await;
+            let kind = match requested {
+                Some(previous) => HistorySnapshotKind::CursorReset {
+                    requested_after: previous.newest_turn_id,
+                },
+                None => HistorySnapshotKind::FullPage,
+            };
+            return Ok(HistorySnapshot {
+                cursor,
+                kind,
+                turns: Vec::new(),
+                has_more: false,
+            });
+        };
+
+        let all = entry.turns.read().await;
+        let newest_turn_id = all.last().map(|turn| turn.id);
+        let cursor = self
+            .history_cursor_unlocked(project, thread, newest_turn_id)
+            .await;
+
+        let cursor_matches = requested.as_ref().is_some_and(|previous| {
+            previous.server_epoch == cursor.server_epoch
+                && previous.amendment_sequence == cursor.amendment_sequence
+        });
+        let requested_position = requested
+            .as_ref()
+            .and_then(|previous| previous.newest_turn_id)
+            .and_then(|turn_id| all.iter().position(|turn| turn.id == turn_id));
+
+        let (mut kind, mut start, mut has_more) = match (&requested, cursor_matches) {
+            (Some(previous), true) => match (previous.newest_turn_id, requested_position) {
+                (Some(after), Some(position)) => {
+                    (HistorySnapshotKind::Delta { after }, position + 1, false)
+                }
+                _ => {
+                    let start = all.len().saturating_sub(limit);
+                    (
+                        HistorySnapshotKind::CursorReset {
+                            requested_after: previous.newest_turn_id,
+                        },
+                        start,
+                        start > 0,
+                    )
+                }
+            },
+            (Some(previous), false) => {
+                let start = all.len().saturating_sub(limit);
+                (
+                    HistorySnapshotKind::CursorReset {
+                        requested_after: previous.newest_turn_id,
+                    },
+                    start,
+                    start > 0,
+                )
+            }
+            (None, _) => {
+                let start = all.len().saturating_sub(limit);
+                (HistorySnapshotKind::FullPage, start, start > 0)
+            }
+        };
+
+        if let Some(required_turn) = required_turn
+            && !all[start..].iter().any(|turn| turn.id == required_turn)
+            && let Some(required_position) = all.iter().position(|turn| turn.id == required_turn)
+        {
+            start = required_position;
+            has_more = start > 0;
+            kind = match &requested {
+                Some(previous) => HistorySnapshotKind::CursorReset {
+                    requested_after: previous.newest_turn_id,
+                },
+                None => HistorySnapshotKind::FullPage,
+            };
+        }
+
+        Ok(HistorySnapshot {
+            cursor,
+            kind,
+            turns: all[start..].to_vec(),
+            has_more,
+        })
     }
 
     /// Rebuild the metadata token aggregates from the authoritative history (H3), for repair when a
@@ -1527,6 +1893,7 @@ impl PersistStore {
         remove_dir_all_if_present(&pending).await?;
 
         self.invalidate_history_cache(project, thread).await;
+        self.lock_amendment_sequences().remove(&(project, thread));
         self.clear_unmigratable(project, thread).await;
         Ok(())
     }
@@ -1812,7 +2179,7 @@ impl PersistStore {
             // Reported, not quarantined. Renaming the bad file aside here would make a *second*
             // `validate` run describe the same damage as a missing payload, losing the parse error
             // that says what is actually wrong with it.
-            let payload = match tokio::fs::read_to_string(&payload_path).await {
+            let payload = match tokio::fs::read(&payload_path).await {
                 Ok(payload) => payload,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     errors.push((
@@ -1826,7 +2193,7 @@ impl PersistStore {
                     continue;
                 }
             };
-            if let Err(e) = history::parse_turn_payload(&payload_path, &payload) {
+            if let Err(e) = history::parse_turn_payload_bytes(&payload_path, &payload) {
                 errors.push((payload_path, e.to_string()));
             }
         }
@@ -2622,7 +2989,7 @@ mod tests {
         );
         assert!(
             store
-                .load_all_turns(project_id, thread_id)
+                .load_all_turns_unlocked(project_id, thread_id)
                 .await
                 .unwrap()
                 .is_empty()
@@ -2843,6 +3210,76 @@ mod tests {
             .await
             .unwrap();
         assert!(stale.is_none());
+    }
+
+    #[tokio::test]
+    async fn bounded_turn_records_do_not_open_payload_files() {
+        use giskard_core::token::TokenUsage;
+
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        let turn = make_turn(TokenUsage::new(100, 10));
+        store.append_turn(pid, tid, &turn).await.unwrap();
+
+        let payload = store.thread_paths(pid, tid).await.turn_payload(turn.id);
+        tokio::fs::write(&payload, b"{not valid json")
+            .await
+            .unwrap();
+
+        let records = store.load_turn_records(pid, tid).await.unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.turn_id)
+                .collect::<Vec<_>>(),
+            vec![turn.id]
+        );
+        assert!(
+            payload.exists(),
+            "the bounded read must not quarantine payloads"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_history_from_returns_an_inclusive_suffix() {
+        use giskard_core::token::TokenUsage;
+
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            let turn = make_turn(TokenUsage::new(100 * (i + 1), 10));
+            ids.push(turn.id);
+            store.append_turn(pid, tid, &turn).await.unwrap();
+        }
+
+        let (suffix, has_more) = store
+            .load_history_from(pid, tid, ids[1])
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(has_more);
+        assert_eq!(
+            suffix.iter().map(|turn| turn.id).collect::<Vec<_>>(),
+            ids[1..]
+        );
+
+        let (all, has_more) = store
+            .load_history_from(pid, tid, ids[0])
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!has_more);
+        assert_eq!(all.iter().map(|turn| turn.id).collect::<Vec<_>>(), ids);
+        assert!(
+            store
+                .load_history_from(pid, tid, TurnId::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -3227,10 +3664,10 @@ mod layout_tests {
     /// File order is write order; `index` is display order. They diverge the moment anything is
     /// appended after the turn committed, which is why the field is carried explicitly.
     ///
-    /// Nothing in this change produces a late append — amendments are out of scope — so the
-    /// scenario is written by hand: a build that was still running at item 1 of 3 settles later and
-    /// is appended at the *end* of the file. Folded by file order it would render last; folded by
-    /// `index` it stays where it happened.
+    /// This parser characterization writes the scenario by hand; the store-level amendment tests
+    /// below cover the atomic producer. A build that was still running at item 1 of 3 settles later
+    /// and is appended at the *end* of the file. Folded by file order it would render last; folded
+    /// by `index` it stays where it happened.
     #[test]
     fn a_late_payload_record_folds_back_into_its_own_slot() {
         let path = std::path::Path::new("turns/T1.jsonl");
@@ -3278,12 +3715,400 @@ mod layout_tests {
         assert_eq!(payload.items[3].id, appended.id);
     }
 
+    #[tokio::test]
+    async fn an_item_amendment_is_appended_index_neutral_and_cache_coherent() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        store
+            .create_thread(pid, test_thread(pid, tid))
+            .await
+            .unwrap();
+
+        let original_item = item("cargo build (running)");
+        let trailing_item = item("after command");
+        let turn = turn_with_items("build", vec![original_item.clone(), trailing_item.clone()]);
+        store.append_turn(pid, tid, &turn).await.unwrap();
+        let warmed = store.load_all_turns(pid, tid).await.unwrap();
+        assert_eq!(warmed[0].items[0], original_item);
+
+        let paths = store.current_thread_paths(pid, tid);
+        let index_before = tokio::fs::read(paths.history()).await.unwrap();
+        let metadata_before = tokio::fs::read(paths.metadata()).await.unwrap();
+        let payload_path = paths.turn_payload(turn.id);
+        let mut original_payload = tokio::fs::read(&payload_path).await.unwrap();
+        original_payload.extend_from_slice(b"{\"kind\":\"future_record\",\"kept\":true}\n");
+        tokio::fs::write(&payload_path, &original_payload)
+            .await
+            .unwrap();
+
+        let mut settled = original_item.clone();
+        settled.payload = ItemPayload::AgentMessage {
+            text: "cargo build (finished)".into(),
+        };
+        let outcome = store
+            .amend_turn_item(pid, tid, turn.id, &settled)
+            .await
+            .unwrap();
+        let ItemAmendmentOutcome::Changed { cursor } = outcome else {
+            panic!("expected a committed amendment");
+        };
+        assert_eq!(cursor.amendment_sequence, 1);
+        assert_eq!(cursor.newest_turn_id, Some(turn.id));
+
+        let payload_after = tokio::fs::read(&payload_path).await.unwrap();
+        assert!(
+            payload_after.starts_with(&original_payload),
+            "the append must retain every original byte, including unknown records"
+        );
+        assert_eq!(
+            tokio::fs::read(paths.history()).await.unwrap(),
+            index_before
+        );
+        assert_eq!(
+            tokio::fs::read(paths.metadata()).await.unwrap(),
+            metadata_before,
+            "a payload amendment must not touch aggregates or recency"
+        );
+
+        let reloaded = store.load_all_turns(pid, tid).await.unwrap();
+        assert_eq!(reloaded[0].items, vec![settled, trailing_item]);
+        assert!(
+            store.history_cache_entry(pid, tid).await.is_some(),
+            "the first read after the amendment installs a fresh cache entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_amendment_preserves_a_torn_utf8_tail_and_starts_at_a_new_record_boundary() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        let original = item("running");
+        let turn = turn_with_items("build", vec![original.clone()]);
+        store.append_turn(pid, tid, &turn).await.unwrap();
+
+        let payload_path = store.current_thread_paths(pid, tid).turn_payload(turn.id);
+        let mut damaged = tokio::fs::read(&payload_path).await.unwrap();
+        damaged.extend_from_slice(b"{\"kind\":\"item\",\"item\":\"\xf0\x9f");
+        tokio::fs::write(&payload_path, &damaged).await.unwrap();
+
+        let mut settled = original;
+        settled.payload = ItemPayload::AgentMessage {
+            text: "finished".into(),
+        };
+        store
+            .amend_turn_item(pid, tid, turn.id, &settled)
+            .await
+            .unwrap();
+
+        let after = tokio::fs::read(&payload_path).await.unwrap();
+        assert!(after.starts_with(&damaged), "no damaged byte is purged");
+        assert_eq!(
+            after.get(damaged.len()),
+            Some(&b'\n'),
+            "the malformed tail is terminated before the new complete record"
+        );
+        let loaded = store.load_all_turns(pid, tid).await.unwrap();
+        assert_eq!(loaded[0].items, vec![settled]);
+    }
+
+    #[tokio::test]
+    async fn a_complete_json_tail_missing_only_its_newline_is_recovered() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        let original = item("running");
+        let turn = turn_with_items("build", vec![original.clone()]);
+        store.append_turn(pid, tid, &turn).await.unwrap();
+
+        let payload_path = store.current_thread_paths(pid, tid).turn_payload(turn.id);
+        let recovered = item("recovered completion");
+        let mut damaged = tokio::fs::read(&payload_path).await.unwrap();
+        let recovered_line = crate::history::payload_item_line(1, &recovered).unwrap();
+        damaged.extend_from_slice(recovered_line.trim_end_matches('\n').as_bytes());
+        tokio::fs::write(&payload_path, &damaged).await.unwrap();
+
+        let mut settled = original;
+        settled.payload = ItemPayload::AgentMessage {
+            text: "finished later".into(),
+        };
+        store
+            .amend_turn_item(pid, tid, turn.id, &settled)
+            .await
+            .unwrap();
+
+        let after = tokio::fs::read(&payload_path).await.unwrap();
+        assert!(after.starts_with(&damaged), "no existing byte is purged");
+        assert_eq!(after.get(damaged.len()), Some(&b'\n'));
+        let loaded = store.load_all_turns(pid, tid).await.unwrap();
+        assert_eq!(
+            loaded[0].items,
+            vec![settled, recovered],
+            "adding the missing record delimiter should recover complete JSON"
+        );
+    }
+
+    #[tokio::test]
+    async fn equal_item_amendments_are_noops_and_do_not_advance_the_cursor() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        let original = item("running");
+        let turn = turn_with_items("build", vec![original.clone()]);
+        store.append_turn(pid, tid, &turn).await.unwrap();
+
+        let first = store
+            .amend_turn_item(pid, tid, turn.id, &original)
+            .await
+            .unwrap();
+        let ItemAmendmentOutcome::Unchanged { cursor, .. } = first else {
+            panic!("equal replacement should not append another record");
+        };
+        assert_eq!(cursor.amendment_sequence, 0);
+
+        let mut settled = original;
+        settled.payload = ItemPayload::AgentMessage {
+            text: "finished".into(),
+        };
+        let changed = store
+            .amend_turn_item(pid, tid, turn.id, &settled)
+            .await
+            .unwrap();
+        let ItemAmendmentOutcome::Changed { cursor, .. } = changed else {
+            panic!("changed replacement should append a record");
+        };
+        assert_eq!(cursor.amendment_sequence, 1);
+        let payload_path = store.current_thread_paths(pid, tid).turn_payload(turn.id);
+        let bytes_after_change = tokio::fs::read(&payload_path).await.unwrap();
+
+        let repeated = store
+            .amend_turn_item(pid, tid, turn.id, &settled)
+            .await
+            .unwrap();
+        let ItemAmendmentOutcome::Unchanged { cursor, .. } = repeated else {
+            panic!("repeating the settled value should be a no-op");
+        };
+        assert_eq!(cursor.amendment_sequence, 1);
+        assert_eq!(
+            tokio::fs::read(payload_path).await.unwrap(),
+            bytes_after_change
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_equal_amendment_needs_no_write_access() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        let original = item("already present");
+        let turn = turn_with_items("build", vec![original.clone()]);
+        store.append_turn(pid, tid, &turn).await.unwrap();
+        let payload_path = store.current_thread_paths(pid, tid).turn_payload(turn.id);
+        let original_permissions = tokio::fs::metadata(&payload_path)
+            .await
+            .unwrap()
+            .permissions();
+        let mut read_only = original_permissions.clone();
+        read_only.set_mode(0o444);
+        tokio::fs::set_permissions(&payload_path, read_only)
+            .await
+            .unwrap();
+        let result = store.amend_turn_item(pid, tid, turn.id, &original).await;
+        tokio::fs::set_permissions(&payload_path, original_permissions)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(result, Ok(ItemAmendmentOutcome::Unchanged { .. })),
+            "logical equality must not require a write or sync: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_amendment_append_keeps_the_payload_and_cursor_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        let original = item("running");
+        let turn = turn_with_items("build", vec![original.clone()]);
+        store.append_turn(pid, tid, &turn).await.unwrap();
+        store.load_all_turns(pid, tid).await.unwrap();
+        assert!(store.history_cache_entry(pid, tid).await.is_some());
+        let paths = store.current_thread_paths(pid, tid);
+        let payload_path = paths.turn_payload(turn.id);
+        let payload_before = tokio::fs::read(&payload_path).await.unwrap();
+
+        let mut settled = original;
+        settled.payload = ItemPayload::AgentMessage {
+            text: "finished".into(),
+        };
+        let original_permissions = tokio::fs::metadata(&payload_path)
+            .await
+            .unwrap()
+            .permissions();
+        let mut read_only = original_permissions.clone();
+        read_only.set_mode(0o444);
+        tokio::fs::set_permissions(&payload_path, read_only)
+            .await
+            .unwrap();
+        let result = store.amend_turn_item(pid, tid, turn.id, &settled).await;
+        tokio::fs::set_permissions(&payload_path, original_permissions)
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_err(),
+            "the test must exercise the failed append path"
+        );
+        assert_eq!(tokio::fs::read(payload_path).await.unwrap(), payload_before);
+        assert!(
+            store.history_cache_entry(pid, tid).await.is_none(),
+            "the cache is invalidated before an amendment append can start"
+        );
+        let snapshot = store
+            .load_history_snapshot(pid, tid, None, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.cursor.amendment_sequence, 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_item_amendments_are_serialized_and_both_survive() {
+        let tmp = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        let first = item("first running");
+        let second = item("second running");
+        let turn = turn_with_items("build", vec![first.clone(), second.clone()]);
+        store.append_turn(pid, tid, &turn).await.unwrap();
+
+        let mut first_settled = first;
+        first_settled.payload = ItemPayload::AgentMessage {
+            text: "first finished".into(),
+        };
+        let mut second_settled = second;
+        second_settled.payload = ItemPayload::AgentMessage {
+            text: "second finished".into(),
+        };
+        let first_task = {
+            let store = store.clone();
+            let item = first_settled.clone();
+            tokio::spawn(async move {
+                store
+                    .amend_turn_item(pid, tid, turn.id, &item)
+                    .await
+                    .unwrap()
+            })
+        };
+        let second_task = {
+            let store = store.clone();
+            let item = second_settled.clone();
+            tokio::spawn(async move {
+                store
+                    .amend_turn_item(pid, tid, turn.id, &item)
+                    .await
+                    .unwrap()
+            })
+        };
+        let outcomes = [first_task.await.unwrap(), second_task.await.unwrap()];
+        let mut sequences = outcomes
+            .iter()
+            .map(|outcome| match outcome {
+                ItemAmendmentOutcome::Changed { cursor, .. } => cursor.amendment_sequence,
+                other => panic!("unexpected amendment outcome: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        sequences.sort_unstable();
+        assert_eq!(sequences, vec![1, 2]);
+
+        let loaded = store.load_all_turns(pid, tid).await.unwrap();
+        assert_eq!(loaded[0].items, vec![first_settled, second_settled]);
+    }
+
+    #[tokio::test]
+    async fn history_snapshot_clocks_amendments_and_expands_from_a_required_turn() {
+        let tmp = TempDir::new().unwrap();
+        let store = PersistStore::new(tmp.path().to_path_buf());
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        let mut turns = Vec::new();
+        for label in ["one", "two", "three", "four"] {
+            let turn = turn_with_items(label, vec![item(label)]);
+            store.append_turn(pid, tid, &turn).await.unwrap();
+            turns.push(turn);
+        }
+
+        let initial = store
+            .load_history_snapshot(pid, tid, None, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(initial.kind, HistorySnapshotKind::FullPage);
+        assert!(initial.has_more);
+        assert_eq!(initial.cursor.newest_turn_id, Some(turns[3].id));
+        assert_eq!(
+            initial.turns.iter().map(|turn| turn.id).collect::<Vec<_>>(),
+            vec![turns[2].id, turns[3].id]
+        );
+
+        let same = store
+            .load_history_snapshot(pid, tid, Some(initial.cursor.clone()), None, 2)
+            .await
+            .unwrap();
+        assert_eq!(same.kind, HistorySnapshotKind::Delta { after: turns[3].id });
+        assert!(same.turns.is_empty());
+
+        let mut amended_item = turns[0].items[0].clone();
+        amended_item.payload = ItemPayload::AgentMessage {
+            text: "one amended".into(),
+        };
+        store
+            .amend_turn_item(pid, tid, turns[0].id, &amended_item)
+            .await
+            .unwrap();
+        let reset = store
+            .load_history_snapshot(pid, tid, Some(initial.cursor.clone()), Some(turns[0].id), 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            reset.kind,
+            HistorySnapshotKind::CursorReset {
+                requested_after: Some(turns[3].id)
+            }
+        );
+        assert_eq!(reset.cursor.amendment_sequence, 1);
+        assert!(!reset.has_more);
+        assert_eq!(
+            reset.turns.iter().map(|turn| turn.id).collect::<Vec<_>>(),
+            turns.iter().map(|turn| turn.id).collect::<Vec<_>>()
+        );
+
+        let restarted = PersistStore::new(tmp.path().to_path_buf());
+        assert_ne!(restarted.server_epoch(), store.server_epoch());
+        let after_restart = restarted
+            .load_history_snapshot(pid, tid, Some(reset.cursor), None, 2)
+            .await
+            .unwrap();
+        assert!(matches!(
+            after_restart.kind,
+            HistorySnapshotKind::CursorReset { .. }
+        ));
+    }
+
     // ---- Containment ----
 
-    /// Atomic payload writes mean this code cannot itself truncate a payload file, so the damage is
-    /// injected directly. The turn must fail alone.
+    /// A payload without a committed user-input record fails its turn alone. The bytes remain in
+    /// place: amendment recovery may append after malformed records, so readers never quarantine
+    /// or rewrite the payload behind that writer.
     #[tokio::test]
-    async fn a_damaged_payload_fails_that_turn_alone_and_is_quarantined() {
+    async fn a_payload_without_committed_input_fails_that_turn_alone_and_is_preserved() {
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
         let tid = ThreadId::new();
@@ -3307,19 +4132,8 @@ mod layout_tests {
             "the damaged turn fails alone; the index and every other turn stay readable"
         );
         assert!(
-            !payload.exists(),
-            "the bad file is quarantined, not left in place"
-        );
-        let quarantined: Vec<_> = std::fs::read_dir(paths.turns_dir())
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.contains(".corrupt-"))
-            .collect();
-        assert_eq!(
-            quarantined.len(),
-            1,
-            "left on disk for inspection: {quarantined:?}"
+            payload.exists(),
+            "malformed and unterminated bytes are preserved for recovery and inspection"
         );
 
         // `validate_all` names the turn that failed, not the whole thread.
@@ -3979,6 +4793,39 @@ mod layout_tests {
             "one entry per path, last-wins, rendered at the index the last record gave it"
         );
         assert_eq!(payload.user_input.as_text(), Some("superseding"));
+    }
+
+    #[test]
+    fn malformed_committed_records_are_skipped_and_an_unterminated_tail_is_ignored() {
+        let path = std::path::Path::new("turns/T1.jsonl");
+        let committed = item("committed");
+        let ignored = item("unterminated");
+        let mut data = payload_prologue().into_bytes();
+        data.extend_from_slice(b"{not json}\n");
+        data.extend_from_slice(b"{\"kind\":\"item\",\"index\":0,\"item\":{\"id\":\"bad\"}}\n");
+        data.extend_from_slice(b"\xff\n");
+        data.extend_from_slice(
+            serde_json::to_string(&serde_json::json!({
+                "kind": "item",
+                "index": 0,
+                "item": &committed,
+            }))
+            .unwrap()
+            .as_bytes(),
+        );
+        data.push(b'\n');
+        data.extend_from_slice(
+            serde_json::to_string(&serde_json::json!({
+                "kind": "item",
+                "index": 1,
+                "item": &ignored,
+            }))
+            .unwrap()
+            .as_bytes(),
+        );
+
+        let payload = crate::history::parse_turn_payload_bytes(path, &data).unwrap();
+        assert_eq!(payload.items, vec![committed]);
     }
 
     /// A turn's status *kind* is bounded and belongs in the index; its *message* is composed from

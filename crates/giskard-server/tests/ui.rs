@@ -106,7 +106,7 @@ async fn index_page_is_served_and_public() {
         "stop button sends the Interrupt client message"
     );
     assert!(
-        body.contains("msg.action===\"interrupt\""),
+        body.contains("msg.action === \"interrupt\""),
         "interrupt errors are handled explicitly"
     );
     assert!(
@@ -122,13 +122,10 @@ async fn index_page_is_served_and_public() {
         "UI renders approval requests as actionable transcript cards"
     );
     assert!(
-        body.contains("case \"approval_resolved\"")
-            && body.contains("resolveApprovalRequest(msg.request_id, msg.decision)")
-            && body.contains("function resolveApprovalRequest(id, decision)")
-            && body.contains("closeWaitingNotification(tid, id)")
-            && body.contains("const msg = entry ? entry.msg : waitingRequestRowById(id)")
-            && body.contains("state.pendingApprovals.delete(id)"),
-        "approval decisions broadcast from another tab resolve pending approval cards"
+        body.contains("function applyRequestState(requestState)")
+            && body.contains("requestStatusName(requestState) === \"resolved\"")
+            && body.contains("closeWaitingNotification(threadId, requestId)"),
+        "ordered request state resolves approval cards across tabs"
     );
     assert!(
         body.contains("type:\"approval_decision\""),
@@ -173,26 +170,19 @@ async fn index_page_is_served_and_public() {
         "permission preset is not configured at project creation"
     );
     assert!(
-        body.contains("pendingApprovals"),
-        "UI de-duplicates pending approval cards"
+        body.contains("requestStates:new Map()")
+            && body.contains("requestStateKey(threadId, requestId)"),
+        "UI keys request cards by thread and request identity"
     );
     assert!(
-        body.contains("answeredApprovals")
-            && body.contains("approvalStateKey(request)")
-            && body.contains("const answered = answeredApprovalEntry(request)")
-            && body.contains("state.answeredApprovals.get(approvalStateKey(request))")
-            && body.contains("JSON.stringify(requestOrId.kind")
-            && body.contains("String(requestOrId.reason")
-            && body.contains("JSON.stringify(requestOrId.metadata")
-            && body.contains("state.answeredApprovals.set")
-            && body.contains("request: entry.request"),
-        "UI remembers answered approvals and matches them only to the replayed request"
+        body.contains("statusName === \"resolved\"")
+            && body.contains("requestState.status && requestState.status.resolution")
+            && body.contains("applyApprovalDecision(msg"),
+        "authoritative resolved request state settles a replayed approval card"
     );
     assert!(
-        !body.contains("renderAnsweredApprovalDecisionsForThread")
-            && !body.contains("renderApprovalRequest(answered.request)")
-            && body.contains("state.renderedApprovalStateKeys"),
-        "UI does not append answered approval cards outside transcript replay order"
+        !body.contains("answeredApprovals") && !body.contains("renderedApprovalStateKeys"),
+        "UI has no parallel answered-request tombstone collection"
     );
     assert!(
         body.contains("applyApprovalDecision")
@@ -278,26 +268,29 @@ async fn index_page_is_served_and_public() {
         "plain approval metadata stays visible without source-overlay behavior"
     );
     assert!(
-        body.contains("pendingServerRequests"),
-        "UI de-duplicates pending server request cards"
+        body.contains("currentRequestEntry(id)"),
+        "server request actions use the shared request authority"
     );
     assert!(
         body.contains("renderServerRequest"),
         "UI renders non-approval server requests as transcript cards"
     );
     assert!(
-        body.contains("case \"server_request_received\""),
-        "UI consumes server request events"
+        body.contains("payload.kind === \"request\"")
+            && body.contains("applyRequestState(payload.request)"),
+        "UI consumes generalized ordered request events"
     );
     assert!(
-        body.contains("case \"server_request_resolved\""),
-        "UI consumes server request resolution events"
+        body.contains("if (requestStatusName(requestState) === \"resolved\")")
+            && body.contains("closeWaitingNotification(threadId, requestId);"),
+        "UI consumes resolved states from the generalized request authority"
     );
     assert!(
-        body.contains("function outstandingServerRequests(snap)")
-            && body.contains("for (const request of outstandingServerRequests(snap))"),
-        "the UI derives outstanding server requests from the replayed rows, which carry their \
-         own answers, rather than from a companion list"
+        body.contains("function replaceThreadRequestStates(threadId, requests)")
+            && body.contains("for (const request of requests) applyRequestState(request);")
+            && !body.contains("outstandingServerRequests")
+            && !body.contains("case \"server_request_resolved\""),
+        "the final runtime snapshot replaces request state through the same generalized path"
     );
     assert!(
         body.contains("type:\"server_request_response\""),
@@ -364,12 +357,12 @@ async fn index_page_is_served_and_public() {
         "UI exposes an intentional unknown-request fallback"
     );
     assert!(
-        body.contains("resetResolvingServerRequests"),
-        "server request response errors re-enable pending cards"
+        body.contains("restoreRespondingRequest(msg.request_id)"),
+        "request response errors restore the authoritative pending card"
     );
     assert!(
-        body.contains("awaitingInitialThreadState"),
-        "UI distinguishes initial thread snapshots from metadata refreshes"
+        body.contains("stagedBootstrap:null") && body.contains("activeSubscription:null"),
+        "UI stages one explicit bootstrap transaction and sequence baseline"
     );
     assert!(
         body.contains("contextUsed"),
@@ -446,7 +439,7 @@ async fn index_page_is_served_and_public() {
             && body.contains("function compactContext")
             && body.contains("type:\"compact_context\", thread_id: state.threadId")
             && body.contains("state.compactPending ? \"Compacting")
-            && body.contains("msg.action===\"compact_context\"")
+            && body.contains("msg.action === \"compact_context\"")
             && body.contains("isContextCompactionItem"),
         "context menu exposes a manual context compaction action with pending/error recovery"
     );
@@ -559,13 +552,15 @@ async fn index_page_is_served_and_public() {
         "sending the first message clears the draft placeholder before the user row is appended"
     );
     assert!(
-        body.contains(
-            "const appliesBootstrap = Object.prototype.hasOwnProperty.call(s, \"active_turn\");"
-        ) && body.contains("const shouldResetTranscript = appliesBootstrap &&")
-            && body.contains("if (appliesBootstrap) {")
-            && body
-                .contains("if (shouldResetTranscript) resetTranscriptForAuthoritativeSnapshot();"),
-        "UI only clears the transcript for initial snapshots or subscribe resyncs"
+        between(
+            &body,
+            "function applyBootstrapHistory(history) {",
+            "function reconcileInFlightTurn() {",
+        )
+        .contains(
+            "if (history.kind === \"full_page\" || history.kind === \"cursor_reset\") {\n    resetTranscriptForAuthoritativeSnapshot();"
+        ),
+        "only an authoritative full or cursor-reset bootstrap clears the transcript"
     );
     assert!(
         body.contains("function resetTranscriptForAuthoritativeSnapshot()")
@@ -593,12 +588,6 @@ async fn index_page_is_served_and_public() {
             "if (result.commonValueChanged || result.equalRevision) syncDerivedThreadCommon(result.threadId);"
         ),
         "thread detail updates derive sidebar and header titles from one authority"
-    );
-    assert!(
-        !body.contains(
-            "// History now arrives separately via `history_page` (H6); clear the transcript ready for it.\n  $(\"transcript\").innerHTML=\"\";\n  resetRenderState();"
-        ),
-        "thread_state metadata broadcasts must not unconditionally clear the transcript"
     );
     assert!(
         body.contains("id=\"tasksBtn\"") && body.contains("id=\"tasksMenu\""),
@@ -668,8 +657,8 @@ async fn index_page_is_served_and_public() {
     );
     assert!(
         body.contains("function activityHostThreadId(tid)")
-            && body.contains("function effectiveThreadActivity(tid, hosts)")
-            && body.contains("function threadActivityRank(activity)")
+            && body.contains("function effectiveRuntimeSummary(tid, hosts)")
+            && body.contains("function runtimeThreadsRank(activity)")
             && body.contains("el.classList.toggle(\"activity-subagent\", visible && !!origin);"),
         "a hidden sub-agent's activity is hoisted onto the nearest visible ancestor row, ranked \
          so an approval is never masked by a merely-running thread"
@@ -692,26 +681,16 @@ async fn index_page_is_served_and_public() {
          tracked as its own flag because an approval also marks the turn active"
     );
     assert!(
-        body.contains("answeredServerRequests:new Set()")
-            && body.contains("for (const answered of (snap.answered_server_requests || []))")
-            && body.contains("if (state.answeredServerRequests.has(id)) resolveServerRequest(id);"),
-        "an answered server request is seeded from the reconnect snapshot before the accumulated \
-         events replay, so the replayed ServerRequestReceived renders resolved instead of \
-         re-prompting — a harness resolved event may be late or never arrive"
+        body.contains("requestStates:new Map()")
+            && body.contains("function applyRequestState(requestState)")
+            && body.contains("function replaceThreadRequestStates(threadId, requests)"),
+        "request status and chronology share one thread-scoped authority"
     );
     assert!(
-        body.contains("msg.type === \"thread_activity_bootstrap\"")
-            && body.contains("function handleThreadActivityBootstrap(msg)")
-            && body.contains("{ source:\"connect_bootstrap\" }")
-            && body.contains("bootstrapNotifiedRequests:new Set()")
-            && body.contains(
-                "if (activity.source === \"connect_bootstrap\" && state.bootstrapNotifiedRequests.has(notificationKey))"
-            )
-            && body.contains("function releaseWaitingNotificationClaim(notificationKey)"),
-        "activity the client missed while disconnected is replayed on connect and repaints the \
-         badge, but alerts at most once per page session — the 15s dedup window cannot answer \
-         \"have we ever alerted for this?\", so a resuming laptop would otherwise re-alert for the \
-         same blocked approval"
+        body.contains("function applyRuntimeOverview(msg)")
+            && body.contains("state.runtimeThreads = replacement;")
+            && body.contains("previousRequests.has(key)"),
+        "the runtime overview replaces cross-thread state and only new request identities notify"
     );
     assert!(
         body.contains("if (!knownThreadMeta(tid)) noteUnresolvedThread(tid);")
@@ -733,7 +712,7 @@ async fn index_page_is_served_and_public() {
     assert!(
         body.contains(
             "const { running, waitingOnUser, activity, origin } = subagentSubtreeState(thread.id);"
-        ) && body.contains("? threadActivityTooltip(activity, origin)"),
+        ) && body.contains("? runtimeThreadsTooltip(activity, origin)"),
         "a sub-agent card's summary comes from the same subtree activity that sets its state, so \
          a card reading \"Waiting on you\" because a descendant is blocked describes that \
          descendant instead of its own unrelated activity — and both come from one walk of the \
@@ -751,9 +730,10 @@ async fn index_page_is_served_and_public() {
     assert!(
         body.contains("function renderProjectThreads(pid) {")
             && body.contains("appendThreadRows(box, pid, archived);")
-            && body.contains("syncActiveThreadHighlight();"),
-        "reloading a project's threads re-derives the selection highlight, so a reload not driven \
-         by opening a thread cannot leave the sidebar with nothing selected"
+            && body.contains("syncActiveThreadHighlight();")
+            && body.contains("renderAllRuntimeSummaryIndicators();"),
+        "reloading a project's threads re-projects selection and runtime authority onto the \
+         replacement sidebar nodes, so a catalog refresh cannot lose either visual state"
     );
     assert!(
         body.contains("function renderTaskCards")
@@ -882,17 +862,21 @@ async fn index_page_is_served_and_public() {
         "history rendering preserves live grouping state and breaks groups at turn boundaries"
     );
     assert!(
-        body.contains("renderItemBody(toolBody, {")
-            && body.contains("name:cmd.command || \"tool\"")
-            && body.contains("state.streamElsByItemId.set(key, toolBody)"),
-        "running tool snapshots create grouped transcript rows when no stream row exists yet"
+        body.contains("function applyThreadTasks(snapshot, resetBaseline)")
+            && !between(
+                &body,
+                "function applyThreadTasks(snapshot, resetBaseline) {",
+                "function renderRunningCommands() {",
+            )
+            .contains("taskBubble("),
+        "task snapshots never create transcript rows"
     );
     assert!(
         !body.contains("id=\"ctxCommands\""),
         "running tasks are not rendered as a permanent right-column section"
     );
     assert!(
-        body.contains("case \"running_tasks\""),
+        body.contains("case \"thread_tasks\": applyThreadTasks(msg, false); break;"),
         "UI consumes server-owned running task snapshots"
     );
     assert!(
@@ -1076,15 +1060,16 @@ async fn index_page_is_served_and_public() {
     );
     assert!(
         body.contains(
-            "state.awaitingIncrementalResync = true;\n      state.awaitingThreadResync = false;"
-        ) && body.contains("send({ type:\"subscribe\", thread_id: state.threadId, since: state.newestPersistedTurnId });")
-            && body.contains("recordReconnectDiagnostic(ws, \"ws_subscribe_sent\", { mode:\"incremental\", sent });")
-            && body.contains("state.awaitingThreadResync = true;\n      state.awaitingIncrementalResync = false;")
-            && body.contains("send({ type:\"subscribe\", thread_id: state.threadId });")
-            && body.contains("recordReconnectDiagnostic(ws, \"ws_subscribe_sent\", { mode:\"full\", sent });")
-            && body.contains("awaitingThreadResync:false")
-            && body.contains("awaitingIncrementalResync:false"),
-        "reconnect asks for an incremental delta when it has a cursor, else a full authoritative resync"
+            "send({ type:\"subscribe\", thread_id: state.threadId, since: state.historyCursor });"
+        ) && body.contains(
+            "recordReconnectDiagnostic(ws, \"ws_subscribe_sent\", { mode:\"incremental\", sent });"
+        ) && body.contains("send({ type:\"subscribe\", thread_id: state.threadId });")
+            && body.contains(
+                "recordReconnectDiagnostic(ws, \"ws_subscribe_sent\", { mode:\"full\", sent });"
+            )
+            && !body.contains("awaitingThreadResync")
+            && !body.contains("awaitingIncrementalResync"),
+        "reconnect selects a cursor without maintaining a second inferred bootstrap state machine"
     );
     assert!(
         body.contains("const WS_BACKGROUND_CLOSE_GRACE_MS = 10000")
@@ -1564,8 +1549,9 @@ async fn index_page_is_served_and_public() {
         "UI centers requested source lines in the code overlay"
     );
     assert!(
-        body.contains("live_turn_snapshot"),
-        "UI replays active-turn snapshots on reconnect"
+        body.contains("function applyLiveTurnProjection(projection, threadId)")
+            && body.contains("applyLiveTurnProjection(payload.live_turn, threadId)"),
+        "UI applies the live projection inside the bootstrap transaction"
     );
     assert!(
         body.contains("itemKindsByItemId"),
@@ -1846,68 +1832,105 @@ async fn version_meta_and_immutable_asset_caching() {
 }
 
 #[test]
-fn browser_resubscribe_replaces_transient_transcript_state() {
+fn browser_bootstrap_is_one_validated_transaction() {
     let body = app_js();
-    let onopen = between(body, "ws.onopen = () => {", "  };\n  ws.onmessage");
-    assert_order(
-        onopen,
-        "state.awaitingThreadResync = true;",
-        "send({ type:\"subscribe\", thread_id: state.threadId });",
-    );
-
-    let render_thread_state = between(
-        body,
-        "function renderThreadState(s, activeTurn) {",
-        "function resetTranscriptForAuthoritativeSnapshot() {",
-    );
-    assert!(render_thread_state.contains(
-        "const appliesBootstrap = Object.prototype.hasOwnProperty.call(s, \"active_turn\");"
-    ));
-    assert!(render_thread_state.contains("const shouldResetTranscript = appliesBootstrap &&"));
-    assert!(render_thread_state.contains("state.awaitingInitialThreadState = false;"));
-    assert!(render_thread_state.contains("state.awaitingThreadResync = false;"));
-    assert!(
-        render_thread_state
-            .contains("if (shouldResetTranscript) resetTranscriptForAuthoritativeSnapshot();")
-    );
-    assert!(
-        !render_thread_state.contains("$(\"transcript\").innerHTML=\"\""),
-        "metadata-only ThreadState updates must not clear the transcript directly"
-    );
-    assert!(
-        !render_thread_state.contains("resetRenderState();"),
-        "metadata-only ThreadState updates must not reset rendered item de-dupe state directly"
-    );
-
-    let reset = between(
-        body,
-        "function resetTranscriptForAuthoritativeSnapshot() {",
-        "const MODE_LABELS",
-    );
-    for expected in [
-        "$(\"transcript\").innerHTML=\"\";",
-        "state.pendingUserEl = null;",
-        "state.pendingUserText = null;",
-        "state.pendingOlder = false;",
-        "state.loadingHistory = false;",
-        "state.oldestTurnId = null;",
-        "state.hasMoreHistory = false;",
-        "state.interruptPending = false;",
-        "state.compactPending = false;",
-        "resetRenderState();",
-        "setTurnActive(false);",
+    for legacy in [
+        "awaitingInitialThreadState",
+        "awaitingThreadResync",
+        "awaitingIncrementalResync",
+        "pendingLiveSnapshotReconcile",
     ] {
         assert!(
-            reset.contains(expected),
-            "authoritative resync reset is missing `{expected}`"
+            !body.contains(legacy),
+            "legacy bootstrap flag remains: {legacy}"
         );
     }
-    assert_order(
-        reset,
-        "$(\"transcript\").innerHTML=\"\";",
-        "resetRenderState();",
+    assert!(body.contains("stagedBootstrap:null"));
+    assert!(body.contains("activeSubscription:null"));
+    let bootstrap = between(
+        body,
+        "function beginThreadBootstrap(msg, frame) {",
+        "function subscribeCurrentThread(delayMs) {",
     );
-    assert_order(reset, "resetRenderState();", "setTurnActive(false);");
+    assert!(bootstrap.contains("state.stagedBootstrap = { threadId, generation, descriptors };"));
+    assert!(bootstrap.contains("descriptor.chunks[index] = bytes;"));
+    assert!(
+        !between(
+            body,
+            "function beginThreadBootstrap(msg, frame) {",
+            "function commitThreadBootstrap(msg) {",
+        )
+        .contains("applyThreadMetadata(")
+    );
+    let commit = between(
+        body,
+        "function commitThreadBootstrap(msg) {",
+        "function handleThreadBootstrap(msg) {",
+    );
+    for expected in [
+        "const payload = validatedBootstrapPayload(staged);",
+        "applyThreadMetadata(payload.metadata, true);",
+        "applyBootstrapHistory(payload.history);",
+        "applyLiveTurnProjection(payload.live_turn, threadId);",
+        "for (const event of payload.ordered_suffix) applySequencedThreadEvent(event, staged.threadId);",
+        "applyFinalRuntime(threadId, payload.final_runtime);",
+        "applyThreadNotices(payload.notices, true);",
+        "lastSeq:Number(payload.final_runtime.through_seq)",
+    ] {
+        assert!(
+            commit.contains(expected),
+            "bootstrap commit is missing `{expected}`"
+        );
+    }
+    assert_order(commit, "applyLiveTurnProjection", "payload.ordered_suffix");
+    assert_order(commit, "payload.ordered_suffix", "applyFinalRuntime");
+    let validate = between(
+        body,
+        "function validatedBootstrapPayload(staged) {",
+        "function commitThreadBootstrap(msg) {",
+    );
+    assert!(validate.contains("threadEventPayloadMatches(event, staged.threadId)"));
+    assert!(validate.contains("threadEventPayloadMatches(event && event.event, staged.threadId)"));
+    assert!(validate.contains("validHistoryCursor(payload.history.cursor)"));
+    assert!(validate.contains("sequence > amendmentSequence + 1"));
+    assert!(body.contains("requestThreadResync(\"history_amendment_sequence_gap\")"));
+}
+
+#[test]
+fn browser_exposes_bounded_turn_persistence_recovery() {
+    let body = app_js();
+    let render = between(
+        body,
+        "function renderPersistenceRecovery(threadId, turnState, historyRecovery) {",
+        "function applyFinalRuntime(threadId, runtime) {",
+    );
+    assert!(render.contains("turnState.state !== \"persistence_blocked\""));
+    assert!(render.contains("Retry persistence"));
+    assert!(render.contains("Discard unpersisted turn"));
+    assert!(body.contains("window.confirm(\"Discard this unpersisted turn?"));
+    assert!(body.contains("type:action, thread_id:threadId, turn_id:turnId"));
+    assert!(render.contains("retry_history_amendment"));
+    assert!(render.contains("discard_history_amendment"));
+    assert!(body.contains("type:action, thread_id:threadId, recovery_id:recoveryId"));
+    assert!(body.contains(
+        "renderPersistenceRecovery(state.threadId, currentTurnState, currentHistoryRecovery);"
+    ));
+    assert!(body.contains(
+        "renderPersistenceRecovery(threadId, runtime.turn_state, runtime.history_recovery || null);"
+    ));
+}
+
+#[test]
+fn browser_retries_bootstrap_capacity_failure_before_the_start_frame() {
+    let body = app_js();
+    let handler = between(
+        body,
+        "function handleResyncRequired(msg) {",
+        "function requestThreadResync(reason) {",
+    );
+    assert!(handler.contains("const beforeFirstFrame ="));
+    assert!(handler.contains("!state.stagedBootstrap && !state.activeSubscription"));
+    assert!(handler.contains("subscribeCurrentThread(msg.retry_after_ms);"));
 }
 
 #[test]
@@ -1929,11 +1952,13 @@ fn browser_marks_turn_active_when_send_is_accepted() {
         "state.pendingUserEl = msgEl;",
     );
 
-    let error_case = between(body, "case \"error\":", "      break;\n  }");
+    let error_case = between(
+        body,
+        "function handleServerError(msg) {",
+        "function applyThreadNotices",
+    );
     assert!(
-        error_case.contains(
-            "if (msg.action===\"send_input\") {\n        setTurnActive(msg.code === \"thread_turn_active\");\n      }"
-        ),
+        error_case.contains("setTurnActive(msg.code === \"thread_turn_active\")"),
         "send_input errors must reconcile optimistic active-turn state"
     );
 }
@@ -2082,8 +2107,8 @@ fn browser_applies_cached_markdown_to_detached_history_rows() {
     let body = app_js();
     let history = between(
         body,
-        "function renderHistoryPage(msg) {",
-        "function renderHistoryDelta(msg) {",
+        "function renderHistoryPage(page, pending) {",
+        "function applyBootstrapHistory(history) {",
     );
     assert_order(
         history,
@@ -2133,7 +2158,7 @@ fn browser_stamps_transcript_rows_with_their_turn_id() {
     let persisted = between(
         body,
         "function renderPersistedTurn(turn) {",
-        "// Load older history",
+        "function onTranscriptScroll() {",
     );
     assert_order(
         persisted,
@@ -2157,23 +2182,25 @@ fn browser_stamps_transcript_rows_with_their_turn_id() {
     );
 
     // A completing turn advances the high-water cursor and stops stamping rows to it.
-    let completed = between(
-        body,
-        "case \"turn_completed\":",
-        "case \"approval_requested\":",
-    );
-    assert!(completed.contains("if (ev.turn) state.newestPersistedTurnId = ev.turn;"));
+    let completed = between(body, "case \"turn_completed\":", "case \"error\":");
+    assert!(completed.contains("state.newestPersistedTurnId = ev.turn;"));
+    assert!(completed.contains("newest_turn_id:String(ev.turn)"));
     assert!(completed.contains("state.currentRenderTurnId = null;"));
 
-    // The initial history page seeds the high-water cursor; older pages must not lower it.
-    let history = between(
+    // The committed bootstrap seeds the high-water cursor; pagination must not lower it.
+    let pagination = between(
         body,
-        "function renderHistoryPage(msg) {",
-        "function maybeAutoFillHistory",
+        "function renderHistoryPage(page, pending) {",
+        "function applyBootstrapHistory(history) {",
     );
-    assert!(history.contains(
-        "if (!older && turns.length) state.newestPersistedTurnId = turns[turns.length - 1].id;"
-    ));
+    assert!(!pagination.contains("state.newestPersistedTurnId ="));
+    let bootstrap = between(
+        body,
+        "function applyBootstrapHistory(history) {",
+        "function reconcileInFlightTurn() {",
+    );
+    assert!(bootstrap.contains("state.newestPersistedTurnId = newestTurnId;"));
+    assert!(bootstrap.contains("state.historyCursor = {"));
 }
 
 #[test]
@@ -2292,142 +2319,60 @@ fn browser_tracks_rendered_items_by_scoped_dom_identity() {
 }
 
 #[test]
-fn browser_incremental_resync_reconciles_in_flight_turn() {
+fn browser_uses_one_reconciliation_path_for_full_and_incremental_bootstrap() {
     let body = app_js();
-
-    // Reconnect asks for a delta when it has a cursor, else a full resync.
     let onopen = between(body, "ws.onopen = () => {", "ws.onmessage = (m) => {");
     assert!(onopen.contains(
-        "send({ type:\"subscribe\", thread_id: state.threadId, since: state.newestPersistedTurnId });"
+        "send({ type:\"subscribe\", thread_id: state.threadId, since: state.historyCursor });"
     ));
-    assert!(onopen.contains("state.awaitingIncrementalResync = true;"));
-
-    // A delta keeps the old live turn visible until the live snapshot arrives, appending any
-    // completed turns before that live block so the transcript never goes blank between messages.
-    let delta = between(
+    assert!(!onopen.contains("awaitingIncrementalResync"));
+    let history = between(
         body,
-        "function renderHistoryDelta(msg) {",
-        "function reconcileInFlightTurn()",
-    );
-    assert_order(
-        delta,
-        "const completedLiveTurn =",
-        "const completedPendingTurn =",
-    );
-    assert_order(
-        delta,
-        "const completedPendingTurn =",
-        "for (const turn of turns) renderPersistedTurn(turn);",
-    );
-    assert!(delta.contains("!liveId && !!state.pendingUserEl && turns.length > 0"));
-    assert!(delta.contains("if (completedLiveTurn || completedPendingTurn)"));
-    assert!(
-        delta.contains("state.pendingLiveSnapshotReconcile = !!liveId || !!state.pendingUserEl;")
-    );
-    assert!(delta.contains("const anchor = !completedLiveTurn ? firstLiveTurnRow(liveId) : null;"));
-    assert!(delta.contains("state.newestPersistedTurnId = turns[turns.length - 1].id;"));
-    assert!(delta.contains("t.insertBefore(container.firstChild, anchor)"));
-    assert!(
-        body.contains("if (state.pendingLiveSnapshotReconcile) {\n    state.pendingLiveSnapshotReconcile = false;\n    reconcileInFlightTurn();"),
-        "live snapshot should reconcile the stale live block synchronously just before replay"
-    );
-    let turn_started = between(body, "case \"turn_started\":", "case \"item_started\":");
-    assert!(
-        turn_started.contains("state.pendingLiveSnapshotReconcile = false;"),
-        "a normal live stream taking over must clear deferred snapshot reconciliation"
-    );
-
-    // Reconcile removes only the in-flight turn's rows (by data-turn) and the optimistic pending rows.
-    let reconcile = between(
-        body,
+        "function applyBootstrapHistory(history) {",
         "function reconcileInFlightTurn() {",
-        "function removeTurnRows(turnId)",
     );
-    assert!(reconcile.contains("removeTurnRows(\"pending\");"));
-    assert!(reconcile.contains("state.activeTurn && state.currentRenderTurnId != null"));
-    assert_order(
-        reconcile,
-        "if (liveId) removeTurnRows(liveId);",
-        "rebuildRenderTrackingFromDom();",
+    assert!(
+        history.contains("history.kind === \"full_page\" || history.kind === \"cursor_reset\"")
     );
-    assert!(reconcile.contains("state.pendingUserEl = null;"));
-    assert!(reconcile.contains("state.pendingUserText = null;"));
-    assert!(reconcile.contains("setTurnActive(false);"));
-    let first_live = between(
-        body,
-        "function firstLiveTurnRow(liveId) {",
-        "function rebuildRenderTrackingFromDom()",
-    );
-    assert!(first_live.contains("el.dataset.turn === \"pending\""));
-    assert!(first_live.contains("el.dataset.turn === liveId"));
-    let remove = between(
-        body,
-        "function removeTurnRows(turnId) {",
-        "function maybeAutoFillHistory",
-    );
-    assert!(remove.contains("if (el.dataset.turn === turnId) el.remove();"));
-
-    // Rebuild uses the surviving DOM as source of truth so removed live rows cannot leave stale
-    // de-dupe sets or body maps pointing at detached elements.
-    assert!(body.contains("rebuildRenderTrackingFromDom();"));
-    let rebuild = between(
-        body,
-        "function rebuildRenderTrackingFromDom() {",
-        "function removeTurnRows(turnId)",
-    );
-    for expected in [
-        "const renderedBodies = new Map();",
-        "for (const row of t.querySelectorAll(\".msg\"))",
-        "const turn = row.dataset.turn || \"\";",
-        "for (const itemId of identityTokens(row.dataset.item))",
-        "const key = scopedItemKey(turn, itemId);",
-        "for (const harnessItemId of identityTokens(row.dataset.harnessItem))",
-        "const key = scopedHarnessKey(turn, harnessItemId);",
-        "state.renderedItemIds = renderedItems;",
-        "state.renderedHarnessItemIds = renderedHarnessItems;",
-        "state.renderedItemBodyByKey = renderedBodies;",
-        "state.streamElsByItemId = new Map();",
-        "state.itemKindsByItemId = new Map();",
-    ] {
-        assert!(
-            rebuild.contains(expected),
-            "incremental resync rebuild is missing `{expected}`"
-        );
-    }
-    for expected in [
-        "state.commandPayloadsByItemId",
-        "state.endedCommandsByItemId",
-        "state.runningCommands",
-        "state.toolPayloadsByItemId",
-        "state.taskGroupsByItemId",
-        "pruneKeySet(state.commandStopRequestedByItemId, liveTaskIds);",
-        "state.pendingApprovals.delete(id)",
-        "state.pendingServerRequests.delete(id)",
-        "state.renderedApprovalStateKeys = approvalKeys;",
-    ] {
-        assert!(
-            rebuild.contains(expected),
-            "incremental resync cleanup is missing `{expected}`"
-        );
-    }
-
-    // Delta is dispatched, and a full page arriving mid-resync is treated as a stale-cursor rebuild.
-    assert!(body.contains("case \"history_delta\": renderHistoryDelta(msg); break;"));
+    assert!(history.contains("resetTranscriptForAuthoritativeSnapshot();"));
+    assert!(history.contains("reconcileInFlightTurn();"));
+    assert!(history.contains("for (const turn of turns) renderPersistedTurn(turn);"));
     let page = between(
         body,
-        "function renderHistoryPage(msg) {",
-        "const older = state.pendingOlder;",
+        "function renderHistoryPage(page, pending) {",
+        "function applyBootstrapHistory(history) {",
+    );
+    assert!(page.contains("const controller = new AbortController();"));
+    assert!(page.contains("{ signal:controller.signal }"));
+    assert!(page.contains("state.paginationRequest !== pending"));
+    assert!(page.contains("String(page.before || \"\") !== before"));
+    assert!(page.contains("/history?${params.toString()}"));
+    assert!(page.contains("pending.controller.abort();"));
+    assert!(!page.contains("resetTranscriptForAuthoritativeSnapshot"));
+    assert!(!body.contains("case \"history_page\""));
+    assert!(!body.contains("type:\"load_history\""));
+    assert!(!body.contains("case \"history_delta\""));
+    assert!(!body.contains("case \"live_turn_snapshot\""));
+}
+
+#[test]
+fn browser_does_not_let_stale_pagination_overwrite_a_history_amendment() {
+    let body = app_js();
+    let amendment = between(
+        body,
+        "function applySequencedThreadEvent(envelope, threadId, resyncOnCursorMismatch) {",
+        "function applyLiveTurnProjection(projection, threadId) {",
     );
     assert_order(
-        page,
-        "if (state.awaitingIncrementalResync) {",
-        "resetTranscriptForAuthoritativeSnapshot();",
+        amendment,
+        "cancelHistoryPagination();",
+        "state.historyCursor = Object.assign({}, cursor, { amendment_sequence:sequence });",
     );
-
-    // Running-tasks is the last resync frame; it restores bottom-stick if the user was pinned there.
-    assert!(body.contains(
-        "if (state.resyncStickBottom) { state.resyncStickBottom = false; keepTranscriptAtBottom(true); }"
-    ));
+    assert_order(
+        amendment,
+        "cancelHistoryPagination();",
+        "finalizeStreamedItem(event.item, event.turn)",
+    );
 }
 
 #[test]
@@ -2449,12 +2394,12 @@ fn browser_scopes_running_command_completion_identity_to_turn() {
     let finish = between(
         body,
         "function finishRunningCommand(item, turnId) {",
-        "function renderRunningCommandSnapshot(commands) {",
+        "function applyThreadTasks(snapshot, resetBaseline) {",
     );
     for expected in [
         "const key = scopedItemKey(turnId, item && item.id);",
         "if (!key) return;",
-        "commandFromItem(item, p, turnId, key, state.runningCommands.get(key))",
+        "commandFromItem(item, p, turnId, key, state.transcriptTasks.get(key))",
     ] {
         assert!(
             finish.contains(expected),
@@ -2481,24 +2426,25 @@ fn browser_scopes_running_command_completion_identity_to_turn() {
 
     let snapshot = between(
         body,
-        "function renderRunningCommandSnapshot(commands) {",
-        "function renderEndedCommandBody(body, cmd, status, opts)",
+        "function applyThreadTasks(snapshot, resetBaseline) {",
+        "function renderRunningCommands() {",
     );
     for expected in [
         "const key = scopedItemKey(info.turn_id, info.item_id);",
-        "const snapshotItem = { id:info.item_id, harness_item_id:info.harness_item_id || \"\" };",
-        "const existing = state.runningCommands.get(key);",
-        "let body = commandBodyFor(key);",
-        "registerRenderedItemBody(toolBody, snapshotItem, info.turn_id);",
-        "registerRenderedItemBody(body, snapshotItem, info.turn_id);",
+        "const existing = state.runningTasks.get(key);",
+        "replacement.set(key, cmd);",
+        "state.runningTasks = replacement;",
+        "state.taskRevision = revision;",
     ] {
         assert!(
             snapshot.contains(expected),
-            "running task snapshots must keep scoped DOM identity: `{expected}`"
+            "running task authority is missing `{expected}`"
         );
     }
-    assert!(snapshot.contains("if (body && stopRequested) {"));
-    assert!(!snapshot.contains("cmd.afterTurn || !cmd.processId"));
+    assert!(!snapshot.contains("taskBubble("));
+    assert!(!snapshot.contains("registerRenderedItemBody("));
+    assert!(snapshot.contains("const body = commandBodyFor(key);"));
+    assert!(snapshot.contains("if (body && transcriptTask.kind !== \"tool\")"));
 
     let start = between(
         body,
@@ -2506,7 +2452,7 @@ fn browser_scopes_running_command_completion_identity_to_turn() {
         "function commandFromParts(parts) {",
     );
     assert!(start.contains("const key = scopedItemKey(turnId, item.id);"));
-    assert!(start.contains("const existing = state.runningCommands.get(key);"));
+    assert!(start.contains("const existing = state.transcriptTasks.get(key);"));
     assert!(start.contains("let body = commandBodyFor(key);"));
     assert!(start.contains("registerRenderedItemBody(body, item, turnId);"));
 }
@@ -2588,7 +2534,7 @@ fn browser_backgrounded_socket_recovery_restores_foreground_errors() {
     assert_order(
         onopen,
         "markWsForegroundRecovered(ws);",
-        "state.awaitingThreadResync = true;",
+        "send({ type:\"subscribe\", thread_id: state.threadId });",
     );
 
     let onmessage = between(body, "ws.onmessage = (m) => {", "  };\n  ws.onerror");
@@ -2632,16 +2578,9 @@ fn browser_diagnostics_panel_is_exposed_from_settings() {
     );
     assert!(body.contains("function reconnectResyncComplete(metrics, msgType)"));
     assert!(
-        body.contains(
-            "if (metrics.subscribeMode === \"incremental\") return msgType === \"running_tasks\";"
-        ),
-        "incremental reconnect diagnostics should complete after the server's final resync message"
-    );
-    assert!(
-        body.contains(
-            "if (metrics.subscribeMode === \"full\") return msgType === \"history_page\";"
-        ),
-        "full reconnect diagnostics should complete after the server's final snapshot message"
+        body.contains("msgType === \"thread_bootstrap\"")
+            && body.contains("state.activeSubscription !== null"),
+        "reconnect diagnostics complete only after a bootstrap commit established its baseline"
     );
     assert!(body.contains("ws_connect_started"));
     assert!(body.contains("ws_ticket_received"));
@@ -2695,40 +2634,30 @@ fn browser_diagnostics_panel_is_exposed_from_settings() {
 }
 
 #[test]
-fn sidebar_activity_notifications_target_approval_rows() {
+fn runtime_overview_notifications_target_authoritative_request_rows() {
     let body = app_js();
 
-    assert!(body.contains("threadActivity:new Map()"));
+    assert!(body.contains("runtimeThreads:new Map()"));
     assert!(body.contains("pendingWaitingFocus:null"));
     assert!(body.contains("notifiedRequests:new Map()"));
     assert!(body.contains("waitingNotifications:new Map()"));
     assert!(body.contains("lastNotificationPromptNoticeAt:0"));
     assert!(body.contains("NOTIFICATION_DEDUP_MS"));
-    assert!(body.contains("function handleThreadActivity(msg)"));
-    assert!(body.contains("if (msg && msg.type === \"thread_activity\")"));
-    assert!(body.contains("function renderThreadActivityIndicator(tid, hosts)"));
+    assert!(body.contains("function applyRuntimeOverview(msg)"));
+    assert!(body.contains("case \"thread_runtime_overview\": applyRuntimeOverview(msg); break;"));
+    assert!(body.contains("function renderRuntimeSummaryIndicator(tid, hosts)"));
     assert!(body.contains("activity.kind === \"approval_requested\""));
     assert!(
-        body.contains(
-            "if (activityWaitsOnUser(activity)) maybeNotifyWaitingRequest(tid, activity);"
-        )
+        body.contains("if (previousRequests.has(key)) continue;")
+            && body.contains("maybeNotifyWaitingRequest(tid, runtimeSummaryActivity({")
     );
-    assert!(body.contains("server_request_id: msg.server_request_id || null"));
     // "Running" is now the complement of "waiting on the user", not of "approval" specifically —
     // a thread waiting on a server request must not also read as merely running.
     assert!(body.contains("activity.active_turn && !activityWaitsOnUser(activity)"));
     assert!(body.contains("else if (activity.active_turn) status.textContent = \"o\""));
     assert!(!body.contains("else if (activity.active_turn) status.textContent = \">\""));
-    assert!(body.contains("function setActiveThreadActivity(kind, activeTurn, summary, extra)"));
-    assert!(body.contains("source: \"active_thread_event\""));
-    assert!(body.contains("setActiveThreadActivity(\"progress\", true, \"Turn running\")"));
-    assert!(
-        body.contains("setActiveThreadActivity(\"turn_completed\", false, \"Turn completed\")")
-    );
-    assert!(body.contains("ACTIVE_THREAD_COMPLETED_MARK_MS = 2500"));
-    assert!(body.contains("function clearActiveThreadActivityLater(tid, kind)"));
-    assert!(body.contains("clearApprovalThreadActivity(tid, id)"));
-    assert!(body.contains("clearServerRequestThreadActivity(tid, id)"));
+    assert!(body.contains("state.runtimeThreads = replacement;"));
+    assert!(!body.contains("setActiveRuntimeSummary"));
     assert!(!body.contains("!!activity && !current &&"));
     assert!(body.contains("function initNotificationSettings()"));
     assert!(body.contains("function notificationPermissionButtons()"));
@@ -2754,9 +2683,8 @@ fn sidebar_activity_notifications_target_approval_rows() {
     // shown: otherwise the live activity broadcast and the live-turn snapshot path can both clear
     // the gate while one is awaiting and notify twice for the same approval. Paths that return
     // without notifying release it again.
-    assert!(body.contains(
-        "  state.notifiedRequests.set(notificationKey, now);\n  state.bootstrapNotifiedRequests.add(notificationKey);\n  // A sub-agent's very first approval"
-    ));
+    assert!(body.contains("state.notifiedRequests.set(notificationKey, now);"));
+    assert!(!body.contains("bootstrapNotifiedRequests"));
     // Both paths that give up without showing anything must release the claim, or the approval is
     // silenced for the rest of the page session.
     assert!(
@@ -2768,7 +2696,7 @@ fn sidebar_activity_notifications_target_approval_rows() {
     assert!(body.contains("function pruneNotificationDedup(now)"));
     assert!(body.contains("function waitingNotificationKey(tid, requestId)"));
     assert!(body.contains("const requestKey = requestId === undefined || requestId === null"));
-    assert!(body.contains("String(approvalId)"));
+    assert!(body.contains("String(requestId)"));
     assert!(body.contains("if (!threadKey || !requestKey) return \"\";"));
     assert!(body.contains("return `${threadKey}:${requestKey}`;"));
     assert!(body.contains("function trackWaitingNotification(key, notification)"));
@@ -2788,16 +2716,9 @@ fn sidebar_activity_notifications_target_approval_rows() {
     ));
     assert!(body.contains("return `giskard-waiting-${tid}-${requestId}`;"));
     assert!(body.contains("tag: notificationTag"));
-    assert!(body.contains("function notifyIncomingApproval(request, tid, opts)"));
-    assert!(body.contains("function handleIncomingApprovalRequest(request, tid, opts)"));
-    assert!(body.contains(
-        "if (opts.notify !== false) notifyIncomingApproval(request, tid, { source: opts.source });"
-    ));
-    assert!(body.contains("source: \"agent_event_approval_requested\""));
-    assert!(body.contains("source: \"live_turn_snapshot_outstanding_approval\""));
-    // Live events default to "thread_activity"; a connect replay overrides it so the notification
-    // gate can tell the two apart.
-    assert!(body.contains("source: msg.source || \"thread_activity\""));
+    assert!(body.contains("function applyRequestState(requestState)"));
+    assert!(body.contains("function requestStateKey(threadId, requestId)"));
+    assert!(body.contains("closeWaitingNotification(threadId, requestId);"));
     assert!(body.contains("waiting_notify_received"));
     assert!(body.contains("waiting_notify_suppressed_visible_current_thread"));
     assert!(body.contains("waiting_notify_constructor_failed"));
@@ -2835,17 +2756,7 @@ fn sidebar_activity_notifications_target_approval_rows() {
     assert!(!body.contains("waiting_notify_skipped_invalid_activity"));
     assert!(body.contains("waiting_notify_skipped_invalid_call"));
     assert!(body.contains("`lastRequest: ${lastWaiting ? lastWaiting.reason : \"none\"}`"));
-    assert!(!body.contains("notifyIncomingApproval(ev.request"));
-    assert!(!body.contains("notifyIncomingApproval(msg.request"));
-    // `notifyIncomingApproval` is called from exactly one place: inside
-    // `handleIncomingApprovalRequest`. The reconnect re-arm must route through it rather than
-    // notifying directly, so a reload does not fire a notification for an approval the user already
-    // answered (or just raised in a thread they are already watching).
-    assert_eq!(
-        body.matches("notifyIncomingApproval").count(),
-        2,
-        "`notifyIncomingApproval` should appear only as the definition plus one call site"
-    );
+    assert!(!body.contains("notifyIncomingApproval"));
     // A sub-agent's approval gets its own headline: it has no sidebar row, so the notification is
     // the only place the user learns a delegated thread — not this one — is blocked.
     assert!(body.contains(
@@ -3073,21 +2984,19 @@ fn browser_applies_revisioned_thread_metadata_to_the_gauge() {
         "function reconcileThreadProjection(kind, payload) {",
         "function composedThreadSummary(tid) {",
     );
-    let render = between(
-        source,
-        "function renderThreadState(s, activeTurn) {",
-        "function resetTranscriptForAuthoritativeSnapshot() {",
-    );
     assert!(reconcile.contains("if (prior && revision < prior.revision)"));
     assert!(reconcile.contains("revision === prior.revision && !sameThreadProjection"));
     assert!(reconcile.contains("authority[kind] = { revision"));
     assert!(source.contains("updateGauge(state.contextUsed, effective.context_window || 0);"));
     assert!(!source.contains("case \"context_window_updated\":"));
-    assert!(render.contains(
-        "const appliesBootstrap = Object.prototype.hasOwnProperty.call(s, \"active_turn\");"
-    ));
-    assert!(render.contains("if (appliesBootstrap) {"));
-    assert!(render.contains("releaseFirstTurnLockIfIdle(activeTurn);"));
+    assert!(source.contains("case \"thread_metadata\": applyThreadMetadata(msg); break;"));
+    let commit = between(
+        source,
+        "function commitThreadBootstrap(msg) {",
+        "function handleThreadBootstrap(msg) {",
+    );
+    assert!(commit.contains("applyThreadMetadata(payload.metadata, true);"));
+    assert!(commit.contains("applyFinalRuntime(threadId, payload.final_runtime);"));
 }
 
 #[test]
@@ -3106,7 +3015,7 @@ fn browser_serializes_project_catalog_invalidation_and_repairs_reconnects() {
     assert!(load.contains("refresh.wantedGeneration++;"));
     assert!(run.contains("if (generation !== refresh.wantedGeneration) continue;"));
     assert!(run.contains("scheduleProjectThreadRetry(pid, refresh);"));
-    assert!(source.contains("msg.type === \"thread_catalog_changed\""));
+    assert!(source.contains("case \"thread_catalog_changed\": refreshKnownThreadLists(); break;"));
 
     let onopen = between(source, "ws.onopen = () => {", "  };\n  ws.onmessage");
     assert!(onopen.contains("refreshKnownThreadLists();"));
@@ -3120,15 +3029,12 @@ fn browser_projection_conflict_and_malformed_catalog_recovery_is_bounded() {
     let apply_detail = between(
         source,
         "function applyThreadMetadata(s, recoverConflict) {",
-        "function renderThreadState(s, activeTurn) {",
+        "function releaseFirstTurnLockIfIdle(activeTurn) {",
     );
     assert!(
-        apply_detail.contains("state.pendingDetailConflictResyncs.add(result.threadId);")
-            && apply_detail.contains("resetThreadAuthorityForDetailResync(result.threadId);")
-            && apply_detail.contains("send(request);")
-            && !apply_detail.contains("state.ws.close(")
+        apply_detail.contains("resetThreadAuthorityForDetailResync(result.threadId);")
+            && apply_detail.contains("requestThreadResync(\"metadata_revision_conflict\");")
             && apply_detail.contains("resetThreadAuthorityForDetailResync(identity.threadId);")
-            && apply_detail.contains("state.pendingDetailConflictResyncs.delete(result.threadId);")
     );
 
     let remember = between(
@@ -3166,7 +3072,6 @@ fn browser_projection_conflict_and_malformed_catalog_recovery_is_bounded() {
         projects.contains(
             "if (String(state.projectId || \"\") === projectId) clearProjectView(projectId);"
         ) && projects.contains("state.threadAuthorities.delete(tid);")
-            && projects.contains("state.pendingDetailConflictResyncs.delete(tid);")
     );
 }
 

@@ -10,7 +10,7 @@ use giskard_persist::PersistError;
 use giskard_persist::store::{
     PersistStore, ThreadFile, ThreadGitWorkspace, ThreadMutation, ThreadRecency, TurnCommitOutcome,
 };
-use giskard_proto::{ThreadMetadata, ThreadState};
+use giskard_proto::ThreadMetadata;
 
 use crate::hub::Hub;
 
@@ -113,13 +113,6 @@ impl ThreadMetadataService {
         Ok(())
     }
 
-    pub fn thread_state(thread: &ThreadFile, active_turn: Option<bool>) -> ThreadState {
-        ThreadState {
-            metadata: Self::metadata(thread),
-            active_turn,
-        }
-    }
-
     pub fn metadata(thread: &ThreadFile) -> ThreadMetadata {
         ThreadMetadata {
             thread_id: thread.id,
@@ -149,7 +142,7 @@ impl ThreadMetadataService {
                 "publishing committed thread metadata"
             );
             self.hub
-                .publish_thread_metadata(after.id, Self::thread_state(after, None))
+                .publish_thread_metadata(after.id, Self::metadata(after))
                 .await;
         }
 
@@ -251,7 +244,6 @@ mod tests {
     use giskard_core::turn::PermissionPreset;
     use giskard_proto::ServerMessage;
     use tempfile::TempDir;
-    use tokio::sync::mpsc;
     use tokio::time::{Duration, timeout};
 
     use super::*;
@@ -298,9 +290,10 @@ mod tests {
             .create(project_id, thread(project_id, thread_id))
             .await
             .unwrap();
-        let (tx, _rx) = mpsc::channel(8);
-        let replacements = hub.register_client(1, tx.clone()).await;
-        assert!(hub.subscribe(thread_id, 1).await);
+        let replacements = hub.register_client(1).await;
+        let generation = hub.begin_subscribe(thread_id, 1).await.unwrap();
+        assert!(hub.prepare_bootstrap_commit(thread_id, 1, generation, 0));
+        assert!(hub.finish_bootstrap(thread_id, 1, generation).await);
 
         let other_model = ModelRef {
             provider: "proxy".into(),
@@ -328,14 +321,14 @@ mod tests {
             .unwrap();
         let message = timeout(Duration::from_secs(1), replacements.recv())
             .await
+            .unwrap()
             .unwrap();
         match message {
-            ServerMessage::ThreadState(state) => {
-                assert_eq!(state.metadata.revision, 3);
-                assert_eq!(state.metadata.context_window, 258_400);
-                assert_eq!(state.active_turn, None);
+            ServerMessage::ThreadMetadata(metadata) => {
+                assert_eq!(metadata.revision, 3);
+                assert_eq!(metadata.context_window, 258_400);
             }
-            other => panic!("expected thread state, got {other:?}"),
+            other => panic!("expected thread metadata, got {other:?}"),
         }
         assert!(
             timeout(Duration::from_millis(20), replacements.recv())
@@ -354,11 +347,11 @@ mod tests {
             .unwrap();
         assert!(matches!(
             replacements.recv().await,
-            ServerMessage::ThreadState(_)
+            Some(ServerMessage::ThreadMetadata(_))
         ));
         assert!(matches!(
             replacements.recv().await,
-            ServerMessage::ThreadCatalogChanged
+            Some(ServerMessage::ThreadCatalogChanged)
         ));
     }
 
@@ -379,9 +372,10 @@ mod tests {
             .create(project_id, thread(project_id, thread_id))
             .await
             .unwrap();
-        let (tx, _rx) = mpsc::channel(8);
-        let replacements = hub.register_client(1, tx.clone()).await;
-        assert!(hub.subscribe(thread_id, 1).await);
+        let replacements = hub.register_client(1).await;
+        let generation = hub.begin_subscribe(thread_id, 1).await.unwrap();
+        assert!(hub.prepare_bootstrap_commit(thread_id, 1, generation, 0));
+        assert!(hub.finish_bootstrap(thread_id, 1, generation).await);
 
         let turn = Turn {
             id: TurnId::new(),
@@ -409,13 +403,13 @@ mod tests {
                 .unwrap(),
             TurnCommitOutcome::MetadataMutation(ThreadMutation::Changed { .. })
         ));
-        let ServerMessage::ThreadState(committed) = replacements.recv().await else {
+        let Some(ServerMessage::ThreadMetadata(committed)) = replacements.recv().await else {
             panic!("turn commit should publish thread metadata");
         };
-        assert_eq!(committed.metadata.tokens.total.total, 110);
+        assert_eq!(committed.tokens.total.total, 110);
         assert!(matches!(
             replacements.recv().await,
-            ServerMessage::ThreadCatalogChanged
+            Some(ServerMessage::ThreadCatalogChanged)
         ));
 
         store
@@ -431,9 +425,9 @@ mod tests {
                 .unwrap(),
             ThreadMutation::Changed { .. }
         ));
-        let ServerMessage::ThreadState(repaired) = replacements.recv().await else {
+        let Some(ServerMessage::ThreadMetadata(repaired)) = replacements.recv().await else {
             panic!("aggregate repair should publish thread metadata");
         };
-        assert_eq!(repaired.metadata.tokens.total.total, 110);
+        assert_eq!(repaired.tokens.total.total, 110);
     }
 }

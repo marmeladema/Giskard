@@ -9,7 +9,7 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.68
+**Version:** 1.69
 
 > **Amendment — frontend approach (supersedes the Dioxus/WASM design below).**
 > This document was written targeting a **Dioxus fullstack / WebAssembly** frontend (`giskard-ui`),
@@ -22,6 +22,39 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.68 → 1.69), runtime and bootstrap reconciliation:**
+- **RB1:** One `ThreadRuntimeRegistry` now owns active-turn leases, live reconstruction, tasks,
+  requests, the bounded per-thread event journal, and the replacement runtime overview. Each
+  client-visible agent event is applied once and receives one process-local sequence.
+- **RB2:** Subscribe now produces one staged `ThreadBootstrap` transaction containing metadata,
+  history, live reconstruction, ordered suffix, final runtime, and notices. The browser stages
+  start/chunk frames and changes authoritative state only at a matching-generation commit.
+- **RB3:** Delivery is bounded and class-aware. Ordered-event loss invalidates only the affected
+  subscription and requests a same-socket resync; revisioned replacements coalesce independently,
+  and slow clients cannot block event forwarding or turn persistence.
+- **RB4:** Request receipt, claim, rollback, and resolution use the ordered event lane plus the
+  final-runtime replacement. Running-task snapshots are menu-only, and one revisioned runtime
+  overview replaces cross-thread additive activity.
+- **RB5:** Turn completion remains owned by runtime until authoritative history persistence
+  succeeds. Bounded retry can enter an actionable `PersistenceBlocked` state with explicit retry
+  and confirmed-discard recovery.
+- **RB6:** The earlier wire mechanisms named in historical changelog entries—including
+  `ThreadState`, `ThreadActivity`, `HistoryDelta`, `LiveTurnSnapshot`, `RunningTasks`,
+  `ApprovalResolved`, and the top-level `Event` message—are superseded and are not current
+  protocol alternatives. The paired browser and server implement only the §13.6 protocol.
+- **RB7:** Turn-less context-window restoration is deliberately deferred. When added, it must use
+  the existing metadata authority and ordinary `ThreadMetadata` publication. Persisted late-command
+  reconciliation and broader thread/project lifecycle sagas remain separate adjacent work.
+- **RB8:** Late command completion is persisted by appending one newline-terminated replacement
+  item record to the already-committed turn payload before ordered publication. Completed append is
+  the process-level commit; `sync_data` is best-effort crash hardening and failure is warned.
+  Per-thread amendments use a process epoch and sequence in the subscription cursor; they do not
+  rewrite the history index, refold usage, or change recency.
+- **RB9:** Failed late amendments use an ordered runtime-owned recovery queue independent of active
+  turn ownership. Completed command output is normalized once to a bounded head/tail retention
+  with an exact omission marker before the journal, live projection, turn payload, or amendment
+  consumes it. Other turn fields remain unbounded, so bootstrap byte chunking remains mandatory.
 
 **Changelog (1.67 → 1.68), advisory data-directory lock:**
 - **DL1:** One `flock` per data directory (`<data_dir>/.giskard.lock`) supplies the cross-process
@@ -73,6 +106,17 @@
   comparison, or validation. A mismatch is logged and the payload file wins. `status.kind` is the
   exception and stays authoritative in the index, because the ledger folds it and repair must not
   have to open a payload file (§5.4).
+- **L8:** A committed turn payload may later receive newline-terminated replacement `item`
+  records for background commands which finish after turn commit. The append is serialized by the
+  per-thread lock. Readers accept only terminated records, warn and skip malformed committed lines,
+  and preserve an unterminated tail. The next amendment adds a separator newline, recovering a
+  complete JSON value missing only that delimiter while leaving genuinely partial JSON malformed,
+  then writes its own complete record rather than truncating old bytes.
+  A completed append advances the process-local amendment sequence even if best-effort `sync_data`
+  fails. Item identity folds last-wins while retaining the original display position. The index
+  remains append-only and unchanged. Completed command output is normalized to a bounded head and
+  tail with an exact omitted-byte marker before either initial commit or amendment; other payload
+  fields remain agent-sized and unbounded.
 
 **Changelog (1.65 → 1.66), explicit client-state authorities:**
 - **ST1:** Every client-visible state projection names one authority, one clock, and one delivery
@@ -87,10 +131,11 @@
 - **ST3:** Browser thread state is an audited `ThreadMetadata` projection rather than serialized
   `ThreadFile`. Project thread rows carry the same revision, and committed catalog changes publish
   one coalescible catalog invalidation for authoritative HTTP refetches.
-- **ST4:** Authoritative metadata and catalog invalidations use a per-connection replacement lane
-  outside the bounded ordered-event FIFO. Metadata coalesces by subscribed thread and catalog
-  changes coalesce into one global dirty signal, so metadata producers never wait for a slow
-  browser and the latest committed value is not dropped.
+- **ST4:** Authoritative metadata and catalog invalidations use replacement entries in the
+  bounded, class-aware per-connection outbox. They coalesce independently of ordered events:
+  metadata by subscribed thread and catalog changes as one global dirty signal. Metadata
+  producers therefore never wait for a slow browser, and overload enters explicit recovery rather
+  than silently dropping the latest committed value.
 - **ST5:** Metadata actions carry a browser request id and receive an authoritative direct result
   even when the mutation is a no-op. The browser reconciles WebSocket detail, HTTP summaries, and
   action results through one revision authority, and retries raced or failed catalog refetches.
@@ -1120,17 +1165,18 @@
   cache (like `context_window`, C4); `recompute_aggregates(thread)` folds the JSONL to repair after a
   crash between the two writes.
 - **H4/H6:** Restore/list read only `.json` (no history parse). Opening a thread loads the last N
-  turns; older pages load on demand via `LoadHistory { thread_id, before: TurnId, limit }` →
-  `HistoryPage { thread_id, turns: [WireTurn], has_more }`, decoupled from the `ThreadState`
-  snapshot (§13.6). Page sizes are config (`[history] initial`/`page`, §16.3). `TurnId` (ULID) is the
-  pagination cursor — no index file.
+  turns in its staged bootstrap; older pages load on demand through authenticated
+  `GET /api/projects/{project_id}/threads/{thread_id}/history?before={turn_id}&limit={count}`.
+  The response is `{ before, turns: [WireTurn], has_more }`. Page sizes are config
+  (`[history] initial`/`page`, §16.3), and the HTTP endpoint caps a page at 100 turns. `TurnId`
+  (ULID) is the pagination cursor — no separate pagination index.
 - **H5:** The loader composes `[last N turns from JSONL] + [live turn from the live buffer]`; the
   in-flight turn is not in the JSONL until `TurnCompleted`.
 - **H8:** Incremental reconnect: a `Subscribe { since: TurnId }` cursor requests only the turns after
   it, served history-first as `HistoryDelta { thread_id, turns: [WireTurn] }` (via
   `load_turns_after`). Because persisted turns are immutable, the browser keeps its completed-turn
   DOM and repaints only the in-flight turn. An unresolvable cursor (stale/unknown turn) falls back to
-  a full `HistoryPage` sent history-first so the client rebuilds cleanly before the live snapshot.
+  a full-page bootstrap sent history-first so the client rebuilds cleanly before the live snapshot.
 - **H7:** `giskard-admin`: `compact_thread`/`dump_thread` operate on the `.jsonl`, plus
   `recompute_aggregates`; `validate` parses the JSONL line-by-line and reports the first bad line
   rather than quarantining whole histories (§5.5).
@@ -1247,7 +1293,7 @@ Config (global)
 └── Project (1 directory, 1 harness process)
     ├── ProjectConfig (workspace root, harness kind, …)
     └── Thread (durable conversation)
-        ├── ThreadState (mode, current model, permission preset, token totals, context window)
+        ├── ThreadMetadata (mode, current model, permission preset, token totals, context window)
         └── Turn (one user input → agent work)
             └── Item (message / reasoning / command / file-change / diff / approval)
 ```
@@ -1399,8 +1445,9 @@ and approval requests. Two of the core types are hostile to a naïve shared-crat
    paths.** Concretely: `WireAgentEvent`, `WireItem`, `WireItemPayload`, `WireFileDiff`,
    `WireApprovalRequest`, `WireApprovalKind`. `serde_json::Value` payloads (`ToolCall`) stay `Value`
    (wasm-safe).
-3. **The server maps `core → wire` at the outbound edge** (the WS fan-out and the live-turn snapshot),
-   performing the lossy `PathBuf → String` conversion **once, server-side**, with
+3. **The server maps `core → wire` at the outbound edge** (the ordered `ThreadEvent` lane and
+   bootstrap live/suffix projections), performing the lossy `PathBuf → String` conversion
+   **once, server-side**, with
    `Path::to_string_lossy()`. Inbound client messages are already path-free (`SendInput` is text;
    `SavePlan` carries a `String` path validated server-side against the workspace root).
 
@@ -2015,7 +2062,7 @@ giskard/
 │       │       ├── thread.json         # thread metadata, permission preset, token cache — no history
 │       │       ├── history.jsonl       # bounded turn index: header line, then one record per turn
 │       │       ├── turns/
-│       │       │   └── <turn_id>.jsonl # that turn's payload, written atomically (§5.4)
+│       │       │   └── <turn_id>.jsonl # atomic initial payload; appended amendments (§5.4)
 │       │       └── legacy/             # pre-migration originals, retained (§5.4)
 │       ├── worktrees/          # only for threads started isolated (§7.1)
 │       │   └── <thread_id>/            # the thread's linked Git worktree — a checkout, not Giskard state
@@ -2171,7 +2218,7 @@ there is one source of truth to correct if needed.
   *status message* is composed from provider error text with no ceiling, so only a capped rendering
   of it reaches the index and the payload file holds what the harness reported. `<thread_id>/turns/<turn_id>.jsonl` is the **payload**: the full `UserInput`, the
   items and the diffs — everything whose size is a function of what the agent did.
-  On `TurnCompleted` the server writes the payload file **first**, with temp file + `fsync` +
+  On `TurnCompleted` the server writes the initial payload file **first**, with temp file + `fsync` +
   rename, and appends the bounded index record **last**. A crash between the two leaves a payload
   file no turn record references; it is invisible to every read path, because reads start from the
   index, so the worst case is a wasted file. (This is what closes the corruption path a whole-turn
@@ -2198,6 +2245,20 @@ there is one source of truth to correct if needed.
   bounded-residency cache *possible*, but claiming it means caching only the parsed index, which
   waits on the bounded read APIs. Transient attachment bytes are redacted before a
   turn is added to this cache.
+- **Late payload amendments.** A background command which finishes after its turn committed appends
+  one ordinary `item` record under the same per-thread persistence lock. Completed `write_all` is
+  the process-level commit and advances the amendment sequence before publication. `sync_data` is
+  attempted afterward as best-effort crash hardening; failure is warned but does not fail the
+  amendment.
+  Only newline-terminated records are committed. Readers warn and skip malformed JSON, malformed
+  known record shapes, and non-UTF-8 records independently; the required `user_input` record must
+  still survive or that turn fails.
+  An unterminated byte tail, including one cut inside a UTF-8 character, is warned about, ignored,
+  and preserved. The next append adds a newline separator before its complete item record. A valid
+  JSON value missing only its delimiter is thereby recovered; a genuinely partial or malformed
+  value remains invalid and is skipped. No old bytes are truncated or rewritten. Item records fold
+  last-wins by `ItemId` at their original display position. The bounded index, usage aggregates,
+  and recency do not change.
 - **Format identification.** Three independent version numbers, each describing exactly what it
   governs: `thread.json` → `version` (the metadata record schema), the `history.jsonl` header →
   `format` (the directory layout and index schema, written once — at thread creation, or by the
@@ -2227,10 +2288,12 @@ there is one source of truth to correct if needed.
   between the rename and the relocation leaves both shapes on disk, and readers prefer the
   directory while a later pass finishes the move. A format 1 history that cannot be parsed aborts
   its migration and leaves that thread on format 1 rather than rebuilding it minus the lost turns.
-- **Crash consistency:** because writes are atomic renames, a crash leaves either the old or
-  the new complete file, never a partial one. On startup the server validates each JSON file;
-  a corrupt file is moved aside to `<file>.corrupt-<ts>` and logged, and the app continues
-  with the rest (a single bad thread never blocks the whole app).
+- **Crash consistency:** replacement JSON writes and initial turn-payload commits are atomic
+  renames, so a crash leaves either the old or the new complete file. Append-only JSONL authorities
+  tolerate an unterminated tail as specified above. On startup the server validates each JSON file;
+  corrupt atomic JSON documents are moved aside to `<file>.corrupt-<ts>` and logged. Turn-payload
+  record damage instead stays in place and is warned/skipped at record granularity; a missing
+  required record fails only that turn. The app continues with the rest in either case.
 
 ### 5.5 Debug / maintenance surface
 
@@ -2350,8 +2413,9 @@ yet, so there is no catalog to choose from (§8.3).
   after native creation, cleanup is best-effort and failures are logged.
   This first turn begins before the browser subscribes to the new thread, so the composer opens
   locked on a turn it has observed nothing of. It must not stay locked on the strength of that
-  assumption alone: the subscribe snapshot's `active_turn` (§13.6) is what settles whether the turn
-  is still running, and a turn that finished during the gap releases the composer with no re-open.
+  assumption alone: the committed bootstrap's `final_runtime.turn_state` (§13.6) is what settles
+  whether the turn is still running, and a turn that finished during the gap releases the composer
+  with no re-open.
 - **Isolation in a Git worktree:** the start request carries `git_strategy`, settable only from a
   draft because a thread's workspace is fixed once it exists. It is an enum — `shared` (the
   project's own checkout, the default and the only possibility for a non-Git workspace) and
@@ -2461,7 +2525,7 @@ Auto-generate an initial title from the first user message (truncated); user-edi
   Switching mode takes effect on the next turn; the UI makes this explicit.
 - **Durable switch (P2).** `SwitchMode` and `SelectModel` **persist immediately**: the new
   `mode` / `current_model` is written to `<thread_id>.json` before the server acknowledges, then
-  a metadata-only `ThreadState` is published to subscribed tabs so they stay in sync. The initiating
+  a revisioned `ThreadMetadata` is published to subscribed tabs so they stay in sync. The initiating
   request also receives a correlated `ThreadMetadataResult`, including for a no-op. This satisfies
   the §5 "same state after restart" requirement — a switch is not lost if the app restarts before
   the user sends the next message. The sandbox/model *effect* still takes hold at the next turn
@@ -2856,7 +2920,7 @@ The preset is a **thread-level** setting, **not** a per-project or per-turn over
 creation does not ask for it. New thread drafts default to `ask_first`, and the selected draft preset
 is persisted when the first message creates the thread. On existing threads, the preset is settable via
 the `SetPermissionPreset` client message (§13.6), which persists immediately, publishes a
-metadata-only `ThreadState` to subscribed tabs, and returns a correlated metadata result to the
+revisioned `ThreadMetadata` to subscribed tabs, and returns a correlated metadata result to the
 initiator — the same durable-switch pattern as `SwitchMode`/`SelectModel` (P2).
 
 **Interaction with Plan mode.** Mode (Plan/Build) and permission preset are **orthogonal
@@ -3258,15 +3322,14 @@ Client-visible state must belong to exactly one authority in this table. A clock
 projection in its own row; comparing clocks from different rows has no meaning. Before adding a
 wire message, its specification must name its authority, clock, and delivery class here.
 
-The metadata and catalog rows are implemented by ST1–ST3. The remaining rows are normative target
-authorities for the staged runtime/bootstrap redesign; they describe the required end state rather
-than claiming that the current transitional stores already provide those clocks.
+These are the implemented authorities for persisted metadata, process-local runtime state, and
+connection reconciliation. No client-visible field may be maintained by a parallel legacy store.
 
 | State | Authority | Clock | Delivery class |
 | --- | --- | --- | --- |
 | Persisted thread metadata | thread metadata service | durable thread revision | revisioned replacement |
 | Project thread catalog | persisted thread files | each row's thread revision | invalidation + HTTP replacement |
-| Completed transcript | history JSONL | ordered `TurnId` | bootstrap/page |
+| Completed transcript | history JSONL | ordered `TurnId` | bootstrap/HTTP page |
 | Active transcript | thread runtime registry | process-local event sequence | ordered journal |
 | Active-turn ownership | thread runtime registry | runtime transition order | bootstrap/runtime replacement |
 | Running tasks | thread runtime registry | process-local task revision | revisioned replacement |
@@ -3277,7 +3340,7 @@ than claiming that the current transitional stores already provide those clocks.
 
 Persisted thread revisions survive a server restart. Event, task, and overview counters do not;
 their bootstrap establishes a new per-connection baseline. A metadata revision does not order
-`active_turn`, transcript events, tasks, requests, or notices.
+active-turn ownership, transcript events, tasks, requests, or notices.
 
 `ThreadMetadata` is the only browser projection of persisted thread detail. It contains the thread
 id, revision, title, mode, current model, effective context window, permission preset, and token
@@ -3309,7 +3372,8 @@ latest persisted turn timestamp; it never uses the repair time.
   A transcript link is opened through
   `POST /api/projects/{project_id}/threads/{parent_thread_id}/subagent-links/{item_id}/open`.
   The browser supplies only Giskard-owned coordinates. The server resolves the raw item from the
-  parent's live buffer or persisted turns, derives its native child ID, prompt, lifecycle evidence,
+  parent's trusted runtime item view or persisted turns, derives its native child ID, prompt,
+  lifecycle evidence,
   and containing `TurnId`, then idempotently materializes or returns the linked thread. Unknown and
   non-link items return `409 Conflict`. A reverse child-to-parent item returns the existing parent
   without changing ownership.
@@ -3332,7 +3396,10 @@ cursor, H8), `Unsubscribe { thread_id }`,
 `SetPermissionPreset { thread_id, request_id, preset }`,
 `Interrupt { thread_id }`, `CompactContext { thread_id }`,
 `TerminateCommand { thread_id, process_id }`,
-`ApprovalDecision { request_id, decision }`, `SavePlan { thread_id, path }`.
+`ApprovalDecision { thread_id, request_id, decision }`,
+`ServerRequestResponse { thread_id, request_id, response }`,
+`RetryTurnPersistence { thread_id, turn_id }`,
+`DiscardUnpersistedTurn { thread_id, turn_id }`, and `SavePlan { thread_id, path }`.
 
 `SendInput` and `CompactContext` are serialized per thread by the server before they enter the
 harness. If another normal turn or manual context compaction is already starting or running on the
@@ -3346,10 +3413,11 @@ anything other than `thread_turn_active`.
 Passive sub-agent monitoring uses that same per-thread gate. It is armed only by explicit
 non-terminal lifecycle evidence; reopening an existing child without such evidence and terminal
 lifecycle events do not start a monitor. Its first turn-bearing
-event reserves and acknowledges the native turn before any live-buffer, broadcast, or persistence
-mutation. If a normal forwarder already owns the thread, the passive subscriber exits without
-processing it. A terminal observation wakes an idle passive subscriber immediately so queued child
-events win, then fallback recovery or clean exit occurs without waiting for the idle timeout.
+event reserves and acknowledges the native turn before any runtime-registry, publication, or
+persistence mutation. If a normal forwarder already owns the thread, the passive subscriber exits
+without processing it. A terminal observation wakes an idle passive subscriber immediately so
+queued child events win, then fallback recovery or clean exit occurs without waiting for the idle
+timeout.
 Explicit active evidence has a renewable ten-minute no-event pre-turn safety bound; any stream or
 lifecycle activity restarts it, and it no longer applies once a native turn starts. Direct user
 input is rejected while that passive ownership is registered, then allowed as a normal child turn
@@ -3359,7 +3427,7 @@ interactive forwarder owns the turn gate, the passive subscriber yields before b
 
 > **Durable settings switches (P2/P3).** `SwitchMode`, `SelectModel`, and `SetPermissionPreset`
 > persist immediately to `<thread_id>.json` before the server acknowledges, then broadcast a
-> metadata-only `ThreadState` to subscribed tabs. The initiating browser receives
+> revisioned `ThreadMetadata` to subscribed tabs. The initiating browser receives
 > `ThreadMetadataResult { request_id, ...ThreadMetadata }` after commit even when the requested
 > value was already current; failures carry the same request id in `Error`. This guarantees the §5
 > "same state after restart" requirement without leaving an optimistic control pending on a no-op.
@@ -3380,55 +3448,53 @@ interactive forwarder owns the turn gate, the passive subscriber yields before b
 > `fs/remove` after the turn, an upload/start failure, stream loss, command/control channel closure,
 > or shutdown. It never writes upload bytes into the project workspace.
 
-**Server → client** (examples): `Event { thread_id, agent_event }` (a serialized
-`WireAgentEvent` — the path-mirrored wire form of `AgentEvent`, §3.5),
-`ThreadActivity { thread_id, kind, active_turn, summary?, ...kind_payload }`
-(lightweight cross-thread sidebar/notification signal; `approval_requested` carries
-`approval_id`, and `server_request_received` carries `server_request_id`),
-`ThreadActivityBootstrap { activities: [ThreadActivity] }` (SB5: the outstanding subset of the
-above, sent once to a connecting client only and never broadcast, so a browser that missed the live
-signal still shows what is blocked; a separate message so clients can tell a replay from a live
-event and apply SB6's alert-once-per-session rule),
-`ThreadState { ...ThreadMetadata, active_turn? }` (typed persisted snapshot; subscribe/resync
-includes `active_turn`, while live metadata publication omits it because runtime liveness has a
-different authority and clock),
-`ThreadMetadataResult { request_id, ...ThreadMetadata }` (direct correlated result for a metadata
-action, including a no-op),
-`ThreadCatalogChanged` (coalescible invalidation for authoritative HTTP thread-list refetches),
-`LiveTurnSnapshot { thread_id, turn_id, user_input?, accumulated,
-answered_approvals, answered_server_requests }` (in-flight turn reconstruction on reconnect,
-carrying the turn input when the server synthesized the turn context, the `WireAgentEvent`s of the
-turn so far. Every `ApprovalRequested` and `ServerRequestReceived` rides along in `accumulated`,
-answered ones included; the client derives what is still outstanding while replaying, with no
-companion pending list. A request is outstanding unless the user answered it (named in
-`answered_approvals` / `answered_server_requests`) or, for server requests, the harness closed it
-(`server_request_resolved` later in `accumulated`). There is no separate "pending" field for either
-kind: a turn can be blocked on several at once, and a precomputed list would duplicate a derivation
-already available on both ends. Approval resolution lives only in browser memory, so without
-`answered_approvals` a reload would replay an answered approval as pending and answering it again
-routes a stale id to the harness, which errors — and `answered_server_requests` for the same reason
-(SR6), since a harness's own resolved event may be late or absent),
-`RunningTasks { thread_id, tasks: [RunningTask] }` (commands and tool/MCP calls still known to be
-running, including commands that outlived an interrupted turn),
-`ApprovalResolved { thread_id, request_id, decision }`,
-`Error { code, severity, message, detail?, thread_id?, action? }`, `Pong`.
+**Server → client** has one current, paired-client protocol:
+
+- `ThreadEvent { thread_id, subscription_generation, seq, event }` is the only ordered live lane.
+  `event` is either `Agent { agent_event: WireAgentEvent }` or
+  `Request { request: RequestState }`. Request receipt, claim, rollback, and resolution therefore
+  use the same sequence and journal as transcript events; one harness event never produces a
+  second field-specific live message.
+- `ThreadMetadata`, `ThreadTasks`, `ThreadNotices`, and `ThreadRuntimeOverview` are complete,
+  revisioned replacements for their authorities. `ThreadRuntimeOverview` is sent on every socket
+  connection, including when empty. `ThreadMetadataResult` is the direct correlated result for a
+  browser metadata action, including a no-op. `ThreadCatalogChanged` is a coalescible invalidation
+  for authoritative HTTP catalog replacement.
+- `ThreadBootstrap { thread_id, subscription_generation, frame }` is one staged transaction.
+  Every bootstrap emits `Start`, one or more `Chunk` frames for each of the six sections, then
+  `Commit`, even when each section fits one chunk. The independently encoded sections are metadata,
+  history, live turn, ordered suffix, final runtime, and notices. Start/chunk frames never mutate
+  authoritative browser state; only a matching-generation commit validates and applies the whole
+  payload.
+- Older completed transcript pages use authenticated HTTP, not the WebSocket:
+  `GET /api/projects/{project_id}/threads/{thread_id}/history?before={turn_id}&limit={count}`.
+  The required cursor is echoed in `{ before, turns, has_more }`; the optional count is capped at
+  100. Browser requests are cancelled or ignored when navigation changes the active thread.
+- `ResyncRequired { thread_id, subscription_generation, reason, retry_after_ms? }` invalidates one
+  subscription, not the socket. The browser re-subscribes that thread on the same connection.
+- `Error { code, severity, message, detail?, thread_id?, action?, request_id?, process_id? }` is a
+  direct control result; `Pong` is the heartbeat response.
+
+The bootstrap final-runtime section contains the committed `through_seq`, active-turn or
+`PersistenceBlocked` state, an optional independent historical-amendment recovery, the task
+baseline, and every current request state. The live-turn
+section contains a compact reconstruction plus `represented_through`. The ordered suffix contains
+only events after that representation watermark which are not explicitly covered by a history turn
+included in the same transaction. An appended late-command amendment carries its sequence as
+coverage; it is filtered only when the coherent history snapshot already includes that sequence.
 
 `OpenThreadResponse` may also carry `warning: ErrorInfo?` with the same `code` / `severity` /
 `message` shape when the requested thread was opened but degraded (for example, Codex resume
 failed and Giskard started a fresh native session while keeping persisted history).
 
-**Approval resolution invariant (AR1):** approval requests may be visible in multiple tabs for the
-same subscribed thread. A successful `ApprovalDecision` is the single authoritative answer for that
-request id. After forwarding it to the harness, the server must broadcast `ApprovalResolved` to the
-thread subscribers; each browser must remove the pending actions and render the resolved decision
-card, and close only native browser notifications keyed to that request id. Duplicate/stale
-decisions for a removed request id remain protocol errors.
-
-**Server-request resolution invariant (SR6):** the same holds for server requests, with one
-difference: a harness emits its own resolved event, so the server does not synthesize one. It must
-still record the answer against the in-flight turn when it routes the response, because that event
-may be arbitrarily late or never sent, and until it lands a reconnect would replay the request as
-actionable.
+**Request resolution invariant (AR1/SR6):** request identity is `(thread_id, request_id)`. Approval
+and server requests share one authoritative state machine: `Pending → Responding → Resolved`, with
+a harness-delivery failure returning `Responding → Pending`. Only one concurrent claim succeeds.
+Every transition is an ordered `ThreadEventPayload::Request`, and the final-runtime bootstrap
+replacement settles actionability after replaying older chronology. A harness may emit its own
+server-request resolution late or not at all; the successful response commit remains authoritative.
+Duplicate, stale, or wrong-thread responses are protocol errors. Browsers close only native
+notifications keyed to the resolved `(thread_id, request_id)`.
 
 **Client rendering invariant (E6):** `ItemDelta { item_id }` and the later `ItemCompleted`
 for the same `Item.id` are one lifecycle. The UI must finalize or replace the streamed body in
@@ -3448,8 +3514,8 @@ for global errors that intentionally omit `thread_id`.
 
 **Server thread isolation invariant (WS3):** a per-thread event forwarder only owns
 `AgentEvent`s whose `thread` field equals the forwarder's `ThreadId`. Events for another thread
-are ignored before turn ownership, live-buffer updates, running-task updates, approval/server
-request registration, hub broadcast, or JSONL persistence. Each ignored foreign-thread event is
+are ignored before turn ownership, runtime-registry application, request/task updates, journal
+publication, or JSONL persistence. Each ignored foreign-thread event is
 logged at error level with structured fields sufficient to diagnose the harness routing bug without
 dumping the full event payload.
 
@@ -3465,11 +3531,11 @@ meaning is rendered as a transcript row. `FileChange`, `ToolCall`, and `Activity
 they must not fall through to empty agent bubbles or be silently hidden. Started tool calls with
 `ToolCallStart` metadata are also visible before completion, so long-running or stuck tool calls
 do not appear as silent active turns. The client records `ItemStarted.kind` and uses it to style
-streamed deltas before completion. On reconnect, the client replays `LiveTurnSnapshot.accumulated`
-events through the same event handler used for live WebSocket events.
+streamed deltas before completion. Bootstrap live projection and ordered suffix events pass through
+the same event handler used for live `ThreadEvent`s.
 
 > **Wire types (C1/§3.5).** Everything the server emits that could carry a filesystem path
-> (`Event` and the `LiveTurnSnapshot` contents) is mapped `core → Wire*` at the
+> (ordered events and bootstrap live/suffix contents) is mapped `core → Wire*` at the
 > fan-out boundary, so paths are UTF-8 `String`s on the wire. Client→server messages are path-free
 > (`SendInput` is text; `SavePlan.path` is a `String` re-validated server-side).
 > Started and completed sub-agent items use `WireSubagentLink`, which retains display/prompt/
@@ -3477,88 +3543,82 @@ events through the same event handler used for live WebSocket events.
 > Giskard ownership IDs. Native routing identities remain in core/persistence and are resolved by
 > the item-based open endpoint.
 
-- **Fan-out:** the server keeps `thread_id → set<client_conn>` for full transcript traffic and a
-  global connected-client registry for lightweight browser activity. An `AgentEvent` is serialized
-  once and sent only to clients subscribed to that thread. Background threads keep producing events;
-  a client that isn't subscribed to a thread still receives lightweight `ThreadActivity` updates so
-  the sidebar shows activity and approval notifications can fire, but it does not receive the full
-  delta stream or history/live snapshots (bandwidth control).
-- **ThreadActivity:** `kind` is an internally tagged payload: `turn_started`, `progress`,
-  `approval_requested { approval_id }`, `server_request_received { server_request_id }`,
-  `turn_completed`, `error`, or `notice`. The JSON object stays flat for browser consumption
-  (`kind`, `approval_id`, `server_request_id` as top-level fields), but the derived Rust protocol
-  type must make invalid server-side construction unrepresentable. High-volume text deltas are
-  intentionally skipped. Clients must use request ids only for notification/targeting/routing
-  affordances and must still subscribe/open the thread before rendering full transcript state.
-  Current-thread approvals are not notified while the page is visible and focused, but may notify
-  when the page is hidden or the browser window is not focused. The browser must deduplicate the
-  lightweight activity path against the later full approval event for the same
-  `(thread_id, approval_id)`.
-- **Activity for threads with no sidebar row (SB1–SB4):** managed sub-agent threads are hidden from
-  the sidebar but still produce `ThreadActivity`, so the browser must not derive thread identity
-  from the rendered row. It resolves the project, display title, kind, and parent from the cached
-  per-project thread summaries, and hoists a hidden thread's activity onto the nearest ancestor
-  that does have a row. That row shows the most urgent state among itself and its hidden
-  descendants — `approval_requested` > `error` > active turn — names the originating descendant in
-  its tooltip, and marks the state as hoisted. Ancestor and descendant walks are bounded so
-  corrupted or cyclic ownership terminates instead of spinning. A sub-agent's approval notification
-  names the child and its owning thread; since the server materializes a child on its own, activity
-  for an unlisted thread must trigger a thread-list refresh before naming or navigating to it.
-  A client that connects later is not left blind (SB5): the server sends it the set of threads
-  currently waiting on the user, before it subscribes to anything.
-- **Backpressure:** per-connection bounded queue; if a client falls behind, coalesce deltas
-  (keep latest) rather than unbounded buffering. Heartbeat ping/pong; auto-reconnect on the
-  client with resubscribe + state resync. Browser disconnects caused by mobile/tab suspension are
-  not user-facing errors while recovery is in progress; foreground auth/network failures remain
-  visible through persistent connection state and throttled warning/error notices.
-- **Reconnect & live-turn resync.** Persisted thread state only advances on `TurnCompleted`
-  (§5.4), so a client that reconnects **during** an in-flight turn cannot reconstruct the live
-  turn from disk alone. To close this gap the server keeps, **per active turn**, an in-memory
-  **live buffer**: the ordered `AgentEvent`s accumulated since `TurnStarted` (agent-text so
-  far, command output so far, pending approval/server requests, current diffs). This buffer is
-  discarded on `TurnCompleted` (the finalized items are then on disk). On `Subscribe`, the
-  server sends a **snapshot** first:
-  1. the persisted thread state (all completed turns) from disk, then
-  2. if a turn is currently live, a `LiveTurnSnapshot` reconstructed from the live buffer
-     (accumulated text/output + any pending approval/server request), then
-  3. subsequent deltas as normal.
+- **Fan-out:** the server keeps `thread_id → set<client_conn>` for ordered transcript traffic and a
+  global connected-client registry for the replacement runtime overview. Background threads keep
+  producing journal events, but only subscribers receive their transcript stream. Every connection
+  receives the complete runtime overview, so inactive-thread turn/request badges and notifications
+  do not depend on additive signals or a full transcript subscription.
+- **Runtime overview and hidden threads:** the overview contains exact membership for threads with
+  an active or persistence-blocked turn, a failed historical amendment, or a pending/responding
+  request. An empty replacement clears
+  stale state. The browser resolves hidden managed sub-agents through cached catalog ownership and
+  hoists the most urgent descendant state to the nearest visible ancestor. Bounded graph walks
+  prevent corrupt ownership cycles from spinning. Newly observed request identities drive browser
+  notifications; replacing overview state never replays a notification already deduplicated in the
+  page session.
+- **Backpressure:** each connection has one bounded, class-aware outbox with data and reserved
+  control capacity. Revisioned replacements coalesce by authority key in their original queue
+  position. Ordered fragments are never coalesced or silently dropped: their admission pressure or
+  a sequence gap moves only that thread subscription to `NeedsResync` and enqueues one same-socket
+  `ResyncRequired`. Admission pressure for a thread replacement does the same rather than silently
+  losing authoritative state. A slow tab cannot await or block event forwarding, history
+  persistence, turn cleanup, or another tab. Bootstrap frame admission is bounded; failure releases
+  its journal pin. A connection that cannot admit a global catalog or runtime-overview replacement
+  is closed because no thread-scoped repair can restore it. Invalid client messages log a
+  diagnostic, enqueue a final structured error, receive a bounded writer drain, and close the
+  connection. Each physical WebSocket write also has a bounded deadline; expiry closes the stalled
+  connection so its subscriptions, journal baselines, and idle runtime state are reclaimed.
+- **Aggregate bootstrap and reconnect.** A subscription is registered in `Bootstrapping` before
+  any read. The runtime captures and pins the live cut first, persisted history is read second, and
+  the final journal cut atomically installs the Hub's `Committing` barrier under the
+  runtime→subscription lock order. Events through `represented_through` are reconstructed by the
+  compact live projection/final runtime; later events form a sequenced suffix. An event covered by
+  a history turn in the same bootstrap is filtered from the suffix, while uncovered late command
+  events remain. Metadata, tasks, and notices racing the transaction wait behind its barrier.
 
-  The browser treats this subscribe/resubscribe snapshot as authoritative for the active thread.
-  It must clear transient browser-rendered transcript state (including optimistic pending user
-  rows, fallback failed-turn bubbles, pending approvals/server requests, running-task DOM maps, and
-  stale active-turn controls) before rendering the returned recent history and then replaying the
-  live snapshot. Later metadata-only `ThreadState` broadcasts are not subscribe snapshots and must
-  not clear the visible transcript.
+  The browser stages all six sections by subscription generation and applies nothing until commit.
+  Commit clears the prior transient authority once, renders history, replays the compact live
+  projection and ordered suffix through the normal event path, and applies final runtime last.
+  Full, incremental, cursor-reset, one-chunk, and multi-chunk bootstraps use this one path. A
+  superseded generation cannot commit. Pagination never enters it.
 
-  Step 2 is conditional, so its *absence* carries no information: a turn that is over and a turn
-  the harness has accepted but not yet streamed both produce no `LiveTurnSnapshot`. The
-  subscribe `ThreadState` of step 1 therefore states turn liveness outright in `active_turn`,
-  answered from
-  the server's active-turn gate — held from before `POST /threads/start` returns until the turn
-  ends, so it covers the window where the live buffer is still empty. This is what a client needs
-  when it starts a turn over HTTP and subscribes afterwards (§7.1): if that turn finishes first,
-  its `TurnCompleted` was broadcast to a thread with no subscribers, and without `active_turn` the
-  client would keep its composer locked on a turn that is already done.
-
-  A later live `ThreadState` is metadata-only and omits `active_turn`. The browser applies its
-  fields only when its revision is newer, but always applies subscribe/resync bootstrap effects and
-  an explicitly present runtime-liveness value independently of metadata staleness.
-
-  This means a reconnected client sees the full in-progress turn, including still-pending
-  approval and server-request prompts. The live buffer is bounded
-  (coalesced/truncated for very long command output, keeping head+tail) to cap memory; the
-  authoritative full output still lands on disk at `TurnCompleted`.
-- **Running-task resync (TK1).** Commands can outlive an interrupted turn even after the live buffer
-  is discarded. The server therefore keeps a separate in-memory running-task registry keyed by
-  `thread_id` + `item_id`, updated from command **and tool-call** item start/output/completion
-  events. Tool calls are tracked the same way (name + server, elapsed time, output tail) and shown
+  The runtime registry owns one bounded per-thread journal shared by subscribers. A bootstrap pin
+  reserves a bounded suffix budget from the live cut; exhaustion returns a retryable thread-scoped
+  resync with a retry delay rather than growing memory or closing every thread on the socket.
+  Runtime state and its process-local counters are retired once no lease, live projection, task,
+  actionable request, journal pin, or subscriber remains.
+- **Turn persistence handoff.** `TurnCompleted` is applied to the runtime but is not published and
+  its lease is not released until the history append succeeds. The server makes three named,
+  bounded automatic attempts and checks the authoritative history by `TurnId` before retrying an
+  ambiguous append. Exhaustion transfers the complete `Turn` and lease to `PersistenceBlocked`,
+  visible in the runtime overview and bootstrap. `RetryTurnPersistence` and
+  `DiscardUnpersistedTurn` both require the expected `TurnId`, so a stale recovery action cannot
+  settle a later turn. Discard requires browser confirmation, logs a structured lost-turn
+  diagnostic, and is the only path which intentionally releases ownership without durable history.
+- **Late history amendments.** Terminal command items arriving after their turn commit enter one
+  runtime-owned FIFO per thread. The queue serializes payload mutation, amendment-sequence
+  allocation, runtime application, and ordered publication, so two completions cannot expose their
+  clocks in reverse order. Persistence appends one newline-terminated ordinary replacement item
+  record to `turns/<turn_id>.jsonl`; the last committed item record for an
+  `ItemId` wins without moving its display position. A malformed record or unterminated tail is
+  preserved and skipped as defined in §5.4. The bounded index, aggregates, usage ledger, and
+  recency do not change. Three failed
+  attempts expose the queue head as `history_recovery` without changing `turn_state`, so a newer
+  turn may continue. Retry and confirmed discard claim only that head. Discard resolves the live
+  task without durable coverage and retains a warning that the result will not survive restart.
+- **Running-task replacement (TK1).** Commands can outlive an interrupted turn after its transcript
+  becomes durable. The thread runtime registry owns task state keyed by
+  `(thread_id, turn_id, item_id)`, updated atomically with command **and tool-call** item
+  start/output/completion events. Tool calls are tracked the same way (name + server, elapsed time,
+  output tail) and shown
   in the same `Tasks` menu, but they carry no `process_id` and do not outlive their turn: a
   tool still running when its turn completes (i.e. an interrupted turn) is dropped, while commands
   are kept as `after_turn`. Stopping a tool has no per-call cancel in Codex, so the browser sends
-  `Interrupt { thread_id }` (turn-level) rather than `TerminateCommand`. On subscribe, and after
-  each registry change, the server sends `RunningTasks`; the browser renders these in the header
-  `Tasks` menu and maps `item_id` back to the transcript row for select/scroll (tool transcript
-  rows are owned by the item stream, not re-rendered from the snapshot).
+  `Interrupt { thread_id }` (turn-level) rather than `TerminateCommand`. Subscribe carries the
+  authoritative task baseline in `ThreadBootstrap.final_runtime`; after each later registry
+  change, the server sends revisioned `ThreadTasks`. The browser renders these in the header
+  `Tasks` menu and maps `(turn_id, item_id)` back to the transcript row for select/scroll (tool
+  transcript rows are owned by the item stream, not re-rendered from the snapshot).
   `TerminateCommand` requests are forwarded to the active harness. Giskard must not terminate
   local processes directly; the adapter uses the harness's process-specific control operation. It
   must not fall back to turn interruption for command stop; the browser exposes turn interruption
@@ -3573,7 +3633,7 @@ events through the same event handler used for live WebSocket events.
   `Error` path and the command remains visible with `terminating: false`.
   Harness adapters that can observe post-turn command lifecycle messages must keep draining them
   while any command is known running. When a late terminal command completion arrives for an
-  already-persisted turn, the server updates `RunningTasks` and may broadcast the terminal
+  already-persisted turn, the server updates `ThreadTasks` and may publish the terminal ordered
   `ItemCompleted` event to connected clients, but it does not mutate the already-appended JSONL
   turn record.
   Running-task snapshots include `started_at_ms`; clients use it to render elapsed time and
@@ -3600,7 +3660,7 @@ Everything is tested. Three layers:
 - `giskard-core`: pure domain logic (mode transitions, token aggregation math, path
   linkification, model-ref equality treating provider as significant, context-gauge
   computation, week/month derivation from daily buckets). No I/O, fast, exhaustive.
-- `giskard-persist`: atomic-write behavior, corruption quarantine, load/round-trip fidelity,
+- `giskard-persist`: atomic-write behavior, atomic-JSON quarantine, payload-record recovery,
   concurrent-write safety (property tests where useful).
 - `giskard-server`: auth (password hash verify, cookie signing/expiry), the filesystem
   browser's path-confinement logic (must reject `..`/symlink escapes when roots are set),
@@ -3765,29 +3825,54 @@ supports, including `collaborationMode` and `item/tool/requestUserInput`.
 
 ```jsonc
 // client → server
-{ "type": "SendInput", "thread_id": "01J…", "text": "Refactor the auth module" }
-{ "type": "SwitchMode", "thread_id": "01J…", "request_id": "meta_1", "mode": "build" }
-{ "type": "SelectModel", "thread_id": "01J…", "request_id": "meta_2",
+{ "type": "send_input", "thread_id": "01J…", "text": "Refactor the auth module" }
+{ "type": "switch_mode", "thread_id": "01J…", "request_id": "meta_1", "mode": "build" }
+{ "type": "select_model", "thread_id": "01J…", "request_id": "meta_2",
   "model_ref": { "provider": "cloudflare-litellm", "model": "@cf/z-ai/glm-4.7",
                  "reasoning_effort": null } }
-{ "type": "SetPermissionPreset", "thread_id": "01J…", "request_id": "meta_3",
+{ "type": "set_permission_preset", "thread_id": "01J…", "request_id": "meta_3",
   "preset": "auto_approve" }
-{ "type": "ApprovalDecision", "request_id": "ap_7", "decision": "accept_for_session" }
-{ "type": "SavePlan", "thread_id": "01J…", "path": "docs/plan-auth-20260706-1030.md" }
+{ "type": "approval_decision", "thread_id": "01J…", "request_id": "ap_7",
+  "decision": "accept_for_session" }
+{ "type": "server_request_response", "thread_id": "01J…", "request_id": "srv_4",
+  "response": { "kind": "result", "value": { "answers": ["Yes"] } } }
+{ "type": "save_plan", "thread_id": "01J…",
+  "path": "docs/plan-auth-20260706-1030.md" }
 
-// server → client
-{ "type": "Event", "thread_id": "01J…",
-  "agent_event": { "kind": "ItemDelta", "item_id": "it_3",
-                   "delta": { "text": "I'll start by reading auth.rs…" } } }
-{ "type": "Event", "thread_id": "01J…",
-  "agent_event": { "kind": "ApprovalRequested",
-    "request": { "id": "ap_7", "kind": "command_execution",
-                 "command": "cargo test", "cwd": "/home/user/dev/x",
-                 "decisions": ["accept","accept_for_session","decline","cancel"] } } }
-{ "type": "Event", "thread_id": "01J…",
-  "agent_event": { "kind": "TurnCompleted",
-                   "usage": { "input": 1200, "output": 340, "total": 1540 },
-                   "status": "completed" } }
+// server → client: one ordered lane for transcript and request transitions
+{ "type": "thread_event", "thread_id": "01J…", "subscription_generation": 7, "seq": 42,
+  "event": { "kind": "agent", "agent_event": {
+    "kind": "item_delta", "thread": "01J…", "turn": "01K…", "item_id": "it_3",
+    "delta": { "type": "text", "text": "I'll start by reading auth.rs…" }
+  } } }
+{ "type": "thread_event", "thread_id": "01J…", "subscription_generation": 7, "seq": 43,
+  "event": { "kind": "request", "request": {
+    "thread_id": "01J…", "request_id": "ap_7",
+    "payload": { "kind": "approval", "request": {
+      "id": "ap_7",
+      "kind": { "kind": "command_execution", "command": "cargo test",
+                "cwd": "/home/user/dev/x" },
+      "available": ["accept", "accept_for_session", "decline", "cancel"]
+    } },
+    "status": { "status": "pending" }
+  } } }
+
+// server → client: every subscription uses the same staged transaction shape
+{ "type": "thread_bootstrap", "thread_id": "01J…", "subscription_generation": 8,
+  "frame": { "phase": "start", "sections": [
+    { "section": "metadata", "encoded_bytes": 512, "chunk_count": 1 },
+    { "section": "history", "encoded_bytes": 16384, "chunk_count": 2 },
+    { "section": "live_turn", "encoded_bytes": 2048, "chunk_count": 1 },
+    { "section": "ordered_suffix", "encoded_bytes": 1024, "chunk_count": 1 },
+    { "section": "final_runtime", "encoded_bytes": 768, "chunk_count": 1 },
+    { "section": "notices", "encoded_bytes": 128, "chunk_count": 1 }
+  ] } }
+// One chunk frame is sent for each declared chunk; one is shown here.
+{ "type": "thread_bootstrap", "thread_id": "01J…", "subscription_generation": 8,
+  "frame": { "phase": "chunk", "section": "metadata", "index": 0,
+             "payload_base64": "eyJ0aHJlYWRfaWQiOiIuLi4ifQ==" } }
+{ "type": "thread_bootstrap", "thread_id": "01J…", "subscription_generation": 8,
+  "frame": { "phase": "commit" } }
 ```
 
 ### Appendix C — Configuration reference (`config.toml`)

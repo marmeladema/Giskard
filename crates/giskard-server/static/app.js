@@ -117,10 +117,6 @@ const COMPOSER_HINT = COMPOSER_IS_TOUCH
   vv.addEventListener("scroll", apply);
 })();
 // History is paginated by turn on the server, but a turn can hold an arbitrary number of items, so a
-// turn count is a poor proxy for screen height. On open we render the live turn first, then top up
-// persisted history in small batches until the transcript holds roughly this many viewports of
-// scrollback — measuring pixels the server can't see. `clientHeight` makes this adapt to phone vs
-// desktop for free. The cap stops pathologically tiny turns from paging forever.
 const HISTORY_FILL_SCREENS = 2;
 const HISTORY_FILL_BATCH = 5;
 const HISTORY_FILL_MAX_TURNS = 200;
@@ -128,12 +124,7 @@ const PICKER_TYPEAHEAD_RESET_MS = 1000;
 const NOTIFICATION_PROMPT_NOTICE_INTERVAL_MS = 30000;
 const BROWSER_DIAGNOSTIC_LIMIT = 120;
 const NOTIFICATION_DEDUP_MS = 15000;
-const ACTIVE_THREAD_COMPLETED_MARK_MS = 2500;
-// Debounce for re-fetching thread lists after activity arrives for a thread the browser has never
-// seen (a sub-agent the server just materialized). Short enough that the sidebar catches up while
-// the child is still blocked, long enough that a burst of child events costs one refresh.
 const STALE_THREAD_LIST_REFRESH_MS = 400;
-// Refresh attempts spent on any one unresolved thread id before giving up on it.
 const STALE_THREAD_LIST_REFRESH_MAX_ATTEMPTS = 3;
 const BROWSER_DIAGNOSTIC_VERSION = "browser-diagnostics-v1";
 const MAX_ATTACHMENTS_PER_MESSAGE = 8;
@@ -150,24 +141,21 @@ let state = {
   wsLastProblem:"", wsLastProblemNotice:"", wsLastProblemNoticeAt:0,
   wsProbeTimer:null, wsProbeToken:0, wsProbeSocket:null,
   draftThread:null, firstTurnStartingThreadId:null, inputDrafts:new Map(),
-  // Per-turn DOM identity (foundation for incremental reconnect): `currentRenderTurnId` is the turn
-  // whose rows are being stamped right now (a persisted turn being rendered, or the live turn being
-  // streamed); `newestPersistedTurnId` is the id of the newest turn known to have completed — the
-  // high-water mark a future resync will use as its "give me turns after this" cursor.
-  currentRenderTurnId:null, newestPersistedTurnId:null,
+  currentRenderTurnId:null, newestPersistedTurnId:null, historyCursor:null,
   models:[], modelsProject:null, modelsLoadingProject:null, streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null,
   streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), renderedItemBodyByKey:new Map(), itemKindsByItemId:new Map(),
-  pendingApprovals:new Map(), answeredApprovals:new Map(), answeredApprovalsById:new Map(), renderedApprovalStateKeys:new Set(), pendingServerRequests:new Map(), answeredServerRequests:new Set(),
-  runningCommands:new Map(), commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null,
+  requestStates:new Map(),
+  transcriptTasks:new Map(), runningTasks:new Map(), taskRevision:null,
+  commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null,
   commandPayloadsByItemId:new Map(), endedCommandsByItemId:new Map(),
   toolPayloadsByItemId:new Map(), toolBodyElsByItemId:new Map(),
   activeTaskGroup:null, taskGroupSeq:0, taskItemSeq:0, taskGroupsById:new Map(), taskGroupsByItemId:new Map(),
   expandedTaskGroups:new Set(), manuallyToggledTaskGroups:new Set(), expandedTaskDetails:new Map(),
   linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, codeOverlaySource:null, outputOverlay:null, activeTurn:false, interruptPending:false, compactPending:false,
-  awaitingInitialThreadState:false, awaitingThreadResync:false, awaitingIncrementalResync:false, resyncStickBottom:false, contextWindow:0, contextUsed:null, permissionPreset:"ask_first", currentModel:null,
-  threadAuthorities:new Map(), pendingDetailConflictResyncs:new Set(),
+  stagedBootstrap:null, activeSubscription:null, paginationRequest:null,
+  contextWindow:0, contextUsed:null, permissionPreset:"ask_first", currentModel:null,
+  threadAuthorities:new Map(),
   pendingMetadataActions:new Map(), threadListRefreshes:new Map(),
-  pendingLiveSnapshotReconcile:false,
   diffOverlayText:null,
   gitStatus:null, gitLoading:false, gitError:null, gitRequestSeq:0,
   draftGitStrategy:"shared",
@@ -176,7 +164,9 @@ let state = {
   threadReadOnly:false, readOnlyProvider:null, readOnlyMessage:null,
   pickerTypeahead:"", pickerTypeaheadTimer:null, pickerSelectedRow:null,
   currentPlan:null, planExpanded:localStorage.getItem("giskard.planExpanded")==="1",
-  threadActivity:new Map(), pendingWaitingFocus:null, notifiedRequests:new Map(), bootstrapNotifiedRequests:new Set(), waitingNotifications:new Map(), browserDiagnostics:[],
+  runtimeOverviewRevision:null, runtimeThreads:new Map(),
+  pendingWaitingFocus:null, notifiedRequests:new Map(), waitingNotifications:new Map(), browserDiagnostics:[],
+  threadNotices:new Map(),
   subagentImports:new Map(), projectThreads:new Map(), threadIndex:new Map(),
   lastNotificationPromptNoticeAt:0, swRegistration:null, pendingAttachments:[],
   attachmentGeneration:0, pendingAttachmentOperations:new Map(),
@@ -202,6 +192,7 @@ setInterval(updateRunningCommandDurations, 1000);
 
 async function api(method, path, body, options) {
   const opts = { method, headers:{} };
+  if (options && options.signal) opts.signal = options.signal;
   const timeoutMs = options && Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 0;
   let timeoutId = null;
   let timedOut = false;
@@ -606,20 +597,12 @@ function recordReconnectMessageRendered(ws, msgType, startedAtMs, msg) {
     message_type:msgType,
     duration_ms: elapsedMsSince(startedAtMs)
   };
-  if (msg && Array.isArray(msg.turns)) detail.turn_count = msg.turns.length;
-  if (msgType === "live_turn_snapshot" && msg) {
-    detail.accumulated_events = Array.isArray(msg.accumulated) ? msg.accumulated.length : 0;
-  }
-  if (msgType === "running_tasks" && msg) {
-    detail.task_count = Array.isArray(msg.tasks) ? msg.tasks.length : 0;
-  }
+  if (msgType === "thread_bootstrap" && msg && msg.frame) detail.bootstrap_phase = msg.frame.phase;
   recordReconnectDiagnostic(ws, "ws_resync_message_rendered", detail);
 }
 function reconnectResyncComplete(metrics, msgType) {
-  if (!metrics) return false;
-  if (metrics.subscribeMode === "incremental") return msgType === "running_tasks";
-  if (metrics.subscribeMode === "full") return msgType === "history_page";
-  return false;
+  return !!metrics && msgType === "thread_bootstrap" && state.stagedBootstrap === null &&
+    state.activeSubscription !== null;
 }
 
 function showBrowserDiagnostics() {
@@ -775,7 +758,6 @@ async function loadProjects() {
       const tid = String(thread.id);
       state.threadIndex.delete(tid);
       state.threadAuthorities.delete(tid);
-      state.pendingDetailConflictResyncs.delete(tid);
     }
   }
   for (const p of projects) {
@@ -1139,6 +1121,9 @@ function renderProjectThreads(pid) {
     appendThreadRows(box, pid, archived);
   }
   syncActiveThreadHighlight();
+  // Rebuilding the catalog replaces every sidebar node. Runtime authority lives outside that
+  // catalog, so project it back onto the newly attached rows after the replacement is complete.
+  renderAllRuntimeSummaryIndicators();
 }
 
 function rememberProjectThreads(pid, threads, conflictThreadIds) {
@@ -1187,7 +1172,6 @@ function rememberProjectThreads(pid, threads, conflictThreadIds) {
   for (const thread of normalized) previousThreadIds.delete(String(thread.id));
   let removedActiveThread = null;
   for (const removedThreadId of previousThreadIds) {
-    state.pendingDetailConflictResyncs.delete(removedThreadId);
     if (String(state.projectId || "") === projectId &&
         String(state.threadId || "") === removedThreadId) {
       removedActiveThread = removedThreadId;
@@ -1377,7 +1361,7 @@ function applyThreadTitleToElement(el, pid, tid, title) {
   el.dataset.pid = pid;
   el.dataset.tid = tid;
   el.onclick = () => openThread(pid, tid, title);
-  renderThreadActivityIndicator(tid);
+  renderRuntimeSummaryIndicator(tid);
 }
 
 function currentThreadTitle(el) {
@@ -1505,7 +1489,7 @@ async function refreshKnownThreadLists() {
   for (const tid of Array.from(staleThreadRefreshAttempts.keys())) {
     if (knownThreadMeta(tid)) staleThreadRefreshAttempts.delete(tid);
   }
-  renderAllThreadActivityIndicators();
+  renderAllRuntimeSummaryIndicators();
   renderSubagentsButton();
 }
 
@@ -1553,40 +1537,17 @@ async function openParentThread() {
 
 $("parentThreadBtn").onclick = openParentThread;
 
-function clearThreadActivity(tid) {
-  if (!tid) return;
-  const activity = state.threadActivity.get(String(tid));
-  if (activity && activity.active_turn) {
-    activity.unread = false;
-    activity.approval_id = null;
-    activity.kind = "progress";
-    state.threadActivity.set(String(tid), activity);
-  } else {
-    state.threadActivity.delete(String(tid));
-  }
-  renderThreadActivityIndicator(tid);
-  renderSubagentsButton();
-}
-
-// A thread is *waiting on the user* when it cannot proceed until the user answers something. Codex
-// splits that into approvals and server requests — and already blurs the line itself, since MCP tool
-// approvals arrive as `requestUserInput` and get promoted to approval cards — but to the person
-// looking at the sidebar they are one state: you are being asked for something.
 function activityWaitsOnUser(activity) {
   if (!activity) return false;
   return activity.kind === "approval_requested" || activity.kind === "server_request_received";
 }
 
-// The id of whatever the thread is waiting for, whichever kind it is.
 function waitingRequestId(activity) {
   if (!activity) return null;
   return activity.approval_id || activity.server_request_id || null;
 }
 
-// Urgency order used when one row has to represent both its own state and its hidden sub-agents'.
-// A blocked child must never be masked by a merely-running parent, so waiting-on-the-user outranks
-// error outranks running.
-function threadActivityRank(activity) {
+function runtimeThreadsRank(activity) {
   if (!activity) return -1;
   if (activityWaitsOnUser(activity)) return 3;
   if (activity.kind === "error") return 2;
@@ -1601,17 +1562,17 @@ function threadActivityRank(activity) {
 // chain walking once-per-activity for the whole repaint.
 function activityHostIndex() {
   const hosts = new Map();
-  for (const tid of state.threadActivity.keys()) hosts.set(tid, activityHostThreadId(tid));
+  for (const tid of state.runtimeThreads.keys()) hosts.set(tid, activityHostThreadId(tid));
   return hosts;
 }
 
-function effectiveThreadActivity(tid, hosts) {
+function effectiveRuntimeSummary(tid, hosts) {
   const key = String(tid);
-  let activity = state.threadActivity.get(key) || null;
+  let activity = state.runtimeThreads.get(key) || null;
   let origin = null;
-  for (const [otherId, other] of state.threadActivity) {
+  for (const [otherId, other] of state.runtimeThreads) {
     if (otherId === key) continue;
-    if (threadActivityRank(other) <= threadActivityRank(activity)) continue;
+    if (runtimeThreadsRank(other) <= runtimeThreadsRank(activity)) continue;
     const host = hosts ? hosts.get(otherId) : activityHostThreadId(otherId);
     if (host !== key) continue;
     activity = other;
@@ -1620,7 +1581,7 @@ function effectiveThreadActivity(tid, hosts) {
   return { activity, origin };
 }
 
-function threadActivityTooltip(activity, origin) {
+function runtimeThreadsTooltip(activity, origin) {
   const summary = (activity && activity.summary) || "Thread activity";
   if (!origin) return summary;
   const meta = threadMetaForId(origin);
@@ -1628,18 +1589,18 @@ function threadActivityTooltip(activity, origin) {
   return `${name}: ${summary}`;
 }
 
-function renderThreadActivityIndicator(tid, hosts) {
+function renderRuntimeSummaryIndicator(tid, hosts) {
   const el = threadRowForId(tid);
   if (!el) {
     // A managed sub-agent has no row. Repaint the ancestor that stands in for it instead; that call
     // takes the branch below, so this cannot recurse further.
     const host = (hosts && hosts.get(String(tid))) || activityHostThreadId(tid);
-    if (host && host !== String(tid)) renderThreadActivityIndicator(host, hosts);
+    if (host && host !== String(tid)) renderRuntimeSummaryIndicator(host, hosts);
     return;
   }
   const status = el.querySelector(".thread-status");
   if (!status) return;
-  const { activity, origin } = effectiveThreadActivity(tid, hosts);
+  const { activity, origin } = effectiveRuntimeSummary(tid, hosts);
   const visible = !!activity && (activity.unread || activity.active_turn || activity.approval_id || activity.kind === "turn_completed" || activity.kind === "error");
   el.classList.toggle("has-activity", visible);
   el.classList.toggle("activity-waiting", visible && activityWaitsOnUser(activity));
@@ -1655,12 +1616,12 @@ function renderThreadActivityIndicator(tid, hosts) {
   else if (activity.kind === "error") status.textContent = "x";
   else if (activity.active_turn) status.textContent = "o";
   else status.textContent = "*";
-  status.title = threadActivityTooltip(activity, origin);
+  status.title = runtimeThreadsTooltip(activity, origin);
 }
 
-function renderAllThreadActivityIndicators() {
+function renderAllRuntimeSummaryIndicators() {
   const hosts = activityHostIndex();
-  document.querySelectorAll(".thread").forEach(el => renderThreadActivityIndicator(el.dataset.tid, hosts));
+  document.querySelectorAll(".thread").forEach(el => renderRuntimeSummaryIndicator(el.dataset.tid, hosts));
 }
 
 // Mark a sidebar row as the selected one (or not). `aria-current` mirrors the visual state for
@@ -1685,79 +1646,6 @@ function syncActiveThreadHighlight() {
     const project = el.closest(".proj");
     markSidebarRowActive(el, draftPid !== null && project && String(project.dataset.pid) === draftPid);
   });
-}
-
-function setThreadActivity(tid, activity) {
-  if (!tid || !activity) return;
-  const key = String(tid);
-  state.threadActivity.set(key, activity);
-  renderThreadActivityIndicator(key);
-  renderSubagentsButton();
-}
-
-function setActiveThreadActivity(kind, activeTurn, summary, extra) {
-  if (!state.threadId) return;
-  const tid = String(state.threadId);
-  setThreadActivity(tid, Object.assign({
-    kind,
-    active_turn: !!activeTurn,
-    approval_id: null,
-    server_request_id: null,
-    summary: summary || "",
-    source: "active_thread_event",
-    unread: false
-  }, extra || {}));
-  if (kind === "turn_completed" && !activeTurn) {
-    clearActiveThreadActivityLater(tid, kind);
-  }
-}
-
-function clearActiveThreadActivityLater(tid, kind) {
-  const key = String(tid || "");
-  if (!key) return;
-  setTimeout(() => {
-    const activity = state.threadActivity.get(key);
-    if (!activity || activity.source !== "active_thread_event" || activity.kind !== kind || activity.active_turn) return;
-    state.threadActivity.delete(key);
-    renderThreadActivityIndicator(key);
-    renderSubagentsButton();
-  }, ACTIVE_THREAD_COMPLETED_MARK_MS);
-}
-
-function clearApprovalThreadActivity(tid, approvalId) {
-  if (!tid || !approvalId) return;
-  const key = String(tid);
-  const activity = state.threadActivity.get(key);
-  if (!activity || String(activity.approval_id || "") !== String(approvalId)) return;
-  activity.approval_id = null;
-  if (activity.active_turn) {
-    activity.kind = "progress";
-    activity.summary = "Turn running";
-    activity.unread = state.threadId ? String(state.threadId) !== key : activity.unread;
-    state.threadActivity.set(key, activity);
-  } else {
-    state.threadActivity.delete(key);
-  }
-  renderThreadActivityIndicator(key);
-  renderSubagentsButton();
-}
-
-function clearServerRequestThreadActivity(tid, requestId) {
-  if (!tid || !requestId) return;
-  const key = String(tid);
-  const activity = state.threadActivity.get(key);
-  if (!activity || String(activity.server_request_id || "") !== String(requestId)) return;
-  activity.server_request_id = null;
-  if (activity.active_turn) {
-    activity.kind = "progress";
-    activity.summary = "Turn running";
-    activity.unread = state.threadId ? String(state.threadId) !== key : activity.unread;
-    state.threadActivity.set(key, activity);
-  } else {
-    state.threadActivity.delete(key);
-  }
-  renderThreadActivityIndicator(key);
-  renderSubagentsButton();
 }
 
 function normalizeThreadTitleInput(value) {
@@ -2077,6 +1965,7 @@ $("removeThreadConfirm").onclick = async () => {
 function clearThreadView(tid) {
   if (state.threadId !== tid) return;
   saveComposerDraft();
+  cancelHistoryPagination();
   try { localStorage.removeItem("giskard.lastThread"); } catch {}
   clearWsReconnectTimer();
   clearWsProbeTimer();
@@ -2096,11 +1985,8 @@ function clearThreadView(tid) {
   state.currentModel = null;
   $("effortControl").hidden = true;
   setTurnActive(false);
-  state.awaitingInitialThreadState = false;
-  state.awaitingThreadResync = false;
-  state.awaitingIncrementalResync = false;
-  state.resyncStickBottom = false;
-  state.pendingLiveSnapshotReconcile = false;
+  state.stagedBootstrap = null;
+  state.activeSubscription = null;
   resetGitState();
   resetRenderState();
   $("thrHeader").style.display="none"; $("composer").style.display="none";
@@ -2440,6 +2326,7 @@ function renderDraftPlaceholder() {
 }
 function openDraftThread(pid) {
   saveComposerDraft();
+  cancelHistoryPagination();
   // Same reason as `openThread`: a draft has no workspace to read files from, so a file view left
   // over from the previous thread would have nothing behind it.
   closeCodeOverlay();
@@ -2483,16 +2370,13 @@ function openDraftThread(pid) {
   setMode("build");
   setPermissionPreset("ask_first");
   setTurnActive(false);
-  state.historyLoaded = false; state.oldestTurnId = null; state.hasMoreHistory = false;
-  state.loadingHistory = false; state.pendingOlder = false; state.autoFilledTurns = 0;
-  state.currentRenderTurnId = null; state.newestPersistedTurnId = null;
+  state.oldestTurnId = null; state.hasMoreHistory = false;
+  state.loadingHistory = false; state.autoFilledTurns = 0;
+  state.currentRenderTurnId = null; state.newestPersistedTurnId = null; state.historyCursor = null;
   state.contextUsed = null; state.contextWindow = 0; state.tokenLedger = null;
   updateGauge(null, 0);
-  state.awaitingInitialThreadState = false;
-  state.awaitingThreadResync = false;
-  state.awaitingIncrementalResync = false;
-  state.resyncStickBottom = false;
-  state.pendingLiveSnapshotReconcile = false;
+  state.stagedBootstrap = null;
+  state.activeSubscription = null;
   resetRenderState();
   syncActiveThreadHighlight();   // state.threadId is null for a draft, so this clears any selection
   $("thrHeader").style.display="flex"; $("composer").style.display="flex";
@@ -2512,6 +2396,7 @@ function openDraftThread(pid) {
 async function openThread(pid, tid, title, opts) {
   opts = opts || {};
   saveComposerDraft();
+  cancelHistoryPagination();
   if (!opts.firstTurnStarting) state.firstTurnStartingThreadId = null;
   if (opts.focusRequestId) {
     state.pendingWaitingFocus = {
@@ -2533,7 +2418,6 @@ async function openThread(pid, tid, title, opts) {
   // Remember this thread so a browser reload resumes it (client-side only).
   try { localStorage.setItem("giskard.lastThread", JSON.stringify({ pid, tid })); } catch {}
 
-  clearThreadActivity(tid);
   // The file view belongs to the thread it was opened from, and navigation is leaving that thread —
   // a notification click can even land in another project. Close it rather than leave it showing
   // one workspace's file while the app is somewhere else.
@@ -2561,18 +2445,16 @@ async function openThread(pid, tid, title, opts) {
   loadMcpServers({ announce:false });
   loadProjectModels(pid);   // load this project's model list (config + discovery + Codex names)
   setTurnActive(false);
-  state.historyLoaded = false; state.oldestTurnId = null; state.hasMoreHistory = false;
-  state.loadingHistory = false; state.pendingOlder = false; state.autoFilledTurns = 0;
-  state.currentRenderTurnId = null; state.newestPersistedTurnId = null;
+  state.oldestTurnId = null; state.hasMoreHistory = false;
+  state.loadingHistory = false; state.autoFilledTurns = 0;
+  state.currentRenderTurnId = null; state.newestPersistedTurnId = null; state.historyCursor = null;
   state.contextUsed = null; state.contextWindow = 0; state.tokenLedger = null;
   updateGauge(null, 0);
-  state.awaitingInitialThreadState = true;
-  state.awaitingThreadResync = false;
-  state.awaitingIncrementalResync = false; state.resyncStickBottom = false;
-  state.pendingLiveSnapshotReconcile = false;
+  state.stagedBootstrap = null;
+  state.activeSubscription = null;
   resetRenderState();
   syncActiveThreadHighlight();
-  renderAllThreadActivityIndicators();
+  renderAllRuntimeSummaryIndicators();
   $("thrHeader").style.display="flex"; $("composer").style.display="flex";
   $("pickerBar").style.display="flex";
   setThreadTitle(title || tid.slice(0,8));
@@ -2715,7 +2597,7 @@ async function connectWs(opts) {
     connectId,
     reconnect: !!opts.reconnect,
     reason: opts.reason || null,
-    cursor: state.newestPersistedTurnId || null,
+    cursor: state.historyCursor || null,
     startedAtMs: connectStartedAtMs,
     firstMessageAtMs: 0
   };
@@ -2739,6 +2621,9 @@ async function connectWs(opts) {
   recordBrowserDiagnostic("websocket", "ws_ticket_received", reconnectDiagnosticBase(reconnectMetrics));
   const ws = new WebSocket(`${proto}://${location.host}/api/ws?ticket=${encodeURIComponent(ticket)}`);
   state.ws = ws;
+  state.stagedBootstrap = null;
+  state.activeSubscription = null;
+  state.runtimeOverviewRevision = null;
   ws._giskardReconnectDiagnostics = reconnectMetrics;
   ws._giskardBackgroundedAt = document.visibilityState === "hidden" ? Date.now() : 0;
   recordReconnectDiagnostic(ws, "ws_socket_created", { ready_state:wsReadyStateLabel(ws) });
@@ -2750,20 +2635,11 @@ async function connectWs(opts) {
     markWsForegroundRecovered(ws);
     recordReconnectDiagnostic(ws, "ws_socket_open", { ready_state:wsReadyStateLabel(ws) });
     refreshKnownThreadLists();
-    // Incremental resync: if we already have persisted history rendered, ask only for the turns
-    // after our newest one (`since`). The server replies with a HistoryDelta and we keep the
-    // immutable completed-turn DOM. If a live snapshot follows, the stale live DOM stays visible
-    // until the snapshot handler replaces it. Without a cursor (nothing rendered yet) fall back to
-    // a full resync that rewrites the transcript.
-    if (state.newestPersistedTurnId) {
-      state.awaitingIncrementalResync = true;
-      state.awaitingThreadResync = false;
-      const sent = send({ type:"subscribe", thread_id: state.threadId, since: state.newestPersistedTurnId });
+    if (state.historyCursor) {
+      const sent = send({ type:"subscribe", thread_id: state.threadId, since: state.historyCursor });
       reconnectMetrics.subscribeMode = "incremental";
       recordReconnectDiagnostic(ws, "ws_subscribe_sent", { mode:"incremental", sent });
     } else {
-      state.awaitingThreadResync = true;
-      state.awaitingIncrementalResync = false;
       const sent = send({ type:"subscribe", thread_id: state.threadId });
       reconnectMetrics.subscribeMode = "full";
       recordReconnectDiagnostic(ws, "ws_subscribe_sent", { mode:"full", sent });
@@ -2775,7 +2651,7 @@ async function connectWs(opts) {
     try {
       handleServer(JSON.parse(m.data), ws);
     } catch (e) {
-      notice("Invalid WebSocket message from server: "+e.message, "error");
+      closeInvalidServerProtocol(ws, e && e.message ? e.message : String(e));
     }
   };
   ws.onerror = () => {
@@ -2997,22 +2873,18 @@ function failPendingUserMessage(text) {
 function serverMessageThreadId(msg) {
   if (!msg) return null;
   if (msg.thread_id !== undefined && msg.thread_id !== null) return String(msg.thread_id);
-  if (msg.error && msg.error.thread_id !== undefined && msg.error.thread_id !== null) {
-    return String(msg.error.thread_id);
-  }
   return null;
 }
 function isThreadScopedServerMessage(msg) {
   if (!msg) return false;
   switch (msg.type) {
-    case "thread_state":
+    case "thread_event":
+    case "thread_metadata":
     case "thread_metadata_result":
-    case "history_page":
-    case "history_delta":
-    case "live_turn_snapshot":
-    case "running_tasks":
-    case "event":
-    case "approval_resolved":
+    case "thread_tasks":
+    case "thread_bootstrap":
+    case "thread_notices":
+    case "resync_required":
       return true;
     case "error":
       return serverMessageThreadId(msg) !== null;
@@ -3028,78 +2900,33 @@ function isCurrentThreadServerMessage(msg) {
 }
 
 function handleServer(msg, ws) {
-  if (msg && msg.type === "pong") {
-    handleWsPong(ws);
+  if (!msg || typeof msg !== "object" || typeof msg.type !== "string") {
+    closeInvalidServerProtocol(ws, "message has no string type");
     return;
   }
   finishWsProbe(ws, "ws_probe_message");
-  if (msg && msg.type === "thread_activity_bootstrap") {
-    handleThreadActivityBootstrap(msg);
-    return;
-  }
-  if (msg && msg.type === "thread_activity") {
-    handleThreadActivity(msg);
-    return;
-  }
-  if (msg && msg.type === "thread_catalog_changed") {
-    refreshKnownThreadLists();
-    return;
-  }
   if (!isCurrentThreadServerMessage(msg)) return;
-  const messageType = msg && msg.type ? msg.type : "unknown";
+  const messageType = msg.type;
   const renderStartedAtMs = browserNowMs();
   recordReconnectMessageReceived(ws, messageType);
   switch (msg.type) {
-    case "thread_state": renderThreadState(msg, msg.active_turn); break;
+    case "thread_event": handleThreadEvent(msg); break;
+    case "thread_metadata": applyThreadMetadata(msg); break;
     case "thread_metadata_result":
       applyThreadMetadata(msg);
       finishMetadataAction(msg.request_id);
       break;
-    case "history_page": renderHistoryPage(msg); break;
-    case "history_delta": renderHistoryDelta(msg); break;
-    case "live_turn_snapshot": renderLiveTurnSnapshot(msg); break;
-    case "running_tasks":
-      renderRunningCommandSnapshot(msg.tasks || []);
-      // Running tasks is the last message of a resync; if the user was pinned to the bottom before
-      // the in-flight turn was repainted, restore that now that everything has re-rendered.
-      if (state.resyncStickBottom) { state.resyncStickBottom = false; keepTranscriptAtBottom(true); }
-      break;
-    case "event": handleEvent(msg.agent_event); break;
-    case "approval_resolved":
-      resolveApprovalRequest(msg.request_id, msg.decision);
-      break;
-    case "error":
-      finishMetadataAction(msg.request_id);
-      if (msg.code === "thread_read_only") {
-        state.threadReadOnly = true;
-        state.readOnlyMessage = msg.message || state.readOnlyMessage || "This thread is read-only.";
-        if (!state.readOnlyProvider && state.currentModel) {
-          state.readOnlyProvider = state.currentModel.provider;
-        }
-        updateReadOnlyBanner();
-        syncModelOptionAvailability();
-        updateComposerControls();
-        break;   // the persistent banner replaces the transient toast
-      }
-      if (msg.action==="send_input" && state.pendingUserEl) {
-        failPendingUserMessage(null);
-      }
-      if (msg.action==="send_input") {
-        setTurnActive(msg.code === "thread_turn_active");
-      }
-      if (msg.action==="interrupt") {
-        state.interruptPending = false;
-        resetTerminatingToolTasks();
-        updateComposerControls();
-      }
-      if (msg.action==="compact_context") {
-        state.compactPending = false;
-        updateComposerControls();
-      }
-      if (msg.action==="terminate_command") resetTerminatingCommand(msg.process_id);
-      if (msg.action==="server_request_response") resetResolvingServerRequests();
-      notice(msg.message||"error", msg.severity||"error");
-      break;
+    case "thread_catalog_changed": refreshKnownThreadLists(); break;
+    case "thread_runtime_overview": applyRuntimeOverview(msg); break;
+    case "thread_tasks": applyThreadTasks(msg, false); break;
+    case "thread_bootstrap": handleThreadBootstrap(msg); break;
+    case "thread_notices": applyThreadNotices(msg); break;
+    case "resync_required": handleResyncRequired(msg); break;
+    case "error": handleServerError(msg); break;
+    case "pong": handleWsPong(ws); break;
+    default:
+      closeInvalidServerProtocol(ws, `unknown server message type ${msg.type}`);
+      return;
   }
   recordReconnectMessageRendered(ws, messageType, renderStartedAtMs, msg);
   const metrics = wsReconnectDiagnostics(ws);
@@ -3109,56 +2936,409 @@ function handleServer(msg, ws) {
   }
 }
 
-function handleThreadActivity(msg) {
-  const tid = msg && msg.thread_id !== undefined && msg.thread_id !== null ? String(msg.thread_id) : "";
-  if (!tid) return;
-  const current = state.threadId && String(state.threadId) === tid;
-  const prior = state.threadActivity.get(tid) || {};
-  const activity = {
-    kind: msg.kind || "progress",
-    active_turn: !!msg.active_turn,
-    approval_id: msg.approval_id || null,
-    server_request_id: msg.server_request_id || null,
-    summary: msg.summary || "",
-    source: msg.source || "thread_activity",
-    unread: !current
-  };
-  if (activity.kind === "turn_completed") {
-    activity.active_turn = false;
-    activity.approval_id = null;
-    activity.unread = !current;
-  } else if (activity.kind === "approval_requested") {
-    activity.unread = !current;
-  } else if (!activity.active_turn && prior.unread && activity.kind !== "error") {
-    activity.unread = true;
-  }
-  state.threadActivity.set(tid, activity);
-  // Activity for a thread we have never listed means the server materialized it after our last
-  // load — almost always a sub-agent. Catch the list up so this activity can be attributed and
-  // hoisted onto a visible ancestor.
-  if (!knownThreadMeta(tid)) noteUnresolvedThread(tid);
-  renderThreadActivityIndicator(tid);
-  renderSubagentsButton();
-  if (activityWaitsOnUser(activity)) maybeNotifyWaitingRequest(tid, activity);
+function closeInvalidServerProtocol(ws, detail) {
+  recordBrowserDiagnostic("websocket", "invalid_server_protocol", { detail });
+  notice(`Invalid WebSocket message from server: ${detail}`, "error");
+  if (!ws) return;
+  ws._giskardExpectedClose = false;
+  try { ws.close(1002, "invalid server protocol"); } catch {}
 }
 
-// Undo a notification claim when the notification did not actually reach the user. Both records
-// must be released together: leaving the session-scoped one set would silence every later replay of
-// a request the user was never shown.
 function releaseWaitingNotificationClaim(notificationKey) {
   state.notifiedRequests.delete(notificationKey);
-  state.bootstrapNotifiedRequests.delete(notificationKey);
 }
 
-// Cross-thread activity the server replayed because we were not connected when it happened. Paints
-// the badge exactly like a live event; notification is gated separately, because a reconnect is not
-// news — see `maybeNotifyWaitingRequest`.
-function handleThreadActivityBootstrap(msg) {
-  const activities = (msg && Array.isArray(msg.activities)) ? msg.activities : [];
-  if (!activities.length) return;
-  recordNotificationDiagnostic("activity_bootstrap_received", { count: activities.length });
-  for (const entry of activities) {
-    handleThreadActivity(Object.assign({}, entry, { source:"connect_bootstrap" }));
+function validHistoryAmendmentRecovery(recovery) {
+  if (recovery === undefined || recovery === null) return true;
+  return typeof recovery === "object" && typeof recovery.recovery_id === "string" &&
+    recovery.recovery_id.length > 0 && typeof recovery.turn_id === "string" &&
+    typeof recovery.item_id === "string" && Number.isSafeInteger(Number(recovery.attempts)) &&
+    Number(recovery.attempts) > 0 && typeof recovery.error === "string";
+}
+
+function runtimeSummaryActivity(summary, unread) {
+  const requests = Array.isArray(summary.outstanding_requests) ? summary.outstanding_requests : [];
+  // Responding requests stay in the replacement's exact membership until delivery settles, but
+  // the user has already acted on them. Keep that membership without presenting or notifying the
+  // request as actionable a second time.
+  const approval = requests.find(request =>
+    request && !request.responding && request.kind === "approval");
+  const server = requests.find(request =>
+    request && !request.responding && request.kind === "server");
+  const turnState = summary.turn_state && summary.turn_state.state;
+  const blocked = turnState === "persistence_blocked";
+  const historyRecovery = summary.history_recovery || null;
+  return {
+    kind: approval ? "approval_requested" : server ? "server_request_received" :
+      blocked || historyRecovery ? "error" : turnState === "active" ? "progress" : "idle",
+    active_turn: turnState === "active" || blocked,
+    approval_id: approval ? String(approval.request_id) : null,
+    server_request_id: server ? String(server.request_id) : null,
+    summary: approval || server ? "Waiting for your input" :
+      historyRecovery ? (historyRecovery.error || "Command result persistence needs attention") :
+      blocked ? (summary.turn_state.error || "Turn persistence needs attention") :
+      turnState === "active" ? "Turn running" : "",
+    history_recovery:historyRecovery,
+    requests,
+    source:"runtime_overview",
+    unread:!!unread
+  };
+}
+
+function applyRuntimeOverview(msg) {
+  const revision = Number(msg.revision);
+  if (!Number.isSafeInteger(revision) || revision < 0 || !Array.isArray(msg.threads)) {
+    throw new Error("invalid thread_runtime_overview");
+  }
+  if (state.runtimeOverviewRevision !== null && revision <= state.runtimeOverviewRevision) return;
+  const previousRequests = new Set();
+  for (const [tid, activity] of state.runtimeThreads) {
+    for (const request of (activity.requests || [])) {
+      previousRequests.add(requestStateKey(tid, request.request_id));
+    }
+  }
+  const replacement = new Map();
+  let currentTurnState = null;
+  let currentHistoryRecovery = null;
+  for (const summary of msg.threads) {
+    const tid = summary && summary.thread_id !== undefined ? String(summary.thread_id) : "";
+    const turnState = summary && summary.turn_state && summary.turn_state.state;
+    if (!tid || replacement.has(tid) || !["idle", "active", "persistence_blocked"].includes(turnState) ||
+        !Array.isArray(summary.outstanding_requests) ||
+        !validHistoryAmendmentRecovery(summary.history_recovery)) {
+      throw new Error("invalid runtime thread summary");
+    }
+    const requestIds = new Set();
+    for (const request of summary.outstanding_requests) {
+      const requestId = request && String(request.request_id || "");
+      if (!requestId || requestIds.has(requestId) || !["approval", "server"].includes(request.kind) ||
+          typeof request.responding !== "boolean") {
+        throw new Error("invalid runtime outstanding request");
+      }
+      requestIds.add(requestId);
+    }
+    const prior = state.runtimeThreads.get(tid);
+    const current = String(state.threadId || "") === tid;
+    if (current) {
+      currentTurnState = summary.turn_state;
+      currentHistoryRecovery = summary.history_recovery || null;
+    }
+    const activity = runtimeSummaryActivity(summary, !current && (!prior || prior.unread));
+    replacement.set(tid, activity);
+    if (!knownThreadMeta(tid)) noteUnresolvedThread(tid);
+    for (const request of activity.requests) {
+      const key = requestStateKey(tid, request.request_id);
+      if (previousRequests.has(key)) continue;
+      maybeNotifyWaitingRequest(tid, runtimeSummaryActivity({
+        turn_state:summary.turn_state,
+        outstanding_requests:[request]
+      }, !current));
+    }
+  }
+  state.runtimeThreads = replacement;
+  state.runtimeOverviewRevision = revision;
+  applyCurrentRuntimeTurnState(state.threadId, currentTurnState);
+  renderPersistenceRecovery(state.threadId, currentTurnState, currentHistoryRecovery);
+  renderAllRuntimeSummaryIndicators();
+  renderSubagentsButton();
+}
+
+const BOOTSTRAP_SECTIONS = [
+  "metadata", "history", "live_turn", "ordered_suffix", "final_runtime", "notices"
+];
+function bootstrapIdentity(msg) {
+  const threadId = msg && msg.thread_id !== undefined ? String(msg.thread_id) : "";
+  const generation = Number(msg && msg.subscription_generation);
+  if (!threadId || !Number.isSafeInteger(generation) || generation < 0) {
+    throw new Error("invalid bootstrap identity");
+  }
+  return { threadId, generation };
+}
+
+function decodeBootstrapChunk(payload) {
+  if (typeof payload !== "string" || payload.length % 4 !== 0 ||
+      !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(payload)) {
+    throw new Error("invalid bootstrap base64");
+  }
+  let binary;
+  try { binary = atob(payload); }
+  catch { throw new Error("invalid bootstrap base64"); }
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function beginThreadBootstrap(msg, frame) {
+  const { threadId, generation } = bootstrapIdentity(msg);
+  if (threadId !== String(state.threadId || "") || !Array.isArray(frame.sections)) return;
+  const currentGeneration = state.activeSubscription &&
+    state.activeSubscription.threadId === threadId ? state.activeSubscription.generation : -1;
+  const stagedGeneration = state.stagedBootstrap &&
+    state.stagedBootstrap.threadId === threadId ? state.stagedBootstrap.generation : -1;
+  if (generation <= currentGeneration || generation <= stagedGeneration) return;
+  const descriptors = new Map();
+  for (const descriptor of frame.sections) {
+    const section = descriptor && String(descriptor.section || "");
+    const encodedBytes = Number(descriptor && descriptor.encoded_bytes);
+    const chunkCount = Number(descriptor && descriptor.chunk_count);
+    if (!BOOTSTRAP_SECTIONS.includes(section) || descriptors.has(section) ||
+        !Number.isSafeInteger(encodedBytes) || encodedBytes < 0 ||
+        !Number.isSafeInteger(chunkCount) || chunkCount < 1) {
+      throw new Error("invalid bootstrap section descriptor");
+    }
+    descriptors.set(section, {
+      encodedBytes,
+      chunks:new Array(chunkCount),
+      receivedBytes:0,
+      receivedChunks:0
+    });
+  }
+  if (descriptors.size !== BOOTSTRAP_SECTIONS.length) {
+    throw new Error("bootstrap does not declare every section");
+  }
+  state.stagedBootstrap = { threadId, generation, descriptors };
+}
+
+function appendThreadBootstrapChunk(msg, frame) {
+  const { threadId, generation } = bootstrapIdentity(msg);
+  const staged = state.stagedBootstrap;
+  if (!staged || staged.threadId !== threadId || staged.generation !== generation) return;
+  const section = String(frame.section || "");
+  const descriptor = staged.descriptors.get(section);
+  const index = Number(frame.index);
+  if (!descriptor || !Number.isSafeInteger(index) || index < 0 || index >= descriptor.chunks.length ||
+      descriptor.chunks[index] !== undefined) {
+    throw new Error("invalid or duplicate bootstrap chunk");
+  }
+  const bytes = decodeBootstrapChunk(frame.payload_base64);
+  if (descriptor.receivedBytes + bytes.length > descriptor.encodedBytes) {
+    throw new Error("bootstrap section exceeds declared size");
+  }
+  descriptor.chunks[index] = bytes;
+  descriptor.receivedBytes += bytes.length;
+  descriptor.receivedChunks += 1;
+}
+
+function parseBootstrapSection(descriptor) {
+  if (descriptor.receivedChunks !== descriptor.chunks.length ||
+      descriptor.receivedBytes !== descriptor.encodedBytes) {
+    throw new Error("incomplete bootstrap section");
+  }
+  const bytes = new Uint8Array(descriptor.encodedBytes);
+  let offset = 0;
+  for (const chunk of descriptor.chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.length;
+  }
+  let json;
+  try { json = new TextDecoder("utf-8", { fatal:true }).decode(bytes); }
+  catch { throw new Error("bootstrap section is not UTF-8"); }
+  try { return JSON.parse(json); }
+  catch { throw new Error("bootstrap section is not JSON"); }
+}
+
+function validHistoryCursor(cursor) {
+  return !!cursor && (cursor.newest_turn_id === undefined || cursor.newest_turn_id === null ||
+    typeof cursor.newest_turn_id === "string") && typeof cursor.server_epoch === "string" &&
+    cursor.server_epoch.length > 0 && Number.isSafeInteger(Number(cursor.amendment_sequence)) &&
+    Number(cursor.amendment_sequence) >= 0;
+}
+
+function validatedBootstrapPayload(staged) {
+  const payload = {};
+  for (const section of BOOTSTRAP_SECTIONS) {
+    payload[section] = parseBootstrapSection(staged.descriptors.get(section));
+  }
+  if (!payload.metadata || String(payload.metadata.thread_id || "") !== staged.threadId ||
+      !Number.isSafeInteger(Number(payload.metadata.revision))) {
+    throw new Error("invalid bootstrap metadata");
+  }
+  if (!payload.history || !["full_page", "delta", "cursor_reset"].includes(payload.history.kind) ||
+      !Array.isArray(payload.history.turns) || !validHistoryCursor(payload.history.cursor) ||
+      (payload.history.kind === "delta" && !validHistoryCursor(payload.history.after)) ||
+      (payload.history.kind === "cursor_reset" && !validHistoryCursor(payload.history.requested_after))) {
+    throw new Error("invalid bootstrap history");
+  }
+  if (payload.live_turn !== null && (!payload.live_turn || !Array.isArray(payload.live_turn.events) ||
+      !Number.isSafeInteger(Number(payload.live_turn.represented_through)) ||
+      payload.live_turn.events.some(event => !threadEventPayloadMatches(event, staged.threadId)))) {
+    throw new Error("invalid bootstrap live projection");
+  }
+  if (!Array.isArray(payload.ordered_suffix)) throw new Error("invalid bootstrap ordered suffix");
+  let previousSeq = payload.live_turn ? Number(payload.live_turn.represented_through) : 0;
+  let amendmentSequence = Number(payload.history.cursor.amendment_sequence);
+  for (const event of payload.ordered_suffix) {
+    const seq = Number(event && event.seq);
+    if (!Number.isSafeInteger(seq) || seq <= previousSeq ||
+        !threadEventPayloadMatches(event && event.event, staged.threadId)) {
+      throw new Error("bootstrap suffix is not strictly ordered");
+    }
+    const amendment = event.history_amendment;
+    if (amendment) {
+      const sequence = Number(amendment.sequence);
+      const wireEvent = event.event && event.event.kind === "agent" && event.event.agent_event;
+      if (amendment.server_epoch !== payload.history.cursor.server_epoch ||
+          !Number.isSafeInteger(sequence) || sequence < amendmentSequence ||
+          sequence > amendmentSequence + 1 || !wireEvent || wireEvent.kind !== "item_completed") {
+        throw new Error("invalid bootstrap history amendment sequence");
+      }
+      if (sequence === amendmentSequence + 1) amendmentSequence = sequence;
+    }
+    previousSeq = seq;
+  }
+  const runtime = payload.final_runtime;
+  if (!runtime || !Number.isSafeInteger(Number(runtime.through_seq)) ||
+      Number(runtime.through_seq) < previousSeq || !runtime.turn_state ||
+      !validHistoryAmendmentRecovery(runtime.history_recovery) ||
+      !runtime.tasks || String(runtime.tasks.thread_id || "") !== staged.threadId ||
+      !Array.isArray(runtime.requests) || runtime.requests.some(request =>
+        String(request && request.thread_id || "") !== staged.threadId)) {
+    throw new Error("invalid bootstrap final runtime");
+  }
+  if (!payload.notices || String(payload.notices.thread_id || "") !== staged.threadId ||
+      !Array.isArray(payload.notices.notices)) {
+    throw new Error("invalid bootstrap notices");
+  }
+  return payload;
+}
+
+function commitThreadBootstrap(msg) {
+  const { threadId, generation } = bootstrapIdentity(msg);
+  const staged = state.stagedBootstrap;
+  if (!staged || staged.threadId !== threadId || staged.generation !== generation) return;
+  const payload = validatedBootstrapPayload(staged);
+  const stickBottom = transcriptShouldStickToBottom();
+  applyThreadMetadata(payload.metadata, true);
+  applyBootstrapHistory(payload.history);
+  applyLiveTurnProjection(payload.live_turn, threadId);
+  for (const event of payload.ordered_suffix) applySequencedThreadEvent(event, staged.threadId);
+  applyFinalRuntime(threadId, payload.final_runtime);
+  applyThreadNotices(payload.notices, true);
+  state.activeSubscription = {
+    threadId,
+    generation,
+    lastSeq:Number(payload.final_runtime.through_seq)
+  };
+  state.stagedBootstrap = null;
+  if (stickBottom) keepTranscriptAtBottom(true);
+}
+
+function handleThreadBootstrap(msg) {
+  const frame = msg && msg.frame;
+  if (!frame || typeof frame.phase !== "string") throw new Error("invalid thread_bootstrap frame");
+  if (frame.phase === "start") beginThreadBootstrap(msg, frame);
+  else if (frame.phase === "chunk") appendThreadBootstrapChunk(msg, frame);
+  else if (frame.phase === "commit") commitThreadBootstrap(msg);
+  else throw new Error("unknown thread_bootstrap phase");
+}
+
+function subscribeCurrentThread(delayMs) {
+  const subscribe = () => {
+    if (!state.threadId || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+    const request = { type:"subscribe", thread_id:state.threadId };
+    if (state.historyCursor) request.since = state.historyCursor;
+    send(request);
+  };
+  if (Number(delayMs) > 0) setTimeout(subscribe, Number(delayMs));
+  else subscribe();
+}
+
+function handleResyncRequired(msg) {
+  const { threadId, generation } = bootstrapIdentity(msg);
+  const stagedMatches = state.stagedBootstrap && state.stagedBootstrap.threadId === threadId &&
+    state.stagedBootstrap.generation === generation;
+  const activeMatches = state.activeSubscription && state.activeSubscription.threadId === threadId &&
+    state.activeSubscription.generation === generation;
+  const beforeFirstFrame = threadId === String(state.threadId || "") &&
+    !state.stagedBootstrap && !state.activeSubscription;
+  if (!stagedMatches && !activeMatches && !beforeFirstFrame) return;
+  if (stagedMatches) state.stagedBootstrap = null;
+  if (activeMatches) state.activeSubscription = null;
+  subscribeCurrentThread(msg.retry_after_ms);
+}
+
+function requestThreadResync(reason) {
+  recordBrowserDiagnostic("websocket", "thread_resync_requested", {
+    thread_id:state.threadId,
+    reason
+  });
+  state.stagedBootstrap = null;
+  state.activeSubscription = null;
+  subscribeCurrentThread(0);
+}
+
+function handleThreadEvent(msg) {
+  const subscription = state.activeSubscription;
+  const threadId = String(msg.thread_id || "");
+  const generation = Number(msg.subscription_generation);
+  const seq = Number(msg.seq);
+  if (!subscription || subscription.threadId !== threadId || subscription.generation !== generation) return;
+  if (!Number.isSafeInteger(seq) || seq < 1 || !msg.event) throw new Error("invalid thread_event");
+  if (seq <= subscription.lastSeq) return;
+  if (seq !== subscription.lastSeq + 1) {
+    requestThreadResync("sequence_gap");
+    return;
+  }
+  if (!applySequencedThreadEvent({
+    event:msg.event,
+    history_amendment:msg.history_amendment || null
+  }, threadId, true)) return;
+  subscription.lastSeq = seq;
+}
+
+function handleServerError(msg) {
+  finishMetadataAction(msg.request_id);
+  if ((msg.action === "approval_decision" || msg.action === "server_request_response") &&
+      msg.request_id) {
+    restoreRespondingRequest(msg.request_id);
+  }
+  if (msg.code === "thread_read_only") {
+    state.threadReadOnly = true;
+    state.readOnlyMessage = msg.message || state.readOnlyMessage || "This thread is read-only.";
+    if (!state.readOnlyProvider && state.currentModel) state.readOnlyProvider = state.currentModel.provider;
+    updateReadOnlyBanner();
+    syncModelOptionAvailability();
+    updateComposerControls();
+    return;
+  }
+  if (msg.action === "send_input" && state.pendingUserEl) failPendingUserMessage(null);
+  if (msg.action === "send_input") setTurnActive(msg.code === "thread_turn_active");
+  if (msg.action === "interrupt") {
+    state.interruptPending = false;
+    resetTerminatingToolTasks();
+    updateComposerControls();
+  }
+  if (msg.action === "compact_context") {
+    state.compactPending = false;
+    updateComposerControls();
+  }
+  if (msg.action === "retry_turn_persistence" || msg.action === "discard_unpersisted_turn" ||
+      msg.action === "retry_history_amendment" || msg.action === "discard_history_amendment") {
+    document.getElementById("persistenceRecovery")?.querySelectorAll("button")
+      .forEach(button => { button.disabled = false; });
+  }
+  if (msg.action === "terminate_command") resetTerminatingCommand(msg.process_id);
+  notice(msg.message || "error", msg.severity || "error");
+}
+
+function applyThreadNotices(snapshot, resetBaseline) {
+  const threadId = snapshot && snapshot.thread_id !== undefined ? String(snapshot.thread_id) : "";
+  const revision = Number(snapshot && snapshot.revision);
+  if (!threadId || !Number.isSafeInteger(revision) || revision < 0 || !Array.isArray(snapshot.notices)) {
+    throw new Error("invalid thread_notices");
+  }
+  const prior = state.threadNotices.get(threadId);
+  if (!resetBaseline && prior && revision <= prior.revision) return;
+  state.threadNotices.set(threadId, { revision, notices:snapshot.notices.slice() });
+  if (threadId !== String(state.threadId || "")) return;
+  document.querySelectorAll("#notices [data-thread-notice]").forEach(el => el.remove());
+  for (const item of snapshot.notices) {
+    const el = document.createElement("div");
+    el.dataset.threadNotice = String(item.kind || "notice");
+    el.className = "notice" + (item.severity === "error" ? " err" : " warn");
+    el.setAttribute("role", item.severity === "error" ? "alert" : "status");
+    el.textContent = item.detail ? `${item.message} ${item.detail}` : String(item.message || "");
+    $("notices").prepend(el);
   }
 }
 
@@ -3200,17 +3380,6 @@ async function maybeNotifyWaitingRequest(tid, activity) {
     maybeNoticeNotificationPermission();
     return;
   }
-  // A replayed request is not news. `notifiedRequests` cannot answer "have we ever alerted for
-  // this?" because it is pruned on a 15s window, so a laptop resuming repeatedly would re-alert for
-  // the same blocked approval. Track bootstrap alerts separately and permanently for this page
-  // session: a reconnect stays silent, while a genuine reload starts a new session and re-alerts.
-  if (activity.source === "connect_bootstrap" && state.bootstrapNotifiedRequests.has(notificationKey)) {
-    recordNotificationDiagnostic("waiting_notify_suppressed_replay", {
-      tid,
-      request_id: waitingRequestId(activity)
-    });
-    return;
-  }
   const now = Date.now();
   pruneNotificationDedup(now);
   const notifiedAt = state.notifiedRequests.get(notificationKey);
@@ -3228,7 +3397,6 @@ async function maybeNotifyWaitingRequest(tid, activity) {
   // check above and the record after the notification, both would clear the gate and notify.
   // Every path that returns without notifying releases it again.
   state.notifiedRequests.set(notificationKey, now);
-  state.bootstrapNotifiedRequests.add(notificationKey);
   // A sub-agent's very first approval routinely arrives before the browser has listed the thread
   // the server just materialized. Resolve it now rather than shipping an unattributable id prefix —
   // this notification is the only signal the user gets for a thread with no sidebar row.
@@ -3433,63 +3601,67 @@ async function focusWaitingRequest(tid, requestId) {
   }
 }
 
-function notifyIncomingApproval(request, tid, opts) {
-  opts = opts || {};
-  if (!request || !request.id || !tid) {
-    recordNotificationDiagnostic("incoming_approval_skipped_invalid_request", {
-      tid,
-      request_id: request && request.id ? String(request.id) : null
-    });
-    return;
-  }
-  maybeNotifyWaitingRequest(String(tid), {
-    kind:"approval_requested",
-    active_turn:true,
-    approval_id:String(request.id),
-    server_request_id:null,
-    summary:approvalTitle(request),
-    source:opts.source || "incoming_approval_request",
-    unread:false
-  });
+function requestStateKey(threadId, requestId) {
+  return `${String(threadId || "")}\n${String(requestId || "")}`;
 }
 
-// Resolve an approval's answer from either the live-session store (keyed by state) or the reload
-// snapshot store (keyed by id, since a reload wiped the browser's state-key memory). Returns the
-// answered entry ({ decision, ... }) or undefined. Single source of truth for the lookup order.
-function answeredApprovalEntry(request) {
-  if (!request || request.id === undefined || request.id === null) return undefined;
-  return state.answeredApprovals.get(approvalStateKey(request))
-    || state.answeredApprovalsById.get(String(request.id));
+function requestStatusName(requestState) {
+  return requestState && requestState.status && String(requestState.status.status || "");
 }
-function isApprovalAnswered(request) {
-  return !!answeredApprovalEntry(request);
-}
-function handleIncomingApprovalRequest(request, tid, opts) {
-  opts = opts || {};
-  // A reconnect snapshot replays already-answered approvals so their cards can be redrawn in the
-  // resolved state. Those must not re-arm the waiting-on-you sidebar activity or fire a
-  // notification — the user already answered them. Render the resolved card and stop.
-  if (isApprovalAnswered(request)) {
-    renderApprovalRequest(request);
-    return;
+
+function applyRequestState(requestState) {
+  const threadId = requestState && requestState.thread_id !== undefined
+    ? String(requestState.thread_id) : "";
+  const requestId = requestState && requestState.request_id !== undefined
+    ? String(requestState.request_id) : "";
+  const payloadRequest = requestState && requestState.payload && requestState.payload.request;
+  const statusName = requestStatusName(requestState);
+  if (!threadId || !requestId || !requestState.payload ||
+      !["approval", "server"].includes(requestState.payload.kind) || !payloadRequest ||
+      String(payloadRequest.id || "") !== requestId ||
+      !["pending", "responding", "resolved"].includes(statusName) ||
+      (statusName === "resolved" && !requestState.status.resolution)) {
+    throw new Error("invalid request state");
   }
-  recordNotificationDiagnostic("incoming_approval_request", {
-    tid,
-    request_id: request && request.id ? String(request.id) : null,
-    source: opts.source || "unknown",
-    notify: opts.notify !== false
-  });
-  if (opts.notify !== false) notifyIncomingApproval(request, tid, { source: opts.source });
-  setThreadActivity(tid, {
-    kind:"approval_requested",
-    active_turn:true,
-    approval_id:request && request.id ? String(request.id) : null,
-    server_request_id:null,
-    summary:approvalTitle(request),
-    source:opts.source || "incoming_approval_request",
-    unread:state.threadId ? String(state.threadId) !== String(tid) : true
-  });
-  renderApprovalRequest(request);
+  const key = requestStateKey(threadId, requestId);
+  const previous = state.requestStates.get(key);
+  const entry = { state:requestState, row:previous && previous.row ? previous.row : null };
+  state.requestStates.set(key, entry);
+  if (requestStatusName(requestState) === "resolved") {
+    closeWaitingNotification(threadId, requestId);
+  }
+  if (threadId !== String(state.threadId || "")) return;
+  if (requestState.payload.kind === "approval") renderApprovalRequest(entry);
+  else if (requestState.payload.kind === "server") renderServerRequest(entry);
+  else throw new Error("unknown request payload kind");
+}
+
+function replaceThreadRequestStates(threadId, requests) {
+  const prefix = `${String(threadId)}\n`;
+  const replacement = new Set(requests.map(request => requestStateKey(threadId, request.request_id)));
+  for (const key of Array.from(state.requestStates.keys())) {
+    if (key.startsWith(prefix) && !replacement.has(key)) state.requestStates.delete(key);
+  }
+  for (const request of requests) applyRequestState(request);
+}
+
+function currentRequestEntry(requestId) {
+  return state.requestStates.get(requestStateKey(state.threadId, requestId));
+}
+
+function markRequestResponding(entry) {
+  if (!entry || requestStatusName(entry.state) !== "pending") return;
+  entry.state = Object.assign({}, entry.state, { status:{ status:"responding" } });
+  if (entry.state.payload.kind === "approval") renderApprovalRequest(entry);
+  else renderServerRequest(entry);
+}
+
+function restoreRespondingRequest(requestId) {
+  const entry = currentRequestEntry(requestId);
+  if (!entry || requestStatusName(entry.state) !== "responding") return;
+  entry.state = Object.assign({}, entry.state, { status:{ status:"pending" } });
+  if (entry.state.payload.kind === "approval") renderApprovalRequest(entry);
+  else renderServerRequest(entry);
 }
 
 function pendingMetadataOverlay(tid) {
@@ -3589,29 +3761,12 @@ function applyThreadMetadata(s, recoverConflict) {
   const prior = s && composedThreadDetail(s.thread_id);
   const result = reconcileThreadProjection("detail", s);
   if (!result.accepted) {
-    if (result.conflict && state.ws && state.ws.readyState === WebSocket.OPEN) {
-      if (!state.pendingDetailConflictResyncs.has(result.threadId)) {
-        state.pendingDetailConflictResyncs.add(result.threadId);
-        resetThreadAuthorityForDetailResync(result.threadId);
-        if (String(state.threadId || "") === result.threadId) {
-          const request = { type:"subscribe", thread_id:result.threadId };
-          if (state.newestPersistedTurnId) {
-            request.since = state.newestPersistedTurnId;
-            state.awaitingIncrementalResync = true;
-            state.awaitingThreadResync = false;
-          } else {
-            state.awaitingThreadResync = true;
-            state.awaitingIncrementalResync = false;
-          }
-          send(request);
-        } else {
-          state.pendingDetailConflictResyncs.delete(result.threadId);
-        }
-      }
+    if (result.conflict && String(state.threadId || "") === result.threadId) {
+      resetThreadAuthorityForDetailResync(result.threadId);
+      requestThreadResync("metadata_revision_conflict");
     }
     return result;
   }
-  if (recoverConflict) state.pendingDetailConflictResyncs.delete(result.threadId);
   const current = composedThreadDetail(result.threadId);
   if (state.threadReadOnly && state.readOnlyProvider && current && current.current_model &&
       current.current_model.provider !== state.readOnlyProvider &&
@@ -3630,38 +3785,6 @@ function applyThreadMetadata(s, recoverConflict) {
   return result;
 }
 
-function renderThreadState(s, activeTurn) {
-  if (!s) return;
-  const appliesBootstrap = Object.prototype.hasOwnProperty.call(s, "active_turn");
-  const recoverConflict = appliesBootstrap &&
-    state.pendingDetailConflictResyncs.has(String(s.thread_id || ""));
-  const shouldResetTranscript = appliesBootstrap &&
-    (state.awaitingInitialThreadState || state.awaitingThreadResync);
-  // An incremental resync keeps the transcript. Remember whether the viewport was pinned to the
-  // bottom now, before the in-flight turn is repainted, so we can restore that afterwards.
-  if (appliesBootstrap && state.awaitingIncrementalResync) {
-    state.resyncStickBottom = transcriptShouldStickToBottom();
-  }
-  if (appliesBootstrap) {
-    state.awaitingInitialThreadState = false;
-    state.awaitingThreadResync = false;
-  }
-  applyThreadMetadata(s, recoverConflict);
-  if (appliesBootstrap) {
-    if (shouldResetTranscript) resetTranscriptForAuthoritativeSnapshot();
-    releaseFirstTurnLockIfIdle(activeTurn);
-  }
-}
-
-// The first turn of a draft thread is started over HTTP, before this thread's socket exists, so the
-// composer locks optimistically (`firstTurnStartingThreadId`) with nothing on the wire yet to
-// confirm the turn. Every other lock is released by something the socket delivers — `turn_completed`
-// for a turn we watched, `error` for one that failed, a resync for one we missed. This one has no
-// such release when the turn finishes *before* the socket attaches: its `turn_completed` was
-// addressed to nobody and, the turn being over, no live snapshot follows to correct us. The
-// composer would then stay locked until the thread is re-opened. The server's `active_turn` is the
-// authority here — held from before the start request returned until the turn ends — so a `false`
-// really does mean there is nothing left to wait for.
 function releaseFirstTurnLockIfIdle(activeTurn) {
   if (activeTurn !== false) return;   // only an explicit "no turn is running" releases the lock
   if (!state.firstTurnStartingThreadId) return;
@@ -3674,23 +3797,16 @@ function resetTranscriptForAuthoritativeSnapshot() {
     state.firstTurnStartingThreadId &&
     state.threadId &&
     String(state.firstTurnStartingThreadId) === String(state.threadId);
-  // Subscribe/resubscribe snapshots replay persisted history and any live turn from the server.
-  // Clear transient browser-only rows first so fallback error/user bubbles cannot be appended
-  // again, and so a missed turn_completed while suspended does not leave stale active-turn UI.
   $("transcript").innerHTML="";
   state.pendingUserEl = null;
   state.pendingUserText = null;
-  state.pendingOlder = false;
-  state.loadingHistory = false;
+  cancelHistoryPagination();
   state.oldestTurnId = null;
   state.hasMoreHistory = false;
   state.autoFilledTurns = 0;
-  // The transcript is being rebuilt from an authoritative snapshot, so drop the in-flight stamp;
-  // the incoming history page re-establishes the persisted high-water mark.
   state.currentRenderTurnId = null;
   state.interruptPending = false;
   state.compactPending = false;
-  state.pendingLiveSnapshotReconcile = false;
   resetRenderState();
   if (keepFirstTurnActive) updateComposerControls();
   else setTurnActive(false);
@@ -3795,37 +3911,14 @@ function setPermissionPreset(preset) {
   updateTurnButton();
 }
 
-// Render the most recent page of persisted history (H6), oldest-first. Older pages are available
-// via LoadHistory { before: oldestTurnId } when has_more is set (wired to the "Load older" button).
-function renderHistoryPage(msg) {
-  // A full page arriving while we expected a resync delta means the server couldn't honor our
-  // cursor (stale/unknown turn) and fell back to a full snapshot. It is sent history-first, so we
-  // still own the transcript here: rebuild it from scratch, then render this as a normal initial
-  // page (the live turn appends afterwards).
-  if (state.awaitingIncrementalResync) {
-    state.awaitingIncrementalResync = false;
-    state.resyncStickBottom = false;
-    state.pendingLiveSnapshotReconcile = false;
-    resetTranscriptForAuthoritativeSnapshot();
-  }
-  // `older` marks a page fetched *above* what's already shown: a scroll-up LoadHistory or an
-  // open-time autofill top-up. The first (initial) page is the only one that is not `older`.
-  const older = state.pendingOlder;
-  state.pendingOlder = false;
+function renderHistoryPage(page, pending) {
+  if (state.paginationRequest !== pending) return;
+  state.paginationRequest = null;
   state.loadingHistory = false;
-  state.hasMoreHistory = !!msg.has_more;
-  const turns = msg.turns || [];
-  if (turns.length) state.oldestTurnId = turns[0].id;   // turns are oldest-first
-  // High-water cursor: the initial page ends at the newest persisted turn. Older pages are, by
-  // definition, further back, so they must never lower this.
-  if (!older && turns.length) state.newestPersistedTurnId = turns[turns.length - 1].id;
+  state.hasMoreHistory = page.has_more;
+  const turns = page.turns;
+  if (turns.length) state.oldestTurnId = turns[0].id;
   state.autoFilledTurns = (state.autoFilledTurns || 0) + turns.length;
-  // The gauge tracks current context occupancy. When a live turn is active it (and the thread_state
-  // aggregates) own the gauge, so a staler value from the newest persisted turn must not clobber it.
-  if (!older && !state.activeTurn) updateGaugeFromTurns(turns);
-
-  // Every page renders into a detached container and is prepended above existing content, so the
-  // live turn (rendered first, at the bottom) and any already-loaded history stay in place.
   const container = document.createElement("div");
   const prev = state.renderTarget;
   const prevTaskGroup = state.activeTaskGroup;
@@ -3837,81 +3930,93 @@ function renderHistoryPage(msg) {
 
   const t = $("transcript");
   const heightBefore = t.scrollHeight;
-  const anchor = t.firstChild;   // insert before current top-most content (or append if empty)
+  const anchor = t.firstChild;
   while (container.firstChild) t.insertBefore(container.firstChild, anchor);
-  if (older) {
-    // Preserve the viewport so it doesn't jump while older content is inserted (infinite scroll).
-    t.scrollTop += t.scrollHeight - heightBefore;
-  } else {
-    // Initial page: reveal the newest content (the live turn, or the last persisted turn).
-    t.scrollTop = t.scrollHeight;
-  }
-
+  t.scrollTop += t.scrollHeight - heightBefore;
   maybeAutoFillHistory();
 }
 
-// Incremental resync: the server sent only the turns that completed while we were disconnected
-// (history-first, before the live snapshot). Completed turns are immutable, so we keep the existing
-// transcript and append these new turns. If a live turn is still running, keep its old DOM visible
-// until the live snapshot arrives; the snapshot handler removes and recreates the live block
-// synchronously, avoiding a visible blank gap between the history-delta and live-snapshot messages.
-function renderHistoryDelta(msg) {
-  state.awaitingIncrementalResync = false;
-  const turns = msg.turns || [];
-  const liveId = state.activeTurn && state.currentRenderTurnId != null
-    ? String(state.currentRenderTurnId)
-    : null;
-  const completedLiveTurn = !!(liveId && turns.some(turn => String(turn.id) === liveId));
-  const completedPendingTurn = !liveId && !!state.pendingUserEl && turns.length > 0;
-
-  if (completedLiveTurn || completedPendingTurn) {
-    // The turn that was live, or still an optimistic pending row, completed while we were
-    // disconnected, so there will be no live snapshot to replace it. Remove the stale live rows
-    // before appending the persisted turn.
-    reconcileInFlightTurn();
-    state.pendingLiveSnapshotReconcile = false;
-  } else {
-    state.pendingLiveSnapshotReconcile = !!liveId || !!state.pendingUserEl;
-  }
-
-  // Append completed-since turns. If the old live turn is still visible, insert the persisted turns
-  // immediately before that live block so transcript chronology stays correct until the snapshot
-  // atomically replaces the live block.
-  if (turns.length) {
-    const container = document.createElement("div");
-    const prev = state.renderTarget;
-    const prevTaskGroup = state.activeTaskGroup;
-    state.renderTarget = container;
-    state.activeTaskGroup = null;
-    for (const turn of turns) renderPersistedTurn(turn);
-    state.renderTarget = prev;
-    state.activeTaskGroup = prevTaskGroup;
-    const t = $("transcript");
-    const anchor = !completedLiveTurn ? firstLiveTurnRow(liveId) : null;
-    while (container.firstChild) t.insertBefore(container.firstChild, anchor);
-    state.newestPersistedTurnId = turns[turns.length - 1].id;   // advance the resume cursor
-    updateGaugeFromTurns(turns);   // a live snapshot, if any, overrides this next
-  }
-
-  // If the user was pinned to the bottom before the repaint, keep them there. When the turn is
-  // still running the live snapshot re-applies this after it renders; for an idle thread (no live
-  // snapshot) this is the final position.
-  if (state.resyncStickBottom) keepTranscriptAtBottom(true);
+function cancelHistoryPagination() {
+  const pending = state.paginationRequest;
+  state.paginationRequest = null;
+  state.loadingHistory = false;
+  if (pending && pending.controller) pending.controller.abort();
 }
 
-// Remove the in-flight turn's DOM on an incremental resync. Completed turns are immutable and stay
-// put; only the turn that was running when we disconnected can have changed, and the optimistic
-// "pending" rows (a user bubble sent but never confirmed) are transient. Matching is by the
-// per-turn `data-turn` stamp; removing a task-group wrapper takes its nested rows with it.
+async function requestOlderHistory(limit) {
+  if (state.renderTarget || state.loadingHistory || !state.projectId || !state.threadId ||
+      !state.hasMoreHistory || !state.oldestTurnId) return;
+  const projectId = String(state.projectId);
+  const threadId = String(state.threadId);
+  const before = String(state.oldestTurnId);
+  const controller = new AbortController();
+  const pending = { projectId, threadId, before, controller };
+  state.loadingHistory = true;
+  state.paginationRequest = pending;
+
+  const params = new URLSearchParams({ before });
+  if (Number.isSafeInteger(limit) && limit > 0) params.set("limit", String(limit));
+  const path = `/api/projects/${encodeURIComponent(projectId)}/threads/` +
+    `${encodeURIComponent(threadId)}/history?${params.toString()}`;
+  try {
+    const page = await api("GET", path, undefined, { signal:controller.signal });
+    if (state.paginationRequest !== pending || String(state.projectId || "") !== projectId ||
+        String(state.threadId || "") !== threadId) return;
+    if (!page || String(page.before || "") !== before || !Array.isArray(page.turns) ||
+        typeof page.has_more !== "boolean") {
+      throw new Error("Invalid older-history response from server.");
+    }
+    renderHistoryPage(page, pending);
+  } catch (error) {
+    if (state.paginationRequest !== pending) return;
+    state.paginationRequest = null;
+    state.loadingHistory = false;
+    if (error && error.name === "AbortError") return;
+    notice(`Could not load older history: ${apiFailureMessage(error)}`, "warning");
+  }
+}
+
+function applyBootstrapHistory(history) {
+  const turns = history.turns || [];
+  const cursor = history && history.cursor;
+  const newestTurnId = cursor && cursor.newest_turn_id != null
+    ? String(cursor.newest_turn_id) : null;
+  const amendmentSequence = Number(cursor && cursor.amendment_sequence);
+  if (!cursor || typeof cursor.server_epoch !== "string" || !cursor.server_epoch ||
+      !Number.isSafeInteger(amendmentSequence) || amendmentSequence < 0) {
+    throw new Error("invalid bootstrap history cursor");
+  }
+  state.historyCursor = {
+    newest_turn_id:newestTurnId,
+    server_epoch:cursor.server_epoch,
+    amendment_sequence:amendmentSequence
+  };
+  state.newestPersistedTurnId = newestTurnId;
+  if (history.kind === "full_page" || history.kind === "cursor_reset") {
+    resetTranscriptForAuthoritativeSnapshot();
+    state.hasMoreHistory = !!history.has_more;
+    state.oldestTurnId = turns.length ? turns[0].id : null;
+    state.autoFilledTurns = turns.length;
+    for (const turn of turns) renderPersistedTurn(turn);
+    updateGaugeFromTurns(turns);
+    $("transcript").scrollTop = $("transcript").scrollHeight;
+    maybeAutoFillHistory();
+    return;
+  }
+  reconcileInFlightTurn();
+  for (const turn of turns) renderPersistedTurn(turn);
+  if (turns.length) {
+    if (!state.oldestTurnId) state.oldestTurnId = turns[0].id;
+    updateGaugeFromTurns(turns);
+  }
+}
+
 function reconcileInFlightTurn() {
   removeTurnRows("pending");
   const liveId = state.activeTurn && state.currentRenderTurnId != null
     ? String(state.currentRenderTurnId)
     : null;
   if (liveId) removeTurnRows(liveId);
-  // The in-flight turn's rows are gone. Rebuild render bookkeeping from the rows that survived
-  // (the DOM is the source of truth) so the live snapshot creates fresh rows for the removed turn
-  // instead of deduping against stale maps or updating detached bodies.
   rebuildRenderTrackingFromDom();
   state.pendingUserEl = null;
   state.pendingUserText = null;
@@ -3920,15 +4025,6 @@ function reconcileInFlightTurn() {
   state.streamEl = null;
   state.streamItemId = null;
   breakTaskGroup();
-}
-function firstLiveTurnRow(liveId) {
-  const t = $("transcript");
-  if (!t) return null;
-  for (const el of Array.from(t.children)) {
-    if (!el.classList || !el.classList.contains("msg")) continue;
-    if (el.dataset.turn === "pending" || (liveId && el.dataset.turn === liveId)) return el;
-  }
-  return null;
 }
 function rebuildRenderTrackingFromDom() {
   const t = $("transcript");
@@ -3970,13 +4066,14 @@ function rebuildRenderTrackingFromDom() {
   for (const m of [
     state.commandPayloadsByItemId,
     state.endedCommandsByItemId,
-    state.runningCommands,
+    state.transcriptTasks,
     state.toolPayloadsByItemId,
     state.taskGroupsByItemId
   ]) {
     for (const key of Array.from(m.keys())) if (!liveTaskIds.has(key)) m.delete(key);
   }
-  pruneKeySet(state.commandStopRequestedByItemId, liveTaskIds);
+  const controllableTaskIds = new Set([...liveTaskIds, ...state.runningTasks.keys()]);
+  pruneKeySet(state.commandStopRequestedByItemId, controllableTaskIds);
 
   for (const [groupId, group] of Array.from(state.taskGroupsById)) {
     if (!attached(group && group.el)) {
@@ -3998,19 +4095,9 @@ function rebuildRenderTrackingFromDom() {
     state.selectedCommandId = null;
   }
 
-  for (const [id, entry] of Array.from(state.pendingApprovals)) {
-    if (!attached(entry && entry.msg)) state.pendingApprovals.delete(id);
+  for (const entry of state.requestStates.values()) {
+    if (!attached(entry.row)) entry.row = null;
   }
-  for (const [id, entry] of Array.from(state.pendingServerRequests)) {
-    if (!attached(entry && entry.msg)) state.pendingServerRequests.delete(id);
-  }
-  const approvalKeys = new Set();
-  if (t) {
-    for (const row of t.querySelectorAll("[data-approval-state-key]")) {
-      if (row.dataset.approvalStateKey) approvalKeys.add(row.dataset.approvalStateKey);
-    }
-  }
-  state.renderedApprovalStateKeys = approvalKeys;
   renderRunningCommands();
 }
 function removeTurnRows(turnId) {
@@ -4023,11 +4110,6 @@ function removeTurnRows(turnId) {
   }
 }
 
-// After each history page lands, keep topping up (oldest-first, in small batches) until the
-// transcript holds ~HISTORY_FILL_SCREENS viewports of scrollback, we run out of history, or we hit
-// the safety cap. This reuses the scroll-up LoadHistory path, so pages arrive as `older` and are
-// prepended without moving the viewport. Measuring pixels here is deliberate: only the browser
-// knows how tall rendered turns are, so the server cannot page by screen.
 function maybeAutoFillHistory() {
   if (state.renderTarget) return;   // never while rendering into a detached container
   const t = $("transcript");
@@ -4035,12 +4117,7 @@ function maybeAutoFillHistory() {
   if (!state.hasMoreHistory || state.loadingHistory || !state.oldestTurnId) return;
   if ((state.autoFilledTurns || 0) >= HISTORY_FILL_MAX_TURNS) return;
   if (t.scrollHeight >= t.clientHeight * HISTORY_FILL_SCREENS) return;
-  state.loadingHistory = true;
-  state.pendingOlder = true;
-  if (!send({ type:"load_history", thread_id: state.threadId, before: state.oldestTurnId, limit: HISTORY_FILL_BATCH })) {
-    state.loadingHistory = false;
-    state.pendingOlder = false;
-  }
+  void requestOlderHistory(HISTORY_FILL_BATCH);
 }
 
 // Render one persisted turn from history: its items, plus the user message and any failure that
@@ -4078,13 +4155,10 @@ function renderPersistedTurn(turn) {
   breakTaskGroup();
 }
 
-// Load older history when the user scrolls near the top (H4/H6 infinite scroll).
 function onTranscriptScroll() {
   const t = $("transcript");
   if (t.scrollTop < 80 && state.hasMoreHistory && !state.loadingHistory && state.oldestTurnId && state.threadId) {
-    state.loadingHistory = true;
-    state.pendingOlder = true;
-    send({ type:"load_history", thread_id: state.threadId, before: state.oldestTurnId });
+    void requestOlderHistory();
   }
 }
 
@@ -4092,7 +4166,6 @@ function handleEvent(ev) {
   switch (ev.kind) {
     case "turn_started":
       state.firstTurnStartingThreadId = null;
-      state.pendingLiveSnapshotReconcile = false;
       breakTaskGroup();
       state.streamEl = null;
       state.streamItemId = null;
@@ -4107,7 +4180,6 @@ function handleEvent(ev) {
       }
       renderLiveTurnUserInput(ev.turn, ev.user_input);
       setTurnActive(true);
-      setActiveThreadActivity("progress", true, "Turn running");
       break;
     case "item_started":
       if (ev.item) {
@@ -4142,7 +4214,14 @@ function handleEvent(ev) {
     case "turn_completed":
       state.firstTurnStartingThreadId = null;
       // This turn is now persisted; advance the high-water cursor and stop stamping rows to it.
-      if (ev.turn) state.newestPersistedTurnId = ev.turn;
+      if (ev.turn) {
+        state.newestPersistedTurnId = ev.turn;
+        if (state.historyCursor) {
+          state.historyCursor = Object.assign({}, state.historyCursor, {
+            newest_turn_id:String(ev.turn)
+          });
+        }
+      }
       state.currentRenderTurnId = null;
       updateGaugeFromUsage(ev.usage);
       state.streamEl=null;
@@ -4153,42 +4232,10 @@ function handleEvent(ev) {
       finishCompactPending();
       clearPlanCard();   // the plan ends with its turn
       setTurnActive(false);
-      setActiveThreadActivity("turn_completed", false, "Turn completed");
       breakTaskGroup();
       // Shell edits leave no file-change item, so the end of the turn is the catch-all.
       scheduleGitRefresh();
       break;
-    case "approval_requested":
-      handleIncomingApprovalRequest(ev.request, ev.thread || state.threadId, {
-        source: "agent_event_approval_requested"
-      });
-      break;
-    case "server_request_received": {
-      const serverRequestId = ev.request && ev.request.id ? String(ev.request.id) : null;
-      // A reconnect snapshot replays every ServerRequestReceived, answered ones included. Those must
-      // not re-arm the waiting-on-you activity or fire a notification — the user already answered
-      // them. Mirrors the approval path's guard in `handleIncomingApprovalRequest`;
-      // `renderServerRequest` settles the card into its resolved state from the same answered set.
-      if (serverRequestId && state.answeredServerRequests.has(serverRequestId)) {
-        renderServerRequest(ev.request);
-        break;
-      }
-      setActiveThreadActivity("server_request_received", true, "Waiting for your input", {
-        server_request_id:serverRequestId
-      });
-      renderServerRequest(ev.request);
-      maybeNotifyWaitingRequest(String(ev.thread || state.threadId || ""), {
-        kind:"server_request_received",
-        active_turn:true,
-        approval_id:null,
-        server_request_id:serverRequestId,
-        summary:"Waiting for your input",
-        source:"agent_event_server_request_received",
-        unread:false
-      });
-      break;
-    }
-    case "server_request_resolved": resolveServerRequest(ev.request_id); break;
     // Render errors as a persistent transcript entry (tied to the turn/message that caused them)
     // rather than a toast that vanishes — so looking back at a thread explains why a message got
     // no agent response. The matching failed turn is also persisted server-side (§7.1).
@@ -4197,7 +4244,6 @@ function handleEvent(ev) {
         state.firstTurnStartingThreadId = null;
         setTurnActive(false);
       }
-      setActiveThreadActivity("error", false, errorText(ev.error));
       failPendingUserMessage(null);   // resolve the optimistic bubble to a failed state
       errorBubble(errorText(ev.error));
       break;
@@ -4224,108 +4270,138 @@ function errorText(e) {
   return e.message || e.detail || JSON.stringify(e);
 }
 
-function renderLiveTurnSnapshot(snap) {
-  if (state.pendingLiveSnapshotReconcile) {
-    state.pendingLiveSnapshotReconcile = false;
-    reconcileInFlightTurn();
+function threadEventPayloadMatches(payload, threadId) {
+  if (!payload || typeof payload.kind !== "string") return false;
+  if (payload.kind === "agent") {
+    return !!payload.agent_event && String(payload.agent_event.thread || "") === String(threadId || "");
   }
-  if (snap && snap.turn_id) {
-    state.firstTurnStartingThreadId = null;
-    // Adopt the live turn id so its rows stamp correctly even if the accumulated events don't lead
-    // with a turn_started (the turn_started handler will confirm the same id).
-    state.currentRenderTurnId = snap.turn_id;
-    renderLiveTurnUserInput(snap.turn_id, snap.user_input);
-    setTurnActive(true);
-    setActiveThreadActivity("progress", true, "Turn running");
-  }
-  // Seed answered approvals before replaying accumulated events: the buffer replays every
-  // ApprovalRequested (answered ones included), and this reload wiped the in-memory answered state,
-  // so without this the answered cards would render actionable again and re-answering errors.
-  for (const answered of (snap.answered_approvals || [])) {
-    if (answered && answered.request_id !== undefined && answered.request_id !== null) {
-      state.answeredApprovalsById.set(String(answered.request_id), { decision: answered.decision });
-    }
-  }
-  // Same reasoning for server requests: `accumulated` replays every ServerRequestReceived, and a
-  // harness's resolved event may be late or never arrive, so without this an answered request
-  // renders actionable again and re-answering routes a stale id to the harness.
-  for (const answered of (snap.answered_server_requests || [])) {
-    if (answered !== undefined && answered !== null) state.answeredServerRequests.add(String(answered));
-  }
-  for (const ev of (snap.accumulated||[])) handleEvent(ev);
-  // Then re-assert what the turn is still waiting on the user for, approvals first. The replay
-  // above already drew these cards, but later events speak for the thread too — an `error` in
-  // particular overwrites the thread's activity and clears the active turn. Whatever is still
-  // outstanding gets the last word, so a turn blocked on an approval that then errored still reads
-  // as waiting on the user rather than "errored, idle". A turn can be blocked on several approvals
-  // at once, so every unanswered approval is re-armed, not just one.
-  for (const approval of outstandingApprovals(snap)) {
-    handleIncomingApprovalRequest(approval, snap.thread_id || state.threadId, {
-      source: "live_turn_snapshot_outstanding_approval"
-    });
-  }
-  for (const request of outstandingServerRequests(snap)) {
-    setActiveThreadActivity("server_request_received", true, "Waiting for your input", {
-      server_request_id:request && request.id ? String(request.id) : null
-    });
-    renderServerRequest(request);
-  }
+  return payload.kind === "request" && !!payload.request &&
+    String(payload.request.thread_id || "") === String(threadId || "");
 }
 
-// Every approval the replayed turn is still waiting on the user for, oldest first. An approval is
-// outstanding unless the user already answered it (named in `snap.answered_approvals`). A re-sent
-// id is the same approval with a fresher payload, so the latest occurrence wins and the order is
-// the first occurrence of each id.
-function outstandingApprovals(snap) {
-  const answered = new Set();
-  for (const a of (snap.answered_approvals || [])) {
-    if (a && a.request_id !== undefined && a.request_id !== null) answered.add(String(a.request_id));
-  }
-  const order = [];
-  const latest = new Map();
-  for (const ev of (snap.accumulated || [])) {
-    if (!ev || ev.kind !== "approval_requested") continue;
-    const request = ev.request;
-    const id = request && request.id !== undefined && request.id !== null ? String(request.id) : null;
-    if (!id) continue;
-    if (!latest.has(id)) order.push(id);
-    latest.set(id, request);
-  }
-  return order
-    .map(id => latest.get(id))
-    .filter(request => request && !answered.has(String(request.id)));
+function applyThreadEventPayload(payload, threadId) {
+  if (!threadEventPayloadMatches(payload, threadId)) throw new Error("invalid thread event payload");
+  if (payload.kind === "agent") handleEvent(payload.agent_event);
+  else applyRequestState(payload.request);
 }
 
-// Every server request the replayed turn is still waiting on the user for, oldest first. A
-// request leaves the outstanding set when the user answered it (named in
-// `snap.answered_server_requests`) or when the harness closed it (`server_request_resolved` in
-// `accumulated`). A re-sent id is the same request with a fresher payload, so the latest
-// `server_request_received` wins and the order is the first occurrence of each id.
-function outstandingServerRequests(snap) {
-  const answered = new Set();
-  for (const id of (snap.answered_server_requests || [])) {
-    if (id !== undefined && id !== null) answered.add(String(id));
+function applySequencedThreadEvent(envelope, threadId, resyncOnCursorMismatch) {
+  const amendment = envelope && envelope.history_amendment;
+  if (!amendment) {
+    applyThreadEventPayload(envelope && envelope.event, threadId);
+    return true;
   }
-  // A `Map` keeps arrival order (iterating a Map yields entries in insertion order). `set` on
-  // receive updates the payload in place when the id is already present, or appends it when it is
-  // new; `delete` on resolve drops it. A re-sent id after a resolution re-inserts at the end, so a
-  // reopen moves to the back rather than keeping its first-seen position. Mirrors
-  // `pending_server_requests` on the server.
-  const pending = new Map();
-  for (const ev of (snap.accumulated || [])) {
-    if (!ev || !ev.kind) continue;
-    if (ev.kind === "server_request_received") {
-      const request = ev.request;
-      const id = request && request.id !== undefined && request.id !== null ? String(request.id) : null;
-      if (!id) continue;
-      pending.set(id, request);
-    } else if (ev.kind === "server_request_resolved") {
-      const id = ev.request_id !== undefined && ev.request_id !== null ? String(ev.request_id) : null;
-      if (id) pending.delete(id);
+  const cursor = state.historyCursor;
+  const sequence = Number(amendment.sequence);
+  if (typeof amendment.server_epoch !== "string" ||
+      !Number.isSafeInteger(sequence) || sequence < 0) {
+    throw new Error("invalid history amendment cursor");
+  }
+  // An older-history response may have read this turn before the amendment committed. Cancel it
+  // before advancing the amendment cursor: otherwise that stale response could arrive afterward,
+  // restore the old item, and prevent a reconnect from requesting the amendment again.
+  cancelHistoryPagination();
+  if (!cursor || amendment.server_epoch !== cursor.server_epoch) {
+    if (resyncOnCursorMismatch) {
+      requestThreadResync("history_amendment_epoch_mismatch");
+      return false;
+    }
+    throw new Error("history amendment epoch mismatch");
+  }
+  if (sequence < cursor.amendment_sequence) return true;
+  if (sequence !== cursor.amendment_sequence + 1) {
+    if (sequence !== cursor.amendment_sequence) {
+      if (resyncOnCursorMismatch) {
+        requestThreadResync("history_amendment_sequence_gap");
+        return false;
+      }
+      throw new Error("history amendment sequence gap");
     }
   }
-  return Array.from(pending.values())
-    .filter(request => request && !answered.has(String(request.id)));
+  const payload = envelope.event;
+  if (!threadEventPayloadMatches(payload, threadId) || payload.kind !== "agent" ||
+      !payload.agent_event || payload.agent_event.kind !== "item_completed") {
+    throw new Error("history amendment is not a completed item");
+  }
+  const event = payload.agent_event;
+  // An amendment for a turn outside the rendered page advances authority without inventing a row
+  // at the bottom of the transcript. HTTP pagination will later render it in its durable position.
+  if (!finalizeStreamedItem(event.item, event.turn) && isRenderedItem(event.item, event.turn)) {
+    addItem(event.item, event.turn);
+  }
+  if (sequence > cursor.amendment_sequence) {
+    state.historyCursor = Object.assign({}, cursor, { amendment_sequence:sequence });
+  }
+  return true;
+}
+
+function applyLiveTurnProjection(projection, threadId) {
+  if (!projection) return;
+  state.firstTurnStartingThreadId = null;
+  state.currentRenderTurnId = projection.turn_id;
+  renderLiveTurnUserInput(projection.turn_id, projection.user_input);
+  setTurnActive(true);
+  for (const event of projection.events) applyThreadEventPayload(event, threadId);
+}
+
+function sendPersistenceRecovery(action, threadId, turnId) {
+  if (action === "discard_unpersisted_turn" &&
+      !window.confirm("Discard this unpersisted turn? Its transcript cannot be recovered.")) return;
+  if (!send({ type:action, thread_id:threadId, turn_id:turnId })) {
+    notice(`Recovery action not sent: WebSocket is ${state.wsStatus}.`, "error");
+    return;
+  }
+  document.getElementById("persistenceRecovery")?.querySelectorAll("button")
+    .forEach(button => { button.disabled = true; });
+}
+
+function sendHistoryAmendmentRecovery(action, threadId, recoveryId) {
+  if (action === "discard_history_amendment" &&
+      !window.confirm("Discard this late command result? It will not survive a server restart.")) return;
+  if (!send({ type:action, thread_id:threadId, recovery_id:recoveryId })) {
+    notice(`Recovery action not sent: WebSocket is ${state.wsStatus}.`, "error");
+    return;
+  }
+  document.getElementById("persistenceRecovery")?.querySelectorAll("button")
+    .forEach(button => { button.disabled = true; });
+}
+
+function renderPersistenceRecovery(threadId, turnState, historyRecovery) {
+  document.getElementById("persistenceRecovery")?.remove();
+  if (threadId && historyRecovery) {
+    const card = notice(historyRecovery.error || "Command result persistence needs attention.", "error", 0);
+    card.id = "persistenceRecovery";
+    card.insertAdjacentHTML("beforeend", `<div class="approval-actions"><button type="button">Retry persistence</button><button type="button">Discard late result</button></div>`);
+    const buttons = card.querySelectorAll("button");
+    buttons[0].onclick = () => sendHistoryAmendmentRecovery(
+      "retry_history_amendment", threadId, historyRecovery.recovery_id);
+    buttons[1].onclick = () => sendHistoryAmendmentRecovery(
+      "discard_history_amendment", threadId, historyRecovery.recovery_id);
+    return;
+  }
+  if (!threadId || !turnState || turnState.state !== "persistence_blocked") return;
+  const card = notice(turnState.error || "Turn persistence needs attention.", "error", 0);
+  card.id = "persistenceRecovery";
+  card.insertAdjacentHTML("beforeend", `<div class="approval-actions"><button type="button">Retry persistence</button><button type="button">Discard unpersisted turn</button></div>`);
+  const buttons = card.querySelectorAll("button");
+  buttons[0].onclick = () => sendPersistenceRecovery("retry_turn_persistence", threadId, turnState.turn_id);
+  buttons[1].onclick = () => sendPersistenceRecovery("discard_unpersisted_turn", threadId, turnState.turn_id);
+}
+
+function applyCurrentRuntimeTurnState(threadId, turnState) {
+  if (!threadId || String(threadId) !== String(state.threadId || "")) return;
+  const status = turnState && turnState.state;
+  const active = status === "active" || status === "persistence_blocked";
+  setTurnActive(active);
+  releaseFirstTurnLockIfIdle(active);
+  if (!active) state.currentRenderTurnId = null;
+}
+
+function applyFinalRuntime(threadId, runtime) {
+  applyThreadTasks(runtime.tasks, true);
+  replaceThreadRequestStates(threadId, runtime.requests);
+  applyCurrentRuntimeTurnState(threadId, runtime.turn_state);
+  renderPersistenceRecovery(threadId, runtime.turn_state, runtime.history_recovery || null);
 }
 
 function renderLiveTurnUserInput(turnId, userInput) {
@@ -4362,21 +4438,24 @@ function placeRowFirstInTurn(row, turnId) {
   if (first) target.insertBefore(row, first);
 }
 
-function renderApprovalRequest(request) {
+function renderApprovalRequest(entry) {
+  const requestState = entry && entry.state;
+  const request = requestState && requestState.payload && requestState.payload.request;
   if (!request || !request.id) return;
-  const id = String(request.id);
-  const stateKey = approvalStateKey(request);
-  if (state.pendingApprovals.has(id) || state.renderedApprovalStateKeys.has(stateKey)) return;
-  // An answer may be keyed by state (live session) or by id (reload snapshot, where the browser's
-  // stateKey memory is gone and the server tells us which ids were already answered).
-  const answered = answeredApprovalEntry(request);
-  const body = bubble("approval","approval");
-  const msg = body.parentElement;
+  const id = String(requestState.request_id);
+  let msg = entry.row;
+  let body;
+  if (!msg || !msg.isConnected) {
+    body = bubble("approval","approval");
+    msg = body.parentElement;
+    entry.row = msg;
+  } else {
+    body = msg.querySelector(".body");
+    body.replaceChildren();
+  }
+  msg.className = "msg approval";
   msg.dataset.approvalId = id;
-  msg.dataset.approvalStateKey = stateKey;
-  if (state.threadId) msg.dataset.threadId = state.threadId;
-  state.renderedApprovalStateKeys.add(stateKey);
-  if (!answered) state.pendingApprovals.set(id, { msg, request, stateKey });
+  msg.dataset.threadId = String(requestState.thread_id);
 
   const title = document.createElement("div");
   title.className = "approval-title";
@@ -4399,8 +4478,17 @@ function renderApprovalRequest(request) {
   }
   renderApprovalMetadata(body, request.metadata || []);
 
-  if (answered) {
-    applyApprovalDecision(msg, answered.decision);
+  const statusName = requestStatusName(requestState);
+  if (statusName === "resolved") {
+    const resolution = requestState.status && requestState.status.resolution;
+    applyApprovalDecision(msg, resolution && resolution.decision ? resolution.decision : "accept");
+    return;
+  }
+  if (statusName === "responding") {
+    const status = document.createElement("div");
+    status.className = "meta approval-result";
+    status.textContent = "Sending decision…";
+    body.append(status);
     return;
   }
 
@@ -4415,7 +4503,6 @@ function renderApprovalRequest(request) {
   schedulePendingWaitingFocus();
 }
 
-// A notification click targets whatever the thread is waiting for, so look in both card kinds.
 function waitingRequestRowById(id) {
   if (!id) return null;
   const target = String(id);
@@ -4530,47 +4617,18 @@ function addApprovalButton(container, id, decision, label, cls, available) {
   container.append(btn);
 }
 function respondApproval(id, decision) {
-  const entry = state.pendingApprovals.get(id);
-  if (!entry) return;
-  const msg = entry.msg;
-  msg.querySelectorAll("button").forEach(btn => btn.disabled = true);
-  if (!send({ type:"approval_decision", request_id:id, decision })) {
-    msg.querySelectorAll("button").forEach(btn => btn.disabled = false);
+  const entry = currentRequestEntry(id);
+  if (!entry || requestStatusName(entry.state) !== "pending") return;
+  if (!send({
+    type:"approval_decision",
+    thread_id:entry.state.thread_id,
+    request_id:String(id),
+    decision
+  })) {
     notice(`Approval response not sent: WebSocket is ${state.wsStatus}.`, "error");
     return;
   }
-  resolveApprovalRequest(id, decision);
-}
-function resolveApprovalRequest(id, decision) {
-  if (id === undefined || id === null || String(id) === "") return;
-  id = String(id);
-  const entry = state.pendingApprovals.get(id);
-  const msg = entry ? entry.msg : waitingRequestRowById(id);
-  const tid = entry && entry.request && entry.request.thread_id
-    ? entry.request.thread_id
-    : (msg && msg.dataset.threadId ? msg.dataset.threadId : state.threadId);
-  closeWaitingNotification(tid, id);
-  clearApprovalThreadActivity(tid, id);
-  if (entry) {
-    state.answeredApprovals.set(entry.stateKey || (msg && msg.dataset.approvalStateKey) || approvalStateKey(id), {
-      request: entry.request,
-      decision
-    });
-  }
-  state.pendingApprovals.delete(id);
-  if (msg) applyApprovalDecision(msg, decision);
-}
-function approvalStateKey(requestOrId) {
-  if (requestOrId && typeof requestOrId === "object") {
-    return [
-      state.threadId || "",
-      String(requestOrId.id || ""),
-      JSON.stringify(requestOrId.kind || {}),
-      String(requestOrId.reason || ""),
-      JSON.stringify(requestOrId.metadata || [])
-    ].join("\n");
-  }
-  return `${state.threadId || ""}\n${String(requestOrId || "")}`;
+  markRequestResponding(entry);
 }
 function applyApprovalDecision(msg, decision) {
   if (!msg) return;
@@ -4602,15 +4660,24 @@ function approvalDecisionLabel(decision) {
   if (decision==="accept_for_session") return "Session";
   return decision.charAt(0).toUpperCase() + decision.slice(1);
 }
-function renderServerRequest(request) {
+function renderServerRequest(entry) {
+  const requestState = entry && entry.state;
+  const request = requestState && requestState.payload && requestState.payload.request;
   if (!request || !request.id) return;
-  const id = String(request.id);
-  if (state.pendingServerRequests.has(id)) return;
-  const body = bubble("server-request","request");
-  const msg = body.parentElement;
+  const id = String(requestState.request_id);
+  let msg = entry.row;
+  let body;
+  if (!msg || !msg.isConnected) {
+    body = bubble("server-request","request");
+    msg = body.parentElement;
+    entry.row = msg;
+  } else {
+    body = msg.querySelector(".body");
+    body.replaceChildren();
+  }
+  msg.className = "msg server-request";
   msg.dataset.serverRequestId = id;
-  if (state.threadId) msg.dataset.threadId = state.threadId;
-  state.pendingServerRequests.set(id, { msg, request });
+  msg.dataset.threadId = String(requestState.thread_id);
 
   const title = document.createElement("div");
   title.className = "server-request-title";
@@ -4632,46 +4699,26 @@ function renderServerRequest(request) {
     body.append(detailEl);
   }
 
-  const method = String(request.method || "");
-  if (method === "item/tool/requestUserInput") renderToolUserInputRequest(body, id, request);
-  else if (method === "mcpServer/elicitation/request") renderMcpElicitationRequest(body, id, request);
-  else if (method === "item/tool/call") renderDynamicToolCallRequest(body, id, request);
-  else if (method === "account/chatgptAuthTokens/refresh") {
-    renderUnsupportedServerRequest(body, id, request, "Giskard cannot refresh ChatGPT auth tokens.");
-  }
-  else if (method === "attestation/generate") {
-    renderUnsupportedServerRequest(body, id, request, "Giskard cannot generate client attestation tokens.");
-  }
-  else renderUnknownServerRequest(body, id, request);
-
-  // Built the card, now settle it: a request answered before this page load exists only as a
-  // replayed `ServerRequestReceived`, so it must not come back actionable.
-  if (state.answeredServerRequests.has(id)) resolveServerRequest(id);
-}
-function resolveServerRequest(id) {
-  id = String(id || "");
-  const entry = state.pendingServerRequests.get(id);
-  if (!entry) return;
-  const tid = entry.msg && entry.msg.dataset.threadId ? entry.msg.dataset.threadId : state.threadId;
-  clearServerRequestThreadActivity(tid, id);
-  entry.msg.classList.add("resolved");
-  entry.msg.querySelectorAll("button,input,select,textarea").forEach(el => el.disabled = true);
-  const body = entry.msg.querySelector(".body");
-  if (body && !entry.msg.dataset.resolvedLabel) {
+  const statusName = requestStatusName(requestState);
+  if (statusName === "pending") {
+    const method = String(request.method || "");
+    if (method === "item/tool/requestUserInput") renderToolUserInputRequest(body, id, request);
+    else if (method === "mcpServer/elicitation/request") renderMcpElicitationRequest(body, id, request);
+    else if (method === "item/tool/call") renderDynamicToolCallRequest(body, id, request);
+    else if (method === "account/chatgptAuthTokens/refresh") {
+      renderUnsupportedServerRequest(body, id, request, "Giskard cannot refresh ChatGPT auth tokens.");
+    }
+    else if (method === "attestation/generate") {
+      renderUnsupportedServerRequest(body, id, request, "Giskard cannot generate client attestation tokens.");
+    }
+    else renderUnknownServerRequest(body, id, request);
+    schedulePendingWaitingFocus();
+  } else {
+    msg.classList.add(statusName === "resolved" ? "resolved" : "responding");
     const status = document.createElement("div");
-    status.className = "meta";
-    status.textContent = "Resolved";
+    status.className = "meta server-request-sent";
+    status.textContent = statusName === "resolved" ? "Resolved" : "Sending response…";
     body.append(status);
-  }
-  state.pendingServerRequests.delete(id);
-}
-function resetResolvingServerRequests() {
-  for (const { msg } of state.pendingServerRequests.values()) {
-    if (msg.dataset.resolving !== "true") continue;
-    msg.dataset.resolving = "false";
-    msg.querySelectorAll("button,input,select,textarea").forEach(el => el.disabled = false);
-    const status = msg.querySelector(".server-request-sent");
-    if (status) status.remove();
   }
 }
 function serverRequestTitle(request) {
@@ -4944,28 +4991,18 @@ function addServerRequestButton(container, id, label, cls, buildResponse) {
   container.append(btn);
 }
 function respondServerRequest(id, response, label) {
-  const entry = state.pendingServerRequests.get(String(id));
-  if (!entry) return;
-  entry.msg.dataset.resolving = "true";
-  entry.msg.querySelectorAll("button,input,select,textarea").forEach(el => el.disabled = true);
-  if (!send({ type:"server_request_response", request_id:String(id), response })) {
-    entry.msg.dataset.resolving = "false";
-    entry.msg.querySelectorAll("button,input,select,textarea").forEach(el => el.disabled = false);
+  const entry = currentRequestEntry(id);
+  if (!entry || requestStatusName(entry.state) !== "pending") return;
+  if (!send({
+    type:"server_request_response",
+    thread_id:entry.state.thread_id,
+    request_id:String(id),
+    response
+  })) {
     notice(`Server request response not sent: WebSocket is ${state.wsStatus}.`, "error");
     return;
   }
-  const body = entry.msg.querySelector(".body");
-  const status = document.createElement("div");
-  status.className = "meta server-request-sent";
-  status.textContent = `Sent: ${label}`;
-  if (body) body.append(status);
-  // Stop claiming the thread is waiting on the user the moment they act. An approval clears here
-  // because answering it broadcasts `ApprovalResolved`; a server request's resolved event comes from
-  // the harness on its own schedule and may never come, so waiting for it would leave the sidebar
-  // demanding attention for something already answered.
-  const tid = entry.msg.dataset.threadId || state.threadId;
-  clearServerRequestThreadActivity(tid, String(id));
-  closeWaitingNotification(tid, String(id));
+  markRequestResponding(entry);
 }
 function objectValue(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : null;
@@ -5317,7 +5354,7 @@ function removeTaskGroupItem(itemId) {
 function startRunningCommand(item, turnId) {
   const key = scopedItemKey(turnId, item.id); if (!key) return;
   const command = item.command || {};
-  const existing = state.runningCommands.get(key);
+  const existing = state.transcriptTasks.get(key);
   const cmd = commandFromParts({
     id:key,
     turnId:idKey(turnId),
@@ -5331,7 +5368,7 @@ function startRunningCommand(item, turnId) {
     afterTurn:existing ? existing.afterTurn : false,
     terminating:existing ? existing.terminating : false
   });
-  state.runningCommands.set(key, cmd);
+  state.transcriptTasks.set(key, cmd);
   let body = commandBodyFor(key);
   if (!body) body = taskBubble(key, "command_execution", "cmd running-command", "command");
   state.streamElsByItemId.set(key, body);
@@ -5363,10 +5400,7 @@ function taskTitleText(cmd) {
   if (cmd.kind === "tool") return (cmd.server ? cmd.server + ":" : "") + (cmd.command || "tool");
   return "$ " + (cmd.command || "(command)");
 }
-// The client accumulates the full running output from command_output deltas, but the server's
-// RunningTasks snapshot and replayed item payloads may carry only a capped tail (see MAX_OUTPUT_TAIL
-// in running_commands.rs). Keep whichever is longer so those updates never shrink the overlay's full
-// log back to the tail during a live session.
+// A compact projection must never shrink output already observed in this page session.
 function mergeRunningOutput(prev, next) {
   prev = prev || "";
   next = next || "";
@@ -5460,12 +5494,12 @@ function inlineOutputPreview(text, mode) {
   return { text: preview, truncated: true };
 }
 function commandOutputPhaseForId(id) {
-  const cmd = state.runningCommands.get(id);
+  const cmd = state.transcriptTasks.get(id);
   if (cmd && commandIsRunningStatus(cmd.status)) return "running";
   return "completed";
 }
 function commandOutputForId(id) {
-  const cmd = state.runningCommands.get(id);
+  const cmd = state.transcriptTasks.get(id);
   if (cmd) return cmd.output || "";
   const ended = state.endedCommandsByItemId.get(id);
   if (ended && ended.command) return ended.command.output || "";
@@ -5539,10 +5573,12 @@ function renderCommandBody(body, cmd) {
   const actions = document.createElement("div");
   actions.className = "cmd-actions";
   const term = document.createElement("button");
+  const taskControl = state.runningTasks.get(cmd.id);
   term.className = "danger";
-  term.textContent = cmd.terminating ? "Stop requested" : "Stop";
-  term.disabled = cmd.terminating || !cmd.processId;
-  term.title = cmd.processId ? "Ask Codex to stop this running command" : "No process id available";
+  term.textContent = taskControl && taskControl.terminating ? "Stop requested" : "Stop";
+  term.disabled = !taskControl || taskControl.terminating || !taskControl.processId;
+  term.title = taskControl && taskControl.processId
+    ? "Ask Codex to stop this running command" : "No active process available";
   term.onclick = (e) => { e.stopPropagation(); terminateCommand(cmd.id); };
   actions.append(term);
   head.append(title, status, actions);
@@ -5635,8 +5671,8 @@ function terminalCommandStatus(status, durationMs, opts) {
   return opts && opts.stopRequested ? `${text} (stop requested)` : text;
 }
 function updateRunningCommandDurations() {
-  if (!state.runningCommands.size) return;
-  for (const cmd of state.runningCommands.values()) {
+  if (!state.transcriptTasks.size) return;
+  for (const cmd of state.transcriptTasks.values()) {
     if (cmd.kind === "tool") {
       const body = toolBodyFor(cmd.id);
       const payload = state.toolPayloadsByItemId.get(cmd.id);
@@ -5650,7 +5686,7 @@ function updateRunningCommandDurations() {
 }
 function appendRunningCommandOutput(turnId, itemId, chunk) {
   const key = scopedItemKey(turnId, itemId);
-  const cmd = state.runningCommands.get(key);
+  const cmd = state.transcriptTasks.get(key);
   if (!cmd) return false;
   // Retain the full streamed output (not just a tail): the inline row renders only a bounded
   // preview, but the output overlay shows the complete log as it streams. The server still keeps
@@ -5663,7 +5699,7 @@ function appendRunningCommandOutput(turnId, itemId, chunk) {
   return true;
 }
 function detachRunningCommands() {
-  for (const cmd of state.runningCommands.values()) {
+  for (const cmd of state.transcriptTasks.values()) {
     if (commandIsRunningStatus(cmd.status)) {
       cmd.afterTurn = true;
     }
@@ -5675,8 +5711,8 @@ function finishRunningCommand(item, turnId) {
   if (!key) return;
   const p = item && item.payload;
   if (p && p.kind==="command_execution" && commandIsRunningStatus(p.status)) {
-    const cmd = commandFromItem(item, p, turnId, key, state.runningCommands.get(key));
-    state.runningCommands.set(key, cmd);
+    const cmd = commandFromItem(item, p, turnId, key, state.transcriptTasks.get(key));
+    state.transcriptTasks.set(key, cmd);
     state.endedCommandsByItemId.delete(key);
     let body = commandBodyFor(key);
     if (body) {
@@ -5685,19 +5721,27 @@ function finishRunningCommand(item, turnId) {
       renderCommandBody(body, cmd);
     }
   } else {
-    state.runningCommands.delete(key);
+    state.transcriptTasks.delete(key);
     state.endedCommandsByItemId.delete(key);
   }
   renderRunningCommands();
 }
-function renderRunningCommandSnapshot(commands) {
-  const seen = new Set();
-  for (const info of commands) {
+function applyThreadTasks(snapshot, resetBaseline) {
+  const threadId = snapshot && snapshot.thread_id !== undefined ? String(snapshot.thread_id) : "";
+  const revision = Number(snapshot && snapshot.revision);
+  if (!threadId || !Number.isSafeInteger(revision) || revision < 0 || !Array.isArray(snapshot.tasks)) {
+    throw new Error("invalid thread_tasks");
+  }
+  if (threadId !== String(state.threadId || "")) return;
+  if (!resetBaseline && state.taskRevision !== null && revision <= state.taskRevision) return;
+  const replacement = new Map();
+  for (const info of snapshot.tasks) {
     const key = scopedItemKey(info.turn_id, info.item_id);
-    if (!key) continue;
-    const snapshotItem = { id:info.item_id, harness_item_id:info.harness_item_id || "" };
-    seen.add(key);
-    const existing = state.runningCommands.get(key);
+    if (!key || replacement.has(key) || !["command", "tool"].includes(info.kind) ||
+        typeof info.terminating !== "boolean") {
+      throw new Error("invalid running task");
+    }
+    const existing = state.runningTasks.get(key);
     const cmd = commandFromParts({
       id:key,
       kind:info.kind,
@@ -5714,84 +5758,18 @@ function renderRunningCommandSnapshot(commands) {
       terminating:info.terminating !== undefined ? !!info.terminating : !!(existing && existing.terminating)
     });
     if (cmd.terminating) state.commandStopRequestedByItemId.add(key);
-    state.runningCommands.set(key, cmd);
-    // Snapshots can arrive before replayed live items, so both task kinds can create transcript
-    // rows here. Later item events reuse the same body by item id and finalize it in place.
-    if (cmd.kind === "tool") {
-      let toolBody = toolBodyFor(key);
-      if (!toolBody) {
-        toolBody = taskBubble(key, "tool_call", "tool running-tool state-running", "tool");
-        state.streamElsByItemId.set(key, toolBody);
-        state.toolBodyElsByItemId.set(key, toolBody);
-        toolBody.parentElement.dataset.toolItemId = key;
-        toolBody.parentElement.dataset.toolStartedAtMs = String(cmd.startedAtMs || Date.now());
-        renderItemBody(toolBody, {
-          kind:"tool_call",
-          name:cmd.command || "tool",
-          input:null,
-          output:cmd.output || null,
-          server:cmd.server || null,
-          status:cmd.status || "in_progress",
-          error:null
-        });
-      }
-      registerRenderedItemBody(toolBody, snapshotItem, info.turn_id);
-      state.commandMsgElsByItemId.set(key, toolBody.parentElement);
-    } else {
-      let body = commandBodyFor(key);
-      if (!body) body = taskBubble(key, "command_execution", "cmd running-command", "command");
-      state.commandBodyElsByItemId.set(key, body);
-      state.commandMsgElsByItemId.set(key, body.parentElement);
-      registerRenderedItemBody(body, snapshotItem, info.turn_id);
-      renderCommandBody(body, cmd);
-    }
+    replacement.set(key, cmd);
   }
-
-  for (const [id, cmd] of Array.from(state.runningCommands.entries())) {
-    if (seen.has(id)) continue;
-    state.runningCommands.delete(id);
-    // Tool transcript rows are owned by the item stream; only commands with an explicit stop
-    // request get a fallback ended-body rewrite when task tracking disappears.
-    if (cmd.kind !== "tool") {
-      const body = commandBodyFor(id);
-      const stopRequested = cmd.terminating || state.commandStopRequestedByItemId.has(id);
-      if (body && stopRequested) {
-        renderEndedCommandBody(body, cmd, "unknown", { stopRequested });
-      }
-    }
-    state.commandStopRequestedByItemId.delete(id);
+  state.runningTasks = replacement;
+  state.taskRevision = revision;
+  for (const [key, transcriptTask] of state.transcriptTasks) {
+    const body = commandBodyFor(key);
+    if (body && transcriptTask.kind !== "tool") renderCommandBody(body, transcriptTask);
   }
   renderRunningCommands();
 }
-function renderEndedCommandBody(body, cmd, status, opts) {
-  state.endedCommandsByItemId.set(cmd.id, { command:cmd, status, opts:opts || {} });
-  const msg = body.parentElement;
-  const stateName = commandVisualStateFromStatus(status);
-  msg.className = `msg cmd state-${stateName}`;
-  if (state.selectedCommandId === cmd.id) msg.classList.add("selected");
-  msg.dataset.commandItemId = cmd.id;
-  msg.dataset.commandStartedAtMs = String(cmd.startedAtMs || Date.now());
-  body.replaceChildren();
-  const { head } = makeCommandHead();
-  const title = document.createElement("div");
-  title.className = "cmd-title mono";
-  title.textContent = "$ " + (cmd.command || "(command)");
-  const meta = document.createElement("div");
-  meta.className = "meta cmd-meta";
-  const durationMs = Date.now() - (cmd.startedAtMs || Date.now());
-  if (cmd.cwd) appendCommandMetaPart(meta, `cwd: ${cmd.cwd}`);
-  if (status) {
-    appendCommandMetaPart(meta, commandStatusNode(terminalCommandStatus(status, durationMs, opts), stateName));
-  }
-  head.append(title);
-  body.append(head);
-  if (meta.childNodes.length) body.append(meta);
-  renderCommandOutputBlock(body, { itemId:cmd.id, output:cmd.output || "", phase:"completed" });
-  syncTaskGroupItem(cmd.id);
-  refreshOutputOverlay(cmd.id);
-}
 function renderRunningCommands() {
-  const cmds = Array.from(state.runningCommands.values());
+  const cmds = Array.from(state.runningTasks.values());
   renderTasksButton(cmds);
   if (!$("tasksMenu").hidden) renderTasksMenu(cmds);
 }
@@ -6224,7 +6202,7 @@ window.addEventListener("resize", () => {
 });
 
 function renderTasksButton(cmds) {
-  cmds = cmds || Array.from(state.runningCommands.values());
+  cmds = cmds || Array.from(state.runningTasks.values());
   const btn = $("tasksBtn");
   const count = cmds.length;
   const stateName = taskButtonState(cmds);
@@ -6258,11 +6236,11 @@ function subagentSubtreeState(threadId) {
   let waitingOnUser = false;
   let activity = null;
   let origin = null;
-  for (const [otherId, other] of state.threadActivity) {
+  for (const [otherId, other] of state.runtimeThreads) {
     if (otherId !== key && !threadDescendsFrom(otherId, key)) continue;
     if (other.active_turn) running = true;
     if (activityWaitsOnUser(other)) waitingOnUser = true;
-    if (threadActivityRank(other) <= threadActivityRank(activity)) continue;
+    if (runtimeThreadsRank(other) <= runtimeThreadsRank(activity)) continue;
     activity = other;
     origin = otherId === key ? null : otherId;
   }
@@ -6332,7 +6310,7 @@ function renderSubagentCard(thread) {
   const parent = thread.parent_thread_id ? knownProjectThreads(state.projectId).find(t => String(t.id) === String(thread.parent_thread_id)) : null;
   const parentLabel = parent && parent.title ? `Parent: ${parent.title}` : "Parent thread";
   const summary = activity && activity.summary
-    ? threadActivityTooltip(activity, origin)
+    ? runtimeThreadsTooltip(activity, origin)
     : parentLabel;
   const active = state.threadId && String(state.threadId) === String(thread.id);
   const name = subagentDisplayName(thread);
@@ -6373,7 +6351,7 @@ function taskButtonState(cmds) {
   return "running";
 }
 function renderTasksMenu(cmds) {
-  cmds = cmds || Array.from(state.runningCommands.values());
+  cmds = cmds || Array.from(state.runningTasks.values());
   const menu = $("tasksMenu");
   const count = cmds.length;
   const commandTasks = cmds.filter(cmd => cmd.kind !== "tool");
@@ -6473,7 +6451,7 @@ document.addEventListener("click", (e) => {
 // A tool task can't be stopped individually (Codex has no per-call cancel), so stopping it
 // interrupts the owning turn; commands terminate by process id.
 function stopTask(id) {
-  const cmd = state.runningCommands.get(id);
+  const cmd = state.runningTasks.get(id);
   if (!cmd || cmd.terminating) return;
   if (cmd.kind === "tool") {
     cmd.terminating = true;
@@ -6509,41 +6487,38 @@ function selectCommand(id) {
     msg.classList.add("selected");
     const task = group && group.items.get(key);
     (task ? task.entry : msg).scrollIntoView({ block:"center", behavior:"smooth" });
+  } else {
+    notice("This task's transcript row has not arrived or is outside the loaded history.", "warning");
   }
   if (group) syncTaskGroupItem(key);
   renderRunningCommands();
 }
 function terminateCommand(id) {
-  const cmd = state.runningCommands.get(id);
+  const cmd = state.runningTasks.get(id);
   if (!cmd || !cmd.processId || cmd.terminating) return;
   cmd.terminating = true;
   state.commandStopRequestedByItemId.add(id);
-  const body = commandBodyFor(id);
-  if (body) renderCommandBody(body, cmd);
   renderRunningCommands();
   if (!send({ type:"terminate_command", thread_id: state.threadId, process_id: cmd.processId })) {
     cmd.terminating = false;
     state.commandStopRequestedByItemId.delete(id);
-    if (body) renderCommandBody(body, cmd);
     renderRunningCommands();
     notice(`Terminate not sent: WebSocket is ${state.wsStatus}.`, "error");
   }
 }
 function resetTerminatingCommand(processId) {
-  for (const cmd of state.runningCommands.values()) {
+  for (const cmd of state.runningTasks.values()) {
     if (!cmd.terminating) continue;
     // Scope the optimistic rollback to the command the failed request targeted. Only fall back
     // to clearing every pending stop request when the server didn't identify a process id.
     if (processId && cmd.processId !== processId) continue;
     cmd.terminating = false;
     state.commandStopRequestedByItemId.delete(cmd.id);
-    const body = commandBodyFor(cmd.id);
-    if (body) renderCommandBody(body, cmd);
   }
   renderRunningCommands();
 }
 function resetTerminatingToolTasks() {
-  for (const cmd of state.runningCommands.values()) {
+  for (const cmd of state.runningTasks.values()) {
     if (cmd.kind !== "tool" || !cmd.terminating) continue;
     cmd.terminating = false;
     state.commandStopRequestedByItemId.delete(cmd.id);
@@ -6829,12 +6804,10 @@ function resetRenderState() {
   state.renderedHarnessItemIds = new Set();
   state.renderedItemBodyByKey = new Map();
   state.itemKindsByItemId = new Map();
-  state.pendingApprovals = new Map();
-  state.answeredApprovalsById = new Map();
-  state.renderedApprovalStateKeys = new Set();
-  state.pendingServerRequests = new Map();
-  state.answeredServerRequests = new Set();
-  state.runningCommands = new Map();
+  state.requestStates = new Map();
+  state.transcriptTasks = new Map();
+  state.runningTasks = new Map();
+  state.taskRevision = null;
   state.commandBodyElsByItemId = new Map();
   state.commandMsgElsByItemId = new Map();
   state.commandStopRequestedByItemId = new Set();
@@ -6951,7 +6924,7 @@ function renderItemBody(body, p) {
       state.commandBodyElsByItemId.set(itemId, body);
       state.commandMsgElsByItemId.set(itemId, msg);
     }
-    const stopRequested = !!(itemId && (state.commandStopRequestedByItemId.has(itemId) || (state.runningCommands.get(itemId) && state.runningCommands.get(itemId).terminating)));
+    const stopRequested = !!(itemId && (state.commandStopRequestedByItemId.has(itemId) || (state.transcriptTasks.get(itemId) && state.transcriptTasks.get(itemId).terminating)));
     const displayStatus = p.status;
     const stateName = commandVisualStateFromStatus(displayStatus);
     msg.classList.add(`state-${stateName}`);
@@ -8247,7 +8220,7 @@ function makeOutputOverlayButton(itemId, kind) {
   return btn;
 }
 function commandLabelForId(id) {
-  const cmd = state.runningCommands.get(id);
+  const cmd = state.transcriptTasks.get(id);
   if (cmd) return cmd.command || "";
   const ended = state.endedCommandsByItemId.get(id);
   if (ended && ended.command) return ended.command.command || "";
@@ -8279,7 +8252,7 @@ function outputOverlayModel(itemId, kind) {
   const phase = commandOutputPhaseForId(key);
   const running = phase === "running";
   const output = commandOutputForId(key);
-  const cmd = state.runningCommands.get(key);
+  const cmd = state.transcriptTasks.get(key);
   const ended = state.endedCommandsByItemId.get(key);
   const payload = state.commandPayloadsByItemId.get(key);
   let stateLabel = running ? "Running" : "Completed";
@@ -9268,11 +9241,13 @@ document.addEventListener("click", (e) => {
   if (e.target.closest && e.target.closest(".usage-wrap")) return;
   menu.hidden = true;
 });
-function notice(text, severity) {
+function notice(text, severity, timeoutMs) {
   const cls = severity===true || severity==="error" ? " err" : severity==="warning" ? " warn" : "";
   const el = document.createElement("div"); el.className="notice"+cls; el.textContent=text;
   el.setAttribute("role", cls ? "alert" : "status");
-  $("notices").prepend(el); setTimeout(()=>el.remove(), 8000);
+  $("notices").prepend(el);
+  if (timeoutMs !== 0) setTimeout(()=>el.remove(), timeoutMs || 8000);
+  return el;
 }
 function escapeHtml(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 function escapeAttr(s){ return escapeHtml(s).replace(/"/g,"&quot;").replace(/'/g,"&#39;"); }

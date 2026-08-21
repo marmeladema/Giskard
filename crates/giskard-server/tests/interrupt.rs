@@ -3,10 +3,13 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use giskard_core::error::HarnessError;
@@ -24,7 +27,10 @@ use giskard_harness::{
     AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
 };
 use giskard_persist::store::ProjectConfig;
-use giskard_proto::{ClientMessage, ErrorInfo, RunningTask, ServerMessage, WireAgentEvent};
+use giskard_proto::{
+    BootstrapSection, ClientMessage, ErrorInfo, RunningTask, ServerMessage, ThreadBootstrapFrame,
+    ThreadEventPayload, ThreadFinalRuntime, WireAgentEvent,
+};
 use giskard_server::{AppState, HarnessFactory, build_app};
 use tokio::sync::{Mutex, broadcast};
 use tokio::time::{Duration, Instant};
@@ -534,19 +540,13 @@ async fn websocket_terminate_running_command_marks_terminating_until_terminal_ev
 
     app.harness.wait_until_terminated().await;
     wait_for_terminating_command(&mut ws).await;
-    let snapshot = app.state.running_commands.snapshot(thread_id).await;
-    assert_eq!(snapshot.len(), 1);
-    assert!(snapshot[0].terminating);
+    let snapshot = app.state.runtime.task_snapshot(thread_id);
+    assert_eq!(snapshot.tasks.len(), 1);
+    assert!(snapshot.tasks[0].terminating);
 
     app.harness.complete_command().await;
     wait_for_completed_command_after_interrupted_turn(&mut ws).await;
-    assert!(
-        app.state
-            .running_commands
-            .snapshot(thread_id)
-            .await
-            .is_empty()
-    );
+    assert!(app.state.runtime.task_snapshot(thread_id).tasks.is_empty());
 }
 
 #[tokio::test]
@@ -658,7 +658,7 @@ async fn no_active_for_after_turn_command_clears_stale_snapshot(behavior: Termin
         .await
         .unwrap();
     wait_for_interrupted_turn(&mut ws).await;
-    assert!(app.state.running_commands.snapshot(thread_id).await[0].after_turn);
+    assert!(app.state.runtime.task_snapshot(thread_id).tasks[0].after_turn);
 
     ws.send(ws_text(&ClientMessage::TerminateCommand {
         thread_id,
@@ -675,13 +675,7 @@ async fn no_active_for_after_turn_command_clears_stale_snapshot(behavior: Termin
     assert!(warning.detail.as_deref().is_some_and(|detail| {
         detail.contains("may still be running in the harness environment")
     }));
-    assert!(
-        app.state
-            .running_commands
-            .snapshot(thread_id)
-            .await
-            .is_empty()
-    );
+    assert!(app.state.runtime.task_snapshot(thread_id).tasks.is_empty());
 }
 
 #[tokio::test]
@@ -734,14 +728,16 @@ async fn terminate_failure_preserves_snapshot(behavior: TerminateBehavior, expec
     let error = wait_for_error(&mut ws, "terminate_command", expected_code).await;
     assert_eq!(error.thread_id, Some(thread_id));
     assert_eq!(error.process_id.as_deref(), Some("proc_1"));
-    let snapshot = app.state.running_commands.snapshot(thread_id).await;
-    assert_eq!(snapshot.len(), 1);
-    assert_eq!(snapshot[0].process_id.as_deref(), Some("proc_1"));
-    assert!(!snapshot[0].terminating);
+    let snapshot = app.state.runtime.task_snapshot(thread_id);
+    assert_eq!(snapshot.tasks.len(), 1);
+    assert_eq!(snapshot.tasks[0].process_id.as_deref(), Some("proc_1"));
+    assert!(!snapshot.tasks[0].terminating);
 }
 
 async fn wait_for_running_command(ws: &mut TestWs) -> RunningTask {
     let deadline = Instant::now() + Duration::from_secs(5);
+    let mut bootstrap_generation = None;
+    let mut final_runtime_chunks = BTreeMap::new();
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -758,18 +754,67 @@ async fn wait_for_running_command(ws: &mut TestWs) -> RunningTask {
         let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
             continue;
         };
-        let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
-        if let ServerMessage::RunningTasks { tasks, .. } = server_msg
-            && let Some(cmd) = tasks
-                .iter()
-                .find(|cmd| cmd.process_id.as_deref() == Some("proc_1"))
-        {
-            assert_eq!(cmd.command, "sleep 60");
-            if cmd.output == "started" {
-                return cmd.clone();
+        match serde_json::from_str::<ServerMessage>(&text).unwrap() {
+            ServerMessage::ThreadTasks(snapshot) => {
+                if let Some(command) = running_command(&snapshot.tasks) {
+                    return command;
+                }
             }
+            ServerMessage::ThreadBootstrap {
+                subscription_generation,
+                frame,
+                ..
+            } => match frame {
+                ThreadBootstrapFrame::Start { .. } => {
+                    bootstrap_generation = Some(subscription_generation);
+                    final_runtime_chunks.clear();
+                }
+                ThreadBootstrapFrame::Chunk {
+                    section: BootstrapSection::FinalRuntime,
+                    index,
+                    payload_base64,
+                } if bootstrap_generation == Some(subscription_generation) => {
+                    final_runtime_chunks.insert(
+                        index,
+                        BASE64
+                            .decode(payload_base64)
+                            .expect("bootstrap chunks should contain valid base64"),
+                    );
+                }
+                ThreadBootstrapFrame::Commit
+                    if bootstrap_generation == Some(subscription_generation) =>
+                {
+                    let mut encoded = Vec::new();
+                    for (expected_index, (index, chunk)) in final_runtime_chunks.iter().enumerate()
+                    {
+                        assert_eq!(*index as usize, expected_index, "bootstrap chunk gap");
+                        encoded.extend(chunk);
+                    }
+                    let runtime: ThreadFinalRuntime = serde_json::from_slice(&encoded)
+                        .expect("bootstrap final runtime should be valid");
+                    if let Some(command) = running_command(&runtime.tasks.tasks) {
+                        return command;
+                    }
+                }
+                ThreadBootstrapFrame::Chunk { .. } | ThreadBootstrapFrame::Commit => {}
+            },
+            _ => {}
         }
     }
+}
+
+fn running_command(tasks: &[RunningTask]) -> Option<RunningTask> {
+    tasks
+        .iter()
+        .find(|task| task.process_id.as_deref() == Some("proc_1"))
+        .and_then(|task| {
+            assert_eq!(task.command, "sleep 60");
+            if task.output == "started" {
+                Some(task.clone())
+            } else {
+                None
+            }
+        })
 }
 
 async fn wait_for_empty_running_commands(ws: &mut TestWs) {
@@ -790,9 +835,9 @@ async fn wait_for_empty_running_commands(ws: &mut TestWs) {
         let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
             continue;
         };
-        if let ServerMessage::RunningTasks { tasks, .. } =
+        if let ServerMessage::ThreadTasks(snapshot) =
             serde_json::from_str::<ServerMessage>(&text).unwrap()
-            && tasks.is_empty()
+            && snapshot.tasks.is_empty()
         {
             return;
         }
@@ -818,8 +863,9 @@ async fn wait_for_terminating_command(ws: &mut TestWs) -> RunningTask {
             continue;
         };
         let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
-        if let ServerMessage::RunningTasks { tasks, .. } = server_msg
-            && let Some(cmd) = tasks
+        if let ServerMessage::ThreadTasks(snapshot) = server_msg
+            && let Some(cmd) = snapshot
+                .tasks
                 .iter()
                 .find(|cmd| cmd.process_id.as_deref() == Some("proc_1") && cmd.terminating)
         {
@@ -881,8 +927,9 @@ async fn wait_for_completed_command_after_interrupted_turn(ws: &mut TestWs) {
             continue;
         };
         match serde_json::from_str::<ServerMessage>(&text).unwrap() {
-            ServerMessage::Event { agent_event, .. } => {
-                if let WireAgentEvent::ItemCompleted { item, .. } = *agent_event
+            ServerMessage::ThreadEvent { event, .. } => {
+                if let ThreadEventPayload::Agent { agent_event } = event.event
+                    && let WireAgentEvent::ItemCompleted { item, .. } = *agent_event
                     && let giskard_proto::WireItemPayload::CommandExecution {
                         status,
                         exit_code,
@@ -895,8 +942,8 @@ async fn wait_for_completed_command_after_interrupted_turn(ws: &mut TestWs) {
                         && duration_ms == Some(60_000);
                 }
             }
-            ServerMessage::RunningTasks { tasks, .. } => {
-                saw_empty_running_commands = tasks.is_empty();
+            ServerMessage::ThreadTasks(snapshot) => {
+                saw_empty_running_commands = snapshot.tasks.is_empty();
             }
             _ => {}
         }
@@ -922,7 +969,8 @@ async fn wait_for_interrupted_turn(ws: &mut TestWs) {
             continue;
         };
         let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
-        if let ServerMessage::Event { agent_event, .. } = server_msg
+        if let ServerMessage::ThreadEvent { event, .. } = server_msg
+            && let ThreadEventPayload::Agent { agent_event } = event.event
             && let WireAgentEvent::TurnCompleted { status, .. } = *agent_event
         {
             assert_eq!(status.kind, TurnStatusKind::Interrupted);
