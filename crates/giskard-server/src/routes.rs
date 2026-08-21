@@ -36,7 +36,7 @@ use giskard_persist::store::{
 };
 use giskard_proto::*;
 use tokio::process::Command as TokioCommand;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 use crate::AppState;
 use crate::auth::{
@@ -49,6 +49,8 @@ use crate::thread_graph::{
 };
 
 const HARNESS_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+const WS_FINAL_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const PROJECT_LIFECYCLE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_THREAD_TITLE_CHARS: usize = 120;
 const GENERATED_THREAD_TITLE_CHARS: usize = 72;
@@ -61,6 +63,23 @@ const MAX_WS_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ATTACHMENT_NAME_BYTES: usize = 255;
 const MAX_ATTACHMENT_MIME_BYTES: usize = 127;
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Debug)]
+enum WsWriteFailure<E> {
+    Send(E),
+    Timeout,
+}
+
+async fn write_ws_message_with_timeout<E>(
+    write: impl std::future::Future<Output = Result<(), E>>,
+    timeout: Duration,
+) -> Result<(), WsWriteFailure<E>> {
+    match tokio::time::timeout(timeout, write).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(WsWriteFailure::Send(error)),
+        Err(_) => Err(WsWriteFailure::Timeout),
+    }
+}
 
 pub fn protected_routes(state: AppState) -> Router<AppState> {
     Router::new()
@@ -433,20 +452,14 @@ async fn delete_project(
         .await?
         .ok_or(ApiError::NotFound)?;
     let thread_ids = state.store.list_threads(id).await?;
-    for thread_id in thread_ids {
-        if state.live_buffers.is_active(thread_id).await
-            || state.registry.thread_has_active_turn(thread_id).await
-        {
+    for thread_id in &thread_ids {
+        if state.runtime.is_active(*thread_id) {
             return Err(ApiError::Conflict(
                 "project has a thread with an active turn; stop it before removing the project"
                     .into(),
             ));
         }
-        if state
-            .running_commands
-            .has_running_for_thread(thread_id)
-            .await
-        {
+        if state.runtime.has_running_for_thread(*thread_id) {
             return Err(ApiError::Conflict(
                 "project has a thread with running commands; stop them before removing the project"
                     .into(),
@@ -459,6 +472,9 @@ async fn delete_project(
         .await
         .map_err(harness_api_error)?;
     state.model_catalogs.remove(id).await;
+    for thread_id in &thread_ids {
+        state.notices.forget(*thread_id);
+    }
     // Forced: the user confirmed a project-scope deletion, and a thread whose worktree still holds
     // work must not be able to strand the whole project half-deleted.
     //
@@ -496,14 +512,12 @@ async fn reject_thread_mutation_if_live(
     state: &AppState,
     thread_id: ThreadId,
 ) -> Result<(), ApiError> {
-    if state.registry.thread_has_active_turn(thread_id).await
-        || state.live_buffers.is_active(thread_id).await
-    {
+    if state.runtime.is_active(thread_id) {
         return Err(ApiError::Conflict(
             "thread has an active turn; stop it before archiving or deleting".into(),
         ));
     }
-    if !state.running_commands.snapshot(thread_id).await.is_empty() {
+    if state.runtime.has_running_for_thread(thread_id) {
         return Err(ApiError::Conflict(
             "thread has running commands; stop them before archiving or deleting".into(),
         ));
@@ -1771,6 +1785,7 @@ async fn cleanup_new_thread_after_start_failure(
                 "failed to delete native thread after failed new-thread startup"
             );
             state.registry.forget_thread(thread_id).await;
+            state.notices.forget(thread_id);
         }
     }
 
@@ -2144,6 +2159,7 @@ async fn delete_thread(
             );
             return Err(error.into());
         }
+        state.notices.forget(*candidate);
 
         info!(
             %project_id,
@@ -2227,6 +2243,13 @@ fn sort_browse_entries(entries: &mut [DirEntry]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stalled_websocket_write_hits_its_deadline() {
+        let pending = std::future::pending::<Result<(), std::io::Error>>();
+        let result = write_ws_message_with_timeout(pending, Duration::from_millis(1)).await;
+        assert!(matches!(result, Err(WsWriteFailure::Timeout)));
+    }
 
     /// Builds a real repository with one linked worktree, and hands back the record the deletion
     /// path works from.
@@ -3913,91 +3936,26 @@ fn harness_error_means_command_unmanaged(error: &HarnessError) -> bool {
         || message.contains("no active turn to interrupt")
 }
 
-/// Tell a just-connected client which threads are already waiting on it.
-///
-/// Cross-thread activity is broadcast live and never replayed, so a browser that was closed or
-/// disconnected when a sub-agent raised an approval has no way to learn the thread is blocked — the
-/// child has no sidebar row of its own, and the approval only reaches the transcript once that
-/// thread is opened. Sent to this client alone, before it subscribes to anything.
-async fn send_activity_bootstrap(
-    state: &AppState,
-    client_id: usize,
-    tx: &mpsc::Sender<ServerMessage>,
-) {
-    let pending = state.live_buffers.pending_attention().await;
-    if pending.is_empty() {
-        return;
-    }
-    let mut activities = Vec::new();
-    for entry in &pending {
-        for approval in &entry.approvals {
-            activities.push(ThreadActivity {
-                thread_id: entry.thread_id,
-                kind: ThreadActivityKind::ApprovalRequested {
-                    approval_id: approval.id.to_string(),
-                },
-                active_turn: true,
-                summary: Some("Approval requested".into()),
-            });
-        }
-        for request in &entry.server_requests {
-            activities.push(ThreadActivity {
-                thread_id: entry.thread_id,
-                kind: ThreadActivityKind::ServerRequestReceived {
-                    server_request_id: request.id.to_string(),
-                },
-                active_turn: true,
-                summary: Some("Waiting for your input".to_string()),
-            });
-        }
-    }
-    if activities.is_empty() {
-        return;
-    }
-    debug!(
-        %client_id,
-        threads = pending.len(),
-        activities = activities.len(),
-        "replaying pending cross-thread activity to a connecting client"
-    );
-    let _ = tx
-        .send(ServerMessage::ThreadActivityBootstrap { activities })
-        .await;
-}
-
 async fn handle_ws(socket: WebSocket, state: AppState) {
-    let (tx, mut rx) = mpsc::channel::<ServerMessage>(256);
     let client_id = state.hub.next_client_id();
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    let replacements = state.hub.register_client(client_id, tx.clone()).await;
+    let receiver = state.hub.register_client(client_id).await;
+    state
+        .hub
+        .send_control(
+            client_id,
+            ServerMessage::ThreadRuntimeOverview(state.runtime.current_overview()),
+        )
+        .await;
     let (writer_done_tx, mut writer_done_rx) = oneshot::channel();
 
-    // Order matters, and is load-bearing in both directions:
-    //
-    // 1. Start draining before the awaited bootstrap send below. Registration itself does not
-    //    await client capacity, so the short registration-to-spawn interval cannot park a domain
-    //    producer or this connection.
-    // 2. Register before computing the bootstrap, not after. Anything that changes between the
-    //    snapshot and its delivery then also reaches this client as a live event, so a badge cannot
-    //    be left showing state that resolved in the gap.
-    //
-    // A live broadcast can therefore land ahead of the bootstrap. That is harmless: the live event
-    // claims the notification dedup key, so the replay for the same approval is suppressed rather
-    // than alerting twice.
-    let send_task = tokio::spawn(async move {
-        loop {
-            // Replacement state bypasses the ordered FIFO. It stays latest-by-key until the
-            // socket writer actually selects it, so obsolete metadata cannot consume event
-            // capacity or make a domain producer wait on a slow peer.
-            let msg = tokio::select! {
-                ordered = rx.recv() => {
-                    let Some(message) = ordered else { break; };
-                    message
-                }
-                replacement = replacements.recv() => replacement,
-            };
+    // Start the connection-owned writer before any bootstrap can await data capacity. Domain
+    // producers never await this queue: ordered pressure becomes a thread-scoped resync and
+    // replacement state coalesces in place.
+    let mut send_task = tokio::spawn(async move {
+        while let Some(msg) = receiver.recv().await {
             let json = match serde_json::to_string(&msg) {
                 Ok(json) => json,
                 Err(e) => {
@@ -4010,22 +3968,38 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
                     continue;
                 }
             };
-            if let Err(e) = ws_sender.send(Message::Text(json.into())).await {
-                debug!(
-                    %client_id,
-                    action = "write_ws_message",
-                    error = %e,
-                    "WebSocket writer stopped"
-                );
-                break;
+            match write_ws_message_with_timeout(
+                ws_sender.send(Message::Text(json.into())),
+                WS_WRITE_TIMEOUT,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(WsWriteFailure::Send(error)) => {
+                    debug!(
+                        %client_id,
+                        action = "write_ws_message",
+                        %error,
+                        "WebSocket writer stopped"
+                    );
+                    break;
+                }
+                Err(WsWriteFailure::Timeout) => {
+                    warn!(
+                        %client_id,
+                        action = "write_ws_message",
+                        timeout_ms = WS_WRITE_TIMEOUT.as_millis(),
+                        "WebSocket write timed out; closing stalled connection"
+                    );
+                    break;
+                }
             }
         }
         let _ = writer_done_tx.send(());
     });
 
-    send_activity_bootstrap(&state, client_id, &tx).await;
-
     let hub = state.hub.clone();
+    let mut drain_final_control = false;
 
     loop {
         let incoming = tokio::select! {
@@ -4044,9 +4018,16 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
                 let msg: ClientMessage = match serde_json::from_str(&text) {
                     Ok(m) => m,
                     Err(e) => {
-                        warn!("invalid WS message: {e}");
-                        let _ = tx
-                            .send(
+                        warn!(
+                            %client_id,
+                            error = %e,
+                            action = "parse_ws_message",
+                            "browser sent an invalid WebSocket message; closing connection"
+                        );
+                        state
+                            .hub
+                            .send_control(
+                                client_id,
                                 WsError::new(
                                     "invalid_ws_message",
                                     ErrorSeverity::Error,
@@ -4057,7 +4038,8 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
                                 .into_server_message(),
                             )
                             .await;
-                        continue;
+                        drain_final_control = true;
+                        break;
                     }
                 };
                 let metadata_request_id = match &msg {
@@ -4068,7 +4050,7 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
                     }
                     _ => None,
                 };
-                if let Err(mut e) = handle_client_msg(&state, client_id, &tx, msg).await {
+                if let Err(mut e) = handle_client_msg(&state, client_id, msg).await {
                     e.info.request_id = metadata_request_id;
                     error!(
                         code = %e.info.code,
@@ -4079,7 +4061,10 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
                         "WS handler error: {}",
                         e.info.message
                     );
-                    let _ = tx.send(e.into_server_message()).await;
+                    state
+                        .hub
+                        .send_control(client_id, e.into_server_message())
+                        .await;
                 }
             }
             Some(Ok(_)) => {}
@@ -4091,7 +4076,17 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
         }
     }
 
-    hub.disconnect(client_id).await;
+    let disconnected_threads = hub.disconnect(client_id).await;
+    for thread_id in disconnected_threads {
+        state.runtime.retire_if_idle(thread_id);
+    }
+    if drain_final_control
+        && tokio::time::timeout(WS_FINAL_DRAIN_TIMEOUT, &mut send_task)
+            .await
+            .is_ok()
+    {
+        return;
+    }
     if !send_task.is_finished() {
         send_task.abort();
     }
@@ -4100,7 +4095,6 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
 async fn handle_client_msg(
     state: &AppState,
     client_id: usize,
-    tx: &mpsc::Sender<ServerMessage>,
     msg: ClientMessage,
 ) -> Result<(), WsError> {
     match msg {
@@ -4127,123 +4121,90 @@ async fn handle_client_msg(
                     )
                 }
             };
-            // Registering before the snapshot below is built is what makes the snapshot's
-            // `active_turn` safe to act on: a turn that ends after this line broadcasts its
-            // `TurnCompleted` to this client, and one that ended before it is already out of the
-            // turn gate. Build the snapshot first and a turn ending in between would be reported
-            // live by a client that then never hears it finish.
-            if !state.hub.subscribe(thread_id, client_id).await {
-                return Err(WsError::new(
-                    "ws_client_not_registered",
-                    ErrorSeverity::Error,
-                    "WebSocket client registration was lost; reconnect to continue.",
-                )
-                .thread(thread_id)
-                .action("subscribe"));
+            if let Some(notice) = notice.as_ref() {
+                retain_background_warning(state, thread_id, notice).await?;
             }
-
-            if let Some(warning) = notice {
-                let _ = tx.send(ServerMessage::Error { error: warning }).await;
-            }
-
-            let tf = state
-                .thread_metadata
-                .recompute_aggregates(project_id, thread_id)
+            let generation = state
+                .hub
+                .begin_subscribe(thread_id, client_id)
                 .await
-                .map_err(|e| WsError::from_persist(e, "subscribe_history", Some(thread_id)))?
-                .into_current()
                 .ok_or_else(|| {
                     WsError::new(
-                        "thread_not_found",
+                        "ws_client_not_registered",
                         ErrorSeverity::Error,
-                        "Thread not found.",
+                        "WebSocket client registration was lost; reconnect to continue.",
                     )
                     .thread(thread_id)
                     .action("subscribe")
                 })?;
-            let _ = tx
-                .send(ServerMessage::ThreadState(
-                    crate::thread_metadata::ThreadMetadataService::thread_state(
-                        &tf,
-                        Some(state.registry.thread_has_active_turn(thread_id).await),
-                    ),
-                ))
-                .await;
-
-            // Two snapshot shapes, distinguished by whether the client sent a resync cursor:
-            //
-            // * Resync (`since` present): history-first ordering. Send the persisted history — a
-            //   `HistoryDelta` of the turns after the cursor when we can resolve it, or a full
-            //   `HistoryPage` when we can't (stale cursor) — *before* the live turn and tasks. The
-            //   client reconciles or rebuilds the transcript while it still owns it, then the live
-            //   turn appends on top. The browser may keep a stale live DOM block visible until the
-            //   replacement snapshot arrives, so delta rows still need to be inserted before that
-            //   retained live block on the UI side.
-            // * Fresh (`since` absent): live-first ordering. The in-flight turn (H5) isn't in the
-            //   JSONL yet, so reconstruct it from the live buffer and send it — with its tasks —
-            //   before the history page, for the fastest first paint. The browser prepends older
-            //   history above it.
-            let resync_delta = match since {
-                Some(cursor) => state
-                    .store
-                    .load_turns_after(project_id, thread_id, cursor)
-                    .await
-                    .map_err(|e| WsError::from_persist(e, "subscribe_resync", Some(thread_id)))?,
-                None => None,
-            };
-
-            // The persisted-history message: a delta after a resolvable cursor, otherwise a full
-            // initial page (fresh open, or a stale cursor that fell back to a full rebuild).
-            let history_message = if let Some(turns) = resync_delta {
-                ServerMessage::HistoryDelta {
-                    thread_id,
-                    turns: turns.into_iter().map(Into::into).collect(),
+            let history_limit = history_limit_or_default(
+                state,
+                thread_id,
+                "subscribe_history",
+                |config| config.history.initial,
+                5,
+            )
+            .await;
+            if let Err(error) = crate::thread_bootstrap::build_and_send(
+                state,
+                client_id,
+                project_id,
+                thread_id,
+                generation,
+                since,
+                history_limit,
+            )
+            .await
+            {
+                match error {
+                    crate::thread_bootstrap::BootstrapBuildError::Retryable {
+                        reason,
+                        retry_after_ms,
+                        detail,
+                    } => {
+                        warn!(
+                            %thread_id,
+                            %client_id,
+                            subscription_generation = generation,
+                            ?reason,
+                            retry_after_ms,
+                            %detail,
+                            action = "subscribe",
+                            "thread bootstrap could not retain its journal cut; requesting same-socket resync"
+                        );
+                        state
+                            .hub
+                            .fail_bootstrap(
+                                thread_id,
+                                client_id,
+                                generation,
+                                reason,
+                                Some(retry_after_ms),
+                            )
+                            .await;
+                    }
+                    crate::thread_bootstrap::BootstrapBuildError::Cancelled(detail) => {
+                        debug!(
+                            %thread_id,
+                            %client_id,
+                            subscription_generation = generation,
+                            %detail,
+                            action = "subscribe",
+                            "thread bootstrap stopped after its subscription was superseded"
+                        );
+                    }
+                    crate::thread_bootstrap::BootstrapBuildError::Failed(detail) => {
+                        state.hub.unsubscribe(thread_id, client_id).await;
+                        return Err(WsError::new(
+                            "thread_bootstrap_failed",
+                            ErrorSeverity::Error,
+                            "Thread state could not be synchronized.",
+                        )
+                        .detail(detail)
+                        .thread(thread_id)
+                        .action("subscribe"));
+                    }
                 }
-            } else {
-                // H4/H6: the most recent page of persisted history (not the whole thread). The
-                // initial page is deliberately small (see `HistoryConfig::initial`); the browser
-                // tops it up to fill the viewport. Older pages are fetched via `LoadHistory`.
-                let limit = history_limit_or_default(
-                    state,
-                    thread_id,
-                    "subscribe_history",
-                    |config| config.history.initial,
-                    5,
-                )
-                .await;
-                let (turns, has_more) = state
-                    .store
-                    .load_history(project_id, thread_id, None, limit)
-                    .await
-                    .map_err(|e| WsError::from_persist(e, "subscribe_history", Some(thread_id)))?;
-                ServerMessage::HistoryPage {
-                    thread_id,
-                    turns: turns.into_iter().map(Into::into).collect(),
-                    has_more,
-                }
-            };
-
-            // The live turn (H5) isn't in the JSONL yet — reconstruct it from the live buffer — and
-            // its running tasks. On a fresh open (`since` absent) these go first, for the fastest
-            // first paint. On a resync (`since` present, delta or stale-cursor rebuild) the history
-            // goes first so the client can reconcile or rebuild before handling the live turn. The
-            // browser may still insert delta rows before a retained stale live block to avoid a
-            // visible gap before the replacement live snapshot arrives.
-            let live_snapshot = state.live_buffers.snapshot(thread_id).await;
-            let tasks = state.running_commands.snapshot(thread_id).await;
-            let running_tasks = ServerMessage::RunningTasks { thread_id, tasks };
-            if since.is_some() {
-                let _ = tx.send(history_message).await;
-                if let Some(snap) = live_snapshot {
-                    let _ = tx.send(ServerMessage::LiveTurnSnapshot(snap)).await;
-                }
-                let _ = tx.send(running_tasks).await;
-            } else {
-                if let Some(snap) = live_snapshot {
-                    let _ = tx.send(ServerMessage::LiveTurnSnapshot(snap)).await;
-                }
-                let _ = tx.send(running_tasks).await;
-                let _ = tx.send(history_message).await;
             }
         }
         ClientMessage::LoadHistory {
@@ -4266,16 +4227,24 @@ async fn handle_client_msg(
                 .load_history(project_id, thread_id, before, limit)
                 .await
                 .map_err(|e| WsError::from_persist(e, "load_history", Some(thread_id)))?;
-            let _ = tx
-                .send(ServerMessage::HistoryPage {
-                    thread_id,
-                    turns: turns.into_iter().map(Into::into).collect(),
-                    has_more,
-                })
+            state
+                .hub
+                .send_control(
+                    client_id,
+                    ServerMessage::HistoryPage {
+                        thread_id,
+                        before,
+                        turns: turns.into_iter().map(Into::into).collect(),
+                        has_more,
+                    },
+                )
                 .await;
         }
         ClientMessage::Unsubscribe { thread_id } => {
             state.hub.unsubscribe(thread_id, client_id).await;
+            if !state.hub.has_subscribers(thread_id) {
+                state.runtime.retire_if_idle(thread_id);
+            }
         }
         ClientMessage::SendInput {
             thread_id,
@@ -4302,7 +4271,7 @@ async fn handle_client_msg(
                 .thread(thread_id)
                 .action("send_input")
             })?;
-            let project_id = project_for(state, thread_id, "send_input").await?;
+            let project_id = project_for(state, client_id, thread_id, "send_input").await?;
             let app_config = state
                 .store
                 .load_config()
@@ -4387,7 +4356,7 @@ async fn handle_client_msg(
             request_id,
             mode,
         } => {
-            let project_id = project_for(state, thread_id, "switch_mode").await?;
+            let project_id = project_for(state, client_id, thread_id, "switch_mode").await?;
             let tf = state
                 .thread_metadata
                 .mutate_with_recency(project_id, thread_id, ThreadRecency::TouchIfChanged, |tf| {
@@ -4405,11 +4374,15 @@ async fn handle_client_msg(
                     .thread(thread_id)
                     .action("switch_mode")
                 })?;
-            let _ = tx
-                .send(ServerMessage::ThreadMetadataResult {
-                    request_id,
-                    metadata: crate::thread_metadata::ThreadMetadataService::metadata(&tf),
-                })
+            state
+                .hub
+                .send_control(
+                    client_id,
+                    ServerMessage::ThreadMetadataResult {
+                        request_id,
+                        metadata: crate::thread_metadata::ThreadMetadataService::metadata(&tf),
+                    },
+                )
                 .await;
         }
         ClientMessage::SelectModel {
@@ -4486,7 +4459,10 @@ async fn handle_client_msg(
                     && let Some(warning) =
                         switch_provider_cold(state, project_id, thread_id, &model_ref).await?
                 {
-                    let _ = tx.send(ServerMessage::Error { error: warning }).await;
+                    state
+                        .hub
+                        .send_control(client_id, ServerMessage::Error { error: warning })
+                        .await;
                 }
             }
 
@@ -4547,11 +4523,15 @@ async fn handle_client_msg(
                     .thread(thread_id)
                     .action("select_model")
                 })?;
-            let _ = tx
-                .send(ServerMessage::ThreadMetadataResult {
-                    request_id,
-                    metadata: crate::thread_metadata::ThreadMetadataService::metadata(&tf),
-                })
+            state
+                .hub
+                .send_control(
+                    client_id,
+                    ServerMessage::ThreadMetadataResult {
+                        request_id,
+                        metadata: crate::thread_metadata::ThreadMetadataService::metadata(&tf),
+                    },
+                )
                 .await;
         }
         ClientMessage::SetPermissionPreset {
@@ -4559,7 +4539,8 @@ async fn handle_client_msg(
             request_id,
             preset,
         } => {
-            let project_id = project_for(state, thread_id, "set_permission_preset").await?;
+            let project_id =
+                project_for(state, client_id, thread_id, "set_permission_preset").await?;
             let tf = state
                 .thread_metadata
                 .mutate_with_recency(project_id, thread_id, ThreadRecency::TouchIfChanged, |tf| {
@@ -4577,92 +4558,49 @@ async fn handle_client_msg(
                     .thread(thread_id)
                     .action("set_permission_preset")
                 })?;
-            let _ = tx
-                .send(ServerMessage::ThreadMetadataResult {
-                    request_id,
-                    metadata: crate::thread_metadata::ThreadMetadataService::metadata(&tf),
-                })
-                .await;
-        }
-        ClientMessage::ApprovalDecision {
-            request_id,
-            decision,
-        } => {
-            let request_id_for_broadcast = request_id.clone();
-            let thread_id = state
-                .registry
-                .respond_approval(giskard_core::ids::ApprovalId(request_id), decision.clone())
-                .await
-                .map_err(|e| WsError::from_harness(e, "approval_decision", None))?;
-            // Record the resolution against the in-flight turn so a browser reload replays this
-            // approval as answered rather than re-prompting the user (spec §13.6).
-            state
-                .live_buffers
-                .resolve_approval(
-                    thread_id,
-                    giskard_core::ids::ApprovalId(request_id_for_broadcast.clone()),
-                    decision.clone(),
-                )
-                .await;
-            debug!(
-                %thread_id,
-                request_id = %request_id_for_broadcast,
-                ?decision,
-                "recorded approval resolution in live buffer for reconnect"
-            );
             state
                 .hub
-                .broadcast(
-                    thread_id,
-                    ServerMessage::ApprovalResolved {
-                        thread_id,
-                        request_id: request_id_for_broadcast,
-                        decision,
+                .send_control(
+                    client_id,
+                    ServerMessage::ThreadMetadataResult {
+                        request_id,
+                        metadata: crate::thread_metadata::ThreadMetadataService::metadata(&tf),
                     },
                 )
                 .await;
         }
+        ClientMessage::ApprovalDecision {
+            thread_id,
+            request_id,
+            decision,
+        } => {
+            state
+                .registry
+                .respond_approval(
+                    thread_id,
+                    giskard_core::ids::ApprovalId(request_id),
+                    decision,
+                )
+                .await
+                .map_err(|e| WsError::from_harness(e, "approval_decision", Some(thread_id)))?;
+        }
         ClientMessage::ServerRequestResponse {
+            thread_id,
             request_id,
             response,
         } => {
-            let request_id_for_log = request_id.clone();
-            let req_id = giskard_core::ids::ServerRequestId(request_id);
-            let thread_id = tokio::time::timeout(
-                HARNESS_CONTROL_TIMEOUT,
-                state
-                    .registry
-                    .respond_server_request(req_id.clone(), response),
-            )
-            .await
-            .map_err(|_| {
-                error!(
-                    request_id = %request_id_for_log,
-                    timeout_ms = HARNESS_CONTROL_TIMEOUT.as_millis(),
-                    "server request response timed out waiting for Codex"
-                );
-                WsError::from_harness(
-                    HarnessError::Timeout(
-                        "server request response timed out waiting for Codex".into(),
-                    ),
-                    "server_request_response",
-                    None,
-                )
-            })?
-            .map_err(|e| WsError::from_harness(e, "server_request_response", None))?;
-            // Record the answer against the in-flight turn. The harness emits its own resolved
-            // event, but on its own schedule and not guaranteed at all; until then the request
-            // still reads as outstanding in the replayed events, so a reload in that window would
-            // re-prompt and re-answering routes a stale id to the harness (spec §13.6).
             state
-                .live_buffers
-                .resolve_server_request(thread_id, req_id)
-                .await;
-            debug!(
-                %thread_id,
-                request_id = %request_id_for_log,
-                "recorded server request resolution in live buffer for reconnect"
-            );
+                .registry
+                .respond_server_request(
+                    thread_id,
+                    giskard_core::ids::ServerRequestId(request_id),
+                    response,
+                    HARNESS_CONTROL_TIMEOUT,
+                )
+                .await
+                .map_err(|e| {
+                    WsError::from_harness(e, "server_request_response", Some(thread_id))
+                })?;
         }
         ClientMessage::Interrupt { thread_id } => {
             tokio::time::timeout(HARNESS_CONTROL_TIMEOUT, state.registry.interrupt(thread_id))
@@ -4684,7 +4622,7 @@ async fn handle_client_msg(
                 .map_err(|e| WsError::from_harness(e, "interrupt", Some(thread_id)))?;
         }
         ClientMessage::CompactContext { thread_id } => {
-            let project_id = project_for(state, thread_id, "compact_context").await?;
+            let project_id = project_for(state, client_id, thread_id, "compact_context").await?;
             let tf = state
                 .store
                 .load_thread(project_id, thread_id)
@@ -4722,21 +4660,51 @@ async fn handle_client_msg(
             })?
             .map_err(|e| WsError::from_harness(e, "compact_context", Some(thread_id)))?;
         }
+        ClientMessage::RetryTurnPersistence { thread_id, turn_id } => {
+            state
+                .registry
+                .retry_turn_persistence(thread_id, turn_id)
+                .await
+                .map_err(|error| {
+                    WsError::new(
+                        "turn_persistence_retry_failed",
+                        ErrorSeverity::Warning,
+                        "The completed turn still could not be saved.",
+                    )
+                    .detail(error.to_string())
+                    .thread(thread_id)
+                    .action("retry_turn_persistence")
+                })?;
+        }
+        ClientMessage::DiscardUnpersistedTurn { thread_id, turn_id } => {
+            state
+                .registry
+                .discard_unpersisted_turn(thread_id, turn_id)
+                .map_err(|error| {
+                    WsError::new(
+                        "discard_unpersisted_turn_failed",
+                        ErrorSeverity::Error,
+                        "The retained turn could not be discarded.",
+                    )
+                    .detail(error.to_string())
+                    .thread(thread_id)
+                    .action("discard_unpersisted_turn")
+                })?;
+        }
         ClientMessage::TerminateCommand {
             thread_id,
             process_id,
         } => {
             let process_id_for_state = process_id.clone();
             let existing_command = state
-                .running_commands
-                .get_by_process(thread_id, &process_id_for_state)
-                .await;
-            if state
-                .running_commands
-                .set_terminating_by_process(thread_id, &process_id_for_state, true)
-                .await
+                .runtime
+                .task_by_process(thread_id, &process_id_for_state);
+            if let Some(tasks) =
+                state
+                    .runtime
+                    .set_task_terminating(thread_id, &process_id_for_state, true)
             {
-                broadcast_running_commands(state, thread_id).await;
+                state.hub.publish_thread_tasks(tasks).await;
             }
             let terminate_result = tokio::time::timeout(
                 HARNESS_CONTROL_TIMEOUT,
@@ -4767,21 +4735,21 @@ async fn handle_client_msg(
                         .unwrap_or(false)
                 {
                     let removed = state
-                        .running_commands
-                        .remove_by_process(thread_id, &process_id_for_state)
-                        .await;
-                    if removed {
-                        broadcast_running_commands(state, thread_id).await;
+                        .runtime
+                        .remove_task_by_process(thread_id, &process_id_for_state);
+                    if let Some(tasks) = &removed {
+                        state.hub.publish_thread_tasks(tasks.clone()).await;
                     }
                     warn!(
                         %thread_id,
                         process_id = %process_id_for_state,
-                        running_task_removed = removed,
+                        running_task_removed = removed.is_some(),
                         error = %error,
                         "harness no longer manages after-turn command; cleared stale running-task state"
                     );
-                    let _ = tx
-                        .send(ServerMessage::Error {
+                    state.hub.send_control(
+                        client_id,
+                        ServerMessage::Error {
                             error: ErrorInfo {
                                 code: "harness_command_unmanaged".into(),
                                 severity: ErrorSeverity::Warning,
@@ -4794,17 +4762,17 @@ async fn handle_client_msg(
                                 request_id: None,
                                 process_id: Some(process_id_for_state),
                             },
-                        })
-                        .await;
+                        },
+                    ).await;
                     return Ok(());
                 }
 
-                if state
-                    .running_commands
-                    .set_terminating_by_process(thread_id, &process_id_for_state, false)
-                    .await
+                if let Some(tasks) =
+                    state
+                        .runtime
+                        .set_task_terminating(thread_id, &process_id_for_state, false)
                 {
-                    broadcast_running_commands(state, thread_id).await;
+                    state.hub.publish_thread_tasks(tasks).await;
                 }
                 return Err(
                     WsError::from_harness(error, "terminate_command", Some(thread_id))
@@ -4826,7 +4794,7 @@ async fn handle_client_msg(
             debug!(%thread_id, path = %written, "plan saved");
         }
         ClientMessage::Ping => {
-            let _ = tx.send(ServerMessage::Pong).await;
+            state.hub.send_control(client_id, ServerMessage::Pong).await;
         }
     }
     Ok(())
@@ -4969,15 +4937,6 @@ async fn ensure_thread_open(
             "thread reopened with warning: {}",
             warning.message
         );
-        state
-            .hub
-            .broadcast(
-                thread_id,
-                ServerMessage::Error {
-                    error: warning.clone(),
-                },
-            )
-            .await;
     }
 
     Ok(ThreadAccess {
@@ -5027,12 +4986,41 @@ async fn find_persisted_thread(
 /// Resolve the project a thread belongs to, reopening it from persistence on first access.
 async fn project_for(
     state: &AppState,
+    client_id: usize,
     thread_id: ThreadId,
     action: &str,
 ) -> Result<ProjectId, WsError> {
-    ensure_thread_open(state, thread_id, action)
-        .await
-        .map(|access| access.project_id)
+    let access = ensure_thread_open(state, thread_id, action).await?;
+    if let Some(warning) = access.warning {
+        retain_background_warning(state, thread_id, &warning).await?;
+        state
+            .hub
+            .send_control(client_id, ServerMessage::Error { error: warning })
+            .await;
+    }
+    Ok(access.project_id)
+}
+
+async fn retain_background_warning(
+    state: &AppState,
+    thread_id: ThreadId,
+    warning: &ErrorInfo,
+) -> Result<(), WsError> {
+    let snapshot = state
+        .notices
+        .upsert_error(thread_id, warning)
+        .map_err(|error| {
+            WsError::new(
+                "thread_notice_update_failed",
+                ErrorSeverity::Error,
+                "The thread warning could not be retained.",
+            )
+            .detail(error.to_string())
+            .thread(thread_id)
+            .action("retain_background_warning")
+        })?;
+    state.hub.publish_thread_notices(snapshot).await;
+    Ok(())
 }
 
 /// Resolve a thread's project using only persistence — **no harness attach**. The read-only paths
@@ -5493,14 +5481,6 @@ async fn load_thread(
         .map_err(|e| e.to_string())?
         .ok_or("thread not found")?;
     Ok((project_id, tf))
-}
-
-async fn broadcast_running_commands(state: &AppState, thread_id: ThreadId) {
-    let tasks = state.running_commands.snapshot(thread_id).await;
-    state
-        .hub
-        .broadcast(thread_id, ServerMessage::RunningTasks { thread_id, tasks })
-        .await;
 }
 
 /// Write the current plan to a markdown file inside the workspace root (§7.4.1). Returns the

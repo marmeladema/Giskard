@@ -65,17 +65,45 @@ the browser. Thread summaries include the effective `workspace_root` the thread 
 reads, Git status and diffs — the project's workspace for shared threads, the inherited worktree
 workspace for isolated threads and their sub-agents. Thread summaries and browser-facing sub-agent
 payloads omit native harness thread IDs. Every summary carries the thread's durable metadata
-`revision`. The WebSocket's typed `ThreadState` carries the same revision with title, mode, selected
-model, effective context window, permission preset, and thread token aggregates; it never exposes
-the persisted native harness id or internal per-model/worktree caches. A committed catalog change
-sends `ThreadCatalogChanged`, which coalesces into serialized refetches of the known project thread
-catalogs. Metadata and catalog invalidations use a coalescing replacement lane, so a full socket
-queue neither blocks the committing task nor permanently drops the latest value. Replacements go
-directly from that lane to the socket writer and do not consume ordered event capacity. Mode,
-model, and permission messages require a `request_id`; the initiating browser receives a correlated
-`ThreadMetadataResult` after commit, including for no-op changes, or an `Error` carrying that id.
-`TokenUpdate` no longer exists; thread totals use the revisioned metadata snapshot.
+`revision`. The WebSocket's typed `ThreadMetadata` carries the same revision with title, mode,
+selected model, effective context window, permission preset, and thread token aggregates; it never
+exposes the persisted native harness id or internal per-model/worktree caches. A committed catalog
+change sends `ThreadCatalogChanged`, which coalesces into serialized refetches of the known project
+thread catalogs. Metadata and catalog invalidations use the connection's bounded, class-aware
+outbox. Replacements coalesce in place; if a thread-scoped replacement cannot be admitted, that
+subscription resynchronizes, while failure to admit a global replacement closes only the unhealthy
+connection. Producers never wait for socket capacity. Mode, model, and permission messages require
+a `request_id`; the initiating browser
+receives a correlated `ThreadMetadataResult` after commit, including for no-op changes, or an
+`Error` carrying that id. Thread token totals change through the same revisioned metadata snapshot.
 See [Sub-agent threads](subagents.md) for the full contract.
+
+The WebSocket uses one ordered `ThreadEvent` lane for transcript and request transitions, plus
+revisioned replacement messages for metadata, tasks, retained notices, and the global runtime
+overview. `Subscribe` produces one staged `ThreadBootstrap` transaction: start, independently
+base64-encoded chunks for metadata/history/live turn/ordered suffix/final runtime/notices, then
+commit. The browser applies nothing before a matching-generation commit. `HistoryPage` is only for
+pagination and echoes its `before` cursor; it is never a bootstrap fragment.
+
+This staged transaction is the only subscription reconciliation path. Metadata, task, and notice
+replacements which race bootstrap wait behind its commit barrier, while the final-runtime section
+settles turn ownership and request actionability after ordered chronology is replayed.
+
+Per-connection delivery is bounded and class-aware. Replacement state coalesces in place. Ordered
+events never coalesce. Ordered-event pressure, a sequence gap, or replacement admission pressure
+sends a thread-scoped `ResyncRequired`, and the browser re-subscribes that thread on the same
+socket. Journal-pin capacity during bootstrap follows the same path with a retry delay. Other
+subscriptions and direct control traffic remain usable. Invalid client messages receive a bounded
+final-error drain and close the connection; a stalled physical WebSocket write also has a bounded
+deadline so connection-owned state is reclaimed. The embedded browser and server are a same-release
+pair, with no legacy protocol negotiation. A connection that cannot admit a global catalog or
+runtime-overview replacement is closed because no thread-scoped repair can restore it.
+
+If a completed turn cannot be appended after three verified attempts, final runtime enters
+`PersistenceBlocked` while retaining the complete turn and its lease. The browser can send
+`RetryTurnPersistence { thread_id, turn_id }` or, after explicit confirmation,
+`DiscardUnpersistedTurn { thread_id, turn_id }`. Expected-turn matching prevents stale recovery
+actions from settling a newer turn.
 
 If you open a thread whose agent can no longer be started — most often because its
 **provider was removed from config** (e.g. you swapped one proxy provider id for another) — the

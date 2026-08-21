@@ -2,9 +2,11 @@
 //! still load **read-only**: the persisted history is served and a non-fatal `thread_read_only`
 //! warning is surfaced, instead of the whole subscribe failing with a JSON-RPC/harness error.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use giskard_core::ids::{ItemId, ProjectId, ThreadId, TurnId};
@@ -14,7 +16,10 @@ use giskard_core::token::{TokenLedger, TokenUsage};
 use giskard_core::turn::{Mode, PermissionPreset, Turn, TurnStatus, TurnStatusKind};
 use giskard_harness_replay::ReplayHarness;
 use giskard_persist::store::{ProjectConfig, ThreadFile};
-use giskard_proto::ClientMessage;
+use giskard_proto::{
+    BootstrapHistory, BootstrapSection, ClientMessage, ServerMessage, ThreadBootstrapFrame,
+    ThreadNoticeSnapshot,
+};
 use giskard_server::{AppState, HarnessFactory, build_app};
 
 /// Always fails to create a harness — simulating a thread whose provider has been removed from
@@ -462,44 +467,98 @@ session_days = 30
     .await
     .unwrap();
 
-    // Collect messages for a short window; we expect both the read-only warning and a history page.
-    let mut history_page: Option<serde_json::Value> = None;
-    let mut read_only_warning: Option<serde_json::Value> = None;
+    // The staged bootstrap is the authority for both persisted history and retained notices.
+    let mut generation = None;
+    let mut chunks: HashMap<BootstrapSection, BTreeMap<u32, Vec<u8>>> = HashMap::new();
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-    while tokio::time::Instant::now() < deadline
-        && (history_page.is_none() || read_only_warning.is_none())
-    {
+    let (history, notices): (BootstrapHistory, ThreadNoticeSnapshot) = loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "committed read-only bootstrap was not observed"
+        );
         match tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
-                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
-                // `ServerMessage::Error` flattens `ErrorInfo`, so its fields sit at the top level.
-                match v["type"].as_str() {
-                    Some("history_page") => history_page = Some(v),
-                    Some("error") if v["code"] == "thread_read_only" => read_only_warning = Some(v),
-                    _ => {}
+                let message: ServerMessage = serde_json::from_str(&t).unwrap();
+                let ServerMessage::ThreadBootstrap {
+                    thread_id,
+                    subscription_generation,
+                    frame,
+                } = message
+                else {
+                    continue;
+                };
+                if thread_id != tid {
+                    continue;
+                }
+                match frame {
+                    ThreadBootstrapFrame::Start { .. } => {
+                        generation = Some(subscription_generation);
+                        chunks.clear();
+                    }
+                    ThreadBootstrapFrame::Chunk {
+                        section,
+                        index,
+                        payload_base64,
+                    } if generation == Some(subscription_generation) => {
+                        let payload = BASE64.decode(payload_base64).unwrap();
+                        chunks.entry(section).or_default().insert(index, payload);
+                    }
+                    ThreadBootstrapFrame::Commit if generation == Some(subscription_generation) => {
+                        break (
+                            take_bootstrap_section(&mut chunks, BootstrapSection::History),
+                            take_bootstrap_section(&mut chunks, BootstrapSection::Notices),
+                        );
+                    }
+                    ThreadBootstrapFrame::Chunk { .. } | ThreadBootstrapFrame::Commit => {}
                 }
             }
             Ok(Some(Ok(_))) => {}
-            _ => break,
+            Ok(Some(Err(error))) => panic!("websocket error during bootstrap: {error}"),
+            Ok(None) => panic!("websocket closed during bootstrap"),
+            Err(_) => {}
         }
-    }
+    };
 
     // The persisted history is served despite the harness being unable to attach.
-    let page = history_page.expect("read-only thread must still deliver a history page");
-    assert_eq!(page["turns"].as_array().unwrap().len(), 2);
+    let BootstrapHistory::FullPage { turns, .. } = history else {
+        panic!("initial read-only subscribe must deliver a full history page");
+    };
+    assert_eq!(turns.len(), 2);
 
     // …and the attach failure is surfaced as a non-fatal warning, not a hard error.
-    let warning =
-        read_only_warning.expect("read-only subscribe must surface a thread_read_only warning");
-    assert_eq!(warning["severity"], "warning");
-    let message = warning["message"].as_str().unwrap_or_default();
+    let warning = notices
+        .notices
+        .iter()
+        .find(|notice| notice.kind == "thread_read_only")
+        .expect("read-only subscribe must retain a thread_read_only warning");
+    assert_eq!(warning.severity, giskard_proto::ErrorSeverity::Warning);
+    let message = &warning.message;
     assert!(
         message.contains("\"cloudflare-litellm\"") && message.contains("Pick a model"),
         "subscribe warning must name the provider and the recovery action: {message}"
     );
-    let detail = warning["detail"].as_str().unwrap_or_default();
+    let detail = warning.detail.as_deref().unwrap_or_default();
     assert!(
         detail.contains("cloudflare-litellm"),
         "warning detail should explain the attach failure: {detail}"
     );
+}
+
+fn take_bootstrap_section<T>(
+    chunks: &mut HashMap<BootstrapSection, BTreeMap<u32, Vec<u8>>>,
+    section: BootstrapSection,
+) -> T
+where
+    T: serde::de::DeserializeOwned,
+{
+    let section_chunks = chunks
+        .remove(&section)
+        .unwrap_or_else(|| panic!("bootstrap section {section:?} was absent"));
+    let mut encoded = Vec::new();
+    for (expected_index, (index, chunk)) in section_chunks.into_iter().enumerate() {
+        assert_eq!(index as usize, expected_index, "bootstrap chunk gap");
+        encoded.extend(chunk);
+    }
+    serde_json::from_slice(&encoded)
+        .unwrap_or_else(|error| panic!("bootstrap section {section:?} was invalid: {error}"))
 }

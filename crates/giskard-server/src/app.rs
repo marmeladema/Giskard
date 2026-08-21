@@ -8,12 +8,12 @@ use crate::headers::security_headers_middleware;
 use crate::highlight::Highlighter;
 use crate::hub::Hub;
 use crate::ledger::{self, LedgerHandle};
-use crate::live_buffer::LiveBufferStore;
 use crate::models::ProjectModelCatalogStore;
 use crate::registry::{HarnessFactory, HarnessRegistry};
 use crate::routes::{protected_routes, public_routes};
-use crate::running_commands::RunningTaskStore;
 use crate::thread_metadata::ThreadMetadataService;
+use crate::thread_notices::ThreadNoticeStore;
+use crate::thread_runtime::ThreadRuntimeRegistry;
 use crate::throttle::LoginThrottle;
 
 /// Shared application state passed to all Axum handlers and middleware.
@@ -25,9 +25,9 @@ pub struct AppState {
     pub store: Arc<PersistStore>,
     pub hub: Arc<Hub>,
     pub thread_metadata: Arc<ThreadMetadataService>,
+    pub notices: Arc<ThreadNoticeStore>,
     pub registry: Arc<HarnessRegistry>,
-    pub live_buffers: Arc<LiveBufferStore>,
-    pub running_commands: Arc<RunningTaskStore>,
+    pub runtime: Arc<ThreadRuntimeRegistry>,
     pub model_catalogs: Arc<ProjectModelCatalogStore>,
     pub highlighter: Arc<Highlighter>,
     /// Single-writer token-ledger actor handle (§5.4).
@@ -57,8 +57,8 @@ impl AppState {
         viz_config: Option<&giskard_persist::config::VizConfig>,
     ) -> Self {
         let hub = Arc::new(Hub::new());
-        let live_buffers = Arc::new(LiveBufferStore::new());
-        let running_commands = Arc::new(RunningTaskStore::new());
+        let runtime = Arc::new(ThreadRuntimeRegistry::new());
+        let notices = Arc::new(ThreadNoticeStore::default());
         let model_catalogs = Arc::new(ProjectModelCatalogStore::default());
         let highlighter = match viz_config {
             Some(viz) => Arc::new(Highlighter::with_max_size(viz.max_highlight_size)),
@@ -68,8 +68,7 @@ impl AppState {
         let registry = Arc::new(HarnessRegistry::new(
             factory,
             hub.clone(),
-            live_buffers.clone(),
-            running_commands.clone(),
+            runtime.clone(),
             store.clone(),
             ledger.clone(),
         ));
@@ -78,9 +77,9 @@ impl AppState {
             store,
             hub,
             thread_metadata,
+            notices,
             registry,
-            live_buffers,
-            running_commands,
+            runtime,
             model_catalogs,
             highlighter,
             ledger,

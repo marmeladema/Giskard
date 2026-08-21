@@ -1,17 +1,17 @@
-//! Regression coverage for approval state surviving a browser reconnect (spec §9, §13.6).
+//! Regression coverage for request state surviving a browser reconnect (spec §9, §13.6).
 //!
-//! Approval resolution lives only in browser memory. Before this was fixed, a reconnect's live-turn
-//! snapshot re-surfaced an already-answered approval as `pending_approval`, so the reloaded UI
-//! showed it as actionable again — and answering it a second time routed a stale id to the harness,
-//! which errored. This test drives the real WebSocket API: raise an approval, answer it, reconnect,
-//! and assert the snapshot reports it as answered (not pending).
+//! This test drives the real WebSocket API: raise an approval, answer it, reconnect, and assert
+//! that both runtime projections report the request as resolved rather than actionable.
 
 mod common;
 
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalRequest};
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
@@ -23,7 +23,11 @@ use giskard_harness::{
     AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
 };
 use giskard_persist::store::ProjectConfig;
-use giskard_proto::{ClientMessage, ServerMessage, WireAgentEvent};
+use giskard_proto::{
+    BootstrapSection, ClientMessage, RequestKind, RequestPayload, RequestResolution, RequestState,
+    RequestStatus, RuntimeTurnState, ServerMessage, ThreadBootstrapFrame, ThreadBootstrapPayload,
+    ThreadEventPayload, ThreadRuntimeOverview,
+};
 use giskard_server::{AppState, HarnessFactory, build_app};
 use tokio::sync::{Mutex, broadcast};
 use tokio::time::{Duration, Instant};
@@ -316,14 +320,15 @@ async fn answered_approval_is_not_pending_after_reconnect() {
 
     // Answer it.
     ws.send(ws_text(&ClientMessage::ApprovalDecision {
+        thread_id,
         request_id: APPROVAL_ID.into(),
         decision: ApprovalDecision::Accept,
     }))
     .await
     .unwrap();
 
-    // The server broadcasts `ApprovalResolved` only after it has recorded the resolution against the
-    // live buffer, so waiting for it guarantees the reconnect below sees the answered state.
+    // The resolved request transition is published only after the runtime authority records it, so
+    // observing it guarantees the reconnect below sees the answered state.
     wait_for_approval_resolved(&mut ws).await;
 
     // Reconnect with a fresh socket, as a browser reload would.
@@ -336,47 +341,24 @@ async fn answered_approval_is_not_pending_after_reconnect() {
         .await
         .unwrap();
 
-    let snapshot = wait_for_live_snapshot(&mut reconnect).await;
-    assert_eq!(snapshot.thread_id, thread_id);
-    // The answered approval must NOT be re-surfaced as actionable. The client derives the
-    // outstanding set from `accumulated` plus `answered_approvals`, so the answered approval is
-    // present in `accumulated` (so its resolved card can be drawn) but not in the outstanding set.
-    let outstanding: Vec<ApprovalId> = snapshot
-        .accumulated
+    let bootstrap = wait_for_bootstrap(&mut reconnect, thread_id).await;
+    let live_turn = bootstrap
+        .live_turn
+        .expect("the in-flight turn should have a live projection");
+    let live_request = live_turn
+        .events
         .iter()
-        .filter_map(|e| match e {
-            WireAgentEvent::ApprovalRequested { request, .. } => Some(request.id.clone()),
-            _ => None,
-        })
-        .filter(|id| {
-            !snapshot
-                .answered_approvals
-                .iter()
-                .any(|a| a.request_id == *id)
-        })
-        .collect();
-    assert!(
-        outstanding.is_empty(),
-        "answered approval should not be outstanding after reconnect, got {outstanding:?}",
-    );
-    // It is reported as answered so the reconnecting client renders it in its resolved state.
-    assert_eq!(snapshot.answered_approvals.len(), 1);
-    assert_eq!(
-        snapshot.answered_approvals[0].request_id,
-        ApprovalId(APPROVAL_ID.into())
-    );
-    assert_eq!(
-        snapshot.answered_approvals[0].decision,
-        ApprovalDecision::Accept
-    );
-    // The original request is still replayed in the accumulated stream (so the card can be drawn).
-    assert!(
-        snapshot.accumulated.iter().any(|e| matches!(
-            e,
-            WireAgentEvent::ApprovalRequested { request, .. } if request.id == ApprovalId(APPROVAL_ID.into())
-        )),
-        "the approval request should still be present in the accumulated events"
-    );
+        .find_map(|event| request_with_id(event, APPROVAL_ID))
+        .expect("the approval card should be reconstructed from the live projection");
+    assert_resolved_approval(live_request);
+
+    let final_request = bootstrap
+        .final_runtime
+        .requests
+        .iter()
+        .find(|request| request.request_id == APPROVAL_ID)
+        .expect("the final runtime authority should contain the approval");
+    assert_resolved_approval(final_request);
 }
 
 async fn wait_for_approval(ws: &mut TestWs) {
@@ -385,8 +367,14 @@ async fn wait_for_approval(ws: &mut TestWs) {
     while Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
-                if let Ok(ServerMessage::Event { agent_event, .. }) = serde_json::from_str(&text)
-                    && matches!(*agent_event, WireAgentEvent::ApprovalRequested { .. })
+                if let Ok(ServerMessage::ThreadEvent { event, .. }) = serde_json::from_str(&text)
+                    && matches!(
+                        event.event,
+                        ThreadEventPayload::Request { request }
+                            if request.request_id == APPROVAL_ID
+                                && matches!(request.payload, RequestPayload::Approval { .. })
+                                && matches!(request.status, RequestStatus::Pending)
+                    )
                 {
                     return;
                 }
@@ -404,9 +392,20 @@ async fn wait_for_approval_resolved(ws: &mut TestWs) {
     while Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
-                if let Ok(ServerMessage::ApprovalResolved { request_id, .. }) =
-                    serde_json::from_str(&text)
-                    && request_id == APPROVAL_ID
+                if let Ok(ServerMessage::ThreadEvent { event, .. }) = serde_json::from_str(&text)
+                    && matches!(
+                        event.event,
+                        ThreadEventPayload::Request { request }
+                            if request.request_id == APPROVAL_ID
+                                && matches!(
+                                    request.status,
+                                    RequestStatus::Resolved {
+                                        resolution: RequestResolution::Approval {
+                                            decision: ApprovalDecision::Accept,
+                                        },
+                                    }
+                                )
+                    )
                 {
                     return;
                 }
@@ -419,10 +418,8 @@ async fn wait_for_approval_resolved(ws: &mut TestWs) {
 }
 
 /// A browser that was not connected when an approval was raised must still learn the thread is
-/// blocked. Cross-thread `ThreadActivity` is broadcast live and never replayed, so before this the
-/// only way to discover a blocked thread was to open it — which for a managed sub-agent (no sidebar
-/// row) meant knowing to look in the first place. A connecting client now gets the pending set up
-/// front, without subscribing to anything.
+/// blocked. The complete runtime overview is sent on every connection, without requiring a thread
+/// subscription, so this also covers managed sub-agents that have no sidebar row of their own.
 #[tokio::test]
 async fn pending_approval_is_replayed_to_a_client_that_connects_later() {
     use futures_util::SinkExt;
@@ -446,38 +443,28 @@ async fn pending_approval_is_replayed_to_a_client_that_connects_later() {
 
     // A second browser connects while the approval is still outstanding, and never subscribes.
     let mut latecomer = connect_ws(addr, &cookie).await;
-    let activities = wait_for_activity_bootstrap(&mut latecomer).await;
-    let mine: Vec<_> = activities
+    let overview = wait_for_runtime_overview(&mut latecomer).await;
+    let runtime = overview
+        .threads
         .iter()
-        .filter(|activity| activity.thread_id == thread_id)
-        .collect();
-    let approval = mine
-        .iter()
-        .find(|activity| {
-            matches!(
-                &activity.kind,
-                giskard_proto::ThreadActivityKind::ApprovalRequested { approval_id }
-                    if approval_id == APPROVAL_ID
-            )
-        })
-        .expect("the outstanding approval should appear in the bootstrap");
-    assert!(approval.active_turn);
-    // A non-approval server request blocks the turn just as invisibly, so it is replayed too.
-    let server_request = mine
-        .iter()
-        .find(|activity| {
-            matches!(
-                &activity.kind,
-                giskard_proto::ThreadActivityKind::ServerRequestReceived { server_request_id }
-                    if server_request_id == SERVER_REQUEST_ID
-            )
-        })
-        .expect("the outstanding server request should appear in the bootstrap");
-    assert!(server_request.active_turn);
+        .find(|runtime| runtime.thread_id == thread_id)
+        .expect("the active thread should appear in the runtime overview");
+    assert!(matches!(
+        runtime.turn_state,
+        RuntimeTurnState::Active { .. }
+    ));
+    assert!(runtime.outstanding_requests.iter().any(|request| {
+        request.request_id == APPROVAL_ID && request.kind == RequestKind::Approval
+    }));
+    // A non-approval server request blocks the turn just as invisibly, so it is present too.
+    assert!(runtime.outstanding_requests.iter().any(|request| {
+        request.request_id == SERVER_REQUEST_ID && request.kind == RequestKind::Server
+    }));
 
     // Answer both, then connect again: neither is outstanding any more, so neither may be replayed.
     // Re-alerting for something the user already dealt with is worse than silence.
     ws.send(ws_text(&ClientMessage::ApprovalDecision {
+        thread_id,
         request_id: APPROVAL_ID.into(),
         decision: ApprovalDecision::Accept,
     }))
@@ -485,6 +472,7 @@ async fn pending_approval_is_replayed_to_a_client_that_connects_later() {
     .unwrap();
     wait_for_approval_resolved(&mut ws).await;
     ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+        thread_id,
         request_id: SERVER_REQUEST_ID.into(),
         response: giskard_proto::ServerRequestResponse::result(serde_json::json!("main")),
     }))
@@ -493,26 +481,16 @@ async fn pending_approval_is_replayed_to_a_client_that_connects_later() {
     wait_for_server_request_resolved(&mut ws).await;
 
     let mut after_answer = connect_ws(addr, &cookie).await;
-    let replayed = collect_activity_bootstrap(&mut after_answer).await;
+    let after_answer = wait_for_runtime_overview(&mut after_answer).await;
+    let outstanding = after_answer
+        .threads
+        .iter()
+        .find(|runtime| runtime.thread_id == thread_id)
+        .map(|runtime| runtime.outstanding_requests.as_slice())
+        .unwrap_or_default();
     assert!(
-        !replayed
-            .iter()
-            .any(|activity| activity.thread_id == thread_id
-                && matches!(
-                    &activity.kind,
-                    giskard_proto::ThreadActivityKind::ApprovalRequested { .. }
-                )),
-        "an answered approval must not be replayed to a later client, got {replayed:?}"
-    );
-    assert!(
-        !replayed
-            .iter()
-            .any(|activity| activity.thread_id == thread_id
-                && matches!(
-                    &activity.kind,
-                    giskard_proto::ThreadActivityKind::ServerRequestReceived { .. }
-                )),
-        "an answered server request must not be replayed to a later client, got {replayed:?}"
+        outstanding.is_empty(),
+        "answered requests must not be outstanding for a later client, got {outstanding:?}"
     );
 }
 
@@ -522,8 +500,18 @@ async fn wait_for_server_request_resolved(ws: &mut TestWs) {
     while Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
-                if let Ok(ServerMessage::Event { agent_event, .. }) = serde_json::from_str(&text)
-                    && matches!(*agent_event, WireAgentEvent::ServerRequestResolved { .. })
+                if let Ok(ServerMessage::ThreadEvent { event, .. }) = serde_json::from_str(&text)
+                    && matches!(
+                        event.event,
+                        ThreadEventPayload::Request { request }
+                            if request.request_id == SERVER_REQUEST_ID
+                                && matches!(
+                                    request.status,
+                                    RequestStatus::Resolved {
+                                        resolution: RequestResolution::Server,
+                                    }
+                                )
+                    )
                 {
                     return;
                 }
@@ -535,60 +523,139 @@ async fn wait_for_server_request_resolved(ws: &mut TestWs) {
     panic!("server request resolved event not observed");
 }
 
-async fn wait_for_activity_bootstrap(ws: &mut TestWs) -> Vec<giskard_proto::ThreadActivity> {
+async fn wait_for_runtime_overview(ws: &mut TestWs) -> ThreadRuntimeOverview {
     use futures_util::StreamExt;
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
-                if let Ok(ServerMessage::ThreadActivityBootstrap { activities }) =
+                if let Ok(ServerMessage::ThreadRuntimeOverview(overview)) =
                     serde_json::from_str(&text)
                 {
-                    return activities;
+                    return overview;
                 }
             }
             Ok(Some(Ok(_))) => {}
             _ => {}
         }
     }
-    panic!("activity bootstrap not observed");
+    panic!("runtime overview not observed");
 }
 
-/// Like `wait_for_activity_bootstrap`, but tolerates the message being absent: with nothing
-/// outstanding the server sends no bootstrap at all, which is the expected result after answering.
-async fn collect_activity_bootstrap(ws: &mut TestWs) -> Vec<giskard_proto::ThreadActivity> {
+async fn wait_for_bootstrap(ws: &mut TestWs, thread_id: ThreadId) -> ThreadBootstrapPayload {
     use futures_util::StreamExt;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let mut seen = Vec::new();
-    while Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
-            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
-                if let Ok(ServerMessage::ThreadActivityBootstrap { activities }) =
-                    serde_json::from_str(&text)
-                {
-                    seen.extend(activities);
-                }
-            }
-            Ok(Some(Ok(_))) => {}
-            _ => {}
-        }
-    }
-    seen
-}
 
-async fn wait_for_live_snapshot(ws: &mut TestWs) -> giskard_proto::LiveTurnSnapshot {
-    use futures_util::StreamExt;
     let deadline = Instant::now() + Duration::from_secs(5);
+    let mut generation = None;
+    let mut expected = HashMap::new();
+    let mut chunks: HashMap<BootstrapSection, BTreeMap<u32, Vec<u8>>> = HashMap::new();
     while Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
-                if let Ok(ServerMessage::LiveTurnSnapshot(snapshot)) = serde_json::from_str(&text) {
-                    return snapshot;
+                let Ok(ServerMessage::ThreadBootstrap {
+                    thread_id: message_thread_id,
+                    subscription_generation,
+                    frame,
+                }) = serde_json::from_str(&text)
+                else {
+                    continue;
+                };
+                if message_thread_id != thread_id {
+                    continue;
+                }
+                match frame {
+                    ThreadBootstrapFrame::Start { sections } => {
+                        generation = Some(subscription_generation);
+                        expected = sections
+                            .into_iter()
+                            .map(|section| (section.section, section.chunk_count))
+                            .collect();
+                        chunks.clear();
+                    }
+                    ThreadBootstrapFrame::Chunk {
+                        section,
+                        index,
+                        payload_base64,
+                    } if generation == Some(subscription_generation) => {
+                        let payload = BASE64
+                            .decode(payload_base64)
+                            .expect("bootstrap chunks should contain valid base64");
+                        chunks.entry(section).or_default().insert(index, payload);
+                    }
+                    ThreadBootstrapFrame::Commit if generation == Some(subscription_generation) => {
+                        for (section, chunk_count) in &expected {
+                            assert_eq!(
+                                chunks.get(section).map(BTreeMap::len),
+                                Some(*chunk_count as usize),
+                                "bootstrap section {section:?} was incomplete at commit"
+                            );
+                        }
+                        return decode_bootstrap_sections(&mut chunks);
+                    }
+                    ThreadBootstrapFrame::Chunk { .. } | ThreadBootstrapFrame::Commit => {}
                 }
             }
             Ok(Some(Ok(_))) => {}
             _ => {}
         }
     }
-    panic!("live turn snapshot not observed");
+    panic!("committed thread bootstrap not observed");
+}
+
+fn decode_bootstrap_sections(
+    chunks: &mut HashMap<BootstrapSection, BTreeMap<u32, Vec<u8>>>,
+) -> ThreadBootstrapPayload {
+    ThreadBootstrapPayload {
+        metadata: take_bootstrap_section(chunks, BootstrapSection::Metadata),
+        history: take_bootstrap_section(chunks, BootstrapSection::History),
+        live_turn: take_bootstrap_section(chunks, BootstrapSection::LiveTurn),
+        ordered_suffix: take_bootstrap_section(chunks, BootstrapSection::OrderedSuffix),
+        final_runtime: take_bootstrap_section(chunks, BootstrapSection::FinalRuntime),
+        notices: take_bootstrap_section(chunks, BootstrapSection::Notices),
+    }
+}
+
+fn take_bootstrap_section<T>(
+    chunks: &mut HashMap<BootstrapSection, BTreeMap<u32, Vec<u8>>>,
+    section: BootstrapSection,
+) -> T
+where
+    T: serde::de::DeserializeOwned,
+{
+    let section_chunks = chunks
+        .remove(&section)
+        .unwrap_or_else(|| panic!("bootstrap section {section:?} was absent"));
+    let mut encoded = Vec::new();
+    for (expected_index, (index, chunk)) in section_chunks.into_iter().enumerate() {
+        assert_eq!(index as usize, expected_index, "bootstrap chunk gap");
+        encoded.extend(chunk);
+    }
+    serde_json::from_slice(&encoded)
+        .unwrap_or_else(|error| panic!("bootstrap section {section:?} was invalid: {error}"))
+}
+
+fn request_with_id<'a>(
+    event: &'a ThreadEventPayload,
+    request_id: &str,
+) -> Option<&'a RequestState> {
+    match event {
+        ThreadEventPayload::Request { request } if request.request_id == request_id => {
+            Some(request)
+        }
+        ThreadEventPayload::Agent { .. } | ThreadEventPayload::Request { .. } => None,
+    }
+}
+
+fn assert_resolved_approval(request: &RequestState) {
+    assert!(matches!(
+        &request.payload,
+        RequestPayload::Approval { request: approval }
+            if approval.id == ApprovalId(APPROVAL_ID.into())
+    ));
+    assert!(matches!(
+        &request.status,
+        RequestStatus::Resolved {
+            resolution: RequestResolution::Approval { decision },
+        } if *decision == ApprovalDecision::Accept
+    ));
 }

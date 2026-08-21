@@ -15,7 +15,8 @@ use giskard_harness::AgentHarness;
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 use giskard_persist::store::ProjectConfig;
 use giskard_proto::{
-    ClientMessage, ErrorSeverity, ServerMessage, WireAgentEvent, WireApprovalMetadata,
+    ClientMessage, ErrorSeverity, RequestPayload, ServerMessage, ThreadEventPayload,
+    WireAgentEvent, WireApprovalMetadata,
 };
 use giskard_server::{AppState, HarnessFactory, build_app};
 
@@ -326,8 +327,9 @@ async fn modes_models_approvals_and_plan_dump() {
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
-                if let Ok(ServerMessage::Event { agent_event, .. }) = serde_json::from_str(&t) {
-                    if let WireAgentEvent::ApprovalRequested { request, .. } = agent_event.as_ref()
+                if let Ok(ServerMessage::ThreadEvent { event, .. }) = serde_json::from_str(&t) {
+                    if let ThreadEventPayload::Request { request } = &event.event
+                        && let RequestPayload::Approval { request } = &request.payload
                     {
                         assert!(request.metadata.iter().any(|metadata| {
                             matches!(
@@ -376,7 +378,11 @@ async fn modes_models_approvals_and_plan_dump() {
                         }));
                         saw_approval_metadata = true;
                     }
-                    if matches!(*agent_event, WireAgentEvent::TurnCompleted { .. }) {
+                    if matches!(
+                        event.event,
+                        ThreadEventPayload::Agent { agent_event }
+                            if matches!(*agent_event, WireAgentEvent::TurnCompleted { .. })
+                    ) {
                         saw_completed = true;
                         break;
                     }
@@ -413,7 +419,7 @@ async fn modes_models_approvals_and_plan_dump() {
     // --- Approval routing: the streamed approval was indexed; responding routes it (no error). ---
     let routed = state
         .registry
-        .respond_approval(ApprovalId("ap_1".into()), ApprovalDecision::Accept)
+        .respond_approval(tid, ApprovalId("ap_1".into()), ApprovalDecision::Accept)
         .await;
     assert!(
         routed.is_ok(),

@@ -145,6 +145,13 @@ as the best available proxy for "how full is the active conversation?" Clicking 
 card with both the current context footprint and cumulative input/output/total tokens. Those
 cumulative totals can legitimately exceed the model's context window over a long thread.
 
+If a tab falls behind or reconnects, Giskard rebuilds that thread from one staged history/runtime
+snapshot and resumes ordered updates on the same WebSocket; another thread on the connection is not
+disconnected to repair it. Running-task snapshots update only the **Tasks** menu—the transcript is
+created by history and ordered agent events. If a completed turn cannot be saved after bounded
+retries, the thread stays blocked with **Retry save** and confirmed **Discard turn** actions instead
+of silently releasing the turn or pretending it was persisted.
+
 > **Common gotcha:** with `secure_cookies = true` over plain HTTP, the browser drops the session
 > cookie — login appears to succeed but nothing loads. Use `false` for local HTTP; set `true` only
 > behind HTTPS/TLS (e.g. an Nginx terminator).

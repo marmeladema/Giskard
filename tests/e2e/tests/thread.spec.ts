@@ -80,7 +80,7 @@ test.describe("projects and threads", () => {
     await expect(page.locator("#wsStatusBadge")).toHaveText("Connected");
   });
 
-  test("foregrounding a healthy open websocket keeps it after pong", async ({ page }) => {
+  test("foregrounding a healthy open websocket keeps it after a server response", async ({ page }) => {
     const project = page.locator(".proj", { hasText: "Demo" });
     await project.locator(".project-add").click();
 
@@ -113,7 +113,7 @@ test.describe("projects and threads", () => {
       const diagnostics = snapshot?.diagnostics || [];
       return diagnostics.some((entry: any) =>
         entry.category === "websocket" &&
-        entry.reason === "ws_probe_pong" &&
+        entry.reason === "ws_probe_message" &&
         entry.detail?.ready_state === "open"
       ) && !diagnostics.some((entry: any) =>
         entry.category === "websocket" &&

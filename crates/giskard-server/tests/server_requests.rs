@@ -2,10 +2,13 @@
 
 mod common;
 
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use giskard_core::error::HarnessError;
@@ -20,7 +23,11 @@ use giskard_harness::{
     AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
 };
 use giskard_persist::store::ProjectConfig;
-use giskard_proto::{ClientMessage, LiveTurnSnapshot, ServerMessage, WireAgentEvent};
+use giskard_proto::{
+    BootstrapSection, ClientMessage, RequestKind, RequestPayload, RequestResolution, RequestState,
+    RequestStatus, RuntimeTurnState, ServerMessage, ThreadBootstrapFrame, ThreadBootstrapPayload,
+    ThreadEventPayload, ThreadRuntimeOverview,
+};
 use giskard_server::{AppState, HarnessFactory, build_app};
 use tokio::sync::{Mutex, broadcast};
 use tokio::time::{Duration, Instant};
@@ -35,6 +42,7 @@ struct ServerRequestHarness {
     active: Mutex<Option<(ThreadId, TurnId)>>,
     responses: Mutex<Vec<(ServerRequestId, ServerRequestResponse)>>,
     fail_next_response: Mutex<Option<HarnessError>>,
+    delay_next_response: Mutex<Option<Duration>>,
     /// When set, routing a response does not emit `ServerRequestResolved`/`TurnCompleted`. Real
     /// harnesses resolve on their own schedule and may never resolve at all, and that window is
     /// exactly what the reconnect snapshot has to survive.
@@ -49,6 +57,7 @@ impl ServerRequestHarness {
             active: Mutex::new(None),
             responses: Mutex::new(Vec::new()),
             fail_next_response: Mutex::new(None),
+            delay_next_response: Mutex::new(None),
             suppress_resolution: Mutex::new(false),
         }
     }
@@ -59,6 +68,10 @@ impl ServerRequestHarness {
 
     async fn fail_next_response(&self, error: HarnessError) {
         *self.fail_next_response.lock().await = Some(error);
+    }
+
+    async fn delay_next_response(&self, delay: Duration) {
+        *self.delay_next_response.lock().await = Some(delay);
     }
 
     async fn wait_for_response(&self) -> (ServerRequestId, ServerRequestResponse) {
@@ -164,6 +177,9 @@ impl AgentHarness for ServerRequestHarness {
         req: ServerRequestId,
         response: ServerRequestResponse,
     ) -> Result<(), HarnessError> {
+        if let Some(delay) = self.delay_next_response.lock().await.take() {
+            tokio::time::sleep(delay).await;
+        }
         if let Some(error) = self.fail_next_response.lock().await.take() {
             return Err(error);
         }
@@ -340,8 +356,9 @@ async fn websocket_server_request_response_routes_to_harness() {
     .await
     .unwrap();
 
-    wait_for_server_request(&mut ws).await;
+    wait_for_server_request(&mut ws, thread_id).await;
     ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+        thread_id,
         request_id: "srv_1".into(),
         response: ServerRequestResponse::result(serde_json::json!({
             "answers": { "confirm": { "answers": ["Yes"] } }
@@ -350,6 +367,19 @@ async fn websocket_server_request_response_routes_to_harness() {
     .await
     .unwrap();
 
+    wait_for_server_request_status(&mut ws, thread_id, |status| {
+        matches!(status, RequestStatus::Responding)
+    })
+    .await;
+    wait_for_server_request_status(&mut ws, thread_id, |status| {
+        matches!(
+            status,
+            RequestStatus::Resolved {
+                resolution: RequestResolution::Server
+            }
+        )
+    })
+    .await;
     let (request_id, response) = harness.wait_for_response().await;
     assert_eq!(request_id, ServerRequestId("srv_1".into()));
     match response {
@@ -378,14 +408,28 @@ async fn websocket_server_request_error_response_routes_to_harness() {
     .await
     .unwrap();
 
-    wait_for_server_request(&mut ws).await;
+    wait_for_server_request(&mut ws, thread_id).await;
     ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+        thread_id,
         request_id: "srv_1".into(),
         response: ServerRequestResponse::error(-32000, "cancelled"),
     }))
     .await
     .unwrap();
 
+    wait_for_server_request_status(&mut ws, thread_id, |status| {
+        matches!(status, RequestStatus::Responding)
+    })
+    .await;
+    wait_for_server_request_status(&mut ws, thread_id, |status| {
+        matches!(
+            status,
+            RequestStatus::Resolved {
+                resolution: RequestResolution::Server
+            }
+        )
+    })
+    .await;
     let (request_id, response) = harness.wait_for_response().await;
     assert_eq!(request_id, ServerRequestId("srv_1".into()));
     match response {
@@ -415,12 +459,13 @@ async fn websocket_server_request_response_failure_can_be_retried() {
     .await
     .unwrap();
 
-    wait_for_server_request(&mut ws).await;
+    wait_for_server_request(&mut ws, thread_id).await;
     harness
         .fail_next_response(HarnessError::Protocol("temporary failure".into()))
         .await;
 
     ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+        thread_id,
         request_id: "srv_1".into(),
         response: ServerRequestResponse::result(serde_json::json!({
             "answers": { "confirm": { "answers": ["Yes"] } }
@@ -429,6 +474,14 @@ async fn websocket_server_request_response_failure_can_be_retried() {
     .await
     .unwrap();
 
+    wait_for_server_request_status(&mut ws, thread_id, |status| {
+        matches!(status, RequestStatus::Responding)
+    })
+    .await;
+    wait_for_server_request_status(&mut ws, thread_id, |status| {
+        matches!(status, RequestStatus::Pending)
+    })
+    .await;
     let error = wait_for_ws_error(&mut ws).await;
     assert_eq!(error.code, "harness_protocol_error");
     assert_eq!(error.action.as_deref(), Some("server_request_response"));
@@ -441,6 +494,7 @@ async fn websocket_server_request_response_failure_can_be_retried() {
     );
 
     ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+        thread_id,
         request_id: "srv_1".into(),
         response: ServerRequestResponse::result(serde_json::json!({
             "answers": { "confirm": { "answers": ["Yes"] } }
@@ -449,6 +503,19 @@ async fn websocket_server_request_response_failure_can_be_retried() {
     .await
     .unwrap();
 
+    wait_for_server_request_status(&mut ws, thread_id, |status| {
+        matches!(status, RequestStatus::Responding)
+    })
+    .await;
+    wait_for_server_request_status(&mut ws, thread_id, |status| {
+        matches!(
+            status,
+            RequestStatus::Resolved {
+                resolution: RequestResolution::Server
+            }
+        )
+    })
+    .await;
     let (request_id, response) = harness.wait_for_response().await;
     assert_eq!(request_id, ServerRequestId("srv_1".into()));
     match response {
@@ -457,6 +524,57 @@ async fn websocket_server_request_response_failure_can_be_retried() {
         }
         ServerRequestResponse::Error { .. } => panic!("expected retry result response"),
     }
+}
+
+#[tokio::test]
+async fn timed_out_server_request_response_publishes_rollback_to_every_tab() {
+    let (_tmp, harness, addr, cookie, thread_id) = spawn_test_app().await;
+    let mut first = connect_ws(addr, &cookie).await;
+    let mut second = connect_ws(addr, &cookie).await;
+    for ws in [&mut first, &mut second] {
+        ws.send(ws_text(&ClientMessage::Subscribe {
+            thread_id,
+            since: None,
+        }))
+        .await
+        .unwrap();
+    }
+    first
+        .send(ws_text(&ClientMessage::SendInput {
+            thread_id,
+            text: "ask me".into(),
+            attachments: Vec::new(),
+        }))
+        .await
+        .unwrap();
+    wait_for_server_request(&mut first, thread_id).await;
+    wait_for_server_request(&mut second, thread_id).await;
+    harness.delay_next_response(Duration::from_secs(3)).await;
+
+    first
+        .send(ws_text(&ClientMessage::ServerRequestResponse {
+            thread_id,
+            request_id: "srv_1".into(),
+            response: ServerRequestResponse::result(serde_json::json!({
+                "answers": { "confirm": { "answers": ["Yes"] } }
+            })),
+        }))
+        .await
+        .unwrap();
+
+    for ws in [&mut first, &mut second] {
+        wait_for_server_request_status(ws, thread_id, |status| {
+            matches!(status, RequestStatus::Responding)
+        })
+        .await;
+        wait_for_server_request_status(ws, thread_id, |status| {
+            matches!(status, RequestStatus::Pending)
+        })
+        .await;
+    }
+    let error = wait_for_ws_error(&mut first).await;
+    assert_eq!(error.code, "harness_timeout");
+    assert_eq!(error.action.as_deref(), Some("server_request_response"));
 }
 
 #[tokio::test]
@@ -477,9 +595,18 @@ async fn websocket_subscribe_replays_pending_server_request_snapshot() {
     .await
     .unwrap();
 
-    wait_for_server_request(&mut ws).await;
+    wait_for_server_request(&mut ws, thread_id).await;
 
     let mut reconnect = connect_ws(addr, &cookie).await;
+    let overview = wait_for_runtime_overview(&mut reconnect).await;
+    let runtime = runtime_for_thread(&overview, thread_id);
+    assert!(matches!(
+        runtime.turn_state,
+        RuntimeTurnState::Active { .. }
+    ));
+    assert!(runtime.outstanding_requests.iter().any(|request| {
+        request.request_id == "srv_1" && request.kind == RequestKind::Server && !request.responding
+    }));
     reconnect
         .send(ws_text(&ClientMessage::Subscribe {
             thread_id,
@@ -488,20 +615,10 @@ async fn websocket_subscribe_replays_pending_server_request_snapshot() {
         .await
         .unwrap();
 
-    let snapshot = wait_for_live_snapshot(&mut reconnect).await;
-    assert_eq!(snapshot.thread_id, thread_id);
-    // The outstanding server request is derived from `accumulated` plus
-    // `answered_server_requests`, so the still-open one is reported as pending.
-    let rows = server_request_rows(&snapshot);
-    let [(request, resolved)] = &rows[..] else {
-        panic!("expected exactly one server request row, got {rows:?}");
-    };
-    assert_eq!(request.id, ServerRequestId("srv_1".into()));
-    assert_eq!(request.method, "item/tool/requestUserInput");
-    assert!(
-        !resolved,
-        "nobody answered it, so its row must still read open"
-    );
+    let bootstrap = wait_for_bootstrap(&mut reconnect, thread_id).await;
+    let request = request_from_final_runtime(&bootstrap, "srv_1");
+    assert_server_request(request, thread_id);
+    assert!(matches!(request.status, RequestStatus::Pending));
 }
 
 /// A server request the user answered must not come back actionable on reconnect, even when the
@@ -527,19 +644,39 @@ async fn answered_server_request_is_not_pending_after_reconnect() {
     }))
     .await
     .unwrap();
-    wait_for_server_request(&mut ws).await;
+    wait_for_server_request(&mut ws, thread_id).await;
 
     ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+        thread_id,
         request_id: "srv_1".into(),
         response: ServerRequestResponse::result(serde_json::json!({ "answers": ["main"] })),
     }))
     .await
     .unwrap();
-    // The harness confirms it received the answer; it deliberately never resolves it.
+    wait_for_server_request_status(&mut ws, thread_id, |status| {
+        matches!(status, RequestStatus::Responding)
+    })
+    .await;
+    wait_for_server_request_status(&mut ws, thread_id, |status| {
+        matches!(
+            status,
+            RequestStatus::Resolved {
+                resolution: RequestResolution::Server
+            }
+        )
+    })
+    .await;
+    // The harness confirms it received the answer; it deliberately never emits its own resolution.
     let (answered_id, _) = harness.wait_for_response().await;
     assert_eq!(answered_id, ServerRequestId("srv_1".into()));
 
     let mut reconnect = connect_ws(addr, &cookie).await;
+    let overview = wait_for_runtime_overview(&mut reconnect).await;
+    let runtime = runtime_for_thread(&overview, thread_id);
+    assert!(
+        runtime.outstanding_requests.is_empty(),
+        "the committed response must no longer be outstanding"
+    );
     reconnect
         .send(ws_text(&ClientMessage::Subscribe {
             thread_id,
@@ -548,30 +685,17 @@ async fn answered_server_request_is_not_pending_after_reconnect() {
         .await
         .unwrap();
 
-    let snapshot = wait_for_live_snapshot(&mut reconnect).await;
-    // The request is still replayed — its own row is what says it was answered, so the card renders
-    // resolved instead of re-prompting.
-    let rows = server_request_rows(&snapshot);
-    let [(request, resolved)] = &rows[..] else {
-        panic!("expected exactly one server request row, got {rows:?}");
-    };
-    assert_eq!(request.id, ServerRequestId("srv_1".into()));
+    let bootstrap = wait_for_bootstrap(&mut reconnect, thread_id).await;
+    let request = request_from_final_runtime(&bootstrap, "srv_1");
+    assert_server_request(request, thread_id);
     assert!(
-        resolved,
-        "an answered request's row must be stamped resolved so it is not replayed as actionable"
-    );
-    assert_eq!(
-        snapshot.answered_server_requests,
-        vec![ServerRequestId("srv_1".into())],
-        "the reconnect snapshot must name the answered request so its card renders resolved"
-    );
-    // It is still in the replayed events; naming it answered is what stops it re-prompting.
-    assert!(
-        snapshot.accumulated.iter().any(|event| matches!(
-            event,
-            giskard_proto::WireAgentEvent::ServerRequestReceived { .. }
-        )),
-        "the request should still appear in the accumulated events"
+        matches!(
+            request.status,
+            RequestStatus::Resolved {
+                resolution: RequestResolution::Server
+            }
+        ),
+        "an answered request must reconnect as resolved rather than actionable"
     );
 }
 
@@ -586,6 +710,7 @@ async fn websocket_unknown_server_request_response_surfaces_error() {
     .await
     .unwrap();
     ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+        thread_id,
         request_id: "missing".into(),
         response: ServerRequestResponse::error(-32000, "missing"),
     }))
@@ -598,22 +723,44 @@ async fn websocket_unknown_server_request_response_surfaces_error() {
     assert!(error.message.contains("protocol error"));
 }
 
-async fn wait_for_server_request(ws: &mut TestWs) {
+async fn wait_for_server_request(ws: &mut TestWs, thread_id: ThreadId) -> RequestState {
+    wait_for_server_request_status(ws, thread_id, |status| {
+        matches!(status, RequestStatus::Pending)
+    })
+    .await
+}
+
+async fn wait_for_server_request_status<F>(
+    ws: &mut TestWs,
+    thread_id: ThreadId,
+    status_matches: F,
+) -> RequestState
+where
+    F: Fn(&RequestStatus) -> bool,
+{
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
-                if let Ok(ServerMessage::Event { agent_event, .. }) = serde_json::from_str(&text)
-                    && matches!(*agent_event, WireAgentEvent::ServerRequestReceived { .. })
+                if let Ok(ServerMessage::ThreadEvent {
+                    thread_id: message_thread_id,
+                    event,
+                    ..
+                }) = serde_json::from_str(&text)
+                    && message_thread_id == thread_id
+                    && let ThreadEventPayload::Request { request } = event.event
+                    && request.request_id == "srv_1"
+                    && status_matches(&request.status)
                 {
-                    return;
+                    assert_server_request(&request, thread_id);
+                    return *request;
                 }
             }
             Ok(Some(Ok(_))) => {}
             _ => {}
         }
     }
-    panic!("server request event not observed");
+    panic!("matching server request transition not observed");
 }
 
 async fn wait_for_ws_error(ws: &mut TestWs) -> giskard_proto::ErrorInfo {
@@ -632,43 +779,142 @@ async fn wait_for_ws_error(ws: &mut TestWs) -> giskard_proto::ErrorInfo {
     panic!("error message not observed");
 }
 
-/// Every server-request row in the snapshot, paired with whether a reconnecting client would
-/// render it resolved (answered by the user or closed by the harness). Mirrors the client's
-/// `outstandingServerRequests` derivation.
-fn server_request_rows(snapshot: &LiveTurnSnapshot) -> Vec<(ServerRequest, bool)> {
-    let answered: std::collections::HashSet<ServerRequestId> =
-        snapshot.answered_server_requests.iter().cloned().collect();
-    let mut closed = std::collections::HashSet::new();
-    for ev in &snapshot.accumulated {
-        if let WireAgentEvent::ServerRequestResolved { request_id, .. } = ev {
-            closed.insert(request_id.clone());
-        }
-    }
-    snapshot
-        .accumulated
-        .iter()
-        .filter_map(|event| match event {
-            WireAgentEvent::ServerRequestReceived { request, .. } => Some((
-                request.clone(),
-                answered.contains(&request.id) || closed.contains(&request.id),
-            )),
-            _ => None,
-        })
-        .collect()
+fn assert_server_request(request: &RequestState, thread_id: ThreadId) {
+    assert_eq!(request.thread_id, thread_id);
+    let RequestPayload::Server { request } = &request.payload else {
+        panic!("expected server request payload");
+    };
+    assert_eq!(request.id, ServerRequestId("srv_1".into()));
+    assert_eq!(request.method, "item/tool/requestUserInput");
 }
 
-async fn wait_for_live_snapshot(ws: &mut TestWs) -> giskard_proto::LiveTurnSnapshot {
+async fn wait_for_runtime_overview(ws: &mut TestWs) -> ThreadRuntimeOverview {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
-                if let Ok(ServerMessage::LiveTurnSnapshot(snapshot)) = serde_json::from_str(&text) {
-                    return snapshot;
+                if let Ok(ServerMessage::ThreadRuntimeOverview(overview)) =
+                    serde_json::from_str(&text)
+                {
+                    return overview;
                 }
             }
             Ok(Some(Ok(_))) => {}
             _ => {}
         }
     }
-    panic!("live turn snapshot not observed");
+    panic!("runtime overview not observed");
+}
+
+fn runtime_for_thread(
+    overview: &ThreadRuntimeOverview,
+    thread_id: ThreadId,
+) -> &giskard_proto::ThreadRuntimeSummary {
+    overview
+        .threads
+        .iter()
+        .find(|runtime| runtime.thread_id == thread_id)
+        .expect("active thread should be present in runtime overview")
+}
+
+async fn wait_for_bootstrap(ws: &mut TestWs, thread_id: ThreadId) -> ThreadBootstrapPayload {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut generation = None;
+    let mut expected = HashMap::new();
+    let mut chunks: HashMap<BootstrapSection, BTreeMap<u32, Vec<u8>>> = HashMap::new();
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                let Ok(ServerMessage::ThreadBootstrap {
+                    thread_id: message_thread_id,
+                    subscription_generation,
+                    frame,
+                }) = serde_json::from_str(&text)
+                else {
+                    continue;
+                };
+                if message_thread_id != thread_id {
+                    continue;
+                }
+                match frame {
+                    ThreadBootstrapFrame::Start { sections } => {
+                        generation = Some(subscription_generation);
+                        expected = sections
+                            .into_iter()
+                            .map(|section| (section.section, section.chunk_count))
+                            .collect();
+                        chunks.clear();
+                    }
+                    ThreadBootstrapFrame::Chunk {
+                        section,
+                        index,
+                        payload_base64,
+                    } if generation == Some(subscription_generation) => {
+                        let payload = BASE64
+                            .decode(payload_base64)
+                            .expect("bootstrap chunks should contain valid base64");
+                        chunks.entry(section).or_default().insert(index, payload);
+                    }
+                    ThreadBootstrapFrame::Commit if generation == Some(subscription_generation) => {
+                        for (section, chunk_count) in &expected {
+                            assert_eq!(
+                                chunks.get(section).map(BTreeMap::len),
+                                Some(*chunk_count as usize),
+                                "bootstrap section {section:?} was incomplete at commit"
+                            );
+                        }
+                        return decode_bootstrap_sections(&mut chunks);
+                    }
+                    ThreadBootstrapFrame::Chunk { .. } | ThreadBootstrapFrame::Commit => {}
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => {}
+        }
+    }
+    panic!("committed thread bootstrap not observed");
+}
+
+fn decode_bootstrap_sections(
+    chunks: &mut HashMap<BootstrapSection, BTreeMap<u32, Vec<u8>>>,
+) -> ThreadBootstrapPayload {
+    ThreadBootstrapPayload {
+        metadata: take_bootstrap_section(chunks, BootstrapSection::Metadata),
+        history: take_bootstrap_section(chunks, BootstrapSection::History),
+        live_turn: take_bootstrap_section(chunks, BootstrapSection::LiveTurn),
+        ordered_suffix: take_bootstrap_section(chunks, BootstrapSection::OrderedSuffix),
+        final_runtime: take_bootstrap_section(chunks, BootstrapSection::FinalRuntime),
+        notices: take_bootstrap_section(chunks, BootstrapSection::Notices),
+    }
+}
+
+fn take_bootstrap_section<T>(
+    chunks: &mut HashMap<BootstrapSection, BTreeMap<u32, Vec<u8>>>,
+    section: BootstrapSection,
+) -> T
+where
+    T: serde::de::DeserializeOwned,
+{
+    let section_chunks = chunks
+        .remove(&section)
+        .unwrap_or_else(|| panic!("bootstrap section {section:?} was absent"));
+    let mut encoded = Vec::new();
+    for (expected_index, (index, chunk)) in section_chunks.into_iter().enumerate() {
+        assert_eq!(index as usize, expected_index, "bootstrap chunk gap");
+        encoded.extend(chunk);
+    }
+    serde_json::from_slice(&encoded)
+        .unwrap_or_else(|error| panic!("bootstrap section {section:?} was invalid: {error}"))
+}
+
+fn request_from_final_runtime<'a>(
+    bootstrap: &'a ThreadBootstrapPayload,
+    request_id: &str,
+) -> &'a RequestState {
+    bootstrap
+        .final_runtime
+        .requests
+        .iter()
+        .find(|request| request.request_id == request_id)
+        .expect("server request should be present in final runtime")
 }

@@ -1,5 +1,6 @@
-//! End-to-end coverage: a running tool/MCP call surfaces in the `RunningTasks` snapshot through the
-//! real server path (registry forward → broadcast → WebSocket), the same way commands do (TK1).
+//! End-to-end coverage: a running tool/MCP call surfaces in the `ThreadTasks` snapshot through the
+//! real server path (registry forward → runtime → WebSocket), independently of transcript
+//! rendering.
 
 mod common;
 
@@ -289,9 +290,9 @@ async fn running_tool_call_surfaces_in_running_tasks_snapshot() {
         let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
             continue;
         };
-        if let ServerMessage::RunningTasks { tasks, .. } =
+        if let ServerMessage::ThreadTasks(snapshot) =
             serde_json::from_str::<ServerMessage>(&text).unwrap()
-            && let Some(task) = tasks.iter().find(|t| t.kind == TaskKind::Tool)
+            && let Some(task) = snapshot.tasks.iter().find(|t| t.kind == TaskKind::Tool)
         {
             assert_eq!(task.command, "search");
             assert_eq!(task.server.as_deref(), Some("wiki"));
@@ -321,11 +322,14 @@ async fn running_tool_call_surfaces_in_running_tasks_snapshot() {
         let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
             continue;
         };
-        if let ServerMessage::RunningTasks { tasks, .. } =
+        if let ServerMessage::ThreadTasks(snapshot) =
             serde_json::from_str::<ServerMessage>(&text).unwrap()
-            && tasks.iter().all(|task| task.item_id != tool_item_id)
+            && snapshot
+                .tasks
+                .iter()
+                .all(|task| task.item_id != tool_item_id)
         {
-            assert!(state.running_commands.snapshot(thread_id).await.is_empty());
+            assert!(state.runtime.task_snapshot(thread_id).tasks.is_empty());
             return;
         }
     }

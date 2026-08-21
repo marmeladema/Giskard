@@ -78,7 +78,7 @@ test.describe("sub-agent blocked on an approval", () => {
     // The tooltip names the blocked sub-agent, so the row is not an unattributable badge.
     await expect(status).toHaveAttribute(
       "title",
-      new RegExp(`${SCRIPTED_APPROVAL_SUBAGENT_NAME}: Approval requested`),
+      new RegExp(`${SCRIPTED_APPROVAL_SUBAGENT_NAME}: Waiting for your input`),
     );
 
     // The child is deliberately absent from the sidebar; only the ancestor reports it.
@@ -108,7 +108,7 @@ test.describe("sub-agent blocked on an approval", () => {
     expect(approval).toBeTruthy();
     expect(approval!.title).toBe("Giskard: sub-agent approval needed");
     expect(approval!.body).toContain(`${SCRIPTED_APPROVAL_SUBAGENT_NAME} (in `);
-    expect(approval!.body).toContain("Approval requested");
+    expect(approval!.body).toContain("Waiting for your input");
     expect(approval!.data?.threadId).toBe(child);
   });
 
@@ -151,22 +151,43 @@ test.describe("sub-agent blocked on an approval", () => {
     await expect(page.locator("#subagentsBtn")).not.toHaveClass(/\bstate-waiting\b/);
   });
 
-  // The hoisting rules decide which of several states one row shows. Drive them through the app's
-  // own entry points so the priority order and the cycle guard are pinned without depending on
-  // harness timing.
+  // The hoisting rules decide which of several runtime summaries one row shows. Drive them through
+  // the authoritative replacement entry point so the priority order and cycle guard are pinned
+  // without depending on harness timing.
   test("hoists the most urgent descendant state and survives corrupted ownership", async ({ page }) => {
-    const result = await page.evaluate(() => {
+    const result = await page.evaluate(async () => {
       const app = window as unknown as {
         rememberProjectThreads: (pid: string, threads: unknown[]) => void;
-        handleThreadActivity: (msg: Record<string, unknown>) => void;
-        clearApprovalThreadActivity: (tid: string, approvalId: string) => void;
+        applyRuntimeOverview: (msg: {
+          revision: number;
+          threads: Array<{
+            thread_id: string;
+            turn_state: { state: "idle" | "active" | "persistence_blocked" };
+            outstanding_requests: Array<{
+              request_id: string;
+              kind: "approval" | "server";
+              responding: boolean;
+            }>;
+          }>;
+        }) => void;
         activityHostThreadId: (tid: string) => string | null;
         threadDescendsFrom: (tid: string, ancestorId: string) => boolean;
-        effectiveThreadActivity: (tid: string) => {
+        effectiveRuntimeSummary: (tid: string) => {
           activity: { kind: string } | null;
           origin: string | null;
         };
-        renderThreadActivityIndicator: (tid: string) => void;
+        runtimeSummaryActivity: (
+          summary: Record<string, unknown>,
+          unread: boolean,
+        ) => {
+          kind: string;
+          approval_id: string | null;
+          requests: Array<{ request_id: string; responding: boolean }>;
+        };
+        maybeNotifyWaitingRequest: (
+          tid: string,
+          activity: Record<string, unknown>,
+        ) => Promise<void>;
       };
 
       // A synthetic project: root (the only thread with a sidebar row) → child → grandchild, plus a
@@ -200,17 +221,27 @@ test.describe("sub-agent blocked on an approval", () => {
 
       try {
         // A merely-running root must not mask a grandchild blocked on an approval.
-        app.handleThreadActivity({
-          thread_id: "root", kind: "progress", active_turn: true, summary: "Turn running",
-        });
-        app.handleThreadActivity({
-          thread_id: "grandchild", kind: "approval_requested", active_turn: true,
-          approval_id: "a1", summary: "Approval requested",
+        app.applyRuntimeOverview({
+          revision: Number.MAX_SAFE_INTEGER - 1,
+          threads: [
+            {
+              thread_id: "root",
+              turn_state: { state: "active" },
+              outstanding_requests: [],
+            },
+            {
+              thread_id: "grandchild",
+              turn_state: { state: "active" },
+              outstanding_requests: [
+                { request_id: "a1", kind: "approval", responding: false },
+              ],
+            },
+          ],
         });
         const hoisted = {
           host: app.activityHostThreadId("grandchild"),
-          winner: app.effectiveThreadActivity("root").activity?.kind ?? null,
-          origin: app.effectiveThreadActivity("root").origin,
+          winner: app.effectiveRuntimeSummary("root").activity?.kind ?? null,
+          origin: app.effectiveRuntimeSummary("root").origin,
           statusText: status.textContent,
           rowClass: row.className,
           title: status.title,
@@ -218,16 +249,44 @@ test.describe("sub-agent blocked on an approval", () => {
           unrelated: app.threadDescendsFrom("root", "grandchild"),
         };
 
-        // Once answered, the row falls back to root's own running state and drops the escalation.
-        app.clearApprovalThreadActivity("grandchild", "a1");
+        // While delivery is in progress, the request remains exact runtime membership but is no
+        // longer actionable. The row falls back to root's own running state and drops the
+        // escalation.
+        app.applyRuntimeOverview({
+          revision: Number.MAX_SAFE_INTEGER,
+          threads: [
+            {
+              thread_id: "root",
+              turn_state: { state: "active" },
+              outstanding_requests: [],
+            },
+            {
+              thread_id: "grandchild",
+              turn_state: { state: "active" },
+              outstanding_requests: [
+                { request_id: "a1-responding", kind: "approval", responding: true },
+              ],
+            },
+          ],
+        });
         const afterAnswer = { statusText: status.textContent, rowClass: row.className };
+        const responding = app.runtimeSummaryActivity({
+          turn_state: { state: "active" },
+          outstanding_requests: [
+            { request_id: "a1-responding", kind: "approval", responding: true },
+          ],
+        }, true);
+        await app.maybeNotifyWaitingRequest("grandchild", responding);
+        const respondingNotifications = (window.__giskardNotifications ?? []).filter(
+          (notification) => notification.data?.requestId === "a1-responding",
+        ).length;
 
         // Corrupted ownership (a thread that is its own parent) must terminate, not spin.
         const cycle = {
           host: app.activityHostThreadId("loop"),
           descends: app.threadDescendsFrom("loop", "root"),
         };
-        return { hoisted, afterAnswer, cycle };
+        return { hoisted, afterAnswer, responding, respondingNotifications, cycle };
       } finally {
         row.remove();
       }
@@ -240,22 +299,27 @@ test.describe("sub-agent blocked on an approval", () => {
     expect(result.hoisted.rowClass).toContain("activity-waiting");
     expect(result.hoisted.rowClass).toContain("activity-subagent");
     // Named after the blocked descendant, not the row it is displayed on.
-    expect(result.hoisted.title).toBe("Grandchild: Approval requested");
+    expect(result.hoisted.title).toBe("Grandchild: Waiting for your input");
     expect(result.hoisted.descends).toBe(true);
     expect(result.hoisted.unrelated).toBe(false);
 
     expect(result.afterAnswer.statusText).toBe("o");
     expect(result.afterAnswer.rowClass).not.toContain("activity-waiting");
     expect(result.afterAnswer.rowClass).not.toContain("activity-subagent");
+    expect(result.responding.kind).toBe("progress");
+    expect(result.responding.approval_id).toBeNull();
+    expect(result.responding.requests).toEqual([
+      { request_id: "a1-responding", kind: "approval", responding: true },
+    ]);
+    expect(result.respondingNotifications).toBe(0);
 
     expect(result.cycle.host).toBeNull();
     expect(result.cycle.descends).toBe(false);
   });
 
-  // Thread activity is broadcast live and never replayed, so a browser that was not running when a
-  // sub-agent blocked used to come back to a completely silent sidebar — the child has no row of
-  // its own, and the approval only reaches the transcript once that thread is opened. A reload is
-  // the cleanest way to be "a browser that missed it": the page starts with empty activity state.
+  // A browser that was not running when a sub-agent blocked used to come back to a completely
+  // silent sidebar. A reload is the cleanest way to prove the always-sent runtime replacement,
+  // rather than a live-only signal, reconstructs that state.
   test("a reload learns about an approval it was not connected for", async ({ page }) => {
     const parent = await startThreadWith(page, SCRIPTED_SUBAGENT_APPROVAL_TRIGGER);
     const parentRow = page.locator(`.thread[data-tid="${parent.tid}"]`);
@@ -276,8 +340,8 @@ test.describe("sub-agent blocked on an approval", () => {
     await expect.poll(() => approvalNotificationsFor(page, child!)).toBe(1);
   });
 
-  // An id that no refresh can resolve — trailing activity from a deleted thread, say — must not
-  // re-fetch every project list on every event for the rest of the turn.
+  // An id that no refresh can resolve — a stale runtime summary for a deleted thread, say — must
+  // not re-fetch every project list on every replacement for the rest of the turn.
   test("spends a bounded number of refreshes on an unresolvable thread", async ({ page }) => {
     let threadListFetches = 0;
     page.on("request", (request) => {
@@ -291,16 +355,18 @@ test.describe("sub-agent blocked on an approval", () => {
 
     await page.evaluate(async () => {
       const app = window as unknown as {
-        handleThreadActivity: (msg: Record<string, unknown>) => void;
+        applyRuntimeOverview: (msg: Record<string, unknown>) => void;
       };
-      // Twelve events for a thread the server will never list. Each is spaced past the burst
-      // debounce so an ungated implementation would schedule a refresh for every one.
+      // Twelve newer replacements name a thread the server will never list. Each is spaced past
+      // the burst debounce so an ungated implementation would schedule a refresh for every one.
       for (let i = 0; i < 12; i += 1) {
-        app.handleThreadActivity({
-          thread_id: "thread-that-does-not-exist",
-          kind: "progress",
-          active_turn: true,
-          summary: `tick ${i}`,
+        app.applyRuntimeOverview({
+          revision: Number.MAX_SAFE_INTEGER - 20 + i,
+          threads: [{
+            thread_id: "thread-that-does-not-exist",
+            turn_state: { state: "active" },
+            outstanding_requests: [],
+          }],
         });
         await new Promise((resolve) => setTimeout(resolve, 120));
       }
@@ -313,10 +379,9 @@ test.describe("sub-agent blocked on an approval", () => {
     expect(threadListFetches - before).toBeGreaterThan(0);
   });
 
-  // Two events can describe one approval (the live activity broadcast and the live-turn snapshot
-  // replay). Only one notification may reach the user, even though the handler now awaits a
-  // thread-list refresh between the dedup check and the record.
-  test("notifies once when two events describe the same approval", async ({ page }) => {
+  // Replacing runtime state can remove and later reintroduce a request across reconnect/resync.
+  // Re-observing the same request identity within the dedup window must not alert twice.
+  test("does not renotify when replacements replay the same approval", async ({ page }) => {
     const parent = await startThreadWith(page, SCRIPTED_SUBAGENT_APPROVAL_TRIGGER);
     await expect(page.locator(`.thread[data-tid="${parent.tid}"]`)).toHaveClass(
       /\bactivity-waiting\b/,
@@ -327,22 +392,24 @@ test.describe("sub-agent blocked on an approval", () => {
     expect(child).toBeTruthy();
     expect(await approvalNotificationsFor(page, child!)).toBe(1);
 
-    // Fire two more events for the same approval in the same tick, so both reach the dedup gate
-    // before either records. Neither may notify again.
+    // Remove and reintroduce the same request twice using strictly newer authoritative revisions.
+    // Neither replay may notify again.
     await page.evaluate(
       ({ child, approvalId }) => {
         const app = window as unknown as {
-          handleThreadActivity: (msg: Record<string, unknown>) => void;
+          applyRuntimeOverview: (msg: Record<string, unknown>) => void;
         };
-        const event = {
+        const pending = {
           thread_id: child,
-          kind: "approval_requested",
-          active_turn: true,
-          approval_id: approvalId,
-          summary: "Approval requested",
+          turn_state: { state: "active" },
+          outstanding_requests: [
+            { request_id: approvalId, kind: "approval", responding: false },
+          ],
         };
-        app.handleThreadActivity({ ...event });
-        app.handleThreadActivity({ ...event });
+        app.applyRuntimeOverview({ revision: Number.MAX_SAFE_INTEGER - 3, threads: [] });
+        app.applyRuntimeOverview({ revision: Number.MAX_SAFE_INTEGER - 2, threads: [pending] });
+        app.applyRuntimeOverview({ revision: Number.MAX_SAFE_INTEGER - 1, threads: [] });
+        app.applyRuntimeOverview({ revision: Number.MAX_SAFE_INTEGER, threads: [pending] });
       },
       { child: child!, approvalId: SCRIPTED_SUBAGENT_APPROVAL_ID },
     );

@@ -68,8 +68,8 @@ test.describe("approval persistence across reload", () => {
     await expect(approval.locator(".approval-result")).toHaveText(/Decision: Accept/);
     await expect(acceptBtn).toHaveCount(0);
 
-    // Reload: the in-memory answered state is wiped, so the resolved state must be reconstructed
-    // entirely from the server's live-turn snapshot.
+    // Reload: the in-memory answered state is wiped, so ordered request chronology and the
+    // authoritative runtime state must reconstruct the resolved state.
     await page.reload();
     await expect(page.locator("#app")).toHaveClass(/open/);
 
@@ -90,12 +90,9 @@ test.describe("approval persistence across reload", () => {
   });
 });
 
-// The reconnect snapshot re-asserts what the turn is still waiting on *after* replaying the
-// accumulated events. That order is load-bearing: later events speak for the thread too, and an
-// `error` declares the turn inactive, so a turn blocked on an approval that then errored would
-// come back reading "errored, idle" — no sidebar glyph, no waiting rank, no sub-agent hoist —
-// while the approval sits in the transcript with nothing pointing at it. Re-asserting the
-// outstanding approvals last gives the waiting state the last word, so it outranks the error.
+// The replacement runtime overview is authoritative for what the turn is still waiting on. A later
+// transcript `error` must not strand an outstanding approval in a thread that reads as idle: the
+// runtime request state still gives the waiting activity precedence.
 test.describe("a still-blocked turn survives a reload that replays a later error", () => {
   test.beforeEach(async ({ page }) => {
     await login(page);

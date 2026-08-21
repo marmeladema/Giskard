@@ -1,7 +1,3 @@
-//! Shared client↔server wire protocol types (spec §13.6).
-//!
-//! Defined once here so `giskard-server` and `giskard-ui` never disagree on the protocol.
-
 use serde::{Deserialize, Serialize};
 
 use chrono::{DateTime, Utc};
@@ -15,9 +11,6 @@ pub use wire::{
     WireHarnessError, WireItem, WireItemPayload, WireTurn,
 };
 
-// C1/§3.5: `giskard-proto` is the single wire vocabulary. Path-free `giskard-core` domain types
-// are re-exported here so `giskard-ui` depends only on this crate; path-bearing streamed types are
-// mirrored in `wire` above.
 pub use giskard_core::approval::{
     ApprovalDecision, ApprovalKind, ApprovalMetadata, ApprovalRequest,
 };
@@ -39,17 +32,21 @@ pub use giskard_core::token::{ByModel, DailyTokenLedger, TokenLedger, TokenUsage
 pub use giskard_core::turn::{Mode, PermissionPreset, TurnStatus, TurnStatusKind};
 pub use giskard_core::user_input::{AttachmentKind, UserAttachment};
 
-// ---- Client → Server ----
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     Subscribe {
         thread_id: ThreadId,
-        /// Incremental resync cursor: the newest turn the client already has rendered. When present
-        /// and resolvable, the server replies with a `HistoryDelta` of just the turns after it
-        /// instead of a full `HistoryPage`, so the browser keeps its immutable completed-turn DOM
-        /// and repaints only the in-flight turn. Omitted (or unresolvable) → a full snapshot.
+        /// Incremental bootstrap cursor: the newest persisted turn already rendered by the client.
+        /// The aggregate bootstrap chooses `Delta` or `CursorReset` from this cursor.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         since: Option<TurnId>,
     },
@@ -83,15 +80,25 @@ pub enum ClientMessage {
     CompactContext {
         thread_id: ThreadId,
     },
+    RetryTurnPersistence {
+        thread_id: ThreadId,
+        turn_id: TurnId,
+    },
+    DiscardUnpersistedTurn {
+        thread_id: ThreadId,
+        turn_id: TurnId,
+    },
     TerminateCommand {
         thread_id: ThreadId,
         process_id: String,
     },
     ApprovalDecision {
+        thread_id: ThreadId,
         request_id: String,
         decision: ApprovalDecision,
     },
     ServerRequestResponse {
+        thread_id: ThreadId,
         request_id: String,
         response: ServerRequestResponse,
     },
@@ -99,11 +106,9 @@ pub enum ClientMessage {
         thread_id: ThreadId,
         path: String,
     },
-    /// Request an older page of history (H6): the `limit` turns before `before` (a `TurnId`
-    /// cursor); `before: None` requests the most recent page.
     LoadHistory {
         thread_id: ThreadId,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(deserialize_with = "deserialize_required_option")]
         before: Option<TurnId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<usize>,
@@ -111,9 +116,6 @@ pub enum ClientMessage {
     Ping,
 }
 
-// ---- Server → Client ----
-
-/// Audited browser projection of persisted thread metadata (spec §13.6.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadMetadata {
     pub thread_id: ThreadId,
@@ -126,94 +128,200 @@ pub struct ThreadMetadata {
     pub tokens: TokenLedger,
 }
 
-/// A persisted thread snapshot sent on subscribe/resync or after a committed metadata mutation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ThreadState {
-    #[serde(flatten)]
-    pub metadata: ThreadMetadata,
-    /// Whether a turn is in flight for this thread *right now*, answered from the server's turn
-    /// gate rather than from anything persisted in [`Self::metadata`].
-    ///
-    /// A turn can be started over HTTP (`POST /threads/start`) before the browser's socket for that
-    /// thread exists, so the client cannot always learn a turn's liveness from the event stream: if
-    /// such a turn finishes before the socket attaches, its `TurnCompleted` was addressed to nobody
-    /// and no [`LiveTurnSnapshot`] follows it. This flag closes that gap. The gate is held for the
-    /// whole turn — reserved before the start request returns, released when the turn ends — so it
-    /// also covers the window before the harness emits its first event, where the live buffer is
-    /// still empty but the turn is very much running.
-    /// Live metadata publications omit this field because the metadata revision cannot order a
-    /// runtime transition. Subscribe/resync snapshots always include it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_turn: Option<bool>,
+pub struct SequencedThreadEvent {
+    pub seq: u64,
+    pub event: ThreadEventPayload,
 }
-
-/// Lightweight cross-thread activity update for sidebar badges and browser notifications. This is
-/// intentionally much smaller than a transcript event: inactive threads should show that work is
-/// happening without subscribing every browser to every live delta stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ThreadActivity {
-    pub thread_id: ThreadId,
-    #[serde(flatten)]
-    pub kind: ThreadActivityKind,
-    pub active_turn: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ThreadActivityKind {
-    TurnStarted,
-    Progress,
-    ApprovalRequested { approval_id: String },
-    ServerRequestReceived { server_request_id: String },
-    TurnCompleted,
-    Error,
-    Notice,
+pub enum ThreadEventPayload {
+    Agent { agent_event: Box<WireAgentEvent> },
+    Request { request: Box<RequestState> },
 }
-
-/// In-flight turn reconstruction on reconnect (spec §13.6). Carries wire types (§3.5).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LiveTurnSnapshot {
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RequestPayload {
+    Approval { request: WireApprovalRequest },
+    Server { request: ServerRequest },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestKind {
+    Approval,
+    Server,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RequestResolution {
+    Approval { decision: ApprovalDecision },
+    Server,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RequestStatus {
+    Pending,
+    Responding,
+    Resolved { resolution: RequestResolution },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestState {
     pub thread_id: ThreadId,
+    pub request_id: String,
+    pub payload: RequestPayload,
+    pub status: RequestStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutstandingRequest {
+    pub request_id: String,
+    pub kind: RequestKind,
+    pub responding: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum RuntimeTurnState {
+    Idle,
+    Active {
+        /// Absent only while the harness has accepted a turn but has not named it yet.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_id: Option<TurnId>,
+    },
+    PersistenceBlocked {
+        turn_id: TurnId,
+        attempts: u32,
+        error: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadRuntimeSummary {
+    pub thread_id: ThreadId,
+    pub turn_state: RuntimeTurnState,
+    pub outstanding_requests: Vec<OutstandingRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadRuntimeOverview {
+    pub revision: u64,
+    pub threads: Vec<ThreadRuntimeSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveTurnProjection {
     pub turn_id: TurnId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub user_input: Option<UserInput>,
-    /// The turn as the browser should see it, including what it is still waiting on the user for.
-    ///
-    /// Every `ApprovalRequested` rides along here, answered ones included; the client renders
-    /// answered ones resolved using [`Self::answered_approvals`] and treats the rest as
-    /// actionable. There is no separate "pending approval" field: a turn can be blocked on several
-    /// approvals at once (three commands proposed together, say), and a single field would name
-    /// only the most recently raised one and silently drop the rest.
-    pub accumulated: Vec<WireAgentEvent>,
-    /// Approvals the user already answered during this in-flight turn, with the decision they made.
-    ///
-    /// Approval resolution lives only in browser memory, so a reload would otherwise re-surface an
-    /// answered approval as actionable — and answering it again routes a stale id to the harness,
-    /// which errors (spec §13.6). Carrying the answered set lets the reconnecting client render those
-    /// cards in their resolved state instead of re-prompting.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub answered_approvals: Vec<AnsweredApproval>,
-    /// Server requests the user already answered during this in-flight turn.
-    ///
-    /// A harness emits its own resolved event for these, but on its own schedule and not
-    /// guaranteed at all. Until that lands the request looks outstanding in the replayed events, so
-    /// a reload would render it actionable again and re-answering routes a stale id to the harness.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub answered_server_requests: Vec<ServerRequestId>,
+    pub represented_through: u64,
+    pub events: Vec<ThreadEventPayload>,
 }
 
-/// An approval the user resolved during an in-flight turn (part of [`LiveTurnSnapshot`]).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AnsweredApproval {
-    pub request_id: ApprovalId,
-    pub decision: ApprovalDecision,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BootstrapHistory {
+    FullPage {
+        turns: Vec<WireTurn>,
+        has_more: bool,
+    },
+    Delta {
+        after: TurnId,
+        turns: Vec<WireTurn>,
+    },
+    CursorReset {
+        requested_after: TurnId,
+        turns: Vec<WireTurn>,
+        has_more: bool,
+    },
 }
 
-/// Whether a running task is a shell command or a tool/MCP call. Both are tracked and surfaced the
-/// same way (right-panel row, elapsed time, stop control); they differ only in labeling and how a
-/// stop request is routed (commands terminate by process id, tools interrupt the owning turn).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadTaskSnapshot {
+    pub thread_id: ThreadId,
+    pub revision: u64,
+    pub tasks: Vec<RunningTask>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadFinalRuntime {
+    pub through_seq: u64,
+    pub turn_state: RuntimeTurnState,
+    pub tasks: ThreadTaskSnapshot,
+    pub requests: Vec<RequestState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadNotice {
+    pub kind: String,
+    pub revision: u64,
+    pub severity: ErrorSeverity,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadNoticeSnapshot {
+    pub thread_id: ThreadId,
+    pub revision: u64,
+    pub notices: Vec<ThreadNotice>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadBootstrapPayload {
+    pub metadata: ThreadMetadata,
+    pub history: BootstrapHistory,
+    pub live_turn: Option<LiveTurnProjection>,
+    pub ordered_suffix: Vec<SequencedThreadEvent>,
+    pub final_runtime: ThreadFinalRuntime,
+    pub notices: ThreadNoticeSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BootstrapSection {
+    Metadata,
+    History,
+    LiveTurn,
+    OrderedSuffix,
+    FinalRuntime,
+    Notices,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BootstrapSectionDescriptor {
+    pub section: BootstrapSection,
+    pub encoded_bytes: u64,
+    pub chunk_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum ThreadBootstrapFrame {
+    Start {
+        sections: Vec<BootstrapSectionDescriptor>,
+    },
+    Chunk {
+        section: BootstrapSection,
+        index: u32,
+        payload_base64: String,
+    },
+    Commit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResyncReason {
+    OrderedOverflow,
+    ReplacementOverflow,
+    BootstrapCapacity,
+    SequenceGap,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
@@ -222,21 +330,15 @@ pub enum TaskKind {
     Tool,
 }
 
-/// A unit of agent work still running (or outliving an interrupted turn): a shell command or a
-/// tool/MCP call. Formerly `RunningCommand`; generalized so tool calls share the running-work UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunningTask {
-    #[serde(default)]
     pub kind: TaskKind,
     pub thread_id: ThreadId,
     pub turn_id: TurnId,
     pub item_id: ItemId,
     pub harness_item_id: String,
-    /// Primary label: the command line for commands, the tool name for tool calls.
     pub command: String,
-    /// Secondary label: the working directory for commands (empty for tools).
     pub cwd: String,
-    /// MCP/tool server name, when this is a tool call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
     pub status: String,
@@ -245,7 +347,6 @@ pub struct RunningTask {
     pub started_at_ms: i64,
     pub output: String,
     pub after_turn: bool,
-    #[serde(default)]
     pub terminating: bool,
 }
 
@@ -268,11 +369,8 @@ pub struct ErrorInfo {
     pub thread_id: Option<ThreadId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
-    /// Correlates a failed direct metadata action with its browser-side pending overlay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
-    /// Command process the error refers to, when the failing action targeted a specific command
-    /// (e.g. `terminate_command`). Lets the client scope any recovery to that one command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_id: Option<String>,
 }
@@ -280,54 +378,43 @@ pub struct ErrorInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
-    Event {
+    ThreadEvent {
         thread_id: ThreadId,
-        agent_event: Box<WireAgentEvent>,
+        subscription_generation: u64,
+        #[serde(flatten)]
+        event: SequencedThreadEvent,
     },
-    ThreadActivity(ThreadActivity),
-    /// Cross-thread activity a connecting client missed. `ThreadActivity` is a live signal that is
-    /// never replayed, so without this a browser that was closed (or disconnected) when an approval
-    /// was raised shows no sidebar badge and fires no notification for a thread that is blocked
-    /// right now. Sent once to the connecting client only, never broadcast. Entries reuse
-    /// `ThreadActivity` so clients can funnel them through the same rendering path, but the
-    /// separate message lets a client tell a replay from a live event — it must not re-alert for an
-    /// approval it has already notified about in this page session.
-    ThreadActivityBootstrap {
-        activities: Vec<ThreadActivity>,
-    },
-    ThreadState(ThreadState),
-    /// Authoritative result of a browser-initiated metadata mutation. This is sent even when the
-    /// mutation is a no-op, so pending UI state never depends on a revision changing.
+    ThreadMetadata(ThreadMetadata),
+    /// Metadata mutation result, sent even for no-ops so pending UI state always settles.
     ThreadMetadataResult {
         request_id: String,
         #[serde(flatten)]
         metadata: ThreadMetadata,
     },
-    /// A committed thread-catalog projection changed. The browser refetches the authoritative
-    /// project list; repeated invalidations coalesce client-side.
+    /// The committed catalog changed; the browser coalesces refetches of its authoritative list.
     ThreadCatalogChanged,
-    /// A page of persisted history (H6), oldest-first; `has_more` if older turns exist before it.
+    ThreadRuntimeOverview(ThreadRuntimeOverview),
+    ThreadTasks(ThreadTaskSnapshot),
+    ThreadBootstrap {
+        thread_id: ThreadId,
+        subscription_generation: u64,
+        frame: ThreadBootstrapFrame,
+    },
     HistoryPage {
         thread_id: ThreadId,
+        /// Required JSON field. `null` requests/echoes the newest page.
+        #[serde(deserialize_with = "deserialize_required_option")]
+        before: Option<TurnId>,
         turns: Vec<WireTurn>,
         has_more: bool,
     },
-    /// Incremental-resync delta: the persisted turns that completed after the client's `since`
-    /// cursor, oldest-first. The client keeps its existing transcript, repaints only the in-flight
-    /// turn, and appends these. Sent instead of `HistoryPage` when a resolvable `since` was given.
-    HistoryDelta {
+    ThreadNotices(ThreadNoticeSnapshot),
+    ResyncRequired {
         thread_id: ThreadId,
-        turns: Vec<WireTurn>,
-    },
-    LiveTurnSnapshot(LiveTurnSnapshot),
-    RunningTasks {
-        thread_id: ThreadId,
-        tasks: Vec<RunningTask>,
-    },
-    ApprovalResolved {
-        thread_id: ThreadId,
-        request_id: String,
-        decision: ApprovalDecision,
+        subscription_generation: u64,
+        reason: ResyncReason,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        retry_after_ms: Option<u64>,
     },
     Error {
         #[serde(flatten)]
@@ -456,7 +543,7 @@ pub struct CreateProjectResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct ThreadSummary {
     pub id: ThreadId,
-    /// Same durable metadata revision carried by `ThreadState`.
+    /// Same durable metadata revision carried by `ThreadMetadata`.
     pub revision: u64,
     pub title: String,
     /// Workspace root this thread reads and writes through. For isolated threads this is the
@@ -816,6 +903,28 @@ mod tests {
     }
 
     #[test]
+    fn client_messages_for_runtime_recovery_are_turn_scoped() {
+        let thread_id = ThreadId::new();
+        let turn_id = TurnId::new();
+        let messages = [
+            (
+                ClientMessage::RetryTurnPersistence { thread_id, turn_id },
+                "retry_turn_persistence",
+            ),
+            (
+                ClientMessage::DiscardUnpersistedTurn { thread_id, turn_id },
+                "discard_unpersisted_turn",
+            ),
+        ];
+        for (message, kind) in messages {
+            let value = serde_json::to_value(message).unwrap();
+            assert_eq!(value["type"], kind);
+            assert_eq!(value["thread_id"], thread_id.to_string());
+            assert_eq!(value["turn_id"], turn_id.to_string());
+        }
+    }
+
+    #[test]
     fn client_message_set_permission_preset_is_thread_scoped() {
         let tid = ThreadId::new();
         let msg = ClientMessage::SetPermissionPreset {
@@ -875,7 +984,9 @@ mod tests {
 
     #[test]
     fn client_message_server_request_response_serde() {
+        let thread_id = ThreadId::new();
         let msg = ClientMessage::ServerRequestResponse {
+            thread_id,
             request_id: "req_1".into(),
             response: ServerRequestResponse::result(serde_json::json!({
                 "success": true,
@@ -884,6 +995,7 @@ mod tests {
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["type"], "server_request_response");
+        assert_eq!(json["thread_id"], thread_id.to_string());
         assert_eq!(json["request_id"], "req_1");
         assert_eq!(json["response"]["kind"], "result");
         assert_eq!(json["response"]["value"]["success"], true);
@@ -891,9 +1003,11 @@ mod tests {
         let back: ClientMessage = serde_json::from_value(json).unwrap();
         match back {
             ClientMessage::ServerRequestResponse {
+                thread_id: decoded_thread_id,
                 request_id,
                 response: ServerRequestResponse::Result { value },
             } => {
+                assert_eq!(decoded_thread_id, thread_id);
                 assert_eq!(request_id, "req_1");
                 assert_eq!(value["contentItems"], serde_json::json!([]));
             }
@@ -903,7 +1017,9 @@ mod tests {
 
     #[test]
     fn client_message_server_request_error_response_serde() {
+        let thread_id = ThreadId::new();
         let msg = ClientMessage::ServerRequestResponse {
+            thread_id,
             request_id: "req_1".into(),
             response: ServerRequestResponse::error(-32000, "unsupported"),
         };
@@ -917,9 +1033,11 @@ mod tests {
         let back: ClientMessage = serde_json::from_value(json).unwrap();
         match back {
             ClientMessage::ServerRequestResponse {
+                thread_id: decoded_thread_id,
                 request_id,
                 response: ServerRequestResponse::Error { code, message },
             } => {
+                assert_eq!(decoded_thread_id, thread_id);
                 assert_eq!(request_id, "req_1");
                 assert_eq!(code, -32000);
                 assert_eq!(message, "unsupported");
@@ -951,39 +1069,34 @@ mod tests {
     }
 
     #[test]
-    fn server_message_thread_state_is_a_typed_revisioned_projection() {
+    fn server_message_thread_metadata_is_a_typed_revisioned_projection() {
         let tid = ThreadId::new();
-        let msg = ServerMessage::ThreadState(ThreadState {
-            metadata: ThreadMetadata {
-                thread_id: tid,
-                revision: 7,
-                title: "Typed state".into(),
-                mode: Mode::Build,
-                current_model: ModelRef {
-                    provider: "openai".into(),
-                    model: "gpt-5.5".into(),
-                    reasoning_effort: None,
-                },
-                context_window: 258_400,
-                permission_preset: PermissionPreset::AskFirst,
-                tokens: TokenLedger::default(),
+        let msg = ServerMessage::ThreadMetadata(ThreadMetadata {
+            thread_id: tid,
+            revision: 7,
+            title: "Typed state".into(),
+            mode: Mode::Build,
+            current_model: ModelRef {
+                provider: "openai".into(),
+                model: "gpt-5.5".into(),
+                reasoning_effort: None,
             },
-            active_turn: None,
+            context_window: 258_400,
+            permission_preset: PermissionPreset::AskFirst,
+            tokens: TokenLedger::default(),
         });
 
         let json = serde_json::to_value(&msg).unwrap();
-        assert_eq!(json["type"], "thread_state");
+        assert_eq!(json["type"], "thread_metadata");
         assert_eq!(json["thread_id"], tid.to_string());
         assert_eq!(json["revision"], 7);
         assert_eq!(json["context_window"], 258_400);
-        assert!(json.get("active_turn").is_none());
 
         let back: ServerMessage = serde_json::from_value(json).unwrap();
         match back {
-            ServerMessage::ThreadState(state) => {
-                assert_eq!(state.metadata.thread_id, tid);
-                assert_eq!(state.metadata.revision, 7);
-                assert_eq!(state.active_turn, None);
+            ServerMessage::ThreadMetadata(metadata) => {
+                assert_eq!(metadata.thread_id, tid);
+                assert_eq!(metadata.revision, 7);
             }
             _ => panic!("wrong variant"),
         }
@@ -1031,94 +1144,126 @@ mod tests {
     }
 
     #[test]
-    fn server_message_thread_activity_is_flattened() {
+    fn runtime_overview_is_an_authoritative_replacement() {
         let tid = ThreadId::new();
-        let msg = ServerMessage::ThreadActivity(ThreadActivity {
-            thread_id: tid,
-            kind: ThreadActivityKind::ApprovalRequested {
-                approval_id: "approval-1".into(),
-            },
-            active_turn: true,
-            summary: Some("Approval requested".into()),
+        let msg = ServerMessage::ThreadRuntimeOverview(ThreadRuntimeOverview {
+            revision: 9,
+            threads: vec![ThreadRuntimeSummary {
+                thread_id: tid,
+                turn_state: RuntimeTurnState::Active { turn_id: None },
+                outstanding_requests: vec![OutstandingRequest {
+                    request_id: "approval-1".into(),
+                    kind: RequestKind::Approval,
+                    responding: false,
+                }],
+            }],
         });
 
         let json = serde_json::to_value(&msg).unwrap();
-        assert_eq!(json["type"], "thread_activity");
-        assert_eq!(json["thread_id"], tid.to_string());
-        assert_eq!(json["kind"], "approval_requested");
-        assert_eq!(json["active_turn"], true);
-        assert_eq!(json["approval_id"], "approval-1");
-        assert!(json.get("server_request_id").is_none());
+        assert_eq!(json["type"], "thread_runtime_overview");
+        assert_eq!(json["revision"], 9);
+        assert_eq!(json["threads"][0]["thread_id"], tid.to_string());
+        assert_eq!(json["threads"][0]["turn_state"]["state"], "active");
+        assert_eq!(
+            json["threads"][0]["outstanding_requests"][0]["kind"],
+            "approval"
+        );
 
         let back: ServerMessage = serde_json::from_value(json).unwrap();
         match back {
-            ServerMessage::ThreadActivity(activity) => {
-                assert_eq!(activity.thread_id, tid);
-                match activity.kind {
-                    ThreadActivityKind::ApprovalRequested { approval_id } => {
-                        assert_eq!(approval_id, "approval-1");
-                    }
-                    other => panic!("expected approval activity, got {other:?}"),
-                }
+            ServerMessage::ThreadRuntimeOverview(overview) => {
+                assert_eq!(overview.revision, 9);
+                assert_eq!(overview.threads[0].thread_id, tid);
+                assert_eq!(overview.threads[0].outstanding_requests.len(), 1);
             }
             _ => panic!("wrong variant"),
         }
     }
 
     #[test]
-    fn server_message_thread_activity_requires_variant_ids() {
+    fn runtime_overview_requires_request_identity() {
         let json = serde_json::json!({
-            "type": "thread_activity",
-            "thread_id": ThreadId::new().to_string(),
-            "kind": "approval_requested",
-            "active_turn": true
+            "type": "thread_runtime_overview",
+            "revision": 1,
+            "threads": [{
+                "thread_id": ThreadId::new().to_string(),
+                "turn_state": { "state": "active", "turn_id": null },
+                "outstanding_requests": [{ "kind": "approval", "responding": false }]
+            }]
         });
 
         let err = serde_json::from_value::<ServerMessage>(json).unwrap_err();
         assert!(
-            err.to_string().contains("missing field `approval_id`"),
+            err.to_string().contains("missing field `request_id`"),
             "unexpected error: {err}"
         );
     }
 
     #[test]
-    fn server_message_approval_resolved_serde() {
+    fn ordered_request_state_is_thread_scoped_and_resolved() {
         let tid = ThreadId::new();
-        let msg = ServerMessage::ApprovalResolved {
+        let request = RequestState {
             thread_id: tid,
             request_id: "approval-1".into(),
-            decision: ApprovalDecision::Accept,
+            payload: RequestPayload::Approval {
+                request: WireApprovalRequest {
+                    id: ApprovalId("approval-1".into()),
+                    kind: WireApprovalKind::Permission {
+                        detail: "run command".into(),
+                    },
+                    reason: None,
+                    metadata: Vec::new(),
+                    available: Vec::new(),
+                },
+            },
+            status: RequestStatus::Resolved {
+                resolution: RequestResolution::Approval {
+                    decision: ApprovalDecision::Accept,
+                },
+            },
+        };
+        let msg = ServerMessage::ThreadEvent {
+            thread_id: tid,
+            subscription_generation: 4,
+            event: SequencedThreadEvent {
+                seq: 12,
+                event: ThreadEventPayload::Request {
+                    request: Box::new(request),
+                },
+            },
         };
 
         let json = serde_json::to_value(&msg).unwrap();
-        assert_eq!(json["type"], "approval_resolved");
+        assert_eq!(json["type"], "thread_event");
         assert_eq!(json["thread_id"], tid.to_string());
-        assert_eq!(json["request_id"], "approval-1");
-        assert_eq!(json["decision"], "accept");
+        assert_eq!(json["subscription_generation"], 4);
+        assert_eq!(json["seq"], 12);
+        assert_eq!(json["event"]["kind"], "request");
+        assert_eq!(json["event"]["request"]["request_id"], "approval-1");
+        assert_eq!(json["event"]["request"]["status"]["status"], "resolved");
 
         let back: ServerMessage = serde_json::from_value(json).unwrap();
         match back {
-            ServerMessage::ApprovalResolved {
-                thread_id,
-                request_id,
-                decision,
+            ServerMessage::ThreadEvent {
+                thread_id, event, ..
             } => {
                 assert_eq!(thread_id, tid);
-                assert_eq!(request_id, "approval-1");
-                assert_eq!(decision, ApprovalDecision::Accept);
+                assert_eq!(event.seq, 12);
+                assert!(matches!(event.event, ThreadEventPayload::Request { .. }));
             }
             _ => panic!("wrong variant"),
         }
     }
 
     #[test]
-    fn server_message_running_tasks_serde() {
+    fn server_message_thread_tasks_is_revisioned() {
         let tid = ThreadId::new();
         let turn_id = TurnId::new();
         let item_id = ItemId::new();
         let tool_item = ItemId::new();
-        let msg = ServerMessage::RunningTasks {
+        let msg = ServerMessage::ThreadTasks(ThreadTaskSnapshot {
             thread_id: tid,
+            revision: 6,
             tasks: vec![
                 RunningTask {
                     kind: TaskKind::Command,
@@ -1153,10 +1298,11 @@ mod tests {
                     terminating: false,
                 },
             ],
-        };
+        });
         let json = serde_json::to_value(&msg).unwrap();
-        assert_eq!(json["type"], "running_tasks");
+        assert_eq!(json["type"], "thread_tasks");
         assert_eq!(json["thread_id"], tid.to_string());
+        assert_eq!(json["revision"], 6);
         assert_eq!(json["tasks"][0]["kind"], "command");
         assert_eq!(json["tasks"][0]["process_id"], "proc_1");
         assert_eq!(json["tasks"][0]["after_turn"], true);
@@ -1164,12 +1310,13 @@ mod tests {
         assert_eq!(json["tasks"][1]["server"], "wiki");
         let back: ServerMessage = serde_json::from_value(json).unwrap();
         match back {
-            ServerMessage::RunningTasks { tasks, .. } => {
-                assert_eq!(tasks[0].item_id, item_id);
-                assert_eq!(tasks[0].kind, TaskKind::Command);
-                assert!(tasks[0].terminating);
-                assert_eq!(tasks[1].kind, TaskKind::Tool);
-                assert_eq!(tasks[1].server.as_deref(), Some("wiki"));
+            ServerMessage::ThreadTasks(snapshot) => {
+                assert_eq!(snapshot.revision, 6);
+                assert_eq!(snapshot.tasks[0].item_id, item_id);
+                assert_eq!(snapshot.tasks[0].kind, TaskKind::Command);
+                assert!(snapshot.tasks[0].terminating);
+                assert_eq!(snapshot.tasks[1].kind, TaskKind::Tool);
+                assert_eq!(snapshot.tasks[1].server.as_deref(), Some("wiki"));
             }
             _ => panic!("wrong variant"),
         }
@@ -1206,61 +1353,113 @@ mod tests {
     }
 
     #[test]
-    fn live_turn_snapshot_replays_server_requests_from_accumulated() {
-        let turn = TurnId::new();
-        let thread = ThreadId::new();
-        let snapshot = LiveTurnSnapshot {
-            thread_id: thread,
-            turn_id: turn,
-            user_input: None,
-            accumulated: vec![WireAgentEvent::ServerRequestReceived {
-                thread,
-                turn: Some(turn),
-                request: ServerRequest {
-                    id: giskard_core::ids::ServerRequestId("req_1".into()),
-                    method: "item/tool/call".into(),
-                    params: serde_json::json!({ "tool": "example" }),
-                    received_at: chrono::Utc::now(),
-                },
-            }],
-            answered_approvals: vec![],
-            answered_server_requests: vec![],
+    fn thread_bootstrap_frames_use_one_chunked_transaction_shape() {
+        let tid = ThreadId::new();
+        let start = ServerMessage::ThreadBootstrap {
+            thread_id: tid,
+            subscription_generation: 3,
+            frame: ThreadBootstrapFrame::Start {
+                sections: vec![BootstrapSectionDescriptor {
+                    section: BootstrapSection::History,
+                    encoded_bytes: 11,
+                    chunk_count: 2,
+                }],
+            },
         };
-        let json = serde_json::to_value(&snapshot).unwrap();
-        assert_eq!(json["thread_id"], thread.to_string());
-        assert_eq!(json["accumulated"][0]["kind"], "server_request_received");
-        assert_eq!(json["accumulated"][0]["request"]["id"], "req_1");
-        assert_eq!(
-            json["accumulated"][0]["request"]["method"],
-            "item/tool/call"
+        let chunk = ServerMessage::ThreadBootstrap {
+            thread_id: tid,
+            subscription_generation: 3,
+            frame: ThreadBootstrapFrame::Chunk {
+                section: BootstrapSection::History,
+                index: 1,
+                payload_base64: "d29ybGQ=".into(),
+            },
+        };
+        let commit = ServerMessage::ThreadBootstrap {
+            thread_id: tid,
+            subscription_generation: 3,
+            frame: ThreadBootstrapFrame::Commit,
+        };
+
+        let start_json = serde_json::to_value(&start).unwrap();
+        assert_eq!(start_json["type"], "thread_bootstrap");
+        assert_eq!(start_json["frame"]["phase"], "start");
+        assert_eq!(start_json["frame"]["sections"][0]["encoded_bytes"], 11);
+        assert_eq!(start_json["frame"]["sections"][0]["chunk_count"], 2);
+
+        let chunk_json = serde_json::to_value(&chunk).unwrap();
+        assert_eq!(chunk_json["frame"]["phase"], "chunk");
+        assert_eq!(chunk_json["frame"]["index"], 1);
+        assert_eq!(chunk_json["frame"]["payload_base64"], "d29ybGQ=");
+
+        let commit_json = serde_json::to_value(&commit).unwrap();
+        assert_eq!(commit_json["frame"]["phase"], "commit");
+
+        for message in [start_json, chunk_json, commit_json] {
+            let decoded: ServerMessage = serde_json::from_value(message).unwrap();
+            assert!(matches!(decoded, ServerMessage::ThreadBootstrap { .. }));
+        }
+    }
+
+    #[test]
+    fn history_page_requires_and_echoes_before() {
+        let tid = ThreadId::new();
+        let before = TurnId::new();
+        let json = serde_json::to_value(ServerMessage::HistoryPage {
+            thread_id: tid,
+            before: Some(before),
+            turns: Vec::new(),
+            has_more: false,
+        })
+        .unwrap();
+        assert_eq!(json["before"], before.to_string());
+
+        let newest = serde_json::json!({
+            "type": "history_page",
+            "thread_id": tid,
+            "before": null,
+            "turns": [],
+            "has_more": false
+        });
+        assert!(matches!(
+            serde_json::from_value::<ServerMessage>(newest).unwrap(),
+            ServerMessage::HistoryPage { before: None, .. }
+        ));
+
+        let missing = serde_json::json!({
+            "type": "history_page",
+            "thread_id": tid,
+            "turns": [],
+            "has_more": false
+        });
+        let error = serde_json::from_value::<ServerMessage>(missing).unwrap_err();
+        assert!(
+            error.to_string().contains("missing field `before`"),
+            "unexpected error: {error}"
         );
     }
 
     #[test]
-    fn live_turn_snapshot_includes_answered_approvals() {
-        let snapshot = LiveTurnSnapshot {
-            thread_id: ThreadId::new(),
-            turn_id: TurnId::new(),
-            user_input: None,
-            accumulated: vec![],
-            answered_approvals: vec![AnsweredApproval {
-                request_id: ApprovalId("ap_1".into()),
-                decision: ApprovalDecision::Accept,
-            }],
-            answered_server_requests: vec![ServerRequestId("req_1".into())],
+    fn load_history_requires_before_even_for_the_newest_page() {
+        let tid = ThreadId::new();
+        let newest = ClientMessage::LoadHistory {
+            thread_id: tid,
+            before: None,
+            limit: Some(20),
         };
-        let json = serde_json::to_value(&snapshot).unwrap();
-        assert_eq!(json["answered_approvals"][0]["request_id"], "ap_1");
-        assert_eq!(json["answered_approvals"][0]["decision"], "accept");
-        let back: LiveTurnSnapshot = serde_json::from_value(json).unwrap();
-        assert_eq!(back.answered_approvals.len(), 1);
-        assert_eq!(
-            back.answered_approvals[0].request_id,
-            ApprovalId("ap_1".into())
-        );
-        assert_eq!(
-            back.answered_approvals[0].decision,
-            ApprovalDecision::Accept
+        let json = serde_json::to_value(newest).unwrap();
+        assert!(json.get("before").is_some());
+        assert!(json["before"].is_null());
+
+        let missing = serde_json::json!({
+            "type": "load_history",
+            "thread_id": tid,
+            "limit": 20
+        });
+        let error = serde_json::from_value::<ClientMessage>(missing).unwrap_err();
+        assert!(
+            error.to_string().contains("missing field `before`"),
+            "unexpected error: {error}"
         );
     }
 }

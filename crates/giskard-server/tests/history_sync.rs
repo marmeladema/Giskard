@@ -1,8 +1,11 @@
-//! WebSocket history sync integration tests: paginated history load, resync deltas vs. full-page
-//! fallback on reconnect, and a structured error when persisted history is corrupt.
+//! WebSocket history sync integration tests: staged bootstrap history, pagination, cursor reset,
+//! and a structured error when persisted history is corrupt.
 
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use giskard_core::event::AgentEvent;
@@ -13,8 +16,14 @@ use giskard_core::turn::{TurnStatus, TurnStatusKind};
 use giskard_harness::AgentHarness;
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 use giskard_persist::store::ProjectConfig;
-use giskard_proto::{ClientMessage, ErrorSeverity, ServerMessage};
+use giskard_proto::{
+    BootstrapHistory, BootstrapSection, ClientMessage, ErrorSeverity, ServerMessage,
+    ThreadBootstrapFrame, ThreadBootstrapPayload, WireTurn,
+};
 use giskard_server::{AppState, HarnessFactory, build_app};
+
+type TestWs =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 struct DiffFactory {
     fixture: ReplayFixture,
@@ -138,10 +147,7 @@ async fn login(base: &str) -> (reqwest::Client, String) {
     (client, cookie)
 }
 
-async fn ws_connect(
-    port: u16,
-    cookie: &str,
-) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+async fn ws_connect(port: u16, cookie: &str) -> TestWs {
     let req = tokio_tungstenite::tungstenite::http::Request::builder()
         .uri(format!("ws://127.0.0.1:{port}/api/ws"))
         .header("host", format!("127.0.0.1:{port}"))
@@ -229,29 +235,6 @@ async fn history_pagination_over_websocket() {
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(ws_req).await.unwrap();
 
-    async fn next_history_page<S>(ws: &mut S) -> serde_json::Value
-    where
-        S: futures_util::Stream<
-                Item = Result<
-                    tokio_tungstenite::tungstenite::Message,
-                    tokio_tungstenite::tungstenite::Error,
-                >,
-            > + Unpin,
-    {
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-        while tokio::time::Instant::now() < deadline {
-            if let Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) =
-                tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await
-            {
-                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
-                if v["type"] == "history_page" {
-                    return v;
-                }
-            }
-        }
-        panic!("no history_page received");
-    }
-
     let subscribe = tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::Subscribe {
             thread_id: tid,
@@ -263,12 +246,14 @@ async fn history_pagination_over_websocket() {
     ws.send(subscribe).await.unwrap();
 
     // Initial page = last 2 turns (ids[3], ids[4]), more available.
-    let page = next_history_page(&mut ws).await;
-    let turns = page["turns"].as_array().unwrap();
+    let bootstrap = wait_for_bootstrap(&mut ws, tid).await;
+    let BootstrapHistory::FullPage { turns, has_more } = bootstrap.history else {
+        panic!("initial subscribe should carry a full history page");
+    };
     assert_eq!(turns.len(), 2);
-    assert_eq!(page["has_more"], true);
-    assert_eq!(turns[0]["id"].as_str().unwrap(), ids[3]);
-    assert_eq!(turns[1]["id"].as_str().unwrap(), ids[4]);
+    assert!(has_more);
+    assert_eq!(turns[0].id.to_string(), ids[3]);
+    assert_eq!(turns[1].id.to_string(), ids[4]);
 
     // Page older: before ids[3] → ids[1], ids[2], still more.
     let cursor: TurnId = ids[3].parse().unwrap();
@@ -283,12 +268,12 @@ async fn history_pagination_over_websocket() {
     ))
     .await
     .unwrap();
-    let page = next_history_page(&mut ws).await;
-    let turns = page["turns"].as_array().unwrap();
+    let (before, turns, has_more) = next_history_page(&mut ws).await;
+    assert_eq!(before, Some(cursor));
     assert_eq!(turns.len(), 2);
-    assert_eq!(page["has_more"], true);
-    assert_eq!(turns[0]["id"].as_str().unwrap(), ids[1]);
-    assert_eq!(turns[1]["id"].as_str().unwrap(), ids[2]);
+    assert!(has_more);
+    assert_eq!(turns[0].id.to_string(), ids[1]);
+    assert_eq!(turns[1].id.to_string(), ids[2]);
 
     // Final page: before ids[1] → ids[0], no more.
     let cursor: TurnId = ids[1].parse().unwrap();
@@ -303,21 +288,21 @@ async fn history_pagination_over_websocket() {
     ))
     .await
     .unwrap();
-    let page = next_history_page(&mut ws).await;
-    let turns = page["turns"].as_array().unwrap();
+    let (before, turns, has_more) = next_history_page(&mut ws).await;
+    assert_eq!(before, Some(cursor));
     assert_eq!(turns.len(), 1);
-    assert_eq!(page["has_more"], false);
-    assert_eq!(turns[0]["id"].as_str().unwrap(), ids[0]);
+    assert!(!has_more);
+    assert_eq!(turns[0].id.to_string(), ids[0]);
 }
 
-/// Reconnect with a resync cursor: a resolvable `since` yields a `HistoryDelta` of just the turns
-/// after it, and a stale `since` falls back to a full `HistoryPage`.
+/// Reconnect with a resync cursor: a resolvable `since` yields only later turns, while an unknown
+/// cursor produces an explicit reset to a bounded newest page.
 #[tokio::test]
 async fn resync_delta_over_websocket() {
     let port = 19204;
     let tmp = tempfile::TempDir::new().unwrap();
     let hash = password_hash("testpass");
-    // initial=2 so the stale-cursor fallback returns a bounded page we can assert on.
+    // initial=2 so the cursor-reset payload is a bounded page we can assert on.
     tokio::fs::write(
         tmp.path().join("config.toml"),
         format!(
@@ -372,30 +357,7 @@ async fn resync_delta_over_websocket() {
         state.store.append_turn(pid, tid, &t).await.unwrap();
     }
 
-    async fn next_history_frame<S>(ws: &mut S) -> serde_json::Value
-    where
-        S: futures_util::Stream<
-                Item = Result<
-                    tokio_tungstenite::tungstenite::Message,
-                    tokio_tungstenite::tungstenite::Error,
-                >,
-            > + Unpin,
-    {
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-        while tokio::time::Instant::now() < deadline {
-            if let Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) =
-                tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await
-            {
-                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
-                if v["type"] == "history_delta" || v["type"] == "history_page" {
-                    return v;
-                }
-            }
-        }
-        panic!("no history frame received");
-    }
-
-    // Resolvable cursor (ids[2]) → HistoryDelta with only the turns after it: ids[3], ids[4].
+    // Resolvable cursor (ids[2]) yields only the turns after it: ids[3], ids[4].
     let mut ws = ws_connect(port, &cookie).await;
     let cursor: TurnId = ids[2].parse().unwrap();
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -408,14 +370,16 @@ async fn resync_delta_over_websocket() {
     ))
     .await
     .unwrap();
-    let frame = next_history_frame(&mut ws).await;
-    assert_eq!(frame["type"], "history_delta");
-    let turns = frame["turns"].as_array().unwrap();
+    let bootstrap = wait_for_bootstrap(&mut ws, tid).await;
+    let BootstrapHistory::Delta { after, turns } = bootstrap.history else {
+        panic!("a known cursor should produce delta bootstrap history");
+    };
+    assert_eq!(after, cursor);
     assert_eq!(turns.len(), 2);
-    assert_eq!(turns[0]["id"].as_str().unwrap(), ids[3]);
-    assert_eq!(turns[1]["id"].as_str().unwrap(), ids[4]);
+    assert_eq!(turns[0].id.to_string(), ids[3]);
+    assert_eq!(turns[1].id.to_string(), ids[4]);
 
-    // Stale cursor (a turn id never persisted) → full HistoryPage fallback (initial=2 → last two).
+    // An unknown cursor explicitly resets to the bounded newest page (initial=2 → last two).
     let bogus: TurnId = make_turn("never persisted").id;
     let mut ws2 = ws_connect(port, &cookie).await;
     ws2.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -428,12 +392,20 @@ async fn resync_delta_over_websocket() {
     ))
     .await
     .unwrap();
-    let frame = next_history_frame(&mut ws2).await;
-    assert_eq!(frame["type"], "history_page");
-    let turns = frame["turns"].as_array().unwrap();
+    let bootstrap = wait_for_bootstrap(&mut ws2, tid).await;
+    let BootstrapHistory::CursorReset {
+        requested_after,
+        turns,
+        has_more,
+    } = bootstrap.history
+    else {
+        panic!("an unknown cursor should produce cursor-reset bootstrap history");
+    };
+    assert_eq!(requested_after, bogus);
     assert_eq!(turns.len(), 2);
-    assert_eq!(turns[0]["id"].as_str().unwrap(), ids[3]);
-    assert_eq!(turns[1]["id"].as_str().unwrap(), ids[4]);
+    assert!(has_more);
+    assert_eq!(turns[0].id.to_string(), ids[3]);
+    assert_eq!(turns[1].id.to_string(), ids[4]);
 }
 
 #[tokio::test]
@@ -536,10 +508,10 @@ async fn subscribe_corrupt_history_returns_structured_error() {
         };
         match serde_json::from_str::<ServerMessage>(&text).unwrap() {
             ServerMessage::Error { error } => {
-                assert_eq!(error.code, "persistence_error");
+                assert_eq!(error.code, "thread_bootstrap_failed");
                 assert_eq!(error.severity, ErrorSeverity::Error);
                 assert_eq!(error.thread_id, Some(tid));
-                assert_eq!(error.action.as_deref(), Some("subscribe_history"));
+                assert_eq!(error.action.as_deref(), Some("subscribe"));
                 assert!(error.detail.unwrap_or_default().contains("line 1"));
                 return;
             }
@@ -548,4 +520,120 @@ async fn subscribe_corrupt_history_returns_structured_error() {
     }
 
     panic!("subscribe did not return a structured persistence error");
+}
+
+async fn next_history_page(ws: &mut TestWs) -> (Option<TurnId>, Vec<WireTurn>, bool) {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                if let Ok(ServerMessage::HistoryPage {
+                    before,
+                    turns,
+                    has_more,
+                    ..
+                }) = serde_json::from_str(&text)
+                {
+                    return (before, turns, has_more);
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(error))) => panic!("websocket error while waiting for history: {error}"),
+            Ok(None) => break,
+            Err(_) => {}
+        }
+    }
+    panic!("pagination history page not observed");
+}
+
+async fn wait_for_bootstrap(ws: &mut TestWs, thread_id: ThreadId) -> ThreadBootstrapPayload {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    let mut generation = None;
+    let mut expected = HashMap::new();
+    let mut chunks: HashMap<BootstrapSection, BTreeMap<u32, Vec<u8>>> = HashMap::new();
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                let Ok(ServerMessage::ThreadBootstrap {
+                    thread_id: message_thread_id,
+                    subscription_generation,
+                    frame,
+                }) = serde_json::from_str(&text)
+                else {
+                    continue;
+                };
+                if message_thread_id != thread_id {
+                    continue;
+                }
+                match frame {
+                    ThreadBootstrapFrame::Start { sections } => {
+                        generation = Some(subscription_generation);
+                        expected = sections
+                            .into_iter()
+                            .map(|section| (section.section, section.chunk_count))
+                            .collect();
+                        chunks.clear();
+                    }
+                    ThreadBootstrapFrame::Chunk {
+                        section,
+                        index,
+                        payload_base64,
+                    } if generation == Some(subscription_generation) => {
+                        let payload = BASE64
+                            .decode(payload_base64)
+                            .expect("bootstrap chunks should contain valid base64");
+                        chunks.entry(section).or_default().insert(index, payload);
+                    }
+                    ThreadBootstrapFrame::Commit if generation == Some(subscription_generation) => {
+                        for (section, chunk_count) in &expected {
+                            assert_eq!(
+                                chunks.get(section).map(BTreeMap::len),
+                                Some(*chunk_count as usize),
+                                "bootstrap section {section:?} was incomplete at commit"
+                            );
+                        }
+                        return decode_bootstrap_sections(&mut chunks);
+                    }
+                    ThreadBootstrapFrame::Chunk { .. } | ThreadBootstrapFrame::Commit => {}
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(error))) => panic!("websocket error during bootstrap: {error}"),
+            Ok(None) => break,
+            Err(_) => {}
+        }
+    }
+    panic!("committed thread bootstrap not observed");
+}
+
+fn decode_bootstrap_sections(
+    chunks: &mut HashMap<BootstrapSection, BTreeMap<u32, Vec<u8>>>,
+) -> ThreadBootstrapPayload {
+    ThreadBootstrapPayload {
+        metadata: take_bootstrap_section(chunks, BootstrapSection::Metadata),
+        history: take_bootstrap_section(chunks, BootstrapSection::History),
+        live_turn: take_bootstrap_section(chunks, BootstrapSection::LiveTurn),
+        ordered_suffix: take_bootstrap_section(chunks, BootstrapSection::OrderedSuffix),
+        final_runtime: take_bootstrap_section(chunks, BootstrapSection::FinalRuntime),
+        notices: take_bootstrap_section(chunks, BootstrapSection::Notices),
+    }
+}
+
+fn take_bootstrap_section<T>(
+    chunks: &mut HashMap<BootstrapSection, BTreeMap<u32, Vec<u8>>>,
+    section: BootstrapSection,
+) -> T
+where
+    T: serde::de::DeserializeOwned,
+{
+    let section_chunks = chunks
+        .remove(&section)
+        .unwrap_or_else(|| panic!("bootstrap section {section:?} was absent"));
+    let mut encoded = Vec::new();
+    for (expected_index, (index, chunk)) in section_chunks.into_iter().enumerate() {
+        assert_eq!(index as usize, expected_index, "bootstrap chunk gap");
+        encoded.extend(chunk);
+    }
+    serde_json::from_slice(&encoded)
+        .unwrap_or_else(|error| panic!("bootstrap section {section:?} was invalid: {error}"))
 }
