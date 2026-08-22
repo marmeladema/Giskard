@@ -826,6 +826,28 @@ async fn run() -> Result<(), String> {
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| format!("cannot create data dir {}: {e}", data_dir.display()))?;
 
+    // Locked for the same reason the real server is, and with more at stake: this binary
+    // *overwrites* `config.toml` in whatever directory it is given, so being pointed at a live data
+    // directory would clobber a real configuration. The default is a PID-suffixed temp directory,
+    // so concurrent replay servers never contend. Held for the process lifetime — dropping the
+    // guard releases the lock.
+    let _data_dir_lock = match giskard_persist::DataDirLock::try_acquire(&data_dir) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            return Err(format!(
+                "another Giskard process is using the data directory {}. Stop it, or set \
+                 GISKARD_DATA_DIR to a directory of its own.",
+                data_dir.display()
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "cannot lock data directory {}: {e}",
+                data_dir.display()
+            ));
+        }
+    };
+
     let bind = std::env::var("GISKARD_BIND").unwrap_or_else(|_| "127.0.0.1:8787".to_string());
     let password =
         std::env::var("GISKARD_REPLAY_PASSWORD").unwrap_or_else(|_| "giskard".to_string());

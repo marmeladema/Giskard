@@ -75,9 +75,27 @@ Cargo workspace with 8 crates under `crates/`:
 - `giskard-server` — Axum backend + the embedded vanilla static web UI (`static/`)
 
 ## Conventions
-- Edition 2024, MSRV 1.88.
+- Edition 2024, MSRV 1.89 (`std::fs::File::try_lock`). CI runs `@stable` with no
+  `rust-toolchain.toml`, so it will not catch a newer API sneaking past this line — raising it is
+  always a deliberate act.
 - All Codex-specific types confined to `giskard-harness-codex`.
 - Atomic writes for all persistence (temp file + fsync + rename).
+- The store's per-thread locks are in-process `Mutex`es and order nothing between binaries. Anything
+  that rewrites or deletes store files from outside `giskard-server` must hold the advisory
+  data-directory lock (`giskard_persist::DataDirLock`, `<data_dir>/.giskard.lock`) and fail rather
+  than proceed alongside a running server. Read-only paths and `--dry-run` take no lock and warn
+  instead. Never reintroduce a wall-clock heuristic as a stand-in for exclusion.
+- Thread storage is split by how a field grows. `threads/<id>/history.jsonl` is a **bounded** index
+  — a header line, then one record per turn carrying only strictly bounded or human-scaled fields
+  (ids, model, status kind, usage, timestamps, a capped prompt preview, a capped status message,
+  attachment descriptors). Anything **agent-driven** (prompt text, provider error text, items,
+  diffs, command output) belongs in that turn's payload file,
+  `threads/<id>/turns/<turn_id>.jsonl`, which is written atomically. Never add an agent-driven field
+  to a turn record: the index staying small no matter what the agent did is the property the split
+  exists to create. A turn commits payload first, index last.
+- Every on-disk format states its own version in the file it governs (the `history.jsonl` header for
+  the layout, each payload header for that turn). Unknown `kind` values are skipped with a warning;
+  a newer payload format fails that turn only; a newer history format fails the thread.
 - IDs are ULIDs.
 - Comments are welcome when they explain intent, invariants, protocol contracts, or non-obvious
   failure handling. Avoid comments that only restate the code.

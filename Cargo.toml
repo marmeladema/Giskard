@@ -15,7 +15,10 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-rust-version = "1.88"
+# 1.89 for `std::fs::File::try_lock` (the data-directory lock, giskard-persist::lock). Note that CI
+# will not catch a regression here: every job uses `dtolnay/rust-toolchain@stable` and there is no
+# `rust-toolchain.toml`, so a newer API compiles green while this line claims otherwise.
+rust-version = "1.89"
 
 [workspace.dependencies]
 giskard-core = { path = "crates/giskard-core" }

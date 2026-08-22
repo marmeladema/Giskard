@@ -51,7 +51,7 @@ The agent harness is a replaceable component behind a neutral `AgentHarness` tra
 
 ## Prerequisites
 
-- **Rust** — edition 2024, MSRV **1.88+** (`rustup` recommended).
+- **Rust** — edition 2024, MSRV **1.89+** (`rustup` recommended).
 - **Codex CLI**, already installed and authenticated on the machine. Giskard does **not** manage
   Codex's credentials — it inherits `~/.codex` (ChatGPT login or an API key / custom provider) when
   it spawns the app-server. If Codex isn't configured, turns will fail with an "unauthenticated"
@@ -351,22 +351,41 @@ Flat files under the data directory (human-readable; inspect with `cat`/`jq`):
 ```
 $GISKARD_DATA_DIR/
 ├── config.toml                  # this config
+├── .giskard.lock                # advisory lock: one Giskard process per data directory
 ├── session.key                  # 32-byte local key for signed browser sessions
 ├── projects.json                # project index (id, name, dir, created_at, order)
 ├── projects/<project_id>/
 │   ├── project.json             # workspace root, harness kind
-│   ├── threads/
-│   │   ├── <thread_id>.json      # thread metadata, permission preset, token cache
-│   │   └── <thread_id>.jsonl     # authoritative turn history — one Turn per line, append-only
+│   ├── threads/<thread_id>/
+│   │   ├── thread.json           # thread metadata, permission preset, token cache
+│   │   ├── history.jsonl         # turn index — a header line, then one bounded record per turn
+│   │   ├── turns/<turn_id>.jsonl # that turn's prompt, items and diffs — written atomically
+│   │   └── legacy/               # pre-migration originals, retained until you prune them
 │   ├── worktrees/<thread_id>/    # Git worktree for a thread started isolated (docs/git-worktrees.md)
 │   └── tokens.json               # per-project token ledger (total, by_day, by_model)
 └── tokens-global.json            # cross-project token ledger
 ```
 
-Thread **history** is the append-only `.jsonl` (source of truth); the `.json` is small metadata +
-token aggregates that can be rebuilt from the history. Writes are crash-safe: metadata/ledgers use
-atomic temp-file+rename, history appends are single `O_APPEND` writes (a torn final line is skipped
-on load).
+Thread **history** is split by how the two halves grow. `history.jsonl` is the index: one record per
+turn, holding only bounded fields (ids, model, status, usage, timestamps, a capped prompt preview,
+attachment descriptors) — so it stays small no matter what the agent did, and it is appended to.
+`turns/<turn_id>.jsonl` holds the unbounded half — the full prompt, the full status message, the
+items, the diffs — and is
+written with an atomic temp-file+fsync+rename, so a payload is complete or absent rather than torn.
+A turn commits payload first, index last: a crash between them leaves a file no record references,
+which every read path simply cannot see. `thread.json` is small metadata + token aggregates that can
+be rebuilt from the index alone.
+
+Each file states its own format: `history.jsonl`'s header line carries the layout version (written
+once, when the thread is created) and each payload file carries its own, so one unreadable turn fails alone
+while the index and every other turn stay readable.
+
+**Upgrading.** Threads written by an earlier version — a flat `threads/<thread_id>.json` beside a
+`threads/<thread_id>.jsonl` — are migrated to the directory above automatically, one thread at a
+time, the first time each is opened. Migration stages the rebuild, verifies it before committing,
+and never deletes: the originals are moved to `legacy/`. `giskard-admin migrate-storage` does the
+same thing in bulk, and `giskard-admin prune-legacy` removes the retained originals once you trust
+the new layout.
 
 ---
 
@@ -379,6 +398,18 @@ giskard-admin <command>
 From the checkout without installing, use
 `cargo run -p giskard-persist --bin giskard-admin -- <command>`.
 
+**Stop the server before running a command that changes the store.** `giskard-admin` is a separate
+binary, so the store's in-process locks order nothing between it and a running `giskard-server`.
+Every mutating command therefore takes an advisory lock on the data directory
+(`$GISKARD_DATA_DIR/.giskard.lock`) and refuses if the server — or another `giskard-admin` run —
+holds it. `--dry-run` and the read-only commands take no lock and work either way; they warn that
+what they print may already be stale. The same lock stops a second `giskard-server` from starting
+against a data directory already in use.
+
+The lock is **advisory and local**: it constrains Giskard's own binaries, not `rm -rf`, a backup
+tool, or an editor, and it is not reliable over NFS. The kernel releases it when the holding process
+dies, so a crash leaves nothing to clean up and the file is never deleted.
+
 | Command | Description |
 |---------|-------------|
 | `set-password` | Prompt for a password and print its Argon2 hash. |
@@ -388,7 +419,10 @@ From the checkout without installing, use
 | `dump-thread <project_id> <thread_id>` | Pretty-print a thread's metadata JSON. |
 | `delete-thread <project_id> <thread_id>` | Delete a thread (metadata + history). |
 | `delete-project <project_id>` | Delete a project and its threads. |
-| `validate` | Parse every stored file and report corruption (history is checked line-by-line). |
+| `validate` | Parse every stored file and report corruption (history is checked line-by-line, and an unreadable turn payload is reported per turn). |
+| `migrate-storage [--dry-run]` | Migrate every thread to the current storage layout. Happens automatically per thread on open; this only does it in bulk. Non-destructive — the originals are retained under `legacy/`. |
+| `prune-legacy [--dry-run]` | Delete the retained pre-migration originals. **This destroys transcript history** — run it only once the new layout is trusted. |
+| `sweep-orphan-payloads [--dry-run]` | Delete turn payload files that no history record references. Such files are invisible to every read path, so this only reclaims space. Skips (and exits non-zero for) any thread whose index is missing, references no turns, or would have more than a handful swept at once — a large sweep set is evidence of a truncated index beside recoverable payloads, not of orphaned commits. `--dry-run` reports those refusals too, and lists the files each one is about. |
 
 ---
 
