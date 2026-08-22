@@ -5322,16 +5322,24 @@ mod tests {
         wait_for_turn_count(&store, project_id, thread_id, 2).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
+        // The bounded index carries one record per turn, after its one-line header.
         let raw_history = tokio::fs::read_to_string(
             data_dir
                 .join("projects")
                 .join(project_id.to_string())
                 .join("threads")
-                .join(format!("{thread_id}.jsonl")),
+                .join(thread_id.to_string())
+                .join("history.jsonl"),
         )
         .await
         .unwrap();
-        assert_eq!(raw_history.lines().count(), 2);
+        assert_eq!(
+            raw_history
+                .lines()
+                .filter(|line| line.contains(r#""kind":"turn""#))
+                .count(),
+            2
+        );
 
         let saved = store.load_all_turns(project_id, thread_id).await.unwrap();
         assert_eq!(saved.len(), 2);

@@ -16,8 +16,11 @@ use giskard_core::token::{DailyTokenLedger, TokenLedger};
 use giskard_core::turn::{Mode, PermissionPreset, Turn};
 
 use crate::PersistError;
-use crate::atomic::{atomic_write_json, read_json, read_json_or_quarantine};
+use crate::atomic::{atomic_write, atomic_write_json, read_json, read_json_or_quarantine};
 use crate::config::Config;
+use crate::history::{self, HistoryHeader, TurnRecord};
+use crate::layout::{ThreadLayout, ThreadPaths};
+use crate::migrate::{self, MigrationOutcome};
 
 const SCHEMA_VERSION: u32 = 1;
 
@@ -138,6 +141,15 @@ pub enum ThreadRecency {
 /// earlier than `u64::MAX`.
 const MAX_THREAD_REVISION: u64 = 9_007_199_254_740_991;
 
+/// How many unreferenced payload files one thread can plausibly have accumulated honestly.
+///
+/// A turn commit writes its payload, then appends its index record; only a crash landing between
+/// those two writes leaves an orphan, so they accrue one per crash. Well past that, the likelier
+/// explanation is that the *index* lost a tail of appends and the payloads it no longer names are
+/// the surviving history — so the sweep refuses instead of deleting. Deliberately not a parameter:
+/// a guard against destroying transcript history should not be callable away.
+const MAX_PLAUSIBLE_ORPHANS: usize = 8;
+
 /// Result of an attempted metadata mutation under the per-thread store lock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThreadMutation {
@@ -149,6 +161,21 @@ pub enum ThreadMutation {
         before: Box<ThreadFile>,
         after: Box<ThreadFile>,
     },
+}
+
+/// What an orphan sweep found, and why it declined to delete if it did.
+///
+/// A refusal is carried rather than raised because it is a statement *about* the payload files —
+/// "these may be the surviving history" — so it has to reach the caller together with the list it
+/// describes. Raising it would also make `--dry-run` fail, which is precisely the run whose job is
+/// to show an operator what a refusal is talking about.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OrphanSweep {
+    /// Payload files no turn record references: deleted, or the ones that would be.
+    pub payloads: Vec<PathBuf>,
+    /// Why nothing was deleted. `None` means the sweep was willing to delete `payloads` — and did,
+    /// unless this was a dry run.
+    pub refusal: Option<String>,
 }
 
 /// Result after a turn was appended to authoritative history.
@@ -319,7 +346,7 @@ where
     }
 }
 
-fn parse_turn_history(path: &Path, data: &str) -> Result<Vec<Turn>, PersistError> {
+pub(crate) fn parse_turn_history(path: &Path, data: &str) -> Result<Vec<Turn>, PersistError> {
     let lines: Vec<&str> = data.lines().filter(|l| !l.trim().is_empty()).collect();
     let mut turns = Vec::with_capacity(lines.len());
     let mut seen_turn_ids = HashSet::new();
@@ -358,6 +385,56 @@ fn parse_turn_history(path: &Path, data: &str) -> Result<Vec<Turn>, PersistError
     Ok(turns)
 }
 
+/// Reassemble whole `Turn` values from a format 2 index plus one payload file per turn.
+///
+/// A turn whose payload is missing, damaged, or written in a format this build does not understand
+/// fails **alone**: it is dropped from the returned history with an error logged, while the index
+/// and every other turn stay readable. That containment is the reason a turn is its own file.
+async fn assemble_turns(
+    paths: &ThreadPaths,
+    index_path: &Path,
+    index_data: &str,
+) -> Result<Vec<Turn>, PersistError> {
+    let records = history::parse_history_index(index_path, index_data)?;
+    let mut turns = Vec::with_capacity(records.len());
+    for record in records {
+        let payload_path = paths.turn_payload(record.turn_id);
+        match history::read_turn_payload(&payload_path).await {
+            Ok(Some(payload)) => turns.push(record.into_turn(payload, &payload_path)),
+            Ok(None) => tracing::error!(
+                path = %payload_path.display(),
+                turn_id = %record.turn_id,
+                action = "load_turn_payload",
+                "turn payload file is missing; skipping the turn and keeping the rest of the thread"
+            ),
+            Err(error) => tracing::error!(
+                path = %payload_path.display(),
+                turn_id = %record.turn_id,
+                %error,
+                action = "load_turn_payload",
+                "unreadable turn payload; skipping the turn and keeping the rest of the thread"
+            ),
+        }
+    }
+    Ok(turns)
+}
+
+async fn remove_dir_all_if_present(path: &Path) -> Result<(), PersistError> {
+    match tokio::fs::remove_dir_all(path).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(PersistError::Io(e.to_string())),
+    }
+}
+
+async fn path_exists(path: &Path) -> bool {
+    tokio::fs::metadata(path).await.is_ok()
+}
+
+async fn is_dir(path: &Path) -> bool {
+    matches!(tokio::fs::metadata(path).await, Ok(meta) if meta.is_dir())
+}
+
 // ---- Store ----
 
 /// The flat-file persistence store.
@@ -376,6 +453,13 @@ pub struct PersistStore {
     /// The JSONL remains authoritative. This per-process cache only avoids reparsing unchanged
     /// histories when the user switches between already-opened threads.
     history_cache: RwLock<HashMap<(ProjectId, ThreadId), Arc<HistoryCacheEntry>>>,
+    /// Threads whose migration to the current layout was attempted and could not proceed.
+    ///
+    /// Without this, a thread with an unparseable format 1 history re-reads and re-parses that
+    /// whole file, takes the per-thread lock, and logs an error on *every* store call — including
+    /// the read paths that previously took no lock at all. Nothing here changes what a caller sees;
+    /// it only stops the store from retrying a decision it has already made this process.
+    unmigratable: RwLock<HashSet<(ProjectId, ThreadId)>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -398,6 +482,7 @@ impl PersistStore {
             project_index_lock: Mutex::new(()),
             thread_locks: Mutex::new(HashMap::new()),
             history_cache: RwLock::new(HashMap::new()),
+            unmigratable: RwLock::new(HashSet::new()),
         }
     }
 
@@ -443,12 +528,105 @@ impl PersistStore {
         self.project_dir(id).join("threads")
     }
 
-    fn thread_json_path(&self, project: ProjectId, thread: ThreadId) -> PathBuf {
-        self.threads_dir(project).join(format!("{}.json", thread))
+    // ---- Layout resolution (§5.2) ----
+    //
+    // The store holds a mix of format 1 and format 2 threads for as long as an unmigrated thread
+    // survives, and *every* thread file operation resolves differently between them. Resolution is
+    // centralized here so no call site can branch on only one of the two shapes.
+
+    /// Which layout this thread is actually stored in.
+    ///
+    /// Structural, not recorded anywhere: the directory either exists or it does not. A thread with
+    /// nothing on disk resolves to the current layout, so a first write creates format 2.
+    async fn thread_layout(&self, project: ProjectId, thread: ThreadId) -> ThreadLayout {
+        let threads_dir = self.threads_dir(project);
+        if is_dir(&threads_dir.join(thread.to_string())).await {
+            return ThreadLayout::Directory;
+        }
+        if path_exists(&threads_dir.join(format!("{thread}.json"))).await
+            || path_exists(&threads_dir.join(format!("{thread}.jsonl"))).await
+        {
+            return ThreadLayout::Flat;
+        }
+        ThreadLayout::Directory
     }
 
-    fn thread_jsonl_path(&self, project: ProjectId, thread: ThreadId) -> PathBuf {
-        self.threads_dir(project).join(format!("{}.jsonl", thread))
+    async fn thread_paths(&self, project: ProjectId, thread: ThreadId) -> ThreadPaths {
+        ThreadPaths::new(
+            self.threads_dir(project),
+            thread,
+            self.thread_layout(project, thread).await,
+        )
+    }
+
+    /// Paths for a thread already known to be in the current layout, without re-resolving.
+    fn current_thread_paths(&self, project: ProjectId, thread: ThreadId) -> ThreadPaths {
+        ThreadPaths::new(self.threads_dir(project), thread, ThreadLayout::Directory)
+    }
+
+    /// Migrate this thread to the current layout if it is not already there.
+    ///
+    /// Called at the top of every public thread entry point, *before* that entry point takes the
+    /// per-thread lock, because migration itself runs under that lock and the lock is not
+    /// reentrant. Migration is monotonic, so releasing the lock in between cannot un-migrate.
+    ///
+    /// Returns the layout the thread is actually in afterwards: a migration that cannot proceed
+    /// (an unparseable format 1 history, a failed rename) leaves the thread readable and writable
+    /// exactly as it is today rather than failing the caller's operation.
+    async fn ensure_migrated(&self, project: ProjectId, thread: ThreadId) -> ThreadLayout {
+        let threads_dir = self.threads_dir(project);
+        let has_flat = path_exists(&threads_dir.join(format!("{thread}.json"))).await
+            || path_exists(&threads_dir.join(format!("{thread}.jsonl"))).await;
+        if !has_flat {
+            // The overwhelmingly common case: a format 2 thread, or one with nothing on disk yet.
+            // One `stat` and no lock.
+            return ThreadLayout::Directory;
+        }
+        if self.unmigratable.read().await.contains(&(project, thread)) {
+            return self.thread_layout(project, thread).await;
+        }
+
+        let lock = self.thread_lock(thread).await;
+        let _guard = lock.lock().await;
+        self.migrate_thread_unlocked(project, thread).await
+    }
+
+    /// Migrate under an already-held thread lock, and report the layout that resulted.
+    ///
+    /// Never fails the caller: a migration that cannot proceed is logged, remembered, and left on
+    /// the layout it could not leave.
+    async fn migrate_thread_unlocked(&self, project: ProjectId, thread: ThreadId) -> ThreadLayout {
+        match migrate::migrate_thread(&self.threads_dir(project), thread).await {
+            Ok(MigrationOutcome::Migrated | MigrationOutcome::FinishedLegacyMove) => {
+                // History moved file; anything parsed from the old path is stale.
+                self.invalidate_history_cache(project, thread).await;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::error!(
+                    %project,
+                    %thread,
+                    %error,
+                    action = "migrate_thread",
+                    "thread storage migration failed; continuing on the existing layout"
+                );
+                self.unmigratable.write().await.insert((project, thread));
+            }
+        }
+        self.thread_layout(project, thread).await
+    }
+
+    /// Forget that a thread could not be migrated, so the next open tries again.
+    ///
+    /// Called wherever the reason might have changed: an explicit `giskard-admin` run, and deletion
+    /// (which frees the id for a thread that has nothing to do with the one that failed).
+    async fn clear_unmigratable(&self, project: ProjectId, thread: ThreadId) {
+        self.unmigratable.write().await.remove(&(project, thread));
+    }
+
+    /// The thread metadata record, wherever this thread keeps it.
+    async fn thread_json_path(&self, project: ProjectId, thread: ThreadId) -> PathBuf {
+        self.thread_paths(project, thread).await.metadata()
     }
 
     async fn history_file_meta(
@@ -495,13 +673,26 @@ impl PersistStore {
         entry
     }
 
+    /// The parsed history for a thread, reusing the cache when the index file is unchanged.
+    ///
+    /// Cache validity is keyed on the **index** file's metadata alone. That is sound because
+    /// nothing appends to a payload file after its turn commits, so a turn's payload cannot change
+    /// under a cache entry the index still validates. When amendments start appending to payload
+    /// files, this key has to grow with them.
+    ///
+    /// Note what this trades away. Caching whole `Turn` values keeps a warm `load_all_turns` at
+    /// zero payload opens, but it also keeps resident memory per open thread *unbounded*, exactly
+    /// as before this change — so the split's "the index is bounded, so it can stay resident"
+    /// benefit is available but not yet taken. Claiming it means caching only the parsed index and
+    /// reading payloads per turn, which is worth doing once the bounded read APIs exist and the
+    /// callers that need whole turns are the exception rather than the rule.
     async fn current_history_cache_entry(
         &self,
         project: ProjectId,
         thread: ThreadId,
     ) -> Result<Option<Arc<HistoryCacheEntry>>, PersistError> {
-        let path = self.thread_jsonl_path(project, thread);
-        let Some(meta) = self.history_file_meta(&path).await? else {
+        let paths = self.thread_paths(project, thread).await;
+        let Some(meta) = self.history_file_meta(&paths.history()).await? else {
             self.invalidate_history_cache(project, thread).await;
             return Ok(None);
         };
@@ -513,7 +704,7 @@ impl PersistStore {
             }
         }
 
-        let Some((turns, meta)) = self.load_all_turns_uncached(&path, meta).await? else {
+        let Some((turns, meta)) = self.load_all_turns_uncached(&paths, meta).await? else {
             self.invalidate_history_cache(project, thread).await;
             return Ok(None);
         };
@@ -532,6 +723,10 @@ impl PersistStore {
             .write()
             .await
             .retain(|(cached_project, _), _| *cached_project != project);
+        self.unmigratable
+            .write()
+            .await
+            .retain(|(cached_project, _)| *cached_project != project);
     }
 
     async fn update_history_cache_after_append(
@@ -705,7 +900,18 @@ impl PersistStore {
         project: ProjectId,
         thread: ThreadId,
     ) -> Result<Option<ThreadFile>, PersistError> {
-        read_json_or_quarantine(&self.thread_json_path(project, thread)).await
+        self.ensure_migrated(project, thread).await;
+        self.load_thread_unlocked(project, thread).await
+    }
+
+    /// Load a thread file without migrating first — for callers already holding the thread lock,
+    /// which migration itself takes.
+    async fn load_thread_unlocked(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+    ) -> Result<Option<ThreadFile>, PersistError> {
+        read_json_or_quarantine(&self.thread_json_path(project, thread).await).await
     }
 
     /// Save a thread file atomically.
@@ -714,17 +920,20 @@ impl PersistStore {
         project: ProjectId,
         thread: &ThreadFile,
     ) -> Result<(), PersistError> {
+        self.ensure_migrated(project, thread.id).await;
         let lock = self.thread_lock(thread.id).await;
         let _guard = lock.lock().await;
         self.save_thread_unlocked(project, thread).await
     }
 
+    /// Write the metadata record. The caller must hold this thread's lock — the read-modify-write
+    /// in [`Self::update_thread_with_recency_unlocked`] is only single-writer because of it.
     async fn save_thread_unlocked(
         &self,
         project: ProjectId,
         thread: &ThreadFile,
     ) -> Result<(), PersistError> {
-        atomic_write_json(&self.thread_json_path(project, thread.id), thread).await
+        atomic_write_json(&self.thread_json_path(project, thread.id).await, thread).await
     }
 
     /// Create a thread without overwriting an existing record. New durable records begin at
@@ -740,9 +949,14 @@ impl PersistStore {
                 thread.id, thread.project_id
             )));
         }
+        self.ensure_migrated(project, thread.id).await;
         let lock = self.thread_lock(thread.id).await;
         let _guard = lock.lock().await;
-        if self.load_thread(project, thread.id).await?.is_some() {
+        if self
+            .load_thread_unlocked(project, thread.id)
+            .await?
+            .is_some()
+        {
             return Err(PersistError::Invalid(format!(
                 "thread {} already exists in project {project}",
                 thread.id
@@ -750,6 +964,11 @@ impl PersistStore {
         }
         thread.revision = 1;
         self.save_thread_unlocked(project, &thread).await?;
+        // The history header is written here, once, and never touched again. That is
+        // what lets it carry the layout version: unlike `thread.json` it inherits no bug from the
+        // metadata write path, and there is no second file its claim has to stay consistent with.
+        self.ensure_history_header_unlocked(project, thread.id, thread.created_at)
+            .await?;
         Ok(thread)
     }
 
@@ -797,12 +1016,16 @@ impl PersistStore {
     where
         F: FnOnce(&mut ThreadFile),
     {
+        self.ensure_migrated(project, thread).await;
         let lock = self.thread_lock(thread).await;
         let _guard = lock.lock().await;
         self.update_thread_with_recency_unlocked(project, thread, recency, f)
             .await
     }
 
+    /// The read-modify-write half of [`Self::update_thread_with_recency`], for callers already
+    /// holding the thread lock — a turn commit folds its usage through here inside the same lock
+    /// that ordered its history append.
     async fn update_thread_with_recency_unlocked<F>(
         &self,
         project: ProjectId,
@@ -813,7 +1036,7 @@ impl PersistStore {
     where
         F: FnOnce(&mut ThreadFile),
     {
-        let Some(before) = self.load_thread(project, thread).await? else {
+        let Some(before) = self.load_thread_unlocked(project, thread).await? else {
             return Ok(ThreadMutation::Missing);
         };
         let mut after = before.clone();
@@ -864,38 +1087,119 @@ impl PersistStore {
         })
     }
 
-    // ---- Authoritative turn history (`<thread_id>.jsonl`, one Turn per line, spec §5.4 H1) ----
+    // ---- Authoritative turn history (spec §5.4 H1) ----
+    //
+    // Split across two files by how their size behaves. `history.jsonl` is the **index**: one
+    // strictly bounded record per turn, appended. `turns/<turn_id>.jsonl` is the **payload**:
+    // everything whose size is a function of what the agent did, written atomically.
+    //
+    // The split closes a live corruption path. A whole turn appended with one `write_all` can be
+    // torn by a crash or a full disk; the next append concatenates onto the partial line, the
+    // merged garbage line is no longer last, and the tolerance for a torn *final* line no longer
+    // covers it — so the thread's entire history becomes unreadable. Probability scales with turn
+    // size, so it was likeliest on the threads with the largest command output. Temp file + fsync +
+    // rename makes a payload complete or absent, and what remains on the append-only path is a
+    // bounded record the torn-final-line tolerance is adequate for.
 
-    /// Append a completed `Turn` as one line to the thread's authoritative JSONL history (H1/H2).
+    /// Append a completed `Turn`: payload first, index last.
     ///
-    /// The pre-serialized `JSON + "\n"` is written with a **single** `write_all` to a file opened
-    /// `O_APPEND`, so on a local POSIX filesystem the offset-seek + write is atomic against
-    /// concurrent writers and a process kill leaves the line all-or-nothing. The per-thread lock is
-    /// still used to order appends against aggregate repair. This does not survive power loss (page
-    /// cache) — the tolerant loader (`load_all_turns`) handles a torn final line. On NFS/network
-    /// storage the atomicity guarantee does not hold (out of scope, §1.2 local-first).
+    /// A crash between the two leaves a payload file no turn record references. It is invisible to
+    /// every read path, because reads start from the index — so the worst case is a wasted file
+    /// rather than an unreadable thread.
+    ///
+    /// The index record is a pre-serialized `JSON + "\n"` written with a **single** `write_all` to
+    /// a file opened `O_APPEND`, so on a local POSIX filesystem the offset-seek + write is atomic
+    /// against concurrent writers and a process kill leaves the line all-or-nothing. The per-thread
+    /// lock is still used to order appends against aggregate repair. This does not survive power
+    /// loss (page cache) — the tolerant loader handles a torn final line. On NFS/network storage
+    /// the atomicity guarantee does not hold (out of scope, §1.2 local-first).
     pub async fn append_turn(
         &self,
         project: ProjectId,
         thread: ThreadId,
         turn: &Turn,
     ) -> Result<(), PersistError> {
+        self.ensure_migrated(project, thread).await;
         let lock = self.thread_lock(thread).await;
         let _guard = lock.lock().await;
         self.append_turn_unlocked(project, thread, turn).await
     }
 
+    /// Write the history header if this thread has no index file yet.
+    ///
+    /// Idempotent and called under the thread lock, so the header is written exactly once even
+    /// though both thread creation and a first append can be the one to need it.
+    async fn ensure_history_header_unlocked(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+        created_at: DateTime<Utc>,
+    ) -> Result<(), PersistError> {
+        let paths = self.thread_paths(project, thread).await;
+        if paths.layout() == ThreadLayout::Flat || path_exists(&paths.history()).await {
+            return Ok(());
+        }
+        atomic_write(
+            &paths.history(),
+            HistoryHeader::new(thread, created_at).line()?.as_bytes(),
+        )
+        .await
+    }
+
+    /// The two-file commit described on [`Self::append_turn`], for callers already holding the
+    /// thread lock.
     async fn append_turn_unlocked(
         &self,
         project: ProjectId,
         thread: ThreadId,
         turn: &Turn,
     ) -> Result<(), PersistError> {
-        let path = self.thread_jsonl_path(project, thread);
-        let mut line =
-            serde_json::to_string(turn).map_err(|e| PersistError::Serialize(e.to_string()))?;
-        line.push('\n');
+        let paths = self.thread_paths(project, thread).await;
+        let path = paths.history();
+
+        let line = match paths.layout() {
+            // A thread whose format 1 history could not be migrated (an unparseable interior line)
+            // keeps behaving exactly as it does today rather than losing the append.
+            ThreadLayout::Flat => {
+                let mut line = serde_json::to_string(turn)
+                    .map_err(|e| PersistError::Serialize(e.to_string()))?;
+                line.push('\n');
+                line
+            }
+            ThreadLayout::Directory => {
+                let payload_path = paths.turn_payload(turn.id);
+                if path_exists(&payload_path).await {
+                    // A repeat of a turn whose payload is already durable. The index folds turn
+                    // records first-wins, so replacing the payload here would leave the winning
+                    // record describing bytes it never indexed.
+                    //
+                    // The one case where the two diverge is a *retry* after the index append
+                    // failed: the second attempt skips the payload write and appends its own
+                    // record, so the record that wins was not the one whose write produced the
+                    // file. That is sound only because a retry re-serializes the same turn, making
+                    // the bytes identical — a caller that re-appended a *different* turn under an
+                    // id already on disk would be defeating the first-wins rule, not exercising
+                    // this path.
+                    tracing::warn!(
+                        %project,
+                        %thread,
+                        turn_id = %turn.id,
+                        action = "append_turn",
+                        "turn payload already exists; keeping the durable one"
+                    );
+                } else {
+                    atomic_write(&payload_path, &history::payload_file_bytes(turn)?).await?;
+                }
+                let mut line = String::new();
+                if !path_exists(&path).await {
+                    line.push_str(&HistoryHeader::new(thread, turn.started_at).line()?);
+                }
+                line.push_str(&TurnRecord::from_turn(turn).line()?);
+                line
+            }
+        };
         let appended_len = line.len() as u64;
+        let bytes = line.into_bytes();
 
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -911,7 +1215,7 @@ impl PersistStore {
                 .create(true)
                 .append(true)
                 .open(&write_path)?;
-            file.write_all(line.as_bytes())
+            file.write_all(&bytes)
         })
         .await
         .map_err(|e| PersistError::Io(e.to_string()))?
@@ -941,6 +1245,7 @@ impl PersistStore {
         thread: ThreadId,
         turn: &Turn,
     ) -> Result<TurnCommitOutcome, PersistError> {
+        self.ensure_migrated(project, thread).await;
         let lock = self.thread_lock(thread).await;
         let _guard = lock.lock().await;
         self.append_turn_unlocked(project, thread, turn).await?;
@@ -970,18 +1275,23 @@ impl PersistStore {
         })
     }
 
+    /// Read and parse the history from disk, retrying while the index file changes underneath.
+    ///
+    /// Format 1 parses whole turns from the one file; format 2 parses the index and then opens one
+    /// payload file per turn.
     async fn load_all_turns_uncached(
         &self,
-        path: &Path,
+        paths: &ThreadPaths,
         mut meta_before: HistoryFileMeta,
     ) -> Result<Option<(Vec<Turn>, HistoryFileMeta)>, PersistError> {
+        let path = paths.history();
         for attempt in 0..3 {
-            let data = match tokio::fs::read_to_string(path).await {
+            let data = match tokio::fs::read_to_string(&path).await {
                 Ok(d) => d,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(e) => return Err(PersistError::Io(e.to_string())),
             };
-            let Some(meta_after) = self.history_file_meta(path).await? else {
+            let Some(meta_after) = self.history_file_meta(&path).await? else {
                 return Ok(None);
             };
             if meta_after != meta_before {
@@ -993,11 +1303,40 @@ impl PersistStore {
                     "history file changed while loading; retry limit exceeded".into(),
                 ));
             }
-            return Ok(Some((parse_turn_history(path, &data)?, meta_after)));
+            let turns = match paths.layout() {
+                ThreadLayout::Flat => parse_turn_history(&path, &data)?,
+                ThreadLayout::Directory => assemble_turns(paths, &path, &data).await?,
+            };
+            return Ok(Some((turns, meta_after)));
         }
         Err(PersistError::Io(
             "history file changed while loading; retry limit exceeded".into(),
         ))
+    }
+
+    /// The bounded index rows for a thread, without opening a single payload file.
+    ///
+    /// Everything aggregate repair needs — `usage`, `model`, `status`, and the turn timestamps —
+    /// is a turn-record field, so repair never has to read the agent-driven half of history.
+    async fn load_turn_records_unlocked(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+    ) -> Result<Vec<TurnRecord>, PersistError> {
+        let paths = self.thread_paths(project, thread).await;
+        let path = paths.history();
+        let data = match tokio::fs::read_to_string(&path).await {
+            Ok(data) => data,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) => return Err(PersistError::Io(e.to_string())),
+        };
+        match paths.layout() {
+            ThreadLayout::Directory => history::parse_history_index(&path, &data),
+            ThreadLayout::Flat => Ok(parse_turn_history(&path, &data)?
+                .iter()
+                .map(TurnRecord::from_turn)
+                .collect()),
+        }
     }
 
     /// Load every persisted turn from the JSONL history, in order (H4).
@@ -1005,6 +1344,17 @@ impl PersistStore {
     /// Tolerates a single unparseable **final** line (a torn append after power loss): it is
     /// skipped with a warning. A bad **interior** line is real corruption and returns `Corrupt`.
     pub async fn load_all_turns(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+    ) -> Result<Vec<Turn>, PersistError> {
+        self.ensure_migrated(project, thread).await;
+        self.load_all_turns_unlocked(project, thread).await
+    }
+
+    /// [`Self::load_all_turns`] without the migration check, for callers already holding the
+    /// thread lock — which migration itself takes, so calling the public one there would deadlock.
+    async fn load_all_turns_unlocked(
         &self,
         project: ProjectId,
         thread: ThreadId,
@@ -1025,6 +1375,7 @@ impl PersistStore {
         before: Option<TurnId>,
         limit: usize,
     ) -> Result<(Vec<Turn>, bool), PersistError> {
+        self.ensure_migrated(project, thread).await;
         let Some(entry) = self.current_history_cache_entry(project, thread).await? else {
             return Ok((vec![], false));
         };
@@ -1047,6 +1398,7 @@ impl PersistStore {
         thread: ThreadId,
         after: TurnId,
     ) -> Result<Option<Vec<Turn>>, PersistError> {
+        self.ensure_migrated(project, thread).await;
         let Some(entry) = self.current_history_cache_entry(project, thread).await? else {
             return Ok(None);
         };
@@ -1057,32 +1409,37 @@ impl PersistStore {
         }
     }
 
-    /// Rebuild the metadata token aggregates from the authoritative JSONL history (H3), for repair
-    /// when a crash landed between the history append and the metadata update.
+    /// Rebuild the metadata token aggregates from the authoritative history (H3), for repair when a
+    /// crash landed between the history append and the metadata update.
+    ///
+    /// Reads the **index only**: the ledger needs `usage`, `model` and `status`, and restoring the
+    /// thread's recency needs the turn timestamps — all of them turn-record fields. No payload file
+    /// is opened. An internal optimization, with no change to what repair produces.
     pub async fn recompute_aggregates(
         &self,
         project: ProjectId,
         thread: ThreadId,
     ) -> Result<ThreadMutation, PersistError> {
+        self.ensure_migrated(project, thread).await;
         let lock = self.thread_lock(thread).await;
         let _guard = lock.lock().await;
-        let turns = self.load_all_turns(project, thread).await?;
-        let latest_activity = turns
+        let records = self.load_turn_records_unlocked(project, thread).await?;
+        let latest_activity = records
             .iter()
-            .map(|turn| turn.completed_at.unwrap_or(turn.started_at))
+            .map(|record| record.completed_at.unwrap_or(record.started_at))
             .max();
         let recency = latest_activity
             .map(ThreadRecency::RestoreActivity)
             .unwrap_or(ThreadRecency::Preserve);
         self.update_thread_with_recency_unlocked(project, thread, recency, move |tf| {
             let mut ledger = TokenLedger::default();
-            for t in &turns {
+            for record in &records {
                 if matches!(
-                    t.status.kind,
+                    record.status.kind,
                     giskard_core::turn::TurnStatusKind::Completed
                         | giskard_core::turn::TurnStatusKind::Interrupted
                 ) {
-                    ledger.record(&t.model.provider, &t.model.model, &t.usage);
+                    ledger.record(&record.model.provider, &record.model.model, &record.usage);
                 }
             }
             tf.tokens = ledger;
@@ -1090,7 +1447,13 @@ impl PersistStore {
         .await
     }
 
-    /// List all thread files for a project (by reading the directory).
+    /// List all threads for a project (by reading the directory), in either layout, once each.
+    ///
+    /// A `<ulid>/` directory is a format 2 thread and a `<ulid>.json` file is a format 1 one; both
+    /// exist at once only in the window between a migration's commit rename and its relocation of
+    /// the originals, so the two are deduped by id. Everything else in the directory —
+    /// `<ulid>.migrating/`, `<ulid>.deleting/`, `<ulid>.jsonl`, any `*.corrupt-*` — carries a
+    /// suffix that stops the name parsing as a bare ULID, so none of it is ever enumerated.
     pub async fn list_threads(&self, project: ProjectId) -> Result<Vec<ThreadId>, PersistError> {
         let dir = self.threads_dir(project);
         let mut entries = match tokio::fs::read_dir(&dir).await {
@@ -1099,6 +1462,7 @@ impl PersistStore {
             Err(e) => return Err(PersistError::Io(e.to_string())),
         };
         let mut ids = vec![];
+        let mut seen = HashSet::new();
         while let Some(entry) = entries
             .next_entry()
             .await
@@ -1106,8 +1470,15 @@ impl PersistStore {
         {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if let Some(stem) = name.strip_suffix(".json")
-                && let Ok(ulid) = stem.parse::<ulid::Ulid>()
+            let is_dir = matches!(entry.file_type().await, Ok(file_type) if file_type.is_dir());
+            let parsed = if is_dir {
+                name.parse::<ulid::Ulid>().ok()
+            } else {
+                name.strip_suffix(".json")
+                    .and_then(|stem| stem.parse::<ulid::Ulid>().ok())
+            };
+            if let Some(ulid) = parsed
+                && seen.insert(ulid)
             {
                 ids.push(ThreadId(ulid));
             }
@@ -1115,7 +1486,17 @@ impl PersistStore {
         Ok(ids)
     }
 
-    /// Delete a thread file.
+    /// Delete a thread: its directory, and any format 1 originals still beside it.
+    ///
+    /// A thread is a directory now, but this is deliberately **not** a naive `remove_dir_all`. The
+    /// catalog is derived from metadata, so a partial failure must leave the thread visible and
+    /// retryable rather than deleting the catalog record while history survives as an invisible
+    /// orphan — and `remove_dir_all` gives no ordering guarantee.
+    ///
+    /// Instead the directory is renamed to `<thread_id>.deleting/` first. The rename is atomic and
+    /// immediately drops the thread out of enumeration, after which the recursive removal can fail
+    /// and be retried harmlessly. Format 1 originals keep the ordering they always had: history
+    /// first, metadata last.
     pub async fn delete_thread(
         &self,
         project: ProjectId,
@@ -1123,21 +1504,205 @@ impl PersistStore {
     ) -> Result<(), PersistError> {
         let lock = self.thread_lock(thread).await;
         let _guard = lock.lock().await;
-        // Remove history first and metadata last. The catalog is derived from metadata, so a
-        // partial failure must leave the thread visible and retryable rather than deleting the
-        // catalog record while an undeleted history file remains.
-        for path in [
-            self.thread_jsonl_path(project, thread),
-            self.thread_json_path(project, thread),
-        ] {
+        let paths = self.current_thread_paths(project, thread);
+        let pending = paths.deleting_dir();
+
+        if is_dir(&paths.dir()).await {
+            // A leftover from an interrupted delete would make the rename fail with `ENOTEMPTY`
+            // and strand the thread; it holds nothing this delete is not about to remove anyway.
+            remove_dir_all_if_present(&pending).await?;
+            tokio::fs::rename(paths.dir(), &pending)
+                .await
+                .map_err(|e| PersistError::Io(e.to_string()))?;
+        }
+        remove_dir_all_if_present(&paths.migrating_dir()).await?;
+
+        for path in [paths.flat_history(), paths.flat_metadata()] {
             match tokio::fs::remove_file(&path).await {
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(PersistError::Io(e.to_string())),
             }
         }
+        remove_dir_all_if_present(&pending).await?;
+
         self.invalidate_history_cache(project, thread).await;
+        self.clear_unmigratable(project, thread).await;
         Ok(())
+    }
+
+    // ---- Storage-layout maintenance (`giskard-admin`, spec §5.5) ----
+
+    /// Whether this thread still holds pre-migration originals under `legacy/`.
+    pub async fn has_legacy_data(&self, project: ProjectId, thread: ThreadId) -> bool {
+        is_dir(&self.current_thread_paths(project, thread).legacy_dir()).await
+    }
+
+    /// What [`Self::migrate_thread_layout`] would do to this thread, without doing it.
+    ///
+    /// The same classifier the migration itself uses, so a dry run cannot disagree with the run it
+    /// is previewing. It cannot predict a *failure*: a thread whose format 1 history will not parse
+    /// plans as `Migrated` and reports as an error only when the work is actually attempted.
+    pub async fn planned_migration(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+    ) -> MigrationOutcome {
+        migrate::planned_outcome(&self.threads_dir(project), thread).await
+    }
+
+    /// Migrate one thread to the current layout, reporting what it did.
+    ///
+    /// The same work `ensure_migrated` does on open, exposed so an operator can do it in bulk (and
+    /// see the failures) instead of discovering it one thread at a time.
+    pub async fn migrate_thread_layout(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+    ) -> Result<MigrationOutcome, PersistError> {
+        self.clear_unmigratable(project, thread).await;
+        let lock = self.thread_lock(thread).await;
+        let _guard = lock.lock().await;
+        let outcome = migrate::migrate_thread(&self.threads_dir(project), thread).await?;
+        if matches!(
+            outcome,
+            MigrationOutcome::Migrated | MigrationOutcome::FinishedLegacyMove
+        ) {
+            self.invalidate_history_cache(project, thread).await;
+        }
+        Ok(outcome)
+    }
+
+    /// Delete one thread's retained format 1 originals.
+    ///
+    /// Separate and explicit because it is the only step in this layout change that can destroy
+    /// transcript history — the part of a user's data nothing else can reconstruct. Returns whether
+    /// anything was removed.
+    pub async fn prune_legacy_data(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+    ) -> Result<bool, PersistError> {
+        let lock = self.thread_lock(thread).await;
+        let _guard = lock.lock().await;
+        let legacy = self.current_thread_paths(project, thread).legacy_dir();
+        if !is_dir(&legacy).await {
+            return Ok(false);
+        }
+        tokio::fs::remove_dir_all(&legacy)
+            .await
+            .map_err(|e| PersistError::Io(e.to_string()))?;
+        Ok(true)
+    }
+
+    /// Remove payload files no turn record references.
+    ///
+    /// An orphan is a payload written by a turn commit that crashed before appending its index
+    /// record. It is harmless — reads start from the index, so nothing can see it — so this only
+    /// reclaims space, and nothing calls it automatically on open.
+    ///
+    /// **The caller must hold the data-directory lock** ([`crate::lock::DataDirLock`]) for a real
+    /// run. Deleting an unreferenced payload would otherwise race a turn commit in progress and
+    /// delete the file between its two writes; the per-thread lock taken below cannot prevent that,
+    /// because it is an in-process `Mutex` and `giskard-admin` is a different process from
+    /// `giskard-server`. With the directory locked, unreferenced means unreferenced: there is no
+    /// in-flight commit an orphan could belong to.
+    ///
+    /// Returns the paths swept, or the paths that *would* be swept when `dry_run`.
+    pub async fn sweep_orphan_payloads(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+        dry_run: bool,
+    ) -> Result<OrphanSweep, PersistError> {
+        let lock = self.thread_lock(thread).await;
+        let _guard = lock.lock().await;
+        let paths = self.current_thread_paths(project, thread);
+        if !is_dir(&paths.dir()).await {
+            return Ok(OrphanSweep::default());
+        }
+        let index_missing = !path_exists(&paths.history()).await;
+        let referenced: HashSet<TurnId> = self
+            .load_turn_records_unlocked(project, thread)
+            .await?
+            .into_iter()
+            .map(|record| record.turn_id)
+            .collect();
+
+        let mut entries = match tokio::fs::read_dir(paths.turns_dir()).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(OrphanSweep::default());
+            }
+            Err(e) => return Err(PersistError::Io(e.to_string())),
+        };
+        let mut payloads = vec![];
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| PersistError::Io(e.to_string()))?
+        {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(turn) = name
+                .strip_suffix(".jsonl")
+                .and_then(|stem| stem.parse::<ulid::Ulid>().ok())
+                .map(TurnId)
+            else {
+                continue;
+            };
+            if referenced.contains(&turn) {
+                continue;
+            }
+            payloads.push(entry.path());
+        }
+
+        // Every refusal below is a judgment about the *thread* — "these payloads may be the
+        // surviving history" — not a failure of the sweep. So it is reported alongside the list it
+        // is about, rather than raised in place of it. Raising would make a dry run refuse too,
+        // and the whole point of the dry run is to show an operator the files a refusal names.
+        let refusal = if index_missing {
+            // The index is the *less* durable of the two files by design: bounded records on a
+            // page-cached `O_APPEND` write, against payloads fsynced before their rename. A lost
+            // index beside intact payloads is a recoverable transcript, and "nothing is referenced"
+            // must never be read as "everything is unreferenced" — that would turn a
+            // space-reclaiming command into the one thing in this store that can destroy history.
+            Some(format!(
+                "{}: thread has no history index",
+                paths.dir().display()
+            ))
+        } else if referenced.is_empty() && !payloads.is_empty() {
+            // Same signal as a missing index: an empty thread has no payload files in the first
+            // place, so payloads beside an index that names no turns means the index lost them.
+            Some(format!(
+                "{}: history index references no turns, but {} payload file(s) exist",
+                paths.dir().display(),
+                payloads.len()
+            ))
+        } else if payloads.len() > MAX_PLAUSIBLE_ORPHANS {
+            // Total index loss is the rarer failure. The durability asymmetry above loses a *tail
+            // of appends* far more often than the whole file, and a tail of lost records leaves
+            // that many fsynced payloads unreferenced. An orphan is otherwise produced one at a
+            // time, by one crash landing between a turn's two writes, so a large set is itself the
+            // evidence that the index is what was damaged.
+            Some(format!(
+                "{}: {} unreferenced payload file(s) at once is evidence of a truncated history \
+                 index, not of {MAX_PLAUSIBLE_ORPHANS} or fewer orphaned commits",
+                paths.dir().display(),
+                payloads.len()
+            ))
+        } else {
+            None
+        };
+
+        if refusal.is_none() && !dry_run {
+            for path in &payloads {
+                tokio::fs::remove_file(path)
+                    .await
+                    .map_err(|e| PersistError::Io(e.to_string()))?;
+            }
+        }
+        Ok(OrphanSweep { payloads, refusal })
     }
 
     // ---- Token ledgers ----
@@ -1197,16 +1762,74 @@ impl PersistStore {
             // thread rather than quarantining whole histories).
             if let Ok(thread_ids) = self.list_threads(entry.id).await {
                 for tid in thread_ids {
-                    if let Err(e) = self.load_thread(entry.id, tid).await {
-                        errors.push((self.thread_json_path(entry.id, tid), e.to_string()));
+                    // Deliberately the non-migrating read: `validate` reports what is on disk, and
+                    // migrating every format 1 thread as a side effect of inspecting it would make
+                    // the report describe a store the operator did not ask to change.
+                    if let Err(e) = self.load_thread_unlocked(entry.id, tid).await {
+                        errors.push((self.thread_json_path(entry.id, tid).await, e.to_string()));
                     }
-                    if let Err(e) = self.load_all_turns(entry.id, tid).await {
-                        errors.push((self.thread_jsonl_path(entry.id, tid), e.to_string()));
-                    }
+                    errors.extend(self.history_validation_errors(entry.id, tid).await);
                 }
             }
         }
 
+        errors
+    }
+
+    /// Every readability problem in one thread's history, named at the file that has it.
+    ///
+    /// Reported per turn rather than per thread, because that is how the layout fails: a damaged or
+    /// missing payload takes down one turn while the index and every other turn stay readable, and
+    /// an operator needs to be told *which* turn.
+    async fn history_validation_errors(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+    ) -> Vec<(PathBuf, String)> {
+        let paths = self.thread_paths(project, thread).await;
+        let index_path = paths.history();
+        let data = match tokio::fs::read_to_string(&index_path).await {
+            Ok(data) => data,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return vec![],
+            Err(e) => return vec![(index_path, e.to_string())],
+        };
+
+        if paths.layout() == ThreadLayout::Flat {
+            return match parse_turn_history(&index_path, &data) {
+                Ok(_) => vec![],
+                Err(e) => vec![(index_path, e.to_string())],
+            };
+        }
+
+        let records = match history::parse_history_index(&index_path, &data) {
+            Ok(records) => records,
+            Err(e) => return vec![(index_path, e.to_string())],
+        };
+
+        let mut errors = vec![];
+        for record in records {
+            let payload_path = paths.turn_payload(record.turn_id);
+            // Reported, not quarantined. Renaming the bad file aside here would make a *second*
+            // `validate` run describe the same damage as a missing payload, losing the parse error
+            // that says what is actually wrong with it.
+            let payload = match tokio::fs::read_to_string(&payload_path).await {
+                Ok(payload) => payload,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    errors.push((
+                        payload_path,
+                        format!("turn {} has no payload file", record.turn_id),
+                    ));
+                    continue;
+                }
+                Err(e) => {
+                    errors.push((payload_path, e.to_string()));
+                    continue;
+                }
+            };
+            if let Err(e) = history::parse_turn_payload(&payload_path, &payload) {
+                errors.push((payload_path, e.to_string()));
+            }
+        }
         errors
     }
 }
@@ -1255,7 +1878,7 @@ mod tests {
         (tmp, store)
     }
 
-    fn test_model() -> ModelRef {
+    pub(super) fn test_model() -> ModelRef {
         ModelRef {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
@@ -1263,7 +1886,59 @@ mod tests {
         }
     }
 
-    fn test_thread(project_id: ProjectId, thread_id: ThreadId) -> ThreadFile {
+    /// Write raw metadata bytes wherever this thread's metadata record belongs.
+    pub(super) async fn write_thread_metadata(
+        store: &PersistStore,
+        project: ProjectId,
+        thread: ThreadId,
+        bytes: &[u8],
+    ) {
+        let path = store.thread_json_path(project, thread).await;
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(path, bytes).await.unwrap();
+    }
+
+    /// A whole `history.jsonl`: the header, then one bounded record per turn.
+    pub(super) fn history_index_of(thread: ThreadId, turns: &[&Turn]) -> String {
+        let mut out = HistoryHeader::new(thread, Utc::now()).line().unwrap();
+        for turn in turns {
+            out.push_str(&TurnRecord::from_turn(turn).line().unwrap());
+        }
+        out
+    }
+
+    /// Lay a thread out the way this store did before the per-turn payload split: a flat
+    /// `threads/<id>.json` beside a flat `threads/<id>.jsonl` holding one whole `Turn` per line.
+    pub(super) async fn write_format1_thread(
+        store: &PersistStore,
+        project: ProjectId,
+        thread: &ThreadFile,
+        turns: &[Turn],
+    ) {
+        let threads_dir = store.threads_dir(project);
+        tokio::fs::create_dir_all(&threads_dir).await.unwrap();
+        tokio::fs::write(
+            threads_dir.join(format!("{}.json", thread.id)),
+            serde_json::to_vec_pretty(thread).unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut history = String::new();
+        for turn in turns {
+            history.push_str(&serde_json::to_string(turn).unwrap());
+            history.push('\n');
+        }
+        tokio::fs::write(
+            threads_dir.join(format!("{}.jsonl", thread.id)),
+            history.as_bytes(),
+        )
+        .await
+        .unwrap();
+    }
+
+    pub(super) fn test_thread(project_id: ProjectId, thread_id: ThreadId) -> ThreadFile {
         let now = Utc::now();
         ThreadFile {
             revision: 0,
@@ -1316,18 +1991,21 @@ mod tests {
         );
     }
 
+    /// The format 1 ordering has to survive: history first, metadata last, so a partial failure
+    /// leaves the thread visible rather than deleting the catalog record while history remains.
     #[tokio::test]
-    async fn delete_thread_keeps_metadata_when_history_removal_fails() {
+    async fn delete_thread_keeps_metadata_when_format1_history_removal_fails() {
         let (_tmp, store) = make_store();
         let project_id = ProjectId::new();
         let thread_id = ThreadId::new();
-        store
-            .create_thread(project_id, test_thread(project_id, thread_id))
-            .await
-            .unwrap();
-        tokio::fs::create_dir_all(store.thread_jsonl_path(project_id, thread_id))
-            .await
-            .unwrap();
+        write_format1_thread(&store, project_id, &test_thread(project_id, thread_id), &[]).await;
+        // A directory where the history file belongs makes its removal fail without making the
+        // metadata removal fail.
+        let history = store
+            .threads_dir(project_id)
+            .join(format!("{thread_id}.jsonl"));
+        tokio::fs::remove_file(&history).await.unwrap();
+        tokio::fs::create_dir_all(&history).await.unwrap();
 
         let error = store
             .delete_thread(project_id, thread_id)
@@ -1344,6 +2022,44 @@ mod tests {
         );
     }
 
+    /// Deleting a thread directory renames it out of enumeration *first*, so the recursive removal
+    /// that follows can fail and be retried without ever leaving an invisible orphan behind.
+    #[tokio::test]
+    async fn delete_thread_renames_the_directory_out_of_enumeration_before_removing_it() {
+        use giskard_core::token::TokenUsage;
+        let (_tmp, store) = make_store();
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        store
+            .create_thread(project_id, test_thread(project_id, thread_id))
+            .await
+            .unwrap();
+        let turn = make_turn(TokenUsage::new(100, 10));
+        store
+            .append_turn(project_id, thread_id, &turn)
+            .await
+            .unwrap();
+        let paths = store.current_thread_paths(project_id, thread_id);
+        assert!(paths.turn_payload(turn.id).exists());
+
+        // A leftover from an earlier interrupted delete must not strand the retry.
+        tokio::fs::create_dir_all(paths.deleting_dir().join("turns"))
+            .await
+            .unwrap();
+
+        store.delete_thread(project_id, thread_id).await.unwrap();
+        assert!(!paths.dir().exists());
+        assert!(!paths.deleting_dir().exists());
+        assert!(store.list_threads(project_id).await.unwrap().is_empty());
+        assert!(
+            store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn no_op_mutation_does_not_write_or_advance_revision() {
         let (_tmp, store) = make_store();
@@ -1353,7 +2069,7 @@ mod tests {
             .create_thread(project_id, test_thread(project_id, thread_id))
             .await
             .unwrap();
-        let path = store.thread_json_path(project_id, thread_id);
+        let path = store.thread_json_path(project_id, thread_id).await;
         let before = tokio::fs::read(&path).await.unwrap();
 
         let mutation = store
@@ -1566,7 +2282,7 @@ mod tests {
             git_workspace: None,
         };
         store.save_thread(pid, &thread).await.unwrap();
-        let raw = tokio::fs::read_to_string(store.thread_json_path(pid, tid))
+        let raw = tokio::fs::read_to_string(store.thread_json_path(pid, tid).await)
             .await
             .unwrap();
         assert!(!raw.contains("\"revision\""));
@@ -1577,7 +2293,7 @@ mod tests {
         assert_eq!(loaded.harness_thread_id, "th_abc");
         assert_eq!(loaded.mode, Mode::Build);
 
-        let raw = tokio::fs::read_to_string(store.thread_json_path(pid, tid))
+        let raw = tokio::fs::read_to_string(store.thread_json_path(pid, tid).await)
             .await
             .unwrap();
         assert!(raw.contains("\"permission_preset\""));
@@ -1666,15 +2382,13 @@ mod tests {
         object.remove("permission_preset");
         object.insert("approval_policy".into(), serde_json::json!("read_only"));
 
-        tokio::fs::create_dir_all(store.threads_dir(pid))
-            .await
-            .unwrap();
-        tokio::fs::write(
-            store.thread_json_path(pid, tid),
-            serde_json::to_vec_pretty(&value).unwrap(),
+        write_thread_metadata(
+            &store,
+            pid,
+            tid,
+            &serde_json::to_vec_pretty(&value).unwrap(),
         )
-        .await
-        .unwrap();
+        .await;
 
         let loaded = store.load_thread(pid, tid).await.unwrap().unwrap();
         assert_eq!(loaded.permission_preset, PermissionPreset::AskFirst);
@@ -1720,15 +2434,13 @@ mod tests {
         };
         let mut value = serde_json::to_value(&thread).unwrap();
         value.as_object_mut().unwrap().remove("permission_preset");
-        tokio::fs::create_dir_all(store.threads_dir(pid))
-            .await
-            .unwrap();
-        tokio::fs::write(
-            store.thread_json_path(pid, tid),
-            serde_json::to_vec_pretty(&value).unwrap(),
+        write_thread_metadata(
+            &store,
+            pid,
+            tid,
+            &serde_json::to_vec_pretty(&value).unwrap(),
         )
-        .await
-        .unwrap();
+        .await;
 
         let result = store.load_thread(pid, tid).await;
         assert!(matches!(result.unwrap_err(), PersistError::Corrupt(_)));
@@ -1857,7 +2569,7 @@ mod tests {
         assert!(index.projects.is_empty());
     }
 
-    fn make_turn(usage: giskard_core::token::TokenUsage) -> Turn {
+    pub(super) fn make_turn(usage: giskard_core::token::TokenUsage) -> Turn {
         Turn {
             id: TurnId::new(),
             user_input: giskard_core::user_input::UserInput::text("hi"),
@@ -2045,7 +2757,7 @@ mod tests {
         assert!(!more2);
 
         // A torn final line is tolerated, not fatal.
-        let path = store.thread_jsonl_path(pid, tid);
+        let path = store.thread_paths(pid, tid).await.history();
         tokio::fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -2190,13 +2902,10 @@ mod tests {
             vec![second.id, third.id]
         );
 
-        let path = store.thread_jsonl_path(pid, tid);
-        tokio::fs::write(
-            &path,
-            format!("{}\n", serde_json::to_string(&first).unwrap()),
-        )
-        .await
-        .unwrap();
+        let path = store.thread_paths(pid, tid).await.history();
+        tokio::fs::write(&path, history_index_of(tid, &[&first]))
+            .await
+            .unwrap();
         let reloaded = store.load_all_turns(pid, tid).await.unwrap();
         assert_eq!(
             reloaded.iter().map(|turn| turn.id).collect::<Vec<_>>(),
@@ -2348,5 +3057,1088 @@ mod tests {
             tf.revision, 20,
             "each committed increment gets one revision"
         );
+    }
+}
+
+/// The format 2 layout: the bounded index, the per-turn payloads, and the migration onto it.
+#[cfg(test)]
+mod layout_tests {
+    use super::tests::*;
+    use super::*;
+    use giskard_core::item::{Item, ItemPayload};
+    use giskard_core::token::TokenUsage;
+    use giskard_core::user_input::{AttachmentKind, UserAttachment, UserInput};
+    use tempfile::TempDir;
+
+    fn make_store() -> (TempDir, PersistStore) {
+        let tmp = TempDir::new().unwrap();
+        let store = PersistStore::new(tmp.path().to_path_buf());
+        (tmp, store)
+    }
+
+    fn item(text: &str) -> Item {
+        Item {
+            id: giskard_core::ids::ItemId(ulid::Ulid::new()),
+            harness_item_id: format!("native-{text}"),
+            payload: ItemPayload::AgentMessage { text: text.into() },
+            created_at: Utc::now(),
+        }
+    }
+
+    /// A payload file's required opening records, for fixtures that hand-write the rest.
+    fn payload_prologue() -> String {
+        let mut data = String::new();
+        data.push_str(
+            r#"{"kind":"turn_header","format":1,"turn_id":"01JQ0000000000000000000000"}"#,
+        );
+        data.push('\n');
+        data.push_str(r#"{"kind":"user_input","user_input":{"type":"text","text":"hi"}}"#);
+        data.push('\n');
+        data
+    }
+
+    fn turn_with_items(prompt: &str, items: Vec<Item>) -> Turn {
+        let mut turn = make_turn(TokenUsage::new(100, 10));
+        turn.user_input = UserInput::text(prompt);
+        turn.items = items;
+        turn
+    }
+
+    // ---- Formats ----
+
+    /// The whole point of the split: the index row stays bounded no matter how large the turn is,
+    /// and everything agent-driven lands in the payload file.
+    #[tokio::test]
+    async fn the_index_stays_bounded_while_the_payload_carries_the_agent_driven_half() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+
+        let prompt = "fix the flaky test in ".to_string() + &"x".repeat(4096);
+        let huge_output = "y".repeat(64 * 1024);
+        let mut turn = turn_with_items(&prompt, vec![item(&huge_output), item("done")]);
+        turn.user_input = UserInput::text_with_attachments(
+            prompt.clone(),
+            vec![UserAttachment {
+                name: "trace.log".into(),
+                mime_type: "text/plain".into(),
+                size: 48_213,
+                kind: AttachmentKind::File,
+                data_base64: "dHJhY2U=".into(),
+            }],
+        );
+        store.append_turn(pid, tid, &turn).await.unwrap();
+
+        let paths = store.current_thread_paths(pid, tid);
+        let index = tokio::fs::read_to_string(paths.history()).await.unwrap();
+        assert!(
+            index.len() < 2048,
+            "a 64 KiB turn must not produce a 64 KiB index row: {} bytes",
+            index.len()
+        );
+        assert!(
+            !index.contains(&huge_output),
+            "no agent output in the index"
+        );
+        assert!(!index.contains(&prompt), "no full prompt text in the index");
+        assert!(
+            index.contains("trace.log"),
+            "attachment descriptors are bounded, so they stay"
+        );
+
+        let payload = tokio::fs::read_to_string(paths.turn_payload(turn.id))
+            .await
+            .unwrap();
+        assert!(payload.contains(&huge_output));
+        assert!(payload.contains(&prompt));
+        assert!(
+            !payload.contains("dHJhY2U="),
+            "attachment bytes have never been written to history"
+        );
+
+        // And the whole turn still round-trips.
+        let loaded = store.load_all_turns(pid, tid).await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded[0].user_input,
+            turn.user_input.without_attachment_data()
+        );
+        assert_eq!(loaded[0].items, turn.items);
+        assert_eq!(loaded[0].usage, turn.usage);
+    }
+
+    /// The preview is a capped display hint on a UTF-8 boundary; the payload holds the record.
+    #[tokio::test]
+    async fn the_prompt_preview_is_capped_and_never_authoritative() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        let prompt = "🙂".repeat(400);
+        let turn = turn_with_items(&prompt, vec![]);
+        store.append_turn(pid, tid, &turn).await.unwrap();
+
+        let paths = store.current_thread_paths(pid, tid);
+        let data = tokio::fs::read_to_string(paths.history()).await.unwrap();
+        let records = crate::history::parse_history_index(&paths.history(), &data).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].prompt_truncated);
+        assert!(records[0].prompt_preview.len() <= crate::preview::PROMPT_PREVIEW_MAX_BYTES);
+        assert!(prompt.starts_with(&records[0].prompt_preview));
+        assert_eq!(records[0].item_count, 0);
+
+        // Reading the thread yields the full prompt, not the preview.
+        let loaded = store.load_all_turns(pid, tid).await.unwrap();
+        assert_eq!(loaded[0].user_input.as_text(), Some(prompt.as_str()));
+    }
+
+    /// The header is written once, when the thread is created, and never rewritten afterwards.
+    #[tokio::test]
+    async fn the_history_header_is_written_once_at_thread_creation() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        let created = store
+            .create_thread(pid, test_thread(pid, tid))
+            .await
+            .unwrap();
+
+        let paths = store.current_thread_paths(pid, tid);
+        let header_only = tokio::fs::read_to_string(paths.history()).await.unwrap();
+        assert_eq!(header_only.lines().count(), 1);
+        let header: serde_json::Value = serde_json::from_str(header_only.trim()).unwrap();
+        assert_eq!(header["kind"], "history_header");
+        assert_eq!(header["format"], crate::layout::HISTORY_FORMAT);
+        assert_eq!(header["thread_id"], created.id.to_string());
+
+        for _ in 0..3 {
+            store
+                .append_turn(pid, tid, &make_turn(TokenUsage::new(1, 1)))
+                .await
+                .unwrap();
+        }
+        let after = tokio::fs::read_to_string(paths.history()).await.unwrap();
+        assert!(
+            after.starts_with(&header_only),
+            "the header is never rewritten"
+        );
+        assert_eq!(after.lines().count(), 4);
+    }
+
+    /// File order is write order; `index` is display order. They diverge the moment anything is
+    /// appended after the turn committed, which is why the field is carried explicitly.
+    ///
+    /// Nothing in this change produces a late append — amendments are out of scope — so the
+    /// scenario is written by hand: a build that was still running at item 1 of 3 settles later and
+    /// is appended at the *end* of the file. Folded by file order it would render last; folded by
+    /// `index` it stays where it happened.
+    #[test]
+    fn a_late_payload_record_folds_back_into_its_own_slot() {
+        let path = std::path::Path::new("turns/T1.jsonl");
+        let items = [item("first"), item("cargo build"), item("third")];
+        let mut settled = items[1].clone();
+        settled.payload = ItemPayload::AgentMessage {
+            text: "cargo build (finished)".into(),
+        };
+
+        let mut data = payload_prologue();
+        for (index, item) in items.iter().enumerate() {
+            data.push_str(
+                &serde_json::to_string(
+                    &serde_json::json!({"kind":"item","index":index,"item":item}),
+                )
+                .unwrap(),
+            );
+            data.push('\n');
+        }
+        // Appended after the turn committed: last in the file, index 1.
+        data.push_str(
+            &serde_json::to_string(&serde_json::json!({"kind":"item","index":1,"item":settled}))
+                .unwrap(),
+        );
+        data.push('\n');
+
+        let payload = crate::history::parse_turn_payload(path, &data).unwrap();
+        assert_eq!(
+            payload.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            "last-wins by item id must not move the item to the bottom of the turn"
+        );
+        assert_eq!(payload.items[1].payload, settled.payload);
+
+        // A genuinely new late item takes max(existing) + 1 and renders after the rest.
+        let appended = item("follow-up");
+        let mut with_new = data.clone();
+        with_new.push_str(
+            &serde_json::to_string(&serde_json::json!({"kind":"item","index":3,"item":appended}))
+                .unwrap(),
+        );
+        with_new.push('\n');
+        let payload = crate::history::parse_turn_payload(path, &with_new).unwrap();
+        assert_eq!(payload.items.len(), 4);
+        assert_eq!(payload.items[3].id, appended.id);
+    }
+
+    // ---- Containment ----
+
+    /// Atomic payload writes mean this code cannot itself truncate a payload file, so the damage is
+    /// injected directly. The turn must fail alone.
+    #[tokio::test]
+    async fn a_damaged_payload_fails_that_turn_alone_and_is_quarantined() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        let first = turn_with_items("first", vec![item("one")]);
+        let damaged = turn_with_items("damaged", vec![item("two")]);
+        let last = turn_with_items("last", vec![item("three")]);
+        for turn in [&first, &damaged, &last] {
+            store.append_turn(pid, tid, turn).await.unwrap();
+        }
+
+        let paths = store.current_thread_paths(pid, tid);
+        let payload = paths.turn_payload(damaged.id);
+        tokio::fs::write(&payload, b"{\"kind\":\"item\",\"index\":0,\"it")
+            .await
+            .unwrap();
+
+        let loaded = store.load_all_turns(pid, tid).await.unwrap();
+        assert_eq!(
+            loaded.iter().map(|turn| turn.id).collect::<Vec<_>>(),
+            vec![first.id, last.id],
+            "the damaged turn fails alone; the index and every other turn stay readable"
+        );
+        assert!(
+            !payload.exists(),
+            "the bad file is quarantined, not left in place"
+        );
+        let quarantined: Vec<_> = std::fs::read_dir(paths.turns_dir())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".corrupt-"))
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "left on disk for inspection: {quarantined:?}"
+        );
+
+        // `validate_all` names the turn that failed, not the whole thread.
+        let errors = store.history_validation_errors(pid, tid).await;
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].0.ends_with(format!("{}.jsonl", damaged.id)));
+    }
+
+    /// A turn record whose payload file is simply absent behaves the same way.
+    #[tokio::test]
+    async fn a_missing_payload_fails_that_turn_alone() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        let first = turn_with_items("first", vec![item("one")]);
+        let vanished = turn_with_items("vanished", vec![item("two")]);
+        for turn in [&first, &vanished] {
+            store.append_turn(pid, tid, turn).await.unwrap();
+        }
+
+        let paths = store.current_thread_paths(pid, tid);
+        tokio::fs::remove_file(paths.turn_payload(vanished.id))
+            .await
+            .unwrap();
+
+        let loaded = store.load_all_turns(pid, tid).await.unwrap();
+        assert_eq!(
+            loaded.iter().map(|turn| turn.id).collect::<Vec<_>>(),
+            vec![first.id]
+        );
+        let errors = store.history_validation_errors(pid, tid).await;
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].1.contains("no payload file"));
+    }
+
+    /// A future downgrade must be non-destructive: an unrecognised record is skipped, not fatal.
+    #[tokio::test]
+    async fn an_unknown_index_record_kind_is_skipped_with_a_warning() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        let turn = turn_with_items("kept", vec![]);
+        store.append_turn(pid, tid, &turn).await.unwrap();
+
+        let path = store.current_thread_paths(pid, tid).history();
+        let mut data = tokio::fs::read_to_string(&path).await.unwrap();
+        data.push_str("{\"kind\":\"turn_superseded\",\"turn_id\":\"x\"}\n");
+        data.push_str("{\"no_kind_at_all\":true}\n");
+        tokio::fs::write(&path, data).await.unwrap();
+
+        let loaded = store.load_all_turns(pid, tid).await.unwrap();
+        assert_eq!(
+            loaded.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![turn.id]
+        );
+    }
+
+    /// A payload newer than this build understands fails that turn only, and is left alone rather
+    /// than quarantined — a newer format is not damage.
+    #[tokio::test]
+    async fn a_newer_payload_format_fails_that_turn_only() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        let future = turn_with_items("from the future", vec![]);
+        let ordinary = turn_with_items("ordinary", vec![]);
+        for turn in [&future, &ordinary] {
+            store.append_turn(pid, tid, turn).await.unwrap();
+        }
+
+        let paths = store.current_thread_paths(pid, tid);
+        let payload = paths.turn_payload(future.id);
+        tokio::fs::write(
+            &payload,
+            format!(
+                "{{\"kind\":\"turn_header\",\"format\":{},\"turn_id\":\"{}\"}}\n",
+                crate::layout::TURN_PAYLOAD_FORMAT + 1,
+                future.id
+            ),
+        )
+        .await
+        .unwrap();
+
+        let loaded = store.load_all_turns(pid, tid).await.unwrap();
+        assert_eq!(
+            loaded.iter().map(|turn| turn.id).collect::<Vec<_>>(),
+            vec![ordinary.id]
+        );
+        assert!(
+            payload.exists(),
+            "a newer format is not damage; leave it readable"
+        );
+    }
+
+    /// Without the index there is nothing to partially recover, so a newer layout fails the thread.
+    #[tokio::test]
+    async fn a_newer_history_format_fails_the_whole_thread() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        store
+            .append_turn(pid, tid, &turn_with_items("hi", vec![]))
+            .await
+            .unwrap();
+
+        let path = store.current_thread_paths(pid, tid).history();
+        let data = tokio::fs::read_to_string(&path).await.unwrap();
+        let bumped = data.replacen(
+            &format!("\"format\":{}", crate::layout::HISTORY_FORMAT),
+            &format!("\"format\":{}", crate::layout::HISTORY_FORMAT + 1),
+            1,
+        );
+        tokio::fs::write(&path, bumped).await.unwrap();
+
+        assert!(matches!(
+            store.load_all_turns(pid, tid).await.unwrap_err(),
+            PersistError::Invalid(_)
+        ));
+    }
+
+    // ---- Write ordering ----
+
+    /// Payload first, index last: a crash between them leaves a file no turn record references, and
+    /// nothing can see it because every read starts from the index.
+    #[tokio::test]
+    async fn a_payload_no_turn_record_references_is_invisible_and_sweepable() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        let committed = turn_with_items("committed", vec![]);
+        store.append_turn(pid, tid, &committed).await.unwrap();
+
+        let paths = store.current_thread_paths(pid, tid);
+        let orphan = TurnId::new();
+        tokio::fs::write(
+            paths.turn_payload(orphan),
+            crate::history::payload_file_bytes(&turn_with_items("orphan", vec![])).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store
+                .load_all_turns(pid, tid)
+                .await
+                .unwrap()
+                .iter()
+                .map(|turn| turn.id)
+                .collect::<Vec<_>>(),
+            vec![committed.id],
+            "reads start from the index, so an unreferenced payload is invisible"
+        );
+
+        // With the data directory locked there is no in-flight commit an orphan could belong to,
+        // so a freshly written one is swept on sight — no wall-clock guess about another process.
+        let sweep = store.sweep_orphan_payloads(pid, tid, true).await.unwrap();
+        assert_eq!(sweep.payloads, vec![paths.turn_payload(orphan)]);
+        assert_eq!(sweep.refusal, None);
+        assert!(
+            paths.turn_payload(orphan).exists(),
+            "dry run removes nothing"
+        );
+        store.sweep_orphan_payloads(pid, tid, false).await.unwrap();
+        assert!(!paths.turn_payload(orphan).exists());
+        assert!(paths.turn_payload(committed.id).exists());
+    }
+
+    // ---- Enumeration ----
+
+    #[tokio::test]
+    async fn list_threads_reports_migrated_and_unmigrated_threads_exactly_once() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let migrated = ThreadId::new();
+        let unmigrated = ThreadId::new();
+        let mid_migration = ThreadId::new();
+
+        store
+            .create_thread(pid, test_thread(pid, migrated))
+            .await
+            .unwrap();
+        write_format1_thread(&store, pid, &test_thread(pid, unmigrated), &[]).await;
+
+        // A thread caught between the commit rename and the legacy move has *both* shapes on disk.
+        let threads_dir = store.threads_dir(pid);
+        tokio::fs::create_dir_all(threads_dir.join(mid_migration.to_string()))
+            .await
+            .unwrap();
+        tokio::fs::write(threads_dir.join(format!("{mid_migration}.json")), b"{}")
+            .await
+            .unwrap();
+
+        // Working state and quarantine files are never threads.
+        for name in [
+            format!("{}.migrating", ThreadId::new()),
+            format!("{}.deleting", ThreadId::new()),
+        ] {
+            tokio::fs::create_dir_all(threads_dir.join(name))
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(
+            threads_dir.join(format!("{}.json.corrupt-20260101T000000", ThreadId::new())),
+            b"{}",
+        )
+        .await
+        .unwrap();
+
+        let mut listed = store.list_threads(pid).await.unwrap();
+        listed.sort_by_key(|id| id.0);
+        let mut expected = vec![migrated, unmigrated, mid_migration];
+        expected.sort_by_key(|id| id.0);
+        assert_eq!(listed, expected);
+    }
+
+    #[tokio::test]
+    async fn delete_project_cascades_to_thread_directories() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        store
+            .create_project(pid, "proj", "/tmp/proj")
+            .await
+            .unwrap();
+        let tid = ThreadId::new();
+        store
+            .create_thread(pid, test_thread(pid, tid))
+            .await
+            .unwrap();
+        store
+            .append_turn(pid, tid, &turn_with_items("hi", vec![item("there")]))
+            .await
+            .unwrap();
+        assert!(store.current_thread_paths(pid, tid).turns_dir().exists());
+
+        store.delete_project(pid).await.unwrap();
+        assert!(!store.threads_dir(pid).exists());
+        assert!(store.list_threads(pid).await.unwrap().is_empty());
+    }
+
+    // ---- Migration ----
+
+    #[tokio::test]
+    async fn a_format1_thread_migrates_turn_for_turn_and_re_running_is_a_no_op() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        let source: Vec<Turn> = (0..3)
+            .map(|i| turn_with_items(&format!("prompt {i}"), vec![item(&format!("item {i}"))]))
+            .collect();
+        let metadata = test_thread(pid, tid);
+        write_format1_thread(&store, pid, &metadata, &source).await;
+        assert_eq!(store.thread_layout(pid, tid).await.history_format(), 1);
+
+        // Any read is enough to migrate; nothing has to be run beforehand.
+        let loaded = store.load_all_turns(pid, tid).await.unwrap();
+        assert_eq!(
+            loaded.iter().map(|turn| turn.id).collect::<Vec<_>>(),
+            source.iter().map(|turn| turn.id).collect::<Vec<_>>()
+        );
+        assert_eq!(loaded[1].items, source[1].items);
+        assert_eq!(loaded[2].user_input, source[2].user_input);
+        assert_eq!(store.thread_layout(pid, tid).await.history_format(), 2);
+
+        // Metadata survives byte-for-byte, and the originals are relocated, never deleted.
+        let paths = store.current_thread_paths(pid, tid);
+        assert_eq!(
+            store.load_thread(pid, tid).await.unwrap().unwrap(),
+            metadata
+        );
+        assert!(!paths.flat_metadata().exists());
+        assert!(!paths.flat_history().exists());
+        assert!(paths.legacy_dir().join("thread.json").exists());
+        assert!(paths.legacy_dir().join("history.jsonl").exists());
+        assert!(store.has_legacy_data(pid, tid).await);
+
+        // Re-running changes nothing.
+        let committed = tokio::fs::read_to_string(paths.history()).await.unwrap();
+        assert_eq!(
+            store.migrate_thread_layout(pid, tid).await.unwrap(),
+            MigrationOutcome::AlreadyCurrent
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(paths.history()).await.unwrap(),
+            committed
+        );
+
+        // Pruning is separate and explicit, because it is the step that destroys transcript data.
+        assert!(store.prune_legacy_data(pid, tid).await.unwrap());
+        assert!(!store.has_legacy_data(pid, tid).await);
+        assert!(!store.prune_legacy_data(pid, tid).await.unwrap());
+        assert_eq!(store.load_all_turns(pid, tid).await.unwrap().len(), 3);
+    }
+
+    /// A dry run previews through the migration's own classifier, so it names every case the real
+    /// run acts on — including the thread caught between the commit rename and the legacy move,
+    /// which a bare format check reports as having nothing to do.
+    #[tokio::test]
+    async fn a_planned_migration_names_every_case_the_real_one_acts_on() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+
+        let absent = ThreadId::new();
+        assert_eq!(
+            store.planned_migration(pid, absent).await,
+            MigrationOutcome::Absent
+        );
+
+        let current = ThreadId::new();
+        store
+            .create_thread(pid, test_thread(pid, current))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.planned_migration(pid, current).await,
+            MigrationOutcome::AlreadyCurrent
+        );
+
+        let flat = ThreadId::new();
+        write_format1_thread(&store, pid, &test_thread(pid, flat), &[]).await;
+        assert_eq!(
+            store.planned_migration(pid, flat).await,
+            MigrationOutcome::Migrated
+        );
+
+        // Both shapes on disk: the rebuild is committed, the relocation is not.
+        let interrupted = ThreadId::new();
+        let paths = store.current_thread_paths(pid, interrupted);
+        tokio::fs::create_dir_all(paths.dir()).await.unwrap();
+        tokio::fs::write(paths.flat_metadata(), b"{}")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.planned_migration(pid, interrupted).await,
+            MigrationOutcome::FinishedLegacyMove
+        );
+
+        // Every plan matches what the run actually does.
+        for thread in [absent, current, flat, interrupted] {
+            let planned = store.planned_migration(pid, thread).await;
+            assert_eq!(
+                store.migrate_thread_layout(pid, thread).await.unwrap(),
+                planned,
+                "the plan and the act disagreed about {thread}"
+            );
+        }
+    }
+
+    /// The one thing a plan cannot know is whether the work will succeed.
+    #[tokio::test]
+    async fn a_plan_cannot_predict_a_migration_that_will_fail() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        write_format1_thread(&store, pid, &test_thread(pid, tid), &[]).await;
+        let good = serde_json::to_string(&make_turn(TokenUsage::new(1, 1))).unwrap();
+        tokio::fs::write(
+            store.current_thread_paths(pid, tid).flat_history(),
+            format!("torn interior line\n{good}\n"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store.planned_migration(pid, tid).await,
+            MigrationOutcome::Migrated,
+            "the plan reads the layout, not the history"
+        );
+        assert!(store.migrate_thread_layout(pid, tid).await.is_err());
+    }
+
+    /// A crash between the commit rename and the legacy move leaves both shapes on disk. Readers
+    /// prefer the directory, and the next open finishes the move.
+    #[tokio::test]
+    async fn a_migration_interrupted_after_the_commit_rename_is_finished_on_the_next_open() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        let source = vec![turn_with_items("prompt", vec![item("output")])];
+        write_format1_thread(&store, pid, &test_thread(pid, tid), &source).await;
+
+        // Migrate, then put the originals back where the crash would have left them.
+        let paths = store.current_thread_paths(pid, tid);
+        store.migrate_thread_layout(pid, tid).await.unwrap();
+        for (from, to) in [
+            (
+                paths.legacy_dir().join("thread.json"),
+                paths.flat_metadata(),
+            ),
+            (
+                paths.legacy_dir().join("history.jsonl"),
+                paths.flat_history(),
+            ),
+        ] {
+            tokio::fs::rename(from, to).await.unwrap();
+        }
+        tokio::fs::remove_dir_all(paths.legacy_dir()).await.unwrap();
+        assert!(paths.flat_metadata().exists() && paths.dir().exists());
+
+        // The directory wins, and the move finishes.
+        let loaded = store.load_all_turns(pid, tid).await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, source[0].id);
+        assert!(!paths.flat_metadata().exists());
+        assert!(!paths.flat_history().exists());
+        assert!(paths.legacy_dir().join("history.jsonl").exists());
+    }
+
+    /// A staged migration that never committed is discarded and rebuilt, not adopted.
+    #[tokio::test]
+    async fn a_staged_migration_left_by_a_crash_is_discarded_and_rebuilt() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        let source = vec![turn_with_items("prompt", vec![item("output")])];
+        write_format1_thread(&store, pid, &test_thread(pid, tid), &source).await;
+
+        let paths = store.current_thread_paths(pid, tid);
+        tokio::fs::create_dir_all(paths.migrating_dir().join("turns"))
+            .await
+            .unwrap();
+        tokio::fs::write(paths.migrating_dir().join("history.jsonl"), b"garbage\n")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.migrate_thread_layout(pid, tid).await.unwrap(),
+            MigrationOutcome::Migrated
+        );
+        assert!(!paths.migrating_dir().exists());
+        assert_eq!(
+            store
+                .load_all_turns(pid, tid)
+                .await
+                .unwrap()
+                .iter()
+                .map(|turn| turn.id)
+                .collect::<Vec<_>>(),
+            vec![source[0].id]
+        );
+    }
+
+    /// The index is the less durable of the two files, so an empty or missing one beside intact
+    /// payloads is a recoverable transcript — never a thread whose every payload is unreferenced.
+    #[tokio::test]
+    async fn the_sweep_refuses_to_read_a_lost_index_as_a_directory_full_of_orphans() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        let turns: Vec<Turn> = (0..3)
+            .map(|i| turn_with_items(&format!("prompt {i}"), vec![item(&format!("item {i}"))]))
+            .collect();
+        for turn in &turns {
+            store.append_turn(pid, tid, turn).await.unwrap();
+        }
+        let paths = store.current_thread_paths(pid, tid);
+
+        // A power loss can leave a zero-length index (page-cached `O_APPEND`) beside payloads that
+        // were fsynced before their rename.
+        tokio::fs::write(paths.history(), b"").await.unwrap();
+        let sweep = store.sweep_orphan_payloads(pid, tid, false).await.unwrap();
+        assert!(sweep.refusal.is_some(), "{sweep:?}");
+
+        // Same for an index that is gone outright.
+        tokio::fs::remove_file(paths.history()).await.unwrap();
+        let sweep = store.sweep_orphan_payloads(pid, tid, false).await.unwrap();
+        assert!(sweep.refusal.is_some(), "{sweep:?}");
+        for turn in &turns {
+            assert!(paths.turn_payload(turn.id).exists(), "nothing was deleted");
+        }
+
+        // A thread that genuinely has no turns has no payloads to sweep either, so the guard costs
+        // a legitimate sweep nothing.
+        let empty = ThreadId::new();
+        store
+            .create_thread(pid, test_thread(pid, empty))
+            .await
+            .unwrap();
+        let sweep = store
+            .sweep_orphan_payloads(pid, empty, false)
+            .await
+            .unwrap();
+        assert!(
+            sweep.payloads.is_empty() && sweep.refusal.is_none(),
+            "{sweep:?}"
+        );
+    }
+
+    /// Total index loss is the rarer failure; losing a *tail* of page-cached appends is the likely
+    /// one, and it leaves that many fsynced payloads unreferenced. Deleting them is the same
+    /// history destruction the empty-index guard exists to prevent, through the more probable door.
+    #[tokio::test]
+    async fn the_sweep_refuses_a_partially_truncated_index_too() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        let turns: Vec<Turn> = (0..12)
+            .map(|i| turn_with_items(&format!("prompt {i}"), vec![item(&format!("item {i}"))]))
+            .collect();
+        for turn in &turns {
+            store.append_turn(pid, tid, turn).await.unwrap();
+        }
+        let paths = store.current_thread_paths(pid, tid);
+
+        // Keep the header and the first two records; the rest of the appends never reached disk.
+        let index = tokio::fs::read_to_string(paths.history()).await.unwrap();
+        let kept: String = index
+            .lines()
+            .take(3)
+            .map(|line| format!("{line}\n"))
+            .collect();
+        tokio::fs::write(paths.history(), kept).await.unwrap();
+
+        let sweep = store.sweep_orphan_payloads(pid, tid, false).await.unwrap();
+        assert!(
+            sweep
+                .refusal
+                .as_deref()
+                .is_some_and(|reason| reason.contains("truncated")),
+            "{sweep:?}"
+        );
+        for turn in &turns {
+            assert!(paths.turn_payload(turn.id).exists(), "nothing was deleted");
+        }
+
+        // The refusal points an operator at `--dry-run`, so `--dry-run` has to be the one thing
+        // that still works here: it names the same refusal *and* lists the files it is about.
+        let previewed = store.sweep_orphan_payloads(pid, tid, true).await.unwrap();
+        assert_eq!(previewed.refusal, sweep.refusal);
+        assert_eq!(previewed.payloads.len(), 10, "the list the refusal names");
+        for turn in &turns {
+            assert!(
+                paths.turn_payload(turn.id).exists(),
+                "and a dry run still removes nothing"
+            );
+        }
+
+        // The bound is on magnitude, not on the existence of orphans: a handful still sweeps, which
+        // is what an orphan actually looks like when it is one crash per commit.
+        let few = ThreadId::new();
+        store
+            .append_turn(pid, few, &turn_with_items("kept", vec![]))
+            .await
+            .unwrap();
+        let few_paths = store.current_thread_paths(pid, few);
+        let mut orphans = vec![];
+        for _ in 0..MAX_PLAUSIBLE_ORPHANS {
+            let orphan = TurnId::new();
+            tokio::fs::write(
+                few_paths.turn_payload(orphan),
+                crate::history::payload_file_bytes(&turn_with_items("orphan", vec![])).unwrap(),
+            )
+            .await
+            .unwrap();
+            orphans.push(orphan);
+        }
+        assert_eq!(
+            store
+                .sweep_orphan_payloads(pid, few, false)
+                .await
+                .unwrap()
+                .payloads
+                .len(),
+            MAX_PLAUSIBLE_ORPHANS
+        );
+        for orphan in orphans {
+            assert!(!few_paths.turn_payload(orphan).exists());
+        }
+    }
+
+    /// A payload missing a required record is incomplete. Reassembling it with an empty prompt
+    /// would manufacture a turn indistinguishable from one the user submitted blank.
+    #[tokio::test]
+    async fn a_payload_with_no_user_input_fails_that_turn_instead_of_inventing_one() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        let incomplete = turn_with_items("what was asked", vec![item("one")]);
+        let ordinary = turn_with_items("ordinary", vec![item("two")]);
+        for turn in [&incomplete, &ordinary] {
+            store.append_turn(pid, tid, turn).await.unwrap();
+        }
+
+        // Well-formed lines, one required record missing — not a truncation.
+        let paths = store.current_thread_paths(pid, tid);
+        let payload = paths.turn_payload(incomplete.id);
+        let data = tokio::fs::read_to_string(&payload).await.unwrap();
+        let stripped: String = data
+            .lines()
+            .filter(|line| !line.contains(r#""kind":"user_input""#))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        tokio::fs::write(&payload, stripped).await.unwrap();
+
+        let loaded = store.load_all_turns(pid, tid).await.unwrap();
+        assert_eq!(
+            loaded.iter().map(|turn| turn.id).collect::<Vec<_>>(),
+            vec![ordinary.id],
+            "the incomplete turn fails alone rather than reassembling with an empty prompt"
+        );
+        assert!(
+            payload.exists(),
+            "the bytes parsed, so the file is reported rather than quarantined — its surviving \
+             records may still be recoverable"
+        );
+        let errors = store.history_validation_errors(pid, tid).await;
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].1.contains("no user_input record"), "{errors:?}");
+    }
+
+    /// The payload file holds two classes of record, and each needs its own stated rule.
+    #[test]
+    fn collections_fold_by_identity_and_singletons_last_win() {
+        use giskard_core::diff::FileDiff;
+        use giskard_core::item::FileChangeKind;
+        let path = std::path::Path::new("turns/T1.jsonl");
+
+        let diff = |file: &str, text: &str| FileDiff {
+            path: file.into(),
+            change: FileChangeKind::Modified,
+            old_text: None,
+            new_text: Some(text.into()),
+            hunks: vec![],
+            binary: false,
+        };
+
+        let mut data = payload_prologue();
+        // The same file twice at different indices, and a second file — keyed by path, the first
+        // must survive once, at the slot its first record established.
+        for (index, record) in [
+            (0usize, diff("src/a.rs", "first")),
+            (1, diff("src/b.rs", "other")),
+            (7, diff("src/a.rs", "revised")),
+        ] {
+            data.push_str(
+                &serde_json::to_string(
+                    &serde_json::json!({"kind":"diff","index":index,"diff":record}),
+                )
+                .unwrap(),
+            );
+            data.push('\n');
+        }
+        // A duplicate singleton: last wins, and it is warned about rather than vanishing.
+        data.push_str(r#"{"kind":"user_input","user_input":{"type":"text","text":"superseding"}}"#);
+        data.push('\n');
+
+        let payload = crate::history::parse_turn_payload(path, &data).unwrap();
+        assert_eq!(
+            payload
+                .diffs
+                .iter()
+                .map(|d| (d.path.to_string_lossy().into_owned(), d.new_text.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("src/b.rs".to_string(), Some("other".into())),
+                ("src/a.rs".to_string(), Some("revised".into())),
+            ],
+            "one entry per path, last-wins, rendered at the index the last record gave it"
+        );
+        assert_eq!(payload.user_input.as_text(), Some("superseding"));
+    }
+
+    /// A turn's status *kind* is bounded and belongs in the index; its *message* is composed from
+    /// provider error text and has no ceiling, so the index keeps only a capped rendering.
+    #[tokio::test]
+    async fn an_unbounded_status_message_is_capped_in_the_index_and_whole_in_the_payload() {
+        use giskard_core::turn::{TurnStatus, TurnStatusKind};
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+
+        let detail = "provider said: ".to_string() + &"z".repeat(32 * 1024);
+        let mut turn = turn_with_items("run it", vec![]);
+        turn.status = TurnStatus {
+            kind: TurnStatusKind::Failed,
+            message: Some(detail.clone()),
+        };
+        store.append_turn(pid, tid, &turn).await.unwrap();
+
+        let paths = store.current_thread_paths(pid, tid);
+        let index = tokio::fs::read_to_string(paths.history()).await.unwrap();
+        assert!(
+            index.len() < 2048,
+            "a 32 KiB provider error must not land on the append-only index: {} bytes",
+            index.len()
+        );
+        assert!(!index.contains(&detail));
+
+        // The kind stays authoritative in the index, so aggregate repair still reads no payload.
+        let records = crate::history::parse_history_index(&paths.history(), &index).unwrap();
+        assert_eq!(records[0].status.kind, TurnStatusKind::Failed);
+        assert!(records[0].status.message.as_deref().is_some_and(|message| {
+            message.len() <= crate::preview::STATUS_MESSAGE_MAX_BYTES && detail.starts_with(message)
+        }));
+
+        // And the message the harness reported survives in full.
+        let loaded = store.load_all_turns(pid, tid).await.unwrap();
+        assert_eq!(loaded[0].status, turn.status);
+    }
+
+    /// A replacement record that carries no index of its own keeps the slot its first record
+    /// established, rather than defaulting to zero and jumping to the top of the turn.
+    #[test]
+    fn a_replacement_without_an_index_keeps_its_original_slot() {
+        let path = std::path::Path::new("turns/T1.jsonl");
+        let items = [item("first"), item("second"), item("third")];
+        let mut settled = items[2].clone();
+        settled.payload = ItemPayload::AgentMessage {
+            text: "third (settled)".into(),
+        };
+
+        let mut data = payload_prologue();
+        for (index, item) in items.iter().enumerate() {
+            data.push_str(
+                &serde_json::to_string(
+                    &serde_json::json!({"kind":"item","index":index,"item":item}),
+                )
+                .unwrap(),
+            );
+            data.push('\n');
+        }
+        data.push_str(
+            &serde_json::to_string(&serde_json::json!({"kind":"item","item":settled})).unwrap(),
+        );
+        data.push('\n');
+
+        let payload = crate::history::parse_turn_payload(path, &data).unwrap();
+        assert_eq!(
+            payload.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            items.iter().map(|item| item.id).collect::<Vec<_>>()
+        );
+        assert_eq!(payload.items[2].payload, settled.payload);
+    }
+
+    /// `validate` reports what is on disk. Migrating every format 1 thread as a side effect of
+    /// inspecting it would make the report describe a store the operator did not ask to change.
+    #[tokio::test]
+    async fn validate_all_inspects_without_migrating_or_quarantining() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        store
+            .create_project(pid, "proj", "/tmp/proj")
+            .await
+            .unwrap();
+
+        let flat = ThreadId::new();
+        write_format1_thread(
+            &store,
+            pid,
+            &test_thread(pid, flat),
+            &[make_turn(giskard_core::token::TokenUsage::new(1, 1))],
+        )
+        .await;
+
+        let damaged = ThreadId::new();
+        let turn = turn_with_items("damaged", vec![item("one")]);
+        store.append_turn(pid, damaged, &turn).await.unwrap();
+        let payload = store
+            .current_thread_paths(pid, damaged)
+            .turn_payload(turn.id);
+        tokio::fs::write(&payload, b"{not json").await.unwrap();
+
+        let errors = store.validate_all().await;
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].0, payload);
+        assert_eq!(
+            store.thread_layout(pid, flat).await.history_format(),
+            1,
+            "validate must not migrate the store it is inspecting"
+        );
+        assert!(
+            payload.exists(),
+            "validate reports damage, it does not move it aside"
+        );
+
+        // So a second run says the same thing rather than degrading to "no payload file".
+        let again = store.validate_all().await;
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0], errors[0]);
+    }
+
+    /// A format 1 history with a bad interior line cannot be rebuilt without losing turns, so the
+    /// migration aborts and the thread keeps behaving exactly as it does today.
+    #[tokio::test]
+    async fn an_unmigratable_history_leaves_the_thread_on_format_1_rather_than_losing_turns() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        write_format1_thread(&store, pid, &test_thread(pid, tid), &[]).await;
+        let flat_history = store.current_thread_paths(pid, tid).flat_history();
+        let good = serde_json::to_string(&make_turn(TokenUsage::new(1, 1))).unwrap();
+        tokio::fs::write(&flat_history, format!("torn interior line\n{good}\n"))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store.load_all_turns(pid, tid).await.unwrap_err(),
+            PersistError::Corrupt(_)
+        ));
+        assert_eq!(store.thread_layout(pid, tid).await.history_format(), 1);
+        // Metadata still reads and writes, exactly as before this change.
+        assert!(store.load_thread(pid, tid).await.unwrap().is_some());
+        assert!(matches!(
+            store
+                .update_thread(pid, tid, |thread| thread.title = "renamed".into())
+                .await
+                .unwrap(),
+            ThreadMutation::Changed { .. }
+        ));
+        // The decision is remembered so every later call does not re-parse the whole flat file,
+        // take the lock, and log again — but it is a memo, not a verdict: repairing the file and
+        // asking explicitly migrates.
+        assert!(store.unmigratable.read().await.contains(&(pid, tid)));
+        tokio::fs::write(&flat_history, format!("{good}\n"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.migrate_thread_layout(pid, tid).await.unwrap(),
+            MigrationOutcome::Migrated
+        );
+        assert_eq!(store.load_all_turns(pid, tid).await.unwrap().len(), 1);
     }
 }

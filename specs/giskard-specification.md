@@ -9,7 +9,7 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.66
+**Version:** 1.68
 
 > **Amendment — frontend approach (supersedes the Dioxus/WASM design below).**
 > This document was written targeting a **Dioxus fullstack / WebAssembly** frontend (`giskard-ui`),
@@ -22,6 +22,57 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.67 → 1.68), advisory data-directory lock:**
+- **DL1:** One `flock` per data directory (`<data_dir>/.giskard.lock`) supplies the cross-process
+  exclusion the in-process per-file mutexes never could. `giskard-server` holds it for its process
+  lifetime and refuses to start when another process has it; every mutating `giskard-admin` command
+  holds it for the command and exits non-zero instead of proceeding (§5.4, §5.5).
+- **DL2:** `--dry-run` and read-only inspection take no lock and warn that their output may be
+  stale. A preview that refused while a server ran would make "stop the server first" advice
+  circular — the preview is what an operator uses to decide (§5.4).
+- **DL3:** The orphan sweep's 24-hour mtime threshold is removed. It was a guess about another
+  process's progress standing in for exclusion; with the directory locked, unreferenced means
+  unreferenced. The magnitude and missing-index guards stay: they defend against a *damaged index*,
+  which is a data condition a lock does nothing about (§5.5).
+- **DL4:** MSRV rises to 1.89 for `std::fs::File::try_lock`. CI uses `@stable` with no
+  `rust-toolchain.toml`, so nothing enforces the manifest's claim — the bump is deliberate.
+
+**Changelog (1.66 → 1.67), per-turn payload files with a versioned header:**
+- **Motivation:** a turn's *count* is human-scaled (someone types each prompt) while a turn's
+  *contents* are agent-driven and unbounded (command output, diffs, tool JSON). Writing both to one
+  append-only file put them on the same durability mechanism, and the large one broke it: a whole
+  turn written with one `write_all` can be torn by a crash or a full disk, the next append
+  concatenates onto the partial line, and the merged garbage line is no longer *last* — so the
+  torn-final-line tolerance stops covering it and the thread's entire history becomes unreadable.
+  Probability scaled with turn size, so it was likeliest on the threads with the largest output.
+- **L1:** A thread is a directory. `<thread_id>/history.jsonl` is a bounded **index** (a header
+  line, then one strictly bounded record per turn); `<thread_id>/turns/<turn_id>.jsonl` is that
+  turn's **payload** — full `UserInput`, items, diffs — written with temp file + `fsync` + rename,
+  so it is complete or absent (§5.2, §5.4).
+- **L2:** A turn commits payload first, index last. A crash between them leaves a payload no turn
+  record references, invisible to every read path because reads start from the index (§5.4).
+- **L3:** Three independent version markers: `thread.json` → `version` (metadata schema),
+  `history.jsonl` header → `format` (layout + index schema, written once — at thread creation, or
+  by the first append for a thread the store never saw created — and never rewritten), each
+  payload header → `format` (that turn's payload schema). Unknown `kind` within a known format is
+  skipped with a warning; a newer payload format fails **that turn only**; a newer history format
+  fails the thread (§5.4).
+- **L4:** `recompute_aggregates` is index-only — `usage`, `model`, `status` and the turn timestamps
+  are all turn-record fields, so repair opens no payload file. No API change (§5.4).
+- **L5:** `delete_thread` renames `<thread_id>/` to `<thread_id>.deleting/` before removing it, so
+  the thread leaves enumeration atomically and the recursive removal can fail and be retried. This
+  preserves — deliberately, rather than by ordering luck — the property that a partial delete leaves
+  the thread visible instead of orphaning history (§5.4).
+- **L6:** Format 1 threads migrate per thread, on open, idempotently, under the per-thread lock: a
+  staged rebuild, verified against the source before a single commit rename, after which the
+  originals are *relocated* to `<id>/legacy/` and never deleted. `giskard-admin migrate-storage`,
+  `prune-legacy` and `sweep-orphan-payloads` do the bulk and the cleanup explicitly (§5.4, §5.5).
+- **L7:** `prompt_preview`/`prompt_truncated`, `item_count`, and a turn record's `status.message`
+  are **display hints**: derived, capped, never authoritative, and never used for search,
+  comparison, or validation. A mismatch is logged and the payload file wins. `status.kind` is the
+  exception and stays authoritative in the index, because the ledger folds it and repair must not
+  have to open a payload file (§5.4).
 
 **Changelog (1.65 → 1.66), explicit client-state authorities:**
 - **ST1:** Every client-visible state projection names one authority, one clock, and one delivery
@@ -379,8 +430,8 @@
 
 **Changelog (1.45 → 1.46), per-process parsed history cache:**
 - **HC1:** `PersistStore` maintains a per-process parsed JSONL history cache keyed by
-  `(ProjectId, ThreadId)`. The authoritative source remains `<thread_id>.jsonl`; cache entries are
-  only reused when file metadata still matches, appended to only after the disk append succeeds, and
+  `(ProjectId, ThreadId)`. The authoritative source remains the on-disk history; cache entries are
+  only reused when the index file's metadata still matches, appended to only after the disk append succeeds, and
   invalidated on thread/project deletion or unexpected metadata changes. This keeps thread switching
   and repeated history paging from reparsing unchanged histories while preserving the history-first
   crash-consistency contract.
@@ -1954,13 +2005,18 @@ Root directory (XDG): `${XDG_DATA_HOME:-~/.local/share}/giskard/`. Overridable v
 ```
 giskard/
 ├── config.toml                 # global app config (§16.3) — human-authored + app-updated
+├── .giskard.lock               # advisory data-directory lock: one Giskard process at a time (§5.4)
 ├── projects.json               # index of projects (id, name, dir, created_at, order)
 ├── projects/
 │   └── <project_id>/
 │       ├── project.json        # ProjectConfig: workspace root, harness kind
 │       ├── threads/
-│       │   ├── <thread_id>.json        # thread metadata, permission preset, token cache — no history
-│       │   └── <thread_id>.jsonl       # authoritative turn history, one Turn per line (§5.4)
+│       │   └── <thread_id>/            # a thread is a directory (§5.4)
+│       │       ├── thread.json         # thread metadata, permission preset, token cache — no history
+│       │       ├── history.jsonl       # bounded turn index: header line, then one record per turn
+│       │       ├── turns/
+│       │       │   └── <turn_id>.jsonl # that turn's payload, written atomically (§5.4)
+│       │       └── legacy/             # pre-migration originals, retained (§5.4)
 │       ├── worktrees/          # only for threads started isolated (§7.1)
 │       │   └── <thread_id>/            # the thread's linked Git worktree — a checkout, not Giskard state
 │       └── tokens.json         # per-project token ledger (aggregates + daily buckets)
@@ -2008,7 +2064,7 @@ All defined in `giskard-core`, serialized by `giskard-persist`. Illustrative sha
 ```
 
 ```jsonc
-// projects/<id>/threads/<thread_id>.json
+// projects/<id>/threads/<thread_id>/thread.json
 {
   "version": 1,
   "id": "01J…",
@@ -2052,7 +2108,8 @@ All defined in `giskard-core`, serialized by `giskard-persist`. Illustrative sha
     "git_dir": "/home/user/dev/ostinato-radio/.git/worktrees/01K…"   //   the project may itself be
   },                                     //   a linked worktree, whose `.git` is a pointer file
   "created_at": "…", "updated_at": "…"
-  // NB: no `turns[]` — history is the authoritative `<thread_id>.jsonl`, one `Turn` per line (H1).
+  // NB: no `turns[]` — history is the authoritative `<thread_id>/history.jsonl` index plus one
+  //     `turns/<turn_id>.jsonl` payload file per turn (H1, §5.4).
 }
 ```
 
@@ -2080,7 +2137,24 @@ there is one source of truth to correct if needed.
 - Every mutating operation updates memory, then persists the affected file(s) via
   **atomic replace**: write to `<file>.tmp-<rand>`, `fsync`, `rename` over the target.
 - **Per-file async mutex** (or an actor owning each file) guarantees single-writer; the
-  ~10-thread scale makes contention negligible.
+  ~10-thread scale makes contention negligible. These are **in-process** locks and order nothing
+  between binaries.
+- **Advisory data-directory lock (`<data_dir>/.giskard.lock`).** `giskard-admin` is a separate
+  binary from `giskard-server`, so the per-file mutexes above provide no exclusion between them: a
+  `prune-legacy` or `migrate-storage` run against a live server's data directory, or a second
+  server started on the same directory, had no protection at all. One `flock` per data directory
+  supplies it. `giskard-server` takes it exclusively at startup, holds it for the process lifetime,
+  and refuses to start if another process holds it. Every `giskard-admin` command that rewrites or
+  deletes takes it for the command and exits non-zero rather than proceeding. `--dry-run` and
+  read-only inspection take no lock and warn instead, so they remain usable against a live server —
+  which is what makes "stop the server, then run this" advice actionable rather than circular.
+  `try_lock`, never `lock`: an operator who ran a command by mistake wants an error, not a process
+  that appears to hang. The file is created if absent and never deleted, including on clean
+  shutdown — unlinking races the next holder and buys nothing — and the kernel releases the lock
+  when the holding process dies, so a crash leaves nothing stale and no pidfile liveness check is
+  needed. The lock is **advisory**: it constrains Giskard's own binaries, not other tools; it is
+  **not reliable over NFS** (acceptable under §1.2 local-first, but not a guarantee); and its scope
+  is the data directory, so two instances on two directories never contend.
 - **`tokens-global.json` is a cross-project hot file** (every `TurnCompleted` in any project
   updates it). It is owned by a **single dedicated ledger actor** (one Tokio task holding the
   in-memory global ledger); all projects send `TokenUsage` deltas to it over an `mpsc`
@@ -2089,25 +2163,70 @@ there is one source of truth to correct if needed.
   close together into one atomic write). The same actor owns per-project `tokens.json` writes,
   or those may be delegated to per-project sub-tasks — either is acceptable, but the global
   file must have exactly one writer.
-- **Turn history (authoritative JSONL, H1/H2/H3):** a thread's history is `<thread_id>.jsonl`,
-  the **source of truth** — one `Turn` per line, append-only. On `TurnCompleted` the server appends
-  one line via a single `write()` (JSON + `\n`) to an `O_APPEND` file: on a local POSIX filesystem
-  this is atomic against concurrent writers without an application lock, and a process kill leaves
-  the line all-or-nothing. It does **not** survive power loss (page cache), so the loader tolerates a
-  single unparseable **final** line (torn append) — skipping it — while a bad interior line is real
-  corruption. This atomicity holds on local storage only; NFS/network `GISKARD_DATA_DIR` is out of
-  scope (§1.2). After appending, the server updates `<thread_id>.json` (token aggregates,
-  `updated_at`) — history-first, so a crash between the two leaves the turn recoverable and the
-  aggregates rebuildable from the JSONL (`recompute_aggregates`, treating aggregates as a cache like
+- **Turn history (authoritative, H1/H2/H3):** a thread's history is the **source of truth**, split
+  across two files by how the two halves grow. `<thread_id>/history.jsonl` is the **index**: a
+  header line, then one strictly bounded record per turn (turn id, model, mode, status kind, usage,
+  timestamps, item count, a capped prompt preview, a capped status message, attachment
+  descriptors). It is never agent-driven — a turn's *status kind* is a bounded enum, but its
+  *status message* is composed from provider error text with no ceiling, so only a capped rendering
+  of it reaches the index and the payload file holds what the harness reported. `<thread_id>/turns/<turn_id>.jsonl` is the **payload**: the full `UserInput`, the
+  items and the diffs — everything whose size is a function of what the agent did.
+  On `TurnCompleted` the server writes the payload file **first**, with temp file + `fsync` +
+  rename, and appends the bounded index record **last**. A crash between the two leaves a payload
+  file no turn record references; it is invisible to every read path, because reads start from the
+  index, so the worst case is a wasted file. (This is what closes the corruption path a whole-turn
+  append had: a torn line that a later append concatenates onto stops being the *final* line, and
+  the entire thread's history becomes unreadable — likeliest on the threads with the largest command
+  output.) The index record is appended via a single `write()` (JSON + `\n`) to an `O_APPEND` file:
+  on a local POSIX filesystem this is atomic against concurrent writers without an application lock,
+  and a process kill leaves the line all-or-nothing. It does **not** survive power loss (page
+  cache), so the loader tolerates a single unparseable **final** line (torn append) — skipping it —
+  while a bad interior line is real corruption; at turn-record size that tolerance is adequate. This
+  atomicity holds on local storage only; NFS/network `GISKARD_DATA_DIR` is out of scope (§1.2).
+  After appending, the server updates `thread.json` (token aggregates, `updated_at`) — history-first,
+  so a crash between the two leaves the turn recoverable and the aggregates rebuildable from the
+  index alone (`recompute_aggregates` reads no payload file, treating aggregates as a cache like
   `context_window`, C4). A per-thread persistence lock spans the append and metadata fold and also
   spans repair's history read and metadata replacement. The history write remains first, but repair
   cannot race a live completion and overwrite or double-count its usage. Repair also restores the
   latest durable turn timestamp as recency; it does not use the repair time and make an old thread
-  look newly active. The metadata `.json` never holds `turns[]`. The server may cache the parsed
-  history in memory for the process lifetime, but the cache is never authoritative: reads validate
-  file metadata before reuse, disk append succeeds before in-memory append, and delete/repair paths
-  invalidate stale entries. Transient attachment bytes are redacted before a turn is added to this
-  cache.
+  look newly active. The metadata `thread.json` never holds `turns[]`. The server may cache the
+  parsed history in memory for the process lifetime, but the cache is never authoritative: reads
+  validate the index file's metadata before reuse, disk append succeeds before in-memory append, and
+  delete/repair paths invalidate stale entries. It currently caches whole reassembled turns, so
+  resident memory per open thread stays unbounded as before: the bounded index makes a
+  bounded-residency cache *possible*, but claiming it means caching only the parsed index, which
+  waits on the bounded read APIs. Transient attachment bytes are redacted before a
+  turn is added to this cache.
+- **Format identification.** Three independent version numbers, each describing exactly what it
+  governs: `thread.json` → `version` (the metadata record schema), the `history.jsonl` header →
+  `format` (the directory layout and index schema, written once — at thread creation, or by the
+  first append for a thread the store never saw created — and never rewritten), and each
+  `turns/<id>.jsonl` header → `format` (that turn's payload schema, written once when the turn
+  commits). The layout version lives in the history header rather than in `thread.json` because
+  `thread.json` is rewritten on every metadata mutation, and because a file that carries its own
+  format claim has no cross-file consistency for a crash to break. Payload headers are per-file so a
+  directory holding a mix of old and new payload files is legal, which is what makes lazy per-turn
+  migration possible. Unknown behavior is fixed: an unknown `kind` within a known format is **skipped
+  with a warning** (a future downgrade is non-destructive); a payload `format` newer than understood
+  **fails that turn only**; a history `format` newer than understood **fails the thread**, since
+  without the index there is nothing to partially recover.
+- **Deletion.** A thread directory is renamed to `<thread_id>.deleting/` before it is removed. The
+  rename is atomic and immediately drops the thread out of enumeration, after which the recursive
+  removal can fail and be retried harmlessly — preserving the property that a partial delete leaves
+  the thread visible rather than deleting the catalog record while history survives as an invisible
+  orphan. Enumeration matches a `<ulid>/` directory or a `<ulid>.json` file, deduped by id;
+  `<ulid>.migrating/`, `<ulid>.deleting/` and `*.corrupt-*` never parse as a bare ULID and so are
+  never enumerated.
+- **Migration (format 1 → format 2).** Threads written as a flat `<thread_id>.json` beside a
+  `<thread_id>.jsonl` are migrated per thread, on open, idempotently, under the per-thread lock —
+  self-hosted users do not run a migration before starting the binary. The rebuild is staged in
+  `<id>.migrating/`, verified against the source (turn ids, order, count) before committing, and
+  committed with one rename; the originals are then *relocated* to `<id>/legacy/`, never deleted.
+  A crash before the rename leaves a staging directory the next run discards and rebuilds; a crash
+  between the rename and the relocation leaves both shapes on disk, and readers prefer the
+  directory while a later pass finishes the move. A format 1 history that cannot be parsed aborts
+  its migration and leaves that thread on format 1 rather than rebuilding it minus the lost turns.
 - **Crash consistency:** because writes are atomic renames, a crash leaves either the old or
   the new complete file, never a partial one. On startup the server validates each JSON file;
   a corrupt file is moved aside to `<file>.corrupt-<ts>` and logged, and the app continues
@@ -2122,8 +2241,29 @@ exposes a small maintenance API used by a `giskard-admin` binary (or hidden UI p
 - `list_projects`, `list_threads(project)` (including active/archived status),
   `dump_thread(id)` (pretty JSON to stdout),
 - `delete_thread(id)`, `delete_project(id)` (with confirmation),
-- `validate_all` (parse every file, report corruption),
-- `compact_thread(id)` (rewrite/prune the jsonl log).
+- `validate_all` (parse every file, report corruption — per turn for an unreadable payload),
+- `compact_thread(id)` (rewrite/prune the jsonl log),
+- `migrate-storage` (bulk format 1 → format 2, with `--dry-run`),
+- `prune-legacy` (delete the retained pre-migration originals — the one command here that can
+  destroy transcript history, hence separate and explicit),
+- `sweep-orphan-payloads` (delete payload files no turn record references). Deliberately not
+  automatic, and gated on the data-directory lock: with the directory locked there is no in-flight
+  commit an unreferenced payload could belong to, which is what lets this be actual exclusion rather
+  than the wall-clock guess about another process's progress it replaced. It also refuses any thread
+  whose index is missing, references no turns,
+  or would have more than a handful of payloads swept at once: the index is the less durable file,
+  and losing a *tail* of its page-cached appends leaves exactly that many fsynced payloads
+  unreferenced, so a large sweep set is evidence of a truncated index rather than of orphaned
+  commits. A refusal is a judgment about the thread, not a failure of the sweep, so it is reported
+  alongside the files it names rather than raised in place of them: the refused thread is skipped
+  and never a reason to abandon the run, and a dry run still reports the refusal *and* lists what it
+  is about — which is what makes "inspect them first" advice a thing an operator can act on.
+
+`migrate-storage --dry-run` previews through the migration's own classifier rather than a
+reimplementation of it, so the plan names every case the run acts on (including a thread caught
+between the commit rename and the legacy relocation). The one thing a plan cannot know is whether
+the work will *succeed*: a format 1 history that will not parse plans as a migration and reports as
+an error only when attempted.
 
 This satisfies the "complete tool to debug and potentially correct the database" requirement
 without a SQL console.
@@ -2269,7 +2409,8 @@ yet, so there is no catalog to choose from (§8.3).
   restore as the active thread after reload. Archiving leaves a thread's worktree on disk; reclaiming
   it is deferred to a later phase.
 - **Delete:** delete calls the harness lifecycle operation first (Codex `thread/delete`) and removes
-  local `<thread_id>.json` + `<thread_id>.jsonl` only after success. Delete also drops the in-memory
+  the local `<thread_id>/` directory only after success (§5.4: renamed out of enumeration first,
+  then removed). Delete also drops the in-memory
   Giskard harness handle. Archive/delete are rejected while the thread has an active turn or running
   command; the browser surfaces the failure as an error notice. Delete also takes the thread's
   worktree and the branch Giskard created with it — in that order, since Git refuses to delete a

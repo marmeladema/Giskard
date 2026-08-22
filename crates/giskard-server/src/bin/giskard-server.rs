@@ -84,6 +84,28 @@ async fn load_required_config(
     })
 }
 
+/// Take the data-directory lock, or refuse to start.
+///
+/// Two servers on one data directory would interleave writes that each believes are serialized by
+/// its own in-process per-thread locks — which order nothing between processes. Refusing here is
+/// also what makes `giskard-admin`'s destructive commands able to assume no server is running.
+fn acquire_data_dir_lock(
+    data_dir: &std::path::Path,
+) -> Result<giskard_persist::DataDirLock, String> {
+    match giskard_persist::DataDirLock::try_acquire(data_dir) {
+        Ok(Some(lock)) => Ok(lock),
+        Ok(None) => Err(format!(
+            "another Giskard process is using the data directory {}. Stop it (or set \
+             GISKARD_DATA_DIR to a different directory) and start giskard-server again.",
+            data_dir.display()
+        )),
+        Err(e) => Err(format!(
+            "cannot lock data directory {}: {e}",
+            data_dir.display()
+        )),
+    }
+}
+
 fn load_or_create_session_key(data_dir: &std::path::Path) -> std::io::Result<Vec<u8>> {
     let key_path = data_dir.join("session.key");
     if key_path.exists() {
@@ -133,6 +155,12 @@ async fn run() -> Result<(), String> {
         .map_err(|e| format!("cannot create data dir {}: {e}", data_dir.display()))?;
     info!(data_dir = ?data_dir, "starting giskard server");
 
+    // Held for the whole process, not just past startup: the lock belongs to the open file, so
+    // dropping this guard would release it and let a second server — or a destructive
+    // `giskard-admin` run — into the same data directory mid-flight. Binding it to `_` would drop
+    // it here and lock nothing.
+    let _data_dir_lock = acquire_data_dir_lock(&data_dir)?;
+
     let store = Arc::new(giskard_persist::PersistStore::new(data_dir.clone()));
     let config = load_required_config(store.as_ref(), &data_dir).await?;
     let session_key = load_or_create_session_key(&data_dir)
@@ -157,6 +185,31 @@ async fn run() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A second server on one data directory would interleave writes that each believes its own
+    /// in-process per-thread locks serialize — and those order nothing between processes.
+    #[test]
+    fn startup_refuses_a_data_directory_another_process_holds() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let held = acquire_data_dir_lock(tmp.path()).expect("first server takes the directory");
+
+        let error =
+            acquire_data_dir_lock(tmp.path()).expect_err("a second server must refuse to start");
+        assert!(
+            error.contains("another Giskard process is using the data directory"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("GISKARD_DATA_DIR"),
+            "unexpected error: {error}"
+        );
+
+        drop(held);
+        assert!(
+            acquire_data_dir_lock(tmp.path()).is_ok(),
+            "the directory is takeable once the first server is gone"
+        );
+    }
 
     #[tokio::test]
     async fn required_config_rejects_missing_file() {

@@ -489,13 +489,15 @@ async fn subscribe_corrupt_history_returns_structured_error() {
         serde_json::from_value(resp["thread_id"].clone()).unwrap()
     };
 
+    // A bad **interior** line of the history index is real corruption, not a torn final append.
     let valid_turn = serde_json::to_string(&make_turn("valid after corrupt line")).unwrap();
     let history_path = tmp
         .path()
         .join("projects")
         .join(pid.to_string())
         .join("threads")
-        .join(format!("{tid}.jsonl"));
+        .join(tid.to_string())
+        .join("history.jsonl");
     tokio::fs::write(&history_path, format!("not json\n{valid_turn}\n"))
         .await
         .unwrap();
