@@ -1,15 +1,19 @@
+#[cfg(test)]
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
-use tokio::sync::Mutex;
-
-use giskard_core::approval::{ApprovalDecision, ApprovalRequest};
+use giskard_core::approval::ApprovalDecision;
+#[cfg(test)]
+use giskard_core::approval::ApprovalRequest;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{ItemDelta, ItemPayload};
+#[cfg(test)]
 use giskard_core::server_request::ServerRequest;
 use giskard_core::user_input::UserInput;
-use giskard_proto::{AnsweredApproval, LiveTurnSnapshot, WireAgentEvent, WireApprovalRequest};
+#[cfg(test)]
+use giskard_proto::WireApprovalRequest;
+use giskard_proto::{AnsweredApproval, LiveTurnSnapshot, WireAgentEvent};
 
 const MAX_LIVE_COMMAND_OUTPUT: usize = 16 * 1024;
 const LIVE_COMMAND_OUTPUT_EDGE: usize = 8 * 1024;
@@ -33,64 +37,61 @@ struct LiveTurn {
     resolved_server_requests: HashSet<ServerRequestId>,
 }
 
-pub struct LiveBufferStore {
-    buffers: Mutex<HashMap<ThreadId, LiveTurn>>,
+#[derive(Default)]
+pub struct LiveTurnState {
+    thread_id: Option<ThreadId>,
+    turn: Option<LiveTurn>,
 }
 
-impl LiveBufferStore {
+impl LiveTurnState {
+    #[cfg(test)]
     pub fn new() -> Self {
-        Self {
-            buffers: Mutex::new(HashMap::new()),
-        }
+        Self::default()
     }
 
-    pub async fn start_turn(&self, thread_id: ThreadId) {
-        self.start_turn_with_user_input(thread_id, None).await;
+    #[cfg(test)]
+    pub fn start_turn(&mut self, thread_id: ThreadId) {
+        self.start_turn_with_user_input(thread_id, None);
     }
 
-    pub async fn start_turn_with_user_input(
-        &self,
+    #[cfg(test)]
+    pub fn start_turn_with_user_input(
+        &mut self,
         thread_id: ThreadId,
         user_input: Option<UserInput>,
     ) {
-        self.replace_turn_with_user_input(thread_id, TurnId::new(), user_input)
-            .await;
+        self.replace_turn_with_user_input(thread_id, TurnId::new(), user_input);
     }
 
-    pub async fn replace_turn_with_user_input(
-        &self,
+    pub fn replace_turn_with_user_input(
+        &mut self,
         thread_id: ThreadId,
         turn_id: TurnId,
         user_input: Option<UserInput>,
     ) {
-        let mut buffers = self.buffers.lock().await;
-        buffers.insert(
-            thread_id,
-            LiveTurn {
-                turn_id,
-                user_input,
-                events: Vec::new(),
-                resolved_approvals: HashMap::new(),
-                resolved_server_requests: HashSet::new(),
-            },
-        );
+        self.thread_id = Some(thread_id);
+        self.turn = Some(LiveTurn {
+            turn_id,
+            user_input,
+            events: Vec::new(),
+            resolved_approvals: HashMap::new(),
+            resolved_server_requests: HashSet::new(),
+        });
     }
 
     /// Ensure an exact turn has a reconnect buffer without replacing events already observed for
     /// it. Harnesses may publish a turn-scoped item before their delayed `TurnStarted` event; that
     /// item is still live state and must survive a browser reload.
-    pub async fn ensure_turn_with_user_input(
-        &self,
+    pub fn ensure_turn_with_user_input(
+        &mut self,
         thread_id: ThreadId,
         turn_id: TurnId,
         user_input: Option<UserInput>,
     ) -> Result<(), TurnId> {
-        use std::collections::hash_map::Entry;
-
-        let mut buffers = self.buffers.lock().await;
-        match buffers.entry(thread_id) {
-            Entry::Vacant(entry) => {
-                entry.insert(LiveTurn {
+        match self.turn.as_mut() {
+            None => {
+                self.thread_id = Some(thread_id);
+                self.turn = Some(LiveTurn {
                     turn_id,
                     user_input,
                     events: Vec::new(),
@@ -99,19 +100,20 @@ impl LiveBufferStore {
                 });
                 Ok(())
             }
-            Entry::Occupied(mut entry) if entry.get().turn_id == turn_id => {
-                if entry.get().user_input.is_none() && user_input.is_some() {
-                    entry.get_mut().user_input = user_input;
+            Some(turn) if turn.turn_id == turn_id => {
+                if turn.user_input.is_none() && user_input.is_some() {
+                    turn.user_input = user_input;
                 }
                 Ok(())
             }
-            Entry::Occupied(entry) => Err(entry.get().turn_id),
+            Some(turn) => Err(turn.turn_id),
         }
     }
 
-    pub async fn append(&self, thread_id: ThreadId, event: AgentEvent) {
-        let mut buffers = self.buffers.lock().await;
-        if let Some(turn) = buffers.get_mut(&thread_id) {
+    pub fn append(&mut self, thread_id: ThreadId, event: AgentEvent) {
+        if self.thread_id == Some(thread_id)
+            && let Some(turn) = self.turn.as_mut()
+        {
             if let AgentEvent::TurnStarted { turn: tid, .. } = &event {
                 turn.turn_id = *tid;
             }
@@ -130,14 +132,15 @@ impl LiveBufferStore {
     /// Record that the user answered an approval in the thread's in-flight turn, so the reconnect
     /// snapshot renders it resolved instead of re-prompting (spec §13.6). No-op if the thread has no
     /// live turn (e.g. the turn already completed and its buffer was cleared).
-    pub async fn resolve_approval(
-        &self,
+    pub fn resolve_approval(
+        &mut self,
         thread_id: ThreadId,
         approval_id: ApprovalId,
         decision: ApprovalDecision,
     ) {
-        let mut buffers = self.buffers.lock().await;
-        if let Some(turn) = buffers.get_mut(&thread_id) {
+        if self.thread_id == Some(thread_id)
+            && let Some(turn) = self.turn.as_mut()
+        {
             turn.resolved_approvals.insert(approval_id, decision);
         }
     }
@@ -145,30 +148,32 @@ impl LiveBufferStore {
     /// Record that the user answered a server request in the thread's in-flight turn. Mirrors
     /// [`Self::resolve_approval`]: the harness's own resolved event may be late or may never come,
     /// and until then a reconnect would replay the request as actionable.
-    pub async fn resolve_server_request(&self, thread_id: ThreadId, request_id: ServerRequestId) {
-        let mut buffers = self.buffers.lock().await;
-        if let Some(turn) = buffers.get_mut(&thread_id) {
+    pub fn resolve_server_request(&mut self, thread_id: ThreadId, request_id: ServerRequestId) {
+        if self.thread_id == Some(thread_id)
+            && let Some(turn) = self.turn.as_mut()
+        {
             turn.resolved_server_requests.insert(request_id);
         }
     }
 
-    pub async fn clear_turn(&self, thread_id: ThreadId) {
-        let mut buffers = self.buffers.lock().await;
-        buffers.remove(&thread_id);
+    pub fn clear_turn(&mut self, thread_id: ThreadId) {
+        if self.thread_id == Some(thread_id) {
+            self.thread_id = None;
+            self.turn = None;
+        }
     }
 
-    pub async fn is_active(&self, thread_id: ThreadId) -> bool {
-        let buffers = self.buffers.lock().await;
-        buffers.contains_key(&thread_id)
+    pub fn is_active(&self, thread_id: ThreadId) -> bool {
+        self.thread_id == Some(thread_id) && self.turn.is_some()
     }
 
     /// Return raw server-side lifecycle events for one Giskard item. This is intentionally not a
     /// wire snapshot: linked-thread opening needs the native routing id that wire conversion
     /// redacts before data reaches the browser.
-    pub async fn item_events(&self, thread_id: ThreadId, item_id: ItemId) -> Vec<AgentEvent> {
-        let buffers = self.buffers.lock().await;
-        buffers
-            .get(&thread_id)
+    pub fn item_events(&self, thread_id: ThreadId, item_id: ItemId) -> Vec<AgentEvent> {
+        (self.thread_id == Some(thread_id))
+            .then_some(self.turn.as_ref())
+            .flatten()
             .into_iter()
             .flat_map(|turn| turn.events.iter())
             .filter(|event| match event {
@@ -180,70 +185,69 @@ impl LiveBufferStore {
             .collect()
     }
 
-    pub async fn snapshot(&self, thread_id: ThreadId) -> Option<LiveTurnSnapshot> {
-        let buffers = self.buffers.lock().await;
-        buffers.get(&thread_id).map(|turn| {
-            // C1/§3.5: the snapshot crosses the wire, so narrow core → wire here too.
-            // Answered approvals still ride along in `accumulated`; the client renders them resolved
-            // from this list rather than re-prompting.
-            let answered_approvals: Vec<AnsweredApproval> = turn
-                .events
-                .iter()
-                .filter_map(|e| match e {
-                    AgentEvent::ApprovalRequested { request, .. } => turn
-                        .resolved_approvals
-                        .get(&request.id)
-                        .map(|decision| AnsweredApproval {
-                            request_id: request.id.clone(),
-                            decision: decision.clone(),
-                        }),
-                    _ => None,
-                })
-                .collect();
-            let accumulated: Vec<WireAgentEvent> = turn
-                .events
-                .iter()
-                .cloned()
-                .filter_map(WireAgentEvent::from_agent_event)
-                .collect();
-            // Answered requests still ride along in `accumulated` as `ServerRequestReceived`, and
-            // replaying that renders an actionable card. Naming them lets the client render those
-            // resolved instead, exactly as `answered_approvals` does.
-            let answered_server_requests: Vec<ServerRequestId> = turn
-                .events
-                .iter()
-                .filter_map(|e| match e {
-                    AgentEvent::ServerRequestReceived { request, .. }
-                        if turn.resolved_server_requests.contains(&request.id) =>
-                    {
-                        Some(request.id.clone())
-                    }
-                    _ => None,
-                })
-                .collect();
-            LiveTurnSnapshot {
-                thread_id,
-                turn_id: turn.turn_id,
-                user_input: turn.user_input.clone(),
-                accumulated,
-                answered_approvals,
-                answered_server_requests,
-            }
-        })
+    pub fn snapshot(&self, thread_id: ThreadId) -> Option<LiveTurnSnapshot> {
+        (self.thread_id == Some(thread_id))
+            .then_some(self.turn.as_ref())
+            .flatten()
+            .map(|turn| {
+                // C1/§3.5: the snapshot crosses the wire, so narrow core → wire here too.
+                // Answered approvals still ride along in `accumulated`; the client renders them resolved
+                // from this list rather than re-prompting.
+                let answered_approvals: Vec<AnsweredApproval> = turn
+                    .events
+                    .iter()
+                    .filter_map(|e| match e {
+                        AgentEvent::ApprovalRequested { request, .. } => turn
+                            .resolved_approvals
+                            .get(&request.id)
+                            .map(|decision| AnsweredApproval {
+                                request_id: request.id.clone(),
+                                decision: decision.clone(),
+                            }),
+                        _ => None,
+                    })
+                    .collect();
+                let accumulated: Vec<WireAgentEvent> = turn
+                    .events
+                    .iter()
+                    .cloned()
+                    .filter_map(WireAgentEvent::from_agent_event)
+                    .collect();
+                // Answered requests still ride along in `accumulated` as `ServerRequestReceived`, and
+                // replaying that renders an actionable card. Naming them lets the client render those
+                // resolved instead, exactly as `answered_approvals` does.
+                let answered_server_requests: Vec<ServerRequestId> = turn
+                    .events
+                    .iter()
+                    .filter_map(|e| match e {
+                        AgentEvent::ServerRequestReceived { request, .. }
+                            if turn.resolved_server_requests.contains(&request.id) =>
+                        {
+                            Some(request.id.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                LiveTurnSnapshot {
+                    thread_id,
+                    turn_id: turn.turn_id,
+                    user_input: turn.user_input.clone(),
+                    accumulated,
+                    answered_approvals,
+                    answered_server_requests,
+                }
+            })
     }
 
     /// Every thread currently waiting on the user, across all in-flight turns.
     ///
-    /// `ThreadActivity` is broadcast the instant an approval is raised and is never replayed, so a
-    /// browser that was not connected at that moment learns nothing about it — no sidebar badge, no
-    /// notification — until it happens to open that thread. This is the state a connecting client
-    /// needs to catch up. A buffer exists exactly while a turn is in flight, so "has a live buffer
-    /// with an unanswered approval" is the same question as "is blocked right now". Answered
-    /// approvals are filtered out for the same reason `snapshot` filters them.
-    pub async fn pending_attention(&self) -> Vec<PendingAttention> {
-        let buffers = self.buffers.lock().await;
-        buffers
-            .iter()
+    /// Legacy test projection retained to verify that every unanswered request is reconstructed.
+    /// Production cross-thread state comes from `ThreadRuntimeRegistry`'s replacement overview.
+    #[cfg(test)]
+    pub fn pending_attention(&self) -> Vec<PendingAttention> {
+        self.thread_id
+            .zip(self.turn.as_ref())
+            .into_iter()
             .filter_map(|(thread_id, turn)| {
                 let approvals = pending_approvals(&turn.events, &turn.resolved_approvals);
                 let server_requests =
@@ -252,7 +256,7 @@ impl LiveBufferStore {
                     return None;
                 }
                 Some(PendingAttention {
-                    thread_id: *thread_id,
+                    thread_id,
                     approvals,
                     server_requests,
                 })
@@ -264,6 +268,7 @@ impl LiveBufferStore {
 /// One thread's outstanding user-facing requests, as needed to rebuild a connecting client's
 /// cross-thread activity view.
 #[derive(Debug)]
+#[cfg(test)]
 pub struct PendingAttention {
     pub thread_id: ThreadId,
     pub approvals: Vec<WireApprovalRequest>,
@@ -276,6 +281,7 @@ pub struct PendingAttention {
 /// this is a list, not a single value. A re-sent id is the same approval with a fresher payload, so
 /// the latest occurrence wins and the order is the first occurrence of each id. Approvals have no
 /// harness-emitted resolved event, so "still waiting" is exactly "not in `resolved_approvals`".
+#[cfg(test)]
 fn pending_approvals(
     events: &[AgentEvent],
     resolved_approvals: &HashMap<ApprovalId, ApprovalDecision>,
@@ -298,6 +304,7 @@ fn pending_approvals(
         .collect()
 }
 
+#[cfg(test)]
 fn pending_server_requests(
     events: &[AgentEvent],
     resolved_server_requests: &HashSet<ServerRequestId>,
@@ -437,12 +444,6 @@ fn ceil_char_boundary(s: &str, mut idx: usize) -> usize {
     idx
 }
 
-impl Default for LiveBufferStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -526,7 +527,7 @@ mod tests {
 
     #[tokio::test]
     async fn turn_started_does_not_discard_an_earlier_turn_item() {
-        let store = LiveBufferStore::new();
+        let mut store = LiveTurnState::new();
         let thread = ThreadId::new();
         let turn = TurnId::new();
         let input = UserInput::text("Sub-agent turn");
@@ -548,18 +549,14 @@ mod tests {
 
         store
             .ensure_turn_with_user_input(thread, turn, Some(input.clone()))
-            .await
             .expect("first event starts the exact turn buffer");
-        store.append(thread, item).await;
+        store.append(thread, item);
         store
             .ensure_turn_with_user_input(thread, turn, Some(input.clone()))
-            .await
             .expect("late turn start reuses the buffer");
-        store
-            .append(thread, AgentEvent::TurnStarted { thread, turn })
-            .await;
+        store.append(thread, AgentEvent::TurnStarted { thread, turn });
 
-        let snapshot = store.snapshot(thread).await.expect("snapshot");
+        let snapshot = store.snapshot(thread).expect("snapshot");
         assert_eq!(snapshot.turn_id, turn);
         assert_eq!(snapshot.user_input, Some(input));
         assert_eq!(snapshot.accumulated.len(), 2);
@@ -575,53 +572,45 @@ mod tests {
 
     #[tokio::test]
     async fn command_output_deltas_are_compacted_for_live_snapshot() {
-        let store = LiveBufferStore::new();
+        let mut store = LiveTurnState::new();
         let thread = ThreadId::new();
         let turn = TurnId::new();
         let item = ItemId::new();
-        store.start_turn(thread).await;
-        store
-            .append(thread, AgentEvent::TurnStarted { thread, turn })
-            .await;
-        store
-            .append(
+        store.start_turn(thread);
+        store.append(thread, AgentEvent::TurnStarted { thread, turn });
+        store.append(
+            thread,
+            AgentEvent::ItemStarted {
                 thread,
-                AgentEvent::ItemStarted {
-                    thread,
-                    turn,
-                    item: command_start(item),
-                },
-            )
-            .await;
+                turn,
+                item: command_start(item),
+            },
+        );
 
-        store
-            .append(
+        store.append(
+            thread,
+            AgentEvent::ItemDelta {
                 thread,
-                AgentEvent::ItemDelta {
-                    thread,
-                    turn,
-                    item_id: item,
-                    delta: ItemDelta::CommandOutput {
-                        chunk: format!("head\n{}", "a".repeat(MAX_LIVE_COMMAND_OUTPUT)),
-                    },
+                turn,
+                item_id: item,
+                delta: ItemDelta::CommandOutput {
+                    chunk: format!("head\n{}", "a".repeat(MAX_LIVE_COMMAND_OUTPUT)),
                 },
-            )
-            .await;
-        store
-            .append(
+            },
+        );
+        store.append(
+            thread,
+            AgentEvent::ItemDelta {
                 thread,
-                AgentEvent::ItemDelta {
-                    thread,
-                    turn,
-                    item_id: item,
-                    delta: ItemDelta::CommandOutput {
-                        chunk: format!("{}\ntail", "b".repeat(MAX_LIVE_COMMAND_OUTPUT)),
-                    },
+                turn,
+                item_id: item,
+                delta: ItemDelta::CommandOutput {
+                    chunk: format!("{}\ntail", "b".repeat(MAX_LIVE_COMMAND_OUTPUT)),
                 },
-            )
-            .await;
+            },
+        );
 
-        let snapshot = store.snapshot(thread).await.expect("snapshot");
+        let snapshot = store.snapshot(thread).expect("snapshot");
         let outputs = snapshot
             .accumulated
             .iter()
@@ -644,7 +633,7 @@ mod tests {
 
     #[tokio::test]
     async fn completed_command_output_is_compacted_in_live_snapshot() {
-        let store = LiveBufferStore::new();
+        let mut store = LiveTurnState::new();
         let thread = ThreadId::new();
         let turn = TurnId::new();
         let item_id = ItemId::new();
@@ -654,32 +643,30 @@ mod tests {
             "b".repeat(MAX_LIVE_COMMAND_OUTPUT)
         );
 
-        store.start_turn(thread).await;
-        store
-            .append(
+        store.start_turn(thread);
+        store.append(
+            thread,
+            AgentEvent::ItemCompleted {
                 thread,
-                AgentEvent::ItemCompleted {
-                    thread,
-                    turn,
-                    item: Item {
-                        id: item_id,
-                        harness_item_id: "cmd_1".into(),
-                        payload: ItemPayload::CommandExecution {
-                            command: "yes".into(),
-                            cwd: "/tmp/project".into(),
-                            output,
-                            exit_code: Some(0),
-                            status: Some("completed".into()),
-                            process_id: Some("proc_1".into()),
-                            duration_ms: Some(500),
-                        },
-                        created_at: Utc::now(),
+                turn,
+                item: Item {
+                    id: item_id,
+                    harness_item_id: "cmd_1".into(),
+                    payload: ItemPayload::CommandExecution {
+                        command: "yes".into(),
+                        cwd: "/tmp/project".into(),
+                        output,
+                        exit_code: Some(0),
+                        status: Some("completed".into()),
+                        process_id: Some("proc_1".into()),
+                        duration_ms: Some(500),
                     },
+                    created_at: Utc::now(),
                 },
-            )
-            .await;
+            },
+        );
 
-        let snapshot = store.snapshot(thread).await.expect("snapshot");
+        let snapshot = store.snapshot(thread).expect("snapshot");
         let completed = snapshot.accumulated.iter().find_map(|event| {
             let WireAgentEvent::ItemCompleted { item, .. } = event else {
                 return None;
@@ -698,45 +685,39 @@ mod tests {
 
     #[tokio::test]
     async fn pending_server_requests_are_reconstructed_for_live_snapshot() {
-        let store = LiveBufferStore::new();
+        let mut store = LiveTurnState::new();
         let thread = ThreadId::new();
         let turn = TurnId::new();
         let pending = ServerRequestId("pending".into());
         let resolved = ServerRequestId("resolved".into());
 
-        store.start_turn(thread).await;
-        store
-            .append(thread, AgentEvent::TurnStarted { thread, turn })
-            .await;
+        store.start_turn(thread);
+        store.append(thread, AgentEvent::TurnStarted { thread, turn });
         for id in [pending.clone(), resolved.clone()] {
-            store
-                .append(
-                    thread,
-                    AgentEvent::ServerRequestReceived {
-                        thread,
-                        turn: Some(turn),
-                        request: ServerRequest {
-                            id,
-                            method: "item/tool/call".into(),
-                            params: serde_json::json!({ "tool": "example" }),
-                            received_at: Utc::now(),
-                        },
-                    },
-                )
-                .await;
-        }
-        store
-            .append(
+            store.append(
                 thread,
-                AgentEvent::ServerRequestResolved {
+                AgentEvent::ServerRequestReceived {
                     thread,
                     turn: Some(turn),
-                    request_id: resolved,
+                    request: ServerRequest {
+                        id,
+                        method: "item/tool/call".into(),
+                        params: serde_json::json!({ "tool": "example" }),
+                        received_at: Utc::now(),
+                    },
                 },
-            )
-            .await;
+            );
+        }
+        store.append(
+            thread,
+            AgentEvent::ServerRequestResolved {
+                thread,
+                turn: Some(turn),
+                request_id: resolved,
+            },
+        );
 
-        let snapshot = store.snapshot(thread).await.expect("snapshot");
+        let snapshot = store.snapshot(thread).expect("snapshot");
         // The harness resolved one with its own event, the other is still open. The outstanding
         // server requests are derived from `accumulated` plus `answered_server_requests`, so only
         // the still-open one is reported as pending.
@@ -751,34 +732,26 @@ mod tests {
     // resolution — a reconnected user has to be able to answer it.
     #[tokio::test]
     async fn a_server_request_reopened_after_resolution_is_outstanding_again() {
-        let store = LiveBufferStore::new();
+        let mut store = LiveTurnState::new();
         let thread = ThreadId::new();
         let turn = TurnId::new();
         let id = ServerRequestId("srv".into());
 
-        store.start_turn(thread).await;
-        store
-            .append(thread, AgentEvent::TurnStarted { thread, turn })
-            .await;
-        store
-            .append(thread, server_request_received(thread, turn, &id))
-            .await;
-        store
-            .append(
+        store.start_turn(thread);
+        store.append(thread, AgentEvent::TurnStarted { thread, turn });
+        store.append(thread, server_request_received(thread, turn, &id));
+        store.append(
+            thread,
+            AgentEvent::ServerRequestResolved {
                 thread,
-                AgentEvent::ServerRequestResolved {
-                    thread,
-                    turn: Some(turn),
-                    request_id: id.clone(),
-                },
-            )
-            .await;
+                turn: Some(turn),
+                request_id: id.clone(),
+            },
+        );
         // The harness re-raises the same id after resolving it.
-        store
-            .append(thread, server_request_received(thread, turn, &id))
-            .await;
+        store.append(thread, server_request_received(thread, turn, &id));
 
-        let snapshot = store.snapshot(thread).await.expect("snapshot");
+        let snapshot = store.snapshot(thread).expect("snapshot");
         assert_eq!(
             outstanding_server_requests(&snapshot),
             vec![id],
@@ -793,38 +766,28 @@ mod tests {
     // `outstandingServerRequests` in the browser.
     #[tokio::test]
     async fn a_reopened_server_request_moves_to_the_end_of_arrival_order() {
-        let store = LiveBufferStore::new();
+        let mut store = LiveTurnState::new();
         let thread = ThreadId::new();
         let turn = TurnId::new();
         let a = ServerRequestId("a".into());
         let b = ServerRequestId("b".into());
 
-        store.start_turn(thread).await;
-        store
-            .append(thread, AgentEvent::TurnStarted { thread, turn })
-            .await;
-        store
-            .append(thread, server_request_received(thread, turn, &a))
-            .await;
-        store
-            .append(thread, server_request_received(thread, turn, &b))
-            .await;
-        store
-            .append(
+        store.start_turn(thread);
+        store.append(thread, AgentEvent::TurnStarted { thread, turn });
+        store.append(thread, server_request_received(thread, turn, &a));
+        store.append(thread, server_request_received(thread, turn, &b));
+        store.append(
+            thread,
+            AgentEvent::ServerRequestResolved {
                 thread,
-                AgentEvent::ServerRequestResolved {
-                    thread,
-                    turn: Some(turn),
-                    request_id: a.clone(),
-                },
-            )
-            .await;
+                turn: Some(turn),
+                request_id: a.clone(),
+            },
+        );
         // A re-opens after being resolved.
-        store
-            .append(thread, server_request_received(thread, turn, &a))
-            .await;
+        store.append(thread, server_request_received(thread, turn, &a));
 
-        let snapshot = store.snapshot(thread).await.expect("snapshot");
+        let snapshot = store.snapshot(thread).expect("snapshot");
         assert_eq!(
             outstanding_server_requests(&snapshot),
             vec![b.clone(), a.clone()],
@@ -834,44 +797,42 @@ mod tests {
 
     #[tokio::test]
     async fn pending_approval_metadata_is_reconstructed_for_live_snapshot() {
-        let store = LiveBufferStore::new();
+        let mut store = LiveTurnState::new();
         let thread = ThreadId::new();
         let turn = TurnId::new();
 
-        store.start_turn(thread).await;
-        store
-            .append(
+        store.start_turn(thread);
+        store.append(
+            thread,
+            AgentEvent::ApprovalRequested {
                 thread,
-                AgentEvent::ApprovalRequested {
-                    thread,
-                    turn,
-                    request: ApprovalRequest {
-                        id: ApprovalId("ap_1".into()),
-                        kind: ApprovalKind::Permission {
-                            detail: "network".into(),
-                        },
-                        reason: None,
-                        metadata: vec![
-                            ApprovalMetadata::Host {
-                                label: "Network host".into(),
-                                host: "api.example.com".into(),
-                                protocol: Some("https".into()),
-                                port: Some(443),
-                                target: None,
-                            },
-                            ApprovalMetadata::Path {
-                                label: "Grant root".into(),
-                                path: "/tmp/project".into(),
-                                source_link: false,
-                            },
-                        ],
-                        available: vec![ApprovalDecision::Accept, ApprovalDecision::Decline],
+                turn,
+                request: ApprovalRequest {
+                    id: ApprovalId("ap_1".into()),
+                    kind: ApprovalKind::Permission {
+                        detail: "network".into(),
                     },
+                    reason: None,
+                    metadata: vec![
+                        ApprovalMetadata::Host {
+                            label: "Network host".into(),
+                            host: "api.example.com".into(),
+                            protocol: Some("https".into()),
+                            port: Some(443),
+                            target: None,
+                        },
+                        ApprovalMetadata::Path {
+                            label: "Grant root".into(),
+                            path: "/tmp/project".into(),
+                            source_link: false,
+                        },
+                    ],
+                    available: vec![ApprovalDecision::Accept, ApprovalDecision::Decline],
                 },
-            )
-            .await;
+            },
+        );
 
-        let snapshot = store.snapshot(thread).await.expect("snapshot");
+        let snapshot = store.snapshot(thread).expect("snapshot");
         let pending = snapshot
             .accumulated
             .iter()
@@ -939,26 +900,20 @@ mod tests {
 
     #[tokio::test]
     async fn answered_approval_is_not_resurfaced_as_pending() {
-        let store = LiveBufferStore::new();
+        let mut store = LiveTurnState::new();
         let thread = ThreadId::new();
         let turn = TurnId::new();
 
-        store.start_turn(thread).await;
-        store
-            .append(thread, AgentEvent::TurnStarted { thread, turn })
-            .await;
-        store
-            .append(thread, approval_requested(thread, turn, "ap_answered"))
-            .await;
-        store
-            .resolve_approval(
-                thread,
-                ApprovalId("ap_answered".into()),
-                ApprovalDecision::Accept,
-            )
-            .await;
+        store.start_turn(thread);
+        store.append(thread, AgentEvent::TurnStarted { thread, turn });
+        store.append(thread, approval_requested(thread, turn, "ap_answered"));
+        store.resolve_approval(
+            thread,
+            ApprovalId("ap_answered".into()),
+            ApprovalDecision::Accept,
+        );
 
-        let snapshot = store.snapshot(thread).await.expect("snapshot");
+        let snapshot = store.snapshot(thread).expect("snapshot");
         // The answered approval must not come back as actionable — re-answering a stale id errors.
         assert!(
             outstanding_approvals(&snapshot).is_empty(),
@@ -978,29 +933,21 @@ mod tests {
 
     #[tokio::test]
     async fn unanswered_approval_stays_pending_when_another_is_answered() {
-        let store = LiveBufferStore::new();
+        let mut store = LiveTurnState::new();
         let thread = ThreadId::new();
         let turn = TurnId::new();
 
-        store.start_turn(thread).await;
-        store
-            .append(thread, AgentEvent::TurnStarted { thread, turn })
-            .await;
-        store
-            .append(thread, approval_requested(thread, turn, "ap_answered"))
-            .await;
-        store
-            .append(thread, approval_requested(thread, turn, "ap_open"))
-            .await;
-        store
-            .resolve_approval(
-                thread,
-                ApprovalId("ap_answered".into()),
-                ApprovalDecision::Decline,
-            )
-            .await;
+        store.start_turn(thread);
+        store.append(thread, AgentEvent::TurnStarted { thread, turn });
+        store.append(thread, approval_requested(thread, turn, "ap_answered"));
+        store.append(thread, approval_requested(thread, turn, "ap_open"));
+        store.resolve_approval(
+            thread,
+            ApprovalId("ap_answered".into()),
+            ApprovalDecision::Decline,
+        );
 
-        let snapshot = store.snapshot(thread).await.expect("snapshot");
+        let snapshot = store.snapshot(thread).expect("snapshot");
         // Only the still-open approval is actionable; the answered one is not, even though both
         // ride along in `accumulated`.
         assert_eq!(
@@ -1020,21 +967,17 @@ mod tests {
     // from `accumulated`, so every unanswered approval is reported.
     #[tokio::test]
     async fn every_unanswered_approval_is_reported_as_pending() {
-        let store = LiveBufferStore::new();
+        let mut store = LiveTurnState::new();
         let thread = ThreadId::new();
         let turn = TurnId::new();
 
-        store.start_turn(thread).await;
-        store
-            .append(thread, AgentEvent::TurnStarted { thread, turn })
-            .await;
+        store.start_turn(thread);
+        store.append(thread, AgentEvent::TurnStarted { thread, turn });
         for id in ["ap_first", "ap_second", "ap_third"] {
-            store
-                .append(thread, approval_requested(thread, turn, id))
-                .await;
+            store.append(thread, approval_requested(thread, turn, id));
         }
 
-        let snapshot = store.snapshot(thread).await.expect("snapshot");
+        let snapshot = store.snapshot(thread).expect("snapshot");
         assert_eq!(
             outstanding_approvals(&snapshot),
             vec![
@@ -1047,7 +990,6 @@ mod tests {
         // The SB5 connect bootstrap reports all of them too, not just one.
         let [attention] = store
             .pending_attention()
-            .await
             .into_iter()
             .filter(|entry| entry.thread_id == thread)
             .collect::<Vec<_>>()
@@ -1073,7 +1015,7 @@ mod tests {
     // deterministic, not decided by hash iteration.
     #[tokio::test]
     async fn every_unanswered_server_request_is_reported_in_arrival_order() {
-        let store = LiveBufferStore::new();
+        let mut store = LiveTurnState::new();
         let thread = ThreadId::new();
         let turn = TurnId::new();
         let ids: Vec<ServerRequestId> = ["sr_first", "sr_second", "sr_third"]
@@ -1081,17 +1023,13 @@ mod tests {
             .map(|s| ServerRequestId(s.into()))
             .collect();
 
-        store.start_turn(thread).await;
-        store
-            .append(thread, AgentEvent::TurnStarted { thread, turn })
-            .await;
+        store.start_turn(thread);
+        store.append(thread, AgentEvent::TurnStarted { thread, turn });
         for id in &ids {
-            store
-                .append(thread, server_request_received(thread, turn, id))
-                .await;
+            store.append(thread, server_request_received(thread, turn, id));
         }
 
-        let snapshot = store.snapshot(thread).await.expect("snapshot");
+        let snapshot = store.snapshot(thread).expect("snapshot");
         assert_eq!(
             outstanding_server_requests(&snapshot),
             ids,
@@ -1101,7 +1039,6 @@ mod tests {
         // The SB5 connect bootstrap (the production `pending_attention`) is first-seen ordered too.
         let [attention] = store
             .pending_attention()
-            .await
             .into_iter()
             .filter(|entry| entry.thread_id == thread)
             .collect::<Vec<_>>()
@@ -1120,12 +1057,10 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_approval_is_a_no_op_without_a_live_turn() {
-        let store = LiveBufferStore::new();
+        let mut store = LiveTurnState::new();
         let thread = ThreadId::new();
         // No panic and no snapshot materializes when the turn buffer was already cleared.
-        store
-            .resolve_approval(thread, ApprovalId("ap_1".into()), ApprovalDecision::Accept)
-            .await;
-        assert!(store.snapshot(thread).await.is_none());
+        store.resolve_approval(thread, ApprovalId("ap_1".into()), ApprovalDecision::Accept);
+        assert!(store.snapshot(thread).is_none());
     }
 }

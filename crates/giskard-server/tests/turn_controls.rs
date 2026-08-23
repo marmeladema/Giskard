@@ -413,7 +413,7 @@ async fn modes_models_approvals_and_plan_dump() {
     // --- Approval routing: the streamed approval was indexed; responding routes it (no error). ---
     let routed = state
         .registry
-        .respond_approval(ApprovalId("ap_1".into()), ApprovalDecision::Accept)
+        .respond_approval(tid, ApprovalId("ap_1".into()), ApprovalDecision::Accept)
         .await;
     assert!(
         routed.is_ok(),

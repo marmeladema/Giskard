@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     Router,
@@ -439,7 +439,7 @@ async fn delete_project(
         .ok_or(ApiError::NotFound)?;
     let thread_ids = state.store.list_threads(id).await?;
     for thread_id in thread_ids {
-        if state.live_buffers.is_active(thread_id).await
+        if state.runtime.live_is_active(thread_id)
             || state.registry.thread_has_active_turn(thread_id).await
         {
             return Err(ApiError::Conflict(
@@ -447,11 +447,7 @@ async fn delete_project(
                     .into(),
             ));
         }
-        if state
-            .running_commands
-            .has_running_for_thread(thread_id)
-            .await
-        {
+        if state.runtime.has_running_for_thread(thread_id) {
             return Err(ApiError::Conflict(
                 "project has a thread with running commands; stop them before removing the project"
                     .into(),
@@ -502,13 +498,13 @@ async fn reject_thread_mutation_if_live(
     thread_id: ThreadId,
 ) -> Result<(), ApiError> {
     if state.registry.thread_has_active_turn(thread_id).await
-        || state.live_buffers.is_active(thread_id).await
+        || state.runtime.live_is_active(thread_id)
     {
         return Err(ApiError::Conflict(
             "thread has an active turn; stop it before archiving or deleting".into(),
         ));
     }
-    if !state.running_commands.snapshot(thread_id).await.is_empty() {
+    if !state.runtime.tasks_snapshot(thread_id).1.is_empty() {
         return Err(ApiError::Conflict(
             "thread has running commands; stop them before archiving or deleting".into(),
         ));
@@ -3986,44 +3982,15 @@ async fn send_activity_bootstrap(
     client_id: usize,
     tx: &mpsc::Sender<ServerMessage>,
 ) {
-    let pending = state.live_buffers.pending_attention().await;
-    if pending.is_empty() {
-        return;
-    }
-    let mut activities = Vec::new();
-    for entry in &pending {
-        for approval in &entry.approvals {
-            activities.push(ThreadActivity {
-                thread_id: entry.thread_id,
-                kind: ThreadActivityKind::ApprovalRequested {
-                    approval_id: approval.id.to_string(),
-                },
-                active_turn: true,
-                summary: Some("Approval requested".into()),
-            });
-        }
-        for request in &entry.server_requests {
-            activities.push(ThreadActivity {
-                thread_id: entry.thread_id,
-                kind: ThreadActivityKind::ServerRequestReceived {
-                    server_request_id: request.id.to_string(),
-                },
-                active_turn: true,
-                summary: Some("Waiting for your input".to_string()),
-            });
-        }
-    }
-    if activities.is_empty() {
-        return;
-    }
+    let overview = state.runtime.current_overview();
     debug!(
         %client_id,
-        threads = pending.len(),
-        activities = activities.len(),
-        "replaying pending cross-thread activity to a connecting client"
+        revision = overview.revision,
+        threads = overview.threads.len(),
+        "sending authoritative runtime overview to connecting client"
     );
     let _ = tx
-        .send(ServerMessage::ThreadActivityBootstrap { activities })
+        .send(ServerMessage::ThreadRuntimeOverview(overview))
         .await;
 }
 
@@ -4283,9 +4250,13 @@ async fn handle_client_msg(
             // The live turn (H5) isn't in the JSONL yet — reconstruct it from the live buffer — and
             // its running tasks. Bootstrap history goes first so a reset rebuilds completed rows
             // before the live snapshot appends its in-flight rows.
-            let live_snapshot = state.live_buffers.snapshot(thread_id).await;
-            let tasks = state.running_commands.snapshot(thread_id).await;
-            let running_tasks = ServerMessage::RunningTasks { thread_id, tasks };
+            let live_snapshot = state.runtime.live_snapshot(thread_id);
+            let (revision, tasks) = state.runtime.tasks_snapshot(thread_id);
+            let running_tasks = ServerMessage::RunningTasks {
+                thread_id,
+                revision,
+                tasks,
+            };
             if let Some(history_message) = history_message {
                 let _ = tx.send(history_message).await;
             }
@@ -4293,6 +4264,9 @@ async fn handle_client_msg(
                 let _ = tx.send(ServerMessage::LiveTurnSnapshot(snap)).await;
             }
             let _ = tx.send(running_tasks).await;
+            for request in state.runtime.request_states(thread_id) {
+                let _ = tx.send(ServerMessage::RequestState(request)).await;
+            }
         }
         ClientMessage::Unsubscribe { thread_id } => {
             state.hub.unsubscribe(thread_id, client_id).await;
@@ -4605,84 +4579,101 @@ async fn handle_client_msg(
                 .await;
         }
         ClientMessage::ApprovalDecision {
+            thread_id,
             request_id,
             decision,
         } => {
             let request_id_for_broadcast = request_id.clone();
-            let thread_id = state
-                .registry
-                .respond_approval(giskard_core::ids::ApprovalId(request_id), decision.clone())
-                .await
-                .map_err(|e| WsError::from_harness(e, "approval_decision", None))?;
-            // Record the resolution against the in-flight turn so a browser reload replays this
-            // approval as answered rather than re-prompting the user (spec §13.6).
-            state
-                .live_buffers
-                .resolve_approval(
-                    thread_id,
-                    giskard_core::ids::ApprovalId(request_id_for_broadcast.clone()),
-                    decision.clone(),
-                )
-                .await;
-            debug!(
-                %thread_id,
-                request_id = %request_id_for_broadcast,
-                ?decision,
-                "recorded approval resolution in live buffer for reconnect"
-            );
-            state
-                .hub
-                .broadcast(
-                    thread_id,
-                    ServerMessage::ApprovalResolved {
-                        thread_id,
-                        request_id: request_id_for_broadcast,
-                        decision,
-                    },
-                )
-                .await;
+            let approval_id = giskard_core::ids::ApprovalId(request_id);
+            let response_started = Instant::now();
+            let response_result = tokio::time::timeout(
+                HARNESS_CONTROL_TIMEOUT,
+                state
+                    .registry
+                    .respond_approval(thread_id, approval_id.clone(), decision.clone()),
+            )
+            .await;
+            match response_result {
+                Ok(result) => {
+                    result.map_err(|e| {
+                        WsError::from_harness(e, "approval_decision", Some(thread_id))
+                    })?;
+                }
+                Err(_) => {
+                    error!(
+                        %thread_id,
+                        request_id = %request_id_for_broadcast,
+                        timeout_ms = HARNESS_CONTROL_TIMEOUT.as_millis(),
+                        elapsed_ms = response_started.elapsed().as_millis(),
+                        "approval decision timed out waiting for Codex"
+                    );
+                    // Cancelling the registry future drops its claim and rolls Responding back to
+                    // Pending. Republish the rollback so every tab becomes actionable again.
+                    state
+                        .registry
+                        .republish_approval_request_state(thread_id, approval_id)
+                        .await;
+                    return Err(WsError::from_harness(
+                        HarnessError::Timeout(
+                            "approval decision timed out waiting for Codex".into(),
+                        ),
+                        "approval_decision",
+                        Some(thread_id),
+                    ));
+                }
+            };
+            // `respond_approval` owns both halves of the resolution: it records the answer against
+            // the in-flight turn for reconnect and publishes the revisioned `RequestState`. A
+            // second broadcast here would give the browser two authorities for one request, only
+            // one of which a client can gate on.
         }
         ClientMessage::ServerRequestResponse {
+            thread_id,
             request_id,
             response,
         } => {
             let request_id_for_log = request_id.clone();
             let req_id = giskard_core::ids::ServerRequestId(request_id);
-            let thread_id = tokio::time::timeout(
+            let response_started = Instant::now();
+            let response_result = tokio::time::timeout(
                 HARNESS_CONTROL_TIMEOUT,
                 state
                     .registry
-                    .respond_server_request(req_id.clone(), response),
+                    .respond_server_request(thread_id, req_id.clone(), response),
             )
-            .await
-            .map_err(|_| {
-                error!(
-                    request_id = %request_id_for_log,
-                    timeout_ms = HARNESS_CONTROL_TIMEOUT.as_millis(),
-                    "server request response timed out waiting for Codex"
-                );
-                WsError::from_harness(
-                    HarnessError::Timeout(
-                        "server request response timed out waiting for Codex".into(),
-                    ),
-                    "server_request_response",
-                    None,
-                )
-            })?
-            .map_err(|e| WsError::from_harness(e, "server_request_response", None))?;
-            // Record the answer against the in-flight turn. The harness emits its own resolved
-            // event, but on its own schedule and not guaranteed at all; until then the request
-            // still reads as outstanding in the replayed events, so a reload in that window would
-            // re-prompt and re-answering routes a stale id to the harness (spec §13.6).
-            state
-                .live_buffers
-                .resolve_server_request(thread_id, req_id)
-                .await;
-            debug!(
-                %thread_id,
-                request_id = %request_id_for_log,
-                "recorded server request resolution in live buffer for reconnect"
-            );
+            .await;
+            match response_result {
+                Ok(result) => {
+                    result.map_err(|e| {
+                        WsError::from_harness(e, "server_request_response", Some(thread_id))
+                    })?;
+                }
+                Err(_) => {
+                    error!(
+                        %thread_id,
+                        request_id = %request_id_for_log,
+                        timeout_ms = HARNESS_CONTROL_TIMEOUT.as_millis(),
+                        elapsed_ms = response_started.elapsed().as_millis(),
+                        "server request response timed out waiting for Codex"
+                    );
+                    // Cancelling the registry future drops its claim and rolls Responding back to
+                    // Pending. Publish that authoritative rollback so peer tabs do not remain
+                    // disabled after the claimant receives its timeout error.
+                    state
+                        .registry
+                        .republish_server_request_state(thread_id, req_id.clone())
+                        .await;
+                    return Err(WsError::from_harness(
+                        HarnessError::Timeout(
+                            "server request response timed out waiting for Codex".into(),
+                        ),
+                        "server_request_response",
+                        Some(thread_id),
+                    ));
+                }
+            };
+            // `respond_server_request` records the answer against the in-flight turn before it
+            // publishes the resolution, so there is nothing left to do here.
         }
         ClientMessage::Interrupt { thread_id } => {
             tokio::time::timeout(HARNESS_CONTROL_TIMEOUT, state.registry.interrupt(thread_id))
@@ -4748,13 +4739,11 @@ async fn handle_client_msg(
         } => {
             let process_id_for_state = process_id.clone();
             let existing_command = state
-                .running_commands
-                .get_by_process(thread_id, &process_id_for_state)
-                .await;
+                .runtime
+                .task_by_process(thread_id, &process_id_for_state);
             if state
-                .running_commands
-                .set_terminating_by_process(thread_id, &process_id_for_state, true)
-                .await
+                .runtime
+                .set_task_terminating(thread_id, &process_id_for_state, true)
             {
                 broadcast_running_commands(state, thread_id).await;
             }
@@ -4787,9 +4776,8 @@ async fn handle_client_msg(
                         .unwrap_or(false)
                 {
                     let removed = state
-                        .running_commands
-                        .remove_by_process(thread_id, &process_id_for_state)
-                        .await;
+                        .runtime
+                        .remove_task_by_process(thread_id, &process_id_for_state);
                     if removed {
                         broadcast_running_commands(state, thread_id).await;
                     }
@@ -4820,9 +4808,8 @@ async fn handle_client_msg(
                 }
 
                 if state
-                    .running_commands
-                    .set_terminating_by_process(thread_id, &process_id_for_state, false)
-                    .await
+                    .runtime
+                    .set_task_terminating(thread_id, &process_id_for_state, false)
                 {
                     broadcast_running_commands(state, thread_id).await;
                 }
@@ -5516,10 +5503,17 @@ async fn load_thread(
 }
 
 async fn broadcast_running_commands(state: &AppState, thread_id: ThreadId) {
-    let tasks = state.running_commands.snapshot(thread_id).await;
+    let (revision, tasks) = state.runtime.tasks_snapshot(thread_id);
     state
         .hub
-        .broadcast(thread_id, ServerMessage::RunningTasks { thread_id, tasks })
+        .broadcast(
+            thread_id,
+            ServerMessage::RunningTasks {
+                thread_id,
+                revision,
+                tasks,
+            },
+        )
         .await;
 }
 

@@ -158,8 +158,7 @@ test.describe("sub-agent blocked on an approval", () => {
     const result = await page.evaluate(() => {
       const app = window as unknown as {
         rememberProjectThreads: (pid: string, threads: unknown[]) => void;
-        handleThreadActivity: (msg: Record<string, unknown>) => void;
-        clearApprovalThreadActivity: (tid: string, approvalId: string) => void;
+        handleThreadRuntimeOverview: (msg: Record<string, unknown>) => void;
         activityHostThreadId: (tid: string) => string | null;
         threadDescendsFrom: (tid: string, ancestorId: string) => boolean;
         effectiveThreadActivity: (tid: string) => {
@@ -200,12 +199,14 @@ test.describe("sub-agent blocked on an approval", () => {
 
       try {
         // A merely-running root must not mask a grandchild blocked on an approval.
-        app.handleThreadActivity({
-          thread_id: "root", kind: "progress", active_turn: true, summary: "Turn running",
-        });
-        app.handleThreadActivity({
-          thread_id: "grandchild", kind: "approval_requested", active_turn: true,
-          approval_id: "a1", summary: "Approval requested",
+        app.handleThreadRuntimeOverview({
+          revision: 100,
+          threads: [
+            { thread_id: "root", turn_state: { state: "active", turn_id: null }, outstanding_requests: [] },
+            { thread_id: "grandchild", turn_state: { state: "active", turn_id: null }, outstanding_requests: [
+              { request_id: "a1", kind: "approval", responding: false },
+            ] },
+          ],
         });
         const hoisted = {
           host: app.activityHostThreadId("grandchild"),
@@ -219,7 +220,12 @@ test.describe("sub-agent blocked on an approval", () => {
         };
 
         // Once answered, the row falls back to root's own running state and drops the escalation.
-        app.clearApprovalThreadActivity("grandchild", "a1");
+        app.handleThreadRuntimeOverview({
+          revision: 101,
+          threads: [
+            { thread_id: "root", turn_state: { state: "active", turn_id: null }, outstanding_requests: [] },
+          ],
+        });
         const afterAnswer = { statusText: status.textContent, rowClass: row.className };
 
         // Corrupted ownership (a thread that is its own parent) must terminate, not spin.
@@ -291,16 +297,18 @@ test.describe("sub-agent blocked on an approval", () => {
 
     await page.evaluate(async () => {
       const app = window as unknown as {
-        handleThreadActivity: (msg: Record<string, unknown>) => void;
+        handleThreadRuntimeOverview: (msg: Record<string, unknown>) => void;
       };
       // Twelve events for a thread the server will never list. Each is spaced past the burst
       // debounce so an ungated implementation would schedule a refresh for every one.
       for (let i = 0; i < 12; i += 1) {
-        app.handleThreadActivity({
-          thread_id: "thread-that-does-not-exist",
-          kind: "progress",
-          active_turn: true,
-          summary: `tick ${i}`,
+        app.handleThreadRuntimeOverview({
+          revision: 200 + i,
+          threads: [{
+            thread_id: "thread-that-does-not-exist",
+            turn_state: { state: "active", turn_id: null },
+            outstanding_requests: [],
+          }],
         });
         await new Promise((resolve) => setTimeout(resolve, 120));
       }
@@ -332,17 +340,18 @@ test.describe("sub-agent blocked on an approval", () => {
     await page.evaluate(
       ({ child, approvalId }) => {
         const app = window as unknown as {
-          handleThreadActivity: (msg: Record<string, unknown>) => void;
+          handleThreadRuntimeOverview: (msg: Record<string, unknown>) => void;
         };
-        const event = {
-          thread_id: child,
-          kind: "approval_requested",
-          active_turn: true,
-          approval_id: approvalId,
-          summary: "Approval requested",
+        const overview = {
+          revision: 300,
+          threads: [{
+            thread_id: child,
+            turn_state: { state: "active", turn_id: null },
+            outstanding_requests: [{ request_id: approvalId, kind: "approval", responding: false }],
+          }],
         };
-        app.handleThreadActivity({ ...event });
-        app.handleThreadActivity({ ...event });
+        app.handleThreadRuntimeOverview({ ...overview });
+        app.handleThreadRuntimeOverview({ ...overview, revision: 301 });
       },
       { child: child!, approvalId: SCRIPTED_SUBAGENT_APPROVAL_ID },
     );

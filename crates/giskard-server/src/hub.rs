@@ -7,7 +7,7 @@ use tracing::{debug, warn};
 
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ProjectId, ThreadId};
-use giskard_proto::{ServerMessage, ThreadState, WireAgentEvent};
+use giskard_proto::{ServerMessage, ThreadRuntimeOverview, ThreadState, WireAgentEvent};
 
 use crate::delivery::{ClientDelivery, DeliverySendError, ReplacementReceiver};
 
@@ -206,7 +206,37 @@ impl Hub {
         });
     }
 
+    /// Publish the complete process-local runtime projection as latest-wins replacement state.
+    pub async fn publish_runtime_overview(&self, overview: ThreadRuntimeOverview) {
+        let mut clients = self.clients.lock().await;
+        clients.retain(|client_id, delivery| {
+            let retained = delivery.publish_runtime_overview(overview.clone());
+            if !retained {
+                warn!(
+                    %client_id,
+                    runtime_revision = overview.revision,
+                    action = "publish_runtime_overview",
+                    "client outbound queue closed; removing global client"
+                );
+            }
+            retained
+        });
+    }
+
     pub async fn broadcast_event(&self, thread_id: ThreadId, event: AgentEvent) {
+        if matches!(
+            event,
+            AgentEvent::ThreadOpened { .. }
+                | AgentEvent::DiffUpdated { .. }
+                | AgentEvent::ContextWindowUpdated { .. }
+        ) {
+            debug!(
+                %thread_id,
+                event_kind = event_kind(&event),
+                "keeping internal-only harness event off the browser stream"
+            );
+            return;
+        }
         // C1/§3.5: narrow core → wire (lossy `PathBuf → String`) at the outbound edge.
         let Some(agent_event) = WireAgentEvent::from_agent_event(event) else {
             warn!(
@@ -226,6 +256,24 @@ impl Hub {
     }
 }
 
+fn event_kind(event: &AgentEvent) -> &'static str {
+    match event {
+        AgentEvent::ThreadOpened { .. } => "thread_opened",
+        AgentEvent::TurnStarted { .. } => "turn_started",
+        AgentEvent::ContextWindowUpdated { .. } => "context_window_updated",
+        AgentEvent::ItemStarted { .. } => "item_started",
+        AgentEvent::ItemDelta { .. } => "item_delta",
+        AgentEvent::ItemCompleted { .. } => "item_completed",
+        AgentEvent::DiffUpdated { .. } => "diff_updated",
+        AgentEvent::ApprovalRequested { .. } => "approval_requested",
+        AgentEvent::ServerRequestReceived { .. } => "server_request_received",
+        AgentEvent::ServerRequestResolved { .. } => "server_request_resolved",
+        AgentEvent::TurnCompleted { .. } => "turn_completed",
+        AgentEvent::Error { .. } => "error",
+        AgentEvent::Notice { .. } => "notice",
+    }
+}
+
 impl Default for Hub {
     fn default() -> Self {
         Self::new()
@@ -235,15 +283,14 @@ impl Default for Hub {
 fn server_message_kind(msg: &ServerMessage) -> &'static str {
     match msg {
         ServerMessage::Event { .. } => "event",
-        ServerMessage::ThreadActivity(_) => "thread_activity",
-        ServerMessage::ThreadActivityBootstrap { .. } => "thread_activity_bootstrap",
+        ServerMessage::RequestState(_) => "request_state",
+        ServerMessage::ThreadRuntimeOverview(_) => "thread_runtime_overview",
         ServerMessage::ThreadState(_) => "thread_state",
         ServerMessage::ThreadMetadataResult { .. } => "thread_metadata_result",
         ServerMessage::ThreadCatalogChanged => "thread_catalog_changed",
         ServerMessage::HistoryDelta { .. } => "history_delta",
         ServerMessage::LiveTurnSnapshot(_) => "live_turn_snapshot",
         ServerMessage::RunningTasks { .. } => "running_tasks",
-        ServerMessage::ApprovalResolved { .. } => "approval_resolved",
         ServerMessage::Error { .. } => "error",
         ServerMessage::Pong => "pong",
     }
@@ -306,40 +353,6 @@ mod tests {
 
         let subs = hub.subs.lock().await;
         assert!(subs.get(&thread_id).is_none_or(Vec::is_empty));
-    }
-
-    #[tokio::test]
-    async fn global_broadcast_reaches_unsubscribed_client() {
-        let hub = Hub::new();
-        let client_id = hub.next_client_id();
-        let (tx, mut rx) = mpsc::channel(1);
-        let thread_id = ThreadId::new();
-
-        let _replacements = hub.register_client(client_id, tx).await;
-        hub.broadcast_all(ServerMessage::ThreadActivity(
-            giskard_proto::ThreadActivity {
-                thread_id,
-                kind: giskard_proto::ThreadActivityKind::ApprovalRequested {
-                    approval_id: "approval-1".into(),
-                },
-                active_turn: true,
-                summary: Some("Approval requested".into()),
-            },
-        ))
-        .await;
-
-        match rx.try_recv() {
-            Ok(ServerMessage::ThreadActivity(activity)) => {
-                assert_eq!(activity.thread_id, thread_id);
-                match activity.kind {
-                    giskard_proto::ThreadActivityKind::ApprovalRequested { approval_id } => {
-                        assert_eq!(approval_id, "approval-1");
-                    }
-                    other => panic!("expected approval activity, got {other:?}"),
-                }
-            }
-            other => panic!("expected thread activity, got {other:?}"),
-        }
     }
 
     #[tokio::test]

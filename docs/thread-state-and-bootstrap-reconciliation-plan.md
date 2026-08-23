@@ -15,9 +15,9 @@ of the original plan; it was inserted because the bootstrap and retention work b
 into the same root cause — a turn's record was both its index entry and its unbounded payload. See
 *What the storage layout change unlocks* for the parts of this plan it simplifies or retires.
 
-**Everything else in this document is not implemented.** The runtime registry, event journal,
-transactional bootstrap, class-aware outbox, request claim/commit, and turn-less context restoration
-remain to be built, in the milestones defined under *Implementation milestones*.
+**The runtime registry milestone is also complete.** The event journal, transactional bootstrap,
+class-aware outbox, turn-less context restoration, and later milestones remain to be built, in the
+milestones defined under *Implementation milestones*.
 
 This plan began with Codex restoring a context window outside a turn. The codebase audit showed
 that the context window is not a special state class. It exposed missing general primitives for
@@ -402,7 +402,8 @@ Turn completion is a state transition, not `persist; clear whatever is in memory
    history by `TurnId`: an error after a successful append must be settled as success, not appended
    twice.
 5. Retry a confirmed-missing turn with named attempt, elapsed-time, and backoff bounds. When the
-   budget is exhausted, enter `PersistenceBlocked { turn_id, attempts, error }`. **Scope note:** the
+   budget is exhausted, enter `PersistenceBlocked { turn_id, error }`, extended with the attempt
+   count at that point. **Scope note:** the
    browser-facing half of this step — a blocked composer with explicit recovery actions and the two
    client messages behind them — is a user-facing feature inside an otherwise internal milestone.
    Decide explicitly whether M2 ships it, or stops at "hold the lease and surface the error" with
@@ -521,7 +522,7 @@ ThreadBootstrap {
     live_turn?,
     ordered_suffix,
     final_runtime: {
-        turn_state: Idle | Active | PersistenceBlocked { turn_id, attempts, error },
+        turn_state: Idle | Active | PersistenceBlocked { turn_id, error },
         running_tasks: { revision, tasks },
         requests: [RequestState],
     },
@@ -776,7 +777,7 @@ After the new primitives are active, remove these server-message variants:
 - `ThreadContextWindowUpdated`;
 - `TokenUpdate` and `TokenScope`;
 - top-level `ApprovalRequest` (it has no production producer);
-- `ApprovalResolved` after generalized `RequestResolved` exists;
+- ~~`ApprovalResolved`~~ — removed in M2; `RequestState` is the sole resolution authority;
 - top-level bootstrap-only `HistoryDelta` and `LiveTurnSnapshot`;
 - additive `ThreadActivityBootstrap` and authoritative use of `ThreadActivity`;
 - turn runtime state from live `ThreadState`.
@@ -923,6 +924,16 @@ snapshot, journal watermark, ordered suffix, and aggregate bootstrap commit desc
 
 ### M2 — Runtime registry
 
+**Status:** complete. Runtime state and immutable publication effects now share one per-thread
+transition boundary; the legacy stores and additive activity protocol are removed; request
+transitions are revisioned claim/commit operations; and failed turn persistence retains the lease
+and complete runtime representation according to the decision below.
+
+`ApprovalResolved` went with them: a resolution announced twice, once revisioned and once not, is
+two authorities for one request, and the unrevisioned one is the half a client cannot gate. The
+attempt counter in `PersistenceBlocked` did not ship either — with no retry loop it could only ever
+be a constant, so it lands with the recovery step that gives it a value.
+
 **Scope.** `ThreadRuntimeRegistry` as the sole process-local authority for the active-turn gate,
 the in-flight turn projection, running tasks, outstanding requests, and the cross-thread overview.
 Every client-visible agent event goes through one apply boundary. Delete `LiveBufferStore` and
@@ -936,7 +947,14 @@ not touch that crate**; if it appears to need to, that is the signal to stop.
 Recovery from a *failed turn append* is in scope here, because it is part of the turn-completion
 handoff: hold the lease, keep the only complete representation, surface an actionable error. Whether
 this milestone also ships the user-facing `Retry persistence` / `Discard unpersisted turn` actions
-and their two client messages is an open decision — see the scope note in *Turn completion handoff*.
+and their two client messages was left open in the scope note in *Turn completion handoff*.
+
+**Decision.** M2 stops at retaining the lease and complete runtime representation, blocking another
+turn, and surfacing the append failure through the existing structured error path. It does **not**
+add retry/discard client messages, controls, or destructive recovery behavior. Those recovery
+actions require a separate landing and review; until then an operator repairs the persistence fault
+and restarts the server. This decision does not permit releasing the lease or discarding the only
+complete representation on append failure.
 
 **Exit criteria.** One input event produces one sequence, one projection update, and at most one
 snapshot per changed replacement projection. Both legacy stores are gone. Two simultaneous requests

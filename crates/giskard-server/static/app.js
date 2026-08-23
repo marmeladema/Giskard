@@ -128,7 +128,6 @@ const PICKER_TYPEAHEAD_RESET_MS = 1000;
 const NOTIFICATION_PROMPT_NOTICE_INTERVAL_MS = 30000;
 const BROWSER_DIAGNOSTIC_LIMIT = 120;
 const NOTIFICATION_DEDUP_MS = 15000;
-const ACTIVE_THREAD_COMPLETED_MARK_MS = 2500;
 // Debounce for re-fetching thread lists after activity arrives for a thread the browser has never
 // seen (a sub-agent the server just materialized). Short enough that the sidebar catches up while
 // the child is still blocked, long enough that a burst of child events costs one refresh.
@@ -157,8 +156,8 @@ let state = {
   currentRenderTurnId:null, newestPersistedTurnId:null,
   models:[], modelsProject:null, modelsLoadingProject:null, streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null,
   streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), renderedItemBodyByKey:new Map(), itemKindsByItemId:new Map(),
-  pendingApprovals:new Map(), answeredApprovals:new Map(), answeredApprovalsById:new Map(), renderedApprovalStateKeys:new Set(), pendingServerRequests:new Map(), answeredServerRequests:new Set(),
-  runningCommands:new Map(), commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null,
+  pendingApprovals:new Map(), answeredApprovals:new Map(), answeredApprovalsById:new Map(), renderedApprovalStateKeys:new Set(), pendingServerRequests:new Map(), answeredServerRequests:new Set(), requestStates:new Map(), runtimeOverviewRevision:-1,
+  runningCommands:new Map(), runningTasksRevision:-1, commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null,
   commandPayloadsByItemId:new Map(), endedCommandsByItemId:new Map(),
   toolPayloadsByItemId:new Map(), toolBodyElsByItemId:new Map(),
   activeTaskGroup:null, taskGroupSeq:0, taskItemSeq:0, taskGroupsById:new Map(), taskGroupsByItemId:new Map(),
@@ -1575,13 +1574,9 @@ $("parentThreadBtn").onclick = openParentThread;
 function clearThreadActivity(tid) {
   if (!tid) return;
   const activity = state.threadActivity.get(String(tid));
-  if (activity && activity.active_turn) {
+  if (activity) {
     activity.unread = false;
-    activity.approval_id = null;
-    activity.kind = "progress";
     state.threadActivity.set(String(tid), activity);
-  } else {
-    state.threadActivity.delete(String(tid));
   }
   renderThreadActivityIndicator(tid);
   renderSubagentsButton();
@@ -1659,7 +1654,7 @@ function renderThreadActivityIndicator(tid, hosts) {
   const status = el.querySelector(".thread-status");
   if (!status) return;
   const { activity, origin } = effectiveThreadActivity(tid, hosts);
-  const visible = !!activity && (activity.unread || activity.active_turn || activity.approval_id || activity.kind === "turn_completed" || activity.kind === "error");
+  const visible = !!activity && (activity.unread || activity.active_turn || activity.approval_id || activity.kind === "error");
   el.classList.toggle("has-activity", visible);
   el.classList.toggle("activity-waiting", visible && activityWaitsOnUser(activity));
   el.classList.toggle("activity-error", visible && activity && activity.kind === "error");
@@ -1704,79 +1699,6 @@ function syncActiveThreadHighlight() {
     const project = el.closest(".proj");
     markSidebarRowActive(el, draftPid !== null && project && String(project.dataset.pid) === draftPid);
   });
-}
-
-function setThreadActivity(tid, activity) {
-  if (!tid || !activity) return;
-  const key = String(tid);
-  state.threadActivity.set(key, activity);
-  renderThreadActivityIndicator(key);
-  renderSubagentsButton();
-}
-
-function setActiveThreadActivity(kind, activeTurn, summary, extra) {
-  if (!state.threadId) return;
-  const tid = String(state.threadId);
-  setThreadActivity(tid, Object.assign({
-    kind,
-    active_turn: !!activeTurn,
-    approval_id: null,
-    server_request_id: null,
-    summary: summary || "",
-    source: "active_thread_event",
-    unread: false
-  }, extra || {}));
-  if (kind === "turn_completed" && !activeTurn) {
-    clearActiveThreadActivityLater(tid, kind);
-  }
-}
-
-function clearActiveThreadActivityLater(tid, kind) {
-  const key = String(tid || "");
-  if (!key) return;
-  setTimeout(() => {
-    const activity = state.threadActivity.get(key);
-    if (!activity || activity.source !== "active_thread_event" || activity.kind !== kind || activity.active_turn) return;
-    state.threadActivity.delete(key);
-    renderThreadActivityIndicator(key);
-    renderSubagentsButton();
-  }, ACTIVE_THREAD_COMPLETED_MARK_MS);
-}
-
-function clearApprovalThreadActivity(tid, approvalId) {
-  if (!tid || !approvalId) return;
-  const key = String(tid);
-  const activity = state.threadActivity.get(key);
-  if (!activity || String(activity.approval_id || "") !== String(approvalId)) return;
-  activity.approval_id = null;
-  if (activity.active_turn) {
-    activity.kind = "progress";
-    activity.summary = "Turn running";
-    activity.unread = state.threadId ? String(state.threadId) !== key : activity.unread;
-    state.threadActivity.set(key, activity);
-  } else {
-    state.threadActivity.delete(key);
-  }
-  renderThreadActivityIndicator(key);
-  renderSubagentsButton();
-}
-
-function clearServerRequestThreadActivity(tid, requestId) {
-  if (!tid || !requestId) return;
-  const key = String(tid);
-  const activity = state.threadActivity.get(key);
-  if (!activity || String(activity.server_request_id || "") !== String(requestId)) return;
-  activity.server_request_id = null;
-  if (activity.active_turn) {
-    activity.kind = "progress";
-    activity.summary = "Turn running";
-    activity.unread = state.threadId ? String(state.threadId) !== key : activity.unread;
-    state.threadActivity.set(key, activity);
-  } else {
-    state.threadActivity.delete(key);
-  }
-  renderThreadActivityIndicator(key);
-  renderSubagentsButton();
 }
 
 function normalizeThreadTitleInput(value) {
@@ -2763,6 +2685,7 @@ async function connectWs(opts) {
   recordReconnectDiagnostic(ws, "ws_socket_created", { ready_state:wsReadyStateLabel(ws) });
   ws.onopen = () => {
     if (state.ws !== ws) return;
+    state.runtimeOverviewRevision = -1;
     state.wsReconnectAttempt = 0;
     state.wsLastProblem = "";
     setWsStatus("open", "Connected to agent.");
@@ -3030,7 +2953,8 @@ function isThreadScopedServerMessage(msg) {
     case "live_turn_snapshot":
     case "running_tasks":
     case "event":
-    case "approval_resolved":
+      return true;
+    case "request_state":
       return true;
     case "error":
       return serverMessageThreadId(msg) !== null;
@@ -3051,12 +2975,8 @@ function handleServer(msg, ws) {
     return;
   }
   finishWsProbe(ws, "ws_probe_message");
-  if (msg && msg.type === "thread_activity_bootstrap") {
-    handleThreadActivityBootstrap(msg);
-    return;
-  }
-  if (msg && msg.type === "thread_activity") {
-    handleThreadActivity(msg);
+  if (msg && msg.type === "thread_runtime_overview") {
+    handleThreadRuntimeOverview(msg);
     return;
   }
   if (msg && msg.type === "thread_catalog_changed") {
@@ -3076,15 +2996,15 @@ function handleServer(msg, ws) {
     case "history_delta": renderHistoryDelta(msg); break;
     case "live_turn_snapshot": renderLiveTurnSnapshot(msg); break;
     case "running_tasks":
+      if (Number(msg.revision) < state.runningTasksRevision) break;
+      state.runningTasksRevision = Number(msg.revision) || 0;
       renderRunningCommandSnapshot(msg.tasks || []);
       // Running tasks is the last message of a resync; if the user was pinned to the bottom before
       // the in-flight turn was repainted, restore that now that everything has re-rendered.
       if (state.resyncStickBottom) { state.resyncStickBottom = false; keepTranscriptAtBottom(true); }
       break;
     case "event": handleEvent(msg.agent_event); break;
-    case "approval_resolved":
-      resolveApprovalRequest(msg.request_id, msg.decision);
-      break;
+    case "request_state": handleRequestState(msg); break;
     case "error":
       finishMetadataAction(msg.request_id);
       if (msg.code === "thread_read_only") {
@@ -3115,6 +3035,7 @@ function handleServer(msg, ws) {
       }
       if (msg.action==="terminate_command") resetTerminatingCommand(msg.process_id);
       if (msg.action==="server_request_response") resetResolvingServerRequests();
+      if (msg.action==="approval_decision") resetResolvingApprovals();
       notice(msg.message||"error", msg.severity||"error");
       break;
   }
@@ -3126,38 +3047,84 @@ function handleServer(msg, ws) {
   }
 }
 
-function handleThreadActivity(msg) {
-  const tid = msg && msg.thread_id !== undefined && msg.thread_id !== null ? String(msg.thread_id) : "";
-  if (!tid) return;
-  const current = state.threadId && String(state.threadId) === tid;
-  const prior = state.threadActivity.get(tid) || {};
-  const activity = {
-    kind: msg.kind || "progress",
-    active_turn: !!msg.active_turn,
-    approval_id: msg.approval_id || null,
-    server_request_id: msg.server_request_id || null,
-    summary: msg.summary || "",
-    source: msg.source || "thread_activity",
-    unread: !current
-  };
-  if (activity.kind === "turn_completed") {
-    activity.active_turn = false;
-    activity.approval_id = null;
-    activity.unread = !current;
-  } else if (activity.kind === "approval_requested") {
-    activity.unread = !current;
-  } else if (!activity.active_turn && prior.unread && activity.kind !== "error") {
-    activity.unread = true;
+function handleThreadRuntimeOverview(overview) {
+  const revision = Number(overview && overview.revision) || 0;
+  if (revision < state.runtimeOverviewRevision) return;
+  state.runtimeOverviewRevision = revision;
+  const replacement = new Map();
+  for (const summary of (overview && overview.threads) || []) {
+    const tid = String(summary.thread_id || "");
+    if (!tid) continue;
+    const requests = summary.outstanding_requests || [];
+    // The server lists both pending and responding requests. Only a pending one is waiting on the
+    // user; a responding one has already been answered and must not raise a badge or notification.
+    const waiting = requests.find(request => !request.responding);
+    const turnState = summary.turn_state || { state:"idle" };
+    let activity = null;
+    if (waiting) {
+      const approval = waiting.kind === "approval";
+      activity = {
+        kind: approval ? "approval_requested" : "server_request_received",
+        active_turn: turnState.state !== "idle",
+        approval_id: approval ? waiting.request_id : null,
+        server_request_id: approval ? null : waiting.request_id,
+        summary: approval ? "Approval requested" : "Waiting for your input",
+        source: "runtime_overview",
+        unread: state.threadId ? String(state.threadId) !== tid : true
+      };
+    } else if (turnState.state === "persistence_blocked") {
+      activity = { kind:"error", active_turn:true, summary:turnState.error || "Turn persistence blocked", source:"runtime_overview", unread:true };
+    } else if (turnState.state === "active") {
+      activity = { kind:"progress", active_turn:true, summary:"Turn running", source:"runtime_overview", unread:false };
+    }
+    if (activity) {
+      replacement.set(tid, activity);
+      if (!knownThreadMeta(tid)) noteUnresolvedThread(tid);
+    }
   }
-  state.threadActivity.set(tid, activity);
-  // Activity for a thread we have never listed means the server materialized it after our last
-  // load — almost always a sub-agent. Catch the list up so this activity can be attributed and
-  // hoisted onto a visible ancestor.
-  if (!knownThreadMeta(tid)) noteUnresolvedThread(tid);
-  renderThreadActivityIndicator(tid);
+  state.threadActivity = replacement;
+  renderAllThreadActivityIndicators();
   renderSubagentsButton();
-  if (activityWaitsOnUser(activity)) maybeNotifyWaitingRequest(tid, activity);
+  for (const [tid, activity] of replacement) {
+    if (activityWaitsOnUser(activity)) maybeNotifyWaitingRequest(tid, activity);
+  }
 }
+
+function handleRequestState(requestState) {
+  if (!requestState || requestState.request_id === undefined) return;
+  const id = String(requestState.request_id);
+  const revision = Number(requestState.revision || 0);
+  const current = state.requestStates.get(id);
+  if (current && Number(current.revision || 0) > revision) return;
+  state.requestStates.set(id, requestState);
+  const status = requestState.status;
+  if (status === "resolved" || (status && status.status === "resolved")) {
+    const resolution = requestState.resolution || (status && status.resolution) || {};
+    if (resolution.kind === "approval") resolveApprovalRequest(id, resolution.decision);
+    else resolveServerRequest(id);
+    return;
+  }
+  const entry = state.pendingApprovals.get(id) || state.pendingServerRequests.get(id);
+  if (!entry || !entry.msg) return;
+  const responding = status === "responding" || (status && status.status === "responding");
+  entry.msg.dataset.resolving = responding ? "true" : "false";
+  entry.msg.querySelectorAll("button,input,select,textarea").forEach(el => el.disabled = responding);
+}
+
+function clearCompletedRequestState() {
+  for (const [id, requestState] of state.requestStates) {
+    const status = requestState && requestState.status;
+    if (status === "resolved" || (status && status.status === "resolved")) {
+      state.requestStates.delete(id);
+    }
+  }
+  // Provider request IDs need only be unique while their request is alive. Do not let an answer
+  // from the completed turn suppress a later turn that legitimately reuses the same native ID.
+  state.answeredApprovalsById.clear();
+  state.answeredServerRequests.clear();
+}
+
+
 
 // Undo a notification claim when the notification did not actually reach the user. Both records
 // must be released together: leaving the session-scoped one set would silence every later replay of
@@ -3170,14 +3137,7 @@ function releaseWaitingNotificationClaim(notificationKey) {
 // Cross-thread activity the server replayed because we were not connected when it happened. Paints
 // the badge exactly like a live event; notification is gated separately, because a reconnect is not
 // news — see `maybeNotifyWaitingRequest`.
-function handleThreadActivityBootstrap(msg) {
-  const activities = (msg && Array.isArray(msg.activities)) ? msg.activities : [];
-  if (!activities.length) return;
-  recordNotificationDiagnostic("activity_bootstrap_received", { count: activities.length });
-  for (const entry of activities) {
-    handleThreadActivity(Object.assign({}, entry, { source:"connect_bootstrap" }));
-  }
-}
+
 
 async function maybeNotifyWaitingRequest(tid, activity) {
   const notificationKey = waitingNotificationKey(tid, waitingRequestId(activity));
@@ -3221,7 +3181,8 @@ async function maybeNotifyWaitingRequest(tid, activity) {
   // this?" because it is pruned on a 15s window, so a laptop resuming repeatedly would re-alert for
   // the same blocked approval. Track bootstrap alerts separately and permanently for this page
   // session: a reconnect stays silent, while a genuine reload starts a new session and re-alerts.
-  if (activity.source === "connect_bootstrap" && state.bootstrapNotifiedRequests.has(notificationKey)) {
+  if ((activity.source === "connect_bootstrap" || activity.source === "runtime_overview")
+      && state.bootstrapNotifiedRequests.has(notificationKey)) {
     recordNotificationDiagnostic("waiting_notify_suppressed_replay", {
       tid,
       request_id: waitingRequestId(activity)
@@ -3497,15 +3458,6 @@ function handleIncomingApprovalRequest(request, tid, opts) {
     notify: opts.notify !== false
   });
   if (opts.notify !== false) notifyIncomingApproval(request, tid, { source: opts.source });
-  setThreadActivity(tid, {
-    kind:"approval_requested",
-    active_turn:true,
-    approval_id:request && request.id ? String(request.id) : null,
-    server_request_id:null,
-    summary:approvalTitle(request),
-    source:opts.source || "incoming_approval_request",
-    unread:state.threadId ? String(state.threadId) !== String(tid) : true
-  });
   renderApprovalRequest(request);
 }
 
@@ -4139,7 +4091,6 @@ function handleEvent(ev) {
       }
       renderLiveTurnUserInput(ev.turn, ev.user_input);
       setTurnActive(true);
-      setActiveThreadActivity("progress", true, "Turn running");
       break;
     case "item_started":
       if (ev.item) {
@@ -4185,7 +4136,7 @@ function handleEvent(ev) {
       finishCompactPending();
       clearPlanCard();   // the plan ends with its turn
       setTurnActive(false);
-      setActiveThreadActivity("turn_completed", false, "Turn completed");
+      clearCompletedRequestState();
       breakTaskGroup();
       // Shell edits leave no file-change item, so the end of the turn is the catch-all.
       scheduleGitRefresh();
@@ -4205,9 +4156,6 @@ function handleEvent(ev) {
         renderServerRequest(ev.request);
         break;
       }
-      setActiveThreadActivity("server_request_received", true, "Waiting for your input", {
-        server_request_id:serverRequestId
-      });
       renderServerRequest(ev.request);
       maybeNotifyWaitingRequest(String(ev.thread || state.threadId || ""), {
         kind:"server_request_received",
@@ -4229,7 +4177,6 @@ function handleEvent(ev) {
         state.firstTurnStartingThreadId = null;
         setTurnActive(false);
       }
-      setActiveThreadActivity("error", false, errorText(ev.error));
       failPendingUserMessage(null);   // resolve the optimistic bubble to a failed state
       errorBubble(errorText(ev.error));
       break;
@@ -4268,7 +4215,6 @@ function renderLiveTurnSnapshot(snap) {
     state.currentRenderTurnId = snap.turn_id;
     renderLiveTurnUserInput(snap.turn_id, snap.user_input);
     setTurnActive(true);
-    setActiveThreadActivity("progress", true, "Turn running");
   }
   // Seed answered approvals before replaying accumulated events: the buffer replays every
   // ApprovalRequested (answered ones included), and this reload wiped the in-memory answered state,
@@ -4297,9 +4243,6 @@ function renderLiveTurnSnapshot(snap) {
     });
   }
   for (const request of outstandingServerRequests(snap)) {
-    setActiveThreadActivity("server_request_received", true, "Waiting for your input", {
-      server_request_id:request && request.id ? String(request.id) : null
-    });
     renderServerRequest(request);
   }
 }
@@ -4444,6 +4387,8 @@ function renderApprovalRequest(request) {
   addApprovalButton(actions, id, "decline", "Decline", "danger", available);
   addApprovalButton(actions, id, "cancel", "Cancel", "", available);
   body.append(actions);
+  const authoritative = state.requestStates.get(id);
+  if (authoritative) handleRequestState(authoritative);
   schedulePendingWaitingFocus();
 }
 
@@ -4566,12 +4511,13 @@ function respondApproval(id, decision) {
   if (!entry) return;
   const msg = entry.msg;
   msg.querySelectorAll("button").forEach(btn => btn.disabled = true);
-  if (!send({ type:"approval_decision", request_id:id, decision })) {
+  const threadId = (entry.request && entry.request.thread_id) || msg.dataset.threadId || state.threadId;
+  if (!send({ type:"approval_decision", thread_id:threadId, request_id:id, decision })) {
     msg.querySelectorAll("button").forEach(btn => btn.disabled = false);
     notice(`Approval response not sent: WebSocket is ${state.wsStatus}.`, "error");
     return;
   }
-  resolveApprovalRequest(id, decision);
+  msg.dataset.resolving = "true";
 }
 function resolveApprovalRequest(id, decision) {
   if (id === undefined || id === null || String(id) === "") return;
@@ -4582,7 +4528,6 @@ function resolveApprovalRequest(id, decision) {
     ? entry.request.thread_id
     : (msg && msg.dataset.threadId ? msg.dataset.threadId : state.threadId);
   closeWaitingNotification(tid, id);
-  clearApprovalThreadActivity(tid, id);
   if (entry) {
     state.answeredApprovals.set(entry.stateKey || (msg && msg.dataset.approvalStateKey) || approvalStateKey(id), {
       request: entry.request,
@@ -4679,13 +4624,15 @@ function renderServerRequest(request) {
   // Built the card, now settle it: a request answered before this page load exists only as a
   // replayed `ServerRequestReceived`, so it must not come back actionable.
   if (state.answeredServerRequests.has(id)) resolveServerRequest(id);
+  else {
+    const authoritative = state.requestStates.get(id);
+    if (authoritative) handleRequestState(authoritative);
+  }
 }
 function resolveServerRequest(id) {
   id = String(id || "");
   const entry = state.pendingServerRequests.get(id);
   if (!entry) return;
-  const tid = entry.msg && entry.msg.dataset.threadId ? entry.msg.dataset.threadId : state.threadId;
-  clearServerRequestThreadActivity(tid, id);
   entry.msg.classList.add("resolved");
   entry.msg.querySelectorAll("button,input,select,textarea").forEach(el => el.disabled = true);
   const body = entry.msg.querySelector(".body");
@@ -4696,6 +4643,13 @@ function resolveServerRequest(id) {
     body.append(status);
   }
   state.pendingServerRequests.delete(id);
+}
+function resetResolvingApprovals() {
+  for (const { msg } of state.pendingApprovals.values()) {
+    if (msg.dataset.resolving !== "true") continue;
+    msg.dataset.resolving = "false";
+    msg.querySelectorAll("button,input,select,textarea").forEach(el => el.disabled = false);
+  }
 }
 function resetResolvingServerRequests() {
   for (const { msg } of state.pendingServerRequests.values()) {
@@ -4980,7 +4934,8 @@ function respondServerRequest(id, response, label) {
   if (!entry) return;
   entry.msg.dataset.resolving = "true";
   entry.msg.querySelectorAll("button,input,select,textarea").forEach(el => el.disabled = true);
-  if (!send({ type:"server_request_response", request_id:String(id), response })) {
+  const threadId = entry.msg.dataset.threadId || state.threadId;
+  if (!send({ type:"server_request_response", thread_id:threadId, request_id:String(id), response })) {
     entry.msg.dataset.resolving = "false";
     entry.msg.querySelectorAll("button,input,select,textarea").forEach(el => el.disabled = false);
     notice(`Server request response not sent: WebSocket is ${state.wsStatus}.`, "error");
@@ -4991,13 +4946,8 @@ function respondServerRequest(id, response, label) {
   status.className = "meta server-request-sent";
   status.textContent = `Sent: ${label}`;
   if (body) body.append(status);
-  // Stop claiming the thread is waiting on the user the moment they act. An approval clears here
-  // because answering it broadcasts `ApprovalResolved`; a server request's resolved event comes from
-  // the harness on its own schedule and may never come, so waiting for it would leave the sidebar
-  // demanding attention for something already answered.
-  const tid = entry.msg.dataset.threadId || state.threadId;
-  clearServerRequestThreadActivity(tid, String(id));
-  closeWaitingNotification(tid, String(id));
+  // The authoritative request-state transition resolves the card and cross-thread badge. Until
+  // then this tab, like every other tab, displays the request as responding.
 }
 function objectValue(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : null;
@@ -5727,7 +5677,6 @@ function renderRunningCommandSnapshot(commands) {
   for (const info of commands) {
     const key = scopedItemKey(info.turn_id, info.item_id);
     if (!key) continue;
-    const snapshotItem = { id:info.item_id, harness_item_id:info.harness_item_id || "" };
     seen.add(key);
     const existing = state.runningCommands.get(key);
     const cmd = commandFromParts({
@@ -5747,50 +5696,11 @@ function renderRunningCommandSnapshot(commands) {
     });
     if (cmd.terminating) state.commandStopRequestedByItemId.add(key);
     state.runningCommands.set(key, cmd);
-    // Snapshots can arrive before replayed live items, so both task kinds can create transcript
-    // rows here. Later item events reuse the same body by item id and finalize it in place.
-    if (cmd.kind === "tool") {
-      let toolBody = toolBodyFor(key);
-      if (!toolBody) {
-        toolBody = taskBubble(key, "tool_call", "tool running-tool state-running", "tool");
-        state.streamElsByItemId.set(key, toolBody);
-        state.toolBodyElsByItemId.set(key, toolBody);
-        toolBody.parentElement.dataset.toolItemId = key;
-        toolBody.parentElement.dataset.toolStartedAtMs = String(cmd.startedAtMs || Date.now());
-        renderItemBody(toolBody, {
-          kind:"tool_call",
-          name:cmd.command || "tool",
-          input:null,
-          output:cmd.output || null,
-          server:cmd.server || null,
-          status:cmd.status || "in_progress",
-          error:null
-        });
-      }
-      registerRenderedItemBody(toolBody, snapshotItem, info.turn_id);
-      state.commandMsgElsByItemId.set(key, toolBody.parentElement);
-    } else {
-      let body = commandBodyFor(key);
-      if (!body) body = taskBubble(key, "command_execution", "cmd running-command", "command");
-      state.commandBodyElsByItemId.set(key, body);
-      state.commandMsgElsByItemId.set(key, body.parentElement);
-      registerRenderedItemBody(body, snapshotItem, info.turn_id);
-      renderCommandBody(body, cmd);
-    }
   }
 
   for (const [id, cmd] of Array.from(state.runningCommands.entries())) {
     if (seen.has(id)) continue;
     state.runningCommands.delete(id);
-    // Tool transcript rows are owned by the item stream; only commands with an explicit stop
-    // request get a fallback ended-body rewrite when task tracking disappears.
-    if (cmd.kind !== "tool") {
-      const body = commandBodyFor(id);
-      const stopRequested = cmd.terminating || state.commandStopRequestedByItemId.has(id);
-      if (body && stopRequested) {
-        renderEndedCommandBody(body, cmd, "unknown", { stopRequested });
-      }
-    }
     state.commandStopRequestedByItemId.delete(id);
   }
   renderRunningCommands();
@@ -6866,7 +6776,9 @@ function resetRenderState() {
   state.renderedApprovalStateKeys = new Set();
   state.pendingServerRequests = new Map();
   state.answeredServerRequests = new Set();
+  state.requestStates = new Map();
   state.runningCommands = new Map();
+  state.runningTasksRevision = -1;
   state.commandBodyElsByItemId = new Map();
   state.commandMsgElsByItemId = new Map();
   state.commandStopRequestedByItemId = new Set();

@@ -5,7 +5,7 @@ use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error};
 
 use giskard_core::ids::ThreadId;
-use giskard_proto::{ServerMessage, ThreadState};
+use giskard_proto::{ServerMessage, ThreadRuntimeOverview, ThreadState};
 
 use crate::hub::ClientId;
 
@@ -68,6 +68,14 @@ impl ClientDelivery {
         self.replacements.invalidate_thread_catalog();
         true
     }
+
+    pub(crate) fn publish_runtime_overview(&self, overview: ThreadRuntimeOverview) -> bool {
+        if self.ordered.is_closed() {
+            return false;
+        }
+        self.replacements.insert_runtime_overview(overview);
+        true
+    }
 }
 
 impl ReplacementReceiver {
@@ -86,6 +94,7 @@ impl ReplacementReceiver {
 enum ReplacementKey {
     Thread(ThreadId),
     ThreadCatalog,
+    RuntimeOverview,
 }
 
 #[derive(Default)]
@@ -175,6 +184,39 @@ impl ReplacementMailbox {
         self.changed.notify_one();
     }
 
+    fn insert_runtime_overview(&self, overview: ThreadRuntimeOverview) {
+        let key = ReplacementKey::RuntimeOverview;
+        let revision = overview.revision;
+        let mut pending = self.lock_pending();
+        if let Some(ServerMessage::ThreadRuntimeOverview(current)) = pending.messages.get(&key) {
+            if current.revision > revision {
+                debug!(
+                    client_id = self.client_id,
+                    pending_revision = current.revision,
+                    ignored_revision = revision,
+                    action = "coalesce_runtime_overview",
+                    "ignoring an older pending runtime overview"
+                );
+                return;
+            }
+            debug!(
+                client_id = self.client_id,
+                replaced_revision = current.revision,
+                retained_revision = revision,
+                action = "coalesce_runtime_overview",
+                "coalescing pending runtime overview replacement"
+            );
+        }
+        if !pending.messages.contains_key(&key) {
+            pending.order.push_back(key);
+        }
+        pending
+            .messages
+            .insert(key, ServerMessage::ThreadRuntimeOverview(overview));
+        drop(pending);
+        self.changed.notify_one();
+    }
+
     fn pop_front(&self) -> Option<ServerMessage> {
         let mut pending = self.lock_pending();
         while let Some(key) = pending.order.pop_front() {
@@ -217,7 +259,7 @@ mod tests {
     use giskard_core::model::ModelRef;
     use giskard_core::token::TokenLedger;
     use giskard_core::turn::{Mode, PermissionPreset};
-    use giskard_proto::ThreadMetadata;
+    use giskard_proto::{ThreadMetadata, ThreadRuntimeOverview};
     use tokio::time::{Duration, timeout};
 
     use super::*;
@@ -282,6 +324,72 @@ mod tests {
         {
             ServerMessage::ThreadState(state) => assert_eq!(state.metadata.revision, 8),
             other => panic!("expected thread state, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_runtime_overview_replaces_stale_pending_activity() {
+        let (tx, _rx) = mpsc::channel(1);
+        tx.send(ServerMessage::Pong).await.unwrap();
+        let (delivery, replacements) = ClientDelivery::new(20, tx);
+        let thread_id = ThreadId::new();
+
+        assert!(delivery.publish_runtime_overview(ThreadRuntimeOverview {
+            revision: 4,
+            threads: vec![giskard_proto::ThreadRuntimeSummary {
+                thread_id,
+                turn_state: giskard_proto::RuntimeTurnState::Active { turn_id: None },
+                outstanding_requests: Vec::new(),
+            }],
+        }));
+        assert!(delivery.publish_runtime_overview(ThreadRuntimeOverview {
+            revision: 5,
+            threads: Vec::new(),
+        }));
+
+        match timeout(Duration::from_secs(1), replacements.recv())
+            .await
+            .unwrap()
+        {
+            ServerMessage::ThreadRuntimeOverview(overview) => {
+                assert_eq!(overview.revision, 5);
+                assert!(overview.threads.is_empty());
+            }
+            other => panic!("expected runtime overview, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn older_runtime_overview_does_not_displace_a_newer_pending_one() {
+        let (tx, _rx) = mpsc::channel(1);
+        tx.send(ServerMessage::Pong).await.unwrap();
+        let (delivery, replacements) = ClientDelivery::new(20, tx);
+        let thread_id = ThreadId::new();
+
+        assert!(delivery.publish_runtime_overview(ThreadRuntimeOverview {
+            revision: 5,
+            threads: Vec::new(),
+        }));
+        // A late overview built from an earlier snapshot must not roll the pending
+        // replacement back to the state it already superseded.
+        assert!(delivery.publish_runtime_overview(ThreadRuntimeOverview {
+            revision: 4,
+            threads: vec![giskard_proto::ThreadRuntimeSummary {
+                thread_id,
+                turn_state: giskard_proto::RuntimeTurnState::Active { turn_id: None },
+                outstanding_requests: Vec::new(),
+            }],
+        }));
+
+        match timeout(Duration::from_secs(1), replacements.recv())
+            .await
+            .unwrap()
+        {
+            ServerMessage::ThreadRuntimeOverview(overview) => {
+                assert_eq!(overview.revision, 5);
+                assert!(overview.threads.is_empty());
+            }
+            other => panic!("expected runtime overview, got {other:?}"),
         }
     }
 

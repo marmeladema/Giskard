@@ -88,10 +88,12 @@ pub enum ClientMessage {
         process_id: String,
     },
     ApprovalDecision {
+        thread_id: ThreadId,
         request_id: String,
         decision: ApprovalDecision,
     },
     ServerRequestResponse {
+        thread_id: ThreadId,
         request_id: String,
         response: ServerRequestResponse,
     },
@@ -138,29 +140,77 @@ pub struct ThreadState {
     pub active_turn: Option<bool>,
 }
 
-/// Lightweight cross-thread activity update for sidebar badges and browser notifications. This is
-/// intentionally much smaller than a transcript event: inactive threads should show that work is
-/// happening without subscribing every browser to every live delta stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ThreadActivity {
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RequestPayload {
+    Approval { request: WireApprovalRequest },
+    Server { request: ServerRequest },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RequestResolution {
+    Approval { decision: ApprovalDecision },
+    Server,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RequestStatus {
+    Pending,
+    Responding,
+    Resolved { resolution: RequestResolution },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestState {
     pub thread_id: ThreadId,
-    #[serde(flatten)]
-    pub kind: ThreadActivityKind,
-    pub active_turn: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
+    pub request_id: String,
+    /// Monotonic within this request ID for the lifetime of its runtime entry.
+    pub revision: u64,
+    pub payload: RequestPayload,
+    pub status: RequestStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestKind {
+    Approval,
+    Server,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ThreadActivityKind {
-    TurnStarted,
-    Progress,
-    ApprovalRequested { approval_id: String },
-    ServerRequestReceived { server_request_id: String },
-    TurnCompleted,
-    Error,
-    Notice,
+pub struct OutstandingRequest {
+    pub request_id: String,
+    pub kind: RequestKind,
+    pub responding: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum RuntimeTurnState {
+    Idle,
+    Active {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_id: Option<TurnId>,
+    },
+    PersistenceBlocked {
+        turn_id: TurnId,
+        error: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadRuntimeSummary {
+    pub thread_id: ThreadId,
+    pub turn_state: RuntimeTurnState,
+    pub outstanding_requests: Vec<OutstandingRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadRuntimeOverview {
+    pub revision: u64,
+    pub threads: Vec<ThreadRuntimeSummary>,
 }
 
 /// In-flight turn reconstruction on reconnect (spec §13.6). Carries wire types (§3.5).
@@ -275,17 +325,10 @@ pub enum ServerMessage {
         thread_id: ThreadId,
         agent_event: Box<WireAgentEvent>,
     },
-    ThreadActivity(ThreadActivity),
-    /// Cross-thread activity a connecting client missed. `ThreadActivity` is a live signal that is
-    /// never replayed, so without this a browser that was closed (or disconnected) when an approval
-    /// was raised shows no sidebar badge and fires no notification for a thread that is blocked
-    /// right now. Sent once to the connecting client only, never broadcast. Entries reuse
-    /// `ThreadActivity` so clients can funnel them through the same rendering path, but the
-    /// separate message lets a client tell a replay from a live event — it must not re-alert for an
-    /// approval it has already notified about in this page session.
-    ThreadActivityBootstrap {
-        activities: Vec<ThreadActivity>,
-    },
+    /// Authoritative replacement state for one approval or server request.
+    RequestState(RequestState),
+    /// Authoritative cross-thread replacement projection; an empty vector clears stale badges.
+    ThreadRuntimeOverview(ThreadRuntimeOverview),
     ThreadState(ThreadState),
     /// Authoritative result of a browser-initiated metadata mutation. This is sent even when the
     /// mutation is a no-op, so pending UI state never depends on a revision changing.
@@ -311,12 +354,8 @@ pub enum ServerMessage {
     LiveTurnSnapshot(LiveTurnSnapshot),
     RunningTasks {
         thread_id: ThreadId,
+        revision: u64,
         tasks: Vec<RunningTask>,
-    },
-    ApprovalResolved {
-        thread_id: ThreadId,
-        request_id: String,
-        decision: ApprovalDecision,
     },
     Error {
         #[serde(flatten)]
@@ -864,7 +903,9 @@ mod tests {
 
     #[test]
     fn client_message_server_request_response_serde() {
+        let thread_id = ThreadId::new();
         let msg = ClientMessage::ServerRequestResponse {
+            thread_id,
             request_id: "req_1".into(),
             response: ServerRequestResponse::result(serde_json::json!({
                 "success": true,
@@ -880,10 +921,12 @@ mod tests {
         let back: ClientMessage = serde_json::from_value(json).unwrap();
         match back {
             ClientMessage::ServerRequestResponse {
+                thread_id: decoded_thread_id,
                 request_id,
                 response: ServerRequestResponse::Result { value },
             } => {
                 assert_eq!(request_id, "req_1");
+                assert_eq!(decoded_thread_id, thread_id);
                 assert_eq!(value["contentItems"], serde_json::json!([]));
             }
             _ => panic!("wrong variant"),
@@ -892,7 +935,9 @@ mod tests {
 
     #[test]
     fn client_message_server_request_error_response_serde() {
+        let thread_id = ThreadId::new();
         let msg = ClientMessage::ServerRequestResponse {
+            thread_id,
             request_id: "req_1".into(),
             response: ServerRequestResponse::error(-32000, "unsupported"),
         };
@@ -906,10 +951,12 @@ mod tests {
         let back: ClientMessage = serde_json::from_value(json).unwrap();
         match back {
             ClientMessage::ServerRequestResponse {
+                thread_id: decoded_thread_id,
                 request_id,
                 response: ServerRequestResponse::Error { code, message },
             } => {
                 assert_eq!(request_id, "req_1");
+                assert_eq!(decoded_thread_id, thread_id);
                 assert_eq!(code, -32000);
                 assert_eq!(message, "unsupported");
             }
@@ -1020,87 +1067,6 @@ mod tests {
     }
 
     #[test]
-    fn server_message_thread_activity_is_flattened() {
-        let tid = ThreadId::new();
-        let msg = ServerMessage::ThreadActivity(ThreadActivity {
-            thread_id: tid,
-            kind: ThreadActivityKind::ApprovalRequested {
-                approval_id: "approval-1".into(),
-            },
-            active_turn: true,
-            summary: Some("Approval requested".into()),
-        });
-
-        let json = serde_json::to_value(&msg).unwrap();
-        assert_eq!(json["type"], "thread_activity");
-        assert_eq!(json["thread_id"], tid.to_string());
-        assert_eq!(json["kind"], "approval_requested");
-        assert_eq!(json["active_turn"], true);
-        assert_eq!(json["approval_id"], "approval-1");
-        assert!(json.get("server_request_id").is_none());
-
-        let back: ServerMessage = serde_json::from_value(json).unwrap();
-        match back {
-            ServerMessage::ThreadActivity(activity) => {
-                assert_eq!(activity.thread_id, tid);
-                match activity.kind {
-                    ThreadActivityKind::ApprovalRequested { approval_id } => {
-                        assert_eq!(approval_id, "approval-1");
-                    }
-                    other => panic!("expected approval activity, got {other:?}"),
-                }
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn server_message_thread_activity_requires_variant_ids() {
-        let json = serde_json::json!({
-            "type": "thread_activity",
-            "thread_id": ThreadId::new().to_string(),
-            "kind": "approval_requested",
-            "active_turn": true
-        });
-
-        let err = serde_json::from_value::<ServerMessage>(json).unwrap_err();
-        assert!(
-            err.to_string().contains("missing field `approval_id`"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn server_message_approval_resolved_serde() {
-        let tid = ThreadId::new();
-        let msg = ServerMessage::ApprovalResolved {
-            thread_id: tid,
-            request_id: "approval-1".into(),
-            decision: ApprovalDecision::Accept,
-        };
-
-        let json = serde_json::to_value(&msg).unwrap();
-        assert_eq!(json["type"], "approval_resolved");
-        assert_eq!(json["thread_id"], tid.to_string());
-        assert_eq!(json["request_id"], "approval-1");
-        assert_eq!(json["decision"], "accept");
-
-        let back: ServerMessage = serde_json::from_value(json).unwrap();
-        match back {
-            ServerMessage::ApprovalResolved {
-                thread_id,
-                request_id,
-                decision,
-            } => {
-                assert_eq!(thread_id, tid);
-                assert_eq!(request_id, "approval-1");
-                assert_eq!(decision, ApprovalDecision::Accept);
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
     fn server_message_running_tasks_serde() {
         let tid = ThreadId::new();
         let turn_id = TurnId::new();
@@ -1108,6 +1074,7 @@ mod tests {
         let tool_item = ItemId::new();
         let msg = ServerMessage::RunningTasks {
             thread_id: tid,
+            revision: 3,
             tasks: vec![
                 RunningTask {
                     kind: TaskKind::Command,

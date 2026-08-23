@@ -25,7 +25,7 @@ use giskard_harness::{
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 use giskard_persist::store::ProjectConfig;
 use giskard_proto::{
-    ClientMessage, ErrorSeverity, ServerMessage, ThreadActivity, ThreadActivityKind, WireAgentEvent,
+    ClientMessage, ErrorSeverity, RequestKind, RuntimeTurnState, ServerMessage, WireAgentEvent,
 };
 use giskard_server::{AppState, HarnessFactory, build_app};
 use tracing::Subscriber;
@@ -2237,29 +2237,24 @@ async fn wait_for_live_item_id(
 ) -> ItemId {
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     loop {
-        if let Some(item_id) = state
-            .live_buffers
-            .snapshot(thread_id)
-            .await
-            .and_then(|snapshot| {
-                snapshot
-                    .accumulated
-                    .into_iter()
-                    .find_map(|event| match event {
-                        WireAgentEvent::ItemStarted { item, .. }
-                            if item.harness_item_id.starts_with(harness_item_prefix) =>
-                        {
-                            Some(item.id)
-                        }
-                        WireAgentEvent::ItemCompleted { item, .. }
-                            if item.harness_item_id.starts_with(harness_item_prefix) =>
-                        {
-                            Some(item.id)
-                        }
-                        _ => None,
-                    })
-            })
-        {
+        if let Some(item_id) = state.runtime.live_snapshot(thread_id).and_then(|snapshot| {
+            snapshot
+                .accumulated
+                .into_iter()
+                .find_map(|event| match event {
+                    WireAgentEvent::ItemStarted { item, .. }
+                        if item.harness_item_id.starts_with(harness_item_prefix) =>
+                    {
+                        Some(item.id)
+                    }
+                    WireAgentEvent::ItemCompleted { item, .. }
+                        if item.harness_item_id.starts_with(harness_item_prefix) =>
+                    {
+                        Some(item.id)
+                    }
+                    _ => None,
+                })
+        }) {
             return item_id;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -2538,7 +2533,7 @@ async fn wait_for_approval_request(
     panic!("approval request for {thread_id} was not observed");
 }
 
-async fn wait_for_approval_resolved(
+async fn wait_for_approval_resolution(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
@@ -2549,13 +2544,12 @@ async fn wait_for_approval_resolved(
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(tokio::time::Duration::from_secs(1), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
-                if let Ok(ServerMessage::ApprovalResolved {
-                    thread_id: resolved_thread,
-                    request_id: resolved_request,
-                    decision,
-                }) = serde_json::from_str(&text)
-                    && resolved_thread == thread_id
-                    && resolved_request == request_id
+                if let Ok(ServerMessage::RequestState(state)) = serde_json::from_str(&text)
+                    && state.thread_id == thread_id
+                    && state.request_id == request_id
+                    && let giskard_proto::RequestStatus::Resolved {
+                        resolution: giskard_proto::RequestResolution::Approval { decision },
+                    } = state.status
                 {
                     return decision;
                 }
@@ -2565,6 +2559,17 @@ async fn wait_for_approval_resolved(
         }
     }
     panic!("approval resolution for {thread_id}/{request_id} was not observed");
+}
+
+struct ThreadActivity {
+    kind: ThreadActivityKind,
+    active_turn: bool,
+}
+
+enum ThreadActivityKind {
+    ApprovalRequested { approval_id: String },
+    ServerRequestReceived { server_request_id: String },
+    TurnCompleted,
 }
 
 async fn wait_for_thread_activity(
@@ -2584,12 +2589,6 @@ async fn wait_for_thread_activity(
                     continue;
                 };
                 match server_msg {
-                    ServerMessage::ThreadActivity(activity)
-                        if activity.thread_id == inactive_thread && expected(&activity.kind) =>
-                    {
-                        return activity;
-                    }
-                    ServerMessage::ThreadActivity(_) => {}
                     ServerMessage::Event {
                         thread_id,
                         agent_event,
@@ -2612,14 +2611,48 @@ async fn wait_for_thread_activity(
                             "live snapshot should belong to subscribed thread"
                         );
                     }
-                    // Sent once on connect and carries only lightweight `ThreadActivity`, so it is
-                    // allowed to mention the unsubscribed thread — that is the point of it. It can
-                    // never carry transcript traffic, which is what this loop guards.
-                    ServerMessage::ThreadActivityBootstrap { .. } => {}
+                    ServerMessage::RequestState(_) => {}
+                    ServerMessage::ThreadRuntimeOverview(overview) => {
+                        let summary = overview
+                            .threads
+                            .iter()
+                            .find(|summary| summary.thread_id == inactive_thread);
+                        let kind = match expected_name {
+                            "approval_requested" => summary.and_then(|summary| {
+                                summary.outstanding_requests.iter().find_map(|request| {
+                                    matches!(request.kind, RequestKind::Approval).then(|| {
+                                        ThreadActivityKind::ApprovalRequested {
+                                            approval_id: request.request_id.clone(),
+                                        }
+                                    })
+                                })
+                            }),
+                            "server_request_received" => summary.and_then(|summary| {
+                                summary.outstanding_requests.iter().find_map(|request| {
+                                    matches!(request.kind, RequestKind::Server).then(|| {
+                                        ThreadActivityKind::ServerRequestReceived {
+                                            server_request_id: request.request_id.clone(),
+                                        }
+                                    })
+                                })
+                            }),
+                            "turn_completed" if overview.revision > 0 && summary.is_none() => {
+                                Some(ThreadActivityKind::TurnCompleted)
+                            }
+                            _ => None,
+                        };
+                        if let Some(kind) = kind.filter(expected) {
+                            return ThreadActivity {
+                                active_turn: summary.is_some_and(|summary| {
+                                    !matches!(summary.turn_state, RuntimeTurnState::Idle)
+                                }),
+                                kind,
+                            };
+                        }
+                    }
                     ServerMessage::ThreadState(_)
                     | ServerMessage::ThreadMetadataResult { .. }
                     | ServerMessage::ThreadCatalogChanged
-                    | ServerMessage::ApprovalResolved { .. }
                     | ServerMessage::Error { .. }
                     | ServerMessage::Pong => {}
                 }
@@ -2823,7 +2856,7 @@ async fn subscribe_thread_state_reports_a_turn_the_harness_has_not_streamed_yet(
         .unwrap();
     harness.wait_for_start_calls(1).await;
     assert!(
-        !state.live_buffers.is_active(thread_id).await,
+        !state.runtime.live_is_active(thread_id),
         "the harness is still inside start_turn, so there is nothing buffered for this turn"
     );
 
@@ -2878,7 +2911,7 @@ async fn send_input_rejects_same_thread_during_compaction() {
     .unwrap();
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-    while !state.live_buffers.is_active(thread_id).await {
+    while !state.runtime.live_is_active(thread_id) {
         if tokio::time::Instant::now() >= deadline {
             panic!("compaction thread did not become active");
         }
@@ -3063,14 +3096,11 @@ async fn new_turn_start_replaces_stale_live_buffer_without_dropping_events() {
     let cookie = login_cookie(&client, &base).await;
     let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
     let stale_turn = TurnId::new();
-    state
-        .live_buffers
-        .replace_turn_with_user_input(
-            thread_id,
-            stale_turn,
-            Some(UserInput::text("stale interrupted turn")),
-        )
-        .await;
+    state.runtime.replace_live_turn(
+        thread_id,
+        stale_turn,
+        Some(UserInput::text("stale interrupted turn")),
+    );
     let mut ws = connect_ws(port, &cookie).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -3095,7 +3125,7 @@ async fn new_turn_start_replaces_stale_live_buffer_without_dropping_events() {
     let new_turn = wait_for_turn_started(&mut ws, thread_id).await;
     assert_ne!(new_turn, stale_turn);
     wait_for_turn_completed(&mut ws, thread_id).await;
-    assert!(state.live_buffers.snapshot(thread_id).await.is_none());
+    assert!(state.runtime.live_snapshot(thread_id).is_none());
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     loop {
         if state
@@ -3151,7 +3181,7 @@ async fn compact_context_does_not_block_turns_on_other_threads_or_projects() {
     .unwrap();
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-    while !state.live_buffers.is_active(compacting_thread).await {
+    while !state.runtime.live_is_active(compacting_thread) {
         if tokio::time::Instant::now() >= deadline {
             panic!("compaction thread did not become active");
         }
@@ -3216,7 +3246,7 @@ async fn compact_context_does_not_block_turns_on_other_threads_or_projects() {
         "a compaction turn must not block another project from completing work"
     );
     assert!(
-        state.live_buffers.is_active(compacting_thread).await,
+        state.runtime.live_is_active(compacting_thread),
         "precondition check: compaction should still be active while the other thread completed"
     );
 }
@@ -3255,9 +3285,8 @@ async fn inactive_thread_progress_sends_activity_without_full_event_subscription
     .await
     .unwrap();
 
-    let mut saw_inactive_start = false;
-    let mut saw_inactive_progress = false;
-    let mut saw_inactive_completed = false;
+    let mut saw_inactive_runtime = false;
+    let mut saw_final_empty_runtime = false;
     let mut saw_active_state = false;
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
@@ -3268,25 +3297,6 @@ async fn inactive_thread_progress_sends_activity_without_full_event_subscription
                     ServerMessage::ThreadState(state) => {
                         if state.metadata.thread_id == active_thread {
                             saw_active_state = true;
-                        }
-                    }
-                    ServerMessage::ThreadActivity(activity) => {
-                        if activity.thread_id == inactive_thread {
-                            match activity.kind {
-                                ThreadActivityKind::TurnStarted => {
-                                    assert!(activity.active_turn);
-                                    saw_inactive_start = true;
-                                }
-                                ThreadActivityKind::Progress => {
-                                    assert!(activity.active_turn);
-                                    saw_inactive_progress = true;
-                                }
-                                ThreadActivityKind::TurnCompleted => {
-                                    assert!(!activity.active_turn);
-                                    saw_inactive_completed = true;
-                                }
-                                other => panic!("unexpected inactive-thread activity: {other:?}"),
-                            }
                         }
                     }
                     ServerMessage::Event {
@@ -3316,18 +3326,29 @@ async fn inactive_thread_progress_sends_activity_without_full_event_subscription
                             "live snapshot should belong to the subscribed thread"
                         );
                     }
-                    // Connect-time replay of lightweight activity. Unlike the live `ThreadActivity`
-                    // arm above it is not asserted against the inactive thread's turn lifecycle:
-                    // it reports only what is still outstanding, so a completed turn contributes
-                    // nothing to it.
-                    ServerMessage::ThreadActivityBootstrap { .. } => {}
+                    ServerMessage::RequestState(_) => {}
+                    ServerMessage::ThreadRuntimeOverview(overview) => {
+                        if overview.threads.iter().any(|summary| {
+                            summary.thread_id == inactive_thread
+                                && !matches!(summary.turn_state, RuntimeTurnState::Idle)
+                        }) {
+                            saw_inactive_runtime = true;
+                        }
+                        if overview.revision > 0
+                            && !overview
+                                .threads
+                                .iter()
+                                .any(|summary| summary.thread_id == inactive_thread)
+                        {
+                            saw_final_empty_runtime = true;
+                        }
+                    }
                     ServerMessage::ThreadCatalogChanged
                     | ServerMessage::ThreadMetadataResult { .. }
-                    | ServerMessage::ApprovalResolved { .. }
                     | ServerMessage::Error { .. }
                     | ServerMessage::Pong => {}
                 }
-                if saw_inactive_start && saw_inactive_progress && saw_inactive_completed {
+                if saw_inactive_runtime && saw_final_empty_runtime {
                     break;
                 }
             }
@@ -3341,16 +3362,12 @@ async fn inactive_thread_progress_sends_activity_without_full_event_subscription
         "subscribe should return active thread state"
     );
     assert!(
-        saw_inactive_start,
-        "inactive thread should announce turn start activity"
+        saw_inactive_runtime,
+        "inactive thread should appear in the runtime overview"
     );
     assert!(
-        saw_inactive_progress,
-        "inactive thread should announce progress activity"
-    );
-    assert!(
-        saw_inactive_completed,
-        "inactive thread should announce completion activity"
+        saw_final_empty_runtime,
+        "completion should remove the inactive thread from the runtime overview"
     );
 }
 
@@ -3404,6 +3421,7 @@ async fn inactive_thread_requests_send_activity_and_route_responses() {
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::ApprovalDecision {
+            thread_id: inactive_thread,
             request_id: approval_id.clone(),
             decision: ApprovalDecision::Accept,
         })
@@ -3454,6 +3472,7 @@ async fn inactive_thread_requests_send_activity_and_route_responses() {
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::ServerRequestResponse {
+            thread_id: inactive_thread,
             request_id: server_request_id.clone(),
             response: ServerRequestResponse::result(serde_json::json!({
                 "answers": { "confirm": "Yes" }
@@ -3528,6 +3547,7 @@ async fn approval_decision_broadcasts_resolution_to_other_tabs() {
     first_ws
         .send(tokio_tungstenite::tungstenite::Message::Text(
             serde_json::to_string(&ClientMessage::ApprovalDecision {
+                thread_id,
                 request_id: first_approval_id.clone(),
                 decision: ApprovalDecision::Accept,
             })
@@ -3537,7 +3557,8 @@ async fn approval_decision_broadcasts_resolution_to_other_tabs() {
         .await
         .unwrap();
 
-    let decision = wait_for_approval_resolved(&mut second_ws, thread_id, &first_approval_id).await;
+    let decision =
+        wait_for_approval_resolution(&mut second_ws, thread_id, &first_approval_id).await;
     assert_eq!(decision, ApprovalDecision::Accept);
     let (handled_approval, handled_decision) = harness.wait_for_approval_response().await;
     assert_eq!(handled_approval.0, first_approval_id);
@@ -3561,30 +3582,15 @@ async fn compact_context_unsupported_harness_returns_structured_error() {
     .await
     .unwrap();
 
-    let msg = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
-        panic!("expected text WS frame");
-    };
-    let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
-    match server_msg {
-        ServerMessage::Error { error } => {
-            assert_eq!(error.code, "harness_unsupported");
-            assert_eq!(error.severity, ErrorSeverity::Error);
-            assert_eq!(error.thread_id, Some(thread_id));
-            assert_eq!(error.action.as_deref(), Some("compact_context"));
-            assert!(
-                error
-                    .detail
-                    .as_deref()
-                    .is_some_and(|detail| detail.contains("context compaction is not supported"))
-            );
-        }
-        other => panic!("expected structured compaction error, got {other:?}"),
-    }
+    let error = wait_for_ws_error(&mut ws, "compact_context", "harness_unsupported").await;
+    assert_eq!(error.severity, ErrorSeverity::Error);
+    assert_eq!(error.thread_id, Some(thread_id));
+    assert!(
+        error
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("context compaction is not supported"))
+    );
 }
 
 #[tokio::test]
@@ -4192,9 +4198,8 @@ async fn passive_subagent_command_start_streams_before_completion() {
     assert_eq!(streamed_turn, external_turn);
 
     let snapshot = state
-        .live_buffers
-        .snapshot(child_id)
-        .await
+        .runtime
+        .live_snapshot(child_id)
         .expect("sub-agent live turn should remain buffered before completion");
     assert_eq!(snapshot.thread_id, child_id);
     assert_eq!(snapshot.turn_id, external_turn);
@@ -4660,9 +4665,8 @@ async fn server_resolved_subagent_link_uses_agent_name_prompt_and_turn() {
         Some("investigate")
     );
     let snapshot = state
-        .live_buffers
-        .snapshot(child_id)
-        .await
+        .runtime
+        .live_snapshot(child_id)
         .expect("server-resolved sub-agent live turn should remain buffered before completion");
     assert_eq!(
         snapshot.user_input.as_ref().and_then(UserInput::as_text),
@@ -5805,7 +5809,9 @@ async fn thread_archive_and_delete_reject_active_turns() {
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
     let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
-    state.live_buffers.start_turn(thread_id).await;
+    state
+        .runtime
+        .replace_live_turn(thread_id, TurnId::new(), None);
 
     let archive = client
         .post(format!(
@@ -5836,7 +5842,9 @@ async fn project_remove_rejects_active_turns() {
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
     let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
-    state.live_buffers.start_turn(thread_id).await;
+    state
+        .runtime
+        .replace_live_turn(thread_id, TurnId::new(), None);
 
     let resp = client
         .delete(format!("{base}/api/projects/{project_id}"))
@@ -5868,28 +5876,32 @@ async fn thread_archive_and_delete_reject_running_commands() {
     // Track a running command without starting a turn, so only the running-command branch of the
     // guard can trip (not the live-turn branch).
     let tracked = state
-        .running_commands
-        .apply_event(&AgentEvent::ItemStarted {
-            thread: thread_id,
-            turn: TurnId::new(),
-            item: ItemStart {
-                id: ItemId::new(),
-                harness_item_id: "cmd_guard".into(),
-                kind: ItemKind::CommandExecution,
-                command: Some(CommandExecutionStart {
-                    command: "sleep 60".into(),
-                    cwd: "/tmp/thread-actions".into(),
-                    status: Some("in_progress".into()),
-                    process_id: Some("proc_guard".into()),
-                    started_at_ms: None,
-                }),
-                tool: None,
+        .runtime
+        .apply_event(
+            thread_id,
+            &AgentEvent::ItemStarted {
+                thread: thread_id,
+                turn: TurnId::new(),
+                item: ItemStart {
+                    id: ItemId::new(),
+                    harness_item_id: "cmd_guard".into(),
+                    kind: ItemKind::CommandExecution,
+                    command: Some(CommandExecutionStart {
+                        command: "sleep 60".into(),
+                        cwd: "/tmp/thread-actions".into(),
+                        status: Some("in_progress".into()),
+                        process_id: Some("proc_guard".into()),
+                        started_at_ms: None,
+                    }),
+                    tool: None,
+                },
             },
-        })
-        .await;
+            false,
+        )
+        .tasks_changed;
     assert!(tracked, "command should be tracked as running");
     assert!(
-        !state.live_buffers.is_active(thread_id).await,
+        !state.runtime.live_is_active(thread_id),
         "precondition: no live turn — only a running command"
     );
 
@@ -5924,25 +5936,29 @@ async fn project_remove_rejects_running_commands() {
     let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
 
     let tracked = state
-        .running_commands
-        .apply_event(&AgentEvent::ItemStarted {
-            thread: thread_id,
-            turn: TurnId::new(),
-            item: ItemStart {
-                id: ItemId::new(),
-                harness_item_id: "cmd_project_guard".into(),
-                kind: ItemKind::CommandExecution,
-                command: Some(CommandExecutionStart {
-                    command: "sleep 60".into(),
-                    cwd: "/tmp/thread-actions".into(),
-                    status: Some("in_progress".into()),
-                    process_id: Some("proc_project_guard".into()),
-                    started_at_ms: None,
-                }),
-                tool: None,
+        .runtime
+        .apply_event(
+            thread_id,
+            &AgentEvent::ItemStarted {
+                thread: thread_id,
+                turn: TurnId::new(),
+                item: ItemStart {
+                    id: ItemId::new(),
+                    harness_item_id: "cmd_project_guard".into(),
+                    kind: ItemKind::CommandExecution,
+                    command: Some(CommandExecutionStart {
+                        command: "sleep 60".into(),
+                        cwd: "/tmp/thread-actions".into(),
+                        status: Some("in_progress".into()),
+                        process_id: Some("proc_project_guard".into()),
+                        started_at_ms: None,
+                    }),
+                    tool: None,
+                },
             },
-        })
-        .await;
+            false,
+        )
+        .tasks_changed;
     assert!(tracked, "command should be tracked as running");
 
     let resp = client
@@ -6139,25 +6155,10 @@ async fn subscribe_unknown_thread_returns_structured_error() {
     .await
     .unwrap();
 
-    let msg = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
-        panic!("expected text WS frame");
-    };
-    let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
-    match server_msg {
-        ServerMessage::Error { error } => {
-            assert_eq!(error.code, "thread_not_found");
-            assert_eq!(error.severity, ErrorSeverity::Error);
-            assert_eq!(error.thread_id, Some(tid));
-            assert_eq!(error.action.as_deref(), Some("subscribe"));
-            assert!(!error.message.is_empty());
-        }
-        other => panic!("expected structured error, got {other:?}"),
-    }
+    let error = wait_for_ws_error(&mut ws, "subscribe", "thread_not_found").await;
+    assert_eq!(error.severity, ErrorSeverity::Error);
+    assert_eq!(error.thread_id, Some(tid));
+    assert!(!error.message.is_empty());
 }
 
 #[tokio::test]
@@ -6220,16 +6221,19 @@ async fn websocket_accepts_ticket_without_cookie_header() {
     .await
     .unwrap();
 
-    let msg = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
-        panic!("expected text WS frame");
-    };
-    let server_msg: ServerMessage = serde_json::from_str(&text).unwrap();
-    assert!(matches!(server_msg, ServerMessage::Pong));
+    loop {
+        let msg = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if matches!(
+            serde_json::from_str::<ServerMessage>(msg.to_text().unwrap()).unwrap(),
+            ServerMessage::Pong
+        ) {
+            break;
+        }
+    }
 }
 
 #[tokio::test]
@@ -6317,15 +6321,19 @@ async fn websocket_serializes_harness_error_events() {
     .await
     .unwrap();
 
-    let msg = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert!(matches!(
-        serde_json::from_str::<ServerMessage>(msg.to_text().unwrap()).unwrap(),
-        ServerMessage::ThreadState(_)
-    ));
+    loop {
+        let msg = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if matches!(
+            serde_json::from_str::<ServerMessage>(msg.to_text().unwrap()).unwrap(),
+            ServerMessage::ThreadState(_)
+        ) {
+            break;
+        }
+    }
 
     state
         .hub
