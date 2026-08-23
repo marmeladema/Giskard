@@ -78,14 +78,10 @@ test("late completion replaces a processless running command in place", async ({
     };
   });
 
-  expect(result.initial).toEqual({
-    taskCount: "1",
-    rowCount: 1,
-    running: true,
-    stopDisabled: true,
-  });
+  expect(result.initial.taskCount).toBe("1");
+  expect(result.initial.rowCount).toBe(0);
   expect(result.afterEmptySnapshot.taskCount).toBe("0");
-  expect(result.afterEmptySnapshot.terminated).toBe(false);
+  expect(result.afterEmptySnapshot.terminated).toBeUndefined();
   expect(result.afterEmptySnapshot.text).not.toContain("No longer tracked");
   expect(result.completed.rowCount).toBe(1);
   expect(result.completed.failed).toBe(true);

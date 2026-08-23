@@ -9,7 +9,7 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.68
+**Version:** 1.69
 
 > **Amendment — frontend approach (supersedes the Dioxus/WASM design below).**
 > This document was written targeting a **Dioxus fullstack / WebAssembly** frontend (`giskard-ui`),
@@ -22,6 +22,28 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.68 → 1.69), process-local thread runtime authority:**
+- **RT1:** `ThreadRuntimeRegistry` is the sole server-facing authority for active-turn ownership,
+  reconnect projection, running tasks, outstanding/resolved requests, and the cross-thread runtime
+  overview. Client-visible agent events enter through one apply operation and receive one
+  process-local sequence; metadata-only/internal events do not consume that sequence or reach the
+  transcript stream.
+- **RT2:** Approval and server-request responses carry `thread_id` and atomically claim a pending
+  request before calling the harness. The authoritative request state moves
+  `pending → responding → resolved`, or back to `pending` on harness failure. Each transition
+  increments the request's process-local revision; revision-gated `RequestState` replacement
+  messages keep tabs aligned and preserve simultaneous requests independently.
+- **RT3:** `ThreadRuntimeOverview { revision, threads }` replaces additive `ThreadActivity` state.
+  It is sent to every connection, including when `threads` is empty, so stale badges are cleared.
+  Notifications remain transition side effects and are not the state authority.
+- **RT4:** `RunningTasks` carries its own process-local `revision` and owns only the Tasks menu and
+  controls. Transcript rows are created and updated only by history, live snapshots, and events.
+- **RT5:** A failed completed-turn append retains the complete `Turn` and its turn lease, publishes
+  `PersistenceBlocked` plus a structured `turn_persistence_blocked` error, and does not publish
+  `TurnCompleted`. M2 deliberately provides no browser retry/discard action: an operator repairs
+  the persistence fault and restarts the server. No change to the durable persistence format is
+  part of this amendment.
 
 **Changelog (1.67 → 1.68), advisory data-directory lock:**
 - **DL1:** One `flock` per data directory (`<data_dir>/.giskard.lock`) supplies the cross-process
@@ -203,9 +225,9 @@
   user" rather than "is an approval". Card rendering stays per-kind: a decision has fixed choices, a
   server request has a per-method form.
 - **SR9:** The waiting state must clear as soon as the user acts, not when the harness confirms.
-  Answering an approval broadcasts `ApprovalResolved`, but a server request's resolved event comes
-  from the harness on its own schedule and may never come, so the browser clears its own waiting
-  state on send.
+  Answering an approval publishes a resolved `RequestState`, but a server request's resolved event
+  comes from the harness on its own schedule and may never come, so the browser clears its own
+  waiting state on send.
 
 **Changelog (1.58 → 1.59), answered server requests survive a reload:**
 - **SR6:** Answering a server request recorded nothing server-side. A request leaves the pending set
@@ -221,6 +243,8 @@
   `answered_approvals` works.
 
 **Changelog (1.57 → 1.58), replaying missed cross-thread activity:**
+The additive messages described in this historical entry were removed by RT3; the replacement
+runtime overview now supplies both live and reconnect state.
 - **SB5:** `ThreadActivity` is broadcast live and was never replayed, so a browser that was closed or
   disconnected when a thread became blocked learned nothing about it: no sidebar badge and no
   notification, until that thread happened to be opened. For a managed sub-agent, which has no
@@ -235,6 +259,8 @@
   was ever shown.
 
 **Changelog (1.56 → 1.57), surfacing a blocked sub-agent:**
+The `ThreadActivity` references in this historical entry now mean the derived state from RT3's
+runtime overview; the hoisting and notification behavior remains current.
 - **SB1:** Approval requests already route correctly to a managed sub-agent thread, but that thread
   is deliberately absent from the sidebar, so every browser affordance keyed to a thread id used to
   no-op for it. The browser must therefore resolve thread identity from the cached per-project
@@ -400,14 +426,15 @@
   default/cancel button treatment while keeping Cancel in the neutral/default style.
 
 **Changelog (1.47 → 1.48), cross-tab approval resolution:**
-- **AR1:** When one browser client answers an approval request, the server broadcasts
-  `ApprovalResolved { thread_id, request_id, decision }` to every client subscribed to that thread
-  after the harness accepts the decision. Other tabs must resolve the matching approval card and
-  remove its actions so a stale duplicate response cannot be submitted. Browser clients that created
-  native notifications for that approval close only notifications keyed to the resolved
-  `(thread_id, request_id)`.
+- **AR1:** When one browser client answers an approval request, the server publishes a resolved
+  `RequestState` to every client subscribed to that thread after the harness accepts the decision.
+  Other tabs must resolve the matching approval card and remove its actions so a stale duplicate
+  response cannot be submitted. Browser clients that created native notifications for that approval
+  close only notifications keyed to the resolved `(thread_id, request_id)`.
 
 **Changelog (1.46 → 1.47), cross-thread activity and browser diagnostics:**
+The additive transport described in TA1 was removed by RT3. Its UI behavior is now derived from the
+authoritative replacement runtime overview.
 - **TA1:** Inactive threads emit lightweight `ThreadActivity` WebSocket messages to all connected
   browser clients. These messages carry the thread id, activity kind, active-turn flag, optional
   kind-specific approval/server-request ids, and a short summary. They are intentionally separate
@@ -3341,7 +3368,8 @@ cursor, H8), `Unsubscribe { thread_id }`,
 `SetPermissionPreset { thread_id, request_id, preset }`,
 `Interrupt { thread_id }`, `CompactContext { thread_id }`,
 `TerminateCommand { thread_id, process_id }`,
-`ApprovalDecision { request_id, decision }`, `SavePlan { thread_id, path }`.
+`ApprovalDecision { thread_id, request_id, decision }`,
+`ServerRequestResponse { thread_id, request_id, response }`, `SavePlan { thread_id, path }`.
 
 `SendInput` and `CompactContext` are serialized per thread by the server before they enter the
 harness. If another normal turn or manual context compaction is already starting or running on the
@@ -3391,13 +3419,11 @@ interactive forwarder owns the turn gate, the passive subscriber yields before b
 
 **Server → client** (examples): `Event { thread_id, agent_event }` (a serialized
 `WireAgentEvent` — the path-mirrored wire form of `AgentEvent`, §3.5),
-`ThreadActivity { thread_id, kind, active_turn, summary?, ...kind_payload }`
-(lightweight cross-thread sidebar/notification signal; `approval_requested` carries
-`approval_id`, and `server_request_received` carries `server_request_id`),
-`ThreadActivityBootstrap { activities: [ThreadActivity] }` (SB5: the outstanding subset of the
-above, sent once to a connecting client only and never broadcast, so a browser that missed the live
-signal still shows what is blocked; a separate message so clients can tell a replay from a live
-event and apply SB6's alert-once-per-session rule),
+`ThreadRuntimeOverview { revision, threads }` (authoritative cross-thread replacement state,
+broadcast globally even when empty),
+`RequestState { thread_id, request_id, revision, payload, status }` (authoritative per-request
+replacement; `revision` orders transitions for that request and `status` is `pending`, `responding`,
+or `resolved`),
 `ThreadState { ...ThreadMetadata, active_turn? }` (typed persisted snapshot; subscribe/resync
 includes `active_turn`, while live metadata publication omits it because runtime liveness has a
 different authority and clock),
@@ -3417,21 +3443,21 @@ already available on both ends. Approval resolution lives only in browser memory
 `answered_approvals` a reload would replay an answered approval as pending and answering it again
 routes a stale id to the harness, which errors — and `answered_server_requests` for the same reason
 (SR6), since a harness's own resolved event may be late or absent),
-`RunningTasks { thread_id, tasks: [RunningTask] }` (commands and tool/MCP calls still known to be
+`RunningTasks { thread_id, revision, tasks: [RunningTask] }` (commands and tool/MCP calls still known to be
 running, including commands that outlived an interrupted turn),
-`ApprovalResolved { thread_id, request_id, decision }`,
 `Error { code, severity, message, detail?, thread_id?, action? }`, `Pong`.
 
 `OpenThreadResponse` may also carry `warning: ErrorInfo?` with the same `code` / `severity` /
 `message` shape when the requested thread was opened but degraded (for example, Codex resume
 failed and Giskard started a fresh native session while keeping persisted history).
 
-**Approval resolution invariant (AR1):** approval requests may be visible in multiple tabs for the
-same subscribed thread. A successful `ApprovalDecision` is the single authoritative answer for that
-request id. After forwarding it to the harness, the server must broadcast `ApprovalResolved` to the
-thread subscribers; each browser must remove the pending actions and render the resolved decision
-card, and close only native browser notifications keyed to that request id. Duplicate/stale
-decisions for a removed request id remain protocol errors.
+**Request resolution invariant (RT2):** approval and server requests may be visible in multiple
+tabs. A response first atomically claims the request in its owning thread. Every tab follows the
+authoritative revision-gated `RequestState`; local send state is never authoritative. A failed or
+timed-out harness call rolls the claim back to pending and publishes that newer state, while a
+successful call commits resolved. Duplicate, wrong-thread, and stale responses are protocol errors.
+`RequestState` is the sole authority for a request's resolution: there is no second, unrevisioned
+message announcing the same fact, because a client cannot gate one against the other.
 
 **Server-request resolution invariant (SR6):** the same holds for server requests, with one
 difference: a harness emits its own resolved event, so the server does not synthesize one. It must
@@ -3486,26 +3512,18 @@ events through the same event handler used for live WebSocket events.
 > Giskard ownership IDs. Native routing identities remain in core/persistence and are resolved by
 > the item-based open endpoint.
 
-- **Fan-out:** the server keeps `thread_id → set<client_conn>` for full transcript traffic and a
-  global connected-client registry for lightweight browser activity. An `AgentEvent` is serialized
-  once and sent only to clients subscribed to that thread. Background threads keep producing events;
-  a client that isn't subscribed to a thread still receives lightweight `ThreadActivity` updates so
-  the sidebar shows activity and approval notifications can fire, but it does not receive the full
-  delta stream or history/live snapshots (bandwidth control).
-- **ThreadActivity:** `kind` is an internally tagged payload: `turn_started`, `progress`,
-  `approval_requested { approval_id }`, `server_request_received { server_request_id }`,
-  `turn_completed`, `error`, or `notice`. The JSON object stays flat for browser consumption
-  (`kind`, `approval_id`, `server_request_id` as top-level fields), but the derived Rust protocol
-  type must make invalid server-side construction unrepresentable. High-volume text deltas are
-  intentionally skipped. Clients must use request ids only for notification/targeting/routing
-  affordances and must still subscribe/open the thread before rendering full transcript state.
-  Current-thread approvals are not notified while the page is visible and focused, but may notify
-  when the page is hidden or the browser window is not focused. The browser must deduplicate the
-  lightweight activity path against the later full approval event for the same
-  `(thread_id, approval_id)`.
+- **Fan-out:** the server keeps `thread_id → set<client_conn>` for transcript traffic and a global
+  connected-client registry for the revisioned runtime overview. An `AgentEvent` is applied once
+  and sent only to clients subscribed to that thread. Background threads remain visible through the
+  lightweight replacement overview without sending their delta stream or history/live snapshots.
+- **Runtime overview:** the browser replaces its complete cross-thread runtime map from each newer
+  `ThreadRuntimeOverview`; it never merges entries additively. Pending/responding requests determine
+  waiting badges, active turns determine running badges, and an empty `threads` array clears all
+  stale runtime badges. Notifications are emitted from request transitions and deduplicated by
+  `(thread_id, request_id)`, but notification state is not used to reconstruct runtime state.
 - **Activity for threads with no sidebar row (SB1–SB4):** managed sub-agent threads are hidden from
-  the sidebar but still produce `ThreadActivity`, so the browser must not derive thread identity
-  from the rendered row. It resolves the project, display title, kind, and parent from the cached
+  the sidebar but still appear in the runtime overview, so the browser must not derive thread
+  identity from the rendered row. It resolves the project, display title, kind, and parent from the cached
   per-project thread summaries, and hoists a hidden thread's activity onto the nearest ancestor
   that does have a row. That row shows the most urgent state among itself and its hidden
   descendants — `approval_requested` > `error` > active turn — names the originating descendant in
@@ -3557,15 +3575,16 @@ events through the same event handler used for live WebSocket events.
   approval and server-request prompts. The live buffer is bounded
   (coalesced/truncated for very long command output, keeping head+tail) to cap memory; the
   authoritative full output still lands on disk at `TurnCompleted`.
-- **Running-task resync (TK1).** Commands can outlive an interrupted turn even after the live buffer
-  is discarded. The server therefore keeps a separate in-memory running-task registry keyed by
+- **Running-task resync (TK1).** Commands can outlive an interrupted turn even after the live
+  projection is discarded. The server therefore keeps running tasks in the process-local thread
+  runtime entry, keyed by
   `thread_id` + `item_id`, updated from command **and tool-call** item start/output/completion
   events. Tool calls are tracked the same way (name + server, elapsed time, output tail) and shown
   in the same `Tasks` menu, but they carry no `process_id` and do not outlive their turn: a
   tool still running when its turn completes (i.e. an interrupted turn) is dropped, while commands
   are kept as `after_turn`. Stopping a tool has no per-call cancel in Codex, so the browser sends
   `Interrupt { thread_id }` (turn-level) rather than `TerminateCommand`. On subscribe, and after
-  each registry change, the server sends `RunningTasks`; the browser renders these in the header
+  each task revision change, the server sends revisioned `RunningTasks`; the browser renders these in the header
   `Tasks` menu and maps `item_id` back to the transcript row for select/scroll (tool transcript
   rows are owned by the item stream, not re-rendered from the snapshot).
   `TerminateCommand` requests are forwarded to the active harness. Giskard must not terminate

@@ -35,6 +35,7 @@ struct ServerRequestHarness {
     active: Mutex<Option<(ThreadId, TurnId)>>,
     responses: Mutex<Vec<(ServerRequestId, ServerRequestResponse)>>,
     fail_next_response: Mutex<Option<HarnessError>>,
+    hang_next_response: Mutex<bool>,
     /// When set, routing a response does not emit `ServerRequestResolved`/`TurnCompleted`. Real
     /// harnesses resolve on their own schedule and may never resolve at all, and that window is
     /// exactly what the reconnect snapshot has to survive.
@@ -49,6 +50,7 @@ impl ServerRequestHarness {
             active: Mutex::new(None),
             responses: Mutex::new(Vec::new()),
             fail_next_response: Mutex::new(None),
+            hang_next_response: Mutex::new(false),
             suppress_resolution: Mutex::new(false),
         }
     }
@@ -59,6 +61,10 @@ impl ServerRequestHarness {
 
     async fn fail_next_response(&self, error: HarnessError) {
         *self.fail_next_response.lock().await = Some(error);
+    }
+
+    async fn hang_next_response(&self) {
+        *self.hang_next_response.lock().await = true;
     }
 
     async fn wait_for_response(&self) -> (ServerRequestId, ServerRequestResponse) {
@@ -164,6 +170,9 @@ impl AgentHarness for ServerRequestHarness {
         req: ServerRequestId,
         response: ServerRequestResponse,
     ) -> Result<(), HarnessError> {
+        if std::mem::take(&mut *self.hang_next_response.lock().await) {
+            std::future::pending::<()>().await;
+        }
         if let Some(error) = self.fail_next_response.lock().await.take() {
             return Err(error);
         }
@@ -342,6 +351,7 @@ async fn websocket_server_request_response_routes_to_harness() {
 
     wait_for_server_request(&mut ws).await;
     ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+        thread_id,
         request_id: "srv_1".into(),
         response: ServerRequestResponse::result(serde_json::json!({
             "answers": { "confirm": { "answers": ["Yes"] } }
@@ -380,6 +390,7 @@ async fn websocket_server_request_error_response_routes_to_harness() {
 
     wait_for_server_request(&mut ws).await;
     ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+        thread_id,
         request_id: "srv_1".into(),
         response: ServerRequestResponse::error(-32000, "cancelled"),
     }))
@@ -421,6 +432,7 @@ async fn websocket_server_request_response_failure_can_be_retried() {
         .await;
 
     ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+        thread_id,
         request_id: "srv_1".into(),
         response: ServerRequestResponse::result(serde_json::json!({
             "answers": { "confirm": { "answers": ["Yes"] } }
@@ -441,6 +453,7 @@ async fn websocket_server_request_response_failure_can_be_retried() {
     );
 
     ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+        thread_id,
         request_id: "srv_1".into(),
         response: ServerRequestResponse::result(serde_json::json!({
             "answers": { "confirm": { "answers": ["Yes"] } }
@@ -457,6 +470,49 @@ async fn websocket_server_request_response_failure_can_be_retried() {
         }
         ServerRequestResponse::Error { .. } => panic!("expected retry result response"),
     }
+}
+
+#[tokio::test]
+async fn timed_out_server_request_response_republishes_pending_to_peer_tabs() {
+    let (_tmp, harness, addr, cookie, thread_id) = spawn_test_app().await;
+    let mut claimant = connect_ws(addr, &cookie).await;
+    let mut peer = connect_ws(addr, &cookie).await;
+    for ws in [&mut claimant, &mut peer] {
+        ws.send(ws_text(&ClientMessage::Subscribe {
+            thread_id,
+            since: None,
+        }))
+        .await
+        .unwrap();
+    }
+    claimant
+        .send(ws_text(&ClientMessage::SendInput {
+            thread_id,
+            text: "ask me".into(),
+            attachments: Vec::new(),
+        }))
+        .await
+        .unwrap();
+    wait_for_server_request(&mut claimant).await;
+    let pending = wait_for_request_state(&mut peer, "pending").await;
+    assert_eq!(pending.revision, 1);
+
+    harness.hang_next_response().await;
+    claimant
+        .send(ws_text(&ClientMessage::ServerRequestResponse {
+            thread_id,
+            request_id: "srv_1".into(),
+            response: ServerRequestResponse::result(serde_json::json!({ "answers": ["Yes"] })),
+        }))
+        .await
+        .unwrap();
+
+    let responding = wait_for_request_state(&mut peer, "responding").await;
+    assert_eq!(responding.revision, 2);
+    let error = wait_for_ws_error(&mut claimant).await;
+    assert_eq!(error.code, "harness_timeout");
+    let rolled_back = wait_for_request_state(&mut peer, "pending").await;
+    assert_eq!(rolled_back.revision, 3);
 }
 
 #[tokio::test]
@@ -530,6 +586,7 @@ async fn answered_server_request_is_not_pending_after_reconnect() {
     wait_for_server_request(&mut ws).await;
 
     ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+        thread_id,
         request_id: "srv_1".into(),
         response: ServerRequestResponse::result(serde_json::json!({ "answers": ["main"] })),
     }))
@@ -586,6 +643,7 @@ async fn websocket_unknown_server_request_response_surfaces_error() {
     .await
     .unwrap();
     ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+        thread_id,
         request_id: "missing".into(),
         response: ServerRequestResponse::error(-32000, "missing"),
     }))
@@ -630,6 +688,33 @@ async fn wait_for_ws_error(ws: &mut TestWs) -> giskard_proto::ErrorInfo {
         }
     }
     panic!("error message not observed");
+}
+
+async fn wait_for_request_state(
+    ws: &mut TestWs,
+    expected_status: &str,
+) -> giskard_proto::RequestState {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                if let Ok(ServerMessage::RequestState(state)) = serde_json::from_str(&text) {
+                    let matches = matches!(
+                        (&state.status, expected_status),
+                        (giskard_proto::RequestStatus::Pending, "pending")
+                            | (giskard_proto::RequestStatus::Responding, "responding")
+                            | (giskard_proto::RequestStatus::Resolved { .. }, "resolved")
+                    );
+                    if state.request_id == "srv_1" && matches {
+                        return state;
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => {}
+        }
+    }
+    panic!("request state {expected_status} not observed");
 }
 
 /// Every server-request row in the snapshot, paired with whether a reconnecting client would

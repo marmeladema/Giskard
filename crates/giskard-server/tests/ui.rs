@@ -122,13 +122,15 @@ async fn index_page_is_served_and_public() {
         "UI renders approval requests as actionable transcript cards"
     );
     assert!(
-        body.contains("case \"approval_resolved\"")
-            && body.contains("resolveApprovalRequest(msg.request_id, msg.decision)")
+        !body.contains("approval_resolved")
+            && body.contains("if (resolution.kind === \"approval\") resolveApprovalRequest(id, resolution.decision);")
             && body.contains("function resolveApprovalRequest(id, decision)")
             && body.contains("closeWaitingNotification(tid, id)")
             && body.contains("const msg = entry ? entry.msg : waitingRequestRowById(id)")
             && body.contains("state.pendingApprovals.delete(id)"),
-        "approval decisions broadcast from another tab resolve pending approval cards"
+        "an approval answered in another tab resolves the card here through the revision-gated \
+         request state, and through nothing else — a second, unrevisioned resolution message would \
+         be a second authority the browser could not order against the first"
     );
     assert!(
         body.contains("type:\"approval_decision\""),
@@ -700,18 +702,23 @@ async fn index_page_is_served_and_public() {
          re-prompting — a harness resolved event may be late or never arrive"
     );
     assert!(
-        body.contains("msg.type === \"thread_activity_bootstrap\"")
-            && body.contains("function handleThreadActivityBootstrap(msg)")
-            && body.contains("{ source:\"connect_bootstrap\" }")
+        body.contains("msg.type === \"thread_runtime_overview\"")
+            && body.contains("function handleThreadRuntimeOverview(overview)")
+            && body.contains("source: \"runtime_overview\"")
             && body.contains("bootstrapNotifiedRequests:new Set()")
-            && body.contains(
-                "if (activity.source === \"connect_bootstrap\" && state.bootstrapNotifiedRequests.has(notificationKey))"
-            )
             && body.contains("function releaseWaitingNotificationClaim(notificationKey)"),
         "activity the client missed while disconnected is replayed on connect and repaints the \
          badge, but alerts at most once per page session — the 15s dedup window cannot answer \
          \"have we ever alerted for this?\", so a resuming laptop would otherwise re-alert for the \
          same blocked approval"
+    );
+    assert!(
+        body.contains("const waiting = requests.find(request => !request.responding);")
+            && !body.contains("!request.responding) || requests[0]"),
+        "the overview lists pending and responding requests alike, so the waiting badge picks a \
+         pending one and never falls back to a responding request — the user already answered \
+         that one, and treating it as waiting would both misreport it and burn its one-shot \
+         notification claim"
     );
     assert!(
         body.contains("if (!knownThreadMeta(tid)) noteUnresolvedThread(tid);")
@@ -881,11 +888,15 @@ async fn index_page_is_served_and_public() {
             && body.contains("function renderPersistedTurn(turn) {\n  breakTaskGroup();"),
         "history rendering preserves live grouping state and breaks groups at turn boundaries"
     );
+    let running_snapshot = between(
+        &body,
+        "function renderRunningCommandSnapshot(commands) {",
+        "function renderEndedCommandBody(body, cmd, status, opts)",
+    );
     assert!(
-        body.contains("renderItemBody(toolBody, {")
-            && body.contains("name:cmd.command || \"tool\"")
-            && body.contains("state.streamElsByItemId.set(key, toolBody)"),
-        "running tool snapshots create grouped transcript rows when no stream row exists yet"
+        !running_snapshot.contains("renderItemBody")
+            && !running_snapshot.contains("state.streamElsByItemId.set"),
+        "running task snapshots are menu-only and never synthesize transcript rows"
     );
     assert!(
         !body.contains("id=\"ctxCommands\""),
@@ -2530,19 +2541,18 @@ fn browser_scopes_running_command_completion_identity_to_turn() {
     );
     for expected in [
         "const key = scopedItemKey(info.turn_id, info.item_id);",
-        "const snapshotItem = { id:info.item_id, harness_item_id:info.harness_item_id || \"\" };",
         "const existing = state.runningCommands.get(key);",
-        "let body = commandBodyFor(key);",
-        "registerRenderedItemBody(toolBody, snapshotItem, info.turn_id);",
-        "registerRenderedItemBody(body, snapshotItem, info.turn_id);",
+        "state.runningCommands.set(key, cmd);",
+        "state.runningCommands.delete(id);",
+        "renderRunningCommands();",
     ] {
         assert!(
             snapshot.contains(expected),
             "running task snapshots must keep scoped DOM identity: `{expected}`"
         );
     }
-    assert!(snapshot.contains("if (body && stopRequested) {"));
-    assert!(!snapshot.contains("cmd.afterTurn || !cmd.processId"));
+    assert!(!snapshot.contains("registerRenderedItemBody"));
+    assert!(!snapshot.contains("commandBodyFor"));
 
     let start = between(
         body,
@@ -2748,8 +2758,8 @@ fn sidebar_activity_notifications_target_approval_rows() {
     assert!(body.contains("waitingNotifications:new Map()"));
     assert!(body.contains("lastNotificationPromptNoticeAt:0"));
     assert!(body.contains("NOTIFICATION_DEDUP_MS"));
-    assert!(body.contains("function handleThreadActivity(msg)"));
-    assert!(body.contains("if (msg && msg.type === \"thread_activity\")"));
+    assert!(body.contains("function handleThreadRuntimeOverview(overview)"));
+    assert!(body.contains("if (msg && msg.type === \"thread_runtime_overview\")"));
     assert!(body.contains("function renderThreadActivityIndicator(tid, hosts)"));
     assert!(body.contains("activity.kind === \"approval_requested\""));
     assert!(
@@ -2757,22 +2767,14 @@ fn sidebar_activity_notifications_target_approval_rows() {
             "if (activityWaitsOnUser(activity)) maybeNotifyWaitingRequest(tid, activity);"
         )
     );
-    assert!(body.contains("server_request_id: msg.server_request_id || null"));
+    assert!(body.contains("server_request_id: approval ? null : waiting.request_id"));
     // "Running" is now the complement of "waiting on the user", not of "approval" specifically —
     // a thread waiting on a server request must not also read as merely running.
     assert!(body.contains("activity.active_turn && !activityWaitsOnUser(activity)"));
     assert!(body.contains("else if (activity.active_turn) status.textContent = \"o\""));
     assert!(!body.contains("else if (activity.active_turn) status.textContent = \">\""));
-    assert!(body.contains("function setActiveThreadActivity(kind, activeTurn, summary, extra)"));
-    assert!(body.contains("source: \"active_thread_event\""));
-    assert!(body.contains("setActiveThreadActivity(\"progress\", true, \"Turn running\")"));
-    assert!(
-        body.contains("setActiveThreadActivity(\"turn_completed\", false, \"Turn completed\")")
-    );
-    assert!(body.contains("ACTIVE_THREAD_COMPLETED_MARK_MS = 2500"));
-    assert!(body.contains("function clearActiveThreadActivityLater(tid, kind)"));
-    assert!(body.contains("clearApprovalThreadActivity(tid, id)"));
-    assert!(body.contains("clearServerRequestThreadActivity(tid, id)"));
+    assert!(body.contains("state.threadActivity = replacement;"));
+    assert!(body.contains("source: \"runtime_overview\""));
     assert!(!body.contains("!!activity && !current &&"));
     assert!(body.contains("function initNotificationSettings()"));
     assert!(body.contains("function notificationPermissionButtons()"));
@@ -2812,7 +2814,6 @@ fn sidebar_activity_notifications_target_approval_rows() {
     assert!(body.contains("function pruneNotificationDedup(now)"));
     assert!(body.contains("function waitingNotificationKey(tid, requestId)"));
     assert!(body.contains("const requestKey = requestId === undefined || requestId === null"));
-    assert!(body.contains("String(approvalId)"));
     assert!(body.contains("if (!threadKey || !requestKey) return \"\";"));
     assert!(body.contains("return `${threadKey}:${requestKey}`;"));
     assert!(body.contains("function trackWaitingNotification(key, notification)"));
@@ -2839,9 +2840,7 @@ fn sidebar_activity_notifications_target_approval_rows() {
     ));
     assert!(body.contains("source: \"agent_event_approval_requested\""));
     assert!(body.contains("source: \"live_turn_snapshot_outstanding_approval\""));
-    // Live events default to "thread_activity"; a connect replay overrides it so the notification
-    // gate can tell the two apart.
-    assert!(body.contains("source: msg.source || \"thread_activity\""));
+    assert!(body.contains("source: \"runtime_overview\""));
     assert!(body.contains("waiting_notify_received"));
     assert!(body.contains("waiting_notify_suppressed_visible_current_thread"));
     assert!(body.contains("waiting_notify_constructor_failed"));

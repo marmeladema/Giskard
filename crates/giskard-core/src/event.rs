@@ -100,6 +100,26 @@ pub enum AgentEvent {
     },
 }
 
+impl AgentEvent {
+    pub fn thread_id(&self) -> ThreadId {
+        match self {
+            Self::ThreadOpened { thread, .. }
+            | Self::TurnStarted { thread, .. }
+            | Self::ContextWindowUpdated { thread, .. }
+            | Self::ItemStarted { thread, .. }
+            | Self::ItemDelta { thread, .. }
+            | Self::ItemCompleted { thread, .. }
+            | Self::DiffUpdated { thread, .. }
+            | Self::ApprovalRequested { thread, .. }
+            | Self::ServerRequestReceived { thread, .. }
+            | Self::ServerRequestResolved { thread, .. }
+            | Self::TurnCompleted { thread, .. }
+            | Self::Error { thread, .. }
+            | Self::Notice { thread, .. } => *thread,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
