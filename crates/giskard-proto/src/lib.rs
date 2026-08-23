@@ -47,9 +47,9 @@ pub enum ClientMessage {
     Subscribe {
         thread_id: ThreadId,
         /// Incremental resync cursor: the newest turn the client already has rendered. When present
-        /// and resolvable, the server replies with a `HistoryDelta` of just the turns after it
-        /// instead of a full `HistoryPage`, so the browser keeps its immutable completed-turn DOM
-        /// and repaints only the in-flight turn. Omitted (or unresolvable) → a full snapshot.
+        /// and resolvable, the server replies with a `HistoryDelta` of just the turns after it.
+        /// An unresolvable cursor, or an omitted cursor on a fresh subscription, produces a
+        /// bounded reset delta. Older-page pagination is loaded independently over HTTP.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         since: Option<TurnId>,
     },
@@ -98,15 +98,6 @@ pub enum ClientMessage {
     SavePlan {
         thread_id: ThreadId,
         path: String,
-    },
-    /// Request an older page of history (H6): the `limit` turns before `before` (a `TurnId`
-    /// cursor); `before: None` requests the most recent page.
-    LoadHistory {
-        thread_id: ThreadId,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        before: Option<TurnId>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        limit: Option<usize>,
     },
     Ping,
 }
@@ -306,18 +297,16 @@ pub enum ServerMessage {
     /// A committed thread-catalog projection changed. The browser refetches the authoritative
     /// project list; repeated invalidations coalesce client-side.
     ThreadCatalogChanged,
-    /// A page of persisted history (H6), oldest-first; `has_more` if older turns exist before it.
-    HistoryPage {
-        thread_id: ThreadId,
-        turns: Vec<WireTurn>,
-        has_more: bool,
-    },
-    /// Incremental-resync delta: the persisted turns that completed after the client's `since`
-    /// cursor, oldest-first. The client keeps its existing transcript, repaints only the in-flight
-    /// turn, and appends these. Sent instead of `HistoryPage` when a resolvable `since` was given.
+    /// Bootstrap-only reconnect history, oldest-first. Normally contains turns after `since`;
+    /// `reset` marks the bounded replacement returned for a stale cursor.
     HistoryDelta {
         thread_id: ThreadId,
         turns: Vec<WireTurn>,
+        /// The cursor was stale; replace completed history with this bounded initial view.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        reset: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        has_more: Option<bool>,
     },
     LiveTurnSnapshot(LiveTurnSnapshot),
     RunningTasks {

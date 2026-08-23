@@ -671,7 +671,7 @@
 - **WS1:** Browser clients must reject stale messages from a replaced WebSocket connection and must
   ignore any thread-scoped server message whose `thread_id` does not match the currently selected
   thread. This guard applies before rendering or mutating transcript state for `ThreadState`,
-  `HistoryPage`, `LiveTurnSnapshot`, `RunningTasks`, `Event`, and thread-scoped `Error`.
+  `HistoryDelta`, `LiveTurnSnapshot`, `RunningTasks`, `Event`, and thread-scoped `Error`.
 - **WS2 (superseded by ST1–ST3):** Thread token totals now travel only in revisioned
   `ThreadMetadata`; the standalone `TokenUpdate` message and `TokenScope` were removed.
 - **WS3:** Event forwarders must verify that each incoming `AgentEvent.thread` matches the
@@ -1119,18 +1119,20 @@
 - **H3:** Append history first, then update metadata aggregates. Aggregates are a recomputable
   cache (like `context_window`, C4); `recompute_aggregates(thread)` folds the JSONL to repair after a
   crash between the two writes.
-- **H4/H6:** Restore/list read only `.json` (no history parse). Opening a thread loads the last N
-  turns; older pages load on demand via `LoadHistory { thread_id, before: TurnId, limit }` →
-  `HistoryPage { thread_id, turns: [WireTurn], has_more }`, decoupled from the `ThreadState`
-  snapshot (§13.6). Page sizes are config (`[history] initial`/`page`, §16.3). `TurnId` (ULID) is the
-  pagination cursor — no index file.
+- **H4/H6 (transport amended by M1):** Restore/list read only metadata. Opening a thread receives
+  the last N completed turns as bootstrap-only `HistoryDelta`; older pages load on demand through authenticated
+  `GET /api/projects/{project_id}/threads/{thread_id}/history?before=TurnId&limit=N`, returning
+  `{ thread_id, turns: [WireTurn], has_more }`. Page sizes are config (`[history] initial`/`page`,
+  §16.3), and requested counts are capped at 100. `LoadHistory` and `HistoryPage` are not WebSocket
+  protocol variants.
 - **H5:** The loader composes `[last N turns from JSONL] + [live turn from the live buffer]`; the
   in-flight turn is not in the JSONL until `TurnCompleted`.
 - **H8:** Incremental reconnect: a `Subscribe { since: TurnId }` cursor requests only the turns after
   it, served history-first as `HistoryDelta { thread_id, turns: [WireTurn] }` (via
   `load_turns_after`). Because persisted turns are immutable, the browser keeps its completed-turn
   DOM and repaints only the in-flight turn. An unresolvable cursor (stale/unknown turn) falls back to
-  a full `HistoryPage` sent history-first so the client rebuilds cleanly before the live snapshot.
+  a bounded reset `HistoryDelta` sent history-first so the client rebuilds cleanly before the live
+  snapshot. Normal older-history pagination uses HTTP.
 - **H7:** `giskard-admin`: `compact_thread`/`dump_thread` operate on the `.jsonl`, plus
   `recompute_aggregates`; `validate` parses the JSONL line-by-line and reports the first bad line
   rather than quarantining whole histories (§5.5).
@@ -3305,6 +3307,13 @@ latest persisted turn timestamp; it never uses the repair time.
   `POST /api/projects/{project_id}/threads/start` with
   `{ text, attachments?, model_ref, mode, permission_preset }` and returns
   `{ thread_id, harness_thread_id, turn_id, warning? }`.
+
+- **Completed-history pages are REST-backed:**
+  `GET /api/projects/{project_id}/threads/{thread_id}/history?before?&limit?` returns
+  `{ thread_id, turns, has_more }`. The server clamps `limit` to 1–100. The browser discards a
+  response if its active-view generation changed while the request was in flight, including an
+  A → B → A navigation back to the same IDs. Pagination has no
+  WebSocket ordering semantics; `LoadHistory` and `HistoryPage` do not exist in the wire protocol.
 
   A transcript link is opened through
   `POST /api/projects/{project_id}/threads/{parent_thread_id}/subagent-links/{item_id}/open`.

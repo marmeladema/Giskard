@@ -145,7 +145,7 @@ const THREAD_DELETE_TIMEOUT_MS = 30000;
 const THREAD_LIST_RETRY_BASE_MS = 500;
 const THREAD_LIST_RETRY_MAX_MS = 10000;
 let state = {
-  projectId:null, threadId:null, mode:"build", ws:null, wsStatus:"closed", wsConnectId:0,
+  projectId:null, threadId:null, activeViewGeneration:0, mode:"build", ws:null, wsStatus:"closed", wsConnectId:0,
   wsReconnectTimer:null, wsReconnectAttempt:0, wsStatusDetail:"WebSocket disconnected",
   wsLastProblem:"", wsLastProblemNotice:"", wsLastProblemNoticeAt:0,
   wsProbeTimer:null, wsProbeToken:0, wsProbeSocket:null,
@@ -239,6 +239,25 @@ async function api(method, path, body, options) {
   } finally {
     if (timeoutId !== null) clearTimeout(timeoutId);
   }
+}
+
+// Async work tied to the selected project/thread must compare the view generation, not only the
+// IDs. A user can navigate A → B → A while A's first request is still in flight; matching IDs
+// alone would then let that obsolete response mutate the second visit to A.
+function setActiveViewIdentity(projectId, threadId) {
+  state.activeViewGeneration += 1;
+  state.projectId = projectId;
+  state.threadId = threadId;
+}
+function captureActiveViewIdentity() {
+  return {
+    generation:state.activeViewGeneration,
+    projectId:state.projectId,
+    threadId:state.threadId
+  };
+}
+function activeViewIdentityIsCurrent(view) {
+  return !!view && view.generation === state.activeViewGeneration;
 }
 function apiFailureMessage(e) {
   const msg = e && e.message ? e.message : String(e);
@@ -618,7 +637,7 @@ function recordReconnectMessageRendered(ws, msgType, startedAtMs, msg) {
 function reconnectResyncComplete(metrics, msgType) {
   if (!metrics) return false;
   if (metrics.subscribeMode === "incremental") return msgType === "running_tasks";
-  if (metrics.subscribeMode === "full") return msgType === "history_page";
+  if (metrics.subscribeMode === "full") return msgType === "running_tasks";
   return false;
 }
 
@@ -2087,7 +2106,7 @@ function clearThreadView(tid) {
     ws._giskardExpectedClose = true;
     try { ws.close(); } catch {}
   }
-  state.projectId = null; state.threadId = null;
+  setActiveViewIdentity(null, null);
   renderParentThreadButton();
   state.draftThread = null;
   state.firstTurnStartingThreadId = null;
@@ -2453,8 +2472,7 @@ function openDraftThread(pid) {
     try { oldWs.close(); } catch {}
   }
 
-  state.projectId = pid;
-  state.threadId = null;
+  setActiveViewIdentity(pid, null);
   renderParentThreadButton();
   // `modelLoading` until the project's default arrives; `currentModel` stays null until then so a
   // placeholder can never reach `threads/start` (LT7).
@@ -2538,7 +2556,8 @@ async function openThread(pid, tid, title, opts) {
   // a notification click can even land in another project. Close it rather than leave it showing
   // one workspace's file while the app is somewhere else.
   closeCodeOverlay();
-  state.projectId = pid; state.threadId = tid; state.pendingUserEl = null; state.pendingUserText = null;
+  setActiveViewIdentity(pid, tid);
+  state.pendingUserEl = null; state.pendingUserText = null;
   renderParentThreadButton();
   state.threadReadOnly = false; state.readOnlyProvider = null; state.readOnlyMessage = null;
   updateReadOnlyBanner();
@@ -3007,7 +3026,6 @@ function isThreadScopedServerMessage(msg) {
   switch (msg.type) {
     case "thread_state":
     case "thread_metadata_result":
-    case "history_page":
     case "history_delta":
     case "live_turn_snapshot":
     case "running_tasks":
@@ -3055,7 +3073,6 @@ function handleServer(msg, ws) {
       applyThreadMetadata(msg);
       finishMetadataAction(msg.request_id);
       break;
-    case "history_page": renderHistoryPage(msg); break;
     case "history_delta": renderHistoryDelta(msg); break;
     case "live_turn_snapshot": renderLiveTurnSnapshot(msg); break;
     case "running_tasks":
@@ -3635,8 +3652,7 @@ function renderThreadState(s, activeTurn) {
   const appliesBootstrap = Object.prototype.hasOwnProperty.call(s, "active_turn");
   const recoverConflict = appliesBootstrap &&
     state.pendingDetailConflictResyncs.has(String(s.thread_id || ""));
-  const shouldResetTranscript = appliesBootstrap &&
-    (state.awaitingInitialThreadState || state.awaitingThreadResync);
+  const shouldResetTranscript = appliesBootstrap && state.awaitingThreadResync;
   // An incremental resync keeps the transcript. Remember whether the viewport was pinned to the
   // bottom now, before the in-flight turn is repainted, so we can restore that afterwards.
   if (appliesBootstrap && state.awaitingIncrementalResync) {
@@ -3795,20 +3811,9 @@ function setPermissionPreset(preset) {
   updateTurnButton();
 }
 
-// Render the most recent page of persisted history (H6), oldest-first. Older pages are available
-// via LoadHistory { before: oldestTurnId } when has_more is set (wired to the "Load older" button).
+// Render an authenticated HTTP history response, oldest-first.
 function renderHistoryPage(msg) {
-  // A full page arriving while we expected a resync delta means the server couldn't honor our
-  // cursor (stale/unknown turn) and fell back to a full snapshot. It is sent history-first, so we
-  // still own the transcript here: rebuild it from scratch, then render this as a normal initial
-  // page (the live turn appends afterwards).
-  if (state.awaitingIncrementalResync) {
-    state.awaitingIncrementalResync = false;
-    state.resyncStickBottom = false;
-    state.pendingLiveSnapshotReconcile = false;
-    resetTranscriptForAuthoritativeSnapshot();
-  }
-  // `older` marks a page fetched *above* what's already shown: a scroll-up LoadHistory or an
+  // `older` marks a page fetched *above* what's already shown: a scroll-up HTTP request or an
   // open-time autofill top-up. The first (initial) page is the only one that is not `older`.
   const older = state.pendingOlder;
   state.pendingOlder = false;
@@ -3856,6 +3861,13 @@ function renderHistoryPage(msg) {
 // until the live snapshot arrives; the snapshot handler removes and recreates the live block
 // synchronously, avoiding a visible blank gap between the history-delta and live-snapshot messages.
 function renderHistoryDelta(msg) {
+  if (msg.reset) {
+    state.awaitingIncrementalResync = false;
+    state.resyncStickBottom = false;
+    resetTranscriptForAuthoritativeSnapshot();
+    renderHistoryPage({ turns:msg.turns || [], has_more:!!msg.has_more });
+    return;
+  }
   state.awaitingIncrementalResync = false;
   const turns = msg.turns || [];
   const liveId = state.activeTurn && state.currentRenderTurnId != null
@@ -4025,7 +4037,7 @@ function removeTurnRows(turnId) {
 
 // After each history page lands, keep topping up (oldest-first, in small batches) until the
 // transcript holds ~HISTORY_FILL_SCREENS viewports of scrollback, we run out of history, or we hit
-// the safety cap. This reuses the scroll-up LoadHistory path, so pages arrive as `older` and are
+// the safety cap. This reuses the scroll-up HTTP path, so pages arrive as `older` and are
 // prepended without moving the viewport. Measuring pixels here is deliberate: only the browser
 // knows how tall rendered turns are, so the server cannot page by screen.
 function maybeAutoFillHistory() {
@@ -4037,9 +4049,29 @@ function maybeAutoFillHistory() {
   if (t.scrollHeight >= t.clientHeight * HISTORY_FILL_SCREENS) return;
   state.loadingHistory = true;
   state.pendingOlder = true;
-  if (!send({ type:"load_history", thread_id: state.threadId, before: state.oldestTurnId, limit: HISTORY_FILL_BATCH })) {
+  loadHistoryPage(state.oldestTurnId, HISTORY_FILL_BATCH, true);
+}
+
+async function loadHistoryPage(before, limit, older) {
+  const view = captureActiveViewIdentity();
+  const projectId = view.projectId;
+  const threadId = view.threadId;
+  if (!projectId || !threadId) return;
+  state.loadingHistory = true;
+  state.pendingOlder = !!older;
+  const query = new URLSearchParams();
+  if (before) query.set("before", before);
+  if (limit) query.set("limit", String(limit));
+  const suffix = query.toString() ? `?${query}` : "";
+  try {
+    const page = await api("GET", `/api/projects/${projectId}/threads/${threadId}/history${suffix}`);
+    if (!activeViewIdentityIsCurrent(view)) return;
+    renderHistoryPage(page);
+  } catch (e) {
+    if (!activeViewIdentityIsCurrent(view)) return;
     state.loadingHistory = false;
     state.pendingOlder = false;
+    notice(`Could not load thread history: ${apiFailureMessage(e)}`, "error");
   }
 }
 
@@ -4084,7 +4116,7 @@ function onTranscriptScroll() {
   if (t.scrollTop < 80 && state.hasMoreHistory && !state.loadingHistory && state.oldestTurnId && state.threadId) {
     state.loadingHistory = true;
     state.pendingOlder = true;
-    send({ type:"load_history", thread_id: state.threadId, before: state.oldestTurnId });
+    loadHistoryPage(state.oldestTurnId, null, true);
   }
 }
 
