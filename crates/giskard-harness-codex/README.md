@@ -445,18 +445,26 @@ Codex includes the effective context capacity in
 actually applies after reserving any model-specific headroom, so it is authoritative
 for the thread gauge even when it differs from a provider's raw advertised maximum.
 
-The adapter emits `AgentEvent::ContextWindowUpdated` whenever the valid reported
-value changes and suppresses consecutive unchanged repeats. Each event carries the
-model selected for that turn, which the adapter records when `turn/start` is
-acknowledged. Non-positive values and values outside Giskard's `u32` range are logged
-and ignored without dropping the notification's token usage. The server persists
-accepted values per `(provider, model)` so they survive reloads and model switches.
+During an active turn, the adapter emits `AgentEvent::ContextWindowUpdated` whenever
+the valid reported value changes and suppresses consecutive unchanged repeats. Each
+event carries the model selected for that turn.
+The server persists accepted values per `(provider, model)` so they survive reloads
+and model switches.
 
 Existing threads initialize the gauge from Giskard's latest persisted runtime value
 for the selected model. If none has been observed, they use provider/config metadata
 or the conservative fallback. Codex may replay historical token usage after
-`thread/resume`; that replay is not a new turn observation and is not folded into
-Giskard's ledgers or context-window metadata.
+`thread/resume`; that replay is not a new turn and is never folded into Giskard's
+token ledger. After a successful resume that reports an authoritative model, the
+adapter offers the first valid matching window through the bounded thread-update
+channel with that model. The runtime registry accepts it only when no newer turn,
+compaction, or deletion lifecycle superseded the open. This observation has no
+time-based deadline.
+
+An invalid or out-of-range `modelContextWindow` suppresses only the context-window
+update. It never suppresses the turn's token usage, which is still attached on
+`turn/completed`. While unresolved, a pending restore keeps the Codex message loop
+awake so an arbitrarily late update can still be observed.
 
 ## Restart and unload behavior
 

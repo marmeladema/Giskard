@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, warn};
 
 use giskard_core::approval::ApprovalDecision;
@@ -309,6 +309,47 @@ pub struct OpenThreadOptions {
     /// would silently move an existing conversation onto a different model. Starting a fresh
     /// thread, and reopening one Giskard already tracks, both pass `Some`.
     pub initial_model: Option<ModelRef>,
+    /// Bounded, non-blocking destination for metadata discovered after open returns.
+    pub updates: ThreadUpdateSink,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadUpdate {
+    ContextWindowRestored {
+        model: ModelRef,
+        context_window: u32,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct ThreadUpdateSink(mpsc::Sender<ThreadUpdate>);
+
+impl ThreadUpdateSink {
+    pub fn send(&self, update: ThreadUpdate) -> Result<(), ThreadUpdateSendError> {
+        self.0.try_send(update).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(update) => ThreadUpdateSendError::Full(update),
+            mpsc::error::TrySendError::Closed(update) => ThreadUpdateSendError::Closed(update),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadUpdateSendError {
+    Full(ThreadUpdate),
+    Closed(ThreadUpdate),
+}
+
+pub struct ThreadUpdateStream(mpsc::Receiver<ThreadUpdate>);
+
+impl ThreadUpdateStream {
+    pub async fn recv(&mut self) -> Option<ThreadUpdate> {
+        self.0.recv().await
+    }
+}
+
+pub fn thread_update_channel() -> (ThreadUpdateSink, ThreadUpdateStream) {
+    let (tx, rx) = mpsc::channel(1);
+    (ThreadUpdateSink(tx), ThreadUpdateStream(rx))
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

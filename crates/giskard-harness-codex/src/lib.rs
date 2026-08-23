@@ -30,7 +30,7 @@ use giskard_core::mcp::{
     McpAuthStatus, McpOauthStart, McpResource, McpResourceTemplate, McpServerInfo, McpServerStatus,
     McpTool,
 };
-use giskard_core::model::ModelDescriptor;
+use giskard_core::model::{ModelDescriptor, ModelRef};
 use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::text::trimmed_non_empty;
 use giskard_core::token::TokenUsage;
@@ -38,7 +38,7 @@ use giskard_core::turn::{PermissionPreset, TurnOverrides, TurnStatus, TurnStatus
 use giskard_core::{AttachmentKind, UserAttachment, UserInput};
 use giskard_harness::{
     AgentEventStream, AgentHarness, HarnessCapabilities, HarnessNotice, HarnessProvider,
-    OpenThreadOptions, ProviderAuth, ProviderAuthCommand, ResumePolicy, ThreadHandle,
+    OpenThreadOptions, ProviderAuth, ProviderAuthCommand, ResumePolicy, ThreadHandle, ThreadUpdate,
 };
 
 use mapping::CodexMapper;
@@ -60,6 +60,17 @@ const WORKER_QUEUE_WARN_AFTER: Duration = Duration::from_secs(10);
 const WORKER_QUEUE_WARN_AFTER: Duration = Duration::from_millis(50);
 const THREAD_BACKGROUND_TERMINALS_TERMINATE: &str = "thread/backgroundTerminals/terminate";
 const CODEX_UPLOAD_DIR_NAME: &str = "giskard-codex-uploads";
+
+struct PendingContextRestore {
+    thread: ThreadId,
+    model: ModelRef,
+    sink: giskard_harness::ThreadUpdateSink,
+}
+
+struct OpenThreadOutcome {
+    handle: ThreadHandle,
+    resume_replay_model: Option<ModelRef>,
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1305,14 +1316,16 @@ async fn background_task<C>(
 {
     let mut mapper = CodexMapper::new(workspace_root.clone());
     let mut pending_compactions: HashMap<ThreadId, PendingCompaction> = HashMap::new();
+    let mut pending_context_restores: HashMap<String, PendingContextRestore> = HashMap::new();
     let mut active_turns: ActiveTurns = HashMap::new();
     let mut first_event_warn_tick = tokio::time::interval(Duration::from_secs(1));
 
     loop {
         tokio::select! {
-            msg = client.next_message(), if should_poll_codex_messages(&mapper, &active_turns, &pending_compactions) => {
+            msg = client.next_message(), if should_poll_codex_messages(&mapper, &active_turns, &pending_compactions) || !pending_context_restores.is_empty() => {
                 match msg {
                     Ok(Some(msg)) => {
+                        observe_pending_context_restore(&mut pending_context_restores, &msg);
                         match handle_background_server_message(
                                 &mut client,
                                 &mut mapper,
@@ -1417,7 +1430,26 @@ async fn background_task<C>(
                     HarnessCommand::OpenThread { opts, response } => {
                         let result =
                             handle_open_thread(&mut client, &mut mapper, &opts, &senders).await;
-                        let _ = response.send(result);
+                        match result {
+                            Ok(outcome) => {
+                                let handle = outcome.handle;
+                                if let Some(model) = outcome.resume_replay_model {
+                                    let replaced = pending_context_restores.insert(handle.harness_thread_id.clone(), PendingContextRestore {
+                                        thread: handle.thread,
+                                        model,
+                                        sink: opts.updates.clone(),
+                                    });
+                                    if let Some(replaced) = replaced {
+                                        warn!(thread_id = %handle.thread,
+                                            replaced_thread_id = %replaced.thread,
+                                            harness_thread_id = %handle.harness_thread_id,
+                                            "replaced an overlapping pending context restore");
+                                    }
+                                }
+                                let _ = response.send(Ok(handle));
+                            }
+                            Err(error) => { let _ = response.send(Err(error)); }
+                        }
                     }
                     HarnessCommand::StartTurn {
                         thread,
@@ -1464,6 +1496,7 @@ async fn background_task<C>(
                         &mut mapper,
                         &senders,
                         &mut pending_compactions,
+                        &mut pending_context_restores,
                         &active_turns,
                         Some(queued.command),
                     )
@@ -1702,6 +1735,7 @@ async fn handle_control_command(
     mapper: &mut CodexMapper,
     senders: &SenderMap,
     pending_compactions: &mut HashMap<ThreadId, PendingCompaction>,
+    pending_context_restores: &mut HashMap<String, PendingContextRestore>,
     active_turns: &ActiveTurns,
     control: Option<ControlCommand>,
 ) -> StreamOutcome {
@@ -1841,6 +1875,7 @@ async fn handle_control_command(
             };
             if result.is_ok() {
                 lock_senders(senders).remove(&thread.thread);
+                pending_context_restores.remove(&thread.harness_thread_id);
             }
             let _ = response.send(result);
             StreamOutcome::TurnEnded
@@ -2060,7 +2095,7 @@ async fn handle_open_thread(
     mapper: &mut CodexMapper,
     opts: &OpenThreadOptions,
     senders: &SenderMap,
-) -> Result<ThreadHandle, HarnessError> {
+) -> Result<OpenThreadOutcome, HarnessError> {
     let cwd = opts.workspace_root.to_string_lossy().to_string();
     let thread_id = opts.thread.unwrap_or_default();
 
@@ -2134,17 +2169,71 @@ async fn handle_open_thread(
         .await;
     }
 
-    Ok(ThreadHandle {
-        warning: resume_warning,
-        resumed_model: opened.model,
-        agent_name: opened.agent_name,
-        parent_harness_thread_id: opened.parent_harness_thread_id,
-        ..ThreadHandle::opened(
-            thread_id,
-            opened.harness_thread_id,
-            opts.workspace_root.clone(),
-        )
+    let resume_replay_model = (opts.resume.is_some() && resume_warning.is_none())
+        .then(|| opened.model.clone())
+        .flatten();
+    Ok(OpenThreadOutcome {
+        handle: ThreadHandle {
+            warning: resume_warning,
+            resumed_model: opened.model,
+            agent_name: opened.agent_name,
+            parent_harness_thread_id: opened.parent_harness_thread_id,
+            ..ThreadHandle::opened(
+                thread_id,
+                opened.harness_thread_id,
+                opts.workspace_root.clone(),
+            )
+        },
+        resume_replay_model,
     })
+}
+
+fn observe_pending_context_restore(
+    pending: &mut HashMap<String, PendingContextRestore>,
+    message: &codex_codes::ServerMessage,
+) {
+    let codex_codes::ServerMessage::Notification(
+        codex_codes::messages::Notification::ThreadTokenUsageUpdated(notification),
+    ) = message
+    else {
+        return;
+    };
+    if !pending.contains_key(&notification.thread_id) {
+        return;
+    }
+    if notification.turn_id.is_empty() {
+        debug!(harness_thread_id = %notification.thread_id,
+            "pending context-window restore ignored usage without a turn id");
+        return;
+    }
+    let Some(reported) = notification.token_usage.model_context_window else {
+        debug!(harness_thread_id = %notification.thread_id,
+            native_turn_id = %notification.turn_id,
+            "pending context-window restore observed usage without a context window");
+        return;
+    };
+    let Ok(context_window) = u32::try_from(reported) else {
+        debug!(harness_thread_id = %notification.thread_id,
+            native_turn_id = %notification.turn_id, reported,
+            "pending context-window restore rejected an out-of-range context window");
+        return;
+    };
+    if context_window == 0 {
+        debug!(harness_thread_id = %notification.thread_id,
+            native_turn_id = %notification.turn_id,
+            "pending context-window restore rejected a zero context window");
+        return;
+    }
+    let Some(restore) = pending.remove(&notification.thread_id) else {
+        return;
+    };
+    let update = ThreadUpdate::ContextWindowRestored {
+        model: restore.model,
+        context_window,
+    };
+    if let Err(error) = restore.sink.send(update) {
+        warn!(thread_id = %restore.thread, ?error, "failed to forward resumed context window");
+    }
 }
 
 struct OpenedNativeThread {
@@ -3915,6 +4004,7 @@ mod tests {
     }
 
     fn open_opts(thread: Option<ThreadId>, resume: Option<&str>) -> OpenThreadOptions {
+        let (updates, _) = giskard_harness::thread_update_channel();
         OpenThreadOptions {
             project: ProjectId::new(),
             thread,
@@ -3922,6 +4012,7 @@ mod tests {
             resume: resume.map(str::to_owned),
             resume_policy: ResumePolicy::AllowFreshFallback,
             initial_model: Some(test_model(None)),
+            updates,
         }
     }
 
@@ -4809,6 +4900,7 @@ mod tests {
                 resume: Some("native-existing".into()),
                 resume_policy: ResumePolicy::AllowFreshFallback,
                 initial_model: None,
+                updates: giskard_harness::thread_update_channel().0,
             }),
         )
         .await
@@ -4837,6 +4929,51 @@ mod tests {
             resume.params.get("model").is_none() && resume.params.get("modelProvider").is_none(),
             "an import must send no model override, which would suppress the thread's own: {:?}",
             resume.params
+        );
+    }
+
+    #[tokio::test]
+    async fn resumed_usage_is_forwarded_as_a_turnless_thread_update() {
+        let (harness, controller) = spawn_fake_harness();
+        let (updates, mut update_stream) = giskard_harness::thread_update_channel();
+        let thread = ThreadId::new();
+        harness
+            .open_thread(OpenThreadOptions {
+                project: ProjectId::new(),
+                thread: Some(thread),
+                workspace_root: PathBuf::from("/tmp"),
+                resume: Some("native-existing".into()),
+                resume_policy: ResumePolicy::AllowFreshFallback,
+                initial_model: Some(test_model(None)),
+                updates,
+            })
+            .await
+            .unwrap();
+        controller
+            .send_server_message(codex_codes::ServerMessage::Notification(
+                codex_codes::messages::Notification::ThreadTokenUsageUpdated(
+                    serde_json::from_value(json!({
+                        "threadId": "native-existing", "turnId": "historical-turn",
+                        "tokenUsage": { "last": { "cachedInputTokens": 0, "inputTokens": 1,
+                            "outputTokens": 1, "reasoningOutputTokens": 0, "totalTokens": 2 },
+                            "total": { "cachedInputTokens": 0, "inputTokens": 1,
+                            "outputTokens": 1, "reasoningOutputTokens": 0, "totalTokens": 2 },
+                            "modelContextWindow": 258400 }
+                    }))
+                    .unwrap(),
+                ),
+            ))
+            .await;
+        let update = timeout(Duration::from_secs(1), update_stream.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            update,
+            ThreadUpdate::ContextWindowRestored {
+                model: test_model(Some(giskard_core::model::Effort("high".into()))),
+                context_window: 258_400,
+            }
         );
     }
 
