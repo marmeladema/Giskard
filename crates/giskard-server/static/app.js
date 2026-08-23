@@ -7909,7 +7909,11 @@ async function openCodeOverlay(path, line) {
   state.codeOverlaySource = null;
   $("codeOverlay").classList.add("open");
   $("codeOverlay").dataset.requestId = requestId;
-  $("codePath").textContent = state.codeLine ? `${path}#${state.codeLine}` : path;
+  // The raw path is kept for `state.codePath` (download/file API) but the title bar shows the
+  // workspace-relative form, the same truncation the transcript diff row uses, so the leading
+  // checkout/worktree prefix is not carried in the overlay header.
+  const displayPath = displayPathForWorkspace(path);
+  $("codePath").textContent = state.codeLine ? `${displayPath}#${state.codeLine}` : displayPath;
   $("codeMeta").textContent = "Loading…";
   $("codeView").innerHTML = `<div class="code-empty">Loading source…</div>`;
   $("codeDownload").disabled = false;
@@ -8125,7 +8129,10 @@ function openDiffOverlay(path, diff) {
   delete $("codeOverlay").dataset.requestId;
   setCodeSourceToggle(false);
   setCodeCopyDiff(true);
-  $("codePath").textContent = `Diff: ${path || "File change"}`;
+  // Truncate the workspace prefix from the title the same way the transcript diff row does, so
+  // the overlay header does not carry the checkout/worktree path.
+  const titlePath = displayPathForWorkspace(path) || "File change";
+  $("codePath").textContent = `Diff: ${titlePath}`;
   const stats = diffStats(diff);
   $("codeMeta").textContent = `+${stats.added} −${stats.removed} · ${stats.lines.toLocaleString()} lines`;
   $("codeDownload").disabled = true;

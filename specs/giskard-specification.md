@@ -9,7 +9,7 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.70
+**Version:** 1.71
 
 > **Amendment — frontend approach (supersedes the Dioxus/WASM design below).**
 > This document was written targeting a **Dioxus fullstack / WebAssembly** frontend (`giskard-ui`),
@@ -22,6 +22,9 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.70 → 1.71), overlay title path truncation:**
+- **L8:** The diff view and code overlay title bar shows the workspace-relative path (the same truncation the transcript diff row uses) instead of the raw checkout/worktree-prefixed path. The raw path is still kept for the download/file API.
 
 **Changelog (1.69 → 1.70), turn-less context restoration:**
 - **CR1:** Harnesses report metadata discovered after a thread opens through a bounded,
@@ -3089,6 +3092,7 @@ alongside raw token counts. Off by default; raw token counts are the primary met
   `GET /api/projects/{id}/threads/{thread_id}/raw?path=…`. This is intentionally whole-file
   oriented until the
   virtualized line-range viewer in §11.3 is implemented.
+- **Title path truncation (L8):** the overlay title bar (the diff view and the code overlay) shows the workspace-relative path, stripping the checkout/worktree prefix the same way the transcript diff row does. The raw path is retained for the download/file API (`state.codePath`), so only the displayed title is affected.
 - **Image previews (IV1):** completed Codex `ImageView` activity rows render a thumbnail through
   `GET /api/projects/{id}/threads/{thread_id}/image?path=…`. The endpoint uses the same workspace
   confinement as
