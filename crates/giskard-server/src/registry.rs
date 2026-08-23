@@ -25,7 +25,7 @@ use giskard_core::turn::{Mode, Turn, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
     AgentHarness, HarnessCapabilities, HarnessProvider, OpenThreadOptions, ResumePolicy,
-    ThreadHandle,
+    ThreadHandle, ThreadUpdate, thread_update_channel,
 };
 use giskard_persist::PersistStore;
 use giskard_persist::store::{ProjectConfig, ThreadFile, ThreadMutation, TurnCommitOutcome};
@@ -39,7 +39,7 @@ use crate::thread_graph::{
 };
 use crate::thread_metadata::ThreadMetadataService;
 use crate::thread_runtime::{
-    AppliedRuntimeEvent, RequestResolution, RequestTransition, RuntimeRequestId,
+    AppliedRuntimeEvent, RequestResolution, RequestTransition, RestorePermit, RuntimeRequestId,
     ThreadRuntimeRegistry, ThreadTurnLease, TurnReservation,
 };
 
@@ -280,6 +280,58 @@ impl RegistryShared {
     }
 }
 
+fn prepare_thread_updates(
+    shared: &RegistryShared,
+    thread_id: ThreadId,
+) -> (
+    giskard_harness::ThreadUpdateSink,
+    giskard_harness::ThreadUpdateStream,
+    RestorePermit,
+) {
+    let (sink, stream) = thread_update_channel();
+    let permit = shared.runtime.restoration_permit(thread_id);
+    (sink, stream, permit)
+}
+
+fn spawn_thread_update_forwarder(
+    shared: Arc<RegistryShared>,
+    project_id: ProjectId,
+    thread_id: ThreadId,
+    mut updates: giskard_harness::ThreadUpdateStream,
+    permit: RestorePermit,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let Some(update) = updates.recv().await else {
+            return;
+        };
+        let ThreadUpdate::ContextWindowRestored {
+            model,
+            context_window,
+        } = update;
+        let stored_model = model.clone();
+        let runtime = shared.runtime.clone();
+        let result = shared
+            .thread_metadata
+            .mutate(project_id, thread_id, move |thread| {
+                if runtime.restoration_is_current(&permit) {
+                    thread.record_model_context_window(&stored_model, context_window);
+                }
+            })
+            .await;
+        match result {
+            Ok(ThreadMutation::Changed { after, .. }) => info!(%project_id, %thread_id,
+                metadata_revision = after.revision, provider = %model.provider, model = %model.model,
+                context_window, "restored resumed thread context window"),
+            Ok(ThreadMutation::Unchanged { .. }) => debug!(%project_id, %thread_id,
+                "resumed context-window restore was stale or already current"),
+            Ok(ThreadMutation::Missing) => warn!(%project_id, %thread_id,
+                "thread disappeared before resumed context window could be restored"),
+            Err(error) => error!(%project_id, %thread_id, %error,
+                "failed to persist resumed context window"),
+        }
+    })
+}
+
 impl HarnessRegistry {
     #[cfg(test)]
     pub fn new(
@@ -405,6 +457,9 @@ impl HarnessRegistry {
         );
         let harness = self.get_or_create_harness(config.id, config).await?;
         let requested_native_id = resume.clone();
+        let (updates, update_stream) = thread_update_channel();
+        let restore_permit =
+            thread.map(|thread_id| self.shared.runtime.restoration_permit(thread_id));
 
         let handle = harness
             .open_thread(OpenThreadOptions {
@@ -414,8 +469,14 @@ impl HarnessRegistry {
                 resume,
                 resume_policy,
                 initial_model: initial_model.clone(),
+                updates,
             })
             .await?;
+        // A known thread can begin another lifecycle while its harness open is in flight, so its
+        // permit was captured above. A newly imported thread is not exposed until after this
+        // function returns, making the harness-returned identity safe to capture here.
+        let restore_permit =
+            restore_permit.unwrap_or_else(|| self.shared.runtime.restoration_permit(handle.thread));
 
         // This is the harness-neutral identity boundary. Individual adapters may enforce the same
         // contract internally, but the registry must not rely on adapter-specific validation.
@@ -436,6 +497,13 @@ impl HarnessRegistry {
             .resumed_model
             .clone()
             .or_else(|| initial_model.clone());
+        drop(spawn_thread_update_forwarder(
+            self.shared.clone(),
+            config.id,
+            handle.thread,
+            update_stream,
+            restore_permit,
+        ));
         let mut threads = self.shared.threads.lock().await;
         threads.insert(
             handle.thread,
@@ -1035,7 +1103,7 @@ impl HarnessRegistry {
             .await
             .unwrap_or_else(|| ThreadHandle::detached(thread_id, harness_thread_id));
         harness.delete_thread(&handle).await?;
-        self.forget_thread(thread_id).await;
+        self.retire_thread(thread_id).await;
         Ok(())
     }
 
@@ -1120,6 +1188,14 @@ impl HarnessRegistry {
     pub async fn forget_thread(&self, thread_id: ThreadId) {
         let mut threads = self.shared.threads.lock().await;
         threads.remove(&thread_id);
+    }
+
+    pub async fn retire_thread(&self, thread_id: ThreadId) {
+        self.forget_thread(thread_id).await;
+        self.shared
+            .runtime
+            .forget_threads(&HashSet::from([thread_id]));
+        publish_runtime_overview(&self.shared).await;
     }
 
     pub async fn delete_project(&self, project_id: ProjectId) -> Result<(), HarnessError> {
@@ -1809,6 +1885,7 @@ async fn materialize_subagent_thread(
     // and applied on its next cold resume, moving the thread out of the worktree its own earlier
     // work is in.
     let workspace_root = subagent_workspace_root(&shared, &project_config, &parent_file).await?;
+    let (updates, update_stream) = thread_update_channel();
     let handle = harness
         .open_thread(OpenThreadOptions {
             project: project_id,
@@ -1817,8 +1894,10 @@ async fn materialize_subagent_thread(
             resume: Some(info.native_thread_id.clone()),
             resume_policy: ResumePolicy::RequireExisting,
             initial_model: Some(model.clone()),
+            updates,
         })
         .await?;
+    let restore_permit = shared.runtime.restoration_permit(handle.thread);
     // This path calls the harness directly rather than `open_thread_with_resume_policy`, so retain
     // the registry's harness-neutral strict-resume check even when the adapter also validates it.
     if handle.harness_thread_id != info.native_thread_id {
@@ -1870,6 +1949,15 @@ async fn materialize_subagent_thread(
         .create(project_id, thread_file)
         .await
         .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+    // The bounded channel retains an early replay while the thread is being created. Start the
+    // forwarder only after metadata exists, so restoration cannot race creation and be lost.
+    drop(spawn_thread_update_forwarder(
+        shared.clone(),
+        project_id,
+        handle.thread,
+        update_stream,
+        restore_permit,
+    ));
     let native_model = Some(current_model.clone());
     shared.threads.lock().await.insert(
         handle.thread,
@@ -2003,7 +2091,7 @@ async fn subagent_workspace_root(
 async fn ensure_subagent_thread_open(
     project_config: &ProjectConfig,
     thread_file: &ThreadFile,
-    shared: &RegistryShared,
+    shared: &Arc<RegistryShared>,
 ) -> Result<Option<String>, HarnessError> {
     if let Some(binding) = shared.threads.lock().await.get(&thread_file.id) {
         return Ok(binding.handle.agent_name.clone());
@@ -2018,6 +2106,7 @@ async fn ensure_subagent_thread_open(
     // Reopening a persisted sub-agent is that cold resume: resolve from the chain, not from the
     // child's own record, which never names a worktree.
     let workspace_root = subagent_workspace_root(shared, project_config, thread_file).await?;
+    let (updates, update_stream, restore_permit) = prepare_thread_updates(shared, thread_file.id);
     let handle = harness
         .open_thread(OpenThreadOptions {
             project: project_config.id,
@@ -2026,6 +2115,7 @@ async fn ensure_subagent_thread_open(
             resume: Some(thread_file.harness_thread_id.clone()),
             resume_policy: ResumePolicy::RequireExisting,
             initial_model: Some(thread_file.current_model.clone()),
+            updates,
         })
         .await?;
     // This path calls the harness directly rather than `open_thread_with_resume_policy`, so retain
@@ -2036,6 +2126,13 @@ async fn ensure_subagent_thread_open(
             handle.harness_thread_id, thread_file.harness_thread_id
         )));
     }
+    drop(spawn_thread_update_forwarder(
+        shared.clone(),
+        project_config.id,
+        handle.thread,
+        update_stream,
+        restore_permit,
+    ));
     let native_model = Some(
         handle
             .resumed_model
@@ -4046,7 +4143,7 @@ mod tests {
     use giskard_core::token::{TokenLedger, TokenUsage};
     use giskard_core::turn::{Mode, PermissionPreset, Turn, TurnStatus, TurnStatusKind};
     use giskard_core::user_input::UserInput;
-    use giskard_harness::{AgentEventStream, ThreadHandle};
+    use giskard_harness::{AgentEventStream, ThreadHandle, ThreadUpdate};
     use giskard_persist::PersistStore;
     use giskard_persist::store::{ProjectConfig, ThreadFile};
     use giskard_proto::{ServerMessage, WireAgentEvent};
@@ -4056,9 +4153,10 @@ mod tests {
     use super::{
         CurrentTurnItems, TurnContext, TurnContextKind, command_completion_is_normal_success,
         command_status_is_running, forward_events, passive_subagent_prompt_text,
-        persist_subagent_fallback_transcript, should_refresh_subagent_title,
-        subagent_monitor_policy, subagent_path_leaf, take_passive_subagent_monitor_metadata,
-        track_item_identity, turn_reservation, update_passive_subagent_metadata,
+        persist_subagent_fallback_transcript, prepare_thread_updates,
+        should_refresh_subagent_title, spawn_thread_update_forwarder, subagent_monitor_policy,
+        subagent_path_leaf, take_passive_subagent_monitor_metadata, track_item_identity,
+        turn_reservation, update_passive_subagent_metadata,
     };
     use crate::hub::Hub;
     use crate::ledger;
@@ -4688,6 +4786,134 @@ mod tests {
             track_item_identity(&mut identities, &conflicting),
             Some((turn, "cmd_1".into(), original_item, conflicting_item))
         );
+    }
+
+    #[tokio::test]
+    async fn resumed_context_window_uses_resumed_model_and_metadata_service() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "historical-model".into(),
+            reasoning_effort: None,
+        };
+        store
+            .create_project(project_id, "proj", "/tmp/test")
+            .await
+            .unwrap();
+        let now = Utc::now();
+        store
+            .save_thread(
+                project_id,
+                &ThreadFile {
+                    revision: 0,
+                    version: 1,
+                    id: thread_id,
+                    project_id,
+                    title: "t".into(),
+                    harness_thread_id: "native-thread".into(),
+                    parent_thread_id: None,
+                    spawned_by_turn_id: None,
+                    kind: giskard_core::ThreadKind::Primary,
+                    mode: Mode::Build,
+                    current_model: model.clone(),
+                    context_window: 128_000,
+                    model_context_windows: Default::default(),
+                    permission_preset: PermissionPreset::AskFirst,
+                    model_efforts: Default::default(),
+                    tokens: TokenLedger::default(),
+                    created_at: now,
+                    updated_at: now,
+                    archived: false,
+                    git_workspace: None,
+                },
+            )
+            .await
+            .unwrap();
+        let hub = Arc::new(Hub::new());
+        let shared = Arc::new(super::RegistryShared::new(
+            hub,
+            store.clone(),
+            ledger::spawn(store.clone()),
+        ));
+        let (sink, stream, permit) = prepare_thread_updates(&shared, thread_id);
+        let forwarder =
+            spawn_thread_update_forwarder(shared.clone(), project_id, thread_id, stream, permit);
+        sink.send(ThreadUpdate::ContextWindowRestored {
+            model: model.clone(),
+            context_window: 258_400,
+        })
+        .unwrap();
+        forwarder.await.unwrap();
+        assert_eq!(
+            store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .context_window,
+            258_400
+        );
+
+        for invalidate_with_turn in [true, false] {
+            let stale_thread_id = ThreadId::new();
+            let mut stale_thread = store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .unwrap();
+            stale_thread.id = stale_thread_id;
+            stale_thread.revision = 0;
+            stale_thread.context_window = 128_000;
+            stale_thread.model_context_windows.clear();
+            store.save_thread(project_id, &stale_thread).await.unwrap();
+            let (sink, stream, permit) = prepare_thread_updates(&shared, stale_thread_id);
+            if invalidate_with_turn {
+                let handle = ThreadHandle::detached(stale_thread_id, "native-stale".into());
+                let ctx = TurnContext {
+                    user_input: UserInput::text("newer turn"),
+                    model: model.clone(),
+                    mode: Mode::Build,
+                    kind: TurnContextKind::User,
+                    passive_input_is_fallback: false,
+                    subagent_fallback: None,
+                    passive_subagent_metadata: None,
+                    passive_pre_turn_timeout: None,
+                };
+                let _lease = shared
+                    .runtime
+                    .reserve_turn(stale_thread_id, turn_reservation(project_id, &handle, &ctx))
+                    .unwrap();
+            } else {
+                shared
+                    .runtime
+                    .forget_threads(&HashSet::from([stale_thread_id]));
+            }
+            let forwarder = spawn_thread_update_forwarder(
+                shared.clone(),
+                project_id,
+                stale_thread_id,
+                stream,
+                permit,
+            );
+            sink.send(ThreadUpdate::ContextWindowRestored {
+                model: model.clone(),
+                context_window: 400_000,
+            })
+            .unwrap();
+            forwarder.await.unwrap();
+            assert_eq!(
+                store
+                    .load_thread(project_id, stale_thread_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .context_window,
+                128_000
+            );
+        }
     }
 
     #[tokio::test]

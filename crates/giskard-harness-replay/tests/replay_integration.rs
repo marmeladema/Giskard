@@ -115,6 +115,7 @@ async fn open_thread_one_turn_assert_state() {
             workspace_root: "/tmp/test".into(),
             resume: Some("th_test_001".into()),
             resume_policy: giskard_harness::ResumePolicy::AllowFreshFallback,
+            updates: giskard_harness::thread_update_channel().0,
             initial_model: Some(ModelRef {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
@@ -251,6 +252,7 @@ async fn replay_persisted_state_roundtrip() {
             workspace_root: "/tmp/test".into(),
             resume: Some("th_test_001".into()),
             resume_policy: giskard_harness::ResumePolicy::AllowFreshFallback,
+            updates: giskard_harness::thread_update_channel().0,
             initial_model: Some(ModelRef {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),

@@ -9,7 +9,7 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.69
+**Version:** 1.70
 
 > **Amendment — frontend approach (supersedes the Dioxus/WASM design below).**
 > This document was written targeting a **Dioxus fullstack / WebAssembly** frontend (`giskard-ui`),
@@ -22,6 +22,18 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.69 → 1.70), turn-less context restoration:**
+- **CR1:** Harnesses report metadata discovered after a thread opens through a bounded,
+  non-blocking `ThreadUpdateSink`; these updates are not agent events and add no WebSocket surface.
+- **CR2:** Codex separates active-turn usage from historical usage replayed after resume. It offers
+  the first valid matching context window with the authoritative model returned by the resume
+  operation; replayed usage never enters a Giskard turn ledger. No timing assumption is involved.
+- **CR3:** Context restoration is transient harness metadata and does not change either persisted
+  JSONL format. A replay without an authoritative resumed model is not watched.
+- **CR4:** The runtime registry invalidates delayed restores on a newer accepted turn lifecycle or
+  thread retirement. Metadata commits through `ThreadMetadataService`, using the existing
+  revisioned browser projection.
 
 **Changelog (1.68 → 1.69), process-local thread runtime authority:**
 - **RT1:** `ThreadRuntimeRegistry` is the sole server-facing authority for active-turn ownership,

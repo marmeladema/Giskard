@@ -1771,7 +1771,7 @@ async fn cleanup_new_thread_after_start_failure(
                 error = %error,
                 "failed to delete native thread after failed new-thread startup"
             );
-            state.registry.forget_thread(thread_id).await;
+            state.registry.retire_thread(thread_id).await;
         }
     }
 

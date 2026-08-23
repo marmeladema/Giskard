@@ -15,9 +15,9 @@ of the original plan; it was inserted because the bootstrap and retention work b
 into the same root cause — a turn's record was both its index entry and its unbounded payload. See
 *What the storage layout change unlocks* for the parts of this plan it simplifies or retires.
 
-**The runtime registry milestone is also complete.** The event journal, transactional bootstrap,
-class-aware outbox, turn-less context restoration, and later milestones remain to be built, in the
-milestones defined under *Implementation milestones*.
+**The runtime registry and turn-less context restoration milestones are also complete.** The event
+journal, transactional bootstrap, class-aware outbox, and later milestones remain to be built, in
+the milestones defined under *Implementation milestones*.
 
 This plan began with Codex restoring a context window outside a turn. The codebase audit showed
 that the context window is not a special state class. It exposed missing general primitives for
@@ -136,16 +136,15 @@ Keep the harness-neutral `ThreadUpdateSink`, per-model context-window persistenc
 generation guard — all of which exist only on the abandoned branch and must be ported, not found in
 `main`. `ThreadContextWindowUpdated` was never merged, so M3 adds nothing in its place: restoration
 publishes through the general metadata path.
-Also keep the Codex mapper's distinction between active-turn usage and turn-less resume metadata,
-the bounded resume replay lifetime, and centralized harness-open update forwarding. Those solve the
-real provenance/lifecycle gap and are independent of browser delivery ordering.
+Also keep the Codex mapper's distinction between active-turn usage and turn-less resume metadata
+and centralized harness-open update forwarding. Observe pending restoration without a time-based
+deadline. Those solve the real provenance/lifecycle gap and are independent of browser delivery
+ordering.
 
-Use one authoritative invalidation policy for delayed restoration. The registry generation/commit
-guard is required because it covers adapter replay, the server retry window, external/passive turn
-starts, compaction, and deletion. The adapter's separate cancellation on accepted turn start or
-manual compaction is only an early-exit optimization: a late update is still rejected by the server
-guard. Remove those duplicate cancellation calls and keep the adapter TTL as a resource bound, so
-two lifecycle policies cannot drift.
+Use one authoritative invalidation policy for delayed restoration. The registry revision check at
+the metadata commit boundary covers adapter replay, external/passive turn starts, compaction, and
+deletion. The adapter does not cancel on a clock or on accepted turn start, so two lifecycle
+policies cannot drift.
 
 ### A subscription FIFO is not an ordering primitive
 
@@ -427,8 +426,7 @@ browser merge semantics; an append-only sidecar by itself would leave incrementa
 stale. Record that work separately rather than silently changing the completed-history contract in
 this branch.
 
-No client delivery is awaited while holding the turn lease, lifecycle commit lock, runtime lock, or
-store lock.
+No client delivery is awaited while holding the turn lease, runtime lock, or store lock.
 
 ### Request state semantics
 
@@ -965,11 +963,13 @@ is untouched.
 
 ### M3 — Turn-less context restoration
 
+**Status:** complete.
+
 **The original bug.** Deliberately placed after the runtime registry rather than first.
 
 Most of this milestone is harness-side and independent: `ThreadUpdateSink`, the Codex resume
-mapping, the bounded replay lifetime, and the mapper's active-turn gate that keeps replayed usage
-out of turn ledgers. Those live in crates M2 and M5 never touch.
+mapping, pending replay observation without a time-based deadline, and the mapper's active-turn
+gate that keeps replayed usage out of turn ledgers. Those live in crates M2 and M5 never touch.
 
 The exception is the staleness guard. On the abandoned branch it was a bespoke generation/commit
 counter in `registry.rs`, hooked into `start_turn`, `compact_thread`, `forget_thread`,
@@ -980,8 +980,8 @@ the runtime registry already owns.
 
 **Scope.** Port the harness-side pieces above. Persist the restored window through
 `ThreadMetadataService`. **Ask the runtime registry whether a newer lifecycle transition superseded
-the restore — do not add a second generation counter.** Keep the adapter's replay TTL as a resource
-bound only, not as a second invalidation policy.
+the restore at the metadata commit boundary — do not add a second generation counter or a
+time-based invalidation policy.**
 
 **Non-goals.** Any new WebSocket message. Any browser handler. Any bespoke lifecycle counter outside
 the runtime registry. The bootstrap and delivery layers.

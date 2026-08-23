@@ -35,6 +35,7 @@ pub struct ThreadRuntimeRegistry {
 #[derive(Default)]
 struct ThreadRuntimeEntry {
     active_turn: Option<ActiveTurnOwner>,
+    lifecycle_revision: u64,
     requests: HashMap<RuntimeRequestId, RequestRecord>,
     event_sequence: u64,
     task_revision: u64,
@@ -139,12 +140,43 @@ pub(crate) struct ThreadTurnLease {
     detached: bool,
 }
 
+/// Opaque proof that no newer lifecycle has superseded a delayed thread restore.
+pub(crate) struct RestorePermit {
+    thread_id: ThreadId,
+    entry: std::sync::Weak<Mutex<ThreadRuntimeEntry>>,
+    lifecycle_revision: u64,
+}
+
 impl ThreadRuntimeRegistry {
     pub fn new() -> Self {
         Self {
             entries: Arc::new(Mutex::new(HashMap::new())),
             overview: Arc::new(Mutex::new(OverviewState::default())),
         }
+    }
+
+    pub(crate) fn restoration_permit(&self, thread_id: ThreadId) -> RestorePermit {
+        let entry = self.entry_or_create(thread_id);
+        let revision = lock_unpoison(&entry, "thread runtime entry").lifecycle_revision;
+        RestorePermit {
+            thread_id,
+            entry: Arc::downgrade(&entry),
+            lifecycle_revision: revision,
+        }
+    }
+
+    pub(crate) fn restoration_is_current(&self, permit: &RestorePermit) -> bool {
+        let Some(expected) = permit.entry.upgrade() else {
+            return false;
+        };
+        let Some(current) = self.existing_entry(permit.thread_id) else {
+            return false;
+        };
+        if !Arc::ptr_eq(&expected, &current) {
+            return false;
+        }
+        let current_revision = lock_unpoison(&current, "thread runtime entry").lifecycle_revision;
+        current_revision == permit.lifecycle_revision
     }
 
     pub fn live_is_active(&self, thread_id: ThreadId) -> bool {
@@ -470,6 +502,7 @@ impl ThreadRuntimeRegistry {
             reserved_at: Instant::now(),
             persistence_blocked: None,
         });
+        entry.lifecycle_revision = entry.lifecycle_revision.saturating_add(1);
         self.refresh_overview(thread_id, &entry);
         Ok(ThreadTurnLease {
             registry: self.clone(),
@@ -566,15 +599,10 @@ impl ThreadRuntimeRegistry {
     }
 
     pub(crate) fn forget_threads(&self, thread_ids: &std::collections::HashSet<ThreadId>) {
-        let mut entries = lock_unpoison(&self.entries, "thread runtime entry registry");
         for thread_id in thread_ids {
-            let entry = entries.get(thread_id).cloned();
-            let _entry = entry
-                .as_ref()
-                .map(|entry| lock_unpoison(entry, "thread runtime entry"));
+            let mut entries = lock_unpoison(&self.entries, "thread runtime entry registry");
             entries.remove(thread_id);
         }
-        drop(entries);
         let mut overview = lock_unpoison(&self.overview, "runtime overview");
         let before = overview.summaries.len();
         overview.summaries.retain(|id, _| !thread_ids.contains(id));
@@ -1274,8 +1302,8 @@ mod tests {
         assert!(matches!(state.status, WireRequestStatus::Pending));
     }
 
-    #[test]
-    fn event_application_refreshes_the_overview_only_for_summary_changes() {
+    #[tokio::test]
+    async fn event_application_refreshes_the_overview_only_for_summary_changes() {
         let runtime = ThreadRuntimeRegistry::new();
         let thread_id = ThreadId::new();
         let turn_id = TurnId::new();
@@ -1340,6 +1368,39 @@ mod tests {
         assert_eq!(runtime.current_overview().revision, initial_revision + 1);
 
         lease.release();
+    }
+
+    #[tokio::test]
+    async fn restore_permit_is_invalidated_by_a_new_turn_lifecycle() {
+        let runtime = ThreadRuntimeRegistry::new();
+        let thread = ThreadId::new();
+        let permit = runtime.restoration_permit(thread);
+        assert!(runtime.restoration_is_current(&permit));
+        let _lease = runtime
+            .reserve_turn(
+                thread,
+                TurnReservation {
+                    project_id: ProjectId::new(),
+                    harness_thread_id: "native".into(),
+                    mode: Mode::Build,
+                    provider: "provider".into(),
+                    model: "model".into(),
+                    context_kind: "test",
+                },
+            )
+            .unwrap();
+        assert!(!runtime.restoration_is_current(&permit));
+    }
+
+    #[tokio::test]
+    async fn restore_permit_does_not_survive_forget_and_recreate() {
+        let runtime = ThreadRuntimeRegistry::new();
+        let thread = ThreadId::new();
+        let permit = runtime.restoration_permit(thread);
+        runtime.forget_threads(&std::collections::HashSet::from([thread]));
+        let replacement = runtime.restoration_permit(thread);
+        assert!(!runtime.restoration_is_current(&permit));
+        assert!(runtime.restoration_is_current(&replacement));
     }
 
     #[tokio::test]
@@ -1410,8 +1471,8 @@ mod tests {
         assert!(matches!(result, Err(error) if error.to_string().contains("no pending request")));
     }
 
-    #[test]
-    fn empty_overview_replaces_the_last_active_summary() {
+    #[tokio::test]
+    async fn empty_overview_replaces_the_last_active_summary() {
         let runtime = ThreadRuntimeRegistry::new();
         let thread_id = ThreadId::new();
         runtime.register_approval(thread_id, approval("a"));
@@ -1420,8 +1481,8 @@ mod tests {
         assert!(runtime.current_overview().threads.is_empty());
     }
 
-    #[test]
-    fn explicit_lease_release_returns_the_empty_overview_effect() {
+    #[tokio::test]
+    async fn explicit_lease_release_returns_the_empty_overview_effect() {
         let runtime = ThreadRuntimeRegistry::new();
         let thread_id = ThreadId::new();
         let mut lease = runtime
@@ -1444,8 +1505,8 @@ mod tests {
         assert!(lease.release().is_none());
     }
 
-    #[test]
-    fn persistence_failure_keeps_the_complete_turn_and_lease() {
+    #[tokio::test]
+    async fn persistence_failure_keeps_the_complete_turn_and_lease() {
         let runtime = ThreadRuntimeRegistry::new();
         let thread_id = ThreadId::new();
         let reservation = TurnReservation {
