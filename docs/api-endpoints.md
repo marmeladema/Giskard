@@ -8,6 +8,7 @@ WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticke
 /api/projects/{id}/threads/{parent_thread_id}/subagent-links/{item_id}/open`, `PATCH
 /api/projects/{id}/threads/{thread_id}/title`,
 `POST /api/projects/{id}/threads/{thread_id}/archive`,
+`GET /api/projects/{id}/threads/{thread_id}/history`,
 `GET /api/projects/{id}/threads/{thread_id}/deletion-impact`,
 `GET /api/projects/{id}/models`,
 `GET /api/tokens`, `GET /api/projects/{id}/tokens`,
@@ -76,6 +77,13 @@ model, and permission messages require a `request_id`; the initiating browser re
 `ThreadMetadataResult` after commit, including for no-op changes, or an `Error` carrying that id.
 `TokenUpdate` no longer exists; thread totals use the revisioned metadata snapshot.
 See [Sub-agent threads](subagents.md) for the full contract.
+
+`GET /api/projects/{id}/threads/{thread_id}/history` returns completed turns oldest-first as
+`{ thread_id, turns, has_more }`. `before=<TurnId>` selects the page immediately before that turn;
+without it the endpoint returns the newest page. `limit` is optional and is clamped to 1–100 turns;
+the configured `[history] initial` default applies to the newest page and `page` to older pages.
+History pagination is authenticated HTTP, not a WebSocket message, and a thread outside the named
+project returns 404.
 
 If you open a thread whose agent can no longer be started — most often because its
 **provider was removed from config** (e.g. you swapped one proxy provider id for another) — the

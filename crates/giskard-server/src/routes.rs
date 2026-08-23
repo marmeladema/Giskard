@@ -61,6 +61,7 @@ const MAX_WS_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ATTACHMENT_NAME_BYTES: usize = 255;
 const MAX_ATTACHMENT_MIME_BYTES: usize = 127;
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_HISTORY_PAGE_TURNS: usize = 100;
 
 pub fn protected_routes(state: AppState) -> Router<AppState> {
     Router::new()
@@ -97,6 +98,10 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
         .route(
             "/api/projects/{id}/threads/{thread_id}/deletion-impact",
             get(thread_deletion_impact),
+        )
+        .route(
+            "/api/projects/{id}/threads/{thread_id}/history",
+            get(thread_history),
         )
         // File reads name their thread in the path rather than leaving it implicit. The workspace a
         // read is answered from is the thread's, so the thread has to be part of the request; a
@@ -3904,6 +3909,63 @@ async fn history_limit_or_default(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct HistoryQuery {
+    before: Option<giskard_core::ids::TurnId>,
+    limit: Option<usize>,
+}
+
+#[derive(serde::Serialize)]
+struct HistoryResponse {
+    thread_id: ThreadId,
+    turns: Vec<WireTurn>,
+    has_more: bool,
+}
+
+/// Completed transcript pagination is an ordinary authenticated request/response. It deliberately
+/// stays outside the ordered WebSocket lane: pages have no ordering relationship with live events.
+async fn thread_history(
+    State(state): State<AppState>,
+    AxumPath((project_id, thread_id)): AxumPath<(ProjectId, ThreadId)>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<HistoryResponse>, ApiError> {
+    if state
+        .store
+        .load_thread(project_id, thread_id)
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::NotFound);
+    }
+    let default_limit = history_limit_or_default(
+        &state,
+        thread_id,
+        "http_history",
+        |config| {
+            if query.before.is_some() {
+                config.history.page
+            } else {
+                config.history.initial
+            }
+        },
+        if query.before.is_some() { 50 } else { 5 },
+    )
+    .await;
+    let limit = query
+        .limit
+        .unwrap_or(default_limit)
+        .clamp(1, MAX_HISTORY_PAGE_TURNS);
+    let (turns, has_more) = state
+        .store
+        .load_history(project_id, thread_id, query.before, limit)
+        .await?;
+    Ok(Json(HistoryResponse {
+        thread_id,
+        turns: turns.into_iter().map(Into::into).collect(),
+        has_more,
+    }))
+}
+
 fn harness_error_means_command_unmanaged(error: &HarnessError) -> bool {
     let HarnessError::Transport(message) = error else {
         return false;
@@ -4170,19 +4232,16 @@ async fn handle_client_msg(
                 ))
                 .await;
 
-            // Two snapshot shapes, distinguished by whether the client sent a resync cursor:
+            // Initial/reconnect history remains a temporary bootstrap-only delta. Only older-page
+            // pagination is fetched over HTTP and kept out of the ordered socket lane.
             //
             // * Resync (`since` present): history-first ordering. Send the persisted history — a
-            //   `HistoryDelta` of the turns after the cursor when we can resolve it, or a full
-            //   `HistoryPage` when we can't (stale cursor) — *before* the live turn and tasks. The
+            //   `HistoryDelta` of the turns after the cursor when we can resolve it, or a bounded
+            //   reset delta when we can't (stale cursor) — *before* the live turn and tasks. The
             //   client reconciles or rebuilds the transcript while it still owns it, then the live
             //   turn appends on top. The browser may keep a stale live DOM block visible until the
             //   replacement snapshot arrives, so delta rows still need to be inserted before that
             //   retained live block on the UI side.
-            // * Fresh (`since` absent): live-first ordering. The in-flight turn (H5) isn't in the
-            //   JSONL yet, so reconstruct it from the live buffer and send it — with its tasks —
-            //   before the history page, for the fastest first paint. The browser prepends older
-            //   history above it.
             let resync_delta = match since {
                 Some(cursor) => state
                     .store
@@ -4192,17 +4251,14 @@ async fn handle_client_msg(
                 None => None,
             };
 
-            // The persisted-history message: a delta after a resolvable cursor, otherwise a full
-            // initial page (fresh open, or a stale cursor that fell back to a full rebuild).
             let history_message = if let Some(turns) = resync_delta {
-                ServerMessage::HistoryDelta {
+                Some(ServerMessage::HistoryDelta {
                     thread_id,
                     turns: turns.into_iter().map(Into::into).collect(),
-                }
+                    reset: false,
+                    has_more: None,
+                })
             } else {
-                // H4/H6: the most recent page of persisted history (not the whole thread). The
-                // initial page is deliberately small (see `HistoryConfig::initial`); the browser
-                // tops it up to fill the viewport. Older pages are fetched via `LoadHistory`.
                 let limit = history_limit_or_default(
                     state,
                     thread_id,
@@ -4216,63 +4272,27 @@ async fn handle_client_msg(
                     .load_history(project_id, thread_id, None, limit)
                     .await
                     .map_err(|e| WsError::from_persist(e, "subscribe_history", Some(thread_id)))?;
-                ServerMessage::HistoryPage {
+                Some(ServerMessage::HistoryDelta {
                     thread_id,
                     turns: turns.into_iter().map(Into::into).collect(),
-                    has_more,
-                }
+                    reset: true,
+                    has_more: Some(has_more),
+                })
             };
 
             // The live turn (H5) isn't in the JSONL yet — reconstruct it from the live buffer — and
-            // its running tasks. On a fresh open (`since` absent) these go first, for the fastest
-            // first paint. On a resync (`since` present, delta or stale-cursor rebuild) the history
-            // goes first so the client can reconcile or rebuild before handling the live turn. The
-            // browser may still insert delta rows before a retained stale live block to avoid a
-            // visible gap before the replacement live snapshot arrives.
+            // its running tasks. Bootstrap history goes first so a reset rebuilds completed rows
+            // before the live snapshot appends its in-flight rows.
             let live_snapshot = state.live_buffers.snapshot(thread_id).await;
             let tasks = state.running_commands.snapshot(thread_id).await;
             let running_tasks = ServerMessage::RunningTasks { thread_id, tasks };
-            if since.is_some() {
-                let _ = tx.send(history_message).await;
-                if let Some(snap) = live_snapshot {
-                    let _ = tx.send(ServerMessage::LiveTurnSnapshot(snap)).await;
-                }
-                let _ = tx.send(running_tasks).await;
-            } else {
-                if let Some(snap) = live_snapshot {
-                    let _ = tx.send(ServerMessage::LiveTurnSnapshot(snap)).await;
-                }
-                let _ = tx.send(running_tasks).await;
+            if let Some(history_message) = history_message {
                 let _ = tx.send(history_message).await;
             }
-        }
-        ClientMessage::LoadHistory {
-            thread_id,
-            before,
-            limit,
-        } => {
-            let project_id = project_for_readonly(state, thread_id, "load_history").await?;
-            let default_limit = history_limit_or_default(
-                state,
-                thread_id,
-                "load_history",
-                |config| config.history.page,
-                50,
-            )
-            .await;
-            let limit = limit.unwrap_or(default_limit);
-            let (turns, has_more) = state
-                .store
-                .load_history(project_id, thread_id, before, limit)
-                .await
-                .map_err(|e| WsError::from_persist(e, "load_history", Some(thread_id)))?;
-            let _ = tx
-                .send(ServerMessage::HistoryPage {
-                    thread_id,
-                    turns: turns.into_iter().map(Into::into).collect(),
-                    has_more,
-                })
-                .await;
+            if let Some(snap) = live_snapshot {
+                let _ = tx.send(ServerMessage::LiveTurnSnapshot(snap)).await;
+            }
+            let _ = tx.send(running_tasks).await;
         }
         ClientMessage::Unsubscribe { thread_id } => {
             state.hub.unsubscribe(thread_id, client_id).await;
@@ -5036,7 +5056,7 @@ async fn project_for(
 }
 
 /// Resolve a thread's project using only persistence — **no harness attach**. The read-only paths
-/// (subscribe history, load_history) use this so a thread whose provider was removed from config
+/// Subscription reads use this so a thread whose provider was removed from config
 /// stays viewable even though its harness can never re-attach. Prefers an already-open thread's
 /// registered project, then falls back to scanning persistence.
 async fn project_for_readonly(

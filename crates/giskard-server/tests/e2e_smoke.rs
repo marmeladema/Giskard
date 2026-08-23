@@ -2599,7 +2599,6 @@ async fn wait_for_thread_activity(
                         );
                     }
                     ServerMessage::Event { thread_id, .. }
-                    | ServerMessage::HistoryPage { thread_id, .. }
                     | ServerMessage::HistoryDelta { thread_id, .. }
                     | ServerMessage::RunningTasks { thread_id, .. } => {
                         assert_eq!(
@@ -3304,8 +3303,7 @@ async fn inactive_thread_progress_sends_activity_without_full_event_subscription
                             "only the subscribed thread may deliver full events"
                         );
                     }
-                    ServerMessage::HistoryPage { thread_id, .. }
-                    | ServerMessage::HistoryDelta { thread_id, .. }
+                    ServerMessage::HistoryDelta { thread_id, .. }
                     | ServerMessage::RunningTasks { thread_id, .. } => {
                         assert_eq!(
                             thread_id, active_thread,
@@ -6357,9 +6355,7 @@ async fn websocket_serializes_harness_error_events() {
                 }
                 other => panic!("expected error event, got {other:?}"),
             },
-            ServerMessage::HistoryPage { .. }
-            | ServerMessage::LiveTurnSnapshot(_)
-            | ServerMessage::RunningTasks { .. } => continue,
+            ServerMessage::LiveTurnSnapshot(_) | ServerMessage::RunningTasks { .. } => continue,
             other => panic!("expected event, got {other:?}"),
         }
     }

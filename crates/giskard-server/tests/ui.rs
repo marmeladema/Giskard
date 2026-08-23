@@ -1501,13 +1501,13 @@ async fn index_page_is_served_and_public() {
         between(
             &body,
             "async function openThread(",
-            "state.projectId = pid;"
+            "setActiveViewIdentity(pid, tid);"
         )
         .contains("closeCodeOverlay();")
             && between(
                 &body,
                 "function openDraftThread(pid) {",
-                "state.projectId = pid;"
+                "setActiveViewIdentity(pid, null);"
             )
             .contains("closeCodeOverlay();"),
         "navigating to another thread closes the file view, which belongs to the thread it was \
@@ -1947,7 +1947,11 @@ fn browser_scopes_unsent_composer_text_to_thread() {
         "function openDraftThread(pid) {",
         "/* ---------- thread view + websocket ---------- */",
     );
-    assert_order(open_draft, "saveComposerDraft();", "state.projectId = pid;");
+    assert_order(
+        open_draft,
+        "saveComposerDraft();",
+        "setActiveViewIdentity(pid, null);",
+    );
     assert_order(
         open_draft,
         "state.draftThread = { projectId:pid",
@@ -1962,7 +1966,7 @@ fn browser_scopes_unsent_composer_text_to_thread() {
     assert_order(
         open_thread,
         "saveComposerDraft();",
-        "state.projectId = pid; state.threadId = tid;",
+        "setActiveViewIdentity(pid, tid);",
     );
     assert_order(
         open_thread,
@@ -2010,6 +2014,46 @@ fn browser_scopes_unsent_composer_text_to_thread() {
         "clearComposerDraft(draftKey);",
         "state.draftThread = null;",
     );
+}
+
+#[test]
+fn browser_scopes_async_http_results_to_an_active_view_generation() {
+    let body = app_js();
+    assert!(body.contains("function setActiveViewIdentity(projectId, threadId) {"));
+    assert!(body.contains("state.activeViewGeneration += 1;"));
+    assert!(body.contains("function captureActiveViewIdentity() {"));
+    assert!(body.contains("function activeViewIdentityIsCurrent(view) {"));
+
+    let history_loader = between(
+        body,
+        "async function loadHistoryPage(before, limit, older) {",
+        "// Render one persisted turn from history",
+    );
+    assert!(history_loader.contains("const view = captureActiveViewIdentity();"));
+    assert!(
+        history_loader
+            .matches("if (!activeViewIdentityIsCurrent(view)) return;")
+            .count()
+            >= 2
+    );
+
+    let history_renderer = between(
+        body,
+        "function renderHistoryPage(msg) {",
+        "function renderHistoryDelta(msg) {",
+    );
+    assert!(
+        !history_renderer.contains("awaitingIncrementalResync")
+            && !history_renderer.contains("resetTranscriptForAuthoritativeSnapshot()"),
+        "an independent HTTP page must never be interpreted as WebSocket bootstrap state"
+    );
+    let delta_renderer = between(
+        body,
+        "function renderHistoryDelta(msg) {",
+        "function reconcileInFlightTurn()",
+    );
+    assert!(delta_renderer.contains("if (msg.reset)"));
+    assert!(delta_renderer.contains("resetTranscriptForAuthoritativeSnapshot();"));
 }
 
 #[test]
@@ -2411,16 +2455,16 @@ fn browser_incremental_resync_reconciles_in_flight_turn() {
         );
     }
 
-    // Delta is dispatched, and a full page arriving mid-resync is treated as a stale-cursor rebuild.
+    // Delta is dispatched, and only an explicit reset delta owns stale-cursor rebuilding.
     assert!(body.contains("case \"history_delta\": renderHistoryDelta(msg); break;"));
-    let page = between(
+    let delta = between(
         body,
-        "function renderHistoryPage(msg) {",
-        "const older = state.pendingOlder;",
+        "function renderHistoryDelta(msg) {",
+        "function reconcileInFlightTurn()",
     );
     assert_order(
-        page,
-        "if (state.awaitingIncrementalResync) {",
+        delta,
+        "if (msg.reset) {",
         "resetTranscriptForAuthoritativeSnapshot();",
     );
 
@@ -2639,7 +2683,7 @@ fn browser_diagnostics_panel_is_exposed_from_settings() {
     );
     assert!(
         body.contains(
-            "if (metrics.subscribeMode === \"full\") return msgType === \"history_page\";"
+            "if (metrics.subscribeMode === \"full\") return msgType === \"running_tasks\";"
         ),
         "full reconnect diagnostics should complete after the server's final snapshot message"
     );

@@ -911,6 +911,14 @@ and is sufficient here; the bounded reads land with the bootstrap that needs the
 **Exit criteria.** Two protocol variants are gone. Pagination cannot be confused with bootstrap
 history. Switching threads mid-fetch cannot apply the previous thread's page.
 
+**Transitional handoff to M5.** M1 moves only older-page pagination to HTTP. Until M5 replaces the
+implicit bootstrap state machine, fresh subscriptions and stale-cursor recovery continue to carry
+their bounded initial history as a bootstrap-only reset `HistoryDelta`; this is not a pagination
+response. The server still obtains that history and the live snapshot through sequential reads, so
+they do not form a transactional cut. M1 deliberately preserves that pre-existing limitation rather
+than introducing a second independent HTTP/WebSocket race. M5 owns closing it with the runtime
+snapshot, journal watermark, ordered suffix, and aggregate bootstrap commit described above.
+
 ---
 
 ### M2 — Runtime registry

@@ -240,7 +240,6 @@ fn server_message_kind(msg: &ServerMessage) -> &'static str {
         ServerMessage::ThreadState(_) => "thread_state",
         ServerMessage::ThreadMetadataResult { .. } => "thread_metadata_result",
         ServerMessage::ThreadCatalogChanged => "thread_catalog_changed",
-        ServerMessage::HistoryPage { .. } => "history_page",
         ServerMessage::HistoryDelta { .. } => "history_delta",
         ServerMessage::LiveTurnSnapshot(_) => "live_turn_snapshot",
         ServerMessage::RunningTasks { .. } => "running_tasks",

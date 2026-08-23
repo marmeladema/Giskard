@@ -638,7 +638,7 @@ impl From<ApprovalMetadata> for WireApprovalMetadata {
     }
 }
 
-/// Wire-mirror of [`Turn`] (§4.5), used by paged history (`HistoryPage`, H6). Items and diffs use
+/// Wire-mirror of [`Turn`] (§4.5), used by HTTP history pages and reconnect bootstrap. Items and diffs use
 /// their path-mirrored wire forms (C1/§3.5).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireTurn {

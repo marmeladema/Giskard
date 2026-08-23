@@ -462,19 +462,15 @@ session_days = 30
     .await
     .unwrap();
 
-    // Collect messages for a short window; we expect both the read-only warning and a history page.
-    let mut history_page: Option<serde_json::Value> = None;
+    // The socket reports the read-only attach warning; completed history is independent HTTP.
     let mut read_only_warning: Option<serde_json::Value> = None;
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-    while tokio::time::Instant::now() < deadline
-        && (history_page.is_none() || read_only_warning.is_none())
-    {
+    while tokio::time::Instant::now() < deadline && read_only_warning.is_none() {
         match tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
                 let v: serde_json::Value = serde_json::from_str(&t).unwrap();
                 // `ServerMessage::Error` flattens `ErrorInfo`, so its fields sit at the top level.
                 match v["type"].as_str() {
-                    Some("history_page") => history_page = Some(v),
                     Some("error") if v["code"] == "thread_read_only" => read_only_warning = Some(v),
                     _ => {}
                 }
@@ -485,7 +481,15 @@ session_days = 30
     }
 
     // The persisted history is served despite the harness being unable to attach.
-    let page = history_page.expect("read-only thread must still deliver a history page");
+    let page: serde_json::Value = client
+        .get(format!("{base}/api/projects/{pid}/threads/{tid}/history"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(page["turns"].as_array().unwrap().len(), 2);
 
     // …and the attach failure is surfaced as a non-fatal warning, not a hard error.
