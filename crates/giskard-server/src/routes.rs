@@ -4209,6 +4209,7 @@ async fn handle_client_msg(
             //   turn appends on top. The browser may keep a stale live DOM block visible until the
             //   replacement snapshot arrives, so delta rows still need to be inserted before that
             //   retained live block on the UI side.
+            let history_started_at = Instant::now();
             let resync_delta = match since {
                 Some(cursor) => state
                     .store
@@ -4250,7 +4251,27 @@ async fn handle_client_msg(
             // The live turn (H5) isn't in the JSONL yet — reconstruct it from the live buffer — and
             // its running tasks. Bootstrap history goes first so a reset rebuilds completed rows
             // before the live snapshot appends its in-flight rows.
+            debug!(
+                %project_id,
+                %thread_id,
+                action = "subscribe_history",
+                incremental = since.is_some(),
+                elapsed_ms = history_started_at.elapsed().as_millis(),
+                "loaded subscription history"
+            );
+
+            let live_snapshot_started_at = Instant::now();
             let live_snapshot = state.runtime.live_snapshot(thread_id);
+            debug!(
+                %project_id,
+                %thread_id,
+                action = "build_live_snapshot",
+                accumulated_events = live_snapshot
+                    .as_ref()
+                    .map_or(0, |snapshot| snapshot.accumulated.len()),
+                elapsed_ms = live_snapshot_started_at.elapsed().as_millis(),
+                "built subscription live snapshot"
+            );
             let (revision, tasks) = state.runtime.tasks_snapshot(thread_id);
             let running_tasks = ServerMessage::RunningTasks {
                 thread_id,
