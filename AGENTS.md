@@ -50,6 +50,17 @@ cargo clippy --all-targets -- -D warnings
 tests/e2e/run.sh
 ```
 
+For local E2E and screenshot runs, prefer refreshing and supplying a compatible host replay binary
+when supported; this avoids compiling Rust in the Docker build:
+
+```bash
+cargo build -p giskard-server --bin giskard-server-replay
+GISKARD_E2E_PREBUILT_BIN=target/debug/giskard-server-replay tests/e2e/run.sh
+```
+
+The script builds the binary in Docker when that path is absent. See `tests/e2e/README.md` for the
+host-binary compatibility requirements and screenshot equivalent.
+
 Playwright tests in `tests/e2e/` drive the real UI against `giskard-server-replay` (a bin in
 `giskard-server`): a deterministic, Codex-free server with a scripted in-process harness. When you
 change the login/project/thread/settings UI or that binary's seeded state, keep those tests and the

@@ -11,9 +11,11 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 image="${GISKARD_E2E_IMAGE:-giskard-e2e}"
 out_dir="$repo_root/docs/screenshots"
+binary_dir="$(mktemp -d)"
+trap 'rm -rf "$binary_dir"' EXIT
 
-echo "==> Building $image (context: $repo_root)"
-docker build -f "$repo_root/tests/e2e/Dockerfile" -t "$image" "$repo_root"
+"$repo_root/tests/e2e/build-image.sh" "$repo_root" "$image" "$binary_dir"
+binary_path="$(<"$binary_dir/resolved-path")"
 
 echo "==> Generating screenshots into $out_dir"
 mkdir -p "$out_dir"
@@ -21,6 +23,7 @@ mkdir -p "$out_dir"
 # output at the bind-mounted directory. --ipc=host keeps Chromium happy on small /dev/shm.
 docker run --rm --ipc=host \
   -e SCREENSHOT_DIR=/out \
+  -v "$binary_path:/usr/local/bin/giskard-server-replay:ro" \
   -v "$out_dir:/out" \
   "$image" --config=screenshots.config.ts "$@"
 

@@ -13,14 +13,17 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 image="${GISKARD_E2E_IMAGE:-giskard-e2e}"
+binary_dir="$(mktemp -d)"
+trap 'rm -rf "$binary_dir"' EXIT
 
-echo "==> Building $image (context: $repo_root)"
-docker build -f "$repo_root/tests/e2e/Dockerfile" -t "$image" "$repo_root"
+"$repo_root/tests/e2e/build-image.sh" "$repo_root" "$image" "$binary_dir"
+binary_path="$(<"$binary_dir/resolved-path")"
 
 echo "==> Running Playwright tests"
 # --ipc=host avoids Chromium crashing on small /dev/shm. The report volume surfaces results on the
 # host even when tests fail.
 mkdir -p "$repo_root/tests/e2e/playwright-report"
 docker run --rm --ipc=host \
+  -v "$binary_path:/usr/local/bin/giskard-server-replay:ro" \
   -v "$repo_root/tests/e2e/playwright-report:/e2e/playwright-report" \
   "$image" "$@"
