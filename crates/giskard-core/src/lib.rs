@@ -27,8 +27,9 @@ pub use error::{GiskardError, HarnessError, PersistError};
 pub use event::AgentEvent;
 pub use ids::{ApprovalId, DiffId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
 pub use item::{
-    FileChangeKind, Item, ItemDelta, ItemKind, ItemPayload, ItemStart, SubagentAction,
-    SubagentLink, SubagentStatus,
+    CommandOutputDescriptor, FileChangeKind, Item, ItemDelta, ItemKind, ItemPayload, ItemStart,
+    NormalizedCommandOutput, SubagentAction, SubagentLink, SubagentStatus,
+    command_output_logical_lines, command_output_tail_preview,
 };
 pub use mcp::{
     McpAuthStatus, McpOauthStart, McpResource, McpResourceTemplate, McpServerInfo, McpServerStatus,

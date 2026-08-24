@@ -169,7 +169,13 @@ async fn run() -> Result<(), String> {
 
     let factory = Arc::new(CodexFactory);
 
-    let state = AppState::new_with_config(store, factory, session_key, Some(&config.viz));
+    let state = AppState::new_with_config(
+        store,
+        factory,
+        session_key,
+        Some(&config.viz),
+        Some(&config.retention),
+    );
 
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind(&bind)

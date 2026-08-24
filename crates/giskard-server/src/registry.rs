@@ -29,7 +29,7 @@ use giskard_harness::{
 };
 use giskard_persist::PersistStore;
 use giskard_persist::store::{ProjectConfig, ThreadFile, ThreadMutation, TurnCommitOutcome};
-use giskard_proto::{RunningTask, ServerMessage, WireAgentEvent};
+use giskard_proto::{RunningTask, ServerMessage, WireAgentEvent, WireItem};
 
 use crate::hub::Hub;
 use crate::ledger::LedgerHandle;
@@ -2826,6 +2826,12 @@ async fn forward_events(
                     }
                 }
 
+                // Normalize every admitted completed-item payload once before runtime state, wire
+                // projection, current-turn assembly, or persistence can observe it. Command
+                // terminality is handled separately: providers may send a nonterminal
+                // ItemCompleted followed by a later terminal replacement.
+                let event = runtime.normalize_command_output(event);
+
                 if let Some(turn) = event_turn
                     && seen_turn_ids.contains(&turn)
                 {
@@ -2833,6 +2839,18 @@ async fn forward_events(
                         let before =
                             terminating_command_before_terminal_completion(&runtime, &event).await;
                         let applied = shared.runtime.apply_event(thread_id, &event, false);
+                        if let AgentEvent::ItemCompleted { turn, item, .. } = &event {
+                            shared
+                                .runtime
+                                .remove_command_output(thread_id, *turn, item.id);
+                            warn!(
+                                %project_id,
+                                %thread_id,
+                                %turn,
+                                item_id = %item.id,
+                                "deferred durable command-output update for already-persisted turn"
+                            );
+                        }
                         log_command_completion_after_terminate(before.as_ref(), &event);
                         debug!(
                             %thread_id,
@@ -2860,7 +2878,9 @@ async fn forward_events(
                                 "broadcasting terminal command completion for a persisted turn without matching running-task state"
                             );
                         }
-                        hub.broadcast_event(thread_id, event).await;
+                        if let Some(message) = late_command_completion_message(thread_id, event) {
+                            hub.broadcast(thread_id, message).await;
+                        }
                     }
                     if owned_turn_completed
                         && let Some(owned) = owned_turn
@@ -3853,6 +3873,49 @@ fn is_terminal_command_completion(event: &AgentEvent) -> bool {
         .unwrap_or(false)
 }
 
+fn late_command_completion_message(
+    thread_id: ThreadId,
+    event: AgentEvent,
+) -> Option<ServerMessage> {
+    let AgentEvent::ItemCompleted { thread, turn, item } = event else {
+        return None;
+    };
+    let descriptor = match &item.payload {
+        ItemPayload::CommandExecution {
+            output,
+            output_truncated,
+            output_original_bytes,
+            output_original_lines,
+            ..
+        } => {
+            let original_bytes = output_truncated
+                .then_some(*output_original_bytes)
+                .flatten()
+                .unwrap_or(output.len() as u64);
+            let original_lines = output_truncated
+                .then_some(*output_original_lines)
+                .flatten()
+                .unwrap_or_else(|| giskard_core::command_output_logical_lines(output));
+            Some(giskard_core::CommandOutputDescriptor::from_durable(
+                output,
+                *output_truncated,
+                original_bytes,
+                original_lines,
+                false,
+            ))
+        }
+        _ => None,
+    };
+    Some(ServerMessage::Event {
+        thread_id,
+        agent_event: Box::new(WireAgentEvent::ItemCompleted {
+            thread,
+            turn,
+            item: WireItem::from_item_with_command_output(item, descriptor),
+        }),
+    })
+}
+
 fn command_completion_is_normal_success(status: &str, exit_code: Option<i32>) -> bool {
     matches!(
         normalized_command_status(status).as_str(),
@@ -4161,8 +4224,8 @@ mod tests {
 
     use super::{
         CurrentTurnItems, TurnContext, TurnContextKind, command_completion_is_normal_success,
-        command_status_is_running, forward_events, passive_subagent_prompt_text,
-        persist_subagent_fallback_transcript, prepare_thread_updates,
+        command_status_is_running, forward_events, late_command_completion_message,
+        passive_subagent_prompt_text, persist_subagent_fallback_transcript, prepare_thread_updates,
         should_refresh_subagent_title, spawn_thread_update_forwarder, subagent_monitor_policy,
         subagent_path_leaf, take_passive_subagent_monitor_metadata, track_item_identity,
         turn_reservation, update_passive_subagent_metadata,
@@ -4170,6 +4233,47 @@ mod tests {
     use crate::hub::Hub;
     use crate::ledger;
     use crate::thread_runtime::ThreadRuntimeRegistry;
+
+    #[test]
+    fn late_untruncated_command_completion_ignores_original_counts() {
+        let thread_id = ThreadId::new();
+        let message = late_command_completion_message(
+            thread_id,
+            AgentEvent::ItemCompleted {
+                thread: thread_id,
+                turn: TurnId::new(),
+                item: Item {
+                    id: ItemId::new(),
+                    harness_item_id: "command-1".into(),
+                    payload: ItemPayload::CommandExecution {
+                        command: "printf ok".into(),
+                        cwd: std::path::PathBuf::from("/tmp/project"),
+                        output: "ok\n".into(),
+                        output_truncated: false,
+                        output_original_bytes: Some(999),
+                        output_original_lines: Some(88),
+                        exit_code: Some(0),
+                        status: Some("completed".into()),
+                        process_id: None,
+                        duration_ms: None,
+                    },
+                    created_at: Utc::now(),
+                },
+            },
+        )
+        .unwrap();
+        let ServerMessage::Event { agent_event, .. } = message else {
+            panic!("expected event message");
+        };
+        let WireAgentEvent::ItemCompleted { item, .. } = *agent_event else {
+            panic!("expected completed item");
+        };
+        let giskard_proto::WireItemPayload::CommandExecution { output, .. } = item.payload else {
+            panic!("expected command execution payload");
+        };
+        assert_eq!(output.original_bytes, 3);
+        assert_eq!(output.original_lines, 1);
+    }
 
     struct UnusedHarnessFactory;
 
@@ -5401,6 +5505,9 @@ mod tests {
                     command: "sleep 600".into(),
                     cwd: "/tmp/test".into(),
                     output: "still running".into(),
+                    output_truncated: false,
+                    output_original_bytes: None,
+                    output_original_lines: None,
                     exit_code: None,
                     status: Some("running".into()),
                     process_id: None,
@@ -5437,6 +5544,9 @@ mod tests {
                     command: "sleep 600".into(),
                     cwd: "/tmp/test".into(),
                     output: "done".into(),
+                    output_truncated: false,
+                    output_original_bytes: None,
+                    output_original_lines: None,
                     exit_code: Some(0),
                     status: Some("completed".into()),
                     process_id: None,
@@ -5635,6 +5745,9 @@ mod tests {
                             command: "sleep 1".into(),
                             cwd: "/tmp/test".into(),
                             output: "done".into(),
+                            output_truncated: false,
+                            output_original_bytes: None,
+                            output_original_lines: None,
                             exit_code: Some(0),
                             status: Some("completed".into()),
                             process_id: Some("proc_1".into()),
@@ -5760,6 +5873,9 @@ mod tests {
                             command: "<command included NUL byte>".into(),
                             cwd: "/tmp/test".into(),
                             output: String::new(),
+                            output_truncated: false,
+                            output_original_bytes: None,
+                            output_original_lines: None,
                             exit_code: None,
                             status: Some("in_progress".into()),
                             process_id: None,
@@ -5811,6 +5927,9 @@ mod tests {
                     command: "<command included NUL byte>".into(),
                     cwd: "/tmp/test".into(),
                     output: "failed before spawn".into(),
+                    output_truncated: false,
+                    output_original_bytes: None,
+                    output_original_lines: None,
                     exit_code: Some(1),
                     status: Some("failed".into()),
                     process_id: None,

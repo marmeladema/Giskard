@@ -217,11 +217,22 @@ test.describe("git status line", () => {
     await expect(page.locator("#codeCopyDiff")).toBeVisible();
 
     // Straight from the diff into a source file, with the overlay still open.
-    await page.evaluate(() => openCodeOverlay("src/main.rs"));
+    let releaseHighlight: (() => void) | undefined;
+    const highlightMayContinue = new Promise<void>(resolve => { releaseHighlight = resolve; });
+    await page.route("**/highlight?path=src%2Fmain.rs", async route => {
+      await highlightMayContinue;
+      await route.continue();
+    });
+    await page.evaluate(() => { void openCodeOverlay("src/main.rs"); });
     await expect(page.locator("#codeCopyDiff")).toBeHidden();
     await expect.poll(() => page.evaluate(() => state.diffOverlayText)).toBeNull();
+    await expect(page.locator("#codeView")).toHaveText("Loading source…");
+    await expect(page.locator("#codeDownload")).toBeEnabled();
+    releaseHighlight?.();
     // And the view really is the source one now, not the diff left behind.
     await expect(page.locator("#codeView .diff-table")).toHaveCount(0);
+    await expect(page.locator("#codeView")).toContainText("fn main");
+    await expect(page.locator("#codeDownload")).toBeEnabled();
   });
 
   test("says so when the clipboard refuses the diff", async ({ page }) => {

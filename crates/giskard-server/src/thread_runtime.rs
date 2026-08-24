@@ -13,10 +13,11 @@ use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ProjectId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::ids::{DiffId, ItemId};
-use giskard_core::item::ItemPayload;
+use giskard_core::item::{Item, ItemPayload, command_status_is_running};
 use giskard_core::server_request::{ServerRequest, ServerRequestResponse};
 use giskard_core::turn::{Mode, Turn};
 use giskard_core::user_input::UserInput;
+use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use crate::runtime_live::LiveTurnState;
@@ -32,6 +33,7 @@ use giskard_proto::{
 pub struct ThreadRuntimeRegistry {
     entries: Arc<Mutex<HashMap<ThreadId, Arc<Mutex<ThreadRuntimeEntry>>>>>,
     overview: Arc<Mutex<OverviewState>>,
+    max_command_output_bytes: usize,
 }
 
 #[derive(Default)]
@@ -44,6 +46,52 @@ struct ThreadRuntimeEntry {
     live: LiveTurnState,
     tasks: RunningTaskState,
     captured_diffs: HashMap<TurnId, ActiveCapturedDiffs>,
+    command_outputs: HashMap<(TurnId, ItemId), RuntimeCommandOutput>,
+    persisted_command_output_versions: HashMap<(TurnId, ItemId), String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeCommandOutput {
+    pub output: String,
+    pub output_truncated: bool,
+    pub original_bytes: u64,
+    pub original_lines: u64,
+    pub version: String,
+}
+
+pub(crate) enum RuntimeCommandOutputLookup {
+    Found(RuntimeCommandOutput),
+    Missing,
+}
+
+pub(crate) struct PersistedCommandOutputVersionPermit {
+    entry: std::sync::Weak<Mutex<ThreadRuntimeEntry>>,
+}
+
+impl PersistedCommandOutputVersionPermit {
+    pub(crate) fn version(&self, turn_id: TurnId, item_id: ItemId) -> Option<String> {
+        let entry = self.entry.upgrade()?;
+        lock_unpoison(&entry, "thread runtime entry")
+            .persisted_command_output_versions
+            .get(&(turn_id, item_id))
+            .cloned()
+    }
+
+    pub(crate) fn cache(
+        &self,
+        turn_id: TurnId,
+        item_id: ItemId,
+        version: String,
+    ) -> Option<String> {
+        let entry = self.entry.upgrade()?;
+        Some(
+            lock_unpoison(&entry, "thread runtime entry")
+                .persisted_command_output_versions
+                .entry((turn_id, item_id))
+                .or_insert(version)
+                .clone(),
+        )
+    }
 }
 
 #[derive(Default)]
@@ -184,6 +232,32 @@ pub(crate) struct RestorePermit {
 }
 
 impl ThreadRuntimeRegistry {
+    /// Normalize a completed-item event before runtime, wire, or persistence can observe it.
+    pub(crate) fn normalize_command_output(&self, mut event: AgentEvent) -> AgentEvent {
+        let AgentEvent::ItemCompleted { item, .. } = &mut event else {
+            return event;
+        };
+        let ItemPayload::CommandExecution {
+            output,
+            output_truncated,
+            output_original_bytes,
+            output_original_lines,
+            ..
+        } = &mut item.payload
+        else {
+            return event;
+        };
+        let normalized = giskard_persist::normalize_command_output(
+            std::mem::take(output),
+            self.max_command_output_bytes,
+        );
+        *output = normalized.output;
+        *output_truncated = normalized.output_truncated;
+        *output_original_bytes = normalized.output_original_bytes;
+        *output_original_lines = normalized.output_original_lines;
+        event
+    }
+
     /// Extract full diff bodies before an event reaches reconnect state or browser projection.
     pub(crate) fn capture_event_diffs(
         &self,
@@ -258,6 +332,49 @@ impl ThreadRuntimeRegistry {
             .map_or_else(Vec::new, |state| state.contents.values().cloned().collect())
     }
 
+    pub(crate) fn command_output(
+        &self,
+        thread_id: ThreadId,
+        turn_id: TurnId,
+        item_id: ItemId,
+    ) -> RuntimeCommandOutputLookup {
+        let Some(entry) = self.existing_entry(thread_id) else {
+            return RuntimeCommandOutputLookup::Missing;
+        };
+        lock_unpoison(&entry, "thread runtime entry")
+            .command_outputs
+            .get(&(turn_id, item_id))
+            .cloned()
+            .map_or(
+                RuntimeCommandOutputLookup::Missing,
+                RuntimeCommandOutputLookup::Found,
+            )
+    }
+
+    pub(crate) fn remove_command_output(
+        &self,
+        thread_id: ThreadId,
+        turn_id: TurnId,
+        item_id: ItemId,
+    ) {
+        let Some(entry) = self.existing_entry(thread_id) else {
+            return;
+        };
+        lock_unpoison(&entry, "thread runtime entry")
+            .command_outputs
+            .remove(&(turn_id, item_id));
+    }
+
+    pub(crate) fn persisted_command_output_version_permit(
+        &self,
+        thread_id: ThreadId,
+    ) -> PersistedCommandOutputVersionPermit {
+        let entry = self.entry_or_create(thread_id);
+        PersistedCommandOutputVersionPermit {
+            entry: Arc::downgrade(&entry),
+        }
+    }
+
     pub(crate) fn captured_diff(
         &self,
         thread_id: ThreadId,
@@ -281,9 +398,16 @@ impl ThreadRuntimeRegistry {
             .map_or(RuntimeDiffLookup::Missing, RuntimeDiffLookup::Superseded)
     }
     pub fn new() -> Self {
+        Self::with_max_command_output_bytes(
+            giskard_persist::config::RetentionConfig::DEFAULT_MAX_COMMAND_OUTPUT_BYTES,
+        )
+    }
+
+    pub fn with_max_command_output_bytes(max_command_output_bytes: usize) -> Self {
         Self {
             entries: Arc::new(Mutex::new(HashMap::new())),
             overview: Arc::new(Mutex::new(OverviewState::default())),
+            max_command_output_bytes,
         }
     }
 
@@ -532,6 +656,9 @@ impl ThreadRuntimeRegistry {
             }
             _ => (None, false),
         };
+        if let AgentEvent::ItemCompleted { turn, item, .. } = event {
+            update_command_output_authority(entry, *turn, item);
+        }
         let tasks_changed = entry.tasks.apply_event(event);
         if tasks_changed {
             entry.task_revision = entry.task_revision.saturating_add(1);
@@ -581,6 +708,9 @@ impl ThreadRuntimeRegistry {
                 };
                 if let Some(completed_turn) = completed_turn {
                     entry.captured_diffs.remove(&completed_turn);
+                    entry
+                        .command_outputs
+                        .retain(|(turn_id, _), _| *turn_id != completed_turn);
                 }
                 entry.requests.retain(|_, record| {
                     !(matches!(record.status, RequestStatus::Resolved(_))
@@ -926,8 +1056,57 @@ impl Clone for ThreadRuntimeRegistry {
         Self {
             entries: self.entries.clone(),
             overview: self.overview.clone(),
+            max_command_output_bytes: self.max_command_output_bytes,
         }
     }
+}
+
+fn update_command_output_authority(entry: &mut ThreadRuntimeEntry, turn_id: TurnId, item: &Item) {
+    let ItemPayload::CommandExecution {
+        output,
+        output_truncated,
+        output_original_bytes,
+        output_original_lines,
+        status,
+        ..
+    } = &item.payload
+    else {
+        entry.command_outputs.remove(&(turn_id, item.id));
+        return;
+    };
+    if status.as_deref().is_some_and(command_status_is_running) {
+        entry.command_outputs.remove(&(turn_id, item.id));
+        return;
+    }
+    let Ok(descriptor) = giskard_persist::command_output_descriptor(
+        output,
+        *output_truncated,
+        *output_original_bytes,
+        *output_original_lines,
+        true,
+    ) else {
+        tracing::error!(
+            %turn_id,
+            item_id = %item.id,
+            "completed command output has inconsistent truncation metadata"
+        );
+        entry.command_outputs.remove(&(turn_id, item.id));
+        return;
+    };
+    entry.command_outputs.insert(
+        (turn_id, item.id),
+        RuntimeCommandOutput {
+            output: output.clone(),
+            output_truncated: *output_truncated,
+            original_bytes: descriptor.original_bytes,
+            original_lines: descriptor.original_lines,
+            version: command_output_version(output),
+        },
+    );
+}
+
+pub(crate) fn command_output_version(output: &str) -> String {
+    format!("\"sha256_{:x}\"", Sha256::digest(output.as_bytes()))
 }
 
 impl ThreadTurnLease {
@@ -2120,5 +2299,113 @@ mod tests {
                 .0,
             turn
         );
+    }
+
+    #[test]
+    fn terminal_command_output_is_normalized_and_addressable_until_cleanup() {
+        let runtime = ThreadRuntimeRegistry::with_max_command_output_bytes(32 * 1024);
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let item_id = ItemId::new();
+        let event = runtime.normalize_command_output(AgentEvent::ItemCompleted {
+            thread,
+            turn,
+            item: Item {
+                id: item_id,
+                harness_item_id: "command".into(),
+                payload: ItemPayload::CommandExecution {
+                    command: "produce-output".into(),
+                    cwd: "/tmp".into(),
+                    output: format!("head\n{}\ntail", "🙂".repeat(20_000)),
+                    output_truncated: false,
+                    output_original_bytes: None,
+                    output_original_lines: None,
+                    exit_code: Some(0),
+                    status: Some("completed".into()),
+                    process_id: None,
+                    duration_ms: None,
+                },
+                created_at: Utc::now(),
+            },
+        });
+        runtime.apply_event(thread, &event, true);
+        let RuntimeCommandOutputLookup::Found(output) =
+            runtime.command_output(thread, turn, item_id)
+        else {
+            panic!("terminal output was not installed");
+        };
+        assert!(output.output.len() <= 32 * 1024);
+        assert!(output.output_truncated);
+        assert!(output.original_bytes > output.output.len() as u64);
+        assert_eq!(output.version, command_output_version(&output.output));
+
+        runtime.settle_completed_turn(
+            thread,
+            &AgentEvent::TurnCompleted {
+                thread,
+                turn,
+                usage: Default::default(),
+                status: TurnStatus {
+                    kind: TurnStatusKind::Completed,
+                    message: None,
+                },
+            },
+            None,
+        );
+        assert!(matches!(
+            runtime.command_output(thread, turn, item_id),
+            RuntimeCommandOutputLookup::Missing
+        ));
+    }
+
+    #[test]
+    fn persisted_output_version_cache_is_authority_scoped_and_separate_from_runtime() {
+        let runtime = ThreadRuntimeRegistry::new();
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let item = ItemId::new();
+        let permit = runtime.persisted_command_output_version_permit(thread);
+        let persisted = command_output_version("persisted");
+        assert_eq!(
+            permit.cache(turn, item, persisted.clone()),
+            Some(persisted.clone())
+        );
+        assert_eq!(permit.version(turn, item), Some(persisted));
+
+        let event = runtime.normalize_command_output(AgentEvent::ItemCompleted {
+            thread,
+            turn,
+            item: Item {
+                id: item,
+                harness_item_id: "runtime-command".into(),
+                payload: ItemPayload::CommandExecution {
+                    command: "printf runtime".into(),
+                    cwd: "/tmp".into(),
+                    output: "runtime".into(),
+                    output_truncated: false,
+                    output_original_bytes: None,
+                    output_original_lines: None,
+                    exit_code: Some(0),
+                    status: Some("completed".into()),
+                    process_id: None,
+                    duration_ms: None,
+                },
+                created_at: Utc::now(),
+            },
+        });
+        runtime.apply_event(thread, &event, true);
+        let RuntimeCommandOutputLookup::Found(output) = runtime.command_output(thread, turn, item)
+        else {
+            panic!("runtime output was not installed");
+        };
+        assert_eq!(output.version, command_output_version("runtime"));
+        assert_eq!(
+            permit.version(turn, item),
+            Some(command_output_version("persisted"))
+        );
+
+        runtime.forget_threads(&std::collections::HashSet::from([thread]));
+        assert_eq!(permit.cache(turn, item, "stale".into()), None);
+        assert!(runtime.existing_entry(thread).is_none());
     }
 }

@@ -128,7 +128,9 @@ Then open **http://127.0.0.1:8787**, log in, and:
    and 25 MiB total. The first send creates the Codex thread with the selected
    provider/model and starts the turn. Existing threads show the **Tasks** menu for running
    commands/tools, **Sub-agents** monitor, **MCP** status menu, and **Context** usage button;
-   scrolling the transcript to the top lazy-loads older history. When the project's workspace is a
+   scrolling the transcript to the top lazy-loads older history. Completed command rows carry only
+   a bounded preview; opening one fetches its retained output and resolves path links by command
+   identity, without uploading that potentially large output from the browser. When the project's workspace is a
    Git repository, a one-line **Git status** sits just above the composer — branch, ahead/behind,
    changed-file count and total diffstat — and expands in place into the changed files, each
    opening its diff. It refreshes as the agent changes the tree, so it stays current during a turn.
@@ -217,6 +219,7 @@ service does not silently run with an empty provider list.
 | `[tokens]` | `cost_estimation` | `false` | Show an estimated € cost from `[tokens.rates."provider/model"]`. |
 | `[viz]` | `max_highlight_size` | `10485760` (10 MiB) | Files larger than this aren't syntax-highlighted. |
 | `[history]` | `initial` / `page` | `5` / `5` | Turns fetched on open (topped up client-side to ~2 screens) / per scroll-up page. |
+| `[retention]` | `max_command_output_bytes` | `134217728` (128 MiB) | Maximum durable completed-command output. Must be at least `32768` (32 KiB); larger output retains a UTF-8-safe head and tail. |
 | `[harness]` | `kind` | `codex` | Agent harness (v1: `codex`). |
 | | `idle_shutdown_secs` | `0` (keep alive) | Terminate an idle project's harness after N seconds. |
 | `[providers.<id>]` | `model_listing`, `[[providers.<id>.models]]` | — | **Optional.** Models are found without it: every provider Codex has a `base_url` for is discovered from `GET {base_url}/models` with the key Codex holds for it, and the provider Codex routes to also contributes its `model/list` catalog. A built-in Codex has no endpoint for and does not route to — `ollama` or `lmstudio` when you use neither — has nothing to contribute and is not offered; declare models for it if you want it in the picker. Declare a provider only to turn discovery off (`model_listing = false`), to add models by hand for an endpoint with no `/models` route, to override metadata, or to pin picker order — declared providers come first in the order written, the rest by id. Keyed by routing id, the same way Codex keys `[model_providers.<id>]`; the id must name a provider Codex knows (see below). |

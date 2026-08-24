@@ -121,7 +121,6 @@ impl LiveTurnState {
                 remove_command_output_deltas(&mut turn.events, item_id);
             }
             let command_delta_item = command_output_item_id(&event);
-            let event = compact_completed_command_output(event);
             turn.events.push(event);
             if let Some(item_id) = command_delta_item {
                 compact_command_output_deltas(&mut turn.events, item_id);
@@ -352,15 +351,6 @@ fn command_output_item_id(event: &AgentEvent) -> Option<ItemId> {
         return None;
     };
     Some(*item_id)
-}
-
-fn compact_completed_command_output(mut event: AgentEvent) -> AgentEvent {
-    if let AgentEvent::ItemCompleted { item, .. } = &mut event
-        && let ItemPayload::CommandExecution { output, .. } = &mut item.payload
-    {
-        *output = compact_command_output(output);
-    }
-    event
 }
 
 fn remove_command_output_deltas(events: &mut Vec<AgentEvent>, item_id: ItemId) {
@@ -632,7 +622,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_command_output_is_compacted_in_live_snapshot() {
+    async fn completed_command_output_uses_bounded_wire_descriptor_in_live_snapshot() {
         let mut store = LiveTurnState::new();
         let thread = ThreadId::new();
         let turn = TurnId::new();
@@ -656,6 +646,9 @@ mod tests {
                         command: "yes".into(),
                         cwd: "/tmp/project".into(),
                         output,
+                        output_truncated: false,
+                        output_original_bytes: None,
+                        output_original_lines: None,
                         exit_code: Some(0),
                         status: Some("completed".into()),
                         process_id: Some("proc_1".into()),
@@ -678,9 +671,10 @@ mod tests {
         });
 
         let output = completed.expect("completed command output");
-        assert!(output.starts_with("head\n"));
-        assert!(output.contains(LIVE_COMMAND_OUTPUT_TRUNCATED.trim()));
-        assert!(output.ends_with("\ntail"));
+        assert!(output.preview_truncated);
+        assert!(!output.preview.contains("head\n"));
+        assert!(output.preview.len() <= giskard_persist::COMMAND_OUTPUT_PREVIEW_MAX_BYTES);
+        assert!(output.preview.ends_with("\ntail"));
     }
 
     #[tokio::test]

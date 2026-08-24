@@ -668,6 +668,31 @@ pub fn parse_turn_payload(path: &Path, data: &str) -> Result<TurnPayload, Persis
     };
 
     for (_, item) in &mut items {
+        crate::command_output::validate_command_output_payload(&item.payload).map_err(|error| {
+            PersistError::Invalid(format!(
+                "{}: item {} has invalid command-output metadata: {error}",
+                path.display(),
+                item.id
+            ))
+        })?;
+        let (ignored_bytes, ignored_lines) =
+            crate::command_output::ignored_command_output_metadata(&item.payload);
+        if ignored_bytes {
+            tracing::warn!(
+                path = %path.display(),
+                item_id = %item.id,
+                field = "output_original_bytes",
+                "ignoring command-output metadata field because output is not truncated"
+            );
+        }
+        if ignored_lines {
+            tracing::warn!(
+                path = %path.display(),
+                item_id = %item.id,
+                field = "output_original_lines",
+                "ignoring command-output metadata field because output is not truncated"
+            );
+        }
         if let ItemPayload::FileChange { changes, .. } = &mut item.payload {
             for change in changes {
                 let Some(text) = change.diff.take() else {
@@ -762,6 +787,54 @@ mod lazy_diff_tests {
         FileChangeKind, Item, ItemId, ItemPayload, Mode, ModelRef, TokenUsage, TurnId, TurnStatus,
         TurnStatusKind, UserInput,
     };
+
+    #[test]
+    fn payload_load_rejects_incomplete_command_output_metadata() {
+        let now = chrono::Utc::now();
+        let turn = Turn {
+            id: TurnId::new(),
+            user_input: UserInput::text("show output"),
+            items: vec![Item {
+                id: ItemId::new(),
+                harness_item_id: "malformed-command".into(),
+                payload: ItemPayload::CommandExecution {
+                    command: "printf output".into(),
+                    cwd: ".".into(),
+                    output:
+                        "first\nsecond\n[… 20 bytes omitted from durable command output …]\nlast\n"
+                            .into(),
+                    output_truncated: true,
+                    output_original_bytes: Some(1),
+                    output_original_lines: None,
+                    exit_code: Some(0),
+                    status: Some("completed".into()),
+                    process_id: None,
+                    duration_ms: Some(1),
+                },
+                created_at: now,
+            }],
+            model: ModelRef {
+                provider: "test".into(),
+                model: "test".into(),
+                reasoning_effort: None,
+            },
+            mode: Mode::Build,
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+            usage: TokenUsage::default(),
+            diffs: Vec::new(),
+            started_at: now,
+            completed_at: Some(now),
+        };
+
+        let serialized = String::from_utf8(payload_file_bytes(&turn).unwrap()).unwrap();
+        let error = parse_turn_payload(Path::new("turn.jsonl"), &serialized).unwrap_err();
+        assert!(error.to_string().contains(
+            "invalid command-output metadata: truncated command output is missing original-size metadata"
+        ));
+    }
 
     #[test]
     fn legacy_diff_id_is_deterministic_and_content_sensitive() {

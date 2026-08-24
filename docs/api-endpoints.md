@@ -10,6 +10,8 @@ WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticke
 `POST /api/projects/{id}/threads/{thread_id}/archive`,
 `GET /api/projects/{id}/threads/{thread_id}/history`,
 `GET /api/projects/{id}/threads/{thread_id}/turns/{turn_id}/diffs/{diff_id}`,
+`GET /api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}/command-output`,
+`GET /api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}/command-output-links`,
 `GET /api/projects/{id}/threads/{thread_id}/deletion-impact`,
 `GET /api/projects/{id}/models`,
 `GET /api/tokens`, `GET /api/projects/{id}/tokens`,
@@ -86,6 +88,20 @@ JSON `409 diff_superseded` with the current descriptor, while an unknown turn or
 404. This endpoint is distinct from `/api/projects/{id}/git/diff`, which intentionally answers a
 current-worktree question.
 
+Completed command events and history carry a bounded 8 KiB tail preview and output statistics,
+not the completed output body. `GET
+/api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}/command-output` lazily returns
+all durably retained output as `text/plain; charset=utf-8`. The
+`X-Giskard-Output-Truncated`, `X-Giskard-Output-Original-Bytes`, and
+`X-Giskard-Output-Original-Lines` headers describe the provider output before durable truncation.
+Its strong `ETag` identifies the exact retained bytes. `GET` on the sibling `command-output-links`
+path accepts that value in the required `If-Output-Match` header and returns only link spans,
+without uploading or echoing the output. A missing precondition returns 428 and a stale version
+returns 412; the browser keeps the raw output as plain text in either degraded case.
+The lookup uses active runtime state first and immutable history second; unknown, wrong-kind,
+unavailable, and still-running items all return 404. The browser requests it only when the command
+overlay opens and releases the fetched body when that overlay closes.
+
 Process-local thread state is published separately: `ThreadRuntimeOverview { revision, threads }`
 is a global replacement snapshot (including an empty `threads` list), `RequestState` carries a
 per-request revision and the authoritative pending/responding/resolved status for each approval or
@@ -131,7 +147,7 @@ endpoint returns `503` rather than reporting zeroes: "the cost could not be dete
 would be lost" lead to opposite confirmation copy, so a client must not read the first as the
 second. The matching `DELETE` refuses for the same reason.
 
-Five endpoints resolve a path against a thread's workspace, and all five name that thread in the
+Six endpoints resolve a path against a thread's workspace, and all six name that thread in the
 path — there is no thread-less form. The thread is part of the request rather than an optional
 scope, because a caller that could omit it would be answered from a workspace it never named. That
 workspace is the thread's own Git worktree when it was started with one, its parent's when it is a
@@ -143,7 +159,7 @@ They use the workspace for two different things, which is worth keeping straight
 
 - **`highlight`, `raw` and `image` read the file.** The workspace decides which bytes come back, so
   the wrong one is answered successfully with the wrong content.
-- **`linkify` and `render` only test that a path exists.** Neither opens a file: `linkify` returns
+- **`linkify`, `command-output-links`, and `render` only test that a path exists.** None opens a file: `linkify` and `command-output-links` return
   spans for the candidates that resolve inside the workspace and are files, and `render` is
   workspace-independent apart from running that same pass to decide which text becomes a
   `.path-link` button. The wrong workspace there costs a link, not content — a path rendered

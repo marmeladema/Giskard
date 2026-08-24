@@ -107,6 +107,14 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
             "/api/projects/{id}/threads/{thread_id}/turns/{turn_id}/diffs/{diff_id}",
             get(captured_diff),
         )
+        .route(
+            "/api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}/command-output",
+            get(command_output),
+        )
+        .route(
+            "/api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}/command-output-links",
+            get(command_output_links),
+        )
         // File reads name their thread in the path rather than leaving it implicit. The workspace a
         // read is answered from is the thread's, so the thread has to be part of the request; a
         // caller that could omit it would be answered from somewhere it never asked about.
@@ -2231,7 +2239,194 @@ fn sort_browse_entries(entries: &mut [DirEntry]) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use giskard_core::event::AgentEvent;
+    use giskard_core::item::{Item, ItemPayload};
+    use giskard_harness::AgentHarness;
+    use giskard_persist::store::ProjectConfig;
+
     use super::*;
+    use crate::HarnessFactory;
+
+    struct FailingFactory;
+
+    #[async_trait::async_trait]
+    impl HarnessFactory for FailingFactory {
+        async fn create(
+            &self,
+            _config: &ProjectConfig,
+        ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
+            Err(giskard_core::HarnessError::Spawn("unused in test".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn command_output_response_has_exact_body_and_retention_headers() {
+        let response = command_output_response(
+            "kept 🙂 output".into(),
+            true,
+            99_999,
+            42,
+            crate::thread_runtime::command_output_version("kept 🙂 output"),
+        )
+        .expect("response");
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(response.headers()["x-giskard-output-truncated"], "true");
+        assert_eq!(
+            response.headers()["x-giskard-output-original-bytes"],
+            "99999"
+        );
+        assert_eq!(response.headers()["x-giskard-output-original-lines"], "42");
+        assert_eq!(
+            response.headers()[axum::http::header::ETAG],
+            crate::thread_runtime::command_output_version("kept 🙂 output")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(body, "kept 🙂 output");
+    }
+
+    #[test]
+    fn command_output_version_is_strong_and_content_sensitive() {
+        let version = crate::thread_runtime::command_output_version("kept 🙂 output");
+        assert!(version.starts_with('"') && version.ends_with('"'));
+        assert!(!version.starts_with("W/"));
+        assert_ne!(
+            version,
+            crate::thread_runtime::command_output_version("kept 🙂 output!")
+        );
+    }
+
+    #[tokio::test]
+    async fn command_output_loader_prefers_runtime_output_over_persisted_output() {
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(giskard_persist::PersistStore::new(
+            data_dir.path().to_path_buf(),
+        ));
+        let state = AppState::new(store, Arc::new(FailingFactory), vec![0; 32]);
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let turn_id = giskard_core::TurnId::new();
+        let item_id = giskard_core::ItemId::new();
+        state
+            .store
+            .create_project(
+                project_id,
+                "runtime precedence",
+                &workspace.path().to_string_lossy(),
+            )
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let thread = giskard_persist::store::ThreadFile {
+            revision: 0,
+            version: 1,
+            id: thread_id,
+            project_id,
+            title: "runtime precedence".into(),
+            harness_thread_id: format!("native-{thread_id}"),
+            parent_thread_id: None,
+            spawned_by_turn_id: None,
+            kind: giskard_core::ThreadKind::Primary,
+            mode: giskard_core::turn::Mode::Build,
+            current_model: giskard_core::model::ModelRef {
+                provider: "openai".into(),
+                model: "gpt-5.5".into(),
+                reasoning_effort: None,
+            },
+            context_window: 128_000,
+            model_context_windows: Default::default(),
+            permission_preset: giskard_core::turn::PermissionPreset::AskFirst,
+            model_efforts: Default::default(),
+            tokens: Default::default(),
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            git_workspace: None,
+        };
+        state.store.save_thread(project_id, &thread).await.unwrap();
+
+        let persisted_item = Item {
+            id: item_id,
+            harness_item_id: "persisted-command".into(),
+            payload: ItemPayload::CommandExecution {
+                command: "printf persisted".into(),
+                cwd: workspace.path().to_path_buf(),
+                output: "persisted output".into(),
+                output_truncated: false,
+                output_original_bytes: None,
+                output_original_lines: None,
+                exit_code: Some(0),
+                status: Some("completed".into()),
+                process_id: None,
+                duration_ms: Some(1),
+            },
+            created_at: now,
+        };
+        state
+            .store
+            .append_turn(
+                project_id,
+                thread_id,
+                &giskard_core::turn::Turn {
+                    id: turn_id,
+                    user_input: giskard_core::user_input::UserInput::text("run"),
+                    items: vec![persisted_item],
+                    model: thread.current_model.clone(),
+                    mode: thread.mode,
+                    status: giskard_core::turn::TurnStatus {
+                        kind: giskard_core::turn::TurnStatusKind::Completed,
+                        message: None,
+                    },
+                    usage: Default::default(),
+                    diffs: vec![],
+                    started_at: now,
+                    completed_at: Some(now),
+                },
+            )
+            .await
+            .unwrap();
+
+        let runtime_event = state
+            .runtime
+            .normalize_command_output(AgentEvent::ItemCompleted {
+                thread: thread_id,
+                turn: turn_id,
+                item: Item {
+                    id: item_id,
+                    harness_item_id: "runtime-command".into(),
+                    payload: ItemPayload::CommandExecution {
+                        command: "printf runtime".into(),
+                        cwd: workspace.path().to_path_buf(),
+                        output: "runtime output".into(),
+                        output_truncated: false,
+                        output_original_bytes: None,
+                        output_original_lines: None,
+                        exit_code: Some(0),
+                        status: Some("completed".into()),
+                        process_id: None,
+                        duration_ms: Some(2),
+                    },
+                    created_at: now,
+                },
+            });
+        state.runtime.apply_event(thread_id, &runtime_event, true);
+
+        let loaded = load_command_output(&state, project_id, thread_id, turn_id, item_id)
+            .await
+            .unwrap();
+        assert_eq!(loaded.output, "runtime output");
+        assert_eq!(
+            loaded.version,
+            crate::thread_runtime::command_output_version("runtime output")
+        );
+    }
 
     /// Builds a real repository with one linked worktree, and hands back the record the deletion
     /// path works from.
@@ -3980,6 +4175,246 @@ async fn captured_diff(
         .map_err(|error| ApiError::Internal(error.to_string()))?
         .ok_or(ApiError::NotFound)?;
     Ok(Json(CapturedDiffResponse { diff_id, content }).into_response())
+}
+
+async fn command_output(
+    State(state): State<AppState>,
+    AxumPath((project_id, thread_id, turn_id, item_id)): AxumPath<(
+        ProjectId,
+        ThreadId,
+        giskard_core::TurnId,
+        giskard_core::ItemId,
+    )>,
+) -> Result<axum::response::Response, ApiError> {
+    let output = load_command_output(&state, project_id, thread_id, turn_id, item_id).await?;
+    command_output_response(
+        output.output,
+        output.output_truncated,
+        output.original_bytes,
+        output.original_lines,
+        output.version,
+    )
+}
+
+struct LoadedCommandOutput {
+    output: String,
+    output_truncated: bool,
+    original_bytes: u64,
+    original_lines: u64,
+    version: String,
+}
+
+async fn load_command_output(
+    state: &AppState,
+    project_id: ProjectId,
+    thread_id: ThreadId,
+    turn_id: giskard_core::TurnId,
+    item_id: giskard_core::ItemId,
+) -> Result<LoadedCommandOutput, ApiError> {
+    if state
+        .store
+        .load_thread(project_id, thread_id)
+        .await
+        .map_err(|error| ApiError::Internal(error.to_string()))?
+        .is_none()
+    {
+        return Err(ApiError::NotFound);
+    }
+    if let crate::thread_runtime::RuntimeCommandOutputLookup::Found(output) =
+        state.runtime.command_output(thread_id, turn_id, item_id)
+    {
+        return Ok(LoadedCommandOutput {
+            output: output.output,
+            output_truncated: output.output_truncated,
+            original_bytes: output.original_bytes,
+            original_lines: output.original_lines,
+            version: output.version,
+        });
+    }
+    let version_permit = state
+        .runtime
+        .persisted_command_output_version_permit(thread_id);
+    let output = state
+        .store
+        .load_command_output(project_id, thread_id, turn_id, item_id)
+        .await
+        .map_err(|error| ApiError::Internal(error.to_string()))?
+        .ok_or(ApiError::NotFound)?;
+    if let crate::thread_runtime::RuntimeCommandOutputLookup::Found(output) =
+        state.runtime.command_output(thread_id, turn_id, item_id)
+    {
+        return Ok(LoadedCommandOutput {
+            output: output.output,
+            output_truncated: output.output_truncated,
+            original_bytes: output.original_bytes,
+            original_lines: output.original_lines,
+            version: output.version,
+        });
+    }
+    let version = if let Some(version) = version_permit.version(turn_id, item_id) {
+        version
+    } else {
+        let output = tokio::task::spawn_blocking(move || {
+            let version = crate::thread_runtime::command_output_version(&output.output);
+            (output, version)
+        })
+        .await
+        .map_err(|error| {
+            error!(
+                %project_id,
+                %thread_id,
+                %turn_id,
+                %item_id,
+                action = "hash_command_output",
+                error = %error,
+                "command output hashing task failed"
+            );
+            ApiError::Internal("command output hashing failed".into())
+        })?;
+        let (loaded, computed) = output;
+        if let crate::thread_runtime::RuntimeCommandOutputLookup::Found(output) =
+            state.runtime.command_output(thread_id, turn_id, item_id)
+        {
+            return Ok(LoadedCommandOutput {
+                output: output.output,
+                output_truncated: output.output_truncated,
+                original_bytes: output.original_bytes,
+                original_lines: output.original_lines,
+                version: output.version,
+            });
+        }
+        let version = version_permit
+            .cache(turn_id, item_id, computed.clone())
+            .unwrap_or(computed);
+        return Ok(LoadedCommandOutput {
+            output: loaded.output,
+            output_truncated: loaded.output_truncated,
+            original_bytes: loaded.original_bytes,
+            original_lines: loaded.original_lines,
+            version,
+        });
+    };
+    Ok(LoadedCommandOutput {
+        output: output.output,
+        output_truncated: output.output_truncated,
+        original_bytes: output.original_bytes,
+        original_lines: output.original_lines,
+        version,
+    })
+}
+
+async fn command_output_links(
+    State(state): State<AppState>,
+    AxumPath((project_id, thread_id, turn_id, item_id)): AxumPath<(
+        ProjectId,
+        ThreadId,
+        giskard_core::TurnId,
+        giskard_core::ItemId,
+    )>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::response::Response, ApiError> {
+    // Resolve the entity before its precondition so a caller cannot use status differences to
+    // probe command identities it cannot otherwise read.
+    let output = load_command_output(&state, project_id, thread_id, turn_id, item_id).await?;
+    let version = &output.version;
+    let supplied: Vec<_> = headers.get_all("if-output-match").iter().collect();
+    if supplied.is_empty() {
+        return Ok((
+            axum::http::StatusCode::PRECONDITION_REQUIRED,
+            "If-Output-Match is required",
+        )
+            .into_response());
+    }
+    if supplied.len() != 1 {
+        return Err(ApiError::BadRequest(
+            "If-Output-Match must have exactly one value".into(),
+        ));
+    }
+    let supplied = supplied[0]
+        .to_str()
+        .map_err(|_| ApiError::BadRequest("If-Output-Match is not valid ASCII".into()))?;
+    if !is_command_output_version(supplied) {
+        return Err(ApiError::BadRequest(
+            "If-Output-Match must be a quoted sha256_ digest with 64 lowercase hexadecimal characters"
+                .into(),
+        ));
+    }
+    if supplied != version {
+        return Ok((
+            axum::http::StatusCode::PRECONDITION_FAILED,
+            "command output changed",
+        )
+            .into_response());
+    }
+
+    let workspace_root = thread_workspace(&state, project_id, thread_id).await?;
+    let root_canonical = workspace_root.canonicalize().unwrap_or(workspace_root);
+    let output_text = output.output;
+    let linkification = tokio::task::spawn_blocking(move || {
+        crate::linkify::linkify_text(&output_text, &root_canonical)
+    })
+    .await;
+    let links = linkification
+        .map_err(|error| {
+            error!(
+                %project_id,
+                %thread_id,
+                %turn_id,
+                %item_id,
+                action = "linkify_command_output",
+                error = %error,
+                "command output linkification task failed"
+            );
+            ApiError::Internal("command output linkification failed".into())
+        })?
+        .into_iter()
+        .map(|span| LinkSpanResponse {
+            start: span.start,
+            end: span.end,
+            path: span.path,
+            line: span.line,
+        })
+        .collect();
+    Ok(Json(LinkifyResponse { links }).into_response())
+}
+
+fn is_command_output_version(value: &str) -> bool {
+    let Some(digest) = value
+        .strip_prefix("\"sha256_")
+        .and_then(|value| value.strip_suffix('"'))
+    else {
+        return false;
+    };
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn command_output_response(
+    output: String,
+    truncated: bool,
+    original_bytes: u64,
+    original_lines: u64,
+    version: String,
+) -> Result<axum::response::Response, ApiError> {
+    axum::http::Response::builder()
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )
+        .header("x-giskard-output-truncated", truncated.to_string())
+        .header(
+            "x-giskard-output-original-bytes",
+            original_bytes.to_string(),
+        )
+        .header(
+            "x-giskard-output-original-lines",
+            original_lines.to_string(),
+        )
+        .header(axum::http::header::ETAG, version)
+        .body(axum::body::Body::from(output))
+        .map_err(|error| ApiError::Internal(error.to_string()))
 }
 
 /// Completed transcript pagination is an ordinary authenticated request/response. It deliberately

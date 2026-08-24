@@ -9,7 +9,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Weak};
 use tokio::sync::{Mutex, RwLock};
 
-use giskard_core::ids::{ProjectId, ThreadId, TurnId};
+use giskard_core::ids::{ItemId, ProjectId, ThreadId, TurnId};
+use giskard_core::item::ItemPayload;
 use giskard_core::model::{Effort, ModelRef};
 use giskard_core::thread::ThreadKind;
 use giskard_core::token::{DailyTokenLedger, TokenLedger};
@@ -365,6 +366,38 @@ pub(crate) fn parse_turn_history(path: &Path, data: &str) -> Result<Vec<Turn>, P
                     );
                     continue;
                 }
+                for item in &turn.items {
+                    crate::command_output::validate_command_output_payload(&item.payload).map_err(
+                        |error| {
+                            PersistError::Invalid(format!(
+                                "{}: line {} item {} has invalid command-output metadata: {error}",
+                                path.display(),
+                                i + 1,
+                                item.id
+                            ))
+                        },
+                    )?;
+                    let (ignored_bytes, ignored_lines) =
+                        crate::command_output::ignored_command_output_metadata(&item.payload);
+                    if ignored_bytes {
+                        tracing::warn!(
+                            path = %path.display(),
+                            turn_id = %turn.id,
+                            item_id = %item.id,
+                            field = "output_original_bytes",
+                            "ignoring command-output metadata field because output is not truncated"
+                        );
+                    }
+                    if ignored_lines {
+                        tracing::warn!(
+                            path = %path.display(),
+                            turn_id = %turn.id,
+                            item_id = %item.id,
+                            field = "output_original_lines",
+                            "ignoring command-output metadata field because output is not truncated"
+                        );
+                    }
+                }
                 turns.push(turn);
             }
             Err(e) if i == last => {
@@ -483,6 +516,14 @@ pub struct PersistStore {
     /// the read paths that previously took no lock at all. Nothing here changes what a caller sees;
     /// it only stops the store from retrying a decision it has already made this process.
     unmigratable: RwLock<HashSet<(ProjectId, ThreadId)>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredCommandOutput {
+    pub output: String,
+    pub output_truncated: bool,
+    pub original_bytes: u64,
+    pub original_lines: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1451,6 +1492,79 @@ impl PersistStore {
             return Ok(None);
         };
         Ok(payload.diff_contents.get(diff_id).cloned())
+    }
+
+    /// Load one terminal command's retained output from an indexed immutable turn payload.
+    pub async fn load_command_output(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+        turn: TurnId,
+        item_id: ItemId,
+    ) -> Result<Option<StoredCommandOutput>, PersistError> {
+        self.ensure_migrated(project, thread).await;
+        let records = self.load_turn_records_unlocked(project, thread).await?;
+        if !records.iter().any(|record| record.turn_id == turn) {
+            return Ok(None);
+        }
+        let paths = self.thread_paths(project, thread).await;
+        let loaded_items = if paths.layout() == ThreadLayout::Flat {
+            let path = paths.history();
+            let data = match tokio::fs::read_to_string(&path).await {
+                Ok(data) => data,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(PersistError::Io(error.to_string())),
+            };
+            parse_turn_history(&path, &data)?
+                .into_iter()
+                .find(|candidate| candidate.id == turn)
+                .map(|turn| turn.items)
+        } else {
+            let payload_path = paths.turn_payload(turn);
+            history::read_turn_payload(&payload_path)
+                .await?
+                .map(|payload| payload.items)
+        };
+        let Some(item) =
+            loaded_items.and_then(|items| items.into_iter().find(|item| item.id == item_id))
+        else {
+            return Ok(None);
+        };
+        let ItemPayload::CommandExecution {
+            output,
+            output_truncated,
+            output_original_bytes,
+            output_original_lines,
+            status,
+            ..
+        } = item.payload
+        else {
+            return Ok(None);
+        };
+        if status
+            .as_deref()
+            .is_some_and(giskard_core::item::command_status_is_running)
+        {
+            return Ok(None);
+        }
+        let descriptor = crate::command_output_descriptor(
+            &output,
+            output_truncated,
+            output_original_bytes,
+            output_original_lines,
+            true,
+        )
+        .map_err(|error| {
+            PersistError::Invalid(format!(
+                "command output {item_id} in turn {turn} has invalid metadata: {error}"
+            ))
+        })?;
+        Ok(Some(StoredCommandOutput {
+            output,
+            output_truncated,
+            original_bytes: descriptor.original_bytes,
+            original_lines: descriptor.original_lines,
+        }))
     }
 
     /// Load up to `limit` readable turns ending before `end`, backfilling across isolated damaged
