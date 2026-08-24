@@ -34,6 +34,24 @@ can't run unattended in CI.
 
 ## Run it
 
+When a compatible host binary is available, the preferred local command bind-mounts it into the
+test container. The debug profile gives faster incremental local builds, while the mount keeps the
+larger executable out of image layers. Node, Playwright, and Chromium remain inside Docker:
+
+```bash
+cargo build -p giskard-server --bin giskard-server-replay
+GISKARD_E2E_PREBUILT_BIN=target/debug/giskard-server-replay tests/e2e/run.sh
+```
+
+The binary must be a Linux executable for the Docker image's CPU architecture, with an ELF loader,
+glibc baseline, and dynamic libraries available in the Ubuntu Noble Playwright image. A macOS or
+Windows binary is not compatible. Linux binaries built against a newer glibc may also be
+incompatible. The script verifies compatibility by briefly starting the server inside the actual
+runtime image; an existing binary that fails validation stops the run with an error.
+
+If `GISKARD_E2E_PREBUILT_BIN` is unset or names a file that does not exist, the script falls back to
+building the replay server in Docker:
+
 ```bash
 # From anywhere in the repo. Builds the image, runs the whole suite.
 tests/e2e/run.sh
@@ -44,6 +62,11 @@ tests/e2e/run.sh --reporter=line
 ```
 
 The HTML report lands in `tests/e2e/playwright-report/` on your host.
+
+The fallback builder keeps the Cargo registry, Git checkout, and compilation output in BuildKit
+cache mounts, exports only the executable to a temporary host directory, and bind-mounts it for the
+run. Neither path stores the executable or the Rust `target` directory in local runtime-image
+layers.
 
 If your local network intercepts TLS, put any additional host CA certificates as `.crt` files in
 `tests/e2e/.host-ca-certificates/` before running the Docker-based tests. The directory is optional:
@@ -73,6 +96,10 @@ stay honest as the UI evolves. Regenerate them (Docker only, no host Node/npm) w
 
 ```bash
 tests/e2e/screenshots.sh
+
+# Prefer an existing compatible replay binary locally:
+cargo build -p giskard-server --bin giskard-server-replay
+GISKARD_E2E_PREBUILT_BIN=target/debug/giskard-server-replay tests/e2e/screenshots.sh
 ```
 
 This writes `docs/screenshots/ide-desktop.png` and `docs/screenshots/ide-mobile.png` — the default
@@ -97,6 +124,7 @@ All knobs are environment variables with sensible defaults (see `playwright.conf
 | Variable                   | Default                 | Purpose                                           |
 | -------------------------- | ----------------------- | ------------------------------------------------- |
 | `GISKARD_SERVER_BIN`       | `giskard-server-replay` | Path/command for the replay server binary.        |
+| `GISKARD_E2E_PREBUILT_BIN` | unset                   | Existing replay binary to mount into Docker.      |
 | `GISKARD_HOST`             | `127.0.0.1`             | Host the server binds to and tests connect to.    |
 | `GISKARD_PORT`             | `8787`                  | Port for the same.                                |
 | `GISKARD_BASE_URL`         | `http://<host>:<port>`  | Full base URL (overrides host/port if set).       |
@@ -108,7 +136,7 @@ The Playwright npm package and its browsers must match the Docker base image. Wh
 Playwright, change **both**:
 
 - `@playwright/test` in `tests/e2e/package.json`, and
-- the `mcr.microsoft.com/playwright:vX.Y.Z-jammy` tag in `tests/e2e/Dockerfile`.
+- the `mcr.microsoft.com/playwright:vX.Y.Z-noble` tag in `tests/e2e/Dockerfile`.
 
 The scripted reply asserted by `tests/thread.spec.ts` is defined once in the replay binary
 (`SCRIPTED_REPLY`) and mirrored in `tests/helpers.ts`; keep the two in step.
