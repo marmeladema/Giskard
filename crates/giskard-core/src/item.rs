@@ -171,6 +171,12 @@ pub enum ItemPayload {
         command: String,
         cwd: PathBuf,
         output: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        output_truncated: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_original_bytes: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_original_lines: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -214,6 +220,92 @@ pub enum ItemPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subagent: Option<SubagentLink>,
     },
+}
+
+/// Bounded projection of completed command output used by browser-facing protocols.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandOutputDescriptor {
+    pub preview: String,
+    pub preview_truncated: bool,
+    pub durable_truncated: bool,
+    pub original_bytes: u64,
+    pub original_lines: u64,
+    pub durable_bytes: u64,
+    pub durable_lines: u64,
+    pub preview_bytes: u64,
+    pub preview_lines: u64,
+    pub output_available: bool,
+}
+
+impl CommandOutputDescriptor {
+    pub const PREVIEW_MAX_BYTES: usize = 8 * 1024;
+
+    /// Project durable output into the bounded tail descriptor shared by every wire path.
+    pub fn from_durable(
+        output: &str,
+        durable_truncated: bool,
+        original_bytes: u64,
+        original_lines: u64,
+        output_available: bool,
+    ) -> Self {
+        let (preview, preview_truncated) =
+            command_output_tail_preview(output, original_bytes, Self::PREVIEW_MAX_BYTES);
+        Self {
+            preview_bytes: preview.len() as u64,
+            preview_lines: command_output_logical_lines(&preview),
+            durable_bytes: output.len() as u64,
+            durable_lines: command_output_logical_lines(output),
+            original_bytes,
+            original_lines,
+            preview,
+            preview_truncated,
+            durable_truncated,
+            output_available,
+        }
+    }
+}
+
+pub fn command_output_logical_lines(text: &str) -> u64 {
+    if text.is_empty() {
+        0
+    } else {
+        text.bytes().filter(|byte| *byte == b'\n').count() as u64 + u64::from(!text.ends_with('\n'))
+    }
+}
+
+pub fn command_output_tail_preview(
+    text: &str,
+    original_bytes: u64,
+    max_bytes: usize,
+) -> (String, bool) {
+    if original_bytes == text.len() as u64 && text.len() <= max_bytes {
+        return (text.to_owned(), false);
+    }
+    let marker = |omitted| format!("[… {omitted} bytes omitted from command output preview …]\n");
+    let mut omitted = original_bytes;
+    loop {
+        let prefix = marker(omitted);
+        let budget = max_bytes.saturating_sub(prefix.len());
+        let mut start = text.len().saturating_sub(budget);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        let actual = original_bytes.saturating_sub((text.len() - start) as u64);
+        if actual == omitted {
+            return (format!("{prefix}{}", &text[start..]), true);
+        }
+        omitted = actual;
+    }
+}
+
+/// The complete result of normalizing provider command output at the ingestion boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedCommandOutput {
+    pub output: String,
+    pub output_truncated: bool,
+    pub output_original_bytes: Option<u64>,
+    pub output_original_lines: Option<u64>,
+    pub descriptor: CommandOutputDescriptor,
 }
 
 /// Incremental delta streamed during an item's lifecycle (spec §4.5).
@@ -266,6 +358,9 @@ mod tests {
             command: "cargo test".into(),
             cwd: "/tmp/project".into(),
             output: "all passed".into(),
+            output_truncated: false,
+            output_original_bytes: None,
+            output_original_lines: None,
             exit_code: Some(0),
             status: Some("completed".into()),
             process_id: Some("proc_1".into()),
@@ -274,6 +369,22 @@ mod tests {
         let json = serde_json::to_string(&payload).unwrap();
         let back: ItemPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(payload, back);
+    }
+
+    #[test]
+    fn legacy_command_execution_defaults_retention_metadata() {
+        let json =
+            r#"{"kind":"command_execution","command":"echo ok","cwd":"/tmp","output":"ok\n"}"#;
+        let payload: ItemPayload = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            payload,
+            ItemPayload::CommandExecution {
+                output_truncated: false,
+                output_original_bytes: None,
+                output_original_lines: None,
+                ..
+            }
+        ));
     }
 
     #[test]

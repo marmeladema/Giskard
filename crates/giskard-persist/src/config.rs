@@ -14,12 +14,49 @@ pub struct Config {
     pub tokens: TokensConfig,
     pub viz: VizConfig,
     pub history: HistoryConfig,
+    pub retention: RetentionConfig,
     /// Declared providers, keyed by routing id — the same shape Codex uses for
     /// `[model_providers.<id>]`. An `IndexMap` rather than a `HashMap` because the declaration
     /// order is the model picker's order (§8.3): a hashed order would reshuffle the picker on
     /// every restart and change which model a draft starts on when none is marked default.
     pub providers: IndexMap<String, ProviderConfig>,
     pub harness: HarnessConfig,
+}
+
+/// Retention limits for agent-produced content (spec Appendix C).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RetentionConfig {
+    /// Maximum retained UTF-8 bytes for completed command output (default: 128 MiB).
+    #[serde(deserialize_with = "deserialize_command_output_limit")]
+    pub max_command_output_bytes: usize,
+}
+
+impl RetentionConfig {
+    pub const DEFAULT_MAX_COMMAND_OUTPUT_BYTES: usize = 128 * 1024 * 1024;
+    pub const MIN_MAX_COMMAND_OUTPUT_BYTES: usize = 32 * 1024;
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            max_command_output_bytes: Self::DEFAULT_MAX_COMMAND_OUTPUT_BYTES,
+        }
+    }
+}
+
+fn deserialize_command_output_limit<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = usize::deserialize(deserializer)?;
+    if value < RetentionConfig::MIN_MAX_COMMAND_OUTPUT_BYTES {
+        return Err(serde::de::Error::custom(format_args!(
+            "max_command_output_bytes must be at least {} bytes",
+            RetentionConfig::MIN_MAX_COMMAND_OUTPUT_BYTES
+        )));
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -350,6 +387,10 @@ model_listing = true
         assert_eq!(config.server.bind, "127.0.0.1:8787");
         assert!(config.server.secure_cookies);
         assert_eq!(config.auth.session_days, 30);
+        assert_eq!(
+            config.retention.max_command_output_bytes,
+            RetentionConfig::DEFAULT_MAX_COMMAND_OUTPUT_BYTES
+        );
         assert!(config.providers.is_empty());
         assert_eq!(config.harness.kind, "codex");
     }
@@ -359,6 +400,35 @@ model_listing = true
         let config: Config = toml::from_str("").unwrap();
         assert_eq!(config.server.bind, "127.0.0.1:8787");
         assert_eq!(config.harness.kind, "codex");
+        assert_eq!(
+            config.retention.max_command_output_bytes,
+            RetentionConfig::DEFAULT_MAX_COMMAND_OUTPUT_BYTES
+        );
+    }
+
+    #[test]
+    fn command_output_retention_limit_accepts_minimum_and_override() {
+        for value in [
+            RetentionConfig::MIN_MAX_COMMAND_OUTPUT_BYTES,
+            RetentionConfig::DEFAULT_MAX_COMMAND_OUTPUT_BYTES + 1,
+        ] {
+            let config: Config = toml::from_str(&format!(
+                "[retention]\nmax_command_output_bytes = {value}\n"
+            ))
+            .unwrap();
+            assert_eq!(config.retention.max_command_output_bytes, value);
+        }
+    }
+
+    #[test]
+    fn command_output_retention_limit_rejects_value_below_minimum() {
+        let err = toml::from_str::<Config>("[retention]\nmax_command_output_bytes = 32767\n")
+            .expect_err("a command output limit below 32 KiB must not parse");
+        assert!(
+            err.to_string()
+                .contains("max_command_output_bytes must be at least 32768 bytes"),
+            "the error should identify the invalid retention limit: {err}"
+        );
     }
 
     #[test]
@@ -401,6 +471,10 @@ roots = []
         // Example intentionally documents plain-HTTP local dev.
         assert!(!config.server.secure_cookies);
         assert_eq!(config.harness.kind, "codex");
+        assert_eq!(
+            config.retention.max_command_output_bytes,
+            RetentionConfig::DEFAULT_MAX_COMMAND_OUTPUT_BYTES
+        );
         assert_eq!(config.providers.len(), 2);
     }
 }

@@ -18,8 +18,9 @@ use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{
-    CommandExecutionStart, FileChangeEntry, FileChangeKind, Item, ItemDelta, ItemKind, ItemPayload,
-    ItemStart, SubagentAction, SubagentLink, SubagentStatus, ToolCallStart,
+    CommandExecutionStart, CommandOutputDescriptor, FileChangeEntry, FileChangeKind, Item,
+    ItemDelta, ItemKind, ItemPayload, ItemStart, SubagentAction, SubagentLink, SubagentStatus,
+    ToolCallStart,
 };
 use giskard_core::model::ModelRef;
 use giskard_core::server_request::ServerRequest;
@@ -120,6 +121,9 @@ pub struct WireItem {
     pub created_at: DateTime<Utc>,
 }
 
+/// Bounded completed-command output projection.
+pub type WireCommandOutput = CommandOutputDescriptor;
+
 /// Wire-mirror of [`ItemStart`]. Native routing identifiers stay server-side.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireItemStart {
@@ -179,7 +183,7 @@ pub enum WireItemPayload {
     CommandExecution {
         command: String,
         cwd: String,
-        output: String,
+        output: WireCommandOutput,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -452,6 +456,22 @@ impl From<Item> for WireItem {
     }
 }
 
+impl WireItem {
+    /// Convert an item with the descriptor produced at the command normalization boundary.
+    pub fn from_item_with_command_output(
+        item: Item,
+        command_output: Option<WireCommandOutput>,
+    ) -> Self {
+        let mut wire: Self = item.into();
+        if let (Some(output), WireItemPayload::CommandExecution { output: slot, .. }) =
+            (command_output, &mut wire.payload)
+        {
+            *slot = output;
+        }
+        wire
+    }
+}
+
 impl From<ItemStart> for WireItemStart {
     fn from(item: ItemStart) -> Self {
         Self {
@@ -500,19 +520,41 @@ impl From<ItemPayload> for WireItemPayload {
                 command,
                 cwd,
                 output,
+                output_truncated,
+                output_original_bytes,
+                output_original_lines,
                 exit_code,
                 status,
                 process_id,
                 duration_ms,
-            } => Self::CommandExecution {
-                command,
-                cwd: path_to_wire(&cwd),
-                output,
-                exit_code,
-                status,
-                process_id,
-                duration_ms,
-            },
+            } => {
+                let output_available = status
+                    .as_deref()
+                    .is_none_or(|value| !giskard_core::item::command_status_is_running(value));
+                let original_bytes = output_truncated
+                    .then_some(output_original_bytes)
+                    .flatten()
+                    .unwrap_or(output.len() as u64);
+                let original_lines = output_truncated
+                    .then_some(output_original_lines)
+                    .flatten()
+                    .unwrap_or_else(|| giskard_core::command_output_logical_lines(&output));
+                Self::CommandExecution {
+                    command,
+                    cwd: path_to_wire(&cwd),
+                    output: CommandOutputDescriptor::from_durable(
+                        &output,
+                        output_truncated,
+                        original_bytes,
+                        original_lines,
+                        output_available,
+                    ),
+                    exit_code,
+                    status,
+                    process_id,
+                    duration_ms,
+                }
+            }
             ItemPayload::FileChange {
                 path,
                 change,
@@ -797,6 +839,9 @@ mod tests {
             command: "cargo test".into(),
             cwd: PathBuf::from("/tmp/project"),
             output: "ok".into(),
+            output_truncated: false,
+            output_original_bytes: None,
+            output_original_lines: None,
             exit_code: Some(0),
             status: Some("completed".into()),
             process_id: Some("proc_1".into()),
@@ -810,6 +855,52 @@ mod tests {
         assert_eq!(json["status"], "completed");
         assert_eq!(json["process_id"], "proc_1");
         assert_eq!(json["duration_ms"], 1_250);
+        assert_eq!(json["output"]["preview"], "ok");
+        assert_eq!(json["output"]["output_available"], true);
+    }
+
+    #[test]
+    fn untruncated_command_wire_ignores_original_counts() {
+        let wire: WireItemPayload = ItemPayload::CommandExecution {
+            command: "printf ok".into(),
+            cwd: PathBuf::from("/tmp/project"),
+            output: "ok\n".into(),
+            output_truncated: false,
+            output_original_bytes: Some(999),
+            output_original_lines: Some(88),
+            exit_code: Some(0),
+            status: Some("completed".into()),
+            process_id: None,
+            duration_ms: None,
+        }
+        .into();
+        let WireItemPayload::CommandExecution { output, .. } = wire else {
+            panic!("expected command execution payload");
+        };
+        assert_eq!(output.original_bytes, 3);
+        assert_eq!(output.original_lines, 1);
+    }
+
+    #[test]
+    fn completed_command_wire_never_contains_full_output() {
+        let sentinel = "FULL-OUTPUT-SENTINEL";
+        let output = format!("{sentinel}{}tail", "x".repeat(20_000));
+        let wire: WireItemPayload = ItemPayload::CommandExecution {
+            command: "generate".into(),
+            cwd: PathBuf::from("/tmp/project"),
+            output,
+            output_truncated: false,
+            output_original_bytes: None,
+            output_original_lines: None,
+            exit_code: Some(0),
+            status: Some("completed".into()),
+            process_id: None,
+            duration_ms: None,
+        }
+        .into();
+        let encoded = serde_json::to_string(&wire).unwrap();
+        assert!(!encoded.contains(sentinel));
+        assert!(encoded.len() < 10_000);
     }
 
     #[test]

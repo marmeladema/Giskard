@@ -2576,6 +2576,93 @@ fn browser_scopes_running_command_completion_identity_to_turn() {
 }
 
 #[test]
+fn browser_loads_completed_command_output_only_in_the_overlay() {
+    let body = app_js();
+
+    let output_block = between(
+        body,
+        "function renderCommandOutputBlock(body, opts) {",
+        "function renderCommandBody(body, cmd) {",
+    );
+    assert!(output_block.contains("commandOutputDescriptor(opts.output)"));
+    assert!(output_block.contains("String(descriptor.preview || \"\")"));
+    assert!(output_block.contains("commandDescriptorStats(descriptor)"));
+
+    let load = between(
+        body,
+        "async function loadCommandOutputOverlay(overlay) {",
+        "function openOutputOverlay(itemId, kind) {",
+    );
+    for expected in [
+        "new AbortController()",
+        "commandOutputUrl(projectId, threadId, identity.turnId, identity.itemId)",
+        "state.activeViewGeneration !== generation",
+        "state.projectId !== projectId",
+        "state.threadId !== threadId",
+        "state.outputOverlay !== overlay",
+        "overlay.loadedText = text;",
+        "overlay.outputVersion = response.headers.get(\"etag\")",
+    ] {
+        assert!(
+            load.contains(expected),
+            "lazy command-output load is missing `{expected}`"
+        );
+    }
+    assert!(body.contains("Loading command output…"));
+    assert!(body.contains("retry.onclick = () => loadCommandOutputOverlay(ov);"));
+
+    let close = between(
+        body,
+        "function closeCodeOverlay() {",
+        "/* The rendered diff is a grid",
+    );
+    assert!(close.contains("releaseOutputOverlay();"));
+    assert!(body.contains("state.outputOverlay.controller.abort();"));
+    assert!(body.contains("state.outputOverlay.linkController.abort();"));
+    assert!(body.contains("state.outputOverlay = null;"));
+    let source = between(
+        body,
+        "async function openCodeOverlay(path, line) {",
+        "async function renderMarkdownCodeOverlay",
+    );
+    assert!(
+        source.find("releaseOutputOverlay();") < source.find("Loading source…"),
+        "source overlay cleanup must happen before its loading view is initialized"
+    );
+    assert!(
+        body.contains(
+            "commandOutputLinksUrl(projectId, threadId, identity.turnId, identity.itemId)"
+        )
+    );
+    assert!(body.contains("headers:{ \"If-Output-Match\":version }"));
+
+    let finish = between(
+        body,
+        "function finishRunningCommand(item, turnId) {",
+        "function renderRunningCommandSnapshot(commands) {",
+    );
+    assert!(finish.contains("descriptor.output_available === false"));
+    assert!(finish.contains("lateLocalOutput:true"));
+    assert!(finish.contains("state.runningCommands.delete(key);"));
+
+    let download = between(
+        body,
+        "function downloadOutputOverlay() {",
+        "$(\"codeOverlay\").addEventListener",
+    );
+    assert!(download.contains("outputOverlayModel(ov.itemId, ov.kind)"));
+    assert!(download.contains("model.blocks[0].text"));
+    assert!(body.contains("copyToClipboard(copyText)"));
+    let copy = between(
+        body,
+        "$(\"codeCopyDiff\").onclick = async () => {",
+        "/* ---------- command / tool output overlay ----------",
+    );
+    assert!(copy.contains("outputOverlayModel(ov.itemId, ov.kind)"));
+    assert!(copy.contains("model.blocks[0].text"));
+}
+
+#[test]
 fn browser_websocket_lifecycle_errors_are_not_toasted_directly() {
     let body = app_js();
 

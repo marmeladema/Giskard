@@ -42,7 +42,7 @@ impl AppState {
         factory: Arc<dyn HarnessFactory>,
         session_key: Vec<u8>,
     ) -> Self {
-        Self::new_with_config(store, factory, session_key, None)
+        Self::new_with_config(store, factory, session_key, None, None)
     }
 
     /// Create a new `AppState` with visualization config from `config.toml`.
@@ -53,9 +53,15 @@ impl AppState {
         factory: Arc<dyn HarnessFactory>,
         session_key: Vec<u8>,
         viz_config: Option<&giskard_persist::config::VizConfig>,
+        retention_config: Option<&giskard_persist::config::RetentionConfig>,
     ) -> Self {
         let hub = Arc::new(Hub::new());
-        let runtime = Arc::new(ThreadRuntimeRegistry::new());
+        let runtime = Arc::new(ThreadRuntimeRegistry::with_max_command_output_bytes(
+            retention_config.map_or(
+                giskard_persist::config::RetentionConfig::DEFAULT_MAX_COMMAND_OUTPUT_BYTES,
+                |retention| retention.max_command_output_bytes,
+            ),
+        ));
         let model_catalogs = Arc::new(ProjectModelCatalogStore::default());
         let highlighter = match viz_config {
             Some(viz) => Arc::new(Highlighter::with_max_size(viz.max_highlight_size)),

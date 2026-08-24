@@ -3,9 +3,13 @@
 
 use std::sync::Arc;
 
-use giskard_core::ids::{ProjectId, ThreadId};
+use chrono::Utc;
+use giskard_core::ids::{ItemId, ProjectId, ThreadId, TurnId};
+use giskard_core::item::{Item, ItemPayload};
+use giskard_core::token::TokenUsage;
+use giskard_core::turn::{Mode, Turn, TurnStatus, TurnStatusKind};
 use giskard_harness::AgentHarness;
-use giskard_persist::store::ProjectConfig;
+use giskard_persist::store::{ProjectConfig, ThreadGitWorkspace, ThreadWorktree};
 use giskard_server::{AppState, HarnessFactory, build_app};
 
 const TINY_PNG: &[u8] = &[
@@ -169,6 +173,61 @@ fn thread_file(pid: ProjectId, tid: ThreadId) -> giskard_persist::store::ThreadF
         archived: false,
         git_workspace: None,
     }
+}
+
+fn command_turn(output: &str, status: Option<&str>) -> (Turn, ItemId) {
+    let now = Utc::now();
+    let item_id = ItemId::new();
+    (
+        Turn {
+            id: TurnId::new(),
+            user_input: giskard_core::user_input::UserInput::text("run command"),
+            items: vec![Item {
+                id: item_id,
+                harness_item_id: format!("native-{item_id}"),
+                payload: ItemPayload::CommandExecution {
+                    command: "test command".into(),
+                    cwd: ".".into(),
+                    output: output.into(),
+                    output_truncated: false,
+                    output_original_bytes: None,
+                    output_original_lines: None,
+                    exit_code: Some(0),
+                    status: status.map(str::to_owned),
+                    process_id: None,
+                    duration_ms: Some(1),
+                },
+                created_at: now,
+            }],
+            model: giskard_core::model::ModelRef {
+                provider: "openai".into(),
+                model: "gpt-5.5".into(),
+                reasoning_effort: None,
+            },
+            mode: Mode::Build,
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+            usage: TokenUsage::new(1, 1),
+            diffs: vec![],
+            started_at: now,
+            completed_at: Some(now),
+        },
+        item_id,
+    )
+}
+
+fn command_output_url(
+    base: &str,
+    pid: ProjectId,
+    tid: ThreadId,
+    turn_id: TurnId,
+    item_id: ItemId,
+) -> String {
+    format!(
+        "{base}/api/projects/{pid}/threads/{tid}/turns/{turn_id}/items/{item_id}/command-output"
+    )
 }
 
 #[tokio::test]
@@ -445,6 +504,210 @@ async fn linkify_endpoint_returns_only_existing_workspace_files() {
             "span should point at the exact source text path, got {slice:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn command_output_links_linkifies_persisted_output_with_matching_version() {
+    let port = 19029;
+    let (_data_dir, _proj_dir, state, pid, tid, cookie) = start_server(port).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let (turn, item_id) = command_turn("compiler error at main.rs:2\n", Some("completed"));
+    state.store.append_turn(pid, tid, &turn).await.unwrap();
+    let output_url = command_output_url(&base, pid, tid, turn.id, item_id);
+
+    let output = client
+        .get(&output_url)
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(output.status(), 200);
+    let version = output.headers().get("etag").unwrap().clone();
+
+    let response = client
+        .get(format!("{output_url}-links"))
+        .header("cookie", &cookie)
+        .header("if-output-match", version)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let links = body["links"].as_array().unwrap();
+    assert_eq!(
+        links.len(),
+        1,
+        "persisted command output should be linkified"
+    );
+    assert_eq!(links[0]["path"], "main.rs");
+    assert_eq!(links[0]["line"], 2);
+}
+
+#[tokio::test]
+async fn command_output_links_enforces_output_version_precondition() {
+    let port = 19030;
+    let (_data_dir, _proj_dir, state, pid, tid, cookie) = start_server(port).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let (turn, item_id) = command_turn("main.rs:1\n", None);
+    state.store.append_turn(pid, tid, &turn).await.unwrap();
+    let links_url = format!(
+        "{}-links",
+        command_output_url(&base, pid, tid, turn.id, item_id)
+    );
+
+    let missing = client
+        .get(&links_url)
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 428);
+
+    let stale_version = format!("\"sha256_{}\"", "0".repeat(64));
+    let stale = client
+        .get(&links_url)
+        .header("cookie", &cookie)
+        .header("if-output-match", stale_version)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), 412);
+
+    let malformed = [
+        "sha256_unquoted".to_owned(),
+        format!("W/\"sha256_{}\"", "0".repeat(64)),
+        "\"sha256_stale\"".to_owned(),
+        format!("\"sha256_{}\"", "0".repeat(63)),
+        format!("\"sha256_{}\"", "0".repeat(65)),
+        format!("\"sha256_{}\"", "A".repeat(64)),
+        format!("\"sha256_{}\"", "g".repeat(64)),
+        format!(
+            "\"sha256_{}\", \"sha256_{}\"",
+            "0".repeat(64),
+            "1".repeat(64)
+        ),
+        format!("\"sha256_{}\"extra", "0".repeat(64)),
+        format!("\"sha256_{}", "0".repeat(64)),
+    ];
+    for malformed in malformed {
+        let response = client
+            .get(&links_url)
+            .header("cookie", &cookie)
+            .header("if-output-match", &malformed)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400, "header {malformed:?}");
+    }
+}
+
+#[tokio::test]
+async fn command_output_links_rejects_unreadable_items_and_uses_thread_workspace() {
+    let port = 19031;
+    let (_data_dir, proj_dir, state, pid, tid, cookie) = start_server(port).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let isolated = tempfile::TempDir::new().unwrap();
+    tokio::fs::write(isolated.path().join("isolated.rs"), "fn isolated() {}\n")
+        .await
+        .unwrap();
+    state
+        .store
+        .update_thread(pid, tid, |thread| {
+            let path = isolated.path().to_string_lossy().into_owned();
+            thread.git_workspace = Some(ThreadGitWorkspace::Worktree(ThreadWorktree {
+                path: path.clone(),
+                workspace: None,
+                branch: "giskard/test".into(),
+                base_commit: None,
+                repo_root: proj_dir.path().to_string_lossy().into_owned(),
+                common_dir: proj_dir.path().join(".git").to_string_lossy().into_owned(),
+                git_dir: isolated.path().join(".git").to_string_lossy().into_owned(),
+            }));
+        })
+        .await
+        .unwrap();
+
+    let (turn, item_id) = command_turn("isolated.rs:1 main.rs:1\n", Some("completed"));
+    state.store.append_turn(pid, tid, &turn).await.unwrap();
+    let output_url = command_output_url(&base, pid, tid, turn.id, item_id);
+    let output = client
+        .get(&output_url)
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let version = output.headers().get("etag").unwrap().clone();
+    let response = client
+        .get(format!("{output_url}-links"))
+        .header("cookie", &cookie)
+        .header("if-output-match", version)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let paths: Vec<_> = body["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|link| link["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, ["isolated.rs"]);
+
+    let unknown_url = command_output_url(&base, pid, tid, turn.id, ItemId::new());
+    let unknown = client
+        .get(format!("{unknown_url}-links"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), 404);
+
+    let (running_turn, running_item) = command_turn("isolated.rs:1", Some("running"));
+    state
+        .store
+        .append_turn(pid, tid, &running_turn)
+        .await
+        .unwrap();
+    let running = client
+        .get(format!(
+            "{}-links",
+            command_output_url(&base, pid, tid, running_turn.id, running_item)
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(running.status(), 404);
+
+    let wrong_kind = ItemId::new();
+    let mut wrong_turn = command_turn("unused", None).0;
+    wrong_turn.items[0] = Item {
+        id: wrong_kind,
+        harness_item_id: "message".into(),
+        payload: ItemPayload::AgentMessage {
+            text: "isolated.rs:1".into(),
+        },
+        created_at: Utc::now(),
+    };
+    state
+        .store
+        .append_turn(pid, tid, &wrong_turn)
+        .await
+        .unwrap();
+    let wrong = client
+        .get(format!(
+            "{}-links",
+            command_output_url(&base, pid, tid, wrong_turn.id, wrong_kind)
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), 404);
 }
 
 #[cfg(unix)]

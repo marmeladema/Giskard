@@ -963,7 +963,13 @@ async fn run() -> Result<(), String> {
     }
 
     let factory = Arc::new(ScriptedFactory);
-    let state = AppState::new_with_config(store, factory, session_key.to_vec(), Some(&config.viz));
+    let state = AppState::new_with_config(
+        store,
+        factory,
+        session_key.to_vec(),
+        Some(&config.viz),
+        Some(&config.retention),
+    );
     let app = build_app(state);
 
     let listener = tokio::net::TcpListener::bind(&bind)

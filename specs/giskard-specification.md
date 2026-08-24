@@ -1826,7 +1826,10 @@ pub enum ItemPayload {
     CommandExecution {
         command: String,
         cwd: PathBuf,
-        output: String,               // accumulated stdout+stderr
+        output: String,               // durably retained stdout+stderr (bounded head + tail)
+        output_truncated: bool,       // serde default false; omitted when false
+        output_original_bytes: Option<u64>, // present exactly when truncated
+        output_original_lines: Option<u64>, // present exactly when truncated
         exit_code: Option<i32>,
         status: Option<String>,       // completed / failed / in_progress / declined
         process_id: Option<String>,   // retained for UI correlation / terminate affordance
@@ -1978,6 +1981,14 @@ pub enum HarnessError {
     Timeout(String),          // operation timed out (S3: renamed from `Timed`)
 }
 ```
+
+Browser-facing completed command items replace the core `output` string with a
+`WireCommandOutput`: an 8192-byte tail preview, preview/durable truncation flags, original,
+durable, and preview byte and logical-line counts, and `output_available`. The descriptor is used
+consistently by `ItemCompleted`, `LiveTurnSnapshot`, `WireTurn`, and HTTP history, so none of those
+surfaces eagerly repeats the retained body. `output_available` is true only for terminal output
+retrievable from the runtime map or immutable history, including persistence-blocked and legacy
+turns.
 
 > `AgentEventStream` is `impl Stream<Item = AgentEvent> + Send` (concretely a wrapper over a
 > `tokio::sync::broadcast::Receiver<AgentEvent>`), supporting multiple subscribers per thread.
@@ -2225,7 +2236,11 @@ there is one source of truth to correct if needed.
   descriptors). It is never agent-driven — a turn's *status kind* is a bounded enum, but its
   *status message* is composed from provider error text with no ceiling, so only a capped rendering
   of it reaches the index and the payload file holds what the harness reported. `<thread_id>/turns/<turn_id>.jsonl` is the **payload**: the full `UserInput`, the
-  items and the diffs — everything whose size is a function of what the agent did.
+  items and the diffs — everything whose size is a function of what the agent did. Completed
+  command output is the exception with an explicit durable ceiling: output above
+  `[retention].max_command_output_bytes` retains UTF-8-safe head and tail text around an omission
+  marker and records the original byte and logical-line counts. These additive fields remain
+  payload format 1; legacy turns are read without migration or rewrite.
   On `TurnCompleted` the server writes the payload file **first**, with temp file + `fsync` +
   rename, and appends the bounded index record **last**. A crash between the two leaves a payload
   file no turn record references; it is invisible to every read path, because reads start from the
@@ -2490,7 +2505,10 @@ Auto-generate an initial title from the first user message (truncated); user-edi
 - Command executions stream stdout/stderr as `ItemDelta`s under a command item.
 - Command output bodies are collapsible transcript sections. Running command output starts
   expanded while small and may auto-collapse once output is large; completed command output is
-  collapsed by default regardless of size. Expanding a command renders the output inline.
+  collapsed by default regardless of size. Completion and history carry an 8 KiB tail-oriented
+  preview descriptor rather than the retained body. Expanding a completed command lazily fetches
+  its retained output; closing releases it, and retry, copy, download, and path linkification apply
+  to the fetched body. Running commands continue to append deltas and update an open overlay.
 - Tool-call input/output bodies follow the same collapse model as command output: running rows
   start expanded while small and may auto-collapse once large; completed tool-call input/output is
   collapsed by default, and expanding the row renders input/output inline. Tool-call status is
@@ -3121,8 +3139,10 @@ alongside raw token counts. Off by default; raw token counts are the primary met
   label (for example `Rust` or `JSON`; unknown fence labels are shown as provided after
   sanitization). Inline code spans are escaped/styled but not syntax-highlighted because Markdown
   does not carry a reliable language for them. The browser injects the returned HTML as trusted
-  markup and attaches the path-link handlers. `/linkify` is retained for command output, which is
-  plain text rather than Markdown.
+  markup and attaches the path-link handlers. Generic `/linkify` remains available for bounded
+  plain text. Completed command output instead uses its identity-based `command-output-links`
+  endpoint: the browser supplies the raw output response's strong `ETag` as `If-Output-Match`, and
+  the server returns spans for the exact retained bytes without receiving the output again.
 
 ### 11.3 Large files & performance
 
@@ -3630,7 +3650,9 @@ events through the same event handler used for live WebSocket events.
   while any command is known running. When a late terminal command completion arrives for an
   already-persisted turn, the server updates `RunningTasks` and may broadcast the terminal
   `ItemCompleted` event to connected clients, but it does not mutate the already-appended JSONL
-  turn record.
+  turn record. That late completion is normalized and projected as a bounded descriptor, but its
+  lazy output is unavailable until command amendments are implemented; a browser that observed
+  the running stream may retain that local copy for the session.
   Running-task snapshots include `started_at_ms`; clients use it to render elapsed time and
   refresh that display about once per second. Completed command payloads include `duration_ms`
   when the harness supplies it; clients render terminal outcome text from the status plus duration.
@@ -3873,6 +3895,10 @@ filename_template = "plan-{slug}-{ts}.md"
 [tokens]
 cost_estimation = false
 # [tokens.rates."openai/gpt-5.5"]  input_per_mtok_eur = …  output_per_mtok_eur = …
+
+[retention]
+# Completed command output above this limit retains a UTF-8-safe head and tail. Minimum: 32768.
+max_command_output_bytes = 134217728
 
 # Optional in full: discovery runs for every provider the harness reports, and the harness's own
 # catalog covers the provider it routes to (§8.3). A provider with neither contributes nothing.
