@@ -210,6 +210,7 @@ test.describe("thread metadata reconciliation", () => {
     await expect(page.locator("#composer")).toBeVisible();
     await expect(page.locator("#mbTitle")).toContainText("New thread");
     await expect(page.locator("#transcript .draft-empty")).toBeVisible();
+    await expect(page.locator("#notices .notice.warn")).toHaveCount(1);
     expect(await page.evaluate((threadId) =>
       (window as any).composedThreadDetail(threadId), tid,
     )).toBeNull();

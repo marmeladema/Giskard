@@ -1040,7 +1040,7 @@ function projectThreadRefresh(pid) {
     refresh = {
       wantedGeneration:0, appliedGeneration:0, promise:null,
       retryTimer:null, retryAttempt:0, failureNoticed:false, retired:false,
-      conflictThreadIds:new Set()
+      conflictThreadIds:new Set(), locallyDeletingThreadIds:new Set()
     };
     state.threadListRefreshes.set(projectId, refresh);
   }
@@ -1110,7 +1110,7 @@ function runProjectThreadRefresh(pid, refresh) {
       // applying it even briefly could resurrect a deleted thread or hide a new one.
       if (generation !== refresh.wantedGeneration) continue;
       const reconciliation = rememberProjectThreads(
-        pid, response.threads, refresh.conflictThreadIds
+        pid, response.threads, refresh.conflictThreadIds, refresh.locallyDeletingThreadIds
       );
       if (reconciliation.malformed) {
         return failProjectThreadRefresh(
@@ -1159,7 +1159,7 @@ function renderProjectThreads(pid) {
   syncActiveThreadHighlight();
 }
 
-function rememberProjectThreads(pid, threads, conflictThreadIds) {
+function rememberProjectThreads(pid, threads, conflictThreadIds, locallyDeletingThreadIds) {
   if (!pid || !Array.isArray(threads)) {
     return { stale:false, malformed:true, conflicts:new Set() };
   }
@@ -1204,12 +1204,15 @@ function rememberProjectThreads(pid, threads, conflictThreadIds) {
   reindexProjectThreads(projectId, normalized);
   for (const thread of normalized) previousThreadIds.delete(String(thread.id));
   let removedActiveThread = null;
+  let removedActiveThreadWasLocal = false;
   for (const removedThreadId of previousThreadIds) {
     state.pendingDetailConflictResyncs.delete(removedThreadId);
     if (String(state.projectId || "") === projectId &&
         String(state.threadId || "") === removedThreadId) {
       removedActiveThread = removedThreadId;
+      removedActiveThreadWasLocal = !!locallyDeletingThreadIds?.has(removedThreadId);
     }
+    locallyDeletingThreadIds?.delete(removedThreadId);
     state.threadAuthorities.delete(removedThreadId);
   }
   if (removedActiveThread) {
@@ -1219,7 +1222,9 @@ function rememberProjectThreads(pid, threads, conflictThreadIds) {
     // is also the normal destination after deleting the open thread locally.
     try { localStorage.removeItem("giskard.lastThread"); } catch {}
     openDraftThread(projectId);
-    notice("The open thread was removed in another browser session.", "warning");
+    if (!removedActiveThreadWasLocal) {
+      notice("The open thread was removed in another browser session.", "warning");
+    }
   }
 
   // Link results are browser-local accelerators only. Discard them when the authoritative thread
@@ -1948,6 +1953,13 @@ $("removeThreadConfirm").onclick = async () => {
   const requestSeq = pending.requestSeq;
   setRemoveThreadDeleting(true);
   $("removeThreadErr").textContent = "";
+  // Install the local-origin marker before sending DELETE. The server's catalog invalidation can
+  // reach this tab before the HTTP response does, and reconciliation must already know that the
+  // resulting removal belongs to this action. Confirmed removals consume their markers; a failed
+  // request clears them below, while a failed catalog refresh retains them for its retry.
+  const deletedIds = new Set([String(tid), ...descendants]);
+  const refresh = projectThreadRefresh(pid);
+  for (const deletedId of deletedIds) refresh.locallyDeletingThreadIds.add(deletedId);
   try {
     // Forced only when the card actually warned about a worktree. Forcing every deletion would
     // make the server's guard unreachable from the UI, and a worktree that became dirty between
@@ -1960,7 +1972,6 @@ $("removeThreadConfirm").onclick = async () => {
     // client never listed. Decide from the refreshed authoritative list whether the active view
     // was deleted; keep the pre-request set as a fallback in case the sidebar reload fails
     // (loadThreads swallows its own errors and leaves the cached list stale).
-    const deletedIds = new Set([String(tid), ...descendants]);
     const threadsRefreshed = await loadThreads(pid);
     // Read the live view only after the awaits: the user may have navigated to another thread
     // or another project meanwhile, and an unrelated active view must never be cleared.
@@ -1992,6 +2003,7 @@ $("removeThreadConfirm").onclick = async () => {
     // away from the input the user is now expected to type into.
     closeRemoveThreadModal({ force:true, restoreFocus: !openedDraft });
   } catch (e) {
+    for (const deletedId of deletedIds) refresh.locallyDeletingThreadIds.delete(deletedId);
     if (state.pendingRemoveThread === pending && pending.requestSeq === requestSeq) {
       // A 409 here is the server refusing to discard work — either the impact request had not
       // answered yet, or the worktree became dirty while the card was open. Show what it says and

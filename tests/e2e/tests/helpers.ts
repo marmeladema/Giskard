@@ -67,10 +67,46 @@ export type RecordedNotification = {
   data: { threadId?: string; requestId?: string } | null;
 };
 
+export type RecordedNotice = {
+  text: string;
+  classes: string[];
+};
+
 declare global {
   interface Window {
     __giskardNotifications?: RecordedNotification[];
+    __giskardNotices?: RecordedNotice[];
   }
+}
+
+/** Record notices even when a later render clears them before Playwright can inspect the DOM. */
+export async function recordNotices(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const calls: RecordedNotice[] = [];
+    window.__giskardNotices = calls;
+    const notices = document.querySelector("#notices");
+    if (!notices) throw new Error("notice container not found");
+    new MutationObserver((records) => {
+      for (const record of records) {
+        for (const node of record.addedNodes) {
+          if (!(node instanceof Element)) continue;
+          const added = node.matches(".notice")
+            ? [node]
+            : Array.from(node.querySelectorAll(".notice"));
+          for (const notice of added) {
+            calls.push({
+              text: notice.textContent || "",
+              classes: Array.from(notice.classList),
+            });
+          }
+        }
+      }
+    }).observe(notices, { childList:true, subtree:true });
+  });
+}
+
+export function recordedNotices(page: Page): Promise<RecordedNotice[]> {
+  return page.evaluate(() => window.__giskardNotices ?? []);
 }
 
 /**
