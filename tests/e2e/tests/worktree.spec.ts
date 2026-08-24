@@ -1,5 +1,10 @@
 import { test, expect } from "@playwright/test";
-import { SCRIPTED_REPLY, login } from "./helpers";
+import {
+  SCRIPTED_REPLY,
+  login,
+  recordNotices,
+  recordedNotices,
+} from "./helpers";
 
 /**
  * Isolating a thread in its own Git worktree is chosen once, on the draft, because a thread's
@@ -93,7 +98,7 @@ test.describe("git checkout choice on a draft", () => {
    * Deleting a thread destroys its worktree, and a worktree can hold the only copy of work. The
    * card names it while the question is still open — after the fact there is nothing to decide.
    */
-  test("names what deleting an isolated thread would destroy", async ({ page }) => {
+  test("deletes an isolated thread without a remote-removal warning", async ({ page }) => {
     await newDraft(page);
     await page.locator("#gitStrategySel").selectOption("worktree");
     await page.locator("#input").fill("Work that is not committed");
@@ -117,8 +122,14 @@ test.describe("git checkout choice on a draft", () => {
     expect(body.worktrees[0].summary).toBeUndefined();
     await expect(page.locator("#removeThreadWorktree")).toBeHidden();
 
-    await page.locator("#removeThreadCancel").click();
-    await expect(page.locator("#removeThreadModal")).not.toHaveClass(/open/);
+    const threadId = await page.locator(".thread.active").getAttribute("data-tid");
+    expect(threadId).toBeTruthy();
+    await recordNotices(page);
+    await page.locator("#removeThreadConfirm").click();
+    await expect(page.locator(`.thread[data-tid="${threadId}"]`)).toHaveCount(0);
+
+    const notices = await recordedNotices(page);
+    expect(notices).toEqual([]);
   });
 
   test("starts a thread that runs in the worktree", async ({ page }) => {

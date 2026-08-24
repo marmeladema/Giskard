@@ -3176,7 +3176,7 @@ fn browser_projection_conflict_and_malformed_catalog_recovery_is_bounded() {
 
     let remember = between(
         source,
-        "function rememberProjectThreads(pid, threads, conflictThreadIds) {",
+        "function rememberProjectThreads(pid, threads, conflictThreadIds, locallyDeletingThreadIds) {",
         "function knownProjectThreads(pid) {",
     );
     assert!(

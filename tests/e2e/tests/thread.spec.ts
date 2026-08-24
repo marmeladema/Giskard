@@ -1,5 +1,10 @@
 import { test, expect } from "@playwright/test";
-import { SCRIPTED_REPLY, login } from "./helpers";
+import {
+  SCRIPTED_REPLY,
+  login,
+  recordNotices,
+  recordedNotices,
+} from "./helpers";
 
 test.describe("projects and threads", () => {
   test.beforeEach(async ({ page }) => {
@@ -33,6 +38,29 @@ test.describe("projects and threads", () => {
 
     // Starting the turn persisted a real thread, so a thread row now exists in the sidebar.
     await expect(page.locator(".thread").first()).toBeVisible();
+  });
+
+  test("deletes the open shared-workspace thread without a remote-removal warning", async ({ page }) => {
+    const project = page.locator(".proj", { hasText: "Demo" });
+    await project.locator(".project-add").click();
+    await page.locator("#input").fill("Delete this shared-workspace thread");
+    await page.locator("#sendBtn").click();
+    await expect(page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY })).toBeVisible();
+
+    const thread = page.locator(".thread.active");
+    const threadId = await thread.getAttribute("data-tid");
+    expect(threadId).toBeTruthy();
+    const row = thread.locator("xpath=..");
+    await row.locator(".thread-menu-btn").click();
+    await row.locator(".thread-menu .danger").click();
+    await expect(page.locator("#removeThreadModal")).toHaveClass(/open/);
+
+    await recordNotices(page);
+    await page.locator("#removeThreadConfirm").click();
+    await expect(page.locator(`.thread[data-tid="${threadId}"]`)).toHaveCount(0);
+
+    const notices = await recordedNotices(page);
+    expect(notices).toEqual([]);
   });
 
   test("foregrounding a stale open websocket reconnects after probe timeout", async ({ page }) => {
