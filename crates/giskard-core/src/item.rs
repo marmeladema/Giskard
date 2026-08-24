@@ -265,6 +265,26 @@ impl CommandOutputDescriptor {
     }
 }
 
+/// Resolve authoritative command-output counts from a durable representation.
+///
+/// Complete output is authoritative, so redundant persisted metadata is ignored. For truncated
+/// output, callers must validate that both supplied counts are present before using this helper.
+pub fn resolve_command_output_counts(
+    output: &str,
+    output_truncated: bool,
+    output_original_bytes: Option<u64>,
+    output_original_lines: Option<u64>,
+) -> (u64, u64) {
+    if output_truncated {
+        (
+            output_original_bytes.unwrap_or(output.len() as u64),
+            output_original_lines.unwrap_or_else(|| command_output_logical_lines(output)),
+        )
+    } else {
+        (output.len() as u64, command_output_logical_lines(output))
+    }
+}
+
 pub fn command_output_logical_lines(text: &str) -> u64 {
     if text.is_empty() {
         0

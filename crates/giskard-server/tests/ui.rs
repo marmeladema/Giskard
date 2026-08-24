@@ -2625,10 +2625,7 @@ fn browser_loads_completed_command_output_only_in_the_overlay() {
         "async function openCodeOverlay(path, line) {",
         "async function renderMarkdownCodeOverlay",
     );
-    assert!(
-        source.find("releaseOutputOverlay();") < source.find("Loading source…"),
-        "source overlay cleanup must happen before its loading view is initialized"
-    );
+    assert_order(source, "releaseOutputOverlay();", "Loading source…");
     assert!(
         body.contains(
             "commandOutputLinksUrl(projectId, threadId, identity.turnId, identity.itemId)"

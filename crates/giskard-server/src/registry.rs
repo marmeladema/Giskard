@@ -77,6 +77,8 @@ enum ForwarderExitReason {
     StreamEndedWithoutTurn,
     DuplicateForwarder,
     PersistenceBlocked,
+    EventPreparationFailed,
+    RuntimeAuthorityReplaced,
 }
 
 fn forwarder_exit_reason_label(reason: ForwarderExitReason) -> &'static str {
@@ -88,6 +90,8 @@ fn forwarder_exit_reason_label(reason: ForwarderExitReason) -> &'static str {
         ForwarderExitReason::StreamEndedWithoutTurn => "stream_ended_without_turn",
         ForwarderExitReason::DuplicateForwarder => "duplicate_forwarder",
         ForwarderExitReason::PersistenceBlocked => "persistence_blocked",
+        ForwarderExitReason::EventPreparationFailed => "event_preparation_failed",
+        ForwarderExitReason::RuntimeAuthorityReplaced => "runtime_authority_replaced",
     }
 }
 
@@ -2570,6 +2574,9 @@ async fn forward_events(
 ) {
     let hub = shared.hub.clone();
     let runtime = shared.runtime.clone();
+    // Establish the authority once. Per-event permits must only observe this entry, never recreate
+    // it after retirement.
+    drop(runtime.restoration_permit(thread_id));
     let store = shared.store.clone();
     let mut turn_id: Option<TurnId> = None;
     let mut owned_turn: Option<TurnId> = None;
@@ -2830,7 +2837,35 @@ async fn forward_events(
                 // projection, current-turn assembly, or persistence can observe it. Command
                 // terminality is handled separately: providers may send a nonterminal
                 // ItemCompleted followed by a later terminal replacement.
-                let event = runtime.normalize_command_output(event);
+                let is_completed_command = matches!(
+                    &event,
+                    AgentEvent::ItemCompleted { item, .. }
+                        if matches!(&item.payload, ItemPayload::CommandExecution { .. })
+                );
+                let (event, prepared_command_output, preparation_permit) = if is_completed_command {
+                    let Some(permit) = runtime.event_application_permit(thread_id) else {
+                        break ForwarderExitReason::RuntimeAuthorityReplaced;
+                    };
+                    let preparation_runtime = runtime.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        preparation_runtime.prepare_command_output(event)
+                    })
+                    .await
+                    {
+                        Ok((event, prepared)) => (event, prepared, Some(permit)),
+                        Err(error) => {
+                            tracing::error!(
+                                %project_id,
+                                %thread_id,
+                                error = %error,
+                                "command-output event preparation task failed"
+                            );
+                            break ForwarderExitReason::EventPreparationFailed;
+                        }
+                    }
+                } else {
+                    (event, None, None)
+                };
 
                 if let Some(turn) = event_turn
                     && seen_turn_ids.contains(&turn)
@@ -2838,7 +2873,23 @@ async fn forward_events(
                     let command_state_changed = if is_terminal_command_completion(&event) {
                         let before =
                             terminating_command_before_terminal_completion(&runtime, &event).await;
-                        let applied = shared.runtime.apply_event(thread_id, &event, false);
+                        let applied = match preparation_permit.as_ref() {
+                            Some(permit) => match shared.runtime.apply_prepared_event_if_current(
+                                permit,
+                                &event,
+                                false,
+                                prepared_command_output,
+                            ) {
+                                Some(applied) => applied,
+                                None => break ForwarderExitReason::RuntimeAuthorityReplaced,
+                            },
+                            None => shared.runtime.apply_prepared_event(
+                                thread_id,
+                                &event,
+                                false,
+                                prepared_command_output,
+                            ),
+                        };
                         if let AgentEvent::ItemCompleted { turn, item, .. } = &event {
                             shared
                                 .runtime
@@ -3157,10 +3208,23 @@ async fn forward_events(
                     }
                 }
                 if completed.is_none() {
-                    let applied =
-                        shared
-                            .runtime
-                            .apply_event(thread_id, &event, append_to_live_buffer);
+                    let applied = match preparation_permit.as_ref() {
+                        Some(permit) => match shared.runtime.apply_prepared_event_if_current(
+                            permit,
+                            &event,
+                            append_to_live_buffer,
+                            prepared_command_output,
+                        ) {
+                            Some(applied) => applied,
+                            None => break ForwarderExitReason::RuntimeAuthorityReplaced,
+                        },
+                        None => shared.runtime.apply_prepared_event(
+                            thread_id,
+                            &event,
+                            append_to_live_buffer,
+                            prepared_command_output,
+                        ),
+                    };
                     debug!(
                         %thread_id,
                         event_sequence = ?applied.sequence,
@@ -3888,14 +3952,12 @@ fn late_command_completion_message(
             output_original_lines,
             ..
         } => {
-            let original_bytes = output_truncated
-                .then_some(*output_original_bytes)
-                .flatten()
-                .unwrap_or(output.len() as u64);
-            let original_lines = output_truncated
-                .then_some(*output_original_lines)
-                .flatten()
-                .unwrap_or_else(|| giskard_core::command_output_logical_lines(output));
+            let (original_bytes, original_lines) = giskard_core::resolve_command_output_counts(
+                output,
+                *output_truncated,
+                *output_original_bytes,
+                *output_original_lines,
+            );
             Some(giskard_core::CommandOutputDescriptor::from_durable(
                 output,
                 *output_truncated,
