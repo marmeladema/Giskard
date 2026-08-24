@@ -167,7 +167,7 @@ let state = {
   threadAuthorities:new Map(), pendingDetailConflictResyncs:new Set(),
   pendingMetadataActions:new Map(), threadListRefreshes:new Map(),
   pendingLiveSnapshotReconcile:false,
-  diffOverlayText:null,
+  diffOverlayText:null, diffSelectionToken:0,
   gitStatus:null, gitLoading:false, gitError:null, gitRequestSeq:0,
   draftGitStrategy:"shared",
   gitExpanded:false, gitRepoByWorkspace:new Map(), gitResizeTimer:null, gitBodyHtml:null, gitDiffPending:false, gitRefreshTimer:null,
@@ -226,8 +226,12 @@ async function api(method, path, body, options) {
     if (timeoutPromise) fetchPromise.catch(() => {});
     const r = timeoutPromise ? await Promise.race([fetchPromise, timeoutPromise]) : await fetchPromise;
     if (!r.ok) {
-      const err = new Error((await r.text()) || `HTTP ${r.status}`);
+      const errorText = await r.text();
+      const err = new Error(errorText || `HTTP ${r.status}`);
       err.status = r.status;
+      if ((r.headers.get("content-type") || "").includes("json") && errorText) {
+        try { err.payload = JSON.parse(errorText); } catch (_) {}
+      }
       throw err;
     }
     const ct = r.headers.get("content-type")||"";
@@ -7232,11 +7236,26 @@ function normalizedFileChangePayload(p) {
 function mergeFileChangePayload(existing, next) {
   const current = normalizedFileChangePayload(existing);
   const incoming = normalizedFileChangePayload(next);
+  const changes = [];
+  const indexByDiffId = new Map();
+  for (const change of current.changes.concat(incoming.changes)) {
+    const diffId = change && change.diff && typeof change.diff === "object"
+      ? String(change.diff.id || "")
+      : "";
+    if (diffId && indexByDiffId.has(diffId)) {
+      // A later cumulative file-change item can repeat an earlier captured diff. Keep its newest
+      // status without showing the same immutable snapshot twice in the collapsed summary row.
+      changes[indexByDiffId.get(diffId)] = change;
+    } else {
+      if (diffId) indexByDiffId.set(diffId, changes.length);
+      changes.push(change);
+    }
+  }
   return {
     kind:"file_change",
     path:current.path,
     change:current.change,
-    changes:current.changes.concat(incoming.changes)
+    changes
   };
 }
 function fileChangeContributionKey(item, turnId) {
@@ -7300,9 +7319,13 @@ function renderFileChange(body, p) {
       diffBtn.className = "diff-open";
       diffBtn.textContent = "View diff";
       diffBtn.title = "Open rendered diff";
-      diffBtn.onclick = (e) => {
+      diffBtn.onclick = async (e) => {
         e.stopPropagation();
-        openDiffOverlay(c.path || "File change", c.diff);
+        await openCapturedDiff(
+          c.diff,
+          body.parentElement && body.parentElement.dataset.turn,
+          body.parentElement
+        );
       };
       row.append(diffBtn);
     }
@@ -7316,6 +7339,72 @@ function renderFileChange(body, p) {
     list.append(li);
   }
   body.append(title, list);
+}
+
+function structuredCapturedDiffText(diff) {
+  if (!diff) return "";
+  const supplied = String(diff.new_text || "");
+  const hasUnifiedHeaders = /(?:^|\n)--- [^\r\n]*\r?\n\+\+\+ [^\r\n]*\r?\n/.test(supplied);
+  const hasUnifiedHunk = /(?:^|\n)@@ /.test(supplied);
+  if (hasUnifiedHeaders && hasUnifiedHunk) return supplied;
+  const path = String(diff.path || "file");
+  const lines = [`--- a/${path}`, `+++ b/${path}`];
+  const hunks = diff.hunks || [];
+  for (const hunk of hunks) {
+    lines.push(`@@ -${hunk.old_start},${hunk.old_lines} +${hunk.new_start},${hunk.new_lines} @@`);
+    for (const line of hunk.lines || []) {
+      const kind = line.type || "context";
+      lines.push((kind === "added" ? "+" : kind === "removed" ? "-" : " ") + String(line.text || ""));
+    }
+  }
+  if (!hunks.length && (diff.old_text != null || diff.new_text != null)) {
+    const textLines = value => {
+      const text = String(value == null ? "" : value);
+      const split = text.split(/\r?\n/);
+      if (split.length > 1 && split[split.length - 1] === "") split.pop();
+      return split.length === 1 && split[0] === "" ? [] : split;
+    };
+    const oldLines = textLines(diff.old_text);
+    const newLines = textLines(diff.new_text);
+    lines.push(`@@ -${oldLines.length ? 1 : 0},${oldLines.length} +${newLines.length ? 1 : 0},${newLines.length} @@`);
+    for (const line of oldLines) lines.push("-" + line);
+    for (const line of newLines) lines.push("+" + line);
+  }
+  return lines.join("\n");
+}
+
+function rowAdvertisesCapturedDiff(row, diffId) {
+  if (!row) return true;
+  if (!row.isConnected || !row._fileChangePayload) return false;
+  return (row._fileChangePayload.changes || []).some(change => (
+    change.diff && String(change.diff.id) === String(diffId)
+  ));
+}
+
+async function openCapturedDiff(descriptor, turnId, sourceRow) {
+  const pid = state.projectId;
+  const threadId = state.threadId;
+  const diffId = descriptor && descriptor.id;
+  if (!pid || !threadId || !turnId || !diffId || descriptor.available === false) return;
+  const token = ++state.diffSelectionToken;
+  try {
+    const response = await api("GET", `/api/projects/${encodeURIComponent(pid)}/threads/${encodeURIComponent(threadId)}/turns/${encodeURIComponent(turnId)}/diffs/${encodeURIComponent(diffId)}`);
+    if (token !== state.diffSelectionToken || state.projectId !== pid || state.threadId !== threadId || String(response.diff_id) !== String(diffId) || !rowAdvertisesCapturedDiff(sourceRow, diffId)) return;
+    const content = response.content || {};
+    const text = content.kind === "unified" ? String(content.text || "") : structuredCapturedDiffText(content.diff);
+    if (!text.trim()) {
+      notice("This captured diff has no displayable text.", "warning");
+      return;
+    }
+    openDiffOverlay(descriptor.path || "File change", text);
+  } catch (e) {
+    if (token !== state.diffSelectionToken || state.projectId !== pid || state.threadId !== threadId || !rowAdvertisesCapturedDiff(sourceRow, diffId)) return;
+    if (e && e.status === 409) {
+      notice("That diff was replaced while it was loading. Open the current diff to retry.", "warning");
+      return;
+    }
+    notice("Could not load captured diff: " + apiFailureMessage(e), "error");
+  }
 }
 // Tool calls (esp. MCP results) can return very large input/output payloads. Render them with the
 // same row-owned collapse model as command output: running rows start expanded while small, large
@@ -7913,6 +8002,7 @@ function overlayFileUrl(kind, path) {
 async function openCodeOverlay(path, line) {
   // A thread as well as a project: the file is read as that thread sees it, and the route says so.
   if (!state.projectId || !state.threadId || !path) return;
+  state.diffSelectionToken++;
   const requestId = Math.random().toString(36).slice(2);
   $("codeOverlay").dataset.projectId = state.projectId;
   $("codeOverlay").dataset.threadId = state.threadId;
@@ -8131,6 +8221,7 @@ function renderDiffRows(rows) {
 function openDiffOverlay(path, diff) {
   diff = String(diff || "");
   if (!state.projectId || !diff.trim()) return;
+  state.diffSelectionToken++;
   state.codePath = null;
   state.codeLine = null;
   state.codeOverlaySource = null;
@@ -8159,6 +8250,7 @@ function setCodeCopyDiff(visible) {
   if (!visible) btn.textContent = "Copy diff";
 }
 function closeCodeOverlay() {
+  state.diffSelectionToken++;
   $("codeOverlay").classList.remove("open");
   delete $("codeOverlay").dataset.requestId;
   delete $("codeOverlay").dataset.projectId;

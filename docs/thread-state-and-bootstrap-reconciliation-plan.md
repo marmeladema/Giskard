@@ -15,8 +15,9 @@ of the original plan; it was inserted because the bootstrap and retention work b
 into the same root cause — a turn's record was both its index entry and its unbounded payload. See
 *What the storage layout change unlocks* for the parts of this plan it simplifies or retires.
 
-**The runtime registry and turn-less context restoration milestones are also complete.** The event
-journal, transactional bootstrap, class-aware outbox, and later milestones remain to be built, in
+**The runtime registry, turn-less context restoration, and lazy agent-produced diff milestones are
+also complete.** The event journal, transactional bootstrap, class-aware outbox, and later
+milestones remain to be built, in
 the milestones defined under *Implementation milestones*.
 
 This plan began with Codex restoring a context window outside a turn. The codebase audit showed
@@ -1009,6 +1010,10 @@ request metadata and the structured `DiffUpdated` collection stored with a turn.
 `GET /api/projects/{id}/git/diff` workspace endpoint and Git panel remain unchanged and receive
 regression coverage; they answer a different, current-worktree question.
 
+`DiffUpdated` events and persisted `turn.diffs` already reach the wire without being rendered by
+the browser. Making those turn-level diffs discoverable in the UI is an existing product gap, not
+a regression introduced by M4's lazy-diff representation.
+
 **Scope.** Replace eagerly delivered agent-produced diff bodies with bounded descriptors carrying
 the path, change kind, display metadata or statistics, availability, and a stable content identity.
 Add an authenticated
@@ -1025,19 +1030,19 @@ become bounded captured-diff descriptors; `WireAgentEvent::DiffUpdated` carries 
 `WireTurn` and the existing HTTP history response use the same descriptor-only forms. The new read
 returns the tagged full representation identified by `diff_id` (unified text or structured diff).
 
-Use one logical diff-content side table per turn. While active, the runtime entry maps `DiffId` to
-immutable content and projections carry only descriptors. At commit, write descriptor references
-and their deduplicated diff-content records into the same atomic per-turn payload file; do not create
-a separately committed blob directory. Persist item association on the descriptor when one exists,
-but key lookup by `(project_id, thread_id, turn_id, diff_id)`. The persisted endpoint scans the
-selected turn payload for that `DiffId`; history projection skips content records and returns only
-descriptors.
+Use one logical diff-content side table per active turn. The runtime entry maps content-hash
+`DiffId`s to immutable content and projections carry only descriptors. At commit, reconstruct the
+existing inline payload representation and write the same atomic per-turn payload format; do not
+create a separately committed blob directory. Item association remains on the projected descriptor
+when one exists, but lookup is keyed by `(project_id, thread_id, turn_id, diff_id)`. The persisted
+endpoint scans the selected turn payload for matching content, while history projection returns
+only descriptors.
 
-This normalized representation advances the payload format version for new writes. The reader
-continues to accept the prior inline representation: it derives a stable `DiffId` from legacy diff
-content, projects a descriptor, and serves that content through the same endpoint without rewriting
-the turn. Duplicate identical content within a turn may share one content record while retaining
-separate descriptor/item associations.
+Keep the existing inline payload representation and payload format version. Derive a stable,
+domain-separated hash of the complete diff identity — content kind, path, change kind, and body —
+while projecting a turn, and serve the matching inline content through the same endpoint without
+rewriting the turn. Repeated identical updates for one path share one runtime map entry, while the
+same patch text on different paths remains independently replaceable.
 
 Persist the full diff before releasing its runtime authority. A fetch racing turn completion may
 resolve through either authority but must return the same identified content. If an active update

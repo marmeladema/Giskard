@@ -370,7 +370,7 @@ Thread **history** is split by how the two halves grow. `history.jsonl` is the i
 turn, holding only bounded fields (ids, model, status, usage, timestamps, a capped prompt preview,
 attachment descriptors) — so it stays small no matter what the agent did, and it is appended to.
 `turns/<turn_id>.jsonl` holds the unbounded half — the full prompt, the full status message, the
-items, the diffs — and is
+items, and the full captured diffs — and is
 written with an atomic temp-file+fsync+rename, so a payload is complete or absent rather than torn.
 A turn commits payload first, index last: a crash between them leaves a file no record references,
 which every read path simply cannot see. `thread.json` is small metadata + token aggregates that can

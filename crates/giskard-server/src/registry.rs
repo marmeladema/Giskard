@@ -2932,6 +2932,11 @@ async fn forward_events(
                     continue;
                 }
 
+                // Only admitted events may mutate lazy diff storage. Extract bodies after the
+                // wrong-turn and already-persisted-turn exits, but before reconnect state,
+                // persistence assembly, or browser projection can observe the event.
+                let event = runtime.capture_event_diffs(thread_id, event);
+
                 if ctx.kind == TurnContextKind::PassiveSubagent {
                     refresh_passive_subagent_context(thread_id, &mut ctx).await;
                     if let Some(turn) = event_turn
@@ -3444,6 +3449,7 @@ async fn persist_subagent_fallback_transcript(
         project_id,
         thread_id,
         &turn,
+        &[],
     )
     .await;
     if !outcome.history_appended {
@@ -3547,12 +3553,14 @@ async fn complete_forwarded_turn(
         started_at,
         completed_at: Some(Utc::now()),
     };
+    let captured_diffs = shared.runtime.captured_diff_records(thread_id, tid);
     let persist_outcome = persist_turn(
         &shared.thread_metadata,
         &shared.ledger,
         project_id,
         thread_id,
         &turn,
+        &captured_diffs,
     )
     .await;
     if ctx.kind == TurnContextKind::ManualCompaction {
@@ -4014,6 +4022,7 @@ async fn persist_turn(
     project_id: ProjectId,
     thread_id: ThreadId,
     turn: &Turn,
+    captured_diffs: &[giskard_core::CapturedDiffRecord],
 ) -> PersistTurnOutcome {
     // Only completed/interrupted turns carry real usage; capture the bits we need before `turn`
     // moves into the closure.
@@ -4035,7 +4044,7 @@ async fn persist_turn(
     // metadata aggregates. A crash between the two leaves the turn in history but not yet in the
     // aggregates cache — recoverable via `recompute_aggregates`.
     let commit = match thread_metadata
-        .append_turn(project_id, thread_id, turn)
+        .append_turn_with_diffs(project_id, thread_id, turn, captured_diffs)
         .await
     {
         Ok(commit) => commit,
@@ -5202,7 +5211,7 @@ mod tests {
         let hub = Arc::new(Hub::new());
         let ledger = ledger::spawn(store.clone());
 
-        spawn_forwarder(
+        let runtime = spawn_forwarder(
             thread_id,
             project_id,
             AgentEventStream::new(tx.subscribe()),
@@ -5213,16 +5222,41 @@ mod tests {
             "first",
         );
         let first_turn = TurnId::new();
-        for event in turn_events(
+        let second_turn = TurnId::new();
+        let mut first_events = turn_events(
             thread_id,
             first_turn,
             "first",
             "one",
             TokenUsage::new(10, 1),
-        ) {
+        );
+        tx.send(first_events.remove(0)).unwrap();
+        let rejected_diff = giskard_core::FileDiff {
+            path: "src/rejected.rs".into(),
+            change: giskard_core::FileChangeKind::Modified,
+            old_text: Some("old".into()),
+            new_text: Some("foreign".into()),
+            hunks: Vec::new(),
+            binary: false,
+            captured: None,
+        };
+        let rejected_id = giskard_core::capture_structured_diff(rejected_diff.clone())
+            .1
+            .id;
+        tx.send(AgentEvent::DiffUpdated {
+            thread: thread_id,
+            turn: second_turn,
+            diff: rejected_diff,
+        })
+        .unwrap();
+        for event in first_events {
             tx.send(event).unwrap();
         }
         wait_for_turn_count(&store, project_id, thread_id, 1).await;
+        assert!(matches!(
+            runtime.captured_diff(thread_id, second_turn, &rejected_id),
+            crate::thread_runtime::RuntimeDiffLookup::Missing
+        ));
 
         spawn_forwarder(
             thread_id,
@@ -5234,7 +5268,6 @@ mod tests {
             model,
             "second",
         );
-        let second_turn = TurnId::new();
         for event in turn_events(
             thread_id,
             second_turn,

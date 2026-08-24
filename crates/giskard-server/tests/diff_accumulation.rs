@@ -8,7 +8,7 @@ use futures_util::SinkExt;
 use giskard_core::diff::{DiffHunk, DiffLine, FileDiff};
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ItemId, ProjectId, ThreadId, TurnId};
-use giskard_core::item::{FileChangeKind, Item, ItemKind, ItemPayload, ItemStart};
+use giskard_core::item::{FileChangeEntry, FileChangeKind, Item, ItemKind, ItemPayload, ItemStart};
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnStatus, TurnStatusKind};
 use giskard_harness::AgentHarness;
@@ -58,6 +58,7 @@ fn make_diff_fixture() -> ReplayFixture {
             ],
         }],
         binary: false,
+        captured: None,
     };
 
     let diff2 = FileDiff {
@@ -76,6 +77,7 @@ fn make_diff_fixture() -> ReplayFixture {
             ],
         }],
         binary: false,
+        captured: None,
     };
 
     let diff3 = FileDiff {
@@ -85,6 +87,7 @@ fn make_diff_fixture() -> ReplayFixture {
         new_text: Some("pub fn lib() {}".into()),
         hunks: vec![],
         binary: false,
+        captured: None,
     };
 
     ReplayFixture::from_events(vec![
@@ -99,7 +102,7 @@ fn make_diff_fixture() -> ReplayFixture {
             item: ItemStart {
                 id: item,
                 harness_item_id: "it_1".into(),
-                kind: ItemKind::AgentMessage,
+                kind: ItemKind::FileChange,
                 command: None,
                 tool: None,
             },
@@ -125,8 +128,16 @@ fn make_diff_fixture() -> ReplayFixture {
             item: Item {
                 id: item,
                 harness_item_id: "it_1".into(),
-                payload: ItemPayload::AgentMessage {
-                    text: "Modified src/main.rs and created src/lib.rs".into(),
+                payload: ItemPayload::FileChange {
+                    path: "src/inline.rs".into(),
+                    change: FileChangeKind::Modified,
+                    changes: vec![FileChangeEntry {
+                        path: "src/inline.rs".into(),
+                        change: FileChangeKind::Modified,
+                        diff: Some("--- a/src/inline.rs\n+++ b/src/inline.rs\n-old\n+new\n".into()),
+                        captured_diff: None,
+                    }],
+                    status: Some("completed".into()),
                 },
                 created_at: now,
             },
@@ -292,9 +303,32 @@ session_days = 30
                 .find(|d| d.path.to_string_lossy() == "src/main.rs")
                 .expect("src/main.rs diff should exist");
             assert_eq!(main_rs_diff.change, FileChangeKind::Modified);
+            assert!(main_rs_diff.old_text.is_none() && main_rs_diff.new_text.is_none());
             assert!(
-                main_rs_diff.new_text.as_ref().unwrap().contains("hello"),
-                "should contain the latest diff (hello, not hi)"
+                main_rs_diff.hunks.is_empty(),
+                "history projection is descriptor-only"
+            );
+            let main_descriptor = main_rs_diff.captured.as_ref().expect("captured descriptor");
+            let main_content: serde_json::Value = http_client
+                .get(format!(
+                    "http://127.0.0.1:{port}/api/projects/{pid}/threads/{thread_id}/turns/{}/diffs/{}",
+                    turn.id, main_descriptor.id
+                ))
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert!(
+                main_content["content"]["diff"]["new_text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("hello"),
+                "lazy endpoint should return the latest captured body"
             );
 
             let lib_rs_diff = turn
@@ -303,6 +337,58 @@ session_days = 30
                 .find(|d| d.path.to_string_lossy() == "src/lib.rs")
                 .expect("src/lib.rs diff should exist");
             assert_eq!(lib_rs_diff.change, FileChangeKind::Created);
+            assert!(lib_rs_diff.captured.is_some());
+
+            let inline_descriptor = match &turn.items[0].payload {
+                ItemPayload::FileChange { changes, .. } => {
+                    assert!(
+                        changes[0].diff.is_none(),
+                        "inline body must not hydrate history"
+                    );
+                    changes[0]
+                        .captured_diff
+                        .as_ref()
+                        .expect("inline descriptor")
+                }
+                other => panic!("expected file-change item, got {other:?}"),
+            };
+            let inline_content: serde_json::Value = http_client
+                .get(format!(
+                    "http://127.0.0.1:{port}/api/projects/{pid}/threads/{thread_id}/turns/{}/diffs/{}",
+                    turn.id, inline_descriptor.id
+                ))
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(inline_content["content"]["kind"], "unified");
+            assert!(
+                inline_content["content"]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("+new")
+            );
+
+            let raw_payload = tokio::fs::read_to_string(
+                tmp.path()
+                    .join("projects")
+                    .join(pid.to_string())
+                    .join("threads")
+                    .join(thread_id.to_string())
+                    .join("turns")
+                    .join(format!("{}.jsonl", turn.id)),
+            )
+            .await
+            .unwrap();
+            assert!(raw_payload.contains(r#""format":1"#));
+            assert!(raw_payload.contains(r#""diff":"--- a/src/inline.rs"#));
+            assert!(!raw_payload.contains("diff_content"));
+            assert!(!raw_payload.contains("captured_diff"));
 
             return;
         }

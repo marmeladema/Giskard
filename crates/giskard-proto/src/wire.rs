@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalMetadata, ApprovalRequest};
-use giskard_core::diff::{DiffHunk, FileDiff};
+use giskard_core::diff::{CapturedDiffDescriptor, DiffContentKind, FileDiff};
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, ThreadId, TurnId};
@@ -229,23 +229,27 @@ pub struct WireFileChangeEntry {
     pub path: String,
     pub change: FileChangeKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub diff: Option<String>,
+    pub diff: Option<WireCapturedDiffDescriptor>,
 }
 
-/// Wire-mirror of [`FileDiff`].
+/// Bounded wire projection of captured diff content.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WireFileDiff {
+pub struct WireCapturedDiffDescriptor {
+    pub id: giskard_core::DiffId,
     pub path: String,
     pub change: FileChangeKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub old_text: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub new_text: Option<String>,
-    #[serde(default)]
-    pub hunks: Vec<DiffHunk>,
-    #[serde(default)]
+    pub content_kind: DiffContentKind,
+    pub available: bool,
+    pub byte_size: u64,
+    pub additions: u64,
+    pub deletions: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub binary: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<ItemId>,
 }
+
+pub type WireFileDiff = WireCapturedDiffDescriptor;
 
 /// Wire-mirror of [`ApprovalRequest`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -559,21 +563,42 @@ impl From<FileChangeEntry> for WireFileChangeEntry {
         Self {
             path: path_to_wire(&entry.path),
             change: entry.change,
-            diff: entry.diff,
+            diff: entry.captured_diff.map(Into::into),
+        }
+    }
+}
+
+impl From<CapturedDiffDescriptor> for WireCapturedDiffDescriptor {
+    fn from(d: CapturedDiffDescriptor) -> Self {
+        Self {
+            id: d.id,
+            path: path_to_wire(&d.path),
+            change: d.change,
+            content_kind: d.content_kind,
+            available: d.available,
+            byte_size: d.byte_size,
+            additions: d.additions,
+            deletions: d.deletions,
+            binary: d.binary,
+            item_id: d.item_id,
         }
     }
 }
 
 impl From<FileDiff> for WireFileDiff {
     fn from(d: FileDiff) -> Self {
-        Self {
+        d.captured.map(Into::into).unwrap_or_else(|| Self {
+            id: giskard_core::DiffId::from_digest("unavailable"),
             path: path_to_wire(&d.path),
             change: d.change,
-            old_text: d.old_text,
-            new_text: d.new_text,
-            hunks: d.hunks,
+            content_kind: DiffContentKind::Structured,
+            available: false,
+            byte_size: 0,
+            additions: 0,
+            deletions: 0,
             binary: d.binary,
-        }
+            item_id: None,
+        })
     }
 }
 
@@ -755,6 +780,7 @@ mod tests {
                 path: PathBuf::from("/src/lib.rs"),
                 change: FileChangeKind::Created,
                 diff: None,
+                captured_diff: None,
             }],
             status: Some("completed".into()),
         };

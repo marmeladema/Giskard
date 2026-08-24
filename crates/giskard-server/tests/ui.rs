@@ -1188,6 +1188,16 @@ async fn index_page_is_served_and_public() {
         "UI opens file-change diffs in the diff overlay, rendered as source"
     );
     assert!(
+        body.contains("openCapturedDiff(")
+            && body.contains("rowAdvertisesCapturedDiff(sourceRow, diffId)")
+            && body.contains(
+                "/turns/${encodeURIComponent(turnId)}/diffs/${encodeURIComponent(diffId)}"
+            )
+            && body.contains("token !== state.diffSelectionToken")
+            && body.contains("e.status === 409"),
+        "UI lazily fetches captured diffs and rejects stale or superseded responses"
+    );
+    assert!(
         body.contains("renderToolBody"),
         "UI renders tool-call items"
     );

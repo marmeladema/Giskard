@@ -3,6 +3,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use tracing::debug;
 
+use giskard_core::CapturedDiffRecord;
 use giskard_core::ids::{ProjectId, ThreadId, TurnId};
 use giskard_core::thread::ThreadKind;
 use giskard_core::turn::{Mode, Turn};
@@ -78,9 +79,20 @@ impl ThreadMetadataService {
         thread_id: ThreadId,
         turn: &Turn,
     ) -> Result<TurnCommitOutcome, PersistError> {
+        self.append_turn_with_diffs(project_id, thread_id, turn, &[])
+            .await
+    }
+
+    pub async fn append_turn_with_diffs(
+        &self,
+        project_id: ProjectId,
+        thread_id: ThreadId,
+        turn: &Turn,
+        captured: &[CapturedDiffRecord],
+    ) -> Result<TurnCommitOutcome, PersistError> {
         let outcome = self
             .store
-            .append_turn_and_update_aggregates(project_id, thread_id, turn)
+            .append_turn_with_diffs_and_update_aggregates(project_id, thread_id, turn, captured)
             .await?;
         if let TurnCommitOutcome::MetadataMutation(mutation) = &outcome {
             self.publish(project_id, mutation).await;

@@ -21,6 +21,8 @@ use crate::config::Config;
 use crate::history::{self, HistoryHeader, TurnRecord};
 use crate::layout::{ThreadLayout, ThreadPaths};
 use crate::migrate::{self, MigrationOutcome};
+use giskard_core::diff::CapturedDiffRecord;
+use giskard_core::{CapturedDiffContent, DiffId};
 
 const SCHEMA_VERSION: u32 = 1;
 
@@ -1140,10 +1142,22 @@ impl PersistStore {
         thread: ThreadId,
         turn: &Turn,
     ) -> Result<(), PersistError> {
+        self.append_turn_with_diffs(project, thread, turn, &[])
+            .await
+    }
+
+    pub async fn append_turn_with_diffs(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+        turn: &Turn,
+        captured: &[CapturedDiffRecord],
+    ) -> Result<(), PersistError> {
         self.ensure_migrated(project, thread).await;
         let lock = self.thread_lock(thread).await;
         let _guard = lock.lock().await;
-        self.append_turn_unlocked(project, thread, turn).await
+        self.append_turn_unlocked(project, thread, turn, captured)
+            .await
     }
 
     /// Write the history header if this thread has no index file yet.
@@ -1174,6 +1188,7 @@ impl PersistStore {
         project: ProjectId,
         thread: ThreadId,
         turn: &Turn,
+        captured: &[CapturedDiffRecord],
     ) -> Result<(), PersistError> {
         let paths = self.thread_paths(project, thread).await;
         let path = paths.history();
@@ -1182,7 +1197,8 @@ impl PersistStore {
             // A thread whose format 1 history could not be migrated (an unparseable interior line)
             // keeps behaving exactly as it does today rather than losing the append.
             ThreadLayout::Flat => {
-                let mut line = serde_json::to_string(turn)
+                let persisted = history::turn_with_inline_diffs(turn, captured)?;
+                let mut line = serde_json::to_string(&persisted)
                     .map_err(|e| PersistError::Serialize(e.to_string()))?;
                 line.push('\n');
                 line
@@ -1209,7 +1225,11 @@ impl PersistStore {
                         "turn payload already exists; keeping the durable one"
                     );
                 } else {
-                    atomic_write(&payload_path, &history::payload_file_bytes(turn)?).await?;
+                    atomic_write(
+                        &payload_path,
+                        &history::payload_file_bytes_with_diffs(turn, captured)?,
+                    )
+                    .await?;
                 }
                 let mut line = String::new();
                 if !path_exists(&path).await {
@@ -1266,10 +1286,22 @@ impl PersistStore {
         thread: ThreadId,
         turn: &Turn,
     ) -> Result<TurnCommitOutcome, PersistError> {
+        self.append_turn_with_diffs_and_update_aggregates(project, thread, turn, &[])
+            .await
+    }
+
+    pub async fn append_turn_with_diffs_and_update_aggregates(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+        turn: &Turn,
+        captured: &[CapturedDiffRecord],
+    ) -> Result<TurnCommitOutcome, PersistError> {
         self.ensure_migrated(project, thread).await;
         let lock = self.thread_lock(thread).await;
         let _guard = lock.lock().await;
-        self.append_turn_unlocked(project, thread, turn).await?;
+        self.append_turn_unlocked(project, thread, turn, captured)
+            .await?;
 
         let should_record = matches!(
             turn.status.kind,
@@ -1385,6 +1417,40 @@ impl PersistStore {
     ) -> Result<Vec<TurnRecord>, PersistError> {
         self.ensure_migrated(project, thread).await;
         self.load_turn_records_unlocked(project, thread).await
+    }
+
+    /// Load one captured diff from an indexed immutable turn payload.
+    pub async fn load_captured_diff(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+        turn: TurnId,
+        diff_id: &DiffId,
+    ) -> Result<Option<CapturedDiffContent>, PersistError> {
+        self.ensure_migrated(project, thread).await;
+        let records = self.load_turn_records_unlocked(project, thread).await?;
+        if !records.iter().any(|record| record.turn_id == turn) {
+            return Ok(None);
+        }
+        let paths = self.thread_paths(project, thread).await;
+        if paths.layout() == ThreadLayout::Flat {
+            let path = paths.history();
+            let data = match tokio::fs::read_to_string(&path).await {
+                Ok(data) => data,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(PersistError::Io(error.to_string())),
+            };
+            let turns = parse_turn_history(&path, &data)?;
+            let Some(turn) = turns.iter().find(|candidate| candidate.id == turn) else {
+                return Ok(None);
+            };
+            return Ok(history::captured_diff_contents(turn).remove(diff_id));
+        }
+        let payload_path = paths.turn_payload(turn);
+        let Some(payload) = history::read_turn_payload(&payload_path).await? else {
+            return Ok(None);
+        };
+        Ok(payload.diff_contents.get(diff_id).cloned())
     }
 
     /// Load up to `limit` readable turns ending before `end`, backfilling across isolated damaged
@@ -3372,7 +3438,8 @@ mod tests {
 mod layout_tests {
     use super::tests::*;
     use super::*;
-    use giskard_core::item::{Item, ItemPayload};
+    use giskard_core::diff::FileDiff;
+    use giskard_core::item::{FileChangeEntry, FileChangeKind, Item, ItemPayload};
     use giskard_core::token::TokenUsage;
     use giskard_core::user_input::{AttachmentKind, UserAttachment, UserInput};
     use tempfile::TempDir;
@@ -4250,6 +4317,7 @@ mod layout_tests {
             new_text: Some(text.into()),
             hunks: vec![],
             binary: false,
+            captured: None,
         };
 
         let mut data = payload_prologue();
@@ -4277,7 +4345,16 @@ mod layout_tests {
             payload
                 .diffs
                 .iter()
-                .map(|d| (d.path.to_string_lossy().into_owned(), d.new_text.clone()))
+                .map(|d| {
+                    let id = &d.captured.as_ref().unwrap().id;
+                    let text = match payload.diff_contents.get(id).unwrap() {
+                        giskard_core::CapturedDiffContent::Structured { diff } => {
+                            diff.new_text.clone()
+                        }
+                        other => panic!("expected structured diff, got {other:?}"),
+                    };
+                    (d.path.to_string_lossy().into_owned(), text)
+                })
                 .collect::<Vec<_>>(),
             vec![
                 ("src/b.rs".to_string(), Some("other".into())),
@@ -4447,5 +4524,103 @@ mod layout_tests {
             MigrationOutcome::Migrated
         );
         assert_eq!(store.load_all_turns(pid, tid).await.unwrap().len(), 1);
+    }
+
+    /// A migration failure leaves a readable flat thread in service. Its writes and lazy reads
+    /// must retain the same inline format-1 bodies as an ordinary migrated payload.
+    #[tokio::test]
+    async fn degraded_flat_layout_preserves_and_loads_captured_diff_bodies() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        write_format1_thread(&store, pid, &test_thread(pid, tid), &[]).await;
+        store.unmigratable.write().await.insert((pid, tid));
+
+        let item_id = giskard_core::ItemId::new();
+        let unified_text = "@@ -1 +1 @@\n-old\n+new\n".to_string();
+        let (unified_descriptor, unified_record) = giskard_core::capture_unified_diff(
+            "src/inline.rs".into(),
+            FileChangeKind::Modified,
+            Some(item_id),
+            unified_text.clone(),
+        );
+        let structured_body = FileDiff {
+            path: "src/structured.rs".into(),
+            change: FileChangeKind::Modified,
+            old_text: Some("before\n".into()),
+            new_text: Some("after\n".into()),
+            hunks: Vec::new(),
+            binary: false,
+            captured: None,
+        };
+        let (structured_projection, structured_record) =
+            giskard_core::capture_structured_diff(structured_body.clone());
+        let mut turn = make_turn(TokenUsage::new(1, 1));
+        turn.items = vec![Item {
+            id: item_id,
+            harness_item_id: "native-file-change".into(),
+            payload: ItemPayload::FileChange {
+                path: "src/inline.rs".into(),
+                change: FileChangeKind::Modified,
+                changes: vec![FileChangeEntry {
+                    path: "src/inline.rs".into(),
+                    change: FileChangeKind::Modified,
+                    diff: None,
+                    captured_diff: Some(unified_descriptor.clone()),
+                }],
+                status: None,
+            },
+            created_at: Utc::now(),
+        }];
+        turn.diffs = vec![structured_projection];
+
+        store
+            .append_turn_with_diffs(
+                pid,
+                tid,
+                &turn,
+                &[unified_record, structured_record.clone()],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.thread_layout(pid, tid).await, ThreadLayout::Flat);
+        let flat_history = store.thread_paths(pid, tid).await.history();
+        let persisted = parse_turn_history(
+            &flat_history,
+            &tokio::fs::read_to_string(&flat_history).await.unwrap(),
+        )
+        .unwrap();
+        let persisted_turn = persisted
+            .iter()
+            .find(|candidate| candidate.id == turn.id)
+            .unwrap();
+        let persisted_change = match &persisted_turn.items[0].payload {
+            ItemPayload::FileChange { changes, .. } => &changes[0],
+            _ => panic!("expected file change"),
+        };
+        assert_eq!(
+            persisted_change.diff.as_deref(),
+            Some(unified_text.as_str())
+        );
+        assert!(persisted_change.captured_diff.is_none());
+        assert_eq!(persisted_turn.diffs, vec![structured_body.clone()]);
+
+        assert_eq!(
+            store
+                .load_captured_diff(pid, tid, turn.id, &unified_descriptor.id)
+                .await
+                .unwrap(),
+            Some(giskard_core::CapturedDiffContent::Unified { text: unified_text })
+        );
+        assert_eq!(
+            store
+                .load_captured_diff(pid, tid, turn.id, &structured_record.id)
+                .await
+                .unwrap(),
+            Some(giskard_core::CapturedDiffContent::Structured {
+                diff: structured_body
+            })
+        );
     }
 }
