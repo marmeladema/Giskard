@@ -7298,6 +7298,7 @@ function mergeFileChangeWithPrevious(p, item, turnId) {
 function renderFileChange(body, p) {
   const normalized = normalizedFileChangePayload(p);
   body.parentElement._fileChangePayload = normalized;
+  body.replaceChildren();
   const changes = normalized.changes;
   const title = document.createElement("div");
   title.textContent = `File change${changes.length===1 ? "" : "s"}`;
