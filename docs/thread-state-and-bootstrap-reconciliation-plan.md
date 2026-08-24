@@ -82,10 +82,9 @@ Consequences for Primitive 3:
 - The bootstrap can send bounded turn records for the history page and fetch payloads separately,
   instead of embedding whole turns and then discovering the result does not fit a frame.
 - **Byte chunking with base64 was accepted only because a single turn record could be arbitrarily
-  large.** That is no longer structurally true for the index. Re-evaluate the encoding once the
-  bootstrap uses bounded records: chunking the two array sections by element removes the base64
-  inflation, the reassembly buffer, and the decode step. Do not treat the current byte-chunking
-  decision as settled.
+  large.** That is no longer structurally true for the index. The bootstrap therefore exchanges
+  bounded semantic elements as individual transaction messages. It does not base64-encode,
+  concatenate, or reconstruct a serialized whole-bootstrap blob.
 - An oversized single turn is now one file, retrievable over the HTTP pagination lane, where no
   frame limit applies.
 
@@ -93,7 +92,7 @@ The store now exposes `load_turn_records`, and ordinary format-2 pagination sele
 before fetching their payloads. Adding the consistent `load_history_snapshot` and
 `load_history_from` reads remains in scope for the milestone whose bootstrap consumes them — the
 storage plan deferred those transaction-facing reads until a consumer existed, and that consumer
-is M5.
+is M6.
 
 ### One of the two full-history reads per bootstrap is already gone
 
@@ -115,7 +114,7 @@ Payload records already carry an explicit `index`, payload files are tagged and 
 and the fold rules for collections and singletons are stated in `parse_turn_payload`. A late command
 completion can therefore be appended to its turn's payload file without a format bump.
 
-Nothing implements this. It is M7, and it is a durable-format behaviour change that
+Nothing implements this. It is M8, and it is a durable-format behaviour change that
 deserves its own review: an amendment needs a durable clock the browser can compare against, a
 persistence-recovery path when the amendment write fails, and a reconnect rule. It must not be
 absorbed into an earlier milestone.
@@ -498,12 +497,14 @@ turn snapshot remains the authoritative compact representation of events it cove
 
 The normalized live snapshot should coalesce text/reasoning deltas by item and compact command
 output while advancing `represented_through`. This bounds event count by meaningful runtime state,
-not by chunk count. Apply a per-turn and per-item byte ceiling to reconnect-only accumulated text,
-keeping bounded head and tail content with an explicit omission marker. The live delivery path and
-the eventual completed item remain authoritative and untruncated. If the event stream fails before
-the harness supplies a completed item, persist or surface the same marked recovery representation
-rather than silently claiming complete output. This gives runtime memory a real bound without a
-second temporary persistence format.
+not by chunk count. Apply a per-item byte ceiling to reconnect-only accumulated text, keeping bounded
+head and tail content with an explicit omission marker. Live incremental delivery remains
+authoritative; completed command output is authoritative up to its separately configured durable
+limit, while its WebSocket completion carries only the bounded item representation. If the event
+stream fails before the harness supplies a completed item, persist or surface the same marked
+recovery representation rather than silently claiming complete output. The semantic bootstrap has
+its own aggregate staged-byte and item budgets; it does not redistribute one turn-wide text budget
+among items.
 
 ### Wire transaction
 
@@ -530,40 +531,39 @@ ThreadBootstrap {
 }
 ```
 
-The connection allocates this generation monotonically for each thread. `BootstrapStart`, chunks,
-commit, live events, and resync controls carry it. A newer subscribe cancels the prior generation;
-the browser discards any frame which does not match the latest started generation. WebSocket FIFO
+The connection allocates this generation monotonically for each thread. `BootstrapStart`, semantic
+elements, commit, live events, and resync controls carry it. A newer subscribe cancels the prior
+generation; the browser discards any frame which does not match the latest started generation. WebSocket FIFO
 plus this server-owned generation is sufficient—there is no client-generated subscription token.
 
 This is one logical transaction, not one WebSocket frame. Encode it physically as
-`BootstrapStart`, one or more bounded `BootstrapChunk` messages, and `BootstrapCommit`. Chunks carry
-transaction and section identities and have a hard encoded-byte limit. The browser stages a
-transaction and changes authoritative UI state only after validating its commit. It then applies
-metadata/history/live state, replays `ordered_suffix`, and applies `final_runtime` last. Older
-suffix events therefore cannot regress the final active/request/task state. Only the committed
-transaction resets bootstrap state or releases an optimistic first-turn lock from an explicit
-`turn_state = Idle`. Live `ThreadState` changes metadata only.
+`BootstrapStart`, independently parseable typed semantic element messages, and `BootstrapCommit`.
+Each element carries transaction and section identity, ordinal information, and a hard encoded-byte
+limit. The browser stages a transaction and changes authoritative UI state only after validating
+its commit. It then applies metadata/history/live state, replays `ordered_suffix`, and applies
+`final_runtime` last. Older suffix events therefore cannot regress the final active/request/task
+state. Only the committed transaction resets bootstrap state or releases an optimistic first-turn
+lock from an explicit `turn_state = Idle`. Live `ThreadState` changes metadata only.
 
-Always use start/chunk/commit, including when the payload fits in one chunk. There is one browser
-staging and apply path, not a small-frame fast path. The transaction generation and commit
-provide atomicity; chunk encoding only provides the size bound. The target protocol does not make chunking conditional.
+Always use start/elements/commit, including when the transaction has only one element. There is one
+browser staging and apply path, not a small-transaction fast path. Generation and commit provide
+atomicity; semantic element boundaries provide the per-message size bound.
 
-The per-client bootstrap task may await capacity while emitting chunks because it is not a store,
+The per-client bootstrap task may await capacity while emitting elements because it is not a store,
 harness, or event-forwarder producer. It reserves a transaction/barrier slot but does not place the
 whole encoded transaction in the connection outbox. The initial history page has a byte as well as
-turn-count budget. Individual history records larger than a frame are split across chunks. **Re-evaluate this against
-the storage split before implementing:** a bootstrap history record can now be a bounded
-`TurnRecord` with its payload fetched separately, which is the constraint that forced byte chunking
-in the first place. See *What the storage layout change unlocks*. The
-pinned ordered suffix has separate entry and byte limits and counts against both runtime-journal
-and bootstrap memory until commit or cancellation.
+turn-count budget. A bootstrap history element is a bounded `TurnRecord`; its payload is fetched
+separately after commit. An element which still cannot meet admission uses a bounded descriptor and
+lazy retrieval rather than byte slicing. See *What the storage layout change unlocks*. The pinned
+ordered suffix has separate entry and byte limits and counts against both runtime-journal and
+bootstrap memory until commit or cancellation.
 
 Live request payloads, task-output projections, notices, metadata strings, and reconnect-only
 accumulations each need documented size limits or bounded compact forms. An individual live event
 which cannot fit the maximum ordered-event size does not enter the outbox: mark that subscription
-`NeedsResync`. The next bootstrap obtains the content from chunked history or a bounded runtime
-projection. Never truncate silently; an omission marker or lazy full-content retrieval must make
-the boundary visible.
+`NeedsResync`. The next bootstrap obtains the content from semantic history elements or a bounded
+runtime projection. Never truncate silently; an omission marker or lazy full-content retrieval must
+make the boundary visible.
 
 **Superseded.** This plan previously kept `HistoryPage` on the WebSocket for pagination. M1 moves
 older-history pagination to authenticated HTTP and removes `LoadHistory` and `HistoryPage` from the
@@ -597,7 +597,7 @@ For one subscription generation:
    runtime transition, or delayed publisher can fall through this handoff.
 8. If the pin exhausted its reservation, leave the generation unsubscribed, release the pin, and
    send a retryable thread-scoped control. Otherwise reserve the transaction barrier and stream
-   bounded history/runtime chunks through the dedicated bootstrap task rather than queueing the
+   bounded history/runtime elements through the dedicated bootstrap task rather than queueing the
    whole transaction at once.
 9. Send the transaction commit marker. Events through the installed watermark are
     ignored when delayed publication effects arrive; later events queue behind the commit marker.
@@ -633,14 +633,14 @@ process-local and may restart from a lower value after server restart.
 
 Replace ad hoc broadcast and warning-specific buffering with one connection-owned
 delivery pump. Persistence, harness, and event-forwarder producers never await socket capacity; only
-the dedicated per-client bootstrap encoder may wait for its chunk capacity.
+the dedicated per-client bootstrap encoder may wait for its element capacity.
 
 | Delivery class | Admission and failure behavior |
 | --- | --- |
 | Ordered events | FIFO per subscription; overflow becomes `NeedsResync` |
 | Revisioned replacement | Keep newest by key; evict obsolete entries first |
 | Catalog invalidation | Keep one dirty key per catalog |
-| Bootstrap transaction | Flow-controlled start, chunks, and commit |
+| Bootstrap transaction | Flow-controlled start, semantic elements, and commit |
 | Barrier/control | Use reserved capacity and preserve prerequisites |
 | Direct action response | Use control reserve through delivery/failure |
 | Ephemeral signal | Evict first; never authoritative |
@@ -648,7 +648,7 @@ the dedicated per-client bootstrap encoder may wait for its chunk capacity.
 The outbox owns separate finite data capacity and reserved control capacity, each bounded by bytes
 and entries. Replacement messages and invalidations coalesce in place. Admission first removes
 obsolete replacement entries and ephemeral signals. It never evicts a direct response, required
-barrier, or bootstrap chunk which has begun transmission merely to admit ordinary data.
+barrier, or bootstrap element which has begun transmission merely to admit ordinary data.
 
 Ordered-stream overflow clears that subscription's queued suffix, records one `NeedsResync`
 transition, and schedules `ResyncRequired { thread_id, subscription_generation }` in control
@@ -656,10 +656,10 @@ capacity. It logs once with the lost sequence range and byte counts. While `Need
 further incremental events for that subscription until a new subscription generation establishes
 a baseline. The shared runtime journal continues independently and may satisfy that resubscribe.
 
-Bootstrap chunks are admitted by awaiting ordinary outbox capacity in their dedicated per-client
-task. The transaction start, chunks, and commit retain FIFO order; control priority must never let a
-commit or later incremental event overtake required chunks. Cancellation discards all unsent chunks
-for that transaction and releases its pinned suffix.
+Bootstrap elements are admitted by awaiting ordinary outbox capacity in their dedicated per-client
+task. The transaction start, elements, and commit retain FIFO order; control priority must never let
+a commit or later incremental event overtake required elements. Cancellation discards all unsent
+elements for that transaction and releases its pinned suffix.
 
 Direct action errors and resync controls consume the reserve when ordinary data is full. If only
 non-evictable control/direct entries remain and the reserve is exhausted, reject the enqueue to its
@@ -838,8 +838,8 @@ The audit found correctness issues which should not be hidden inside this alread
 change:
 
 - A command may finish after its interrupted turn was appended. The late event has no durable
-  coverage, so reconnect after disconnection can show the command as running. **This is now
-  M7**: the per-turn payload format admits the amendment without a format bump, and what
+  coverage, so reconnect after disconnection can show the command as running. **This is now M8**:
+  the per-turn payload format admits the amendment without a format bump, and what
   remains is the durable clock, the recovery path, and the reconnect rule.
 - A turn whose payload is unreadable is dropped from the returned history with an `error!` log and
   no user-visible marker. Making the omission visible needs a placeholder turn, which is a
@@ -879,9 +879,11 @@ Each milestone is one landing, reviewable on its own. Scope and non-goals are bi
 *How to use this document*.
 
 **Dependencies.** M1 depends on nothing. M3 and M4 need M2's runtime registry — M3 for the
-lifecycle state that replaces its own guard, M4 for the apply boundary it bounds. M6 needs M5's
-bootstrap as its resync target. M7 needs only M5's journal coverage token. Anything not listed here
-is ordering preference, not a constraint.
+lifecycle state that replaces its own guard, M4 for the active diff authority. M5 needs M4's lazy
+diff descriptors and M2's apply boundary before it can bound every semantic element. M6 needs M5's
+retention policies before journal byte accounting is meaningful. M7 needs M6's bootstrap as its
+resync target. M8 needs only M6's journal coverage token. Anything not listed here is ordering
+preference, not a constraint.
 
 **New behaviour lands after the primitive it depends on, never beside it.** M3 is the worked example:
 it is the bug that started this plan, and it still waits for the runtime registry, because building
@@ -904,7 +906,7 @@ page count; correlate or abort in-flight fetches when the active thread changes.
 
 Pagination is a request/response with no ordering relationship to live state, so it does not belong
 in the ordered lane, where it competes for outbox capacity and would need a subscription generation.
-Moving it out also shrinks what M5 has to reason about.
+Moving it out also shrinks what M6 has to reason about.
 
 **Non-goals.** The bootstrap transaction. Bounded reads — `load_history` already serves whole turns
 and is sufficient here; the bounded reads land with the bootstrap that needs them.
@@ -912,12 +914,12 @@ and is sufficient here; the bounded reads land with the bootstrap that needs the
 **Exit criteria.** Two protocol variants are gone. Pagination cannot be confused with bootstrap
 history. Switching threads mid-fetch cannot apply the previous thread's page.
 
-**Transitional handoff to M5.** M1 moves only older-page pagination to HTTP. Until M5 replaces the
+**Transitional handoff to M6.** M1 moves only older-page pagination to HTTP. Until M6 replaces the
 implicit bootstrap state machine, fresh subscriptions and stale-cursor recovery continue to carry
 their bounded initial history as a bootstrap-only reset `HistoryDelta`; this is not a pagination
 response. The server still obtains that history and the live snapshot through sequential reads, so
 they do not form a transactional cut. M1 deliberately preserves that pre-existing limitation rather
-than introducing a second independent HTTP/WebSocket race. M5 owns closing it with the runtime
+than introducing a second independent HTTP/WebSocket race. M6 owns closing it with the runtime
 snapshot, journal watermark, ordered suffix, and aggregate bootstrap commit described above.
 
 ---
@@ -940,8 +942,9 @@ Every client-visible agent event goes through one apply boundary. Delete `LiveBu
 `RunningTaskStore`. Make task snapshots menu-only. Add request claim/commit with one authoritative
 browser request map. Replace additive activity state with the replacement overview.
 
-**Non-goals.** The event journal and bootstrap transaction (M5). Retention limits (M4). Durable
-amendments and amendment-write recovery (M7). Changes to `giskard-persist` — **this milestone must
+**Non-goals.** Lazy diff delivery (M4). Retention limits (M5). The event journal and bootstrap
+transaction (M6). Durable amendments and amendment-write recovery (M8). Changes to
+`giskard-persist` — **this milestone must
 not touch that crate**; if it appears to need to, that is the signal to stop.
 
 Recovery from a *failed turn append* is in scope here, because it is part of the turn-completion
@@ -971,7 +974,7 @@ is untouched.
 
 Most of this milestone is harness-side and independent: `ThreadUpdateSink`, the Codex resume
 mapping, pending replay observation without a time-based deadline, and the mapper's active-turn
-gate that keeps replayed usage out of turn ledgers. Those live in crates M2 and M5 never touch.
+gate that keeps replayed usage out of turn ledgers. Those live in crates M2 and M6 never touch.
 
 The exception is the staleness guard. On the abandoned branch it was a bespoke generation/commit
 counter in `registry.rs`, hooked into `start_turn`, `compact_thread`, `forget_thread`,
@@ -995,48 +998,149 @@ lifecycle state, with no counter of its own.
 
 ---
 
-### M4 — Retention policies
+### M4 — Lazy agent-produced diffs
+
+**Why it comes first.** Diff bodies are agent-driven and can dwarf every bounded item descriptor.
+Moving them behind an explicit fetch boundary keeps the later retention policies honest and lets
+the bootstrap exchange semantic items without inventing a generic fragmentation format.
+
+This milestone concerns diffs captured from agent events: inline diffs on file-change items or
+request metadata and the structured `DiffUpdated` collection stored with a turn. The existing authenticated
+`GET /api/projects/{id}/git/diff` workspace endpoint and Git panel remain unchanged and receive
+regression coverage; they answer a different, current-worktree question.
+
+**Scope.** Replace eagerly delivered agent-produced diff bodies with bounded descriptors carrying
+the path, change kind, display metadata or statistics, availability, and a stable content identity.
+Add an authenticated
+`GET /api/projects/{project_id}/threads/{thread_id}/turns/{turn_id}/diffs/{diff_id}` read for the full
+captured diff. `DiffId` is an opaque, independent content identity; it does not encode an `ItemId`.
+An item which owns a diff carries both its ordinary item identity and a diff descriptor, while a
+turn-level `DiffUpdated` descriptor needs no invented item identity. Replacing active diff content
+creates a new `DiffId`. Resolve it from runtime state for an active turn and from the immutable
+payload for a completed turn, so a response for older active content cannot masquerade as the
+current value.
+
+On the wire, `WireFileChangeEntry.diff`, `WireFileDiff` bodies, and equivalent request metadata
+become bounded captured-diff descriptors; `WireAgentEvent::DiffUpdated` carries that descriptor.
+`WireTurn` and the existing HTTP history response use the same descriptor-only forms. The new read
+returns the tagged full representation identified by `diff_id` (unified text or structured diff).
+
+Use one logical diff-content side table per turn. While active, the runtime entry maps `DiffId` to
+immutable content and projections carry only descriptors. At commit, write descriptor references
+and their deduplicated diff-content records into the same atomic per-turn payload file; do not create
+a separately committed blob directory. Persist item association on the descriptor when one exists,
+but key lookup by `(project_id, thread_id, turn_id, diff_id)`. The persisted endpoint scans the
+selected turn payload for that `DiffId`; history projection skips content records and returns only
+descriptors.
+
+This normalized representation advances the payload format version for new writes. The reader
+continues to accept the prior inline representation: it derives a stable `DiffId` from legacy diff
+content, projects a descriptor, and serves that content through the same endpoint without rewriting
+the turn. Duplicate identical content within a turn may share one content record while retaining
+separate descriptor/item associations.
+
+Persist the full diff before releasing its runtime authority. A fetch racing turn completion may
+resolve through either authority but must return the same identified content. If an active update
+has replaced the requested `diff_id`, return a conflict carrying the current descriptor; do not
+retain an unbounded version cache. The browser retries only while the same thread/turn remains
+selected and the current descriptor still advertises that identity. A per-request selection token
+rejects late responses; M6 later adds subscription-generation gating. The endpoint reads captured
+agent output and must not recompute a workspace Git diff whose answer may already have changed.
+
+**Non-goals.** Retention policy for command, tool, text, or reasoning content. The journal,
+bootstrap transaction, and general payload-blob store. Any behavior change to workspace Git status
+or Git diff.
+
+**Exit criteria.** Opening, reconnecting to, and hydrating history for a thread transfers no full
+agent-produced diff body eagerly. Every currently advertised diff remains retrievable while active
+and after persistence, including across the completion race; a superseded active identity produces
+the explicit conflict above. Workspace Git diff continues to use its existing HTTP path.
+
+---
+
+### M5 — Retention policies
 
 **Small, and it must come before the journal** so the journal's byte bounds are meaningful from the
 first commit rather than retrofitted.
 
 **Scope.** Named, distinct policies built on the existing
-`giskard-persist::preview::bounded_preview`: durable command output, reconnect preview, task tail,
-and per-frame admission. Apply them at the runtime apply boundary M2 created. Normalize a completed
-command once, before both runtime publication and persistence consume it.
+`giskard-persist::preview::bounded_preview`: durable command output, per-item reconnect previews,
+task tail, and maximum encoded event admission. Apply them at the runtime apply boundary M2 created.
+One normalization operation produces the distinct durable, live/reconnect, and task
+representations; consumers do not independently truncate the same event.
 
-**Non-goals.** A second truncation routine — `bounded_preview` already exists with two callers.
-The journal itself.
+The durable completed-command limit is configured as
+`[retention].max_command_output_bytes`, defaults to 134217728 bytes (128 MiB), and requires a server
+restart like the existing cached configuration. Incremental command output remains authoritative
+while live, but command completion does not resend the full durable output to the browser. Bound
+command output, tool arguments and output, and accumulated text and reasoning per semantic item.
+Keep the task tail bounded. Audit every remaining field which M6 will exchange—request payloads,
+notices, metadata, user input and attachment descriptors—and either cite its existing enforced
+bound or give it a named compact representation. Every omission is explicit and includes the policy
+and omitted byte count.
+
+M5 defines, sizes, and tests the maximum encoded-event policy and applies it to current individual
+live-event publication after normalization. It does not introduce bootstrap elements, journal
+admission, or the M6 transaction. The legacy aggregate snapshot remains transitional until M6
+replaces it; it must not become the template for the new protocol.
+
+**Non-goals.** A second truncation routine — `bounded_preview` already exists with two callers. A
+per-turn allocation algorithm. Aggregate bootstrap staging limits, the journal, and the bootstrap
+transaction belong to M6.
 
 **Exit criteria.** Each policy has a name, a limit, and an explicit omission marker. Nothing
-truncates silently. One normalization pass, not one per consumer.
+truncates silently. Completed command output is normalized once into its policy-specific
+representations, persisted up to the configured durable limit, and never repeated in full in its
+WebSocket completion event.
 
 ---
 
-### M5 — Journal and transactional bootstrap
+### M6 — Journal and semantic transactional bootstrap
 
 **The largest remaining milestone. Watch it.**
 
 **Partial prerequisite complete.** Format-2 history pagination now reads the bounded index first
 and opens payload files only for the selected page or suffix. `PersistStore::load_turn_records`
-exposes the index-only projection for the eventual bootstrap builder. M5 still owns the consistent
+exposes the index-only projection for the eventual bootstrap builder. M6 still owns the consistent
 snapshot/range interface used by the transaction, the live cut and journal, subscription
-generations, chunking decision, and browser commit path.
+generations, semantic element encoding, and browser commit path.
 
 **Scope.** The shared bounded per-thread event journal with a snapshot watermark, pinned at the live
-cut. The staged `ThreadBootstrap` transaction with subscription generations, replacing the four
-browser phase flags and the split snapshot messages. Genuinely cancellable bootstrap — `handle_ws`
+cut. The staged bootstrap transaction with subscription generations, replacing the four browser
+phase flags and the split snapshot messages. Genuinely cancellable bootstrap — `handle_ws`
 currently awaits the whole subscribe operation, so cancellation needs a generation-owned task, not
 just a generation number.
 
 Consume the existing `load_turn_records` primitive and add the consistent snapshot/range reads to
 `PersistStore`. Send bounded turn records with payloads fetched separately rather than embedding
-whole turns.
+whole turns. Hydrate persisted payloads progressively over authenticated HTTP after the committed
+baseline; full diff bodies always use M4's lazy endpoint.
 
-**Decide explicitly:** with bounded records, the byte-chunked base64 encoding may no longer be
-necessary. Record the decision either way.
+**Encoding decision.** Every bootstrap uses `BootstrapStart`, independently parseable typed
+semantic element messages, and `BootstrapCommit`, even when it would fit in one frame. History
+records, live items, request states, task state, notices, and ordered suffix events carry their
+thread and server-owned subscription generation. Do not concatenate, base64-encode, or reconstruct
+a serialized whole-bootstrap blob. A semantic element which cannot meet admission must use a
+bounded descriptor plus lazy retrieval; there is no generic byte-fragment fallback.
 
-**Non-goals.** Class-aware outbox and resync (M6). Amendments (M7).
+`BootstrapStart` carries the thread, generation, history mode/cursor/`has_more`, snapshot and
+journal coverage, per-section element counts, and total staged byte/item budgets. The typed sections
+are metadata (one), history records, live items, ordered suffix events, final turn state (one), final
+running tasks with their baseline revision, final request states, and notices. Each element carries
+its section ordinal. `BootstrapCommit` repeats the thread and generation and authenticates the
+completed manifest and final represented-through watermark. Missing, duplicate, or extra elements
+make the transaction invalid; WebSocket FIFO is not used as a substitute for validation.
+
+The browser stages parsed semantic objects without changing authoritative state. It validates
+section identity, ordinals and counts, generation, and commit completeness; applies metadata,
+history, live items, ordered suffix, and final runtime in that order; and discards the transaction
+on cancellation or validation failure. Keep the old UI visible while building the replacement in a
+cancellable shadow context, yield between bounded render batches, then swap it into view once.
+Bound both individual encoded messages and total staged bytes/items. Exceeding either budget fails
+the transaction explicitly rather than partially applying or selectively hiding items.
+
+**Non-goals.** Class-aware outbox and same-socket resync (M7). Amendments (M8). Generic base64 or
+byte-sliced application messages.
 
 **Exit criteria.** An `ItemDelta` before or after the live cut appears exactly once. Completion
 before, during, and after the history read produces neither a missing nor a duplicate turn. A
@@ -1044,11 +1148,11 @@ repeated subscribe cannot deliver an old generation. The four browser phase flag
 
 ---
 
-### M6 — Class-aware outbox and same-socket resync
+### M7 — Class-aware outbox and same-socket resync
 
 **Scope.** The connection-owned delivery pump with per-class admission, coalescing replacement
 state, control reserve, and ordered-stream loss detection. Ordered overflow marks only that
-subscription `NeedsResync` and resyncs on the same socket, satisfied from M5's journal.
+subscription `NeedsResync` and resyncs on the same socket, satisfied from M6's journal.
 
 **Non-goals.** Anything in the bootstrap transaction beyond the resync entry point.
 
@@ -1058,7 +1162,7 @@ continues. No producer awaits socket capacity.
 
 ---
 
-### M7 — Late command completion (durable amendments)
+### M8 — Late command completion (durable amendments)
 
 **Its own landing, its own review.** This is a durable-format behaviour change.
 
@@ -1077,10 +1181,10 @@ time, not merely after the amendment.
 
 ---
 
-### M8 — Cleanup and budget
+### M9 — Cleanup and budget
 
 **Scope.** Remove obsolete stores, protocol variants, browser flags, tests, and documentation left
-by M2–M7. Measure the complexity budget and report it. Run unit, integration, browser E2E,
+by M2–M8. Measure the complexity budget and report it. Run unit, integration, browser E2E,
 formatting, lint, and the full workspace suite.
 
 **Exit criteria.** The measured protocol/browser counts meet the budget below.
@@ -1119,6 +1223,24 @@ formatting, lint, and the full workspace suite.
 - Retrying an append whose first result was ambiguous checks `TurnId` and cannot duplicate history.
 - Explicitly confirmed discard releases the lease and records a structured lost-turn diagnostic.
 
+### Lazy diffs and retention
+
+- Opening or reconnecting to a live or persisted turn transfers diff descriptors but no full
+  agent-produced diff bodies.
+- Full inline and structured diffs remain fetchable before and after turn completion; a fetch racing
+  an update or completion cannot return content under the wrong identity.
+- Item-owned and turn-level diffs use independent `DiffId`s without inventing or encoding an item
+  identity; identical content can share one persisted content record without merging descriptors.
+- Legacy inline-diff payloads project stable descriptors and remain fetchable without an eager
+  migration; new payloads keep descriptor references and diff-content records in one atomic file.
+- Switching threads or subscription generations during a diff fetch cannot open the stale result.
+- Workspace Git status and `GET /api/projects/{id}/git/diff` retain their existing behavior.
+- Every retention policy preserves UTF-8 boundaries, accounts for its omission marker inside the
+  limit, and reports the omitted byte count.
+- Durable completed-command output honors the configured limit; its WebSocket completion carries
+  only the bounded preview and does not repeat the full output.
+- Command, tool, text, reasoning, and task projections remain within their named per-item limits.
+
 ### Bootstrap cut
 
 - `ItemDelta` before the live cut appears exactly once.
@@ -1130,8 +1252,12 @@ formatting, lint, and the full workspace suite.
 - History append failure retains a recoverable terminal runtime snapshot.
 - Repeated subscribe/unsubscribe cannot deliver an old bootstrap generation.
 - Bootstrap failure leaves no live subscription without a baseline.
-- One-chunk and multi-chunk bootstraps use the same start/stage/commit path.
-- Bootstrap history larger than one frame is staged and becomes visible only on commit.
+- One-element and many-element bootstraps use the same start/stage/commit path.
+- Bootstrap history larger than one message is staged and becomes visible only on commit.
+- Missing, duplicate, unknown-section, over-budget, and wrong-generation elements leave the old UI
+  authoritative and discard the staged transaction.
+- A thread switch during staged or cooperative rendering cancels without leaking transcript rows,
+  request/task state, notifications, or cursor changes.
 - Oversized suffix admission fails with a thread-scoped retryable result and releases its pin.
 
 ### Tasks and history
@@ -1152,11 +1278,12 @@ formatting, lint, and the full workspace suite.
 - Writer exit cancels the receive side; intentional final errors receive a bounded drain.
 - Control reserve exhaustion is reported and closes only the unhealthy connection after a bounded
   drain.
-- A bootstrap commit cannot overtake any required chunk or ordered suffix.
+- A bootstrap commit cannot overtake any required element or ordered suffix.
 
 ### Browser and protocol
 
-- Full and incremental aggregate bootstraps remove the old phase flags and render exactly once.
+- Full-page, delta, and cursor-reset semantic transactions remove the old phase flags and render
+  exactly once.
 - Pagination responses cannot be interpreted as bootstrap history.
 - Two pending requests render one waiting state with both identities.
 - The embedded browser and server use the one current protocol shape without compatibility paths.
@@ -1170,8 +1297,10 @@ Update together:
 - `specs/giskard-specification.md`: first move the authorities/clocks table into §13 and require
   every new client-visible state to name its authority, clock, and overflow class; then document
   aggregate bootstrap, request state, replacement overview, and backpressure;
-- `docs/api-endpoints.md`: changed WebSocket shapes, resync, and ordering;
-- `README.md`: user-visible reconnect/context-window behavior and any storage-layout change;
+- `docs/api-endpoints.md`: the lazy captured-diff read, descriptor-only history response fields,
+  and changed WebSocket shapes, resync, and ordering;
+- `README.md`, `config.example.toml`, and the specification's configuration appendix: the retention
+  key/default, user-visible reconnect/context-window behavior, and any storage-layout change;
 - `crates/giskard-harness-codex/README.md`: only if adapter lifecycle or routing semantics change.
 
 The specification's current instruction to coalesce deltas by keeping the latest is invalid for
@@ -1188,12 +1317,12 @@ Measured on `main` at `6907fd0`:
   **36** places.
 - `giskard-proto/src/lib.rs` and `static/app.js` together contain **10,664** physical lines.
 
-The target after M5 is zero of those four flags, one staged bootstrap transaction and one browser
+The target after M6 is zero of those four flags, one staged bootstrap transaction and one browser
 apply path, no more than 13 `ServerMessage` variants, and no positive net line growth across those
 two files. If a count cannot meet the target, stop and review the design rather than replacing the
 criterion with a qualitative claim.
 
-This is an end-state criterion. Intermediate milestones neither satisfy nor fail it; M5 reports it.
+This is an end-state criterion. Intermediate milestones neither satisfy nor fail it; M6 reports it.
 
 ## Exit criteria
 
