@@ -29,7 +29,7 @@ pub use ids::{ApprovalId, DiffId, ItemId, ProjectId, ServerRequestId, ThreadId, 
 pub use item::{
     CommandOutputDescriptor, FileChangeKind, Item, ItemDelta, ItemKind, ItemPayload, ItemStart,
     NormalizedCommandOutput, SubagentAction, SubagentLink, SubagentStatus,
-    command_output_logical_lines, command_output_tail_preview,
+    command_output_logical_lines, command_output_tail_preview, resolve_command_output_counts,
 };
 pub use mcp::{
     McpAuthStatus, McpOauthStart, McpResource, McpResourceTemplate, McpServerInfo, McpServerStatus,

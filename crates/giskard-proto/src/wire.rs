@@ -531,14 +531,12 @@ impl From<ItemPayload> for WireItemPayload {
                 let output_available = status
                     .as_deref()
                     .is_none_or(|value| !giskard_core::item::command_status_is_running(value));
-                let original_bytes = output_truncated
-                    .then_some(output_original_bytes)
-                    .flatten()
-                    .unwrap_or(output.len() as u64);
-                let original_lines = output_truncated
-                    .then_some(output_original_lines)
-                    .flatten()
-                    .unwrap_or_else(|| giskard_core::command_output_logical_lines(&output));
+                let (original_bytes, original_lines) = giskard_core::resolve_command_output_counts(
+                    &output,
+                    output_truncated,
+                    output_original_bytes,
+                    output_original_lines,
+                );
                 Self::CommandExecution {
                     command,
                     cwd: path_to_wire(&cwd),

@@ -7,7 +7,7 @@ use giskard_core::approval::ApprovalDecision;
 use giskard_core::approval::ApprovalRequest;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, ThreadId, TurnId};
-use giskard_core::item::{ItemDelta, ItemPayload};
+use giskard_core::item::{CommandOutputDescriptor, ItemDelta, ItemPayload};
 #[cfg(test)]
 use giskard_core::server_request::ServerRequest;
 use giskard_core::user_input::UserInput;
@@ -23,6 +23,7 @@ struct LiveTurn {
     turn_id: TurnId,
     user_input: Option<UserInput>,
     events: Vec<AgentEvent>,
+    command_output_descriptors: HashMap<ItemId, CommandOutputDescriptor>,
     /// Approvals the user answered during this turn, and the decision they made. Resolution is not
     /// otherwise recorded in `events` (there is no harness-emitted approval-resolved event), so
     /// without this the reconnect snapshot would replay every answered approval as still pending.
@@ -74,6 +75,7 @@ impl LiveTurnState {
             turn_id,
             user_input,
             events: Vec::new(),
+            command_output_descriptors: HashMap::new(),
             resolved_approvals: HashMap::new(),
             resolved_server_requests: HashSet::new(),
         });
@@ -95,6 +97,7 @@ impl LiveTurnState {
                     turn_id,
                     user_input,
                     events: Vec::new(),
+                    command_output_descriptors: HashMap::new(),
                     resolved_approvals: HashMap::new(),
                     resolved_server_requests: HashSet::new(),
                 });
@@ -111,6 +114,15 @@ impl LiveTurnState {
     }
 
     pub fn append(&mut self, thread_id: ThreadId, event: AgentEvent) {
+        self.append_with_command_output(thread_id, event, None);
+    }
+
+    pub fn append_with_command_output(
+        &mut self,
+        thread_id: ThreadId,
+        mut event: AgentEvent,
+        command_output: Option<CommandOutputDescriptor>,
+    ) {
         if self.thread_id == Some(thread_id)
             && let Some(turn) = self.turn.as_mut()
         {
@@ -119,6 +131,37 @@ impl LiveTurnState {
             }
             if let Some(item_id) = completed_command_item_id(&event) {
                 remove_command_output_deltas(&mut turn.events, item_id);
+                remove_completed_command_events(&mut turn.events, item_id);
+                turn.command_output_descriptors.remove(&item_id);
+                if let Some(descriptor) = command_output {
+                    turn.command_output_descriptors
+                        .insert(item_id, descriptor.clone());
+                    if let AgentEvent::ItemCompleted { item, .. } = &mut event
+                        && let ItemPayload::CommandExecution { output, .. } = &mut item.payload
+                    {
+                        *output = descriptor.preview;
+                    }
+                } else if let AgentEvent::ItemCompleted { item, .. } = &mut event
+                    && let ItemPayload::CommandExecution {
+                        output,
+                        output_truncated,
+                        output_original_bytes,
+                        output_original_lines,
+                        ..
+                    } = &mut item.payload
+                {
+                    // Invalid truncation metadata makes the completed output unusable. Do not keep
+                    // its potentially large payload in reconnect state or let a descriptor from an
+                    // earlier completion of the same item leak into this replacement.
+                    output.clear();
+                    *output_truncated = false;
+                    *output_original_bytes = None;
+                    *output_original_lines = None;
+                    turn.command_output_descriptors.insert(
+                        item_id,
+                        CommandOutputDescriptor::from_durable("", false, 0, 0, false),
+                    );
+                }
             }
             let command_delta_item = command_output_item_id(&event);
             turn.events.push(event);
@@ -210,7 +253,23 @@ impl LiveTurnState {
                     .events
                     .iter()
                     .cloned()
-                    .filter_map(WireAgentEvent::from_agent_event)
+                    .filter_map(|event| match event {
+                        AgentEvent::ItemCompleted {
+                            thread,
+                            turn: turn_id,
+                            item,
+                        } => {
+                            let descriptor = turn.command_output_descriptors.get(&item.id).cloned();
+                            Some(WireAgentEvent::ItemCompleted {
+                                thread,
+                                turn: turn_id,
+                                item: giskard_proto::WireItem::from_item_with_command_output(
+                                    item, descriptor,
+                                ),
+                            })
+                        }
+                        event => WireAgentEvent::from_agent_event(event),
+                    })
                     .collect();
                 // Answered requests still ride along in `accumulated` as `ServerRequestReceived`, and
                 // replaying that renders an actionable card. Naming them lets the client render those
@@ -355,6 +414,10 @@ fn command_output_item_id(event: &AgentEvent) -> Option<ItemId> {
 
 fn remove_command_output_deltas(events: &mut Vec<AgentEvent>, item_id: ItemId) {
     events.retain(|event| command_output_item_id(event) != Some(item_id));
+}
+
+fn remove_completed_command_events(events: &mut Vec<AgentEvent>, item_id: ItemId) {
+    events.retain(|event| completed_command_item_id(event) != Some(item_id));
 }
 
 fn compact_command_output_deltas(events: &mut Vec<AgentEvent>, item_id: ItemId) {
@@ -634,7 +697,15 @@ mod tests {
         );
 
         store.start_turn(thread);
-        store.append(
+        let descriptor = CommandOutputDescriptor::from_durable(
+            &output,
+            false,
+            output.len() as u64,
+            giskard_core::command_output_logical_lines(&output),
+            true,
+        );
+        let original_bytes = output.len() as u64;
+        store.append_with_command_output(
             thread,
             AgentEvent::ItemCompleted {
                 thread,
@@ -657,7 +728,22 @@ mod tests {
                     created_at: Utc::now(),
                 },
             },
+            Some(descriptor),
         );
+
+        let retained_output = store
+            .turn
+            .as_ref()
+            .and_then(|turn| turn.events.last())
+            .and_then(|event| match event {
+                AgentEvent::ItemCompleted { item, .. } => match &item.payload {
+                    ItemPayload::CommandExecution { output, .. } => Some(output),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("bounded completed output");
+        assert!(retained_output.len() <= CommandOutputDescriptor::PREVIEW_MAX_BYTES);
 
         let snapshot = store.snapshot(thread).expect("snapshot");
         let completed = snapshot.accumulated.iter().find_map(|event| {
@@ -675,6 +761,95 @@ mod tests {
         assert!(!output.preview.contains("head\n"));
         assert!(output.preview.len() <= giskard_persist::COMMAND_OUTPUT_PREVIEW_MAX_BYTES);
         assert!(output.preview.ends_with("\ntail"));
+        assert_eq!(output.original_bytes, original_bytes);
+        assert_eq!(output.durable_bytes, original_bytes);
+    }
+
+    #[tokio::test]
+    async fn rejected_command_output_replaces_stale_descriptor_with_unavailable_snapshot() {
+        let mut store = LiveTurnState::new();
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let item_id = ItemId::new();
+        store.start_turn(thread);
+
+        let completed =
+            |output: String, output_truncated, output_original_lines| AgentEvent::ItemCompleted {
+                thread,
+                turn,
+                item: Item {
+                    id: item_id,
+                    harness_item_id: "cmd_1".into(),
+                    payload: ItemPayload::CommandExecution {
+                        command: "yes".into(),
+                        cwd: "/tmp/project".into(),
+                        output,
+                        output_truncated,
+                        output_original_bytes: output_truncated.then_some(100_000),
+                        output_original_lines,
+                        exit_code: Some(0),
+                        status: Some("completed".into()),
+                        process_id: Some("proc_1".into()),
+                        duration_ms: Some(500),
+                    },
+                    created_at: Utc::now(),
+                },
+            };
+
+        let first_output = "first output".to_owned();
+        let first_descriptor = CommandOutputDescriptor::from_durable(
+            &first_output,
+            false,
+            first_output.len() as u64,
+            1,
+            true,
+        );
+        store.append_with_command_output(
+            thread,
+            completed(first_output, false, None),
+            Some(first_descriptor),
+        );
+        store.append_with_command_output(
+            thread,
+            completed("x".repeat(MAX_LIVE_COMMAND_OUTPUT * 4), true, None),
+            None,
+        );
+
+        let turn_state = store.turn.as_ref().expect("live turn");
+        let retained = turn_state
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ItemCompleted { item, .. } if item.id == item_id => {
+                    let ItemPayload::CommandExecution { output, .. } = &item.payload else {
+                        return None;
+                    };
+                    Some(output)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retained, vec![""]);
+
+        let snapshot = store.snapshot(thread).expect("snapshot");
+        let outputs = snapshot
+            .accumulated
+            .iter()
+            .filter_map(|event| {
+                let WireAgentEvent::ItemCompleted { item, .. } = event else {
+                    return None;
+                };
+                let WireItemPayload::CommandExecution { output, .. } = &item.payload else {
+                    return None;
+                };
+                Some(output)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].preview, "");
+        assert_eq!(outputs[0].durable_bytes, 0);
+        assert_eq!(outputs[0].original_bytes, 0);
+        assert!(!outputs[0].output_available);
     }
 
     #[tokio::test]

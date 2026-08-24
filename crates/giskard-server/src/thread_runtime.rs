@@ -59,6 +59,14 @@ pub(crate) struct RuntimeCommandOutput {
     pub version: String,
 }
 
+pub(crate) struct PreparedCommandOutput {
+    turn_id: TurnId,
+    item_id: ItemId,
+    runtime: Option<RuntimeCommandOutput>,
+    descriptor: Option<giskard_core::CommandOutputDescriptor>,
+    live_event: Option<AgentEvent>,
+}
+
 pub(crate) enum RuntimeCommandOutputLookup {
     Found(RuntimeCommandOutput),
     Missing,
@@ -258,6 +266,20 @@ impl ThreadRuntimeRegistry {
         event
     }
 
+    /// Normalize and fully project command output before the event enters locked runtime state.
+    pub(crate) fn prepare_command_output(
+        &self,
+        event: AgentEvent,
+    ) -> (AgentEvent, Option<PreparedCommandOutput>) {
+        let event = self.normalize_command_output(event);
+        let prepared = prepare_normalized_command_output(&event);
+        (event, prepared)
+    }
+
+    fn prepare_existing_command_output(&self, event: &AgentEvent) -> Option<PreparedCommandOutput> {
+        prepare_normalized_command_output(event)
+    }
+
     /// Extract full diff bodies before an event reaches reconnect state or browser projection.
     pub(crate) fn capture_event_diffs(
         &self,
@@ -413,6 +435,19 @@ impl ThreadRuntimeRegistry {
 
     pub(crate) fn restoration_permit(&self, thread_id: ThreadId) -> RestorePermit {
         let entry = self.entry_or_create(thread_id);
+        self.permit_for_entry(thread_id, entry)
+    }
+
+    pub(crate) fn event_application_permit(&self, thread_id: ThreadId) -> Option<RestorePermit> {
+        let entry = self.existing_entry(thread_id)?;
+        Some(self.permit_for_entry(thread_id, entry))
+    }
+
+    fn permit_for_entry(
+        &self,
+        thread_id: ThreadId,
+        entry: Arc<Mutex<ThreadRuntimeEntry>>,
+    ) -> RestorePermit {
         let revision = lock_unpoison(&entry, "thread runtime entry").lifecycle_revision;
         RestorePermit {
             thread_id,
@@ -602,11 +637,87 @@ impl ThreadRuntimeRegistry {
             );
             return AppliedRuntimeEvent::unchanged();
         }
+        let prepared_output = self.prepare_existing_command_output(event);
+        self.apply_prepared_event(thread_id, event, append_live, prepared_output)
+    }
+
+    pub(crate) fn apply_prepared_event(
+        &self,
+        thread_id: ThreadId,
+        event: &AgentEvent,
+        append_live: bool,
+        prepared_output: Option<PreparedCommandOutput>,
+    ) -> AppliedRuntimeEvent {
+        if event.thread_id() != thread_id {
+            return self.apply_event(thread_id, event, append_live);
+        }
         let entry = self.entry_or_create(thread_id);
         let mut entry = lock_unpoison(&entry, "thread runtime entry");
-        let mut applied = self.apply_event_locked(thread_id, event, append_live, &mut entry);
+        self.apply_prepared_event_to_entry(
+            thread_id,
+            event,
+            append_live,
+            prepared_output,
+            &mut entry,
+        )
+    }
+
+    pub(crate) fn apply_prepared_event_if_current(
+        &self,
+        permit: &RestorePermit,
+        event: &AgentEvent,
+        append_live: bool,
+        prepared_output: Option<PreparedCommandOutput>,
+    ) -> Option<AppliedRuntimeEvent> {
+        if event.thread_id() != permit.thread_id {
+            return None;
+        }
+        let expected = permit.entry.upgrade()?;
+        // Keep the registry locked until application completes. Retirement therefore either wins
+        // before this check, or removes the fully-applied entry afterward; it cannot be followed by
+        // stale prepared work recreating authority.
+        let entries = lock_unpoison(&self.entries, "thread runtime entry registry");
+        let current = entries.get(&permit.thread_id)?;
+        if !Arc::ptr_eq(&expected, current) {
+            return None;
+        }
+        let mut entry = lock_unpoison(current, "thread runtime entry");
+        if entry.lifecycle_revision != permit.lifecycle_revision {
+            return None;
+        }
+        Some(self.apply_prepared_event_to_entry(
+            permit.thread_id,
+            event,
+            append_live,
+            prepared_output,
+            &mut entry,
+        ))
+    }
+
+    fn apply_prepared_event_to_entry(
+        &self,
+        thread_id: ThreadId,
+        event: &AgentEvent,
+        append_live: bool,
+        mut prepared_output: Option<PreparedCommandOutput>,
+        entry: &mut ThreadRuntimeEntry,
+    ) -> AppliedRuntimeEvent {
+        let live_descriptor = prepared_output
+            .as_ref()
+            .and_then(|prepared| prepared.descriptor.clone());
+        let live_event = prepared_output
+            .as_mut()
+            .and_then(|prepared| prepared.live_event.take());
+        let mut applied = self.apply_event_locked(thread_id, event, false, prepared_output, entry);
+        if append_live && entry.live.is_active(thread_id) {
+            entry.live.append_with_command_output(
+                thread_id,
+                live_event.unwrap_or_else(|| event.clone()),
+                live_descriptor,
+            );
+        }
         if applied.overview_refresh_needed {
-            applied.overview_if_changed = self.refresh_overview(thread_id, &entry);
+            applied.overview_if_changed = self.refresh_overview(thread_id, entry);
         }
         applied
     }
@@ -616,6 +727,7 @@ impl ThreadRuntimeRegistry {
         thread_id: ThreadId,
         event: &AgentEvent,
         append_live: bool,
+        prepared_output: Option<PreparedCommandOutput>,
         entry: &mut ThreadRuntimeEntry,
     ) -> AppliedRuntimeEvent {
         let sequence = (!matches!(
@@ -657,7 +769,11 @@ impl ThreadRuntimeRegistry {
             _ => (None, false),
         };
         if let AgentEvent::ItemCompleted { turn, item, .. } = event {
-            update_command_output_authority(entry, *turn, item);
+            if let Some(prepared) = prepared_output {
+                update_prepared_command_output_authority(entry, prepared);
+            } else {
+                update_command_output_authority(entry, *turn, item);
+            }
         }
         let tasks_changed = entry.tasks.apply_event(event);
         if tasks_changed {
@@ -698,7 +814,7 @@ impl ThreadRuntimeRegistry {
     ) -> AppliedRuntimeEvent {
         let entry = self.entry_or_create(thread_id);
         let mut entry = lock_unpoison(&entry, "thread runtime entry");
-        let mut applied = self.apply_event_locked(thread_id, event, true, &mut entry);
+        let mut applied = self.apply_event_locked(thread_id, event, true, None, &mut entry);
         match persisted_turn {
             None => {
                 entry.live.clear_turn(thread_id);
@@ -1103,6 +1219,81 @@ fn update_command_output_authority(entry: &mut ThreadRuntimeEntry, turn_id: Turn
             version: command_output_version(output),
         },
     );
+}
+
+fn prepare_normalized_command_output(event: &AgentEvent) -> Option<PreparedCommandOutput> {
+    let AgentEvent::ItemCompleted { turn, item, .. } = event else {
+        return None;
+    };
+    let ItemPayload::CommandExecution {
+        output,
+        output_truncated,
+        output_original_bytes,
+        output_original_lines,
+        status,
+        ..
+    } = &item.payload
+    else {
+        return None;
+    };
+    let descriptor = giskard_persist::command_output_descriptor(
+        output,
+        *output_truncated,
+        *output_original_bytes,
+        *output_original_lines,
+        true,
+    );
+    let (runtime, descriptor) = match descriptor {
+        Ok(descriptor) => {
+            let runtime = (!status.as_deref().is_some_and(command_status_is_running)).then(|| {
+                RuntimeCommandOutput {
+                    output: output.clone(),
+                    output_truncated: *output_truncated,
+                    original_bytes: descriptor.original_bytes,
+                    original_lines: descriptor.original_lines,
+                    version: command_output_version(output),
+                }
+            });
+            (runtime, Some(descriptor))
+        }
+        Err(_) => (None, None),
+    };
+    let mut live_event = event.clone();
+    if let (Some(descriptor), AgentEvent::ItemCompleted { item, .. }) =
+        (&descriptor, &mut live_event)
+        && let ItemPayload::CommandExecution { output, .. } = &mut item.payload
+    {
+        *output = descriptor.preview.clone();
+    }
+    Some(PreparedCommandOutput {
+        turn_id: *turn,
+        item_id: item.id,
+        runtime,
+        descriptor,
+        live_event: Some(live_event),
+    })
+}
+
+fn update_prepared_command_output_authority(
+    entry: &mut ThreadRuntimeEntry,
+    prepared: PreparedCommandOutput,
+) {
+    let key = (prepared.turn_id, prepared.item_id);
+    match prepared.runtime {
+        Some(runtime) => {
+            entry.command_outputs.insert(key, runtime);
+        }
+        None => {
+            if prepared.descriptor.is_none() {
+                tracing::error!(
+                    turn_id = %prepared.turn_id,
+                    item_id = %prepared.item_id,
+                    "completed command output has inconsistent truncation metadata"
+                );
+            }
+            entry.command_outputs.remove(&key);
+        }
+    }
 }
 
 pub(crate) fn command_output_version(output: &str) -> String {
@@ -2352,6 +2543,108 @@ mod tests {
             },
             None,
         );
+        assert!(matches!(
+            runtime.command_output(thread, turn, item_id),
+            RuntimeCommandOutputLookup::Missing
+        ));
+    }
+
+    #[test]
+    fn inconsistent_truncated_command_metadata_is_not_installed() {
+        let runtime = ThreadRuntimeRegistry::new();
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let item_id = ItemId::new();
+        let event = AgentEvent::ItemCompleted {
+            thread,
+            turn,
+            item: Item {
+                id: item_id,
+                harness_item_id: "bad-command".into(),
+                payload: ItemPayload::CommandExecution {
+                    command: "bad-output".into(),
+                    cwd: "/tmp".into(),
+                    output: "retained".into(),
+                    output_truncated: true,
+                    output_original_bytes: Some(100),
+                    output_original_lines: None,
+                    exit_code: Some(0),
+                    status: Some("completed".into()),
+                    process_id: None,
+                    duration_ms: None,
+                },
+                created_at: Utc::now(),
+            },
+        };
+
+        let mut valid_event = event.clone();
+        let AgentEvent::ItemCompleted { item, .. } = &mut valid_event else {
+            panic!("expected completed item");
+        };
+        let ItemPayload::CommandExecution {
+            output_truncated,
+            output_original_bytes,
+            output_original_lines,
+            ..
+        } = &mut item.payload
+        else {
+            panic!("expected command payload");
+        };
+        *output_truncated = false;
+        *output_original_bytes = None;
+        *output_original_lines = None;
+        runtime.apply_event(thread, &valid_event, true);
+        assert!(matches!(
+            runtime.command_output(thread, turn, item_id),
+            RuntimeCommandOutputLookup::Found(_)
+        ));
+
+        runtime.apply_event(thread, &event, true);
+
+        assert!(matches!(
+            runtime.command_output(thread, turn, item_id),
+            RuntimeCommandOutputLookup::Missing
+        ));
+    }
+
+    #[test]
+    fn stale_prepared_command_cannot_recreate_forgotten_authority() {
+        let runtime = ThreadRuntimeRegistry::new();
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let item_id = ItemId::new();
+        let permit = runtime.restoration_permit(thread);
+        let event = AgentEvent::ItemCompleted {
+            thread,
+            turn,
+            item: Item {
+                id: item_id,
+                harness_item_id: "late-command".into(),
+                payload: ItemPayload::CommandExecution {
+                    command: "printf late".into(),
+                    cwd: "/tmp".into(),
+                    output: "late output".into(),
+                    output_truncated: false,
+                    output_original_bytes: None,
+                    output_original_lines: None,
+                    exit_code: Some(0),
+                    status: Some("completed".into()),
+                    process_id: None,
+                    duration_ms: None,
+                },
+                created_at: Utc::now(),
+            },
+        };
+        let (event, prepared) = runtime.prepare_command_output(event);
+
+        runtime.forget_threads(&std::collections::HashSet::from([thread]));
+
+        assert!(
+            runtime
+                .apply_prepared_event_if_current(&permit, &event, true, prepared)
+                .is_none()
+        );
+        assert!(runtime.existing_entry(thread).is_none());
         assert!(matches!(
             runtime.command_output(thread, turn, item_id),
             RuntimeCommandOutputLookup::Missing

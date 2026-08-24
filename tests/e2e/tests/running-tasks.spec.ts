@@ -190,11 +190,14 @@ test("completed command output is fetched only when its overlay opens", async ({
   const outputEtag = '"sha256_1111111111111111111111111111111111111111111111111111111111111111"';
   let reads = 0;
   let linkReads = 0;
+  let linkRequest: { method: string; postData: string | null; outputMatch?: string } | undefined;
   await page.route("**/items/command-lazy-1/command-output-links", async route => {
     linkReads++;
-    expect(route.request().method()).toBe("GET");
-    expect(route.request().postData()).toBeNull();
-    expect(route.request().headers()["if-output-match"]).toBe(outputEtag);
+    linkRequest = {
+      method: route.request().method(),
+      postData: route.request().postData(),
+      outputMatch: route.request().headers()["if-output-match"],
+    };
     await route.fulfill({ status:200, contentType:"application/json", body:'{"links":[]}' });
   });
   await page.route("**/items/command-lazy-1/command-output", async route => {
@@ -211,11 +214,7 @@ test("completed command output is fetched only when its overlay opens", async ({
       body: "full retained output\nsecond line",
     });
   });
-  await login(page);
-  await page.locator(".proj", { hasText: "Demo" }).locator(".project-add").click();
-  await page.locator("#input").fill("Create a command-output test thread.");
-  await page.locator("#sendBtn").click();
-  await expect(page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY })).toBeVisible();
+  await openCommandOutputTestThread(page);
 
   await page.evaluate(() => {
     const app = window as unknown as {
@@ -255,6 +254,7 @@ test("completed command output is fetched only when its overlay opens", async ({
   await expect(page.locator("#codeView")).toContainText("full retained output");
   expect(reads).toBe(1);
   await expect.poll(() => linkReads).toBe(1);
+  expect(linkRequest).toEqual({ method: "GET", postData: null, outputMatch: outputEtag });
 
   await page.locator("#codeClose").click();
   await expect(page.locator("#codeView")).toBeEmpty();
@@ -378,9 +378,10 @@ test("late clipboard completion does not relabel a different overlay", async ({ 
 test("stale command output linkification falls back to plain text without retrying", async ({ page }) => {
   const staleEtag = '"sha256_2222222222222222222222222222222222222222222222222222222222222222"';
   let linkReads = 0;
+  let outputMatch: string | undefined;
   await page.route("**/items/command-stale-links/command-output-links", async route => {
     linkReads++;
-    expect(route.request().headers()["if-output-match"]).toBe(staleEtag);
+    outputMatch = route.request().headers()["if-output-match"];
     await route.fulfill({ status: 412, contentType: "text/plain", body: "command output changed" });
   });
   await page.route("**/items/command-stale-links/command-output", async route => {
@@ -401,6 +402,7 @@ test("stale command output linkification falls back to plain text without retryi
   await expect(output).toHaveText("src/stale.rs:12 remains readable");
   await expect(output.locator(".path-link")).toHaveCount(0);
   await expect.poll(() => linkReads).toBe(1);
+  expect(outputMatch).toBe(staleEtag);
   await page.waitForTimeout(100);
   expect(linkReads).toBe(1);
 });
