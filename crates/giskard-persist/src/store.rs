@@ -396,27 +396,48 @@ async fn assemble_turns(
     index_data: &str,
 ) -> Result<Vec<Turn>, PersistError> {
     let records = history::parse_history_index(index_path, index_data)?;
+    Ok(assemble_turn_records(paths, records).await)
+}
+
+/// Reassemble only the selected index records from their payload files.
+///
+/// Selection happens before this function is called. Keeping that boundary explicit prevents a
+/// bounded display read from accidentally regressing into opening every agent-driven payload in a
+/// thread before slicing the result.
+async fn assemble_turn_records(paths: &ThreadPaths, records: Vec<TurnRecord>) -> Vec<Turn> {
     let mut turns = Vec::with_capacity(records.len());
     for record in records {
-        let payload_path = paths.turn_payload(record.turn_id);
-        match history::read_turn_payload(&payload_path).await {
-            Ok(Some(payload)) => turns.push(record.into_turn(payload, &payload_path)),
-            Ok(None) => tracing::error!(
+        if let Some(turn) = assemble_turn_record(paths, record).await {
+            turns.push(turn);
+        }
+    }
+    turns
+}
+
+async fn assemble_turn_record(paths: &ThreadPaths, record: TurnRecord) -> Option<Turn> {
+    let payload_path = paths.turn_payload(record.turn_id);
+    match history::read_turn_payload(&payload_path).await {
+        Ok(Some(payload)) => Some(record.into_turn(payload, &payload_path)),
+        Ok(None) => {
+            tracing::error!(
                 path = %payload_path.display(),
                 turn_id = %record.turn_id,
                 action = "load_turn_payload",
                 "turn payload file is missing; skipping the turn and keeping the rest of the thread"
-            ),
-            Err(error) => tracing::error!(
+            );
+            None
+        }
+        Err(error) => {
+            tracing::error!(
                 path = %payload_path.display(),
                 turn_id = %record.turn_id,
                 %error,
                 action = "load_turn_payload",
                 "unreadable turn payload; skipping the turn and keeping the rest of the thread"
-            ),
+            );
+            None
         }
     }
-    Ok(turns)
 }
 
 async fn remove_dir_all_if_present(path: &Path) -> Result<(), PersistError> {
@@ -1323,6 +1344,7 @@ impl PersistStore {
         project: ProjectId,
         thread: ThreadId,
     ) -> Result<Vec<TurnRecord>, PersistError> {
+        let started_at = std::time::Instant::now();
         let paths = self.thread_paths(project, thread).await;
         let path = paths.history();
         let data = match tokio::fs::read_to_string(&path).await {
@@ -1330,13 +1352,86 @@ impl PersistStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
             Err(e) => return Err(PersistError::Io(e.to_string())),
         };
-        match paths.layout() {
+        let records = match paths.layout() {
             ThreadLayout::Directory => history::parse_history_index(&path, &data),
             ThreadLayout::Flat => Ok(parse_turn_history(&path, &data)?
                 .iter()
                 .map(TurnRecord::from_turn)
                 .collect()),
+        }?;
+        tracing::debug!(
+            %project,
+            %thread,
+            action = "load_turn_records",
+            records = records.len(),
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "loaded bounded history index"
+        );
+        Ok(records)
+    }
+
+    /// Load the bounded history index without opening any per-turn payload files.
+    ///
+    /// This is an index snapshot from one read, not the consistency boundary for M5's transaction:
+    /// that milestone still owns the history snapshot/range API and its relationship to a live cut.
+    ///
+    /// M5's transactional bootstrap will take ranges from this projection and fetch only their
+    /// corresponding payloads. Exposing the primitive now also keeps ordinary pagination bounded
+    /// on cold reads.
+    pub async fn load_turn_records(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+    ) -> Result<Vec<TurnRecord>, PersistError> {
+        self.ensure_migrated(project, thread).await;
+        self.load_turn_records_unlocked(project, thread).await
+    }
+
+    /// Load up to `limit` readable turns ending before `end`, backfilling across isolated damaged
+    /// payloads so a page cannot be empty while older readable history is stranded behind it.
+    async fn load_history_page_records(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+        records: &[TurnRecord],
+        end: usize,
+        limit: usize,
+    ) -> (Vec<Turn>, usize, bool) {
+        let paths = self.thread_paths(project, thread).await;
+        let mut turns = Vec::with_capacity(limit.min(end));
+        let mut cursor = end;
+        let mut attempted_records = 0;
+        while cursor > 0 && turns.len() < limit {
+            cursor -= 1;
+            attempted_records += 1;
+            if let Some(turn) = assemble_turn_record(&paths, records[cursor].clone()).await {
+                turns.push(turn);
+            }
         }
+        turns.reverse();
+        (turns, attempted_records, cursor > 0)
+    }
+
+    async fn load_selected_turn_records(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+        records: Vec<TurnRecord>,
+    ) -> Vec<Turn> {
+        let started_at = std::time::Instant::now();
+        let selected_records = records.len();
+        let paths = self.thread_paths(project, thread).await;
+        let turns = assemble_turn_records(&paths, records).await;
+        tracing::debug!(
+            %project,
+            %thread,
+            action = "load_selected_turn_payloads",
+            selected_records,
+            returned_turns = turns.len(),
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "loaded selected turn payloads"
+        );
+        turns
     }
 
     /// Load every persisted turn from the JSONL history, in order (H4).
@@ -1376,6 +1471,33 @@ impl PersistStore {
         limit: usize,
     ) -> Result<(Vec<Turn>, bool), PersistError> {
         self.ensure_migrated(project, thread).await;
+        let paths = self.thread_paths(project, thread).await;
+        if paths.layout() == ThreadLayout::Directory {
+            let started_at = std::time::Instant::now();
+            let records = self.load_turn_records_unlocked(project, thread).await?;
+            let total_records = records.len();
+            let end = match before {
+                Some(cursor) => records
+                    .iter()
+                    .position(|record| record.turn_id == cursor)
+                    .unwrap_or(records.len()),
+                None => records.len(),
+            };
+            let (turns, attempted_records, has_more) = self
+                .load_history_page_records(project, thread, &records, end, limit)
+                .await;
+            tracing::debug!(
+                %project,
+                %thread,
+                action = "load_history_page",
+                total_records,
+                attempted_records,
+                returned_turns = turns.len(),
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "loaded bounded history page"
+            );
+            return Ok((turns, has_more));
+        }
         let Some(entry) = self.current_history_cache_entry(project, thread).await? else {
             return Ok((vec![], false));
         };
@@ -1399,6 +1521,41 @@ impl PersistStore {
         after: TurnId,
     ) -> Result<Option<Vec<Turn>>, PersistError> {
         self.ensure_migrated(project, thread).await;
+        let paths = self.thread_paths(project, thread).await;
+        if paths.layout() == ThreadLayout::Directory {
+            let started_at = std::time::Instant::now();
+            let records = self.load_turn_records_unlocked(project, thread).await?;
+            let total_records = records.len();
+            let Some(index) = records.iter().position(|record| record.turn_id == after) else {
+                tracing::debug!(
+                    %project,
+                    %thread,
+                    %after,
+                    action = "load_turns_after",
+                    total_records,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    "history cursor was not found"
+                );
+                return Ok(None);
+            };
+            let selected = records[index + 1..].to_vec();
+            let selected_records = selected.len();
+            let turns = self
+                .load_selected_turn_records(project, thread, selected)
+                .await;
+            tracing::debug!(
+                %project,
+                %thread,
+                %after,
+                action = "load_turns_after",
+                total_records,
+                selected_records,
+                returned_turns = turns.len(),
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "loaded selected history suffix"
+            );
+            return Ok(Some(turns));
+        }
         let Some(entry) = self.current_history_cache_entry(project, thread).await? else {
             return Ok(None);
         };
@@ -2826,12 +2983,58 @@ mod tests {
             store.append_turn(pid, tid, &t).await.unwrap();
         }
 
+        // A reconnect suffix must select records before opening payloads just like a tail page.
+        // Damage before the cursor is unrelated to the requested suffix and must remain untouched.
+        let paths = store.current_thread_paths(pid, tid);
+        let unselected_payload = paths.turn_payload(ids[0]);
+        tokio::fs::write(&unselected_payload, "{ definitely not json")
+            .await
+            .unwrap();
+
         // After a middle turn → the turns strictly after it, oldest-first.
         let after = store.load_turns_after(pid, tid, ids[1]).await.unwrap();
         assert_eq!(
             after.map(|turns| turns.iter().map(|t| t.id).collect::<Vec<_>>()),
             Some(vec![ids[2], ids[3]])
         );
+        assert!(
+            unselected_payload.exists(),
+            "a payload before the reconnect cursor must not be opened or quarantined"
+        );
+
+        // Damage inside the requested suffix fails that turn alone. Later readable turns still
+        // reconnect, and the selected damaged payload follows the normal quarantine path.
+        let damaged_selected_payload = paths.turn_payload(ids[2]);
+        tokio::fs::write(&damaged_selected_payload, "{ definitely not json")
+            .await
+            .unwrap();
+        let after_damage = store.load_turns_after(pid, tid, ids[1]).await.unwrap();
+        assert_eq!(
+            after_damage.map(|turns| turns.iter().map(|turn| turn.id).collect::<Vec<_>>()),
+            Some(vec![ids[3]])
+        );
+        assert!(
+            !damaged_selected_payload.exists(),
+            "a damaged selected payload should be quarantined"
+        );
+        let damaged_name = damaged_selected_payload
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let mut entries = tokio::fs::read_dir(paths.turns_dir()).await.unwrap();
+        let mut quarantined = false;
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&format!("{damaged_name}.corrupt-"))
+            {
+                quarantined = true;
+                break;
+            }
+        }
+        assert!(quarantined, "the damaged selected payload was not retained");
 
         // After the newest turn → an empty delta (the client is already up to date), not None.
         let after_last = store.load_turns_after(pid, tid, ids[3]).await.unwrap();
@@ -2843,6 +3046,110 @@ mod tests {
             .await
             .unwrap();
         assert!(stale.is_none());
+    }
+
+    #[tokio::test]
+    async fn bounded_history_page_does_not_open_unselected_payloads() {
+        use giskard_core::token::TokenUsage;
+
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        let mut turns = Vec::new();
+        for i in 0..128 {
+            let turn = make_turn(TokenUsage::new(100 * (i + 1), 10));
+            store.append_turn(pid, tid, &turn).await.unwrap();
+            turns.push(turn);
+        }
+
+        let paths = store.current_thread_paths(pid, tid);
+        let unselected_payload = paths.turn_payload(turns[0].id);
+        tokio::fs::write(&unselected_payload, "{ definitely not json")
+            .await
+            .unwrap();
+        let selected_payload = paths.turn_payload(turns[126].id);
+        tokio::fs::write(&selected_payload, "{ also definitely not json")
+            .await
+            .unwrap();
+
+        let records = store.load_turn_records(pid, tid).await.unwrap();
+        assert_eq!(records.len(), turns.len());
+        assert!(
+            unselected_payload.exists() && selected_payload.exists(),
+            "the index-only read must not open any payload"
+        );
+
+        let (tail, has_more) = store.load_history(pid, tid, None, 5).await.unwrap();
+        assert!(has_more);
+        assert_eq!(
+            tail.iter().map(|turn| turn.id).collect::<Vec<_>>(),
+            [122usize, 123, 124, 125, 127]
+                .map(|index| turns[index].id)
+                .to_vec(),
+            "a damaged selected payload is skipped and the page is backfilled"
+        );
+        assert!(
+            unselected_payload.exists(),
+            "an unselected corrupt payload must not be opened or quarantined"
+        );
+        let payload_name = unselected_payload
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let mut entries = tokio::fs::read_dir(paths.turns_dir()).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let name = entry.file_name();
+            assert!(
+                !name
+                    .to_string_lossy()
+                    .starts_with(&format!("{payload_name}.corrupt-")),
+                "bounded tail read quarantined an unselected payload"
+            );
+        }
+        assert!(
+            !selected_payload.exists(),
+            "a damaged selected payload should retain the existing quarantine behavior"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_cursor_page_does_not_open_payloads_outside_its_range() {
+        use giskard_core::token::TokenUsage;
+
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        let mut turns = Vec::new();
+        for i in 0..8 {
+            let turn = make_turn(TokenUsage::new(100 * (i + 1), 10));
+            store.append_turn(pid, tid, &turn).await.unwrap();
+            turns.push(turn);
+        }
+
+        let paths = store.current_thread_paths(pid, tid);
+        let older_payload = paths.turn_payload(turns[0].id);
+        let newer_payload = paths.turn_payload(turns[7].id);
+        tokio::fs::write(&older_payload, "{ corrupt older payload")
+            .await
+            .unwrap();
+        tokio::fs::write(&newer_payload, "{ corrupt newer payload")
+            .await
+            .unwrap();
+
+        let (page, has_more) = store
+            .load_history(pid, tid, Some(turns[6].id), 2)
+            .await
+            .unwrap();
+        assert!(has_more);
+        assert_eq!(
+            page.iter().map(|turn| turn.id).collect::<Vec<_>>(),
+            vec![turns[4].id, turns[5].id]
+        );
+        assert!(
+            older_payload.exists() && newer_payload.exists(),
+            "cursor pagination must not open payloads outside the selected range"
+        );
     }
 
     #[tokio::test]

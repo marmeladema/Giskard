@@ -89,9 +89,11 @@ Consequences for Primitive 3:
 - An oversized single turn is now one file, retrievable over the HTTP pagination lane, where no
   frame limit applies.
 
-The store does not expose these reads yet. Adding `load_turn_records`, `load_history_snapshot` and
-`load_history_from` is in scope for the milestone whose bootstrap consumes them — the storage plan
-deferred them explicitly until a consumer existed, and that consumer is M5.
+The store now exposes `load_turn_records`, and ordinary format-2 pagination selects index records
+before fetching their payloads. Adding the consistent `load_history_snapshot` and
+`load_history_from` reads remains in scope for the milestone whose bootstrap consumes them — the
+storage plan deferred those transaction-facing reads until a consumer existed, and that consumer
+is M5.
 
 ### One of the two full-history reads per bootstrap is already gone
 
@@ -1015,14 +1017,20 @@ truncates silently. One normalization pass, not one per consumer.
 
 **The largest remaining milestone. Watch it.**
 
+**Partial prerequisite complete.** Format-2 history pagination now reads the bounded index first
+and opens payload files only for the selected page or suffix. `PersistStore::load_turn_records`
+exposes the index-only projection for the eventual bootstrap builder. M5 still owns the consistent
+snapshot/range interface used by the transaction, the live cut and journal, subscription
+generations, chunking decision, and browser commit path.
+
 **Scope.** The shared bounded per-thread event journal with a snapshot watermark, pinned at the live
 cut. The staged `ThreadBootstrap` transaction with subscription generations, replacing the four
 browser phase flags and the split snapshot messages. Genuinely cancellable bootstrap — `handle_ws`
 currently awaits the whole subscribe operation, so cancellation needs a generation-owned task, not
 just a generation number.
 
-Bounded reads land here as their consumer: add `load_turn_records` and the snapshot/range reads to
-`PersistStore`, and send bounded turn records with payloads fetched separately rather than embedding
+Consume the existing `load_turn_records` primitive and add the consistent snapshot/range reads to
+`PersistStore`. Send bounded turn records with payloads fetched separately rather than embedding
 whole turns.
 
 **Decide explicitly:** with bounded records, the byte-chunked base64 encoding may no longer be
