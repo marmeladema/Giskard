@@ -61,14 +61,22 @@ test.describe("lazy agent diffs", () => {
   });
 
   test("deduplicates repeated immutable diffs in a collapsed file-change row", async ({ page }) => {
-    const merged = await page.evaluate(() => mergeFileChangePayload(
-      {
+    const rendered = await page.evaluate(() => {
+      const row = document.createElement("div");
+      row.className = "msg file";
+      row.dataset.turn = "turn-1";
+      const body = document.createElement("div");
+      body.className = "body";
+      row.append(body);
+      document.querySelector("#transcript")?.append(row);
+
+      renderFileChangeContribution(body, {
         kind: "file_change",
         changes: [{
           path: "same.rs", change: "modified", diff: { id: "same-diff" }, status: "in_progress",
         }],
-      },
-      {
+      }, { id: "item-1" }, "turn-1");
+      renderFileChangeContribution(body, {
         kind: "file_change",
         changes: [
           {
@@ -78,14 +86,17 @@ test.describe("lazy agent diffs", () => {
             path: "same.rs", change: "modified", diff: { id: "new-diff" }, status: "completed",
           },
         ],
-      },
-    ));
+      }, { id: "item-2" }, "turn-1");
 
-    expect(merged.changes).toHaveLength(2);
-    expect(merged.changes.map((change: any) => change.diff.id)).toEqual([
-      "same-diff", "new-diff",
-    ]);
-    expect(merged.changes[0].status).toBe("completed");
+      return {
+        titles: Array.from(body.querySelectorAll(":scope > div")).map(node => node.textContent),
+        entries: Array.from(body.querySelectorAll(".file-change-entry")).map(node => node.textContent),
+      };
+    });
+
+    expect(rendered.titles).toEqual(["File changes"]);
+    expect(rendered.entries).toHaveLength(2);
+    expect(rendered.entries[0]).toContain("completed");
   });
 
   test("renders a full-text-only structured diff from the lazy endpoint", async ({ page }) => {
@@ -318,4 +329,6 @@ declare function api(method: string, path: string): Promise<any>;
 declare function openCapturedDiff(descriptor: unknown, turnId: string): Promise<void>;
 declare function openCodeOverlay(path: string, line?: number): Promise<void>;
 declare function structuredCapturedDiffText(diff: unknown): string;
-declare function mergeFileChangePayload(existing: unknown, next: unknown): any;
+declare function renderFileChangeContribution(
+  body: HTMLElement, payload: unknown, item: unknown, turnId: string,
+): void;
