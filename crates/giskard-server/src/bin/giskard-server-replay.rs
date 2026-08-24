@@ -32,7 +32,8 @@ use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ThreadId, TurnId};
 use giskard_core::item::{
-    Item, ItemDelta, ItemKind, ItemPayload, ItemStart, SubagentAction, SubagentLink,
+    FileChangeEntry, FileChangeKind, Item, ItemDelta, ItemKind, ItemPayload, ItemStart,
+    SubagentAction, SubagentLink,
 };
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
@@ -45,6 +46,10 @@ use giskard_server::{AppState, HarnessFactory, build_app};
 
 /// The scripted agent's fixed reply. Tests assert on this exact string, so keep it stable.
 const SCRIPTED_REPLY: &str = "Hello from the scripted replay harness!";
+const SCRIPTED_DIFF_TRIGGER: &str = "Trigger two scripted lazy diffs.";
+const SCRIPTED_DIFF_PATH: &str = "src/lazy-diff.rs";
+const SCRIPTED_DIFF_REPLACEMENT_DELAY: std::time::Duration = std::time::Duration::from_millis(1200);
+const SCRIPTED_DIFF_COMPLETION_DELAY: std::time::Duration = std::time::Duration::from_millis(1000);
 const SCRIPTED_SUBAGENT_TRIGGER: &str = "Spawn the scripted linked sub-agent.";
 const SCRIPTED_NESTED_SUBAGENT_TRIGGER: &str = "Spawn a scripted nested sub-agent.";
 const SCRIPTED_SUBAGENT_PROMPT: &str = "Review the linked child task.";
@@ -475,11 +480,74 @@ impl AgentHarness for ScriptedHarness {
             input_text == Some(SCRIPTED_SERVER_REQUEST_THEN_ERROR_TRIGGER);
         let raise_server_request =
             input_text == Some(SCRIPTED_SERVER_REQUEST_TRIGGER) || raise_server_request_then_error;
+        let raise_lazy_diffs = input_text == Some(SCRIPTED_DIFF_TRIGGER);
 
         // Stream the canned reply the way a real harness would: start, incremental deltas, then a
         // completed item and a turn-completed with token usage. Emitted off-task with yields so the
         // WebSocket layer observes distinct frames (the transcript renders progressively).
         tokio::spawn(async move {
+            if raise_lazy_diffs {
+                let item_id = ItemId::new();
+                let file_change = |diff: &str, status: &str| Item {
+                    id: item_id,
+                    harness_item_id: "scripted_lazy_diff".into(),
+                    payload: ItemPayload::FileChange {
+                        path: SCRIPTED_DIFF_PATH.into(),
+                        change: FileChangeKind::Modified,
+                        changes: vec![FileChangeEntry {
+                            path: SCRIPTED_DIFF_PATH.into(),
+                            change: FileChangeKind::Modified,
+                            diff: Some(diff.into()),
+                            captured_diff: None,
+                        }],
+                        status: Some(status.into()),
+                    },
+                    created_at: chrono::Utc::now(),
+                };
+                let _ = sender.send(AgentEvent::TurnStarted {
+                    thread: thread_id,
+                    turn,
+                });
+                tokio::task::yield_now().await;
+                let _ = sender.send(AgentEvent::ItemCompleted {
+                    thread: thread_id,
+                    turn,
+                    item: file_change("@@ -1 +1 @@\n-before\n+first version", "in_progress"),
+                });
+                tokio::time::sleep(SCRIPTED_DIFF_REPLACEMENT_DELAY).await;
+                let _ = sender.send(AgentEvent::ItemCompleted {
+                    thread: thread_id,
+                    turn,
+                    item: file_change("@@ -1 +1 @@\n-before\n+second version", "completed"),
+                });
+                let _ = sender.send(AgentEvent::DiffUpdated {
+                    thread: thread_id,
+                    turn,
+                    diff: giskard_core::FileDiff {
+                        path: "src/full-text-only.rs".into(),
+                        change: FileChangeKind::Modified,
+                        old_text: Some("fn old() {}\n".into()),
+                        new_text: Some("fn new() {}\n".into()),
+                        hunks: Vec::new(),
+                        binary: false,
+                        captured: None,
+                    },
+                });
+                // Keep the replacement live long enough for browser tests to exercise the
+                // superseded-id conflict before turn persistence releases runtime diff state.
+                tokio::time::sleep(SCRIPTED_DIFF_COMPLETION_DELAY).await;
+                let _ = sender.send(AgentEvent::TurnCompleted {
+                    thread: thread_id,
+                    turn,
+                    usage: TokenUsage::new(20, 8),
+                    status: TurnStatus {
+                        kind: TurnStatusKind::Completed,
+                        message: None,
+                    },
+                });
+                return;
+            }
+
             if raise_server_request {
                 // Raise a user-input request and leave the turn in-flight. Answering it routes a
                 // response to `respond_server_request`, which deliberately stays silent: a browser

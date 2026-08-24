@@ -511,6 +511,7 @@ impl CodexMapper {
                         new_text: Some(diff.clone()),
                         hunks: parse_diff_hunks(diff),
                         binary: false,
+                        captured: None,
                     },
                 })
             }
@@ -2812,6 +2813,7 @@ fn map_file_changes(changes: &[codex_codes::FileUpdateChange]) -> Vec<FileChange
             path: PathBuf::from(&change.path),
             change: map_patch_change_kind(&change.kind),
             diff: (!change.diff.is_empty()).then(|| change.diff.clone()),
+            captured_diff: None,
         })
         .collect()
 }

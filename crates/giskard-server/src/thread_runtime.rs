@@ -8,10 +8,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use giskard_core::approval::{ApprovalDecision, ApprovalRequest};
+use giskard_core::diff::{CapturedDiffDescriptor, CapturedDiffRecord};
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::ItemId;
 use giskard_core::ids::{ApprovalId, ProjectId, ServerRequestId, ThreadId, TurnId};
+use giskard_core::ids::{DiffId, ItemId};
+use giskard_core::item::ItemPayload;
 use giskard_core::server_request::{ServerRequest, ServerRequestResponse};
 use giskard_core::turn::{Mode, Turn};
 use giskard_core::user_input::UserInput;
@@ -41,6 +43,40 @@ struct ThreadRuntimeEntry {
     task_revision: u64,
     live: LiveTurnState,
     tasks: RunningTaskState,
+    captured_diffs: HashMap<TurnId, ActiveCapturedDiffs>,
+}
+
+#[derive(Default)]
+struct ActiveCapturedDiffs {
+    // Current authority is a set of logical slots, not a path map: turn-level paths and each
+    // occurrence of a path inside an item evolve independently. ItemCompleted replaces the
+    // complete slot set for that item. A matched replacement keeps one conflict redirect; an
+    // omitted slot becomes missing. `contents` contains exactly bodies still referenced by at
+    // least one current slot, with identical content identities shared across slots.
+    contents: HashMap<DiffId, CapturedDiffRecord>,
+    current_by_slot: HashMap<CapturedDiffSlot, CapturedDiffDescriptor>,
+    superseded: HashMap<DiffId, SupersededCapturedDiff>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum CapturedDiffSlot {
+    Item {
+        item_id: ItemId,
+        path: std::path::PathBuf,
+        occurrence: usize,
+    },
+    Turn(std::path::PathBuf),
+}
+
+struct SupersededCapturedDiff {
+    slot: CapturedDiffSlot,
+    current: CapturedDiffDescriptor,
+}
+
+pub(crate) enum RuntimeDiffLookup {
+    Found(CapturedDiffRecord),
+    Superseded(CapturedDiffDescriptor),
+    Missing,
 }
 
 #[derive(Default)]
@@ -148,6 +184,102 @@ pub(crate) struct RestorePermit {
 }
 
 impl ThreadRuntimeRegistry {
+    /// Extract full diff bodies before an event reaches reconnect state or browser projection.
+    pub(crate) fn capture_event_diffs(
+        &self,
+        thread_id: ThreadId,
+        mut event: AgentEvent,
+    ) -> AgentEvent {
+        let entry = self.entry_or_create(thread_id);
+        let mut entry = lock_unpoison(&entry, "thread runtime entry");
+        match &mut event {
+            AgentEvent::ItemCompleted { turn, item, .. } => {
+                let state = entry.captured_diffs.entry(*turn).or_default();
+                let mut captures = Vec::new();
+                if let ItemPayload::FileChange { changes, .. } = &mut item.payload {
+                    let mut occurrences = HashMap::new();
+                    for change in changes {
+                        let occurrence = occurrences.entry(change.path.clone()).or_insert(0);
+                        let slot = CapturedDiffSlot::Item {
+                            item_id: item.id,
+                            path: change.path.clone(),
+                            occurrence: *occurrence,
+                        };
+                        *occurrence += 1;
+                        let Some(text) = change.diff.take() else {
+                            continue;
+                        };
+                        let (descriptor, record) = giskard_core::capture_unified_diff(
+                            change.path.clone(),
+                            change.change,
+                            Some(item.id),
+                            text,
+                        );
+                        captures.push((slot, descriptor.clone(), record));
+                        change.captured_diff = Some(descriptor);
+                    }
+                }
+                // ItemCompleted is an upsert of the complete item payload. An empty file-change
+                // set or a replacement payload of another kind therefore retires every old slot.
+                reconcile_item_captured_diffs(state, thread_id, *turn, item.id, captures);
+            }
+            AgentEvent::DiffUpdated { turn, diff, .. } => {
+                let (projected, record) = giskard_core::capture_structured_diff(diff.clone());
+                if let Some(descriptor) = projected.captured.clone() {
+                    let state = entry.captured_diffs.entry(*turn).or_default();
+                    install_captured_diff(
+                        state,
+                        thread_id,
+                        *turn,
+                        CapturedDiffSlot::Turn(descriptor.path.clone()),
+                        descriptor,
+                        record,
+                    );
+                }
+                *diff = projected;
+            }
+            _ => {}
+        }
+        event
+    }
+
+    pub(crate) fn captured_diff_records(
+        &self,
+        thread_id: ThreadId,
+        turn_id: TurnId,
+    ) -> Vec<CapturedDiffRecord> {
+        let Some(entry) = self.existing_entry(thread_id) else {
+            return Vec::new();
+        };
+        let entry = lock_unpoison(&entry, "thread runtime entry");
+        entry
+            .captured_diffs
+            .get(&turn_id)
+            .map_or_else(Vec::new, |state| state.contents.values().cloned().collect())
+    }
+
+    pub(crate) fn captured_diff(
+        &self,
+        thread_id: ThreadId,
+        turn_id: TurnId,
+        diff_id: &DiffId,
+    ) -> RuntimeDiffLookup {
+        let Some(entry) = self.existing_entry(thread_id) else {
+            return RuntimeDiffLookup::Missing;
+        };
+        let entry = lock_unpoison(&entry, "thread runtime entry");
+        let Some(state) = entry.captured_diffs.get(&turn_id) else {
+            return RuntimeDiffLookup::Missing;
+        };
+        if let Some(record) = state.contents.get(diff_id) {
+            return RuntimeDiffLookup::Found(record.clone());
+        }
+        state
+            .superseded
+            .get(diff_id)
+            .map(|superseded| superseded.current.clone())
+            .map_or(RuntimeDiffLookup::Missing, RuntimeDiffLookup::Superseded)
+    }
     pub fn new() -> Self {
         Self {
             entries: Arc::new(Mutex::new(HashMap::new())),
@@ -447,6 +579,9 @@ impl ThreadRuntimeRegistry {
                     AgentEvent::TurnCompleted { turn, .. } => Some(*turn),
                     _ => None,
                 };
+                if let Some(completed_turn) = completed_turn {
+                    entry.captured_diffs.remove(&completed_turn);
+                }
                 entry.requests.retain(|_, record| {
                     !(matches!(record.status, RequestStatus::Resolved(_))
                         && record.turn_id == completed_turn)
@@ -683,6 +818,93 @@ impl ThreadRuntimeRegistry {
         lock_unpoison(&self.entries, "thread runtime entry registry")
             .get(&thread_id)
             .cloned()
+    }
+}
+
+fn install_captured_diff(
+    state: &mut ActiveCapturedDiffs,
+    thread_id: ThreadId,
+    turn_id: TurnId,
+    slot: CapturedDiffSlot,
+    descriptor: CapturedDiffDescriptor,
+    record: CapturedDiffRecord,
+) {
+    if let Some(previous) = state
+        .current_by_slot
+        .insert(slot.clone(), descriptor.clone())
+        && previous.id != descriptor.id
+    {
+        if !state
+            .current_by_slot
+            .values()
+            .any(|current| current.id == previous.id)
+        {
+            state.contents.remove(&previous.id);
+            debug!(
+                %thread_id,
+                %turn_id,
+                ?slot,
+                superseded_diff_id = %previous.id,
+                current_diff_id = %descriptor.id,
+                "dropped superseded captured diff body"
+            );
+        }
+        // Keep only the immediately superseded identity for each logical diff slot. Item-owned
+        // and turn-level diffs for the same path are independent authorities.
+        state
+            .superseded
+            .retain(|_, superseded| superseded.slot != slot);
+        state.superseded.insert(
+            previous.id,
+            SupersededCapturedDiff {
+                slot,
+                current: descriptor.clone(),
+            },
+        );
+    }
+    state.contents.insert(record.id.clone(), record);
+}
+
+fn reconcile_item_captured_diffs(
+    state: &mut ActiveCapturedDiffs,
+    thread_id: ThreadId,
+    turn_id: TurnId,
+    item_id: ItemId,
+    captures: Vec<(CapturedDiffSlot, CapturedDiffDescriptor, CapturedDiffRecord)>,
+) {
+    let new_slots: std::collections::HashSet<_> =
+        captures.iter().map(|(slot, _, _)| slot.clone()).collect();
+    let omitted: Vec<_> = state
+        .current_by_slot
+        .keys()
+        .filter(|slot| {
+            matches!(slot, CapturedDiffSlot::Item { item_id: owner, .. } if *owner == item_id)
+                && !new_slots.contains(*slot)
+        })
+        .cloned()
+        .collect();
+    for slot in omitted {
+        if let Some(previous) = state.current_by_slot.remove(&slot)
+            && !state
+                .current_by_slot
+                .values()
+                .any(|current| current.id == previous.id)
+        {
+            state.contents.remove(&previous.id);
+            debug!(
+                %thread_id,
+                %turn_id,
+                ?slot,
+                removed_diff_id = %previous.id,
+                "dropped captured diff body omitted by replacement item"
+            );
+        }
+        state
+            .superseded
+            .retain(|_, superseded| superseded.slot != slot);
+    }
+    for (slot, descriptor, record) in captures {
+        install_captured_diff(state, thread_id, turn_id, slot, descriptor, record);
     }
 }
 
@@ -1066,6 +1288,339 @@ mod tests {
             metadata: Vec::new(),
             available: vec![ApprovalDecision::Accept],
         }
+    }
+
+    #[test]
+    fn replacing_active_diff_returns_conflict_for_immediately_previous_identity() {
+        let runtime = ThreadRuntimeRegistry::new();
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let make_event = |text: &str| AgentEvent::DiffUpdated {
+            thread,
+            turn,
+            diff: giskard_core::FileDiff {
+                path: "src/main.rs".into(),
+                change: giskard_core::FileChangeKind::Modified,
+                old_text: None,
+                new_text: Some(text.into()),
+                hunks: Vec::new(),
+                binary: false,
+                captured: None,
+            },
+        };
+
+        let first = runtime.capture_event_diffs(thread, make_event("first"));
+        let first_id = match first {
+            AgentEvent::DiffUpdated { diff, .. } => diff.captured.unwrap().id,
+            _ => panic!("expected diff event"),
+        };
+        let second = runtime.capture_event_diffs(thread, make_event("second"));
+        let second_id = match second {
+            AgentEvent::DiffUpdated { diff, .. } => diff.captured.unwrap().id,
+            _ => panic!("expected diff event"),
+        };
+
+        assert!(matches!(
+            runtime.captured_diff(thread, turn, &first_id),
+            RuntimeDiffLookup::Superseded(current) if current.id == second_id
+        ));
+        assert!(matches!(
+            runtime.captured_diff(thread, turn, &second_id),
+            RuntimeDiffLookup::Found(_)
+        ));
+        let repeated = runtime.capture_event_diffs(thread, make_event("second"));
+        let repeated_id = match repeated {
+            AgentEvent::DiffUpdated { diff, .. } => diff.captured.unwrap().id,
+            _ => panic!("expected diff event"),
+        };
+        assert_eq!(
+            second_id, repeated_id,
+            "identical content reuses its hash id"
+        );
+        let entry = runtime.existing_entry(thread).unwrap();
+        let entry = lock_unpoison(&entry, "thread runtime entry");
+        assert_eq!(entry.captured_diffs[&turn].contents.len(), 1);
+    }
+
+    #[test]
+    fn identical_unified_text_on_different_paths_has_independent_identity() {
+        let mut state = ActiveCapturedDiffs::default();
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let (first, first_record) = giskard_core::capture_unified_diff(
+            "src/first.rs".into(),
+            giskard_core::FileChangeKind::Modified,
+            None,
+            "@@ -1 +1 @@\n-old\n+same".into(),
+        );
+        let (second, second_record) = giskard_core::capture_unified_diff(
+            "src/second.rs".into(),
+            giskard_core::FileChangeKind::Modified,
+            None,
+            "@@ -1 +1 @@\n-old\n+same".into(),
+        );
+        assert_ne!(first.id, second.id);
+        install_captured_diff(
+            &mut state,
+            thread,
+            turn,
+            CapturedDiffSlot::Turn(first.path.clone()),
+            first.clone(),
+            first_record,
+        );
+        install_captured_diff(
+            &mut state,
+            thread,
+            turn,
+            CapturedDiffSlot::Turn(second.path.clone()),
+            second.clone(),
+            second_record,
+        );
+
+        let (replacement, replacement_record) = giskard_core::capture_unified_diff(
+            "src/first.rs".into(),
+            giskard_core::FileChangeKind::Modified,
+            None,
+            "@@ -1 +1 @@\n-old\n+changed".into(),
+        );
+        install_captured_diff(
+            &mut state,
+            thread,
+            turn,
+            CapturedDiffSlot::Turn(replacement.path.clone()),
+            replacement,
+            replacement_record,
+        );
+
+        assert!(state.contents.contains_key(&second.id));
+        assert!(!state.superseded.contains_key(&second.id));
+        assert_eq!(
+            state.current_by_slot[&CapturedDiffSlot::Turn(second.path.clone())].id,
+            second.id
+        );
+    }
+
+    #[test]
+    fn item_and_turn_diffs_for_the_same_path_have_independent_authority() {
+        let mut state = ActiveCapturedDiffs::default();
+        let thread = ThreadId::new();
+        let turn_id = TurnId::new();
+        let path = std::path::PathBuf::from("src/main.rs");
+        let item_id = ItemId::new();
+        let (item, item_record) = giskard_core::capture_unified_diff(
+            path.clone(),
+            giskard_core::FileChangeKind::Modified,
+            Some(item_id),
+            "item body".into(),
+        );
+        let structured = giskard_core::FileDiff {
+            path: path.clone(),
+            change: giskard_core::FileChangeKind::Modified,
+            old_text: Some("old".into()),
+            new_text: Some("turn body".into()),
+            hunks: Vec::new(),
+            binary: false,
+            captured: None,
+        };
+        let (turn, turn_record) = giskard_core::capture_structured_diff(structured);
+        let turn = turn.captured.unwrap();
+
+        install_captured_diff(
+            &mut state,
+            thread,
+            turn_id,
+            CapturedDiffSlot::Item {
+                item_id,
+                path: path.clone(),
+                occurrence: 0,
+            },
+            item.clone(),
+            item_record,
+        );
+        install_captured_diff(
+            &mut state,
+            thread,
+            turn_id,
+            CapturedDiffSlot::Turn(path.clone()),
+            turn.clone(),
+            turn_record,
+        );
+
+        assert!(state.contents.contains_key(&item.id));
+        assert!(state.contents.contains_key(&turn.id));
+        assert!(state.superseded.is_empty());
+        assert_eq!(
+            state.current_by_slot[&CapturedDiffSlot::Item {
+                item_id,
+                path: path.clone(),
+                occurrence: 0,
+            }]
+                .id,
+            item.id
+        );
+        assert_eq!(
+            state.current_by_slot[&CapturedDiffSlot::Turn(path)].id,
+            turn.id
+        );
+    }
+
+    #[test]
+    fn empty_inline_diff_is_captured_instead_of_dropped() {
+        let runtime = ThreadRuntimeRegistry::new();
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let item_id = ItemId::new();
+        let event = AgentEvent::ItemCompleted {
+            thread,
+            turn,
+            item: giskard_core::Item {
+                id: item_id,
+                harness_item_id: "empty-diff-item".into(),
+                payload: ItemPayload::FileChange {
+                    path: "src/empty.rs".into(),
+                    change: giskard_core::FileChangeKind::Modified,
+                    changes: vec![giskard_core::item::FileChangeEntry {
+                        path: "src/empty.rs".into(),
+                        change: giskard_core::FileChangeKind::Modified,
+                        diff: Some(String::new()),
+                        captured_diff: None,
+                    }],
+                    status: None,
+                },
+                created_at: chrono::Utc::now(),
+            },
+        };
+
+        let captured = runtime.capture_event_diffs(thread, event);
+        let descriptor = match captured {
+            AgentEvent::ItemCompleted { item, .. } => match item.payload {
+                ItemPayload::FileChange { changes, .. } => {
+                    let change = &changes[0];
+                    assert!(change.diff.is_none());
+                    change.captured_diff.clone().unwrap()
+                }
+                _ => panic!("expected file-change payload"),
+            },
+            _ => panic!("expected completed item"),
+        };
+        assert_eq!(descriptor.byte_size, 0);
+        assert!(matches!(
+            runtime.captured_diff(thread, turn, &descriptor.id),
+            RuntimeDiffLookup::Found(CapturedDiffRecord {
+                content: giskard_core::CapturedDiffContent::Unified { text },
+                ..
+            }) if text.is_empty()
+        ));
+    }
+
+    #[test]
+    fn item_diff_reconciliation_treats_each_completion_as_a_complete_set() {
+        let runtime = ThreadRuntimeRegistry::new();
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let item_id = ItemId::new();
+        let capture = |changes: Vec<(&str, &str)>| {
+            let event = AgentEvent::ItemCompleted {
+                thread,
+                turn,
+                item: giskard_core::Item {
+                    id: item_id,
+                    harness_item_id: "replacement-item".into(),
+                    payload: ItemPayload::FileChange {
+                        path: changes[0].0.into(),
+                        change: giskard_core::FileChangeKind::Modified,
+                        changes: changes
+                            .into_iter()
+                            .map(|(path, text)| giskard_core::item::FileChangeEntry {
+                                path: path.into(),
+                                change: giskard_core::FileChangeKind::Modified,
+                                diff: Some(text.into()),
+                                captured_diff: None,
+                            })
+                            .collect(),
+                        status: None,
+                    },
+                    created_at: chrono::Utc::now(),
+                },
+            };
+            match runtime.capture_event_diffs(thread, event) {
+                AgentEvent::ItemCompleted { item, .. } => match item.payload {
+                    ItemPayload::FileChange { changes, .. } => changes
+                        .into_iter()
+                        .map(|change| change.captured_diff.unwrap())
+                        .collect::<Vec<_>>(),
+                    _ => panic!("expected file-change payload"),
+                },
+                _ => panic!("expected completed item"),
+            }
+        };
+
+        // Duplicate paths receive occurrence-scoped slots, so every descriptor retained by the
+        // item has a corresponding content record for persistence.
+        let first = capture(vec![
+            ("src/a.rs", "a0"),
+            ("src/a.rs", "a1"),
+            ("src/b.rs", "b0"),
+        ]);
+        assert_eq!(runtime.captured_diff_records(thread, turn).len(), 3);
+        for descriptor in &first {
+            assert!(matches!(
+                runtime.captured_diff(thread, turn, &descriptor.id),
+                RuntimeDiffLookup::Found(_)
+            ));
+        }
+
+        // Reordering distinct paths does not change their slots; duplicate occurrences replace
+        // only their corresponding occurrence.
+        let second = capture(vec![
+            ("src/b.rs", "b1"),
+            ("src/a.rs", "a0-next"),
+            ("src/a.rs", "a1-next"),
+        ]);
+        assert_eq!(runtime.captured_diff_records(thread, turn).len(), 3);
+        for descriptor in &second {
+            assert!(matches!(
+                runtime.captured_diff(thread, turn, &descriptor.id),
+                RuntimeDiffLookup::Found(_)
+            ));
+        }
+
+        // Omitting one duplicate and renaming another path retires those slots instead of keeping
+        // obsolete bodies alive. Repeating an unchanged body preserves its stable identity.
+        let third = capture(vec![("src/a.rs", "a0-next"), ("src/c.rs", "c0")]);
+        assert_eq!(third[0].id, second[1].id);
+        assert_eq!(runtime.captured_diff_records(thread, turn).len(), 2);
+        assert!(matches!(
+            runtime.captured_diff(thread, turn, &second[0].id),
+            RuntimeDiffLookup::Missing
+        ));
+        assert!(matches!(
+            runtime.captured_diff(thread, turn, &second[2].id),
+            RuntimeDiffLookup::Missing
+        ));
+        let entry = runtime.existing_entry(thread).unwrap();
+        let entry = lock_unpoison(&entry, "thread runtime entry");
+        let state = &entry.captured_diffs[&turn];
+        assert_eq!(state.current_by_slot.len(), 2);
+        assert_eq!(state.contents.len(), 2);
+        drop(entry);
+
+        runtime.capture_event_diffs(
+            thread,
+            AgentEvent::ItemCompleted {
+                thread,
+                turn,
+                item: giskard_core::Item {
+                    id: item_id,
+                    harness_item_id: "replacement-item".into(),
+                    payload: ItemPayload::AgentMessage {
+                        text: "the item no longer represents a file change".into(),
+                    },
+                    created_at: chrono::Utc::now(),
+                },
+            },
+        );
+        assert!(runtime.captured_diff_records(thread, turn).is_empty());
     }
 
     #[test]

@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::diff::CapturedDiffDescriptor;
 use crate::ids::ItemId;
 
 /// Kind of item — discriminant only; payload fills in on completion.
@@ -33,6 +34,9 @@ pub struct FileChangeEntry {
     pub change: FileChangeKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
+    /// Present after the server extracts `diff` into turn-owned lazy storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_diff: Option<CapturedDiffDescriptor>,
 }
 
 /// Sent on `AgentEvent::ItemStarted` (spec §4.5, B5: renamed from `ItemStarted` to avoid

@@ -9,6 +9,7 @@ WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticke
 /api/projects/{id}/threads/{thread_id}/title`,
 `POST /api/projects/{id}/threads/{thread_id}/archive`,
 `GET /api/projects/{id}/threads/{thread_id}/history`,
+`GET /api/projects/{id}/threads/{thread_id}/turns/{turn_id}/diffs/{diff_id}`,
 `GET /api/projects/{id}/threads/{thread_id}/deletion-impact`,
 `GET /api/projects/{id}/models`,
 `GET /api/tokens`, `GET /api/projects/{id}/tokens`,
@@ -76,6 +77,15 @@ directly from that lane to the socket writer and do not consume ordered event ca
 model, and permission messages require a `request_id`; the initiating browser receives a correlated
 `ThreadMetadataResult` after commit, including for no-op changes, or an `Error` carrying that id.
 `TokenUpdate` no longer exists; thread totals use the revisioned metadata snapshot.
+
+Agent-produced diffs are advertised as bounded descriptors in live events and history. `GET
+/api/projects/{id}/threads/{thread_id}/turns/{turn_id}/diffs/{diff_id}` returns the exact captured
+unified or structured content on demand. It reads active runtime state or the immutable completed
+turn payload; it never recomputes the current workspace diff. A superseded active identity returns
+JSON `409 diff_superseded` with the current descriptor, while an unknown turn or identity returns
+404. This endpoint is distinct from `/api/projects/{id}/git/diff`, which intentionally answers a
+current-worktree question.
+
 Process-local thread state is published separately: `ThreadRuntimeOverview { revision, threads }`
 is a global replacement snapshot (including an empty `threads` list), `RequestState` carries a
 per-request revision and the authoritative pending/responding/resolved status for each approval or

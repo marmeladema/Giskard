@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 use tokio::fs;
 
 use giskard_core::PersistError;
-use giskard_core::diff::FileDiff;
-use giskard_core::ids::{ItemId, ThreadId, TurnId};
-use giskard_core::item::Item;
+use giskard_core::diff::{CapturedDiffContent, CapturedDiffRecord, FileDiff};
+use giskard_core::ids::{DiffId, ItemId, ThreadId, TurnId};
+use giskard_core::item::{Item, ItemPayload};
 use giskard_core::model::ModelRef;
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{Mode, Turn, TurnStatus};
@@ -174,6 +174,7 @@ pub struct TurnPayload {
     pub status: Option<TurnStatus>,
     pub items: Vec<Item>,
     pub diffs: Vec<FileDiff>,
+    pub diff_contents: HashMap<DiffId, CapturedDiffContent>,
 }
 
 impl HistoryHeader {
@@ -278,6 +279,15 @@ fn line_of<T: Serialize>(value: &T) -> Result<String, PersistError> {
 /// Written with temp file + fsync + rename, so a payload is complete or absent — never the torn
 /// half-line a shared append-only file can leave behind.
 pub fn payload_file_bytes(turn: &Turn) -> Result<Vec<u8>, PersistError> {
+    payload_file_bytes_with_diffs(turn, &[])
+}
+
+pub fn payload_file_bytes_with_diffs(
+    turn: &Turn,
+    captured: &[CapturedDiffRecord],
+) -> Result<Vec<u8>, PersistError> {
+    let projected = turn_with_inline_diffs(turn, captured)?;
+    let turn = &projected;
     let mut out = line_of(&PayloadLine::TurnHeader {
         format: TURN_PAYLOAD_FORMAT,
         turn_id: turn.id,
@@ -295,6 +305,80 @@ pub fn payload_file_bytes(turn: &Turn) -> Result<Vec<u8>, PersistError> {
         out.push_str(&line_of(&PayloadLine::Diff { index, diff })?);
     }
     Ok(out.into_bytes())
+}
+
+/// Reconstruct the unchanged format-1 representation from a bounded runtime projection.
+///
+/// Both supported storage layouts persist full diff bodies inline. Keeping the reconstruction in
+/// one place prevents the degraded flat-layout append path from accidentally persisting only the
+/// descriptors that are meant for runtime and browser delivery.
+pub(crate) fn turn_with_inline_diffs(
+    turn: &Turn,
+    captured: &[CapturedDiffRecord],
+) -> Result<Turn, PersistError> {
+    let mut projected = turn.clone();
+    let contents: HashMap<DiffId, CapturedDiffContent> = captured
+        .iter()
+        .map(|record| (record.id.clone(), record.content.clone()))
+        .collect();
+    for item in &mut projected.items {
+        if let ItemPayload::FileChange { changes, .. } = &mut item.payload {
+            for change in changes {
+                if let Some(descriptor) = change.captured_diff.take() {
+                    let Some(CapturedDiffContent::Unified { text }) = contents.get(&descriptor.id)
+                    else {
+                        return Err(PersistError::Invalid(format!(
+                            "diff descriptor {} has no unified content",
+                            descriptor.id
+                        )));
+                    };
+                    change.diff = Some(text.clone());
+                }
+            }
+        }
+    }
+    for diff in &mut projected.diffs {
+        if let Some(descriptor) = diff.captured.take() {
+            let Some(CapturedDiffContent::Structured { diff: content }) =
+                contents.get(&descriptor.id)
+            else {
+                return Err(PersistError::Invalid(format!(
+                    "diff descriptor {} has no structured content",
+                    descriptor.id
+                )));
+            };
+            *diff = content.clone();
+        }
+    }
+    Ok(projected)
+}
+
+/// Derive lazy content records from a format-1 turn whose full bodies are inline.
+pub(crate) fn captured_diff_contents(turn: &Turn) -> HashMap<DiffId, CapturedDiffContent> {
+    let mut contents = HashMap::new();
+    for item in &turn.items {
+        if let ItemPayload::FileChange { changes, .. } = &item.payload {
+            for change in changes {
+                let Some(text) = &change.diff else {
+                    continue;
+                };
+                let (_, record) = giskard_core::capture_unified_diff(
+                    change.path.clone(),
+                    change.change,
+                    Some(item.id),
+                    text.clone(),
+                );
+                contents.entry(record.id).or_insert(record.content);
+            }
+        }
+    }
+    for diff in &turn.diffs {
+        if diff.captured.is_none() {
+            let (_, record) = giskard_core::capture_structured_diff(diff.clone());
+            contents.entry(record.id).or_insert(record.content);
+        }
+    }
+    contents
 }
 
 /// The `kind` of a JSONL record, or `None` when the line is not a tagged object.
@@ -436,6 +520,7 @@ pub fn parse_turn_payload(path: &Path, data: &str) -> Result<TurnPayload, Persis
     let mut diffs: Vec<(usize, FileDiff)> = Vec::new();
     let mut diff_slots: HashMap<PathBuf, usize> = HashMap::new();
     let mut header_seen = false;
+    let mut diff_contents = HashMap::new();
 
     /// Replace a singleton record, warning if one was already there.
     macro_rules! set_singleton {
@@ -582,11 +667,57 @@ pub fn parse_turn_payload(path: &Path, data: &str) -> Result<TurnPayload, Persis
         )));
     };
 
+    for (_, item) in &mut items {
+        if let ItemPayload::FileChange { changes, .. } = &mut item.payload {
+            for change in changes {
+                let Some(text) = change.diff.take() else {
+                    continue;
+                };
+                let (descriptor, record) = giskard_core::capture_unified_diff(
+                    change.path.clone(),
+                    change.change,
+                    Some(item.id),
+                    text,
+                );
+                change.captured_diff = Some(descriptor);
+                diff_contents.entry(record.id).or_insert(record.content);
+            }
+        }
+    }
+    for (_, diff) in &mut diffs {
+        if diff.captured.is_none() {
+            let (projected, record) = giskard_core::capture_structured_diff(diff.clone());
+            *diff = projected;
+            diff_contents.entry(record.id).or_insert(record.content);
+        }
+    }
+
+    for descriptor in items
+        .iter()
+        .flat_map(|(_, item)| match &item.payload {
+            ItemPayload::FileChange { changes, .. } => changes
+                .iter()
+                .filter_map(|change| change.captured_diff.as_ref())
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        })
+        .chain(diffs.iter().filter_map(|(_, diff)| diff.captured.as_ref()))
+    {
+        if descriptor.available && !diff_contents.contains_key(&descriptor.id) {
+            return Err(PersistError::Invalid(format!(
+                "{}: diff descriptor {} has no content record",
+                path.display(),
+                descriptor.id
+            )));
+        }
+    }
+
     Ok(TurnPayload {
         user_input,
         status,
         items: items.into_iter().map(|(_, item)| item).collect(),
         diffs: diffs.into_iter().map(|(_, diff)| diff).collect(),
+        diff_contents,
     })
 }
 
@@ -620,5 +751,122 @@ pub async fn read_turn_payload(path: &Path) -> Result<Option<TurnPayload>, Persi
             }
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod lazy_diff_tests {
+    use super::*;
+    use giskard_core::item::FileChangeEntry;
+    use giskard_core::{
+        FileChangeKind, Item, ItemId, ItemPayload, Mode, ModelRef, TokenUsage, TurnId, TurnStatus,
+        TurnStatusKind, UserInput,
+    };
+
+    #[test]
+    fn legacy_diff_id_is_deterministic_and_content_sensitive() {
+        let unified = |text: &str| CapturedDiffContent::Unified { text: text.into() };
+        let path = Path::new("src/main.rs");
+        assert_eq!(
+            giskard_core::captured_diff_id(path, FileChangeKind::Modified, &unified("same")),
+            giskard_core::captured_diff_id(path, FileChangeKind::Modified, &unified("same"))
+        );
+        assert_ne!(
+            giskard_core::captured_diff_id(path, FileChangeKind::Modified, &unified("same")),
+            giskard_core::captured_diff_id(path, FileChangeKind::Modified, &unified("changed"))
+        );
+        assert_ne!(
+            giskard_core::captured_diff_id(path, FileChangeKind::Modified, &unified("same")),
+            giskard_core::captured_diff_id(
+                Path::new("src/other.rs"),
+                FileChangeKind::Modified,
+                &unified("same")
+            )
+        );
+
+        let diff = FileDiff {
+            path: "src/main.rs".into(),
+            change: FileChangeKind::Modified,
+            old_text: Some("old".into()),
+            new_text: Some("new".into()),
+            hunks: Vec::new(),
+            binary: false,
+            captured: None,
+        };
+        let structured = |diff: FileDiff| CapturedDiffContent::Structured { diff };
+        assert_eq!(
+            giskard_core::captured_diff_id(&diff.path, diff.change, &structured(diff.clone())),
+            giskard_core::captured_diff_id(&diff.path, diff.change, &structured(diff.clone()))
+        );
+        let mut changed = diff.clone();
+        changed.new_text = Some("newer".into());
+        assert_ne!(
+            giskard_core::captured_diff_id(&diff.path, diff.change, &structured(diff.clone())),
+            giskard_core::captured_diff_id(
+                &changed.path,
+                changed.change,
+                &structured(changed.clone())
+            )
+        );
+    }
+
+    #[test]
+    fn empty_inline_diff_roundtrips_through_format_one_payload() {
+        let item_id = ItemId::new();
+        let (descriptor, record) = giskard_core::capture_unified_diff(
+            "src/empty.rs".into(),
+            FileChangeKind::Modified,
+            Some(item_id),
+            String::new(),
+        );
+        let now = chrono::Utc::now();
+        let turn = Turn {
+            id: TurnId::new(),
+            user_input: UserInput::text("empty diff"),
+            items: vec![Item {
+                id: item_id,
+                harness_item_id: "empty-diff-item".into(),
+                payload: ItemPayload::FileChange {
+                    path: "src/empty.rs".into(),
+                    change: FileChangeKind::Modified,
+                    changes: vec![FileChangeEntry {
+                        path: "src/empty.rs".into(),
+                        change: FileChangeKind::Modified,
+                        diff: None,
+                        captured_diff: Some(descriptor.clone()),
+                    }],
+                    status: None,
+                },
+                created_at: now,
+            }],
+            model: ModelRef {
+                provider: "test".into(),
+                model: "test".into(),
+                reasoning_effort: None,
+            },
+            mode: Mode::Build,
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+            usage: TokenUsage::default(),
+            diffs: Vec::new(),
+            started_at: now,
+            completed_at: Some(now),
+        };
+
+        let bytes = payload_file_bytes_with_diffs(&turn, &[record]).unwrap();
+        let serialized = String::from_utf8(bytes).unwrap();
+        assert!(serialized.contains(r#""diff":"""#));
+        let payload = parse_turn_payload(Path::new("turn.jsonl"), &serialized).unwrap();
+        let change = match &payload.items[0].payload {
+            ItemPayload::FileChange { changes, .. } => &changes[0],
+            _ => panic!("expected file-change payload"),
+        };
+        assert_eq!(change.captured_diff.as_ref().unwrap().id, descriptor.id);
+        assert!(matches!(
+            payload.diff_contents.get(&descriptor.id),
+            Some(CapturedDiffContent::Unified { text }) if text.is_empty()
+        ));
     }
 }

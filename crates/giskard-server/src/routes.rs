@@ -103,6 +103,10 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
             "/api/projects/{id}/threads/{thread_id}/history",
             get(thread_history),
         )
+        .route(
+            "/api/projects/{id}/threads/{thread_id}/turns/{turn_id}/diffs/{diff_id}",
+            get(captured_diff),
+        )
         // File reads name their thread in the path rather than leaving it implicit. The workspace a
         // read is answered from is the thread's, so the thread has to be part of the request; a
         // caller that could omit it would be answered from somewhere it never asked about.
@@ -3916,6 +3920,66 @@ struct HistoryResponse {
     thread_id: ThreadId,
     turns: Vec<WireTurn>,
     has_more: bool,
+}
+
+#[derive(serde::Serialize)]
+struct CapturedDiffResponse {
+    diff_id: giskard_core::DiffId,
+    content: giskard_core::CapturedDiffContent,
+}
+
+#[derive(serde::Serialize)]
+struct CapturedDiffConflict {
+    code: &'static str,
+    current: WireCapturedDiffDescriptor,
+}
+
+async fn captured_diff(
+    State(state): State<AppState>,
+    AxumPath((project_id, thread_id, turn_id, diff_id)): AxumPath<(
+        ProjectId,
+        ThreadId,
+        giskard_core::TurnId,
+        String,
+    )>,
+) -> Result<axum::response::Response, ApiError> {
+    if state
+        .store
+        .load_thread(project_id, thread_id)
+        .await
+        .map_err(|error| ApiError::Internal(error.to_string()))?
+        .is_none()
+    {
+        return Err(ApiError::NotFound);
+    }
+    let diff_id = giskard_core::DiffId(diff_id);
+    match state.runtime.captured_diff(thread_id, turn_id, &diff_id) {
+        crate::thread_runtime::RuntimeDiffLookup::Found(record) => {
+            return Ok(Json(CapturedDiffResponse {
+                diff_id: record.id,
+                content: record.content,
+            })
+            .into_response());
+        }
+        crate::thread_runtime::RuntimeDiffLookup::Superseded(current) => {
+            return Ok((
+                axum::http::StatusCode::CONFLICT,
+                Json(CapturedDiffConflict {
+                    code: "diff_superseded",
+                    current: current.into(),
+                }),
+            )
+                .into_response());
+        }
+        crate::thread_runtime::RuntimeDiffLookup::Missing => {}
+    }
+    let content = state
+        .store
+        .load_captured_diff(project_id, thread_id, turn_id, &diff_id)
+        .await
+        .map_err(|error| ApiError::Internal(error.to_string()))?
+        .ok_or(ApiError::NotFound)?;
+    Ok(Json(CapturedDiffResponse { diff_id, content }).into_response())
 }
 
 /// Completed transcript pagination is an ordinary authenticated request/response. It deliberately

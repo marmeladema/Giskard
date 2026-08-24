@@ -19,10 +19,13 @@ pub mod turn;
 pub mod user_input;
 
 pub use approval::{ApprovalDecision, ApprovalKind, ApprovalMetadata, ApprovalRequest};
-pub use diff::{DiffHunk, DiffLine, FileDiff};
+pub use diff::{
+    CapturedDiffContent, CapturedDiffDescriptor, CapturedDiffRecord, DiffContentKind, DiffHunk,
+    DiffLine, FileDiff, capture_structured_diff, capture_unified_diff, captured_diff_id,
+};
 pub use error::{GiskardError, HarnessError, PersistError};
 pub use event::AgentEvent;
-pub use ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
+pub use ids::{ApprovalId, DiffId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
 pub use item::{
     FileChangeKind, Item, ItemDelta, ItemKind, ItemPayload, ItemStart, SubagentAction,
     SubagentLink, SubagentStatus,

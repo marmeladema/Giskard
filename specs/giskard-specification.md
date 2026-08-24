@@ -9,7 +9,18 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.71
+**Version:** 1.72
+
+> **Amendment — lazy captured diffs (1.72).** Agent-produced unified and structured diff bodies
+> are extracted before browser delivery into immutable, turn-owned content records. Live events,
+> reconnect state, and history carry only bounded descriptors with an opaque `DiffId`; the full
+> tagged content is read through authenticated `GET
+> /api/projects/{project_id}/threads/{thread_id}/turns/{turn_id}/diffs/{diff_id}`. Active content is
+> resolved from the runtime registry and completed content from the indexed atomic turn payload.
+> The current-worktree `/api/projects/{id}/git/diff` endpoint is unchanged. The existing payload
+> format remains unchanged: full diffs stay inline on disk, while deterministic, domain-separated
+> SHA-256 identities over content kind, path, change kind, and body, plus descriptor projections,
+> are derived in memory without rewriting files.
 
 > **Amendment — frontend approach (supersedes the Dioxus/WASM design below).**
 > This document was written targeting a **Dioxus fullstack / WebAssembly** frontend (`giskard-ui`),

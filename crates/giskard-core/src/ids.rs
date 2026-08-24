@@ -22,6 +22,11 @@ pub struct TurnId(pub ulid::Ulid);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ItemId(pub ulid::Ulid);
 
+/// Opaque identity for immutable diff content captured during one turn.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DiffId(pub String);
+
 /// Harness-native approval request identifier (opaque string; short-lived, not persisted).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -52,6 +57,11 @@ impl fmt::Display for TurnId {
 impl fmt::Display for ItemId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+impl fmt::Display for DiffId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
 }
 impl fmt::Display for ApprovalId {
@@ -105,6 +115,23 @@ impl ItemId {
     /// Mint a fresh Giskard-owned item id.
     pub fn new() -> Self {
         Self(ulid::Ulid::new())
+    }
+}
+impl DiffId {
+    /// Mint a fresh identity for newly captured content.
+    pub fn new() -> Self {
+        Self(ulid::Ulid::new().to_string())
+    }
+
+    /// Build a deterministic identity, used when projecting legacy inline content.
+    pub fn from_digest(digest: impl Into<String>) -> Self {
+        Self(digest.into())
+    }
+}
+
+impl Default for DiffId {
+    fn default() -> Self {
+        Self::new()
     }
 }
 impl FromStr for ItemId {
