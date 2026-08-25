@@ -74,6 +74,19 @@ async fn index_page_is_served_and_public() {
         "app fetches a WS auth ticket"
     );
     assert!(
+        body.contains("ticketResponse.ui_version")
+            && body.contains("serverVersion !== browserVersion")
+            && body.contains("requireUiReload(browserVersion, serverVersion);")
+            && body.find("serverVersion !== browserVersion") < body.find("new WebSocket("),
+        "the UI refuses to open a socket when its embedded assets are stale"
+    );
+    assert!(
+        body.contains("if (state.updateRequired) return;")
+            && body.contains("id=\"updateBanner\"")
+            && body.contains("sessionStorage.setItem(RELOAD_DRAFT_KEY"),
+        "an update mismatch stops reconnecting and offers a draft-preserving reload"
+    );
+    assert!(
         body.contains("ws.onmessage = (m) => {\n    if (state.ws !== ws) return;"),
         "stale websocket frames from a replaced connection are ignored"
     );
@@ -1066,13 +1079,16 @@ async fn index_page_is_served_and_public() {
     assert!(
         body.contains("const attachmentsLoading = pendingAttachmentOperationCount() > 0")
             && body.contains(
-                "readOnly || state.activeTurn || attachmentsLoading || modelUnresolved || nothingToSend ||"
+                "readOnly || state.activeTurn || state.updateRequired || state.uiVersionCheckPending ||"
             )
+            && body.contains("attachmentsLoading || modelUnresolved || nothingToSend ||")
             && body.contains("!hasThreadSurface || (!ready && !draft)")
             && body.contains("if (isDraftThread()) {")
-            && body.contains("startDraftThread(text, attachments);"),
+            && body.contains("startDraftThread(text, attachments);")
+            && body.contains("const ticketResponse = await api(\"GET\", \"/api/ws-ticket\")")
+            && body.contains("state.draftThread !== draft"),
         "UI allows draft first sends without a WebSocket, blocks existing-thread sends until open, \
-         and blocks sends on read-only threads"
+         rejects stale draft sends, and blocks sends on read-only threads"
     );
     assert!(
         body.contains("inputDrafts:new Map()")
@@ -1836,6 +1852,17 @@ async fn version_meta_and_immutable_asset_caching() {
 
     // Asset URLs are content-hashed and served immutably, so a browser cache can't shadow an upgrade.
     let js_url = between(&index_html, "<script src=\"", "\"").to_string();
+    let ui_version = between(
+        &index_html,
+        "<meta name=\"giskard-ui-version\" content=\"",
+        "\"",
+    );
+    assert!(
+        !ui_version.is_empty()
+            && ui_version != "__GISKARD_UI_VERSION__"
+            && js_url == format!("/app.{ui_version}.js"),
+        "the page compatibility identity matches its JavaScript asset: {ui_version:?} {js_url:?}"
+    );
     let js_resp = reqwest::get(format!("http://127.0.0.1:{port}{js_url}"))
         .await
         .unwrap();

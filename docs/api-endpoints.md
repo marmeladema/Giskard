@@ -24,6 +24,12 @@ WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticke
 /api/projects/{id}/mcp/oauth-login`. Wire types are defined once in `giskard-proto`. See
 [§13.6](../specs/giskard-specification.md) for the message protocol.
 
+`GET /api/ws-ticket` returns the short-lived `ticket` and `ui_version`, the content identity of the
+server's embedded JavaScript. The browser compares `ui_version` with the identity embedded in its
+loaded page before opening or reopening a WebSocket. A mismatch means the tab predates a server
+upgrade, so it stops reconnecting and asks the user to reload before version-sensitive messages can
+reach stale JavaScript.
+
 `POST /api/projects` takes a name and a directory; there is no `default_model`. A project record
 stores no model at all. The model a new thread starts on is derived from the project's catalog when
 the draft opens (the harness's default when it marks one, else the first entry), so it tracks the

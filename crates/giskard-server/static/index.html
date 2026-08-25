@@ -9,6 +9,7 @@
      instead; the visualViewport sync in app.js (sets --app-height) is the fallback that makes the
      app fit the visible area there too. -->
 <meta name="giskard-version" content="__GISKARD_VERSION__" />
+<meta name="giskard-ui-version" content="__GISKARD_UI_VERSION__" />
 <title>Giskard</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
 <link rel="stylesheet" href="__APP_CSS__" />
@@ -135,6 +136,10 @@
       </header>
       <div id="transcript" class="muted" style="padding:24px">Select or create a thread to begin.</div>
       <div class="readonly-banner" id="readOnlyBanner" hidden></div>
+      <div class="update-banner" id="updateBanner" role="alert" hidden>
+        <span>Giskard was updated. Reload before continuing. Text drafts will be preserved; attachments must be re-added.</span>
+        <button id="reloadUpdateBtn" type="button">Reload</button>
+      </div>
       <!-- Live plan for the active turn: a collapsible card pinned above the composer. Collapsed it
            shows "task N/total · current step"; expanded it shows the full checklist. It appears while
            a turn has an unfinished plan and hides when the plan completes or the turn ends. -->

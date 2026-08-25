@@ -40,6 +40,117 @@ test.describe("projects and threads", () => {
     await expect(page.locator(".thread").first()).toBeVisible();
   });
 
+  test("stale UI stops before websocket reconnect and preserves its text draft", async ({ page }) => {
+    let ticketReads = 0;
+    const sockets: string[] = [];
+    page.on("websocket", socket => sockets.push(socket.url()));
+    const project = page.locator(".proj", { hasText: "Demo" });
+    await project.locator(".project-add").click();
+    await page.locator("#input").fill("Create a thread before testing an upgrade.");
+    await page.locator("#sendBtn").click();
+    await expect(page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY })).toBeVisible();
+    const initialSocketCount = sockets.length;
+
+    const draft = "Keep this draft across the required reload.";
+    await page.locator("#input").fill(draft);
+    await page.route("**/api/ws-ticket", async route => {
+      ticketReads++;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ ticket: "unused", ui_version: "stale-ui-version" }),
+      });
+    });
+
+    await page.evaluate(() => {
+      (window as unknown as { connectWs: (options: unknown) => void })
+        .connectWs({ reconnect: true, reason: "test server upgrade" });
+    });
+    await expect(page.locator("#updateBanner")).toBeVisible();
+    await expect(page.locator("#wsStatusBadge")).toHaveText("Disconnected");
+    await expect(page.locator("#sendBtn")).toBeDisabled();
+    await expect(page.locator("#attachBtn")).toBeDisabled();
+    expect(sockets).toHaveLength(initialSocketCount);
+    expect(ticketReads).toBe(1);
+
+    await page.evaluate(() => window.dispatchEvent(new Event("online")));
+    await page.waitForTimeout(100);
+    expect(ticketReads).toBe(1);
+    await expect(page.locator("#updateBanner")).toBeVisible();
+
+    await page.unroute("**/api/ws-ticket");
+    await page.locator("#reloadUpdateBtn").click();
+    await expect(page.locator("#wsStatusBadge")).toHaveText("Connected");
+    await expect(page.locator("#input")).toHaveValue(draft);
+    await expect(page.locator("#updateBanner")).toBeHidden();
+  });
+
+  test("stale UI refuses to create a thread from a draft", async ({ page }) => {
+    const project = page.locator(".proj", { hasText: "Demo" });
+    await project.locator(".project-add").click();
+
+    const draft = "Do not submit this draft from stale JavaScript.";
+    await page.locator("#input").fill(draft);
+    let startRequests = 0;
+    await page.route("**/api/projects/*/threads/start", async route => {
+      startRequests++;
+      await route.continue();
+    });
+    await page.route("**/api/ws-ticket", async route => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ ticket: "unused", ui_version: "stale-ui-version" }),
+      });
+    });
+
+    await page.locator("#sendBtn").click();
+    await expect(page.locator("#updateBanner")).toBeVisible();
+    await expect(page.locator("#sendBtn")).toBeDisabled();
+    await expect(page.locator("#input")).toHaveValue(draft);
+    expect(startRequests).toBe(0);
+
+    await page.unroute("**/api/ws-ticket");
+    await page.locator("#reloadUpdateBtn").click();
+    await expect(page.locator("#input")).toHaveValue(draft);
+  });
+
+  test("draft creation includes text typed during the UI version check", async ({ page }) => {
+    const project = page.locator(".proj", { hasText: "Demo" });
+    await project.locator(".project-add").click();
+    await page.locator("#input").fill("Initial draft");
+
+    let releaseTicket: (() => void) | null = null;
+    let ticketObserved: (() => void) | null = null;
+    const ticketStarted = new Promise<void>(resolve => { ticketObserved = resolve; });
+    let ticketReads = 0;
+    await page.route("**/api/ws-ticket", async route => {
+      ticketReads++;
+      if (ticketReads > 1) {
+        await route.continue();
+        return;
+      }
+      ticketObserved?.();
+      await new Promise<void>(resolve => { releaseTicket = resolve; });
+      await route.continue();
+    });
+    let submittedText = "";
+    await page.route("**/api/projects/*/threads/start", async route => {
+      submittedText = route.request().postDataJSON().text;
+      await route.continue();
+    });
+
+    await page.locator("#sendBtn").click();
+    await ticketStarted;
+    await expect(page.locator("#attachBtn")).toBeDisabled();
+    await page.locator("#input").fill("Edited while checking the UI version");
+    if (!releaseTicket) throw new Error("ticket request was not intercepted");
+    releaseTicket();
+
+    await expect(page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY })).toBeVisible();
+    expect(submittedText).toBe("Edited while checking the UI version");
+  });
+
   test("deletes the open shared-workspace thread without a remote-removal warning", async ({ page }) => {
     const project = page.locator(".proj", { hasText: "Demo" });
     await project.locator(".project-add").click();

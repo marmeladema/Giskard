@@ -181,6 +181,7 @@ pub fn public_routes() -> Router<AppState> {
 /// `-dirty` suffix for uncommitted builds) shown in the Settings panel, and content hashes of the
 /// two assets used as cache-busting path segments.
 const GIT_HASH: &str = env!("GISKARD_GIT_HASH");
+const UI_VERSION: &str = env!("GISKARD_JS_HASH");
 const APP_JS_PATH: &str = concat!("/app.", env!("GISKARD_JS_HASH"), ".js");
 const APP_CSS_PATH: &str = concat!("/app.", env!("GISKARD_CSS_HASH"), ".css");
 
@@ -195,6 +196,7 @@ static INDEX_HTML: LazyLock<String> = LazyLock::new(|| {
         .replace("__APP_CSS__", APP_CSS_PATH)
         .replace("__APP_JS__", APP_JS_PATH)
         .replace("__GISKARD_VERSION__", GIT_HASH)
+        .replace("__GISKARD_UI_VERSION__", UI_VERSION)
 });
 
 /// Serve the single-page desktop UI (§13). Self-contained HTML/CSS/JS (no npm); it authenticates
@@ -3964,7 +3966,10 @@ async fn ws_ticket(State(state): State<AppState>) -> Result<Json<WsTicketRespons
     let expiry = (Utc::now().timestamp() as u64) + 60;
     let ticket = sign_token(TokenPurpose::WsTicket, expiry, &state.session_key)
         .map_err(|e| ApiError::Internal(format!("failed to sign websocket ticket: {e}")))?;
-    Ok(Json(WsTicketResponse { ticket }))
+    Ok(Json(WsTicketResponse {
+        ticket,
+        ui_version: UI_VERSION.to_owned(),
+    }))
 }
 
 #[derive(Deserialize)]
