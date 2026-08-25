@@ -20,7 +20,7 @@ use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{
     CommandExecutionStart, CommandOutputDescriptor, FileChangeEntry, FileChangeKind, Item,
     ItemDelta, ItemKind, ItemPayload, ItemStart, SubagentAction, SubagentLink, SubagentStatus,
-    ToolCallStart,
+    ToolCallStart, ToolOutputDescriptor,
 };
 use giskard_core::model::ModelRef;
 use giskard_core::server_request::ServerRequest;
@@ -124,6 +124,9 @@ pub struct WireItem {
 /// Bounded completed-command output projection.
 pub type WireCommandOutput = CommandOutputDescriptor;
 
+/// Preview-free descriptor for an addressable completed tool result.
+pub type WireToolOutput = ToolOutputDescriptor;
+
 /// Wire-mirror of [`ItemStart`]. Native routing identifiers stay server-side.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireItemStart {
@@ -205,7 +208,7 @@ pub enum WireItemPayload {
         name: String,
         input: serde_json::Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        output: Option<serde_json::Value>,
+        output: Option<WireToolOutput>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         server: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -470,6 +473,56 @@ impl WireItem {
         }
         wire
     }
+
+    /// Convert an item with descriptors prepared before browser publication.
+    pub fn from_item_with_outputs(
+        item: Item,
+        command_output: Option<WireCommandOutput>,
+        tool_output: Option<WireToolOutput>,
+    ) -> Self {
+        let Item {
+            id,
+            harness_item_id,
+            payload,
+            created_at,
+        } = item;
+        let ItemPayload::ToolCall {
+            name,
+            input,
+            output: _,
+            server,
+            status,
+            metadata,
+            subagent,
+            error,
+        } = payload
+        else {
+            return Self::from_item_with_command_output(
+                Item {
+                    id,
+                    harness_item_id,
+                    payload,
+                    created_at,
+                },
+                command_output,
+            );
+        };
+        Self {
+            id,
+            harness_item_id,
+            payload: WireItemPayload::ToolCall {
+                name,
+                input,
+                output: tool_output,
+                server,
+                status,
+                metadata,
+                subagent: subagent.map(Into::into),
+                error,
+            },
+            created_at,
+        }
+    }
 }
 
 impl From<ItemStart> for WireItemStart {
@@ -573,16 +626,30 @@ impl From<ItemPayload> for WireItemPayload {
                 metadata,
                 subagent,
                 error,
-            } => Self::ToolCall {
-                name,
-                input,
-                output,
-                server,
-                status,
-                metadata,
-                subagent: subagent.map(Into::into),
-                error,
-            },
+            } => {
+                let output = output.and_then(|value| {
+                    let terminal = status
+                        .as_deref()
+                        .is_none_or(|value| !giskard_core::item::tool_status_is_running(value));
+                    terminal
+                        .then(|| {
+                            giskard_core::item::serialize_tool_output(&value)
+                                .ok()
+                                .map(|(_, descriptor)| descriptor)
+                        })
+                        .flatten()
+                });
+                Self::ToolCall {
+                    name,
+                    input,
+                    output,
+                    server,
+                    status,
+                    metadata,
+                    subagent: subagent.map(Into::into),
+                    error,
+                }
+            }
             ItemPayload::Activity {
                 title,
                 detail,
@@ -753,6 +820,86 @@ mod tests {
         let json = serde_json::to_value(&wire).unwrap();
         assert_eq!(json["cwd"], "/home/user/dev");
         assert_eq!(json["kind"], "command_execution");
+    }
+
+    #[test]
+    fn completed_tool_wire_projection_contains_descriptor_not_json() {
+        let sentinel = "tool-output-must-stay-behind-http";
+        let item = Item {
+            id: ItemId::new(),
+            harness_item_id: "native-tool".into(),
+            payload: ItemPayload::ToolCall {
+                name: "lookup".into(),
+                input: serde_json::json!({"query": "kept-inline"}),
+                output: Some(serde_json::json!({"secret": sentinel})),
+                server: Some("example".into()),
+                status: Some("completed".into()),
+                metadata: Some(serde_json::json!({"meta": true})),
+                subagent: None,
+                error: None,
+            },
+            created_at: Utc::now(),
+        };
+        let encoded = serde_json::to_string(&WireItem::from(item)).unwrap();
+        assert!(!encoded.contains(sentinel));
+        assert!(encoded.contains("kept-inline"));
+        assert!(encoded.contains("serialized_bytes"));
+        assert!(encoded.contains("sha256_"));
+    }
+
+    #[test]
+    fn prepared_tool_projection_uses_supplied_descriptor() {
+        let sentinel = "prepared-tool-output-must-not-be-projected";
+        let item = Item {
+            id: ItemId::new(),
+            harness_item_id: "native-tool".into(),
+            payload: ItemPayload::ToolCall {
+                name: "lookup".into(),
+                input: serde_json::Value::Null,
+                output: Some(serde_json::json!({"secret": sentinel})),
+                server: None,
+                status: Some("completed".into()),
+                metadata: None,
+                subagent: None,
+                error: None,
+            },
+            created_at: Utc::now(),
+        };
+        let supplied = WireToolOutput {
+            serialized_bytes: 17,
+            version: "\"sha256_prepared\"".into(),
+        };
+        let wire = WireItem::from_item_with_outputs(item, None, Some(supplied.clone()));
+        let WireItemPayload::ToolCall { output, .. } = &wire.payload else {
+            panic!("expected tool payload");
+        };
+        assert_eq!(output, &Some(supplied));
+        assert!(!serde_json::to_string(&wire).unwrap().contains(sentinel));
+    }
+
+    #[test]
+    fn explicit_json_null_is_available_but_missing_output_is_not() {
+        let project = |output| {
+            WireItemPayload::from(ItemPayload::ToolCall {
+                name: "lookup".into(),
+                input: serde_json::Value::Null,
+                output,
+                server: None,
+                status: None,
+                metadata: None,
+                subagent: None,
+                error: None,
+            })
+        };
+        let WireItemPayload::ToolCall { output, .. } = project(Some(serde_json::Value::Null))
+        else {
+            panic!("expected tool call");
+        };
+        assert_eq!(output.unwrap().serialized_bytes, 4);
+        let WireItemPayload::ToolCall { output, .. } = project(None) else {
+            panic!("expected tool call");
+        };
+        assert!(output.is_none());
     }
 
     #[test]

@@ -47,6 +47,36 @@ async function addCompletedCommand(
   }, { itemId, turnId, preview });
 }
 
+async function addCompletedTool(
+  page: import("@playwright/test").Page,
+  itemId: string,
+  turnId: string,
+  version: string,
+  serializedBytes: number,
+  input: unknown = { query: "weather" },
+) {
+  await page.evaluate(({ itemId, turnId, version, serializedBytes, input }) => {
+    const app = window as unknown as {
+      addItem: (item: unknown, turnId: string, fromHistory: boolean) => void;
+    };
+    app.addItem({
+      id: itemId,
+      harness_item_id: `native-${itemId}`,
+      payload: {
+        kind: "tool_call",
+        name: "lookup",
+        server: "demo",
+        input,
+        output: { serialized_bytes: serializedBytes, version },
+        status: "completed",
+        metadata: null,
+        subagent: null,
+        error: null,
+      },
+    }, turnId, false);
+  }, { itemId, turnId, version, serializedBytes, input });
+}
+
 test("late completion replaces a processless running command in place", async ({ page }) => {
   await login(page);
   await page.locator(".proj", { hasText: "Demo" }).locator(".project-add").click();
@@ -267,6 +297,240 @@ test("completed command output is fetched only when its overlay opens", async ({
   await expect.poll(() => linkReads).toBe(2);
 });
 
+test("completed tool JSON is fetched lazily, validated, and copied with input", async ({ page }) => {
+  const currentVersion = '"tool_sha256_current"';
+  let reads = 0;
+  await page.route("**/items/tool-lazy-1/tool-output", async route => {
+    reads++;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      headers: { ETag: reads === 1 ? '"tool_sha256_stale"' : currentVersion },
+      body: "null",
+    });
+  });
+  await openCommandOutputTestThread(page);
+  await addCompletedTool(page, "tool-lazy-1", "turn-lazy-tool", currentVersion, 4);
+
+  const row = page.locator('[data-tool-item-id="turn-lazy-tool:tool-lazy-1"]');
+  await expect(row).toContainText("Output · 4 B");
+  await expect(row).toContainText('"weather"');
+  await expect(row).not.toContainText("null");
+  expect(reads).toBe(0);
+
+  await page.evaluate(() => {
+    const app = window as unknown as {
+      copyToClipboard: (text: string) => Promise<boolean>;
+      copiedToolOutput?: string;
+    };
+    app.copyToClipboard = async (text: string) => {
+      app.copiedToolOutput = text;
+      return true;
+    };
+  });
+  await row.locator(".output-overlay-btn").evaluate((button: HTMLButtonElement) => button.click());
+  await expect(page.locator("#codeView pre.out").last()).toHaveText("null");
+  await expect(page.locator("#codeMeta")).toContainText("Completed · 4 B");
+  await expect(page.locator("#codeMeta")).not.toContainText("line");
+  expect(reads).toBe(2);
+  await page.locator("#codeCopyDiff").click();
+  await expect.poll(() => page.evaluate(() =>
+    (window as unknown as { copiedToolOutput?: string }).copiedToolOutput,
+  )).toContain('# Input\n{\n  "query": "weather"\n}\n\n# Output\nnull');
+});
+
+test("authoritative tool completion replaces progress without leaking JSON", async ({ page }) => {
+  const version = '"tool_sha256_done"';
+  await page.route("**/items/tool-progress/tool-output", async route => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      headers: { ETag: version },
+      body: '{"result":"complete"}',
+    });
+  });
+  await openCommandOutputTestThread(page);
+  await page.evaluate(({ version }) => {
+    const app = window as unknown as {
+      startToolCall: (item: unknown, turnId: string) => void;
+      appendToolProgress: (turnId: string, itemId: string, text: string) => void;
+      addItem: (item: unknown, turnId: string, fromHistory: boolean) => void;
+    };
+    app.startToolCall({ id:"tool-progress", tool:{ name:"lookup", server:"demo", status:"in_progress" } }, "turn-progress");
+    app.appendToolProgress("turn-progress", "tool-progress", "temporary progress");
+    app.addItem({ id:"tool-progress", payload:{
+      kind:"tool_call", name:"lookup", server:"demo", input:{ q:1 }, status:"completed",
+      output:{ serialized_bytes:21, version }, error:null,
+    } }, "turn-progress", false);
+  }, { version });
+
+  const row = page.locator('[data-tool-item-id="turn-progress:tool-progress"]');
+  await expect(row).not.toContainText("temporary progress");
+  await expect(row).not.toContainText("complete");
+  await expect(row).toContainText("Output · 21 B");
+});
+
+test("open command and tool overlays release replaced output and refetch", async ({ page }) => {
+  let commandReads = 0;
+  let toolReads = 0;
+  await page.route("**/items/command-replaced/command-output", async route => {
+    commandReads++;
+    await route.fulfill({
+      status: 200, contentType: "text/plain; charset=utf-8",
+      body: commandReads === 1 ? "old command body" : "new command body",
+    });
+  });
+  await page.route("**/items/tool-replaced/tool-output", async route => {
+    toolReads++;
+    const version = toolReads === 1 ? '"tool_old"' : '"tool_new"';
+    await route.fulfill({
+      status: 200, contentType: "application/json", headers: { ETag: version },
+      body: JSON.stringify({ value: toolReads === 1 ? "old tool body" : "new tool body" }),
+    });
+  });
+  await openCommandOutputTestThread(page);
+  await addCompletedCommand(page, "command-replaced", "turn-command-replaced", "old preview");
+  const commandRow = page.locator('[data-command-item-id="turn-command-replaced:command-replaced"]');
+  await commandRow.locator(".output-overlay-btn").evaluate((button: HTMLButtonElement) => button.click());
+  await expect(page.locator("#codeView")).toContainText("old command body");
+  await addCompletedCommand(page, "command-replaced", "turn-command-replaced", "new preview");
+  await expect(page.locator("#codeView")).not.toContainText("old command body");
+  await expect(page.locator("#codeView")).toContainText("new command body");
+  expect(commandReads).toBe(2);
+
+  await page.locator("#codeClose").click();
+  await addCompletedTool(page, "tool-replaced", "turn-tool-replaced", '"tool_old"', 25);
+  const toolRow = page.locator('[data-tool-item-id="turn-tool-replaced:tool-replaced"]');
+  await toolRow.locator(".output-overlay-btn").evaluate((button: HTMLButtonElement) => button.click());
+  await expect(page.locator("#codeView")).toContainText("old tool body");
+  await addCompletedTool(page, "tool-replaced", "turn-tool-replaced", '"tool_new"', 25);
+  await expect(page.locator("#codeView")).not.toContainText("old tool body");
+  await expect(page.locator("#codeView")).toContainText("new tool body");
+  expect(toolReads).toBe(2);
+});
+
+test("obsolete lazy-output failures do not poison replacements", async ({ page }) => {
+  let releaseCommandFailure!: () => void;
+  let commandRequestStarted!: () => void;
+  const commandFailureGate = new Promise<void>(resolve => { releaseCommandFailure = resolve; });
+  const commandStarted = new Promise<void>(resolve => { commandRequestStarted = resolve; });
+  let commandReads = 0;
+  await page.route("**/items/command-failure-replaced/command-output", async route => {
+    commandReads++;
+    if (commandReads === 1) {
+      commandRequestStarted();
+      await commandFailureGate;
+      await route.fulfill({ status:500, contentType:"text/plain", body:"obsolete command failure" });
+      return;
+    }
+    await route.fulfill({
+      status:200, contentType:"text/plain; charset=utf-8", body:"replacement command body",
+    });
+  });
+
+  let releaseToolFailure!: () => void;
+  let toolRequestStarted!: () => void;
+  const toolFailureGate = new Promise<void>(resolve => { releaseToolFailure = resolve; });
+  const toolStarted = new Promise<void>(resolve => { toolRequestStarted = resolve; });
+  let toolReads = 0;
+  await page.route("**/items/tool-failure-replaced/tool-output", async route => {
+    toolReads++;
+    if (toolReads === 1) {
+      toolRequestStarted();
+      await toolFailureGate;
+      await route.fulfill({ status:500, contentType:"text/plain", body:"obsolete tool failure" });
+      return;
+    }
+    await route.fulfill({
+      status:200,
+      contentType:"application/json",
+      headers:{ ETag:'"tool_failure_new"' },
+      body:'{"value":"replacement tool body"}',
+    });
+  });
+
+  await openCommandOutputTestThread(page);
+  await addCompletedCommand(page, "command-failure-replaced", "turn-command-failure", "old preview");
+  const commandRow = page.locator('[data-command-item-id="turn-command-failure:command-failure-replaced"]');
+  await commandRow.locator(".output-overlay-btn").evaluate((button: HTMLButtonElement) => button.click());
+  await commandStarted;
+  await page.evaluate(() => {
+    const original = window.requestAnimationFrame;
+    window.requestAnimationFrame = callback => window.setTimeout(() => {
+      window.requestAnimationFrame = original;
+      callback(performance.now());
+    }, 100);
+  });
+  await addCompletedCommand(page, "command-failure-replaced", "turn-command-failure", "new preview");
+  releaseCommandFailure();
+  await expect(page.locator("#codeView")).toContainText("replacement command body");
+  await expect(page.locator("#codeView")).not.toContainText("obsolete command failure");
+  expect(commandReads).toBe(2);
+
+  await page.locator("#codeClose").click();
+  await addCompletedTool(page, "tool-failure-replaced", "turn-tool-failure", '"tool_failure_old"', 20);
+  const toolRow = page.locator('[data-tool-item-id="turn-tool-failure:tool-failure-replaced"]');
+  await toolRow.locator(".output-overlay-btn").evaluate((button: HTMLButtonElement) => button.click());
+  await toolStarted;
+  await page.evaluate(() => {
+    const original = window.requestAnimationFrame;
+    window.requestAnimationFrame = callback => window.setTimeout(() => {
+      window.requestAnimationFrame = original;
+      callback(performance.now());
+    }, 100);
+  });
+  await addCompletedTool(page, "tool-failure-replaced", "turn-tool-failure", '"tool_failure_new"', 33);
+  releaseToolFailure();
+  await expect(page.locator("#codeView")).toContainText("replacement tool body");
+  await expect(page.locator("#codeView")).not.toContainText("obsolete tool failure");
+  expect(toolReads).toBe(2);
+});
+
+test("lazy outputs reject incorrect response content types", async ({ page }) => {
+  await page.route("**/items/command-wrong-type/command-output", route => route.fulfill({
+    status: 200, contentType: "text/plain", body: "must not be accepted",
+  }));
+  await page.route("**/items/tool-wrong-type/tool-output", route => route.fulfill({
+    status: 200, contentType: "application/json; charset=utf-8", headers: { ETag: '"tool_type"' },
+    body: '{"must":"not be accepted"}',
+  }));
+  await openCommandOutputTestThread(page);
+  await addCompletedCommand(page, "command-wrong-type", "turn-command-wrong-type");
+  await page.locator('[data-command-item-id="turn-command-wrong-type:command-wrong-type"] .output-overlay-btn')
+    .evaluate((button: HTMLButtonElement) => button.click());
+  await expect(page.locator("#codeView")).toContainText("invalid Content-Type");
+  await expect(page.locator("#codeView")).not.toContainText("must not be accepted");
+  await page.locator("#codeClose").click();
+
+  await addCompletedTool(page, "tool-wrong-type", "turn-tool-wrong-type", '"tool_type"', 26);
+  await page.locator('[data-tool-item-id="turn-tool-wrong-type:tool-wrong-type"] .output-overlay-btn')
+    .evaluate((button: HTMLButtonElement) => button.click());
+  await expect(page.locator("#codeView")).toContainText("invalid Content-Type");
+  await expect(page.locator("#codeView")).not.toContainText("must not be accepted");
+});
+
+test("tool domain errors remain distinct from lazy fetch retry errors", async ({ page }) => {
+  const version = '"tool_domain_error"';
+  await page.route("**/items/tool-domain-error/tool-output", route => route.fulfill({
+    status: 200, contentType: "application/json", headers: { ETag: version }, body: '{"partial":true}',
+  }));
+  await openCommandOutputTestThread(page);
+  await addCompletedTool(page, "tool-domain-error", "turn-tool-domain-error", version, 16);
+  await page.evaluate(() => {
+    const app = window as unknown as { addItem: (item: unknown, turnId: string, fromHistory: boolean) => void };
+    app.addItem({ id:"tool-domain-error", payload:{
+      kind:"tool_call", name:"lookup", server:"demo", input:{ query:"weather" },
+      output:{ serialized_bytes:16, version:'"tool_domain_error"' }, status:"failed",
+      error:"provider rejected request", metadata:null, subagent:null,
+    } }, "turn-tool-domain-error", false);
+  });
+  await page.locator('[data-tool-item-id="turn-tool-domain-error:tool-domain-error"] .output-overlay-btn')
+    .evaluate((button: HTMLButtonElement) => button.click());
+  await expect(page.locator("#codeView")).toContainText("provider rejected request");
+  await expect(page.locator("#codeView")).toContainText('"partial": true');
+  await expect(page.locator("#codeView .output-overlay-btn", { hasText:"Retry" })).toHaveCount(0);
+});
+
 test("failed command output fetch can be retried", async ({ page }) => {
   let reads = 0;
   await page.route("**/items/command-raw-retry/command-output", async route => {
@@ -300,7 +564,7 @@ test("closing command output isolates a late raw response", async ({ page }) => 
   await page.route("**/items/command-close-raw/command-output", async route => {
     reads++;
     await mayRespond;
-    await route.fulfill({ status: 200, body: "late closed output" }).catch(() => {});
+    await route.fulfill({ status: 200, contentType:"text/plain; charset=utf-8", body: "late closed output" }).catch(() => {});
   });
 
   await openCommandOutputTestThread(page);
@@ -323,10 +587,10 @@ test("switching command overlays isolates a late raw response", async ({ page })
   await page.route("**/items/command-first-raw/command-output", async route => {
     firstReads++;
     await firstMayRespond;
-    await route.fulfill({ status: 200, body: "late first output" }).catch(() => {});
+    await route.fulfill({ status: 200, contentType:"text/plain; charset=utf-8", body: "late first output" }).catch(() => {});
   });
   await page.route("**/items/command-second-raw/command-output", async route => {
-    await route.fulfill({ status: 200, body: "current second output" });
+    await route.fulfill({ status: 200, contentType:"text/plain; charset=utf-8", body: "current second output" });
   });
 
   await openCommandOutputTestThread(page);
@@ -347,7 +611,7 @@ test("switching command overlays isolates a late raw response", async ({ page })
 
 test("late clipboard completion does not relabel a different overlay", async ({ page }) => {
   await page.route("**/items/command-copy-race/command-output", async route => {
-    await route.fulfill({ status: 200, body: "copied command output" });
+    await route.fulfill({ status: 200, contentType:"text/plain; charset=utf-8", body: "copied command output" });
   });
   await openCommandOutputTestThread(page);
   await addCompletedCommand(page, "command-copy-race", "turn-copy-race");

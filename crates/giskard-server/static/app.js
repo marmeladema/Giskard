@@ -6988,7 +6988,7 @@ function renderItemBody(body, p) {
   } else if (p.kind==="file_change") {
     renderFileChange(body, p);
   } else if (p.kind==="tool_call") {
-    const stateName = toolVisualStateFromStatus(p.status, p.error);
+    const stateName = toolDisplayVisualState(p);
     msg.classList.add(`state-${stateName}`);
     if (stateName==="running") msg.classList.add("running-tool");
     renderToolBody(body, p);
@@ -7450,7 +7450,7 @@ async function openCapturedDiff(descriptor, turnId, sourceRow) {
 // same row-owned collapse model as command output: running rows start expanded while small, large
 // running payloads auto-collapse, and completed payloads collapse by default.
 function renderToolBody(body, p) {
-  const stateName = toolVisualStateFromStatus(p.status, p.error);
+  const stateName = toolDisplayVisualState(p);
   const msg = body.parentElement;
   const itemId = idKey(msg.dataset.toolItemId);
   if (itemId) {
@@ -7477,7 +7477,8 @@ function renderToolBody(body, p) {
   renderToolIoBlocks(body, {
     itemId,
     phase:stateName === "running" ? "running" : "completed",
-    blocks:toolIoBlocks(p)
+    blocks:toolIoBlocks(p),
+    descriptor:toolOutputDescriptor(p)
   });
   attachSubagentLinkActions(body, p);
   if (p.error) {
@@ -7490,10 +7491,25 @@ function renderToolBody(body, p) {
 function toolIoBlocks(p) {
   const blocks = [];
   const input = toolIoText(p.input);
-  const output = toolIoText(p.output);
+  // A terminal tool output is an addressable descriptor, not a JSON preview. Running tool output
+  // is temporary MCP progress and remains inline until an authoritative completion replaces it.
+  const output = toolOutputDescriptor(p) ? "" : toolIoText(p.output);
   if (input) blocks.push({ label:"Input", text:input });
   if (output) blocks.push({ label:"Output", text:output });
   return blocks;
+}
+function toolOutputDescriptor(p) {
+  if (!p) return null;
+  const output = p.output;
+  if (!output || typeof output !== "object" || Array.isArray(output)) return null;
+  const serializedBytes = Number(output.serialized_bytes);
+  return Number.isFinite(serializedBytes) && serializedBytes >= 0 && typeof output.version === "string" && output.version
+    ? output
+    : null;
+}
+function toolDisplayVisualState(p) {
+  const stateName = toolVisualStateFromStatus(p && p.status, p && p.error);
+  return stateName === "running" && toolOutputDescriptor(p) ? "succeeded" : stateName;
 }
 function toolIoText(value) {
   if (!hasMeaningfulJson(value)) return "";
@@ -7504,7 +7520,8 @@ function toolIoStats(blocks) {
 }
 function renderToolIoBlocks(body, opts) {
   const blocks = opts.blocks || [];
-  if (!blocks.length) {
+  const descriptor = opts.descriptor || null;
+  if (!blocks.length && !descriptor) {
     clearRowToggle(body.parentElement);
     return;
   }
@@ -7518,12 +7535,13 @@ function renderToolIoBlocks(body, opts) {
 
   const summary = document.createElement("div");
   summary.className = "meta cmd-output-summary";
-  const label = commandOutputStatsLabel(stats, phase);
   const text = document.createElement("span");
   text.className = "cmd-output-summary-text";
-  text.textContent = stats.chars ? `Tool data · ${label}` : label;
+  text.textContent = descriptor
+    ? `Output · ${formatBytes(descriptorNumber(descriptor, "serialized_bytes", 0))}`
+    : (stats.chars ? `Tool data · ${commandOutputStatsLabel(stats, phase)}` : commandOutputStatsLabel(stats, phase));
   summary.append(text);
-  if (stats.chars || phase === "running") {
+  if (descriptor || stats.chars || phase === "running") {
     summary.append(makeOutputOverlayButton(itemId, "tool"));
   }
   body.append(summary);
@@ -8323,9 +8341,7 @@ $("codeCopyDiff").onclick = async () => {
   const ov = state.outputOverlay;
   const diffText = state.diffOverlayText;
   const model = ov && outputOverlayModel(ov.itemId, ov.kind);
-  const outputText = ov && ov.loadedText != null
-    ? ov.loadedText
-    : model && model.blocks.length === 1 && model.blocks[0].label === "Output"
+  const outputText = model && model.blocks.length === 1 && model.blocks[0].label === "Output"
       ? model.blocks[0].text
       : model && model.blocks.length
         ? model.blocks.map((b) => `# ${b.label}\n${b.text}`).join("\n\n")
@@ -8386,9 +8402,17 @@ function outputOverlayModel(itemId, kind) {
   if (kind === "tool") {
     const payload = state.toolPayloadsByItemId.get(key);
     if (!payload) return null;
+    const descriptor = toolOutputDescriptor(payload);
+    const overlay = state.outputOverlay && state.outputOverlay.itemId === key ? state.outputOverlay : null;
     const blocks = toolIoBlocks(payload);
-    const stateName = toolVisualStateFromStatus(payload.status, payload.error);
+    if (descriptor && overlay && overlay.outputLoaded && overlay.outputVersion === descriptor.version) {
+      blocks.push({ label:"Output", text:JSON.stringify(overlay.loadedJson, null, 2) });
+    }
+    const stateName = toolDisplayVisualState(payload);
     const running = stateName === "running";
+    const stats = descriptor
+      ? { chars:0, bytes:descriptorNumber(descriptor, "serialized_bytes", 0), lineCount:0 }
+      : toolIoStats(blocks);
     return {
       kind,
       title: taskTitleText({ kind: "tool", server: payload.server || "", command: payload.name || "tool" }),
@@ -8396,10 +8420,17 @@ function outputOverlayModel(itemId, kind) {
       running,
       stateLabel: running ? "Running" : (stateName === "succeeded" ? "Completed" : stateName === "failed" ? "Failed" : "Ended"),
       blocks,
-      stats: toolIoStats(blocks),
+      stats,
+      hasOutput:!!descriptor || !!stats.chars,
+      statsLabel:descriptor
+        ? formatBytes(stats.bytes)
+        : commandOutputStatsLabel(stats, running ? "running" : "completed"),
       linkify: false,
       truncated: outputHasTruncationMarker(blocks),
-      error: payload.error || ""
+      available:!!descriptor,
+      loading:!!(overlay && overlay.loading),
+      errors:[overlay && overlay.error, payload.error].filter(Boolean),
+      retryable:!!(overlay && overlay.error)
     };
   }
   const phase = commandOutputPhaseForId(key);
@@ -8410,9 +8441,10 @@ function outputOverlayModel(itemId, kind) {
   const descriptor = commandOutputDescriptor(payload && payload.output);
   const overlay = state.outputOverlay && state.outputOverlay.itemId === key ? state.outputOverlay : null;
   const lateLocalOutput = ended && ended.lateLocalOutput ? ended.command.output || "" : "";
+  const loadedText = overlay && overlay.loadedPayload === payload ? overlay.loadedText : null;
   const output = running
     ? commandOutputForId(key)
-    : (overlay && overlay.loadedText != null ? overlay.loadedText : lateLocalOutput);
+    : (loadedText != null ? loadedText : lateLocalOutput);
   let stateLabel = running ? "Running" : "Completed";
   if (!running) {
     const status = (ended && ended.status) || (payload && payload.status) || (cmd && cmd.status) || "";
@@ -8421,6 +8453,7 @@ function outputOverlayModel(itemId, kind) {
       stateName === "terminated" ? "Stopped" : "Completed";
   }
   const blocks = output ? [{ label: "Output", text: output }] : [];
+  const stats = descriptor ? commandDescriptorStats(descriptor) : commandOutputStats(output);
   return {
     kind: "command",
     title: "$ " + (commandLabelForId(key) || "(command)"),
@@ -8428,12 +8461,15 @@ function outputOverlayModel(itemId, kind) {
     running,
     stateLabel,
     blocks,
-    stats:descriptor ? commandDescriptorStats(descriptor) : commandOutputStats(output),
+    stats,
+    hasOutput:!!stats.chars,
+    statsLabel:commandOutputStatsLabel(stats, phase),
     linkify: true,
     truncated:!!(descriptor && descriptor.durable_truncated) || outputHasTruncationMarker(blocks),
     available:!!(descriptor && descriptor.output_available),
     loading:!!(overlay && overlay.loading),
-    error:(overlay && overlay.error) || ""
+    errors:[overlay && overlay.error].filter(Boolean),
+    retryable:!!(overlay && overlay.error)
   };
 }
 function commandOutputIdentity(itemId) {
@@ -8443,6 +8479,9 @@ function commandOutputIdentity(itemId) {
 }
 function commandOutputUrl(projectId, threadId, turnId, itemId) {
   return `/api/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(threadId)}/turns/${encodeURIComponent(turnId)}/items/${encodeURIComponent(itemId)}/command-output`;
+}
+function toolOutputUrl(projectId, threadId, turnId, itemId) {
+  return `/api/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(threadId)}/turns/${encodeURIComponent(turnId)}/items/${encodeURIComponent(itemId)}/tool-output`;
 }
 function commandOutputLinksUrl(projectId, threadId, turnId, itemId) {
   return commandOutputUrl(projectId, threadId, turnId, itemId) + "-links";
@@ -8460,20 +8499,29 @@ async function loadCommandOutputOverlay(overlay) {
   overlay.loading = true;
   overlay.error = "";
   overlay.loadedText = null;
+  overlay.loadedPayload = null;
+  const payload = state.commandPayloadsByItemId.get(overlay.itemId);
+  overlay.loadingPayload = payload;
   renderOutputOverlay();
   try {
     const response = await fetch(commandOutputUrl(projectId, threadId, identity.turnId, identity.itemId), {
       signal:controller ? controller.signal : undefined
     });
     if (!response.ok) throw new Error(await response.text() || `HTTP ${response.status}`);
+    if ((response.headers.get("content-type") || "") !== "text/plain; charset=utf-8") {
+      throw new Error("Command output response had an invalid Content-Type.");
+    }
     const text = await response.text();
     if (state.outputOverlay !== overlay || requestId !== state.outputOverlayRequestSeq ||
         state.activeViewGeneration !== generation || state.projectId !== projectId ||
         state.threadId !== threadId || overlay.itemId !== scopedItemKey(identity.turnId, identity.itemId) ||
-        !$("codeOverlay").classList.contains("open")) return;
+        !$("codeOverlay").classList.contains("open") ||
+        state.commandPayloadsByItemId.get(overlay.itemId) !== payload) return;
     overlay.loadedText = text;
+    overlay.loadedPayload = payload;
     overlay.outputVersion = response.headers.get("etag") || "";
     overlay.loading = false;
+    overlay.loadingPayload = null;
     overlay.controller = null;
     setCodeCopyDiff(true);
     $("codeCopyDiff").textContent = "Copy output";
@@ -8481,10 +8529,76 @@ async function loadCommandOutputOverlay(overlay) {
   } catch (e) {
     if (controller && controller.signal.aborted) return;
     if (state.outputOverlay !== overlay || requestId !== state.outputOverlayRequestSeq ||
-        state.activeViewGeneration !== generation || state.projectId !== projectId || state.threadId !== threadId) return;
+        state.activeViewGeneration !== generation || state.projectId !== projectId || state.threadId !== threadId ||
+        state.commandPayloadsByItemId.get(overlay.itemId) !== payload) return;
     overlay.loading = false;
+    overlay.loadingPayload = null;
     overlay.controller = null;
     overlay.error = apiFailureMessage(e) || "Could not load command output.";
+    renderOutputOverlay();
+  }
+}
+async function loadToolOutputOverlay(overlay) {
+  const identity = commandOutputIdentity(overlay.itemId);
+  const projectId = state.projectId;
+  const threadId = state.threadId;
+  const generation = state.activeViewGeneration;
+  if (!identity || !projectId || !threadId || overlay.kind !== "tool") return;
+  if (overlay.controller) overlay.controller.abort();
+  const requestId = ++state.outputOverlayRequestSeq;
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  overlay.controller = controller;
+  overlay.loading = true;
+  overlay.error = "";
+  overlay.outputLoaded = false;
+  overlay.loadedJson = null;
+  renderOutputOverlay();
+  try {
+    // One replacement can race a fetch. Retry once against the currently selected descriptor;
+    // repeated churn becomes a visible retryable error instead of an unbounded request loop.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const payload = state.toolPayloadsByItemId.get(overlay.itemId);
+      const descriptor = toolOutputDescriptor(payload);
+      if (!descriptor) throw new Error("Tool output is no longer available.");
+      overlay.loadingVersion = descriptor.version;
+      const response = await fetch(toolOutputUrl(projectId, threadId, identity.turnId, identity.itemId), {
+        signal:controller ? controller.signal : undefined
+      });
+      if (!response.ok) throw new Error(await response.text() || `HTTP ${response.status}`);
+      if ((response.headers.get("content-type") || "") !== "application/json") {
+        throw new Error("Tool output response had an invalid Content-Type.");
+      }
+      const value = await response.json();
+      const responseVersion = response.headers.get("etag") || "";
+      const currentDescriptor = toolOutputDescriptor(state.toolPayloadsByItemId.get(overlay.itemId));
+      const selected = state.outputOverlay === overlay && requestId === state.outputOverlayRequestSeq &&
+        state.activeViewGeneration === generation && state.projectId === projectId && state.threadId === threadId &&
+        overlay.itemId === scopedItemKey(identity.turnId, identity.itemId) && $("codeOverlay").classList.contains("open");
+      if (!selected) return;
+      if (currentDescriptor && responseVersion === currentDescriptor.version) {
+        overlay.loadedJson = value;
+        overlay.outputLoaded = true;
+        overlay.outputVersion = responseVersion;
+        overlay.loading = false;
+        overlay.loadingVersion = "";
+        overlay.controller = null;
+        setCodeCopyDiff(true);
+        $("codeCopyDiff").textContent = "Copy output";
+        renderOutputOverlay();
+        return;
+      }
+      if (attempt === 1) throw new Error("Tool output changed while it was loading.");
+    }
+  } catch (e) {
+    if (controller && controller.signal.aborted) return;
+    const currentDescriptor = toolOutputDescriptor(state.toolPayloadsByItemId.get(overlay.itemId));
+    if (state.outputOverlay !== overlay || requestId !== state.outputOverlayRequestSeq ||
+        state.activeViewGeneration !== generation || state.projectId !== projectId || state.threadId !== threadId ||
+        !currentDescriptor || currentDescriptor.version !== overlay.loadingVersion) return;
+    overlay.loading = false;
+    overlay.loadingVersion = "";
+    overlay.controller = null;
+    overlay.error = apiFailureMessage(e) || "Could not load tool output.";
     renderOutputOverlay();
   }
 }
@@ -8499,7 +8613,8 @@ function openOutputOverlay(itemId, kind) {
   delete $("codeOverlay").dataset.requestId;
   releaseOutputOverlay();
   state.outputOverlay = {
-    itemId:key, kind, loadedText:null, loading:false, error:"", controller:null,
+    itemId:key, kind, loadedText:null, loadedPayload:null, loadingPayload:null, loadedJson:null, outputLoaded:false, loading:false, error:"", controller:null,
+    loadingVersion:"",
     outputVersion:"", links:null, linksVersion:"", linkResolvedVersion:"", linkController:null
   };
   cancelOutputOverlayRefresh();
@@ -8515,6 +8630,8 @@ function openOutputOverlay(itemId, kind) {
   const model = outputOverlayModel(key, kind);
   if (kind === "command" && model && !model.running && model.available) {
     loadCommandOutputOverlay(state.outputOverlay);
+  } else if (kind === "tool" && model && !model.running && model.available) {
+    loadToolOutputOverlay(state.outputOverlay);
   } else if (kind === "command" && model && !model.running && model.blocks.length) {
     setCodeCopyDiff(true);
     $("codeCopyDiff").textContent = "Copy output";
@@ -8532,10 +8649,10 @@ function renderOutputOverlay() {
     return;
   }
   $("codePath").textContent = model.title;
-  const statLabel = commandOutputStatsLabel(model.stats, model.phase);
+  const statLabel = model.statsLabel;
   const spinner = model.running ? "⟳ " : "";
   const truncSuffix = model.truncated ? " · retained output truncated" : "";
-  $("codeMeta").textContent = model.stats.chars
+  $("codeMeta").textContent = model.hasOutput
     ? `${spinner}${model.stateLabel} · ${statLabel}${truncSuffix}`
     : `${spinner}${model.stateLabel} · ${model.running ? "no output yet" : "no output"}`;
   $("codeDownload").disabled = model.loading || !model.blocks.length;
@@ -8551,7 +8668,7 @@ function renderOutputOverlay() {
   if (model.loading) {
     const loading = document.createElement("div");
     loading.className = "code-empty";
-    loading.textContent = "Loading command output…";
+    loading.textContent = ov.kind === "tool" ? "Loading tool output…" : "Loading command output…";
     wrap.append(loading);
   } else if (model.truncated) {
     const banner = document.createElement("div");
@@ -8561,7 +8678,7 @@ function renderOutputOverlay() {
       : "⚠ Retained output is truncated — the middle exceeded this project's retention limit.";
     wrap.append(banner);
   }
-  if (!model.loading && !model.blocks.length && !model.error) {
+  if (!model.loading && !model.blocks.length && !model.errors.length) {
     const empty = document.createElement("div");
     empty.className = "code-empty";
     empty.textContent = model.running ? "Waiting for output…" : "No output.";
@@ -8588,19 +8705,19 @@ function renderOutputOverlay() {
       wrap.append(section);
     }
   }
-  if (model.error) {
+  for (const message of model.errors) {
     const err = document.createElement("div");
     err.className = "meta output-overlay-error";
-    err.textContent = "error: " + model.error;
+    err.textContent = "error: " + message;
     wrap.append(err);
-    if (model.kind === "command" && model.available) {
-      const retry = document.createElement("button");
-      retry.type = "button";
-      retry.className = "output-overlay-btn";
-      retry.textContent = "Retry";
-      retry.onclick = () => loadCommandOutputOverlay(ov);
-      wrap.append(retry);
-    }
+  }
+  if (model.retryable && model.available) {
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.className = "output-overlay-btn";
+    retry.textContent = "Retry";
+    retry.onclick = () => model.kind === "tool" ? loadToolOutputOverlay(ov) : loadCommandOutputOverlay(ov);
+    wrap.append(retry);
   }
   view.replaceChildren(wrap);
   // Follow the tail when pinned; otherwise hold the reader's place so a delta doesn't yank them to
@@ -8673,12 +8790,45 @@ function refreshOutputOverlay(itemId) {
   outputOverlayRaf = schedule(() => {
     outputOverlayRaf = 0;
     if (!state.outputOverlay || !$("codeOverlay").classList.contains("open")) return;
-    renderOutputOverlay();
     const current = state.outputOverlay;
+    const payload = current.kind === "tool"
+      ? state.toolPayloadsByItemId.get(current.itemId)
+      : state.commandPayloadsByItemId.get(current.itemId);
+    const descriptor = current.kind === "tool"
+      ? toolOutputDescriptor(payload)
+      : commandOutputDescriptor(payload && payload.output);
+    const stale = current.kind === "tool"
+      ? (current.outputLoaded && (!descriptor || current.outputVersion !== descriptor.version)) ||
+        (current.loading && (!descriptor || current.loadingVersion !== descriptor.version))
+      : (current.loadedText != null && current.loadedPayload !== payload) ||
+        (current.loading && current.loadingPayload !== payload);
+    if (stale) {
+      if (current.controller) current.controller.abort();
+      if (current.linkController) current.linkController.abort();
+      current.controller = null;
+      current.linkController = null;
+      current.loadedText = null;
+      current.loadedPayload = null;
+      current.loadedJson = null;
+      current.outputLoaded = false;
+      current.loading = false;
+      current.loadingPayload = null;
+      current.loadingVersion = "";
+      current.outputVersion = "";
+      current.links = null;
+      current.linksVersion = "";
+      current.linkResolvedVersion = "";
+      current.error = "";
+      if (current.kind === "command") setCodeCopyDiff(false);
+    }
+    renderOutputOverlay();
     const model = outputOverlayModel(current.itemId, current.kind);
     if (current.kind === "command" && model && !model.running && model.available &&
         current.loadedText == null && !current.loading && !current.error) {
       loadCommandOutputOverlay(current);
+    } else if (current.kind === "tool" && model && !model.running && model.available &&
+        !current.outputLoaded && !current.loading && !current.error) {
+      loadToolOutputOverlay(current);
     }
   });
 }

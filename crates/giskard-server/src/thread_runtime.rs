@@ -47,6 +47,7 @@ struct ThreadRuntimeEntry {
     tasks: RunningTaskState,
     captured_diffs: HashMap<TurnId, ActiveCapturedDiffs>,
     command_outputs: HashMap<(TurnId, ItemId), RuntimeCommandOutput>,
+    tool_outputs: HashMap<(TurnId, ItemId), RuntimeToolOutput>,
     persisted_command_output_versions: HashMap<(TurnId, ItemId), String>,
 }
 
@@ -59,16 +60,30 @@ pub(crate) struct RuntimeCommandOutput {
     pub version: String,
 }
 
-pub(crate) struct PreparedCommandOutput {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeToolOutput {
+    pub bytes: Vec<u8>,
+    pub descriptor: giskard_proto::WireToolOutput,
+}
+
+pub(crate) struct PreparedItemOutput {
     turn_id: TurnId,
     item_id: ItemId,
-    runtime: Option<RuntimeCommandOutput>,
-    descriptor: Option<giskard_core::CommandOutputDescriptor>,
+    command_runtime: Option<RuntimeCommandOutput>,
+    command_descriptor: Option<giskard_core::CommandOutputDescriptor>,
+    tool_runtime: Option<RuntimeToolOutput>,
+    tool_descriptor: Option<giskard_proto::WireToolOutput>,
+    command_item: bool,
     live_event: Option<AgentEvent>,
 }
 
 pub(crate) enum RuntimeCommandOutputLookup {
     Found(RuntimeCommandOutput),
+    Missing,
+}
+
+pub(crate) enum RuntimeToolOutputLookup {
+    Found(RuntimeToolOutput),
     Missing,
 }
 
@@ -267,17 +282,17 @@ impl ThreadRuntimeRegistry {
     }
 
     /// Normalize and fully project command output before the event enters locked runtime state.
-    pub(crate) fn prepare_command_output(
+    pub(crate) fn prepare_item_output(
         &self,
         event: AgentEvent,
-    ) -> (AgentEvent, Option<PreparedCommandOutput>) {
+    ) -> (AgentEvent, Option<PreparedItemOutput>) {
         let event = self.normalize_command_output(event);
-        let prepared = prepare_normalized_command_output(&event);
+        let prepared = prepare_item_output(&event);
         (event, prepared)
     }
 
-    fn prepare_existing_command_output(&self, event: &AgentEvent) -> Option<PreparedCommandOutput> {
-        prepare_normalized_command_output(event)
+    fn prepare_existing_item_output(&self, event: &AgentEvent) -> Option<PreparedItemOutput> {
+        prepare_item_output(event)
     }
 
     /// Extract full diff bodies before an event reaches reconnect state or browser projection.
@@ -363,7 +378,8 @@ impl ThreadRuntimeRegistry {
         let Some(entry) = self.existing_entry(thread_id) else {
             return RuntimeCommandOutputLookup::Missing;
         };
-        lock_unpoison(&entry, "thread runtime entry")
+        let entry = lock_unpoison(&entry, "thread runtime entry");
+        entry
             .command_outputs
             .get(&(turn_id, item_id))
             .cloned()
@@ -371,6 +387,31 @@ impl ThreadRuntimeRegistry {
                 RuntimeCommandOutputLookup::Missing,
                 RuntimeCommandOutputLookup::Found,
             )
+    }
+
+    pub(crate) fn tool_output(
+        &self,
+        thread_id: ThreadId,
+        turn_id: TurnId,
+        item_id: ItemId,
+    ) -> RuntimeToolOutputLookup {
+        let Some(entry) = self.existing_entry(thread_id) else {
+            return RuntimeToolOutputLookup::Missing;
+        };
+        let entry = lock_unpoison(&entry, "thread runtime entry");
+        entry.tool_outputs.get(&(turn_id, item_id)).cloned().map_or(
+            RuntimeToolOutputLookup::Missing,
+            RuntimeToolOutputLookup::Found,
+        )
+    }
+
+    pub(crate) fn remove_tool_output(&self, thread_id: ThreadId, turn_id: TurnId, item_id: ItemId) {
+        let Some(entry) = self.existing_entry(thread_id) else {
+            return;
+        };
+        lock_unpoison(&entry, "thread runtime entry")
+            .tool_outputs
+            .remove(&(turn_id, item_id));
     }
 
     pub(crate) fn remove_command_output(
@@ -637,7 +678,7 @@ impl ThreadRuntimeRegistry {
             );
             return AppliedRuntimeEvent::unchanged();
         }
-        let prepared_output = self.prepare_existing_command_output(event);
+        let prepared_output = self.prepare_existing_item_output(event);
         self.apply_prepared_event(thread_id, event, append_live, prepared_output)
     }
 
@@ -646,7 +687,7 @@ impl ThreadRuntimeRegistry {
         thread_id: ThreadId,
         event: &AgentEvent,
         append_live: bool,
-        prepared_output: Option<PreparedCommandOutput>,
+        prepared_output: Option<PreparedItemOutput>,
     ) -> AppliedRuntimeEvent {
         if event.thread_id() != thread_id {
             return self.apply_event(thread_id, event, append_live);
@@ -667,7 +708,7 @@ impl ThreadRuntimeRegistry {
         permit: &RestorePermit,
         event: &AgentEvent,
         append_live: bool,
-        prepared_output: Option<PreparedCommandOutput>,
+        prepared_output: Option<PreparedItemOutput>,
     ) -> Option<AppliedRuntimeEvent> {
         if event.thread_id() != permit.thread_id {
             return None;
@@ -699,21 +740,25 @@ impl ThreadRuntimeRegistry {
         thread_id: ThreadId,
         event: &AgentEvent,
         append_live: bool,
-        mut prepared_output: Option<PreparedCommandOutput>,
+        mut prepared_output: Option<PreparedItemOutput>,
         entry: &mut ThreadRuntimeEntry,
     ) -> AppliedRuntimeEvent {
-        let live_descriptor = prepared_output
+        let live_command_descriptor = prepared_output
             .as_ref()
-            .and_then(|prepared| prepared.descriptor.clone());
+            .and_then(|prepared| prepared.command_descriptor.clone());
+        let live_tool_descriptor = prepared_output
+            .as_ref()
+            .and_then(|prepared| prepared.tool_descriptor.clone());
         let live_event = prepared_output
             .as_mut()
             .and_then(|prepared| prepared.live_event.take());
         let mut applied = self.apply_event_locked(thread_id, event, false, prepared_output, entry);
         if append_live && entry.live.is_active(thread_id) {
-            entry.live.append_with_command_output(
+            entry.live.append_with_outputs(
                 thread_id,
                 live_event.unwrap_or_else(|| event.clone()),
-                live_descriptor,
+                live_command_descriptor,
+                live_tool_descriptor,
             );
         }
         if applied.overview_refresh_needed {
@@ -727,7 +772,7 @@ impl ThreadRuntimeRegistry {
         thread_id: ThreadId,
         event: &AgentEvent,
         append_live: bool,
-        prepared_output: Option<PreparedCommandOutput>,
+        prepared_output: Option<PreparedItemOutput>,
         entry: &mut ThreadRuntimeEntry,
     ) -> AppliedRuntimeEvent {
         let sequence = (!matches!(
@@ -770,9 +815,10 @@ impl ThreadRuntimeRegistry {
         };
         if let AgentEvent::ItemCompleted { turn, item, .. } = event {
             if let Some(prepared) = prepared_output {
-                update_prepared_command_output_authority(entry, prepared);
+                update_prepared_item_output_authority(entry, prepared);
             } else {
                 update_command_output_authority(entry, *turn, item);
+                update_tool_output_authority(entry, *turn, item);
             }
         }
         let tasks_changed = entry.tasks.apply_event(event);
@@ -826,6 +872,9 @@ impl ThreadRuntimeRegistry {
                     entry.captured_diffs.remove(&completed_turn);
                     entry
                         .command_outputs
+                        .retain(|(turn_id, _), _| *turn_id != completed_turn);
+                    entry
+                        .tool_outputs
                         .retain(|(turn_id, _), _| *turn_id != completed_turn);
                 }
                 entry.requests.retain(|_, record| {
@@ -1221,10 +1270,45 @@ fn update_command_output_authority(entry: &mut ThreadRuntimeEntry, turn_id: Turn
     );
 }
 
-fn prepare_normalized_command_output(event: &AgentEvent) -> Option<PreparedCommandOutput> {
+fn prepare_item_output(event: &AgentEvent) -> Option<PreparedItemOutput> {
     let AgentEvent::ItemCompleted { turn, item, .. } = event else {
         return None;
     };
+    if let ItemPayload::ToolCall { output, status, .. } = &item.payload {
+        let terminal = !status
+            .as_deref()
+            .is_some_and(giskard_core::item::tool_status_is_running);
+        let prepared = output
+            .as_ref()
+            .filter(|_| terminal)
+            .and_then(|output| giskard_core::item::serialize_tool_output(output).ok());
+        let (tool_runtime, tool_descriptor) =
+            prepared.map_or((None, None), |(bytes, descriptor)| {
+                (
+                    Some(RuntimeToolOutput {
+                        bytes,
+                        descriptor: descriptor.clone(),
+                    }),
+                    Some(descriptor),
+                )
+            });
+        let mut live_event = event.clone();
+        if let AgentEvent::ItemCompleted { item, .. } = &mut live_event
+            && let ItemPayload::ToolCall { output, .. } = &mut item.payload
+        {
+            *output = None;
+        }
+        return Some(PreparedItemOutput {
+            turn_id: *turn,
+            item_id: item.id,
+            command_runtime: None,
+            command_descriptor: None,
+            tool_runtime,
+            tool_descriptor,
+            command_item: false,
+            live_event: Some(live_event),
+        });
+    }
     let ItemPayload::CommandExecution {
         output,
         output_truncated,
@@ -1265,26 +1349,29 @@ fn prepare_normalized_command_output(event: &AgentEvent) -> Option<PreparedComma
     {
         *output = descriptor.preview.clone();
     }
-    Some(PreparedCommandOutput {
+    Some(PreparedItemOutput {
         turn_id: *turn,
         item_id: item.id,
-        runtime,
-        descriptor,
+        command_runtime: runtime,
+        command_descriptor: descriptor,
+        tool_runtime: None,
+        tool_descriptor: None,
+        command_item: true,
         live_event: Some(live_event),
     })
 }
 
-fn update_prepared_command_output_authority(
+fn update_prepared_item_output_authority(
     entry: &mut ThreadRuntimeEntry,
-    prepared: PreparedCommandOutput,
+    prepared: PreparedItemOutput,
 ) {
     let key = (prepared.turn_id, prepared.item_id);
-    match prepared.runtime {
+    match prepared.command_runtime {
         Some(runtime) => {
             entry.command_outputs.insert(key, runtime);
         }
         None => {
-            if prepared.descriptor.is_none() {
+            if prepared.command_item && prepared.command_descriptor.is_none() {
                 tracing::error!(
                     turn_id = %prepared.turn_id,
                     item_id = %prepared.item_id,
@@ -1292,6 +1379,44 @@ fn update_prepared_command_output_authority(
                 );
             }
             entry.command_outputs.remove(&key);
+        }
+    }
+    match prepared.tool_runtime {
+        Some(runtime) => {
+            entry.tool_outputs.insert(key, runtime);
+        }
+        None => {
+            entry.tool_outputs.remove(&key);
+        }
+    }
+}
+
+fn update_tool_output_authority(entry: &mut ThreadRuntimeEntry, turn_id: TurnId, item: &Item) {
+    let key = (turn_id, item.id);
+    let ItemPayload::ToolCall { output, status, .. } = &item.payload else {
+        entry.tool_outputs.remove(&key);
+        return;
+    };
+    if status
+        .as_deref()
+        .is_some_and(giskard_core::item::tool_status_is_running)
+    {
+        entry.tool_outputs.remove(&key);
+        return;
+    }
+    let Some(output) = output else {
+        entry.tool_outputs.remove(&key);
+        return;
+    };
+    match giskard_core::item::serialize_tool_output(output) {
+        Ok((bytes, descriptor)) => {
+            entry
+                .tool_outputs
+                .insert(key, RuntimeToolOutput { bytes, descriptor });
+        }
+        Err(error) => {
+            tracing::error!(%turn_id, item_id = %item.id, %error, "could not serialize completed tool output");
+            entry.tool_outputs.remove(&key);
         }
     }
 }
@@ -1658,6 +1783,27 @@ mod tests {
             metadata: Vec::new(),
             available: vec![ApprovalDecision::Accept],
         }
+    }
+
+    fn reserve_test_turn(
+        runtime: &ThreadRuntimeRegistry,
+        thread_id: ThreadId,
+    ) -> (ProjectId, ThreadTurnLease) {
+        let project_id = ProjectId::new();
+        let lease = runtime
+            .reserve_turn(
+                thread_id,
+                TurnReservation {
+                    project_id,
+                    harness_thread_id: "native".into(),
+                    mode: Mode::Build,
+                    provider: "provider".into(),
+                    model: "model".into(),
+                    context_kind: "test",
+                },
+            )
+            .unwrap();
+        (project_id, lease)
     }
 
     #[test]
@@ -2445,6 +2591,8 @@ mod tests {
         let mut lease = runtime
             .reserve_turn(thread_id, reservation.clone())
             .unwrap();
+        let command_item_id = ItemId::new();
+        let tool_item_id = ItemId::new();
         let turn = Turn {
             id: TurnId::new(),
             user_input: UserInput::text("keep me"),
@@ -2464,6 +2612,54 @@ mod tests {
             started_at: Utc::now(),
             completed_at: Some(Utc::now()),
         };
+        runtime.apply_event(
+            thread_id,
+            &AgentEvent::ItemCompleted {
+                thread: thread_id,
+                turn: turn.id,
+                item: Item {
+                    id: command_item_id,
+                    harness_item_id: "command".into(),
+                    payload: ItemPayload::CommandExecution {
+                        command: "printf retained".into(),
+                        cwd: "/tmp".into(),
+                        output: "retained command".into(),
+                        output_truncated: false,
+                        output_original_bytes: None,
+                        output_original_lines: None,
+                        exit_code: Some(0),
+                        status: Some("completed".into()),
+                        process_id: None,
+                        duration_ms: None,
+                    },
+                    created_at: Utc::now(),
+                },
+            },
+            true,
+        );
+        runtime.apply_event(
+            thread_id,
+            &AgentEvent::ItemCompleted {
+                thread: thread_id,
+                turn: turn.id,
+                item: Item {
+                    id: tool_item_id,
+                    harness_item_id: "tool".into(),
+                    payload: ItemPayload::ToolCall {
+                        name: "lookup".into(),
+                        input: serde_json::json!({}),
+                        output: Some(serde_json::json!({"retained": true})),
+                        server: Some("mcp".into()),
+                        status: Some("completed".into()),
+                        metadata: None,
+                        subagent: None,
+                        error: None,
+                    },
+                    created_at: Utc::now(),
+                },
+            },
+            true,
+        );
         let completion = AgentEvent::TurnCompleted {
             thread: thread_id,
             turn: turn.id,
@@ -2476,7 +2672,19 @@ mod tests {
             runtime.current_overview().threads[0].turn_state,
             RuntimeTurnState::PersistenceBlocked { turn_id, .. } if turn_id == turn.id
         ));
-        assert!(runtime.reserve_turn(thread_id, reservation).is_err());
+        assert!(
+            runtime
+                .reserve_turn(thread_id, reservation.clone())
+                .is_err()
+        );
+        assert!(matches!(
+            runtime.command_output(thread_id, turn.id, command_item_id),
+            RuntimeCommandOutputLookup::Found(_)
+        ));
+        assert!(matches!(
+            runtime.tool_output(thread_id, turn.id, tool_item_id),
+            RuntimeToolOutputLookup::Found(_)
+        ));
         let entry = runtime.existing_entry(thread_id).unwrap();
         let entry = lock_unpoison(&entry, "thread runtime entry");
         assert_eq!(
@@ -2496,6 +2704,7 @@ mod tests {
     fn terminal_command_output_is_normalized_and_addressable_until_cleanup() {
         let runtime = ThreadRuntimeRegistry::with_max_command_output_bytes(32 * 1024);
         let thread = ThreadId::new();
+        let (_project, _lease) = reserve_test_turn(&runtime, thread);
         let turn = TurnId::new();
         let item_id = ItemId::new();
         let event = runtime.normalize_command_output(AgentEvent::ItemCompleted {
@@ -2550,9 +2759,76 @@ mod tests {
     }
 
     #[test]
+    fn tool_output_authority_tracks_terminal_replacements() {
+        let runtime = ThreadRuntimeRegistry::new();
+        let thread = ThreadId::new();
+        let (_project, _lease) = reserve_test_turn(&runtime, thread);
+        let turn = TurnId::new();
+        let item_id = ItemId::new();
+        let event =
+            |status: Option<&str>, output: Option<serde_json::Value>| AgentEvent::ItemCompleted {
+                thread,
+                turn,
+                item: Item {
+                    id: item_id,
+                    harness_item_id: "tool".into(),
+                    payload: ItemPayload::ToolCall {
+                        name: "lookup".into(),
+                        input: serde_json::json!({}),
+                        output,
+                        server: Some("mcp".into()),
+                        status: status.map(str::to_owned),
+                        metadata: None,
+                        subagent: None,
+                        error: None,
+                    },
+                    created_at: Utc::now(),
+                },
+            };
+
+        runtime.apply_event(
+            thread,
+            &event(Some("completed"), Some(serde_json::Value::Null)),
+            true,
+        );
+        let RuntimeToolOutputLookup::Found(first) = runtime.tool_output(thread, turn, item_id)
+        else {
+            panic!("terminal tool output was not installed");
+        };
+        assert_eq!(first.bytes, b"null");
+
+        runtime.apply_event(
+            thread,
+            &event(
+                Some("IN-PROGRESS"),
+                Some(serde_json::json!({"stale": true})),
+            ),
+            true,
+        );
+        assert!(matches!(
+            runtime.tool_output(thread, turn, item_id),
+            RuntimeToolOutputLookup::Missing
+        ));
+
+        runtime.apply_event(
+            thread,
+            &event(None, Some(serde_json::json!({"new": true}))),
+            true,
+        );
+        let RuntimeToolOutputLookup::Found(replacement) =
+            runtime.tool_output(thread, turn, item_id)
+        else {
+            panic!("replacement tool output was not installed");
+        };
+        assert_ne!(replacement.descriptor.version, first.descriptor.version);
+        assert_eq!(replacement.bytes, br#"{"new":true}"#);
+    }
+
+    #[test]
     fn inconsistent_truncated_command_metadata_is_not_installed() {
         let runtime = ThreadRuntimeRegistry::new();
         let thread = ThreadId::new();
+        let (_project, _lease) = reserve_test_turn(&runtime, thread);
         let turn = TurnId::new();
         let item_id = ItemId::new();
         let event = AgentEvent::ItemCompleted {
@@ -2635,7 +2911,7 @@ mod tests {
                 created_at: Utc::now(),
             },
         };
-        let (event, prepared) = runtime.prepare_command_output(event);
+        let (event, prepared) = runtime.prepare_item_output(event);
 
         runtime.forget_threads(&std::collections::HashSet::from([thread]));
 
@@ -2655,6 +2931,7 @@ mod tests {
     fn persisted_output_version_cache_is_authority_scoped_and_separate_from_runtime() {
         let runtime = ThreadRuntimeRegistry::new();
         let thread = ThreadId::new();
+        let (_project, _lease) = reserve_test_turn(&runtime, thread);
         let turn = TurnId::new();
         let item = ItemId::new();
         let permit = runtime.persisted_command_output_version_permit(thread);

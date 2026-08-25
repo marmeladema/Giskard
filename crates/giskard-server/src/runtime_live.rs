@@ -13,7 +13,7 @@ use giskard_core::server_request::ServerRequest;
 use giskard_core::user_input::UserInput;
 #[cfg(test)]
 use giskard_proto::WireApprovalRequest;
-use giskard_proto::{AnsweredApproval, LiveTurnSnapshot, WireAgentEvent};
+use giskard_proto::{AnsweredApproval, LiveTurnSnapshot, WireAgentEvent, WireToolOutput};
 
 const MAX_LIVE_COMMAND_OUTPUT: usize = 16 * 1024;
 const LIVE_COMMAND_OUTPUT_EDGE: usize = 8 * 1024;
@@ -24,6 +24,7 @@ struct LiveTurn {
     user_input: Option<UserInput>,
     events: Vec<AgentEvent>,
     command_output_descriptors: HashMap<ItemId, CommandOutputDescriptor>,
+    tool_output_descriptors: HashMap<ItemId, WireToolOutput>,
     /// Approvals the user answered during this turn, and the decision they made. Resolution is not
     /// otherwise recorded in `events` (there is no harness-emitted approval-resolved event), so
     /// without this the reconnect snapshot would replay every answered approval as still pending.
@@ -76,6 +77,7 @@ impl LiveTurnState {
             user_input,
             events: Vec::new(),
             command_output_descriptors: HashMap::new(),
+            tool_output_descriptors: HashMap::new(),
             resolved_approvals: HashMap::new(),
             resolved_server_requests: HashSet::new(),
         });
@@ -98,6 +100,7 @@ impl LiveTurnState {
                     user_input,
                     events: Vec::new(),
                     command_output_descriptors: HashMap::new(),
+                    tool_output_descriptors: HashMap::new(),
                     resolved_approvals: HashMap::new(),
                     resolved_server_requests: HashSet::new(),
                 });
@@ -114,14 +117,25 @@ impl LiveTurnState {
     }
 
     pub fn append(&mut self, thread_id: ThreadId, event: AgentEvent) {
-        self.append_with_command_output(thread_id, event, None);
+        self.append_with_outputs(thread_id, event, None, None);
     }
 
+    #[cfg(test)]
     pub fn append_with_command_output(
+        &mut self,
+        thread_id: ThreadId,
+        event: AgentEvent,
+        command_output: Option<CommandOutputDescriptor>,
+    ) {
+        self.append_with_outputs(thread_id, event, command_output, None);
+    }
+
+    pub fn append_with_outputs(
         &mut self,
         thread_id: ThreadId,
         mut event: AgentEvent,
         command_output: Option<CommandOutputDescriptor>,
+        tool_output: Option<WireToolOutput>,
     ) {
         if self.thread_id == Some(thread_id)
             && let Some(turn) = self.turn.as_mut()
@@ -161,6 +175,18 @@ impl LiveTurnState {
                         item_id,
                         CommandOutputDescriptor::from_durable("", false, 0, 0, false),
                     );
+                }
+            }
+            if let Some(item_id) = completed_tool_item_id(&event) {
+                remove_completed_tool_events(&mut turn.events, item_id);
+                turn.tool_output_descriptors.remove(&item_id);
+                if let Some(descriptor) = tool_output {
+                    turn.tool_output_descriptors.insert(item_id, descriptor);
+                }
+                if let AgentEvent::ItemCompleted { item, .. } = &mut event
+                    && let ItemPayload::ToolCall { output, .. } = &mut item.payload
+                {
+                    *output = None;
                 }
             }
             let command_delta_item = command_output_item_id(&event);
@@ -259,12 +285,17 @@ impl LiveTurnState {
                             turn: turn_id,
                             item,
                         } => {
-                            let descriptor = turn.command_output_descriptors.get(&item.id).cloned();
+                            let command_descriptor =
+                                turn.command_output_descriptors.get(&item.id).cloned();
+                            let tool_descriptor =
+                                turn.tool_output_descriptors.get(&item.id).cloned();
                             Some(WireAgentEvent::ItemCompleted {
                                 thread,
                                 turn: turn_id,
-                                item: giskard_proto::WireItem::from_item_with_command_output(
-                                    item, descriptor,
+                                item: giskard_proto::WireItem::from_item_with_outputs(
+                                    item,
+                                    command_descriptor,
+                                    tool_descriptor,
                                 ),
                             })
                         }
@@ -321,6 +352,17 @@ impl LiveTurnState {
             })
             .collect()
     }
+}
+
+fn completed_tool_item_id(event: &AgentEvent) -> Option<ItemId> {
+    let AgentEvent::ItemCompleted { item, .. } = event else {
+        return None;
+    };
+    matches!(item.payload, ItemPayload::ToolCall { .. }).then_some(item.id)
+}
+
+fn remove_completed_tool_events(events: &mut Vec<AgentEvent>, item_id: ItemId) {
+    events.retain(|event| completed_tool_item_id(event) != Some(item_id));
 }
 
 /// One thread's outstanding user-facing requests, as needed to rebuild a connecting client's
