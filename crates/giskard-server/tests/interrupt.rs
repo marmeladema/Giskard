@@ -581,7 +581,6 @@ async fn websocket_subscribe_replays_running_command_snapshot() {
         .unwrap();
     let replayed = wait_for_running_command(&mut second).await;
     assert_eq!(replayed.process_id.as_deref(), Some("proc_1"));
-    assert_eq!(replayed.output, "started");
 }
 
 #[tokio::test]
@@ -756,9 +755,7 @@ async fn wait_for_running_command(ws: &mut TestWs) -> RunningTask {
                 .find(|cmd| cmd.process_id.as_deref() == Some("proc_1"))
         {
             assert_eq!(cmd.command, "sleep 60");
-            if cmd.output == "started" {
-                return cmd.clone();
-            }
+            return cmd.clone();
         }
     }
 }

@@ -285,7 +285,6 @@ pub struct RunningTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_id: Option<String>,
     pub started_at_ms: i64,
-    pub output: String,
     pub after_turn: bool,
     #[serde(default)]
     pub terminating: bool,
@@ -1090,7 +1089,6 @@ mod tests {
                     status: "in_progress".into(),
                     process_id: Some("proc_1".into()),
                     started_at_ms: 1_785_000_000_000,
-                    output: "waiting".into(),
                     after_turn: true,
                     terminating: true,
                 },
@@ -1106,7 +1104,6 @@ mod tests {
                     status: "in_progress".into(),
                     process_id: None,
                     started_at_ms: 1_785_000_000_500,
-                    output: String::new(),
                     after_turn: false,
                     terminating: false,
                 },
@@ -1116,6 +1113,7 @@ mod tests {
         assert_eq!(json["type"], "running_tasks");
         assert_eq!(json["thread_id"], tid.to_string());
         assert_eq!(json["tasks"][0]["kind"], "command");
+        assert!(json["tasks"][0].get("output").is_none());
         assert_eq!(json["tasks"][0]["process_id"], "proc_1");
         assert_eq!(json["tasks"][0]["after_turn"], true);
         assert_eq!(json["tasks"][1]["kind"], "tool");

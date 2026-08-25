@@ -845,11 +845,15 @@ async fn index_page_is_served_and_public() {
             && toggle_group.contains("renderRunningCommands();"),
         "collapsing a task group clears the selected row and refreshes the running-task panel"
     );
+    let wire_group_item = between(
+        &body,
+        "function wireTaskGroupItemRow(row, groupId, itemId)",
+        "function selectTaskGroupItem(groupId, itemId)",
+    );
     assert!(
         body.contains("wireTaskGroupItemRow(row, group.id, key)")
-            && body.contains("function wireTaskGroupItemRow(row, groupId, itemId)")
-            && body.contains("selectTaskGroupItem(groupId, key);")
-            && !body.contains("selectCommand(key);"),
+            && wire_group_item.contains("selectTaskGroupItem(groupId, key);")
+            && !wire_group_item.contains("selectCommand(key);"),
         "in-thread task summary clicks toggle inline details without scrolling the transcript, \
          including after item-id migration"
     );
@@ -1429,12 +1433,17 @@ async fn index_page_is_served_and_public() {
         body.contains("requestAnimationFrame") && body.contains("cancelOutputOverlayRefresh"),
         "streaming overlay refreshes are coalesced to one repaint per frame"
     );
+    let task_snapshot = between(
+        &body,
+        "function renderRunningCommandSnapshot(commands) {",
+        "function renderEndedCommandBody(body, cmd, status, opts)",
+    );
     assert!(
         body.contains("function mergeRunningOutput(prev, next)")
             && body.contains("return prev.length >= next.length ? prev : next;")
-            && body.contains("output:mergeRunningOutput(existing && existing.output, info.output)"),
-        "a running-command snapshot keeps the fuller delta-accumulated output instead of the \
-         server's capped tail"
+            && !task_snapshot.contains("mergeRunningOutput")
+            && !task_snapshot.contains("info.output"),
+        "task snapshots never merge output into the event-owned running command"
     );
     assert!(
         body.contains("renderMarkdown(body, p.text"),
@@ -2581,9 +2590,9 @@ fn browser_scopes_running_command_completion_identity_to_turn() {
     );
     for expected in [
         "const key = scopedItemKey(info.turn_id, info.item_id);",
-        "const existing = state.runningCommands.get(key);",
-        "state.runningCommands.set(key, cmd);",
-        "state.runningCommands.delete(id);",
+        "const existing = state.runningTasks.get(key);",
+        "state.runningTasks.set(key, cmd);",
+        "state.runningTasks.delete(id);",
         "renderRunningCommands();",
     ] {
         assert!(

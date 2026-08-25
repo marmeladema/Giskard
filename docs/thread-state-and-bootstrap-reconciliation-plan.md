@@ -15,9 +15,9 @@ of the original plan; it was inserted because the bootstrap and retention work b
 into the same root cause — a turn's record was both its index entry and its unbounded payload. See
 *What the storage layout change unlocks* for the parts of this plan it simplifies or retires.
 
-**M1 through M6 are complete**: history pagination over HTTP, the runtime registry, turn-less
-context restoration, lazy agent-produced diffs, lazy completed-command output, and lazy completed
-tool output. Each milestone
+**M1 through M7 are complete**: history pagination over HTTP, the runtime registry, turn-less
+context restoration, lazy agent-produced diffs, lazy completed-command output, lazy completed
+tool output, and strict Tasks-menu ownership for `RunningTasks`. Each milestone
 below carries its own status line; this paragraph is a summary, not the record. The remaining
 retention policies, event journal and transactional bootstrap, class-aware outbox, and later
 milestones remain to be built, as defined under *Implementation milestones*.
@@ -1343,8 +1343,8 @@ nothing until M11.
 
 ### M7 — `RunningTasks` authority revamp
 
-**Status:** planned. `RunningTasks` will be a revisioned replacement projection for the Tasks menu
-and its controls only. It will no longer carry or accumulate command or tool output.
+**Status:** complete. `RunningTasks` is a revisioned replacement projection for the Tasks menu and
+its controls only. It no longer carries or accumulates command or tool output.
 
 **Scope.** Remove `RunningTask.output` and stop treating command-output or tool-progress deltas as
 task-state changes. Keep task identity, status, timing, process identity, after-turn state,

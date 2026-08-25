@@ -130,7 +130,11 @@ Process-local thread state is published separately: `ThreadRuntimeOverview { rev
 is a global replacement snapshot (including an empty `threads` list), `RequestState` carries a
 per-request revision and the authoritative pending/responding/resolved status for each approval or
 server request, and
-`RunningTasks { thread_id, revision, tasks }` owns only the Tasks menu. Approval decisions and
+`RunningTasks { thread_id, revision, tasks }` owns only the Tasks menu and its controls. Tasks carry
+identity and lifecycle metadata but no command or tool output. Task-card navigation and the command
+`Open` action resolve the matching transcript row, paging the existing authenticated history API
+when an `after_turn` command's owning turn is not loaded. Output remains owned by ordered events,
+history, and `LiveTurnSnapshot`. Approval decisions and
 server-request responses both include `thread_id` so the runtime registry can validate and claim
 the request atomically instead of consulting a global request-to-thread routing map.
 See [Sub-agent threads](subagents.md) for the full contract.
