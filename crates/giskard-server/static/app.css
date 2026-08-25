@@ -686,6 +686,9 @@
   .notice.err { border-color:#f85149; color:#ffb4ae; }
   .notice.warn { border-color:#d29922; color:#f0d98c; }
   .readonly-banner { margin:0 12px 6px; padding:8px 12px; border-radius:8px; border:1px solid #d29922; background:#241d10; color:#f0d98c; font-size:13px; }
+  .update-banner { margin:0 12px 6px; padding:8px 12px; border-radius:8px; border:1px solid #d29922; background:#241d10; color:#f0d98c; font-size:13px; display:flex; align-items:center; justify-content:space-between; gap:12px; }
+  .update-banner[hidden] { display:none; }
+  .update-banner button { flex:0 0 auto; }
   h3.sec { margin:16px 0 8px; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
   .row { display:flex; gap:6px; margin:6px 0; }
   .kv { font-size:13px; margin:4px 0; }

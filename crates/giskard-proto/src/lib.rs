@@ -380,6 +380,7 @@ pub struct LoginResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct WsTicketResponse {
     pub ticket: String,
+    pub ui_version: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

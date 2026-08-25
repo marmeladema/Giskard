@@ -233,7 +233,7 @@ async fn ws_ticket_is_not_a_session_and_vice_versa() {
         .unwrap()
         .to_string();
 
-    let ticket: String = client
+    let ticket_response = client
         .get(format!("{base}/api/ws-ticket"))
         .header("cookie", &cookie)
         .send()
@@ -241,10 +241,13 @@ async fn ws_ticket_is_not_a_session_and_vice_versa() {
         .unwrap()
         .json::<serde_json::Value>()
         .await
-        .unwrap()["ticket"]
-        .as_str()
-        .unwrap()
-        .to_string();
+        .unwrap();
+    assert!(
+        ticket_response["ui_version"]
+            .as_str()
+            .is_some_and(|version| !version.is_empty())
+    );
+    let ticket: String = ticket_response["ticket"].as_str().unwrap().to_string();
 
     // A ticket presented as a session cookie must not authenticate API requests.
     let resp = client

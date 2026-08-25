@@ -146,9 +146,10 @@ const THREAD_LIST_RETRY_MAX_MS = 10000;
 let state = {
   projectId:null, threadId:null, activeViewGeneration:0, mode:"build", ws:null, wsStatus:"closed", wsConnectId:0,
   wsReconnectTimer:null, wsReconnectAttempt:0, wsStatusDetail:"WebSocket disconnected",
+  updateRequired:false, uiVersionCheckPending:false,
   wsLastProblem:"", wsLastProblemNotice:"", wsLastProblemNoticeAt:0,
   wsProbeTimer:null, wsProbeToken:0, wsProbeSocket:null,
-  draftThread:null, firstTurnStartingThreadId:null, inputDrafts:new Map(),
+  draftThread:null, reloadDraftProjectId:null, firstTurnStartingThreadId:null, inputDrafts:new Map(),
   // Per-turn DOM identity (foundation for incremental reconnect): `currentRenderTurnId` is the turn
   // whose rows are being stamped right now (a persisted turn being rendered, or the live turn being
   // streamed); `newestPersistedTurnId` is the id of the newest turn known to have completed — the
@@ -182,6 +183,19 @@ let state = {
   collapsedProjects:new Set(loadCollapsedProjects()), pendingRemoveProject:null,
   pendingRemoveThread:null, removeThreadRequestSeq:0, projectDirs:{}
 };
+const RELOAD_DRAFT_KEY = "giskard.reloadDraft";
+try {
+  const saved = JSON.parse(sessionStorage.getItem(RELOAD_DRAFT_KEY) || "null");
+  sessionStorage.removeItem(RELOAD_DRAFT_KEY);
+  if (saved && typeof saved.key === "string" && typeof saved.value === "string" && saved.value) {
+    state.inputDrafts.set(saved.key, saved.value);
+    if (typeof saved.draftProjectId === "string" && saved.draftProjectId) {
+      state.reloadDraftProjectId = saved.draftProjectId;
+    }
+  }
+} catch {
+  try { sessionStorage.removeItem(RELOAD_DRAFT_KEY); } catch {}
+}
 let attachmentIngestQueue = Promise.resolve();
 const activeAttachmentReaders = new Set();
 // The inline transcript row shows only a compact preview of a command's/tool's output — the most
@@ -857,6 +871,12 @@ async function loadProjects() {
     pending.push(loadThreads(p.id));
   }
   await Promise.all(pending);
+  const reloadDraftProjectId = state.reloadDraftProjectId;
+  state.reloadDraftProjectId = null;
+  if (reloadDraftProjectId && listedProjectIds.has(reloadDraftProjectId)) {
+    openDraftThread(reloadDraftProjectId);
+    return;
+  }
   restoreLastThread();
 }
 
@@ -2622,6 +2642,7 @@ function markWsForegroundRecovered(ws) {
   ws._giskardResumedAt = 0;
 }
 function scheduleWsReconnect(reason) {
+  if (state.updateRequired) return;
   if (!state.threadId) {
     setWsStatus("closed", "No thread selected.");
     return;
@@ -2644,6 +2665,7 @@ function scheduleWsReconnect(reason) {
 }
 async function connectWs(opts) {
   opts = opts || {};
+  if (state.updateRequired) return;
   if (!state.threadId) {
     setWsStatus("closed", "No thread selected.");
     return;
@@ -2677,9 +2699,9 @@ async function connectWs(opts) {
     firstMessageAtMs: 0
   };
   recordBrowserDiagnostic("websocket", "ws_connect_started", reconnectDiagnosticBase(reconnectMetrics));
-  let ticket;
+  let ticketResponse;
   try {
-    ticket = (await api("GET","/api/ws-ticket")).ticket;
+    ticketResponse = await api("GET","/api/ws-ticket");
   } catch (e) {
     if (connectId !== state.wsConnectId) return;
     recordBrowserDiagnostic("websocket", "ws_ticket_failed", {
@@ -2693,6 +2715,15 @@ async function connectWs(opts) {
     return;
   }
   if (connectId !== state.wsConnectId) return;
+  const browserVersion = browserUiVersion();
+  const serverVersion = ticketResponse && typeof ticketResponse.ui_version === "string"
+    ? ticketResponse.ui_version.trim()
+    : "";
+  if (!browserVersion || serverVersion !== browserVersion) {
+    requireUiReload(browserVersion, serverVersion);
+    return;
+  }
+  const ticket = ticketResponse.ticket;
   recordBrowserDiagnostic("websocket", "ws_ticket_received", reconnectDiagnosticBase(reconnectMetrics));
   const ws = new WebSocket(`${proto}://${location.host}/api/ws?ticket=${encodeURIComponent(ticket)}`);
   state.ws = ws;
@@ -2773,6 +2804,36 @@ async function connectWs(opts) {
     scheduleWsReconnect(message);
   };
 }
+function browserUiVersion() {
+  const meta = document.querySelector('meta[name="giskard-ui-version"]');
+  return (meta && meta.content && meta.content.trim()) || "";
+}
+function requireUiReload(browserVersion, serverVersion) {
+  state.updateRequired = true;
+  clearWsReconnectTimer();
+  clearWsProbeTimer();
+  state.wsProbeToken++;
+  setWsStatus("closed", "Giskard was updated. Reload before reconnecting.");
+  const banner = $("updateBanner");
+  if (banner) banner.hidden = false;
+  recordBrowserDiagnostic("websocket", "ui_version_mismatch", {
+    browser_version:browserVersion || null,
+    server_version:serverVersion || null
+  });
+}
+function reloadUpdatedUi() {
+  saveComposerDraft();
+  const key = composerDraftKey();
+  const value = $("input") ? $("input").value || "" : "";
+  try {
+    if (key && value) {
+      const draftProjectId = isDraftThread() ? state.draftThread.projectId : null;
+      sessionStorage.setItem(RELOAD_DRAFT_KEY, JSON.stringify({ key, value, draftProjectId }));
+    }
+    else sessionStorage.removeItem(RELOAD_DRAFT_KEY);
+  } catch {}
+  location.reload();
+}
 function setWsStatus(status, detail) {
   const nextDetail = detail || wsStatusLabel(status);
   const changed = state.wsStatus !== status || state.wsStatusDetail !== nextDetail;
@@ -2796,7 +2857,9 @@ function updateComposerControls() {
   const hasThreadSurface = !!state.threadId || draft;
   const readOnly = state.threadReadOnly && !draft;
   const attachmentsLoading = pendingAttachmentOperationCount() > 0;
-  const attachmentInputAllowed = hasThreadSurface && !readOnly && !(draft && state.activeTurn);
+  const attachmentInputAllowed = hasThreadSurface && !readOnly && !state.updateRequired &&
+    !state.uiVersionCheckPending &&
+    !(draft && state.activeTurn);
   const modelUnresolved = draftModelUnresolved();
   // An empty composer with nothing attached has nothing to send. That was previously a silent
   // early return in `sendInput`: the button looked live, the click did nothing, and no message
@@ -2804,7 +2867,8 @@ function updateComposerControls() {
   // read as a dead button. Disabling it puts the state on screen instead.
   const nothingToSend = !$("input").value.trim() && state.pendingAttachments.length === 0;
   $("sendBtn").disabled =
-    readOnly || state.activeTurn || attachmentsLoading || modelUnresolved || nothingToSend ||
+    readOnly || state.activeTurn || state.updateRequired || state.uiVersionCheckPending ||
+    attachmentsLoading || modelUnresolved || nothingToSend ||
     !hasThreadSurface || (!ready && !draft);
   // The send arrow and the stop square share one slot: hide the arrow while a turn is running so
   // only the red stop square is visible (no disabled send button alongside it).
@@ -8928,6 +8992,7 @@ function sendInput() {
   // The Send control carries the same condition, so reaching it by clicking is not possible either
   // — no title is set for it, since a hidden button's tooltip is not something a user can read.
   if (!state.threadId && !isDraftThread()) return;
+  if (state.updateRequired || state.uiVersionCheckPending) return;
   if (state.activeTurn) {
     notice("Wait for the current turn to finish, or stop it first.", "warning");
     return;
@@ -8994,6 +9059,7 @@ function staleDraftContinuation(draft, draftKey, pid) {
 async function startDraftThread(text, attachments) {
   const pid = state.projectId;
   if (!pid || !isDraftThread()) return;
+  const draft = state.draftThread;
 
   // The Send button is disabled while this is true, but Enter reaches here directly, so the refusal
   // lives here too. Nothing is drawn yet, so there is no optimistic row to unwind.
@@ -9002,12 +9068,38 @@ async function startDraftThread(text, attachments) {
     return;
   }
 
+  state.uiVersionCheckPending = true;
+  renderPendingAttachments();
+  try {
+    const ticketResponse = await api("GET", "/api/ws-ticket");
+    const browserVersion = browserUiVersion();
+    const serverVersion = ticketResponse && typeof ticketResponse.ui_version === "string"
+      ? ticketResponse.ui_version.trim()
+      : "";
+    if (!browserVersion || serverVersion !== browserVersion) {
+      requireUiReload(browserVersion, serverVersion);
+      return;
+    }
+  } catch (e) {
+    notice("Could not verify the Giskard UI version: " + e.message, "error");
+    return;
+  } finally {
+    state.uiVersionCheckPending = false;
+    renderPendingAttachments();
+  }
+
+  if (state.updateRequired || state.draftThread !== draft ||
+      state.projectId !== pid || !isDraftThread()) return;
+
+  text = $("input").value.trim();
+  attachments = state.pendingAttachments.slice();
+  if (!text && attachments.length === 0) return;
+
   const draftKey = composerDraftKey();
   // The draft object itself, not just its key: two successive drafts in the same project share
   // `draft:<pid>`, so the key cannot tell them apart. Without this a slow `threads/start` for the
   // first draft would come back after the user opened a second one and clear its composer, open
   // over it, or mark its rows failed — losing whatever they had typed in the meantime.
-  const draft = state.draftThread;
   $("transcript").innerHTML = "";   // drop the draft placeholder before the first real row
   const body = bubble("user pending","you");
   body.textContent = pendingUserDisplayText(text, attachments);
@@ -9154,7 +9246,8 @@ function attachmentOperationIsCurrent(generation, draftKey) {
 function composerCanAcceptAttachments() {
   const draft = isDraftThread();
   const hasThreadSurface = !!state.threadId || draft;
-  return hasThreadSurface && !(state.threadReadOnly && !draft) && !(draft && state.activeTurn);
+  return hasThreadSurface && !state.uiVersionCheckPending &&
+    !(state.threadReadOnly && !draft) && !(draft && state.activeTurn);
 }
 
 function initComposerFileDrop() {
@@ -9263,6 +9356,7 @@ function renderPendingAttachments() {
     remove.title = `Remove ${attachment.name}`;
     remove.setAttribute("aria-label", `Remove ${attachment.name}`);
     remove.textContent = "×";
+    remove.disabled = state.uiVersionCheckPending;
     remove.onclick = () => {
       state.pendingAttachments.splice(index, 1);
       renderPendingAttachments();
@@ -9760,6 +9854,7 @@ function initVersionLabel() {
   };
 }
 initVersionLabel();
+$("reloadUpdateBtn").onclick = reloadUpdatedUi;
 
 /* ---------- turn + model pickers (below the composer) ---------- */
 function closeModelPicker() { $("modelPickerMenu").hidden = true; }
