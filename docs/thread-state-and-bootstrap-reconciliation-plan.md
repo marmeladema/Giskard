@@ -2,7 +2,7 @@
 
 ## Status
 
-Two landings are complete on `main`.
+Two foundational landings preceded the milestones below.
 
 **Persisted metadata** (`ThreadMetadataService`, durable thread revisions, typed projections,
 explicit recency, revision-aware catalog reconciliation, non-blocking replacement delivery) is
@@ -15,10 +15,11 @@ of the original plan; it was inserted because the bootstrap and retention work b
 into the same root cause — a turn's record was both its index entry and its unbounded payload. See
 *What the storage layout change unlocks* for the parts of this plan it simplifies or retires.
 
-**The runtime registry, turn-less context restoration, and lazy agent-produced diff milestones are
-also complete.** The event journal, transactional bootstrap, class-aware outbox, and later
-milestones remain to be built, in
-the milestones defined under *Implementation milestones*.
+**M1 through M5 are complete**: history pagination over HTTP, the runtime registry, turn-less
+context restoration, lazy agent-produced diffs, and lazy completed-command output. Each milestone
+below carries its own status line; this paragraph is a summary, not the record. The remaining
+retention policies, the event journal and transactional bootstrap, the class-aware outbox, and the
+later milestones remain to be built, as defined under *Implementation milestones*.
 
 This plan began with Codex restoring a context window outside a turn. The codebase audit showed
 that the context window is not a special state class. It exposed missing general primitives for
@@ -207,6 +208,66 @@ No clock in this table orders a different row.
 
 The internal event sequence may reset when the server restarts. It is a cut within one process, not
 a durable client cursor. Completed `TurnId`s remain the reconnect cursor across restarts.
+
+## Bounded, addressable, truncated
+
+*Authorities and clocks* says who owns each piece of state. This says what Giskard is allowed to do
+to it. The distinction matters because one word was doing several jobs, and the wrong one is a lie
+to the user.
+
+**An item is agent-produced, and therefore unbounded.** Giskard cannot impose a size limit on a
+model's output. The only layer that can is the harness — Codex has already truncated a command's
+output before Giskard sees a byte of it. Everything downstream either transports that content or
+discards it. "Bounded item" is not an achievable property, and a design claiming it is either
+truncating silently or describing something else.
+
+Four distinct things, named:
+
+**Bounded** — a limit Giskard genuinely owns, because Giskard produced the thing being limited: a
+protocol frame, a `history.jsonl` index record, the live in-memory projection, a page size.
+Bounding these costs nothing, because no agent content is lost.
+
+**Addressable** — agent content: unbounded, complete, never truncated, but not carried inline. The
+wire carries a reference plus a preview; the body is one HTTP fetch away. `CapturedDiffDescriptor`
+and `CommandOutputDescriptor` are this, and it is the pattern the remaining heavyweight fields
+follow.
+
+**Truncated** — content Giskard actually discards. Permitted only for durable retention, only
+under a configured limit, and only when the loss is represented explicitly in the projection.
+`[retention].max_command_output_bytes` defaults to 128 MiB precisely because it is a
+pathological-case backstop rather than a routine policy: the intent is that real output is never
+touched.
+
+**Accepted inline** — unbounded agent content transported inline anyway, because in practice it is
+small: agent and reasoning text, approval and activity metadata, sub-agent prompts. This is an
+assumption about model behaviour, not a property of the data. It is named here rather than left
+implicit so that when one of them starts arriving large, the answer is to move it to *addressable*
+— not to begin truncating it.
+
+### Rules that follow
+
+**Never truncate a set whose completeness is its meaning.** A command's output has a natural tail,
+so a preview of it is honest. A file-change entry list does not: a patch review naming 50 of 400
+touched files is not a shortened answer, it is a wrong one — and the approval card rendering that
+set exists specifically to say what will be modified. When such a list does not fit a frame, page
+the fetch. Do not cap the truth.
+
+**A projection states which loss occurred.** `CommandOutputDescriptor` carries `original_bytes`,
+`durable_bytes` and `preview_bytes` as three separate numbers so the browser can distinguish "this
+is everything", "retention discarded some", and "this is a preview; fetch for the rest". Every new
+descriptor owes the same distinction. One boolean cannot express it.
+
+**Addressable content needs a degraded state.** `output_available` exists because a body can be
+swept, or its turn deleted, between the descriptor and the fetch. Every lazy field inherits that
+case and deserves one shared treatment rather than per-field handling.
+
+### What this means for Primitive 3
+
+The bootstrap goal is not bounded items; that is unachievable. It is **no unbounded frame, and
+every item individually addressable**. An item may be arbitrarily large provided the transaction
+carries a reference to it rather than its body — which is precisely what lets the bootstrap
+exchange semantic elements instead of a byte stream. The journal follows the same rule: it holds
+bounded records and references, never an inline agent-sized payload.
 
 ## Primitive 1: `ThreadMetadataService`
 
@@ -898,6 +959,9 @@ non-goals.
 
 ### M1 — History pagination over HTTP
 
+**Status:** complete. Older-history pages are served over authenticated HTTP; `LoadHistory` and
+`HistoryPage` are gone from the protocol.
+
 **The smallest independent landing, and purely subtractive.** Depends on nothing else here.
 
 **Scope.** Serve older-history pages from an authenticated HTTP endpoint. Point the browser's
@@ -1068,6 +1132,10 @@ the explicit conflict above. Workspace Git diff continues to use its existing HT
 
 ### M5 — Lazy completed-command output
 
+**Status:** complete. Completed command output is carried as an 8 KiB tail descriptor and fetched
+in full from its own endpoint; the durable limit is configurable, and the late-completion exception
+remains as documented until M9.
+
 **One heavyweight field, end to end.** Completed command output is already streamed incrementally,
 then redundantly embedded in `ItemCompleted`, reconnect history, ordinary history pages, and every
 `WireTurn`. This milestone removes that eager copy without changing running-command behavior or
@@ -1170,10 +1238,11 @@ first commit rather than retrofitted.
 **Scope.** Named policies built on the same UTF-8-safe preview primitive for tool input/output and
 metadata, task tails, and maximum encoded-event admission. Do not revisit the M5 command policy.
 Apply normalization at M2's runtime boundary so consumers do not independently truncate an event.
-Treat agent/reasoning/user text, approval metadata, activity metadata, and sub-agent prompts as
-accepted practical bounds rather than adding policies for them. Audit request payloads, notices,
-metadata, user input, and attachment descriptors only to cite their existing boundary or record the
-accepted practical assumption. Every actual omission remains explicit.
+Classify agent/reasoning/user text, approval metadata, activity metadata, and sub-agent prompts as
+*accepted inline* rather than adding policies for them — see *Bounded, addressable, truncated*.
+Audit request payloads, notices, metadata, user input, and attachment descriptors only to cite
+their existing boundary or record the accepted-inline assumption. Every actual omission remains
+explicit, and no set whose completeness carries meaning is capped.
 
 Define, size, and test maximum encoded-event admission against current individual live-event
 publication. Do not introduce bootstrap elements, journal admission, or M7's transaction. The
@@ -1201,10 +1270,12 @@ snapshot/range interface used by the transaction, the live cut and journal, subs
 generations, semantic element encoding, and browser commit path.
 
 **Scope.** The shared bounded per-thread event journal with a snapshot watermark, pinned at the live
-cut. The staged bootstrap transaction with subscription generations, replacing the four browser
-phase flags and the split snapshot messages. Genuinely cancellable bootstrap — `handle_ws`
-currently awaits the whole subscribe operation, so cancellation needs a generation-owned task, not
-just a generation number.
+cut. The journal holds bounded records and references to addressable payloads, never an inline
+agent-sized body — see *Bounded, addressable, truncated*; decide this on its first commit, because
+retrofitting it means rewriting the journal. The staged bootstrap transaction with subscription
+generations, replacing the four browser phase flags and the split snapshot messages. Genuinely
+cancellable bootstrap — `handle_ws` currently awaits the whole subscribe operation, so cancellation
+needs a generation-owned task, not just a generation number.
 
 Consume the existing `load_turn_records` primitive and add the consistent snapshot/range reads to
 `PersistStore`. Send bounded turn records with payloads fetched separately rather than embedding
