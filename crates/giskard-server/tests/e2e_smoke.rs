@@ -3901,6 +3901,7 @@ async fn importing_subagent_thread_records_parent_and_reuses_native_child() {
             })
     );
 
+    harness.wait_for_subscribers(child_id, 1).await;
     let external_turn = harness
         .emit_external_turn(child_id, "subagent live output")
         .await

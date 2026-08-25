@@ -106,7 +106,6 @@ test("late completion replaces a processless running command in place", async ({
       status: "in_progress",
       process_id: null,
       started_at_ms: Date.now(),
-      output: "starting",
       after_turn: true,
       terminating: false,
     }]);
@@ -186,11 +185,19 @@ test("late completion replaces a processless running command in place", async ({
       browser.copiedLateOutput = text;
       return true;
     };
+    browser.addItem({
+      id: "command-copy-late", harness_item_id: "native-command-copy-late",
+      payload: {
+        kind: "command_execution", command: "printf preserved", cwd: "/tmp/project",
+        output: "preserved locally", exit_code: null, status: "in_progress",
+        process_id: null, duration_ms: null,
+      },
+    }, "turn-copy-late", false);
     browser.renderRunningCommandSnapshot([{
       kind: "command", thread_id: "browser-thread", turn_id: "turn-copy-late",
       item_id: "command-copy-late", harness_item_id: "native-command-copy-late",
       command: "printf preserved", cwd: "/tmp/project", status: "in_progress",
-      process_id: null, started_at_ms: Date.now(), output: "preserved locally",
+      process_id: null, started_at_ms: Date.now(),
       after_turn: true, terminating: false,
     }]);
     browser.addItem({
@@ -214,6 +221,238 @@ test("late completion replaces a processless running command in place", async ({
   await expect.poll(() => page.evaluate(() =>
     (window as unknown as { copiedLateOutput?: string }).copiedLateOutput,
   )).toBe("preserved locally");
+});
+
+test("command task opens the live transcript output directly", async ({ page }) => {
+  await openCommandOutputTestThread(page);
+  await page.evaluate(() => {
+    const app = window as unknown as {
+      addItem: (item: unknown, turnId: string, fromHistory: boolean) => void;
+      renderRunningCommandSnapshot: (tasks: unknown[]) => void;
+    };
+    app.addItem({
+      id: "command-task-open", harness_item_id: "native-command-task-open",
+      payload: {
+        kind: "command_execution", command: "printf live", cwd: "/tmp/project",
+        output: "complete live output so far", exit_code: null, status: "in_progress",
+        process_id: "proc-task-open", duration_ms: null,
+      },
+    }, "turn-task-open", false);
+    app.renderRunningCommandSnapshot([{
+      kind: "command", thread_id: "browser-thread", turn_id: "turn-task-open",
+      item_id: "command-task-open", harness_item_id: "native-command-task-open",
+      command: "printf live", cwd: "/tmp/project", status: "in_progress",
+      process_id: "proc-task-open", started_at_ms: Date.now(),
+      after_turn: false, terminating: false,
+    }]);
+  });
+
+  await page.locator("#tasksBtn").click();
+  await page.locator("#tasksMenu .cmd-card", { hasText: "printf live" })
+    .getByRole("button", { name: "Open ⤢" }).click();
+  await expect(page.locator("#codeOverlay")).toHaveClass(/open/);
+  await expect(page.locator("#codeView")).toContainText("complete live output so far");
+  await expect(page.locator('[data-command-item-id="turn-task-open:command-task-open"]'))
+    .not.toHaveClass(/selected/);
+
+  await page.locator("#codeClose").click();
+  await page.locator("#tasksBtn").click();
+  await page.locator("#tasksMenu .cmd-card", { hasText: "printf live" }).click();
+  await expect(page.locator("#tasksMenu")).toBeHidden();
+  await expect(page.locator('[data-command-item-id="turn-task-open:command-task-open"]'))
+    .toHaveClass(/selected/);
+});
+
+test("failed command and tool stops clear stop-requested presentation state", async ({ page }) => {
+  await openCommandOutputTestThread(page);
+  const text = await page.evaluate(() => {
+    const app = window as unknown as {
+      addItem: (item: unknown, turnId: string, fromHistory: boolean) => void;
+      renderRunningCommandSnapshot: (tasks: unknown[]) => void;
+      resetTerminatingCommand: (processId: string) => void;
+      resetTerminatingToolTasks: () => void;
+    };
+    const turnId = "turn-task-rollback";
+    const itemId = "command-task-rollback";
+    app.addItem({
+      id: itemId, harness_item_id: "native-command-task-rollback",
+      payload: {
+        kind: "command_execution", command: "sleep 1", cwd: "/tmp/project",
+        output: "", exit_code: null, status: "in_progress",
+        process_id: "proc-task-rollback", duration_ms: null,
+      },
+    }, turnId, false);
+    const task = {
+      kind: "command", thread_id: "browser-thread", turn_id: turnId,
+      item_id: itemId, harness_item_id: "native-command-task-rollback",
+      command: "sleep 1", cwd: "/tmp/project", status: "in_progress",
+      process_id: "proc-task-rollback", started_at_ms: Date.now(),
+      after_turn: false, terminating: true,
+    };
+    const toolTask = {
+      kind: "tool", thread_id: "browser-thread", turn_id: turnId,
+      item_id: "tool-task-rollback", harness_item_id: "native-tool-task-rollback",
+      command: "search", server: "mcp", status: "in_progress",
+      process_id: null, started_at_ms: Date.now(), after_turn: false, terminating: true,
+    };
+    app.renderRunningCommandSnapshot([task, toolTask]);
+    app.resetTerminatingCommand("proc-task-rollback");
+    app.resetTerminatingToolTasks();
+    app.addItem({
+      id: itemId, harness_item_id: "native-command-task-rollback",
+      payload: {
+        kind: "command_execution", command: "sleep 1", cwd: "/tmp/project",
+        output: {
+          preview: "done", preview_truncated: false, durable_truncated: false,
+          original_bytes: 4, original_lines: 1, durable_bytes: 4, durable_lines: 1,
+          preview_bytes: 4, preview_lines: 1, output_available: false,
+        },
+        exit_code: 0, status: "completed", process_id: "proc-task-rollback", duration_ms: 10,
+      },
+    }, turnId, false);
+    return document.querySelector(`[data-command-item-id="${turnId}:${itemId}"]`)?.textContent || "";
+  });
+  expect(text).not.toContain("stop requested");
+  await page.locator("#tasksBtn").click();
+  await expect(page.locator("#tasksMenu")).not.toContainText("Stop requested");
+  await expect(page.locator("#tasksMenu").getByRole("button", { name: "Stop", exact: true }))
+    .toHaveCount(2);
+});
+
+test("after-turn task loads its owning history before opening output", async ({ page }) => {
+  await openCommandOutputTestThread(page);
+  const targetTurn = "01M0WH00000000000000000000";
+  const itemId = "command-old-running";
+  let historyReads = 0;
+  let releaseHistory!: () => void;
+  const historyGate = new Promise<void>(resolve => { releaseHistory = resolve; });
+  await page.route("**/history?before=*", async route => {
+    historyReads++;
+    await historyGate;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        thread_id: "browser-thread",
+        has_more: false,
+        turns: [{
+          id: targetTurn,
+          user_input: { text: "old command", attachments: [] },
+          items: [{
+            id: itemId,
+            harness_item_id: "native-command-old-running",
+            payload: {
+              kind: "command_execution", command: "tail -f logfile", cwd: "/tmp/project",
+              output: "persisted output before interruption", exit_code: null,
+              status: "in_progress", process_id: "proc-old-running", duration_ms: null,
+            },
+          }],
+          status: { kind: "interrupted", message: null },
+        }],
+      }),
+    });
+  });
+  await page.evaluate(({ targetTurn, itemId }) => {
+    const app = window as unknown as {
+      renderHistoryPage: (page: unknown) => void;
+      renderRunningCommandSnapshot: (tasks: unknown[]) => void;
+    };
+    app.renderHistoryPage({
+      has_more: true,
+      turns: [{
+        id: "01M0WJ00000000000000000000",
+        user_input: { text: "newer turn", attachments: [] }, items: [],
+        status: { kind: "completed", message: null },
+      }],
+    });
+    app.renderRunningCommandSnapshot([{
+      kind: "command", thread_id: "browser-thread", turn_id: targetTurn,
+      item_id: itemId, harness_item_id: "native-command-old-running",
+      command: "tail -f logfile", cwd: "/tmp/project", status: "in_progress",
+      process_id: "proc-old-running", started_at_ms: Date.now(),
+      after_turn: true, terminating: false,
+    }]);
+  }, { targetTurn, itemId });
+
+  await page.locator("#tasksBtn").click();
+  await page.locator("#tasksMenu .cmd-card", { hasText: "tail -f logfile" })
+    .getByRole("button", { name: "Open ⤢" }).click();
+  releaseHistory();
+  await expect(page.locator("#codeOverlay")).toHaveClass(/open/);
+  await expect(page.locator("#codeView")).toContainText("persisted output before interruption");
+  expect(historyReads).toBe(1);
+});
+
+test("after-turn task loads and scrolls to its owning history row", async ({ page }) => {
+  await openCommandOutputTestThread(page);
+  const targetTurn = "01M0WG00000000000000000000";
+  const itemId = "command-old-navigation";
+  let historyReads = 0;
+  let releaseHistory!: () => void;
+  const historyGate = new Promise<void>(resolve => { releaseHistory = resolve; });
+  await page.route("**/history?before=*", async route => {
+    historyReads++;
+    await historyGate;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        thread_id: "browser-thread",
+        has_more: false,
+        turns: [{
+          id: targetTurn,
+          user_input: { text: "old navigated command", attachments: [] },
+          items: [{
+            id: itemId,
+            harness_item_id: "native-command-old-navigation",
+            payload: {
+              kind: "command_execution", command: "watch old.log", cwd: "/tmp/project",
+              output: "older output", exit_code: null, status: "in_progress",
+              process_id: "proc-old-navigation", duration_ms: null,
+            },
+          }],
+          status: { kind: "interrupted", message: null },
+        }],
+      }),
+    });
+  });
+  await page.evaluate(({ targetTurn, itemId }) => {
+    const browser = window as unknown as {
+      taskNavigationWasConnected?: boolean;
+      renderHistoryPage: (page: unknown) => void;
+      renderRunningCommandSnapshot: (tasks: unknown[]) => void;
+    };
+    const originalScrollIntoView = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function(...args: Parameters<Element["scrollIntoView"]>) {
+      browser.taskNavigationWasConnected = this.isConnected;
+      originalScrollIntoView.apply(this, args);
+    };
+    browser.renderHistoryPage({
+      has_more: true,
+      turns: [{
+        id: "01M0WJ00000000000000000000",
+        user_input: { text: "newer turn", attachments: [] }, items: [],
+        status: { kind: "completed", message: null },
+      }],
+    });
+    browser.renderRunningCommandSnapshot([{
+      kind: "command", thread_id: "browser-thread", turn_id: targetTurn,
+      item_id: itemId, harness_item_id: "native-command-old-navigation",
+      command: "watch old.log", cwd: "/tmp/project", status: "in_progress",
+      process_id: "proc-old-navigation", started_at_ms: Date.now(),
+      after_turn: true, terminating: false,
+    }]);
+  }, { targetTurn, itemId });
+
+  await page.locator("#tasksBtn").click();
+  await page.locator("#tasksMenu .cmd-card", { hasText: "watch old.log" }).click();
+  releaseHistory();
+  await expect.poll(() => page.evaluate(() =>
+    (window as unknown as { taskNavigationWasConnected?: boolean }).taskNavigationWasConnected,
+  )).toBe(true);
+  await expect(page.locator("#transcript")).toContainText("watch old.log");
+  await expect(page.locator("#transcript .msg.selected", { hasText: "watch old.log" })).toBeVisible();
+  expect(historyReads).toBe(1);
 });
 
 test("completed command output is fetched only when its overlay opens", async ({ page }) => {

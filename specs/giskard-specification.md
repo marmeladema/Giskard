@@ -9,7 +9,15 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.73
+**Version:** 1.74
+
+> **Amendment — strict running-task ownership (1.74).** `RunningTasks` is a revisioned replacement
+> projection for the Tasks menu and controls only. `RunningTask` carries no output, output-only
+> deltas do not advance its revision, and task snapshots never create or reconcile transcript rows.
+> Task navigation and the command `Open` action resolve scoped turn/item identity into the real
+> transcript state, paging older history for an `after_turn` command when necessary. Uninterrupted
+> output comes from ordered events and the active-turn bounded reconnect projection comes from
+> `LiveTurnSnapshot`.
 
 > **Amendment — lazy completed tool output (1.73).** Completed tool-call output remains complete
 > JSON in each turn payload, but browser-facing events, reconnect state, and history replace the
@@ -47,6 +55,12 @@
 
 **Changelog (1.70 → 1.71), overlay title path truncation:**
 - **L8:** The diff view and code overlay title bar shows the workspace-relative path (the same truncation the transcript diff row uses) instead of the raw checkout/worktree-prefixed path. The raw path is still kept for the download/file API.
+
+**Changelog (1.73 → 1.74), strict running-task ownership:**
+- **TK2:** `RunningTask` no longer carries output. Output/progress deltas do not change task state
+  or its revision, and the browser keeps task snapshots separate from transcript commands.
+- **TK3:** Task navigation and direct command-output opening resolve the real transcript item;
+  ordered events and `LiveTurnSnapshot` remain the only live-output authorities.
 
 **Changelog (1.72 → 1.73), lazy completed tool output:**
 - **TO1:** Only the wire projection of completed `ToolCall.output` changes. Input, metadata, error,
@@ -1820,7 +1834,6 @@ pub struct RunningTask {              // TK1: formerly `RunningCommand`; general
     pub status: String,               // in_progress / running-like while present
     pub process_id: Option<String>,   // present for commands; None for tools (stop → turn interrupt)
     pub started_at_ms: i64,           // server-observed fallback when harness omits it
-    pub output: String,               // bounded output tail for the task menu
     pub after_turn: bool,             // true when the turn ended but the command is still known
     pub terminating: bool,             // true while waiting for a terminal event after terminate
 }
@@ -3537,8 +3550,9 @@ already available on both ends. Approval resolution lives only in browser memory
 `answered_approvals` a reload would replay an answered approval as pending and answering it again
 routes a stale id to the harness, which errors — and `answered_server_requests` for the same reason
 (SR6), since a harness's own resolved event may be late or absent),
-`RunningTasks { thread_id, revision, tasks: [RunningTask] }` (commands and tool/MCP calls still known to be
-running, including commands that outlived an interrupted turn),
+`RunningTasks { thread_id, revision, tasks: [RunningTask] }` (output-free identity, lifecycle and
+control state for commands and tool/MCP calls still known to be running, including commands that
+outlived an interrupted turn),
 `Error { code, severity, message, detail?, thread_id?, action? }`, `Pong`.
 
 `OpenThreadResponse` may also carry `warning: ErrorInfo?` with the same `code` / `severity` /
@@ -3672,15 +3686,24 @@ events through the same event handler used for live WebSocket events.
 - **Running-task resync (TK1).** Commands can outlive an interrupted turn even after the live
   projection is discarded. The server therefore keeps running tasks in the process-local thread
   runtime entry, keyed by
-  `thread_id` + `item_id`, updated from command **and tool-call** item start/output/completion
-  events. Tool calls are tracked the same way (name + server, elapsed time, output tail) and shown
+  `thread_id` + `item_id`, updated from command **and tool-call** item start/completion events.
+  Output and progress deltas do not mutate this authority or advance its revision. Tool calls are
+  tracked the same way (name + server and elapsed time) and shown
   in the same `Tasks` menu, but they carry no `process_id` and do not outlive their turn: a
   tool still running when its turn completes (i.e. an interrupted turn) is dropped, while commands
   are kept as `after_turn`. Stopping a tool has no per-call cancel in Codex, so the browser sends
   `Interrupt { thread_id }` (turn-level) rather than `TerminateCommand`. On subscribe, and after
-  each task revision change, the server sends revisioned `RunningTasks`; the browser renders these in the header
-  `Tasks` menu and maps `item_id` back to the transcript row for select/scroll (tool transcript
-  rows are owned by the item stream, not re-rendered from the snapshot).
+  each task revision change, the server sends revisioned `RunningTasks`; the browser renders these
+  from a task-state map distinct from transcript state. Clicking a task maps its scoped turn/item
+  identity back to the real transcript row for select/scroll. A command task also offers `Open`,
+  which launches the same live-output overlay directly. If task state arrives first, either action
+  waits for the authoritative transcript row. For an `after_turn` command outside loaded history,
+  the browser pages in its owning turn through the authenticated history endpoint. Missing or unreadable history is
+  reported visibly. Task state never synthesizes a row. Command and tool transcript rows and output
+  are owned by ordered events and `LiveTurnSnapshot`, not task snapshots. For an `after_turn`
+  command, output emitted after the owning turn was persisted but before browser reconnect is not
+  recoverable until the durable late-item amendment milestone; resumed output does not imply that
+  interval was complete.
   `TerminateCommand` requests are forwarded to the active harness. Giskard must not terminate
   local processes directly; the adapter uses the harness's process-specific control operation. It
   must not fall back to turn interruption for command stop; the browser exposes turn interruption

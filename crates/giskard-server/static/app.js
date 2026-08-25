@@ -158,7 +158,7 @@ let state = {
   models:[], modelsProject:null, modelsLoadingProject:null, streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null,
   streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), renderedItemBodyByKey:new Map(), itemKindsByItemId:new Map(),
   pendingApprovals:new Map(), answeredApprovals:new Map(), answeredApprovalsById:new Map(), renderedApprovalStateKeys:new Set(), pendingServerRequests:new Map(), answeredServerRequests:new Set(), requestStates:new Map(), runtimeOverviewRevision:-1,
-  runningCommands:new Map(), runningTasksRevision:-1, commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null,
+  runningCommands:new Map(), runningTasks:new Map(), runningTasksRevision:-1, commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null, pendingTaskNavigation:null, pendingTaskOpen:null, taskIntentSeq:0, taskHistoryLoading:false, taskHistoryOwner:0,
   commandPayloadsByItemId:new Map(), endedCommandsByItemId:new Map(),
   toolPayloadsByItemId:new Map(), toolBodyElsByItemId:new Map(),
   activeTaskGroup:null, taskGroupSeq:0, taskItemSeq:0, taskGroupsById:new Map(), taskGroupsByItemId:new Map(),
@@ -3884,6 +3884,11 @@ function renderHistoryPage(msg) {
     t.scrollTop = t.scrollHeight;
   }
 
+  // Item registration happens while rows are in the detached container above. Navigation must
+  // wait until insertion so scrollIntoView can affect the transcript viewport.
+  if (state.pendingTaskNavigation) fulfillPendingTaskIntent(state.pendingTaskNavigation);
+  if (state.pendingTaskOpen) fulfillPendingTaskIntent(state.pendingTaskOpen);
+
   maybeAutoFillHistory();
 }
 
@@ -4074,6 +4079,7 @@ function removeTurnRows(turnId) {
 // knows how tall rendered turns are, so the server cannot page by screen.
 function maybeAutoFillHistory() {
   if (state.renderTarget) return;   // never while rendering into a detached container
+  if (state.taskHistoryLoading) return;
   const t = $("transcript");
   if (!t || !state.threadId) return;
   if (!state.hasMoreHistory || state.loadingHistory || !state.oldestTurnId) return;
@@ -5425,10 +5431,9 @@ function taskTitleText(cmd) {
   if (cmd.kind === "tool") return (cmd.server ? cmd.server + ":" : "") + (cmd.command || "tool");
   return "$ " + (cmd.command || "(command)");
 }
-// The client accumulates the full running output from command_output deltas, but the server's
-// RunningTasks snapshot and replayed item payloads may carry only a capped tail (see MAX_OUTPUT_TAIL
-// in running_commands.rs). Keep whichever is longer so those updates never shrink the overlay's full
-// log back to the tail during a live session.
+// The client accumulates the full running output from command_output deltas, while replayed item
+// payloads may carry only a bounded preview. Keep whichever is longer so replay never shrinks the
+// overlay's output during an uninterrupted live session.
 function mergeRunningOutput(prev, next) {
   prev = prev || "";
   const descriptor = commandOutputDescriptor(next);
@@ -5794,7 +5799,7 @@ function renderRunningCommandSnapshot(commands) {
     const key = scopedItemKey(info.turn_id, info.item_id);
     if (!key) continue;
     seen.add(key);
-    const existing = state.runningCommands.get(key);
+    const existing = state.runningTasks.get(key);
     const cmd = commandFromParts({
       id:key,
       kind:info.kind,
@@ -5806,18 +5811,24 @@ function renderRunningCommandSnapshot(commands) {
       status:info.status || "in_progress",
       processId:info.process_id || "",
       startedAtMs:normalizeTimestampMs(info.started_at_ms, existing ? existing.startedAtMs : Date.now()),
-      output:mergeRunningOutput(existing && existing.output, info.output),
+      output:"",
       afterTurn:!!info.after_turn,
       terminating:info.terminating !== undefined ? !!info.terminating : !!(existing && existing.terminating)
     });
     if (cmd.terminating) state.commandStopRequestedByItemId.add(key);
-    state.runningCommands.set(key, cmd);
+    else state.commandStopRequestedByItemId.delete(key);
+    state.runningTasks.set(key, cmd);
   }
 
-  for (const [id, cmd] of Array.from(state.runningCommands.entries())) {
+  for (const [id] of Array.from(state.runningTasks.entries())) {
     if (seen.has(id)) continue;
-    state.runningCommands.delete(id);
+    state.runningTasks.delete(id);
     state.commandStopRequestedByItemId.delete(id);
+    if (state.pendingTaskNavigation === id || state.pendingTaskOpen === id) {
+      state.pendingTaskNavigation = null;
+      state.pendingTaskOpen = null;
+      state.taskIntentSeq++;
+    }
   }
   renderRunningCommands();
 }
@@ -5849,7 +5860,7 @@ function renderEndedCommandBody(body, cmd, status, opts) {
   refreshOutputOverlay(cmd.id);
 }
 function renderRunningCommands() {
-  const cmds = Array.from(state.runningCommands.values());
+  const cmds = Array.from(state.runningTasks.values());
   renderTasksButton(cmds);
   if (!$("tasksMenu").hidden) renderTasksMenu(cmds);
 }
@@ -6282,7 +6293,7 @@ window.addEventListener("resize", () => {
 });
 
 function renderTasksButton(cmds) {
-  cmds = cmds || Array.from(state.runningCommands.values());
+  cmds = cmds || Array.from(state.runningTasks.values());
   const btn = $("tasksBtn");
   const count = cmds.length;
   const stateName = taskButtonState(cmds);
@@ -6431,7 +6442,7 @@ function taskButtonState(cmds) {
   return "running";
 }
 function renderTasksMenu(cmds) {
-  cmds = cmds || Array.from(state.runningCommands.values());
+  cmds = cmds || Array.from(state.runningTasks.values());
   const menu = $("tasksMenu");
   const count = cmds.length;
   const commandTasks = cmds.filter(cmd => cmd.kind !== "tool");
@@ -6477,9 +6488,9 @@ function renderTaskCards(box, cmds, emptyText) {
     row.className = `cmd-card state-${stateName}` + (state.selectedCommandId===cmd.id ? " selected" : "");
     row.tabIndex = 0;
     row.setAttribute("role", "button");
-    row.onclick = () => selectCommand(cmd.id);
+    row.onclick = () => navigateToTask(cmd.id);
     row.onkeydown = (e) => {
-      if (e.key==="Enter" || e.key===" ") { e.preventDefault(); selectCommand(cmd.id); }
+      if (e.key==="Enter" || e.key===" ") { e.preventDefault(); navigateToTask(cmd.id); }
     };
     const title = document.createElement("div");
     title.className = "cmd-title mono";
@@ -6490,6 +6501,14 @@ function renderTaskCards(box, cmds, emptyText) {
     if (cmd.kind !== "tool" && cmd.cwd) appendCommandMetaPart(meta, cmd.cwd);
     const actions = document.createElement("div");
     actions.className = "cmd-actions";
+    if (cmd.kind !== "tool") {
+      const open = document.createElement("button");
+      open.type = "button";
+      open.textContent = "Open ⤢";
+      open.title = "Open live command output";
+      open.onclick = (e) => { e.stopPropagation(); openTaskCommandOutput(cmd.id); };
+      actions.append(open);
+    }
     const term = document.createElement("button");
     term.className = "danger";
     term.textContent = cmd.terminating ? "Stop requested" : "Stop";
@@ -6531,25 +6550,38 @@ document.addEventListener("click", (e) => {
 // A tool task can't be stopped individually (Codex has no per-call cancel), so stopping it
 // interrupts the owning turn; commands terminate by process id.
 function stopTask(id) {
-  const cmd = state.runningCommands.get(id);
+  const cmd = state.runningTasks.get(id);
   if (!cmd || cmd.terminating) return;
   if (cmd.kind === "tool") {
-    cmd.terminating = true;
-    state.commandStopRequestedByItemId.add(id);
+    setToolTasksTerminating(true);
     renderRunningCommands();
     if (!send({ type:"interrupt", thread_id: state.threadId })) {
-      cmd.terminating = false;
-      state.commandStopRequestedByItemId.delete(id);
+      setToolTasksTerminating(false);
       renderRunningCommands();
       notice(`Interrupt not sent: WebSocket is ${state.wsStatus}.`, "error");
     }
     return;
   }
-  terminateCommand(id);
+  requestCommandTermination(cmd.processId);
 }
 function clearTaskSelection() {
   document.querySelectorAll(".msg.selected").forEach(el => el.classList.remove("selected"));
   document.querySelectorAll(".task-group-item.selected").forEach(el => el.classList.remove("selected"));
+}
+function navigateToTask(id) {
+  $("tasksMenu").hidden = true;
+  const key = idKey(id);
+  const task = key && state.runningTasks.get(key);
+  if (!task) return;
+  state.pendingTaskOpen = null;
+  const intent = ++state.taskIntentSeq;
+  if (state.commandMsgElsByItemId.has(key)) {
+    state.pendingTaskNavigation = null;
+    selectCommand(key);
+  } else {
+    state.pendingTaskNavigation = key;
+    if (task.afterTurn) loadTaskHistoryUntilVisible(key, "navigate", intent);
+  }
 }
 function selectCommand(id) {
   const key = idKey(id);
@@ -6564,48 +6596,167 @@ function selectCommand(id) {
   }
   const msg = state.commandMsgElsByItemId.get(key);
   if (msg) {
+    state.pendingTaskNavigation = null;
     msg.classList.add("selected");
     const task = group && group.items.get(key);
     (task ? task.entry : msg).scrollIntoView({ block:"center", behavior:"smooth" });
-  }
+  } else if (state.runningTasks.has(key)) state.pendingTaskNavigation = key;
   if (group) syncTaskGroupItem(key);
   renderRunningCommands();
 }
+function openTaskCommandOutput(id) {
+  const key = idKey(id);
+  const task = key && state.runningTasks.get(key);
+  if (!task) return;
+  state.pendingTaskNavigation = null;
+  const intent = ++state.taskIntentSeq;
+  if (outputOverlayModel(key, "command")) {
+    state.pendingTaskOpen = null;
+    openOutputOverlay(key, "command");
+  } else {
+    state.pendingTaskOpen = key;
+    if (task.afterTurn) loadTaskHistoryUntilVisible(key, "open", intent);
+  }
+}
+function fulfillPendingTaskIntent(id) {
+  const key = idKey(id);
+  if (!key) return;
+  const msg = state.commandMsgElsByItemId.get(key);
+  if (state.pendingTaskNavigation === key && msg && msg.isConnected) selectCommand(key);
+  if (state.pendingTaskOpen === key && outputOverlayModel(key, "command")) {
+    state.pendingTaskOpen = null;
+    openOutputOverlay(key, "command");
+  }
+}
+function taskIntentIsCurrent(key, action, intent, view) {
+  if (intent !== state.taskIntentSeq || !activeViewIdentityIsCurrent(view) || !state.runningTasks.has(key)) return false;
+  return action === "navigate" ? state.pendingTaskNavigation === key : state.pendingTaskOpen === key;
+}
+async function waitForOrdinaryHistoryLoad(key, action, intent, view) {
+  while (state.loadingHistory && taskIntentIsCurrent(key, action, intent, view)) {
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  return taskIntentIsCurrent(key, action, intent, view);
+}
+async function loadTaskHistoryUntilVisible(key, action, intent) {
+  const view = captureActiveViewIdentity();
+  if (!view.projectId || !view.threadId) return;
+  while (state.taskHistoryOwner && state.taskHistoryOwner !== intent && taskIntentIsCurrent(key, action, intent, view)) {
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  if (!taskIntentIsCurrent(key, action, intent, view)) return;
+  state.taskHistoryOwner = intent;
+  state.taskHistoryLoading = true;
+  try {
+    while (taskIntentIsCurrent(key, action, intent, view)) {
+      fulfillPendingTaskIntent(key);
+      if (!taskIntentIsCurrent(key, action, intent, view)) return;
+      if (!(await waitForOrdinaryHistoryLoad(key, action, intent, view))) return;
+      if (!state.hasMoreHistory || !state.oldestTurnId) {
+        notice("The running task's transcript row is not available in loaded history.", "warning");
+        state.pendingTaskNavigation = null;
+        state.pendingTaskOpen = null;
+        return;
+      }
+      state.loadingHistory = true;
+      state.pendingOlder = true;
+      const before = state.oldestTurnId;
+      let page;
+      try {
+        page = await api("GET", `/api/projects/${view.projectId}/threads/${view.threadId}/history?before=${encodeURIComponent(before)}`);
+      } catch (e) {
+        if (taskIntentIsCurrent(key, action, intent, view)) {
+          state.loadingHistory = false;
+          state.pendingOlder = false;
+          state.pendingTaskNavigation = null;
+          state.pendingTaskOpen = null;
+          notice(`Could not load the running task's history: ${apiFailureMessage(e)}`, "error");
+        }
+        return;
+      }
+      if (!taskIntentIsCurrent(key, action, intent, view)) return;
+      renderHistoryPage(page);
+      const targetTurn = key.slice(0, key.indexOf(":"));
+      const targetWasReturned = (page.turns || []).some(turn => String(turn.id) === targetTurn);
+      if (targetWasReturned && taskIntentIsCurrent(key, action, intent, view)) {
+        state.pendingTaskNavigation = null;
+        state.pendingTaskOpen = null;
+        notice("The running task's transcript row could not be read from its owning turn.", "warning");
+        return;
+      }
+      if (state.oldestTurnId === before && taskIntentIsCurrent(key, action, intent, view)) {
+        state.pendingTaskNavigation = null;
+        state.pendingTaskOpen = null;
+        notice("The running task's history did not advance to its owning turn.", "warning");
+        return;
+      }
+    }
+  } finally {
+    if (state.taskHistoryOwner === intent) {
+      state.loadingHistory = false;
+      state.pendingOlder = false;
+      state.taskHistoryOwner = 0;
+      state.taskHistoryLoading = false;
+      maybeAutoFillHistory();
+    }
+  }
+}
 function terminateCommand(id) {
   const cmd = state.runningCommands.get(id);
-  if (!cmd || !cmd.processId || cmd.terminating) return;
-  cmd.terminating = true;
-  state.commandStopRequestedByItemId.add(id);
-  const body = commandBodyFor(id);
-  if (body) renderCommandBody(body, cmd);
+  if (!cmd) return;
+  requestCommandTermination(cmd.processId);
+}
+function setCommandTerminating(processId, terminating) {
+  if (!processId) return false;
+  let changed = false;
+  for (const commands of [state.runningTasks, state.runningCommands]) {
+    for (const cmd of commands.values()) {
+      if (cmd.kind === "tool" || cmd.processId !== processId || cmd.terminating === terminating) continue;
+      cmd.terminating = terminating;
+      if (terminating) state.commandStopRequestedByItemId.add(cmd.id);
+      else state.commandStopRequestedByItemId.delete(cmd.id);
+      if (commands === state.runningCommands) {
+        const body = commandBodyFor(cmd.id);
+        if (body) renderCommandBody(body, cmd);
+      }
+      changed = true;
+    }
+  }
+  return changed;
+}
+function requestCommandTermination(processId) {
+  if (!setCommandTerminating(processId, true)) return;
   renderRunningCommands();
-  if (!send({ type:"terminate_command", thread_id: state.threadId, process_id: cmd.processId })) {
-    cmd.terminating = false;
-    state.commandStopRequestedByItemId.delete(id);
-    if (body) renderCommandBody(body, cmd);
+  if (!send({ type:"terminate_command", thread_id: state.threadId, process_id: processId })) {
+    setCommandTerminating(processId, false);
     renderRunningCommands();
     notice(`Terminate not sent: WebSocket is ${state.wsStatus}.`, "error");
   }
 }
 function resetTerminatingCommand(processId) {
-  for (const cmd of state.runningCommands.values()) {
-    if (!cmd.terminating) continue;
-    // Scope the optimistic rollback to the command the failed request targeted. Only fall back
-    // to clearing every pending stop request when the server didn't identify a process id.
-    if (processId && cmd.processId !== processId) continue;
-    cmd.terminating = false;
-    state.commandStopRequestedByItemId.delete(cmd.id);
-    const body = commandBodyFor(cmd.id);
-    if (body) renderCommandBody(body, cmd);
+  if (processId) {
+    setCommandTerminating(processId, false);
+  } else {
+    const processes = new Set();
+    for (const commands of [state.runningTasks, state.runningCommands]) {
+      for (const cmd of commands.values()) {
+        if (cmd.kind !== "tool" && cmd.terminating && cmd.processId) processes.add(cmd.processId);
+      }
+    }
+    for (const process of processes) setCommandTerminating(process, false);
   }
   renderRunningCommands();
 }
-function resetTerminatingToolTasks() {
-  for (const cmd of state.runningCommands.values()) {
-    if (cmd.kind !== "tool" || !cmd.terminating) continue;
-    cmd.terminating = false;
-    state.commandStopRequestedByItemId.delete(cmd.id);
+function setToolTasksTerminating(terminating) {
+  for (const cmd of state.runningTasks.values()) {
+    if (cmd.kind !== "tool" || cmd.terminating === terminating) continue;
+    cmd.terminating = terminating;
+    if (terminating) state.commandStopRequestedByItemId.add(cmd.id);
+    else state.commandStopRequestedByItemId.delete(cmd.id);
   }
+}
+function resetTerminatingToolTasks() {
+  setToolTasksTerminating(false);
   renderRunningCommands();
 }
 function startToolCall(item, turnId) {
@@ -6894,7 +7045,13 @@ function resetRenderState() {
   state.answeredServerRequests = new Set();
   state.requestStates = new Map();
   state.runningCommands = new Map();
+  state.runningTasks = new Map();
   state.runningTasksRevision = -1;
+  state.pendingTaskNavigation = null;
+  state.pendingTaskOpen = null;
+  state.taskIntentSeq++;
+  state.taskHistoryLoading = false;
+  state.taskHistoryOwner = 0;
   state.commandBodyElsByItemId = new Map();
   state.commandMsgElsByItemId = new Map();
   state.commandStopRequestedByItemId = new Set();
@@ -6965,6 +7122,7 @@ function registerRenderedItemBody(body, item, turnId) {
   }
   if (keys.itemKey) state.renderedItemBodyByKey.set(keys.itemKey, body);
   if (keys.harnessKey) state.renderedItemBodyByKey.set(keys.harnessKey, body);
+  if (keys.itemKey) fulfillPendingTaskIntent(keys.itemKey);
 }
 function isRenderedItem(item, turnId) {
   const keys = itemIdentityKeys(item, turnId);

@@ -4,10 +4,8 @@ use std::path::Path;
 use chrono::Utc;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ItemId, ThreadId, TurnId};
-use giskard_core::item::{ItemDelta, ItemPayload, command_status_is_running};
+use giskard_core::item::{ItemPayload, command_status_is_running};
 use giskard_proto::{RunningTask, TaskKind};
-
-const MAX_OUTPUT_TAIL: usize = 8_000;
 
 type TaskKey = (TurnId, ItemId);
 
@@ -44,7 +42,6 @@ impl RunningTaskState {
                         status,
                         process_id: command.process_id.clone(),
                         started_at_ms: command.started_at_ms.unwrap_or_else(now_ms),
-                        output: String::new(),
                         after_turn: false,
                         terminating: false,
                     }
@@ -66,42 +63,19 @@ impl RunningTaskState {
                         // Tool calls have no OS process; a stop request interrupts the owning turn.
                         process_id: None,
                         started_at_ms: tool.started_at_ms.unwrap_or_else(now_ms),
-                        output: String::new(),
                         after_turn: false,
                         terminating: false,
                     }
                 } else {
                     return false;
                 };
-                self.tasks.insert((*turn, item.id), task);
-                true
-            }
-            // Command output arrives as `CommandOutput`, tool progress as `Text`. Either appends to
-            // the tracked task for its item id (untracked item ids — e.g. agent text — are ignored).
-            AgentEvent::ItemDelta {
-                thread,
-                turn,
-                item_id,
-                delta: ItemDelta::CommandOutput { chunk } | ItemDelta::Text { text: chunk },
-                ..
-            } => {
-                let Some(task) = self
-                    .tasks
-                    .get_mut(&(*turn, *item_id))
-                    .filter(|task| task.thread_id == *thread)
-                else {
-                    return false;
-                };
-                task.output.push_str(chunk);
-                truncate_output_tail(&mut task.output);
-                true
+                self.tasks.insert((*turn, item.id), task.clone()) != Some(task)
             }
             AgentEvent::ItemCompleted { thread, turn, item } => {
                 let completed = match &item.payload {
                     ItemPayload::CommandExecution {
                         command,
                         cwd,
-                        output,
                         status,
                         process_id,
                         ..
@@ -110,23 +84,19 @@ impl RunningTaskState {
                         command: command.clone(),
                         cwd: path_to_display(cwd),
                         server: None,
-                        output: output.clone(),
                         status: status.clone(),
                         process_id: process_id.clone(),
                     },
                     ItemPayload::ToolCall {
                         name,
-                        output,
                         server,
                         status,
-                        error,
                         ..
                     } => CompletedTask {
                         kind: TaskKind::Tool,
                         command: name.clone(),
                         cwd: String::new(),
                         server: server.clone(),
-                        output: tool_output_string(output.as_ref(), error.as_deref()),
                         status: status.clone(),
                         process_id: None,
                     },
@@ -142,8 +112,6 @@ impl RunningTaskState {
                     return self.tasks.remove(&key).is_some();
                 }
 
-                let mut output = completed.output;
-                truncate_output_tail(&mut output);
                 let after_turn = self
                     .tasks
                     .get(&key)
@@ -159,26 +127,22 @@ impl RunningTaskState {
                     .get(&key)
                     .map(|task| task.terminating)
                     .unwrap_or(false);
-                self.tasks.insert(
-                    key,
-                    RunningTask {
-                        kind: completed.kind,
-                        thread_id: *thread,
-                        turn_id: *turn,
-                        item_id: item.id,
-                        harness_item_id: item.harness_item_id.clone(),
-                        command: completed.command,
-                        cwd: completed.cwd,
-                        server: completed.server,
-                        status: status.to_string(),
-                        process_id: completed.process_id,
-                        started_at_ms,
-                        output,
-                        after_turn,
-                        terminating,
-                    },
-                );
-                true
+                let task = RunningTask {
+                    kind: completed.kind,
+                    thread_id: *thread,
+                    turn_id: *turn,
+                    item_id: item.id,
+                    harness_item_id: item.harness_item_id.clone(),
+                    command: completed.command,
+                    cwd: completed.cwd,
+                    server: completed.server,
+                    status: status.to_string(),
+                    process_id: completed.process_id,
+                    started_at_ms,
+                    after_turn,
+                    terminating,
+                };
+                self.tasks.insert(key, task.clone()) != Some(task)
             }
             AgentEvent::TurnCompleted { thread, turn, .. } => {
                 let mut changed = false;
@@ -296,24 +260,8 @@ struct CompletedTask {
     command: String,
     cwd: String,
     server: Option<String>,
-    output: String,
     status: Option<String>,
     process_id: Option<String>,
-}
-
-/// Render a tool call's completion output for the right-panel tail: prefer the structured result,
-/// fall back to the error string.
-fn tool_output_string(output: Option<&serde_json::Value>, error: Option<&str>) -> String {
-    if let Some(value) = output {
-        match value {
-            serde_json::Value::String(s) => s.clone(),
-            other => other.to_string(),
-        }
-    } else if let Some(error) = error {
-        error.to_string()
-    } else {
-        String::new()
-    }
 }
 
 fn path_to_display(path: &Path) -> String {
@@ -324,22 +272,11 @@ fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
 }
 
-fn truncate_output_tail(output: &mut String) {
-    if output.len() <= MAX_OUTPUT_TAIL {
-        return;
-    }
-    let mut cutoff = output.len() - MAX_OUTPUT_TAIL;
-    while !output.is_char_boundary(cutoff) {
-        cutoff += 1;
-    }
-    output.drain(..cutoff);
-}
-
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
     use giskard_core::ids::{ItemId, ThreadId, TurnId};
-    use giskard_core::item::{CommandExecutionStart, Item, ItemKind, ItemStart};
+    use giskard_core::item::{CommandExecutionStart, Item, ItemDelta, ItemKind, ItemStart};
     use giskard_core::token::TokenUsage;
     use giskard_core::turn::{TurnStatus, TurnStatusKind};
 
@@ -469,7 +406,7 @@ mod tests {
         assert_eq!(snapshot[0].started_at_ms, 1_785_000_000_000);
 
         // Tool progress arrives as a Text delta.
-        assert!(store.apply_event(&AgentEvent::ItemDelta {
+        assert!(!store.apply_event(&AgentEvent::ItemDelta {
             thread,
             turn,
             item_id,
@@ -477,7 +414,7 @@ mod tests {
                 text: "searching…".into(),
             },
         }));
-        assert_eq!(store.snapshot(thread)[0].output, "searching…");
+        assert_eq!(store.snapshot(thread), snapshot);
 
         // A terminal completion removes it from the running set.
         assert!(store.apply_event(&tool_completed(
@@ -524,7 +461,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn running_command_snapshot_tracks_output_and_after_turn() {
+    async fn running_command_snapshot_ignores_output_and_tracks_after_turn() {
         let mut store = RunningTaskState::new();
         let thread = ThreadId::new();
         let turn = TurnId::new();
@@ -548,7 +485,7 @@ mod tests {
             },
         }));
 
-        assert!(store.apply_event(&AgentEvent::ItemDelta {
+        assert!(!store.apply_event(&AgentEvent::ItemDelta {
             thread,
             turn,
             item_id,
@@ -569,7 +506,6 @@ mod tests {
         let snapshot = store.snapshot(thread);
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].command, "sleep 60");
-        assert_eq!(snapshot[0].output, "started");
         assert_eq!(snapshot[0].started_at_ms, 1_785_000_000_000);
         assert!(snapshot[0].after_turn);
     }
@@ -680,7 +616,6 @@ mod tests {
 
         let snapshot = store.snapshot(thread);
         assert_eq!(snapshot.len(), 1);
-        assert_eq!(snapshot[0].output, "still sleeping");
         assert_eq!(snapshot[0].process_id.as_deref(), Some("proc_1"));
     }
 
@@ -988,7 +923,7 @@ mod tests {
             "in_progress",
         ));
         assert!(store.set_terminating_by_process(thread, "proc_1", true));
-        assert!(store.apply_event(&command_completed(
+        assert!(!store.apply_event(&command_completed(
             thread,
             turn,
             item_id,
@@ -999,17 +934,14 @@ mod tests {
         let snapshot = store.snapshot(thread);
         assert_eq!(snapshot.len(), 1);
         assert!(snapshot[0].terminating);
-        assert_eq!(snapshot[0].output, "finished");
     }
 
     #[tokio::test]
-    async fn command_output_tail_truncates_on_utf8_boundary() {
+    async fn command_output_does_not_change_running_task_state() {
         let mut store = RunningTaskState::new();
         let thread = ThreadId::new();
         let turn = TurnId::new();
         let item_id = ItemId::new();
-        let tail = "a".repeat(MAX_OUTPUT_TAIL - 1);
-
         store.apply_event(&command_start(
             thread,
             turn,
@@ -1017,18 +949,18 @@ mod tests {
             "proc_1",
             "in_progress",
         ));
-        assert!(store.apply_event(&AgentEvent::ItemDelta {
+        let before = store.snapshot(thread);
+        assert!(!store.apply_event(&AgentEvent::ItemDelta {
             thread,
             turn,
             item_id,
             delta: ItemDelta::CommandOutput {
-                chunk: format!("é{tail}"),
+                chunk: "é and arbitrarily large output".repeat(100_000),
             },
         }));
 
         let snapshot = store.snapshot(thread);
         assert_eq!(snapshot.len(), 1);
-        assert_eq!(snapshot[0].output, tail);
-        assert!(snapshot[0].output.len() <= MAX_OUTPUT_TAIL);
+        assert_eq!(snapshot, before);
     }
 }
