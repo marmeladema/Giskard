@@ -95,7 +95,7 @@ The store now exposes `load_turn_records`, and ordinary format-2 pagination sele
 before fetching their payloads. Adding the consistent `load_history_snapshot` and
 `load_history_from` reads remains in scope for the milestone whose bootstrap consumes them — the
 storage plan deferred those transaction-facing reads until a consumer existed, and that consumer
-is M8.
+is M9.
 
 ### One of the two full-history reads per bootstrap is already gone
 
@@ -107,7 +107,7 @@ needs only a turn's *position* and should use a bounded index scan rather than `
 
 `giskard-persist::preview::bounded_preview(text, max_bytes) -> (String, bool)` is UTF-8-safe and
 already has two callers (`prompt_preview`, `status.message`). M5 extends this primitive with
-retention direction for durable command head/tail and wire tail previews; M7 reuses it for the
+retention direction for durable command head/tail and wire tail previews; M8 reuses it for the
 remaining named policies. Neither milestone adds a second UTF-8 truncation algorithm.
 
 ### Amendments have a home in the format, and no home in the code yet
@@ -116,7 +116,7 @@ Payload records already carry an explicit `index`, payload files are tagged and 
 and the fold rules for collections and singletons are stated in `parse_turn_payload`. A late command
 or tool completion can therefore be appended to its turn's payload file without a format bump.
 
-Nothing implements this. It is M10, and it is a durable-format behaviour change that
+Nothing implements this. It is M11, and it is a durable-format behaviour change that
 deserves its own review: an amendment needs a durable clock the browser can compare against, a
 persistence-recovery path when the amendment write fails, and a reconnect rule. It must not be
 absorbed into an earlier milestone.
@@ -623,8 +623,8 @@ lazy retrieval rather than byte slicing. See *What the storage layout change unl
 ordered suffix has separate entry and byte limits and counts against both runtime-journal and
 bootstrap memory until commit or cancellation.
 
-Live request payloads, task-output projections, notices, metadata strings, and reconnect-only
-accumulations each need documented size limits or bounded compact forms. An individual live event
+Live request payloads, notices, metadata strings, and reconnect-only accumulations each need
+documented size limits or bounded compact forms. An individual live event
 which cannot fit the maximum ordered-event size does not enter the outbox: mark that subscription
 `NeedsResync`. The next bootstrap obtains the content from semantic history elements or a bounded
 runtime projection. Never truncate silently; an omission marker or lazy full-content retrieval must
@@ -903,7 +903,7 @@ The audit found correctness issues which should not be hidden inside this alread
 change:
 
 - A command or tool may finish after its interrupted turn was appended. The late event has no
-  durable coverage, so reconnect after disconnection can show it as running. **This is now M10**:
+  durable coverage, so reconnect after disconnection can show it as running. **This is now M11**:
   the per-turn payload format admits the amendment without a format bump, and what remains is the
   durable clock, recovery path, and reconnect rule.
 - A turn whose payload is unreadable is dropped from the returned history with an `error!` log and
@@ -946,9 +946,10 @@ Each milestone is one landing, reviewable on its own. Scope and non-goals are bi
 **Dependencies.** M1 depends on nothing. M3 and M4 need M2's runtime registry — M3 for the
 lifecycle state that replaces its own guard, M4 for the active diff authority. M5 reuses M4's lazy
 content boundary and M2's apply boundary. M6 applies the same addressable-content pattern to
-completed tool output. M7 consumes M5 and M6's bounded wire projections and bounds the remaining
-semantic items. M8 needs M7's policies before journal byte accounting is meaningful. M9 needs M8's
-bootstrap as its resync target. M10 reuses M5/M6 normalization and needs M8's journal coverage
+completed tool output. M7 removes output from the task projection. M8 consumes M5 and M6's bounded
+wire projections and bounds the remaining semantic items. M9 needs M8's policies before journal
+byte accounting is meaningful. M10 needs M9's bootstrap as its resync target. M11 reuses M5/M6
+normalization and needs M9's journal coverage
 token.
 Anything not listed here is ordering preference, not a constraint.
 
@@ -976,7 +977,7 @@ page count; correlate or abort in-flight fetches when the active thread changes.
 
 Pagination is a request/response with no ordering relationship to live state, so it does not belong
 in the ordered lane, where it competes for outbox capacity and would need a subscription generation.
-Moving it out also shrinks what M8 has to reason about.
+Moving it out also shrinks what M9 has to reason about.
 
 **Non-goals.** The bootstrap transaction. Bounded reads — `load_history` already serves whole turns
 and is sufficient here; the bounded reads land with the bootstrap that needs them.
@@ -984,12 +985,12 @@ and is sufficient here; the bounded reads land with the bootstrap that needs the
 **Exit criteria.** Two protocol variants are gone. Pagination cannot be confused with bootstrap
 history. Switching threads mid-fetch cannot apply the previous thread's page.
 
-**Transitional handoff to M8.** M1 moves only older-page pagination to HTTP. Until M8 replaces the
+**Transitional handoff to M9.** M1 moves only older-page pagination to HTTP. Until M9 replaces the
 implicit bootstrap state machine, fresh subscriptions and stale-cursor recovery continue to carry
 their bounded initial history as a bootstrap-only reset `HistoryDelta`; this is not a pagination
 response. The server still obtains that history and the live snapshot through sequential reads, so
 they do not form a transactional cut. M1 deliberately preserves that pre-existing limitation rather
-than introducing a second independent HTTP/WebSocket race. M8 owns closing it with the runtime
+than introducing a second independent HTTP/WebSocket race. M9 owns closing it with the runtime
 snapshot, journal watermark, ordered suffix, and semantic transaction commit described above.
 
 ---
@@ -1013,8 +1014,8 @@ Every client-visible agent event goes through one apply boundary. Delete `LiveBu
 browser request map. Replace additive activity state with the replacement overview.
 
 **Non-goals.** Lazy diff delivery (M4). Lazy completed-command output (M5). Lazy completed tool
-output (M6). Remaining retention limits (M7). The event journal and bootstrap transaction (M8).
-Durable amendments and amendment-write recovery (M10). Changes to
+output (M6). Task-projection ownership (M7). Remaining retention limits (M8). The event journal and
+bootstrap transaction (M9). Durable amendments and amendment-write recovery (M11). Changes to
 `giskard-persist` — **this milestone must
 not touch that crate**; if it appears to need to, that is the signal to stop.
 
@@ -1045,7 +1046,7 @@ is untouched.
 
 Most of this milestone is harness-side and independent: `ThreadUpdateSink`, the Codex resume
 mapping, pending replay observation without a time-based deadline, and the mapper's active-turn
-gate that keeps replayed usage out of turn ledgers. Those live in crates M2 and M8 never touch.
+gate that keeps replayed usage out of turn ledgers. Those live in crates M2 and M9 never touch.
 
 The exception is the staleness guard. On the abandoned branch it was a bespoke generation/commit
 counter in `registry.rs`, hooked into `start_turn`, `compact_thread`, `forget_thread`,
@@ -1122,7 +1123,7 @@ resolve through either authority but must return the same identified content. If
 has replaced the requested `diff_id`, return a conflict carrying the current descriptor; do not
 retain an unbounded version cache. The browser retries only while the same thread/turn remains
 selected and the current descriptor still advertises that identity. A per-request selection token
-rejects late responses; M8 later adds subscription-generation gating. The endpoint reads captured
+rejects late responses; M9 later adds subscription-generation gating. The endpoint reads captured
 agent output and must not recompute a workspace Git diff whose answer may already have changed.
 
 **Non-goals.** Retention policy for command, tool, text, or reasoning content. The journal,
@@ -1140,7 +1141,7 @@ the explicit conflict above. Workspace Git diff continues to use its existing HT
 
 **Status:** complete. Completed command output is carried as an 8 KiB tail descriptor and fetched
 in full from its own endpoint; the durable limit is configurable, and the late-completion exception
-remains as documented until M10.
+remains as documented until M11.
 
 **One heavyweight field, end to end.** Completed command output is already streamed incrementally,
 then redundantly embedded in `ItemCompleted`, reconnect history, ordinary history pages, and every
@@ -1220,7 +1221,7 @@ Closing the overlay releases fetched content.
 A terminal completion received after its turn was already persisted is still normalized before
 wire publication, but M5 does not amend the payload or advertise lazy availability. A browser which
 observed the running stream may keep its local accumulation for that session; reconnect has only the
-bounded preview. Log the deferred durable update explicitly. M10 makes this case persisted and lazy.
+bounded preview. Log the deferred durable update explicitly. M11 makes this case persisted and lazy.
 
 **Non-goals.** Tool input/output/metadata. A generic item-content abstraction. Any change to agent,
 reasoning, user, approval, activity, or sub-agent content. Running-output retrieval. The journal,
@@ -1230,7 +1231,7 @@ transactional bootstrap, outbox, payload format bump, migration, or command amen
 and truncation is explicit; legacy output remains unmigrated but its wire projection is bounded.
 Running commands behave exactly as before. Every completed command projection carries only the
 8 KiB tail-oriented descriptor. Normal completion has byte-identical runtime and persisted endpoint
-reads; the documented post-persistence late-completion exception advertises no lazy body until M10.
+reads; the documented post-persistence late-completion exception advertises no lazy body until M11.
 Old format-1 turns work without migration, and the browser retains completed output only while its
 overlay is open or while preserving the late-completion exception's already-observed stream.
 
@@ -1307,12 +1308,12 @@ completion arrives and is never substituted for missing output.
 
 A terminal tool completion received after its turn was already persisted remains ignored in M6,
 as it is today: no descriptor or endpoint availability is advertised, and the drop is logged with
-thread, turn, and item identity. M10 extends durable late-item amendments to this case.
+thread, turn, and item identity. M11 extends durable late-item amendments to this case.
 
 Keep persisted JSON complete in M6. There is no durable tool-output limit, truncation marker,
 payload format bump, or migration in this milestone. Durable JSON retention is a distinct policy
 decision: byte-slicing would corrupt JSON, and replacing subtrees would invent a semantic projection
-format. M7 may record the output as already addressable when auditing remaining retention policies;
+format. M8 may record the output as already addressable when auditing remaining retention policies;
 it must not silently truncate it.
 
 **Deferred global thread-identity invariant.** Runtime entries and all of their primitives are keyed
@@ -1336,19 +1337,61 @@ descriptor but not its JSON value. Every advertised output remains retrievable a
 persisted race and `PersistenceBlocked`; absent and running output is not advertised. The overlay
 fetches and releases valid JSON on demand, while live progress behavior and every non-output tool
 field remain unchanged. The documented post-persistence late-completion exception advertises
-nothing until M10.
+nothing until M11.
 
 ---
 
-### M7 — Remaining retention policies
+### M7 — `RunningTasks` authority revamp
+
+**Status:** planned. `RunningTasks` will be a revisioned replacement projection for the Tasks menu
+and its controls only. It will no longer carry or accumulate command or tool output.
+
+**Scope.** Remove `RunningTask.output` and stop treating command-output or tool-progress deltas as
+task-state changes. Keep task identity, status, timing, process identity, after-turn state,
+termination state, and stop routing. In the browser, hold task snapshots in a map distinct from
+the transcript's running-command state. An empty task snapshot clears the menu without deleting
+transcript rows.
+
+Task cards remain shortcuts into the transcript authority. Clicking a card selects, expands, and
+scrolls to the real command or tool row. A command card also has an `Open` action which launches
+the existing live-output overlay without navigating first. If a current-turn task snapshot wins
+the race with the corresponding transcript event, defer navigation or opening until the
+authoritative row is registered. If an `after_turn` command belongs to a turn outside the loaded
+history, progressively load ordinary authenticated history pages until that turn is rendered, then
+fulfil the action. Scope the fetch to the active view generation and cancel it when the thread
+changes, the task disappears, or a newer task action supersedes it. Exhausted or unreadable history
+produces a visible warning; task state never fabricates a transcript row.
+
+Live ordered events continue to supply all command output observed by an uninterrupted browser.
+`LiveTurnSnapshot` remains the active-turn reconnect authority and retains its existing bounded
+command-output projection. If a command outlives its persisted turn, output emitted after that turn
+was appended but before a browser reconnects is not recoverable: the row resumes from persisted
+content plus newly observed deltas and does not imply that the interval is complete. M11 closes
+this late-completion durability gap. Completed command output remains lazily retrievable through
+M5's endpoint. M7 changes neither durable content nor either output policy.
+
+**Non-goals.** Running-output retention or addressability, changing the live reconnect snapshot,
+completed command/tool output, persistence, the event journal, or transactional bootstrap.
+
+**Exit criteria.** Output-only deltas do not advance the task revision. Task snapshots cannot
+create, update, or delete transcript rows or output. Navigation and direct command opening resolve
+through scoped turn/item identity to the real transcript state, continue following live deltas,
+tolerate the task-before-transcript race, and load an older owning turn when necessary. Missing or
+damaged history fails visibly instead of leaving an action pending forever. Command and tool stop
+controls retain their existing routing and lifecycle behavior.
+
+---
+
+### M8 — Remaining retention policies
 
 **Small, and it must come before the journal** so the journal's byte bounds are meaningful from the
 first commit rather than retrofitted.
 
 **Scope.** Treat tool input, metadata, and error text as accepted inline based on the measured
 current corpus, alongside agent/reasoning/user text, approval metadata, activity metadata, and
-sub-agent prompts. Add named policies only for task tails and maximum encoded-event admission. Do
-not revisit M5 command output or M6 addressable tool output.
+sub-agent prompts. Add a named policy for maximum encoded-event admission. Do not revisit M5
+command output, M6 addressable tool output, M7's output-free task projection, or the existing
+transcript-owned inline/reconnect command-output previews.
 
 Apply normalization at M2's runtime boundary so consumers do not independently truncate an event.
 Audit request payloads, notices, metadata, user input, and attachment descriptors only to cite
@@ -1356,27 +1399,27 @@ their existing boundary or record the accepted-inline assumption. Every actual o
 explicit, and no set whose completeness carries meaning is capped.
 
 Define, size, and test maximum encoded-event admission against current individual live-event
-publication. Do not introduce bootstrap elements, journal admission, or M8's transaction. The
-legacy aggregate snapshot remains transitional until M8 replaces it; it must not become the new
+publication. Do not introduce bootstrap elements, journal admission, or M9's transaction. The
+legacy aggregate snapshot remains transitional until M9 replaces it; it must not become the new
 protocol template.
 
 **Non-goals.** Command and tool output, already owned by M5 and M6. A second UTF-8 truncation
 algorithm. A per-turn allocation algorithm. Aggregate bootstrap staging limits, the journal, and
-the bootstrap transaction belong to M8.
+the bootstrap transaction belong to M9.
 
 **Exit criteria.** Every actual policy has a name, limit, and explicit omission representation.
-Nothing truncates silently, and every semantic element admitted to M8 has a proven bound, lazy
+Nothing truncates silently, and every semantic element admitted to M9 has a proven bound, lazy
 content boundary, or named accepted-inline assumption.
 
 ---
 
-### M8 — Journal and semantic transactional bootstrap
+### M9 — Journal and semantic transactional bootstrap
 
 **The largest remaining milestone. Watch it.**
 
 **Partial prerequisite complete.** Format-2 history pagination now reads the bounded index first
 and opens payload files only for the selected page or suffix. `PersistStore::load_turn_records`
-exposes the index-only projection for the eventual bootstrap builder. M8 still owns the consistent
+exposes the index-only projection for the eventual bootstrap builder. M9 still owns the consistent
 snapshot/range interface used by the transaction, the live cut and journal, subscription
 generations, semantic element encoding, and browser commit path.
 
@@ -1416,7 +1459,7 @@ cancellable shadow context, yield between bounded render batches, then swap it i
 Bound both individual encoded messages and total staged bytes/items. Exceeding either budget fails
 the transaction explicitly rather than partially applying or selectively hiding items.
 
-**Non-goals.** Class-aware outbox and same-socket resync (M9). Amendments (M10). Generic base64 or
+**Non-goals.** Class-aware outbox and same-socket resync (M10). Amendments (M11). Generic base64 or
 byte-sliced application messages.
 
 **Exit criteria.** An `ItemDelta` before or after the live cut appears exactly once. Completion
@@ -1425,11 +1468,11 @@ repeated subscribe cannot deliver an old generation. The four browser phase flag
 
 ---
 
-### M9 — Class-aware outbox and same-socket resync
+### M10 — Class-aware outbox and same-socket resync
 
 **Scope.** The connection-owned delivery pump with per-class admission, coalescing replacement
 state, control reserve, and ordered-stream loss detection. Ordered overflow marks only that
-subscription `NeedsResync` and resyncs on the same socket, satisfied from M8's journal.
+subscription `NeedsResync` and resyncs on the same socket, satisfied from M9's journal.
 
 **Non-goals.** Anything in the bootstrap transaction beyond the resync entry point.
 
@@ -1439,7 +1482,7 @@ continues. No producer awaits socket capacity.
 
 ---
 
-### M10 — Late item completion (durable amendments)
+### M11 — Late item completion (durable amendments)
 
 **Its own landing, its own review.** This is a durable-format behaviour change.
 
@@ -1460,10 +1503,10 @@ every point in time, not merely after the amendment.
 
 ---
 
-### M11 — Cleanup and budget
+### M12 — Cleanup and budget
 
 **Scope.** Remove obsolete stores, protocol variants, browser flags, tests, and documentation left
-by M2–M10. Re-measure and report the final complexity budget after cleanup. Run unit, integration,
+by M2–M11. Re-measure and report the final complexity budget after cleanup. Run unit, integration,
 browser E2E,
 formatting, lint, and the full workspace suite.
 
@@ -1553,15 +1596,18 @@ formatting, lint, and the full workspace suite.
   matches the current descriptor.
 - MCP progress `ItemDelta::Text` continues to render while running, does not advertise output
   availability, and is never treated as a fragment of the completed JSON result.
-- A post-persistence late tool completion is logged and advertises nothing in M6; M10 coverage
+- A post-persistence late tool completion is logged and advertises nothing in M6; M11 coverage
   proves that both late command and late tool completion eventually amend and republish durably.
 - Opening a completed tool fetches output lazily; abort on selection change or close, retry, reopen,
   close-time release, structured rendering, combined input/output copy and download, wrong content
   type, and malformed/failing responses preserve the existing overlay behavior without retaining
   fetched JSON after close. Running or absent output issues no fetch.
-- M7's task-tail policy preserves UTF-8 boundaries and explicitly accounts for omitted bytes;
-  encoded-event admission rejects an oversized event explicitly rather than truncating semantic
-  content. Accepted-inline fields remain named assumptions, not falsely asserted limits.
+- M7's task projection carries no transcript output, and output-only deltas do not advance its
+  revision. A current-turn task action survives the task-before-transcript race; an `after_turn`
+  task outside loaded history pages in its owning turn before navigating or opening, and missing or
+  damaged history fails visibly. M8's encoded-event admission rejects an oversized event explicitly
+  rather than truncating semantic content. Accepted-inline fields remain named assumptions, not
+  falsely asserted limits.
 
 ### Bootstrap cut
 
@@ -1642,13 +1688,13 @@ Measured on `main` at `6907fd0`:
   **36** places.
 - `giskard-proto/src/lib.rs` and `static/app.js` together contain **10,664** physical lines.
 
-The target after M8 is zero of those four flags, one staged bootstrap transaction and one browser
+The target after M9 is zero of those four flags, one staged bootstrap transaction and one browser
 apply path, no more than 13 `ServerMessage` variants, and no positive net line growth across those
 two files. If a count cannot meet the target, stop and review the design rather than replacing the
 criterion with a qualitative claim.
 
-M8 measures this target when the unified bootstrap path lands. Intermediate milestones before M8
-neither satisfy nor fail it; M11 re-measures the final state after cleanup.
+M9 measures this target when the unified bootstrap path lands. Intermediate milestones before M9
+neither satisfy nor fail it; M12 re-measures the final state after cleanup.
 
 ## Exit criteria
 
