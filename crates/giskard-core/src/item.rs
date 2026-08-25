@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
 use crate::diff::CapturedDiffDescriptor;
@@ -237,6 +238,38 @@ pub struct CommandOutputDescriptor {
     pub output_available: bool,
 }
 
+/// Bounded projection of an opaque completed tool result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolOutputDescriptor {
+    pub serialized_bytes: u64,
+    /// Strong HTTP entity tag for the exact compact JSON bytes.
+    pub version: String,
+}
+
+/// Serialize a tool result once into the exact bytes used for its descriptor and lazy response.
+pub fn serialize_tool_output(
+    output: &serde_json::Value,
+) -> Result<(Vec<u8>, ToolOutputDescriptor), serde_json::Error> {
+    const DOMAIN: &[u8] = b"giskard.tool-output.v1\0";
+    let bytes = serde_json::to_vec(output)?;
+    let mut digest = Sha256::new();
+    digest.update(DOMAIN);
+    digest.update(&bytes);
+    let descriptor = ToolOutputDescriptor {
+        serialized_bytes: bytes.len() as u64,
+        version: format!("\"sha256_{:x}\"", digest.finalize()),
+    };
+    Ok((bytes, descriptor))
+}
+
+/// Tool-call statuses which still describe a nonterminal result.
+pub fn tool_status_is_running(status: &str) -> bool {
+    matches!(
+        normalized_command_status(status).as_str(),
+        "pending" | "in_progress" | "inprogress" | "running"
+    )
+}
+
 impl CommandOutputDescriptor {
     pub const PREVIEW_MAX_BYTES: usize = 8 * 1024;
 
@@ -370,6 +403,32 @@ mod tests {
         let json = serde_json::to_string(&item).unwrap();
         let back: Item = serde_json::from_str(&json).unwrap();
         assert_eq!(item, back);
+    }
+
+    #[test]
+    fn tool_output_descriptor_uses_exact_compact_json_bytes() {
+        let value = serde_json::json!({"large": [true, null, "sentinel"]});
+        let (bytes, descriptor) = serialize_tool_output(&value).unwrap();
+        assert_eq!(bytes, br#"{"large":[true,null,"sentinel"]}"#);
+        assert_eq!(descriptor.serialized_bytes, bytes.len() as u64);
+        assert!(descriptor.version.starts_with("\"sha256_"));
+        assert!(descriptor.version.ends_with('"'));
+        assert_eq!(serialize_tool_output(&value).unwrap().1, descriptor);
+        assert_ne!(
+            serialize_tool_output(&serde_json::json!({"large": []}))
+                .unwrap()
+                .1,
+            descriptor
+        );
+    }
+
+    #[test]
+    fn tool_running_status_normalizes_provider_spellings() {
+        for status in ["pending", "IN-PROGRESS", "inProgress", "running"] {
+            assert!(tool_status_is_running(status), "{status}");
+        }
+        assert!(!tool_status_is_running("completed"));
+        assert!(!tool_status_is_running("provider_specific_terminal"));
     }
 
     #[test]

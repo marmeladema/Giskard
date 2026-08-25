@@ -14,7 +14,7 @@ use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{
     Item, ItemPayload, SubagentAction, SubagentStatus, command_status_is_running,
-    normalized_command_status,
+    normalized_command_status, tool_status_is_running,
 };
 use giskard_core::mcp::{McpOauthStart, McpServerStatus};
 use giskard_core::model::{ModelDescriptor, ModelRef};
@@ -2837,35 +2837,36 @@ async fn forward_events(
                 // projection, current-turn assembly, or persistence can observe it. Command
                 // terminality is handled separately: providers may send a nonterminal
                 // ItemCompleted followed by a later terminal replacement.
-                let is_completed_command = matches!(
+                let is_completed_addressable_output = matches!(
                     &event,
                     AgentEvent::ItemCompleted { item, .. }
-                        if matches!(&item.payload, ItemPayload::CommandExecution { .. })
+                        if matches!(&item.payload, ItemPayload::CommandExecution { .. } | ItemPayload::ToolCall { .. })
                 );
-                let (event, prepared_command_output, preparation_permit) = if is_completed_command {
-                    let Some(permit) = runtime.event_application_permit(thread_id) else {
-                        break ForwarderExitReason::RuntimeAuthorityReplaced;
-                    };
-                    let preparation_runtime = runtime.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        preparation_runtime.prepare_command_output(event)
-                    })
-                    .await
-                    {
-                        Ok((event, prepared)) => (event, prepared, Some(permit)),
-                        Err(error) => {
-                            tracing::error!(
-                                %project_id,
-                                %thread_id,
-                                error = %error,
-                                "command-output event preparation task failed"
-                            );
-                            break ForwarderExitReason::EventPreparationFailed;
+                let (event, prepared_item_output, preparation_permit) =
+                    if is_completed_addressable_output {
+                        let Some(permit) = runtime.event_application_permit(thread_id) else {
+                            break ForwarderExitReason::RuntimeAuthorityReplaced;
+                        };
+                        let preparation_runtime = runtime.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            preparation_runtime.prepare_item_output(event)
+                        })
+                        .await
+                        {
+                            Ok((event, prepared)) => (event, prepared, Some(permit)),
+                            Err(error) => {
+                                tracing::error!(
+                                    %project_id,
+                                    %thread_id,
+                                    error = %error,
+                                    "addressable item-output event preparation task failed"
+                                );
+                                break ForwarderExitReason::EventPreparationFailed;
+                            }
                         }
-                    }
-                } else {
-                    (event, None, None)
-                };
+                    } else {
+                        (event, None, None)
+                    };
 
                 if let Some(turn) = event_turn
                     && seen_turn_ids.contains(&turn)
@@ -2878,7 +2879,7 @@ async fn forward_events(
                                 permit,
                                 &event,
                                 false,
-                                prepared_command_output,
+                                prepared_item_output,
                             ) {
                                 Some(applied) => applied,
                                 None => break ForwarderExitReason::RuntimeAuthorityReplaced,
@@ -2887,7 +2888,7 @@ async fn forward_events(
                                 thread_id,
                                 &event,
                                 false,
-                                prepared_command_output,
+                                prepared_item_output,
                             ),
                         };
                         if let AgentEvent::ItemCompleted { turn, item, .. } = &event {
@@ -2929,8 +2930,24 @@ async fn forward_events(
                                 "broadcasting terminal command completion for a persisted turn without matching running-task state"
                             );
                         }
-                        if let Some(message) = late_command_completion_message(thread_id, event) {
+                        if let Some(message) =
+                            late_command_completion_message(thread_id, event.clone())
+                        {
                             hub.broadcast(thread_id, message).await;
+                        }
+                    }
+                    if let AgentEvent::ItemCompleted { turn, item, .. } = &event
+                        && matches!(item.payload, ItemPayload::ToolCall { .. })
+                    {
+                        shared.runtime.remove_tool_output(thread_id, *turn, item.id);
+                        if completed_tool_has_terminal_output(item) {
+                            warn!(
+                                %project_id,
+                                %thread_id,
+                                %turn,
+                                item_id = %item.id,
+                                "ignoring completed tool output for an already-persisted turn"
+                            );
                         }
                     }
                     if owned_turn_completed
@@ -3213,7 +3230,7 @@ async fn forward_events(
                             permit,
                             &event,
                             append_to_live_buffer,
-                            prepared_command_output,
+                            prepared_item_output,
                         ) {
                             Some(applied) => applied,
                             None => break ForwarderExitReason::RuntimeAuthorityReplaced,
@@ -3222,7 +3239,7 @@ async fn forward_events(
                             thread_id,
                             &event,
                             append_to_live_buffer,
-                            prepared_command_output,
+                            prepared_item_output,
                         ),
                     };
                     debug!(
@@ -3937,6 +3954,13 @@ fn is_terminal_command_completion(event: &AgentEvent) -> bool {
         .unwrap_or(false)
 }
 
+fn completed_tool_has_terminal_output(item: &Item) -> bool {
+    let ItemPayload::ToolCall { output, status, .. } = &item.payload else {
+        return false;
+    };
+    output.is_some() && !status.as_deref().is_some_and(tool_status_is_running)
+}
+
 fn late_command_completion_message(
     thread_id: ThreadId,
     event: AgentEvent,
@@ -4286,8 +4310,9 @@ mod tests {
 
     use super::{
         CurrentTurnItems, TurnContext, TurnContextKind, command_completion_is_normal_success,
-        command_status_is_running, forward_events, late_command_completion_message,
-        passive_subagent_prompt_text, persist_subagent_fallback_transcript, prepare_thread_updates,
+        command_status_is_running, completed_tool_has_terminal_output, forward_events,
+        late_command_completion_message, passive_subagent_prompt_text,
+        persist_subagent_fallback_transcript, prepare_thread_updates,
         should_refresh_subagent_title, spawn_thread_update_forwarder, subagent_monitor_policy,
         subagent_path_leaf, take_passive_subagent_monitor_metadata, track_item_identity,
         turn_reservation, update_passive_subagent_metadata,
@@ -4295,6 +4320,37 @@ mod tests {
     use crate::hub::Hub;
     use crate::ledger;
     use crate::thread_runtime::ThreadRuntimeRegistry;
+
+    #[test]
+    fn late_tool_warning_requires_terminal_output() {
+        let item = |status: Option<&str>, output: Option<serde_json::Value>| Item {
+            id: ItemId::new(),
+            harness_item_id: "tool-1".into(),
+            payload: ItemPayload::ToolCall {
+                name: "lookup".into(),
+                input: serde_json::Value::Null,
+                output,
+                server: None,
+                status: status.map(str::to_owned),
+                metadata: None,
+                subagent: None,
+                error: None,
+            },
+            created_at: Utc::now(),
+        };
+        assert!(!completed_tool_has_terminal_output(&item(
+            Some("completed"),
+            None,
+        )));
+        assert!(!completed_tool_has_terminal_output(&item(
+            Some("running"),
+            Some(serde_json::json!({"partial": true})),
+        )));
+        assert!(completed_tool_has_terminal_output(&item(
+            Some("completed"),
+            Some(serde_json::Value::Null),
+        )));
+    }
 
     #[test]
     fn late_untruncated_command_completion_ignores_original_counts() {

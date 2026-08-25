@@ -526,6 +526,12 @@ pub struct StoredCommandOutput {
     pub original_lines: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredToolOutput {
+    pub bytes: Vec<u8>,
+    pub descriptor: giskard_core::item::ToolOutputDescriptor,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HistoryFileMeta {
     len: u64,
@@ -1565,6 +1571,59 @@ impl PersistStore {
             original_bytes: descriptor.original_bytes,
             original_lines: descriptor.original_lines,
         }))
+    }
+
+    /// Load one terminal tool's complete JSON output from an indexed immutable turn payload.
+    pub async fn load_tool_output(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+        turn: TurnId,
+        item_id: ItemId,
+    ) -> Result<Option<StoredToolOutput>, PersistError> {
+        self.ensure_migrated(project, thread).await;
+        let records = self.load_turn_records_unlocked(project, thread).await?;
+        if !records.iter().any(|record| record.turn_id == turn) {
+            return Ok(None);
+        }
+        let paths = self.thread_paths(project, thread).await;
+        let loaded_items = if paths.layout() == ThreadLayout::Flat {
+            let path = paths.history();
+            let data = match tokio::fs::read_to_string(&path).await {
+                Ok(data) => data,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(PersistError::Io(error.to_string())),
+            };
+            parse_turn_history(&path, &data)?
+                .into_iter()
+                .find(|candidate| candidate.id == turn)
+                .map(|turn| turn.items)
+        } else {
+            let payload_path = paths.turn_payload(turn);
+            history::read_turn_payload(&payload_path)
+                .await?
+                .map(|payload| payload.items)
+        };
+        let Some(item) =
+            loaded_items.and_then(|items| items.into_iter().find(|item| item.id == item_id))
+        else {
+            return Ok(None);
+        };
+        let ItemPayload::ToolCall { output, status, .. } = item.payload else {
+            return Ok(None);
+        };
+        if status
+            .as_deref()
+            .is_some_and(giskard_core::item::tool_status_is_running)
+        {
+            return Ok(None);
+        }
+        let Some(output) = output else {
+            return Ok(None);
+        };
+        let (bytes, descriptor) = giskard_core::item::serialize_tool_output(&output)
+            .map_err(|error| PersistError::Invalid(error.to_string()))?;
+        Ok(Some(StoredToolOutput { bytes, descriptor }))
     }
 
     /// Load up to `limit` readable turns ending before `end`, backfilling across isolated damaged

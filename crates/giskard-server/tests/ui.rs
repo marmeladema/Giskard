@@ -1240,8 +1240,11 @@ async fn index_page_is_served_and_public() {
         "tool input/output expansion state is no longer tracked"
     );
     assert!(
-        body.contains("Tool data · ${label}"),
-        "visible tool rows summarize their input/output with line/byte stats"
+        body.contains("Tool data · ${commandOutputStatsLabel(stats, phase)}")
+            && body.contains(
+                "Output · ${formatBytes(descriptorNumber(descriptor, \"serialized_bytes\", 0))}"
+            ),
+        "tool rows summarize inline data and addressable completed output"
     );
     assert!(
         !body.contains("tool-io-toggle"),
@@ -2600,7 +2603,10 @@ fn browser_loads_completed_command_output_only_in_the_overlay() {
         "state.projectId !== projectId",
         "state.threadId !== threadId",
         "state.outputOverlay !== overlay",
+        "response.headers.get(\"content-type\")",
+        "state.commandPayloadsByItemId.get(overlay.itemId) !== payload",
         "overlay.loadedText = text;",
+        "overlay.loadedPayload = payload;",
         "overlay.outputVersion = response.headers.get(\"etag\")",
     ] {
         assert!(
@@ -2609,7 +2615,9 @@ fn browser_loads_completed_command_output_only_in_the_overlay() {
         );
     }
     assert!(body.contains("Loading command output…"));
-    assert!(body.contains("retry.onclick = () => loadCommandOutputOverlay(ov);"));
+    assert!(body.contains(
+        "retry.onclick = () => model.kind === \"tool\" ? loadToolOutputOverlay(ov) : loadCommandOutputOverlay(ov);"
+    ));
 
     let close = between(
         body,
@@ -2657,6 +2665,51 @@ fn browser_loads_completed_command_output_only_in_the_overlay() {
     );
     assert!(copy.contains("outputOverlayModel(ov.itemId, ov.kind)"));
     assert!(copy.contains("model.blocks[0].text"));
+}
+
+#[test]
+fn browser_loads_completed_tool_json_only_in_the_overlay() {
+    let body = app_js();
+
+    let tool_blocks = between(
+        body,
+        "function toolIoBlocks(p) {",
+        "function toolIoText(value) {",
+    );
+    assert!(tool_blocks.contains("toolOutputDescriptor(p) ? \"\" : toolIoText(p.output)"));
+    assert!(body.contains(
+        "`Output · ${formatBytes(descriptorNumber(descriptor, \"serialized_bytes\", 0))}`"
+    ));
+
+    let load = between(
+        body,
+        "async function loadToolOutputOverlay(overlay) {",
+        "function openOutputOverlay(itemId, kind) {",
+    );
+    for expected in [
+        "new AbortController()",
+        "toolOutputUrl(projectId, threadId, identity.turnId, identity.itemId)",
+        "for (let attempt = 0; attempt < 2; attempt++)",
+        "response.headers.get(\"etag\")",
+        "response.headers.get(\"content-type\")",
+        "responseVersion === currentDescriptor.version",
+        "state.outputOverlay === overlay",
+        "state.activeViewGeneration === generation",
+        "overlay.outputLoaded = true;",
+        "overlay.loadedJson = value;",
+    ] {
+        assert!(
+            load.contains(expected),
+            "lazy tool-output load is missing `{expected}`"
+        );
+    }
+    assert!(body.contains("outputLoaded:false"));
+    assert!(body.contains("Loading tool output…"));
+    assert!(body.contains("JSON.stringify(overlay.loadedJson, null, 2)"));
+    assert!(body.contains("overlay.outputVersion === descriptor.version"));
+    assert!(body.contains("retryable:!!(overlay && overlay.error)"));
+    assert!(body.contains("loadToolOutputOverlay(state.outputOverlay)"));
+    assert!(body.contains("model.kind === \"tool\" ? loadToolOutputOverlay(ov)"));
 }
 
 #[test]

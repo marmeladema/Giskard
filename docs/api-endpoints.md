@@ -12,6 +12,7 @@ WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticke
 `GET /api/projects/{id}/threads/{thread_id}/turns/{turn_id}/diffs/{diff_id}`,
 `GET /api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}/command-output`,
 `GET /api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}/command-output-links`,
+`GET /api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}/tool-output`,
 `GET /api/projects/{id}/threads/{thread_id}/deletion-impact`,
 `GET /api/projects/{id}/models`,
 `GET /api/tokens`, `GET /api/projects/{id}/tokens`,
@@ -101,6 +102,23 @@ returns 412; the browser keeps the raw output as plain text in either degraded c
 The lookup uses active runtime state first and immutable history second; unknown, wrong-kind,
 unavailable, and still-running items all return 404. The browser requests it only when the command
 overlay opens and releases the fetched body when that overlay closes.
+
+Completed tool events, reconnect snapshots, `WireTurn`, and history retain all non-output fields
+but replace a present terminal JSON output with `WireToolOutput { serialized_bytes, version }`.
+`GET
+/api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}/tool-output` lazily returns
+the complete output value itself as compact JSON with exactly `application/json`. Its strong
+`ETag` equals the descriptor version, and `serialized_bytes` equals the response-body length.
+Explicit JSON `null` is a present four-byte body; missing output has no descriptor.
+
+The lookup resolves completed active runtime output first, then targets the selected immutable turn
+and item. Runtime authority remains available across the persistence race and while
+`PersistenceBlocked`; active, persisted, and legacy reads return byte-identical JSON. Project,
+thread, turn, and item containment is enforced before lookup. Unknown or cross-container items,
+non-tool items, absent or unavailable output, and still-running tools all return the same 404.
+The browser fetches only while the matching tool overlay is open and accepts the body only when its
+`ETag` still matches the selected descriptor. Post-persistence late tool completion is not
+advertised or retrievable until durable late-item amendments are implemented.
 
 Process-local thread state is published separately: `ThreadRuntimeOverview { revision, threads }`
 is a global replacement snapshot (including an empty `threads` list), `RequestState` carries a

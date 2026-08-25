@@ -115,6 +115,10 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
             "/api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}/command-output-links",
             get(command_output_links),
         )
+        .route(
+            "/api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}/tool-output",
+            get(tool_output),
+        )
         // File reads name their thread in the path rather than leaving it implicit. The workspace a
         // read is answered from is the thread's, so the thread has to be part of the request; a
         // caller that could omit it would be answered from somewhere it never asked about.
@@ -2291,6 +2295,30 @@ mod tests {
         assert_eq!(body, "kept 🙂 output");
     }
 
+    #[tokio::test]
+    async fn tool_output_response_has_exact_json_body_and_etag() {
+        let body = br#"{"value":null}"#.to_vec();
+        let version = "\"sha256_deadbeef\"".to_string();
+        let response = tool_output_response(body.clone(), version.clone()).unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/json"
+        );
+        assert_eq!(
+            response.headers().get(axum::http::header::ETAG).unwrap(),
+            version.as_str()
+        );
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            body
+        );
+    }
+
     #[test]
     fn command_output_version_is_strong_and_content_sensitive() {
         let version = crate::thread_runtime::command_output_version("kept 🙂 output");
@@ -2351,6 +2379,21 @@ mod tests {
             git_workspace: None,
         };
         state.store.save_thread(project_id, &thread).await.unwrap();
+
+        let _lease = state
+            .runtime
+            .reserve_turn(
+                thread_id,
+                crate::thread_runtime::TurnReservation {
+                    project_id,
+                    harness_thread_id: thread.harness_thread_id.clone(),
+                    mode: thread.mode,
+                    provider: thread.current_model.provider.clone(),
+                    model: thread.current_model.model.clone(),
+                    context_kind: "test",
+                },
+            )
+            .unwrap();
 
         let persisted_item = Item {
             id: item_id,
@@ -4414,6 +4457,54 @@ fn command_output_response(
         )
         .header(axum::http::header::ETAG, version)
         .body(axum::body::Body::from(output))
+        .map_err(|error| ApiError::Internal(error.to_string()))
+}
+
+async fn tool_output(
+    State(state): State<AppState>,
+    AxumPath((project_id, thread_id, turn_id, item_id)): AxumPath<(
+        ProjectId,
+        ThreadId,
+        giskard_core::TurnId,
+        giskard_core::ItemId,
+    )>,
+) -> Result<axum::response::Response, ApiError> {
+    if state
+        .store
+        .load_thread(project_id, thread_id)
+        .await
+        .map_err(|error| ApiError::Internal(error.to_string()))?
+        .is_none()
+    {
+        return Err(ApiError::NotFound);
+    }
+    let runtime_output = || match state.runtime.tool_output(thread_id, turn_id, item_id) {
+        crate::thread_runtime::RuntimeToolOutputLookup::Found(output) => Some(output),
+        crate::thread_runtime::RuntimeToolOutputLookup::Missing => None,
+    };
+    if let Some(output) = runtime_output() {
+        return tool_output_response(output.bytes, output.descriptor.version);
+    }
+    let persisted = state
+        .store
+        .load_tool_output(project_id, thread_id, turn_id, item_id)
+        .await
+        .map_err(|error| ApiError::Internal(error.to_string()))?;
+    if let Some(output) = runtime_output() {
+        return tool_output_response(output.bytes, output.descriptor.version);
+    }
+    let persisted = persisted.ok_or(ApiError::NotFound)?;
+    tool_output_response(persisted.bytes, persisted.descriptor.version)
+}
+
+fn tool_output_response(
+    bytes: Vec<u8>,
+    version: String,
+) -> Result<axum::response::Response, ApiError> {
+    axum::http::Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(axum::http::header::ETAG, version)
+        .body(axum::body::Body::from(bytes))
         .map_err(|error| ApiError::Internal(error.to_string()))
 }
 

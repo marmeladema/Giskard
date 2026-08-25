@@ -15,12 +15,12 @@ of the original plan; it was inserted because the bootstrap and retention work b
 into the same root cause — a turn's record was both its index entry and its unbounded payload. See
 *What the storage layout change unlocks* for the parts of this plan it simplifies or retires.
 
-**M1 through M5 are complete**: history pagination over HTTP, the runtime registry, turn-less
-context restoration, lazy agent-produced diffs, and lazy completed-command output. Each milestone
+**M1 through M6 are complete**: history pagination over HTTP, the runtime registry, turn-less
+context restoration, lazy agent-produced diffs, lazy completed-command output, and lazy completed
+tool output. Each milestone
 below carries its own status line; this paragraph is a summary, not the record. The remaining
-lazy completed tool output, retention policies, event journal and transactional bootstrap,
-class-aware outbox, and later milestones remain to be built, as defined under *Implementation
-milestones*.
+retention policies, event journal and transactional bootstrap, class-aware outbox, and later
+milestones remain to be built, as defined under *Implementation milestones*.
 
 This plan began with Codex restoring a context window outside a turn. The codebase audit showed
 that the context window is not a special state class. It exposed missing general primitives for
@@ -1238,6 +1238,9 @@ overlay is open or while preserving the late-completion exception's already-obse
 
 ### M6 — Lazy completed tool output
 
+**Status:** complete. Completed tool JSON is represented by a preview-free descriptor across live
+and persisted projections and fetched on demand from its authenticated item endpoint.
+
 **One opaque heavyweight field, without a JSON preview language.** Completed `ToolCall.output`
 values are arbitrary JSON and are currently repeated in `ItemCompleted`, reconnect state, ordinary
 history pages, and every `WireTurn`. Observed inputs are small in practice, while completed outputs
@@ -1277,6 +1280,11 @@ persistence, so a fetch racing completion has no gap. Retain it while `Persisten
 clear it with the rest of runtime state on thread retirement or deletion. Runtime and persisted
 reads return byte-identical compact JSON for the same value.
 
+Persisted history projection must serialize and hash each completed tool output selected for a
+page because the descriptor carries the strong version of the exact JSON response bytes. Active
+completion performs that work off the async reactor and reuses the prepared descriptor; history
+projection retains this per-page CPU cost until descriptors themselves become durable metadata.
+
 An `ItemCompleted` tool is output-addressable when it has an output and its normalized status is
 not `pending`, `in_progress`, `inprogress`, or `running`; hyphens and case are normalized as for
 commands. Missing or unknown status is terminal because the harness emitted `ItemCompleted`.
@@ -1306,6 +1314,18 @@ payload format bump, or migration in this milestone. Durable JSON retention is a
 decision: byte-slicing would corrupt JSON, and replacing subtrees would invent a semantic projection
 format. M7 may record the output as already addressable when auditing remaining retention policies;
 it must not silently truncate it.
+
+**Deferred global thread-identity invariant.** Runtime entries and all of their primitives are keyed
+by `ThreadId`, while persisted thread paths are nested under a project. The intended invariant is
+that a `ThreadId` is globally unique across every project, but the storage/bootstrap boundary does
+not yet reject an externally constructed duplicate. Consequently, duplicate thread IDs can alias
+runtime state across projects; examples include active command or tool output and the persisted
+command-output ETag cache introduced in M5. M6 deliberately does not add `ProjectId` defenses to
+individual runtime primitives: doing so would distribute protection for a missing identity
+invariant throughout the registry. A later storage/bootstrap reconciliation change must reject
+duplicate thread IDs as corruption and bind each runtime entry to its owning project. Endpoint
+project/thread containment checks remain required authorization boundaries even after that
+invariant is enforced, but they do not by themselves disambiguate aliased process-local state.
 
 **Non-goals.** Lazy tool input, metadata, or error; a JSON preview or projection format; changing
 MCP progress; a generic item-content endpoint; splitting MCP, dynamic, and subagent calls into new

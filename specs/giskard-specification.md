@@ -9,7 +9,18 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.72
+**Version:** 1.73
+
+> **Amendment — lazy completed tool output (1.73).** Completed tool-call output remains complete
+> JSON in each turn payload, but browser-facing events, reconnect state, and history replace the
+> value with an optional `WireToolOutput { serialized_bytes, version }` descriptor. The full value
+> is fetched only when its overlay opens through authenticated `GET
+> /api/projects/{project_id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}/tool-output`.
+> Descriptor size, strong domain-separated SHA-256 version, HTTP `ETag`, and response body all
+> derive from the same compact JSON serialization. Explicit JSON `null` is present four-byte
+> output; a missing output remains absent. Runtime authority bridges completion and persistence,
+> including `PersistenceBlocked`, while post-persistence late completion remains ignored until the
+> durable amendment milestone. No payload-format bump, migration, preview, or truncation is added.
 
 > **Amendment — lazy captured diffs (1.72).** Agent-produced unified and structured diff bodies
 > are extracted before browser delivery into immutable, turn-owned content records. Live events,
@@ -36,6 +47,20 @@
 
 **Changelog (1.70 → 1.71), overlay title path truncation:**
 - **L8:** The diff view and code overlay title bar shows the workspace-relative path (the same truncation the transcript diff row uses) instead of the raw checkout/worktree-prefixed path. The raw path is still kept for the download/file API.
+
+**Changelog (1.72 → 1.73), lazy completed tool output:**
+- **TO1:** Only the wire projection of completed `ToolCall.output` changes. Input, metadata, error,
+  identity, server, status, and sub-agent fields remain inline; persisted output stays an optional
+  complete `serde_json::Value`.
+- **TO2:** `WireToolOutput` carries compact serialized byte count and a strong content version.
+  `ItemCompleted`, `LiveTurnSnapshot`, `WireTurn`, and HTTP history carry that descriptor instead
+  of the JSON value.
+- **TO3:** The authenticated item-scoped endpoint returns exact compact JSON with
+  `application/json` and a matching strong `ETag`; active, persisted, legacy, and
+  persistence-blocked reads have the same bytes.
+- **TO4:** Running MCP text deltas remain opaque progress. Terminal authoritative output replaces
+  progress and is loaded only while the tool overlay is open; explicit JSON null remains distinct
+  from output that is absent or unavailable.
 
 **Changelog (1.69 → 1.70), turn-less context restoration:**
 - **CR1:** Harnesses report metadata discovered after a thread opens through a bounded,
@@ -1990,6 +2015,23 @@ surfaces eagerly repeats the retained body. `output_available` is true only for 
 retrievable from the runtime map or immutable history, including persistence-blocked and legacy
 turns.
 
+Browser-facing completed tool-call items retain every non-output field but replace the core
+optional JSON `output` with an optional `WireToolOutput { serialized_bytes: u64, version: String }`.
+The descriptor is present only when output exists and the normalized status is terminal; absent or
+still-running output has no descriptor. Missing or unknown status on `ItemCompleted` is terminal.
+Case and hyphens are normalized, and `pending`, `in_progress`, `inprogress`, and `running` are
+nonterminal. A later nonterminal replacement removes earlier output authority; a terminal
+replacement atomically replaces it and its version. The descriptor is used consistently by
+`ItemCompleted`, `LiveTurnSnapshot`, `WireTurn`, and HTTP history.
+
+Compact `serde_json::to_vec` bytes are the single source for `serialized_bytes`, the
+domain-separated SHA-256 `version`, endpoint body, and strong `ETag`. Consequently
+`Some(Value::Null)` is available output with body `null`, while `None` remains missing output.
+Runtime authority is published before the descriptor and retained until successful persistence,
+including while `PersistenceBlocked`; persisted lookup targets the selected turn and item. A
+post-persistence late tool completion remains ignored and is logged until durable late-item
+amendments are implemented.
+
 > `AgentEventStream` is `impl Stream<Item = AgentEvent> + Send` (concretely a wrapper over a
 > `tokio::sync::broadcast::Receiver<AgentEvent>`), supporting multiple subscribers per thread.
 
@@ -2509,10 +2551,15 @@ Auto-generate an initial title from the first user message (truncated); user-edi
   preview descriptor rather than the retained body. Expanding a completed command lazily fetches
   its retained output; closing releases it, and retry, copy, download, and path linkification apply
   to the fetched body. Running commands continue to append deltas and update an open overlay.
-- Tool-call input/output bodies follow the same collapse model as command output: running rows
-  start expanded while small and may auto-collapse once large; completed tool-call input/output is
-  collapsed by default, and expanding the row renders input/output inline. Tool-call status is
-  rendered in the same meta position and with the same lifecycle wording as command status.
+- Tool-call progress text remains transient and visible while running; it is not a JSON output
+  fragment. On authoritative terminal completion the row discards that progress, keeps its inline
+  input preview, and replaces the output snippet with the serialized byte count and an Open
+  affordance. Opening the tool overlay lazily fetches the complete JSON, verifies its `ETag`
+  against the current descriptor, and pretty-prints it beside the inline input. Selection changes
+  or close abort stale work and release the fetched value; retry, combined input/output copy, and
+  download reuse the command overlay behavior. A separate loaded-state flag preserves fetched JSON
+  `null` as data rather than confusing it with not-yet-loaded state. Tool-call status remains in the
+  command-style meta position with the same lifecycle wording.
 - Reasoning notes (if the model/effort emits them) render in a collapsible "thinking" block.
 - Each item ends with `ItemCompleted` carrying its final, canonical form (this is what gets
   persisted; deltas are transient).
