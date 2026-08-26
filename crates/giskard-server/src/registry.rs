@@ -1,9 +1,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::Utc;
+use futures::future::join_all;
 use tokio::sync::{Mutex, Notify, OwnedMutexGuard, oneshot, watch};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
@@ -13,7 +15,7 @@ use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{
-    Item, ItemPayload, SubagentAction, SubagentStatus, command_status_is_running,
+    Item, ItemDelta, ItemPayload, SubagentAction, SubagentStatus, command_status_is_running,
     normalized_command_status, tool_status_is_running,
 };
 use giskard_core::mcp::{McpOauthStart, McpServerStatus};
@@ -143,6 +145,64 @@ type PassiveMonitorTasks = Arc<PassiveMonitorTaskTracker>;
 type ProjectLifecycleLocks = Arc<Mutex<HashMap<ProjectId, Weak<Mutex<()>>>>>;
 const ACTIVE_SUBAGENT_PRE_TURN_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const PASSIVE_MONITOR_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const HARNESS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+const BACKGROUND_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const LEDGER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Default)]
+struct RegistryTaskTracker {
+    closed: AtomicBool,
+    count: AtomicUsize,
+    completion: Notify,
+}
+
+struct RegistryTaskPermit {
+    tracker: Arc<RegistryTaskTracker>,
+}
+
+impl Drop for RegistryTaskPermit {
+    fn drop(&mut self) {
+        if self.tracker.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.tracker.completion.notify_waiters();
+        }
+    }
+}
+
+impl RegistryTaskTracker {
+    fn register(self: &Arc<Self>) -> Option<RegistryTaskPermit> {
+        if self.closed.load(Ordering::Acquire) {
+            return None;
+        }
+        self.count.fetch_add(1, Ordering::AcqRel);
+        if self.closed.load(Ordering::Acquire) {
+            if self.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+                self.completion.notify_waiters();
+            }
+            return None;
+        }
+        Some(RegistryTaskPermit {
+            tracker: self.clone(),
+        })
+    }
+
+    async fn close_and_wait(&self, wait: Duration) -> Result<(), HarnessError> {
+        self.closed.store(true, Ordering::Release);
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            // Create the waiter before checking count so a concurrent final drop cannot be missed.
+            let completion = self.completion.notified();
+            if self.count.load(Ordering::Acquire) == 0 {
+                return Ok(());
+            }
+            if tokio::time::timeout_at(deadline, completion).await.is_err() {
+                return Err(HarnessError::Timeout(format!(
+                    "registry background tasks did not drain within {} ms",
+                    wait.as_millis()
+                )));
+            }
+        }
+    }
+}
 
 struct PassiveMonitorTaskTracker {
     counts: Mutex<HashMap<ThreadId, usize>>,
@@ -234,14 +294,97 @@ pub struct HarnessRegistry {
     factory: Arc<dyn HarnessFactory>,
 }
 
+#[derive(Default)]
+struct Harnesses {
+    shutting_down: bool,
+    by_project: HashMap<ProjectId, ProjectHarnessState>,
+}
+
+impl Harnesses {
+    fn active(&self, project_id: ProjectId) -> Option<Arc<dyn AgentHarness>> {
+        self.by_project
+            .get(&project_id)
+            .and_then(ProjectHarnessState::active)
+            .cloned()
+    }
+
+    fn begin_delete(
+        &mut self,
+        project_id: ProjectId,
+    ) -> Result<Option<Arc<dyn AgentHarness>>, HarnessError> {
+        match self.by_project.get(&project_id) {
+            Some(ProjectHarnessState::Active(harness)) => {
+                let harness = harness.clone();
+                self.by_project
+                    .insert(project_id, ProjectHarnessState::Deleting(harness.clone()));
+                Ok(Some(harness))
+            }
+            Some(ProjectHarnessState::Deleting(_)) => Err(HarnessError::Protocol(format!(
+                "project {project_id} harness deletion is already in progress"
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    fn rollback_delete(&mut self, project_id: ProjectId, harness: Arc<dyn AgentHarness>) {
+        if !self.shutting_down
+            && matches!(
+                self.by_project.get(&project_id),
+                Some(ProjectHarnessState::Deleting(current)) if Arc::ptr_eq(current, &harness)
+            )
+        {
+            self.by_project
+                .insert(project_id, ProjectHarnessState::Active(harness));
+        }
+    }
+
+    fn finish_delete(&mut self, project_id: ProjectId, harness: &Arc<dyn AgentHarness>) {
+        if matches!(
+            self.by_project.get(&project_id),
+            Some(ProjectHarnessState::Deleting(current)) if Arc::ptr_eq(current, harness)
+        ) {
+            self.by_project.remove(&project_id);
+        }
+    }
+
+    fn begin_shutdown(&mut self) -> HashMap<ProjectId, Arc<dyn AgentHarness>> {
+        self.shutting_down = true;
+        std::mem::take(&mut self.by_project)
+            .into_iter()
+            .map(|(project_id, state)| (project_id, state.into_harness()))
+            .collect()
+    }
+}
+
+enum ProjectHarnessState {
+    Active(Arc<dyn AgentHarness>),
+    Deleting(Arc<dyn AgentHarness>),
+}
+
+impl ProjectHarnessState {
+    fn active(&self) -> Option<&Arc<dyn AgentHarness>> {
+        match self {
+            Self::Active(harness) => Some(harness),
+            Self::Deleting(_) => None,
+        }
+    }
+
+    fn into_harness(self) -> Arc<dyn AgentHarness> {
+        match self {
+            Self::Active(harness) | Self::Deleting(harness) => harness,
+        }
+    }
+}
+
 struct RegistryShared {
-    harnesses: Arc<Mutex<HashMap<ProjectId, Arc<dyn AgentHarness>>>>,
+    harnesses: Arc<Mutex<Harnesses>>,
     threads: Arc<Mutex<HashMap<ThreadId, ThreadBinding>>>,
     passive_monitors: Arc<Mutex<HashSet<ThreadId>>>,
     passive_subagent_metadata: PassiveSubagentMetadataMap,
     /// Generation count spanning subscription and post-forwarder fallback persistence. A new
     /// monitor may start after an old subscription exits, so deletion waits for all generations.
     passive_monitor_tasks: PassiveMonitorTasks,
+    background_tasks: Arc<RegistryTaskTracker>,
     /// Per-parent FIFO for linked lifecycle evidence. Harness events are ordered, so preserving
     /// that order here prevents a later terminal observation from racing ahead of an active one.
     subagent_materialization_queues:
@@ -255,6 +398,10 @@ struct RegistryShared {
 }
 
 impl RegistryShared {
+    async fn active_harness(&self, project_id: ProjectId) -> Option<Arc<dyn AgentHarness>> {
+        self.harnesses.lock().await.active(project_id)
+    }
+
     #[cfg(test)]
     fn new(hub: Arc<Hub>, store: Arc<PersistStore>, ledger: LedgerHandle) -> Self {
         Self::new_with_runtime(hub, Arc::new(ThreadRuntimeRegistry::new()), store, ledger)
@@ -268,11 +415,12 @@ impl RegistryShared {
     ) -> Self {
         let thread_metadata = Arc::new(ThreadMetadataService::new(store.clone(), hub.clone()));
         Self {
-            harnesses: Arc::new(Mutex::new(HashMap::new())),
+            harnesses: Arc::new(Mutex::new(Harnesses::default())),
             threads: Arc::new(Mutex::new(HashMap::new())),
             passive_monitors: Arc::new(Mutex::new(HashSet::new())),
             passive_subagent_metadata: Arc::new(Mutex::new(HashMap::new())),
             passive_monitor_tasks: Arc::new(PassiveMonitorTaskTracker::default()),
+            background_tasks: Arc::new(RegistryTaskTracker::default()),
             subagent_materialization_queues: Arc::new(Mutex::new(HashMap::new())),
             project_lifecycle_locks: Arc::new(Mutex::new(HashMap::new())),
             hub,
@@ -303,8 +451,19 @@ fn spawn_thread_update_forwarder(
     thread_id: ThreadId,
     mut updates: giskard_harness::ThreadUpdateStream,
     permit: RestorePermit,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+) -> Option<tokio::task::JoinHandle<()>> {
+    let Some(task_permit) = shared.background_tasks.register() else {
+        warn!(
+            %project_id,
+            %thread_id,
+            action = "restore_context_window",
+            reason = "registry_shutting_down",
+            "not starting thread update forwarder"
+        );
+        return None;
+    };
+    Some(tokio::spawn(async move {
+        let _task_permit = task_permit;
         let Some(update) = updates.recv().await else {
             return;
         };
@@ -333,7 +492,7 @@ fn spawn_thread_update_forwarder(
             Err(error) => error!(%project_id, %thread_id, %error,
                 "failed to persist resumed context window"),
         }
-    })
+    }))
 }
 
 impl HarnessRegistry {
@@ -397,11 +556,26 @@ impl HarnessRegistry {
         config: &ProjectConfig,
     ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
         let mut harnesses = self.shared.harnesses.lock().await;
-        if let Some(h) = harnesses.get(&project) {
-            return Ok(h.clone());
+        if harnesses.shutting_down {
+            return Err(HarnessError::Protocol(
+                "server is shutting down; refusing to start a harness".into(),
+            ));
+        }
+        if let Some(harness) = harnesses.active(project) {
+            return Ok(harness);
+        }
+        if matches!(
+            harnesses.by_project.get(&project),
+            Some(ProjectHarnessState::Deleting(_))
+        ) {
+            return Err(HarnessError::Protocol(format!(
+                "project {project} harness is being deleted"
+            )));
         }
         let h = self.factory.create(config).await?;
-        harnesses.insert(project, h.clone());
+        harnesses
+            .by_project
+            .insert(project, ProjectHarnessState::Active(h.clone()));
         Ok(h)
     }
 
@@ -537,13 +711,6 @@ impl HarnessRegistry {
         overrides: TurnOverrides,
         effective_model: ModelRef,
     ) -> Result<TurnId, HarnessError> {
-        if self.thread_has_passive_monitor(thread_id).await {
-            warn!(
-                %thread_id,
-                "refusing direct turn while passive sub-agent monitoring owns the thread"
-            );
-            return Err(HarnessError::ThreadBusy { thread: thread_id });
-        }
         let threads = self.shared.threads.lock().await;
         let binding = threads
             .get(&thread_id)
@@ -551,6 +718,15 @@ impl HarnessRegistry {
         let project_id = binding.project;
         let handle = binding.handle.clone();
         drop(threads);
+        if self.thread_has_passive_monitor(thread_id).await {
+            warn!(
+                %project_id,
+                %thread_id,
+                harness_thread_id = %handle.harness_thread_id,
+                "refusing direct turn while passive sub-agent monitoring owns the thread"
+            );
+            return Err(HarnessError::ThreadBusy { thread: thread_id });
+        }
         debug!(
             %project_id,
             %thread_id,
@@ -561,12 +737,11 @@ impl HarnessRegistry {
             "starting harness turn"
         );
 
-        let harnesses = self.shared.harnesses.lock().await;
-        let harness = harnesses
-            .get(&project_id)
-            .ok_or(HarnessError::ThreadNotFound(thread_id))?
-            .clone();
-        drop(harnesses);
+        let harness = self
+            .shared
+            .active_harness(project_id)
+            .await
+            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
 
         let ctx = TurnContext {
             user_input: input.clone(),
@@ -588,6 +763,21 @@ impl HarnessRegistry {
         let shared = self.shared.clone();
 
         let stream = harness.subscribe(&handle);
+        let Some(forwarder_permit) = shared.background_tasks.register() else {
+            warn!(
+                %project_id,
+                %thread_id,
+                action = "start_turn",
+                reason = "registry_shutting_down",
+                "refusing to start turn event forwarder"
+            );
+            if let Some(overview) = turn_gate.release() {
+                self.shared.hub.publish_runtime_overview(overview).await;
+            }
+            return Err(HarnessError::Protocol(
+                "server is shutting down; refusing to start turn forwarder".into(),
+            ));
+        };
         let turn_id = match harness.start_turn(&handle, input, overrides).await {
             Ok(turn_id) => {
                 info!(
@@ -625,9 +815,15 @@ impl HarnessRegistry {
         };
         publish_runtime_overview(&self.shared).await;
 
-        tokio::spawn(async move {
-            forward_events(shared, thread_id, project_id, stream, ctx, Some(turn_gate)).await;
-        });
+        launch_event_forwarder(
+            shared,
+            thread_id,
+            project_id,
+            stream,
+            ctx,
+            Some(turn_gate),
+            forwarder_permit,
+        );
 
         Ok(turn_id)
     }
@@ -646,11 +842,8 @@ impl HarnessRegistry {
 
         let harness = self
             .shared
-            .harnesses
-            .lock()
+            .active_harness(project_id)
             .await
-            .get(&project_id)
-            .cloned()
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
 
         let (claim, transition) = self
@@ -707,11 +900,8 @@ impl HarnessRegistry {
 
         let harness = self
             .shared
-            .harnesses
-            .lock()
+            .active_harness(project_id)
             .await
-            .get(&project_id)
-            .cloned()
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
 
         let (claim, transition) = self
@@ -807,11 +997,8 @@ impl HarnessRegistry {
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
         let harness = self
             .shared
-            .harnesses
-            .lock()
+            .active_harness(project_id)
             .await
-            .get(&project_id)
-            .cloned()
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
         let started = Instant::now();
         info!(
@@ -857,11 +1044,8 @@ impl HarnessRegistry {
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
         let harness = self
             .shared
-            .harnesses
-            .lock()
+            .active_harness(project_id)
             .await
-            .get(&project_id)
-            .cloned()
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
 
         let request_started = Instant::now();
@@ -893,6 +1077,21 @@ impl HarnessRegistry {
         let shared = self.shared.clone();
 
         let stream = harness.subscribe(&handle);
+        let Some(forwarder_permit) = shared.background_tasks.register() else {
+            warn!(
+                %project_id,
+                %thread_id,
+                action = "compact_context",
+                reason = "registry_shutting_down",
+                "refusing to start compaction event forwarder"
+            );
+            if let Some(overview) = turn_gate.release() {
+                self.shared.hub.publish_runtime_overview(overview).await;
+            }
+            return Err(HarnessError::Protocol(
+                "server is shutting down; refusing to start compaction forwarder".into(),
+            ));
+        };
         if let Err(error) = harness.compact_thread(&handle).await {
             if let Some(overview) = turn_gate.release() {
                 self.shared.hub.publish_runtime_overview(overview).await;
@@ -907,9 +1106,15 @@ impl HarnessRegistry {
             "harness accepted context compaction request"
         );
 
-        tokio::spawn(async move {
-            forward_events(shared, thread_id, project_id, stream, ctx, Some(turn_gate)).await;
-        });
+        launch_event_forwarder(
+            shared,
+            thread_id,
+            project_id,
+            stream,
+            ctx,
+            Some(turn_gate),
+            forwarder_permit,
+        );
         Ok(())
     }
 
@@ -935,7 +1140,7 @@ impl HarnessRegistry {
             return Ok(Some(parent_target));
         }
 
-        let (result, receiver) = oneshot::channel();
+        let (result, receiver) = tokio::sync::oneshot::channel();
         enqueue_subagent_materialization(
             parent_thread_id,
             SubagentMaterializationJob {
@@ -971,11 +1176,8 @@ impl HarnessRegistry {
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
         let harness = self
             .shared
-            .harnesses
-            .lock()
+            .active_harness(project_id)
             .await
-            .get(&project_id)
-            .cloned()
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
         let started = Instant::now();
         info!(
@@ -1202,6 +1404,94 @@ impl HarnessRegistry {
         publish_runtime_overview(&self.shared).await;
     }
 
+    /// Stop every project harness after HTTP traffic has drained.
+    ///
+    /// The shutdown flag and drained map share one mutex with harness creation, so a concurrent
+    /// factory call either finishes before this snapshot or is refused after it. Individual
+    /// harness failures are isolated: every project receives a shutdown request before an
+    /// aggregate error is returned.
+    pub async fn shutdown(&self) -> Result<(), HarnessError> {
+        let harnesses = {
+            let mut harnesses = self.shared.harnesses.lock().await;
+            harnesses.begin_shutdown()
+        };
+        if harnesses.is_empty() {
+            debug!("harness registry shutdown found no active harnesses");
+        } else {
+            info!(
+                harness_count = harnesses.len(),
+                "shutting down project harnesses"
+            );
+        }
+        let results = join_all(
+            harnesses
+                .into_iter()
+                .map(|(project_id, harness)| async move {
+                    let started = Instant::now();
+                    let result = match timeout(HARNESS_SHUTDOWN_TIMEOUT, harness.shutdown()).await {
+                        Ok(result) => result,
+                        Err(_) => Err(HarnessError::Timeout(format!(
+                            "harness shutdown exceeded {} ms",
+                            HARNESS_SHUTDOWN_TIMEOUT.as_millis()
+                        ))),
+                    };
+                    match &result {
+                        Ok(()) => info!(
+                            %project_id,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "project harness shutdown completed"
+                        ),
+                        Err(error) => error!(
+                            %project_id,
+                            %error,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "project harness shutdown failed"
+                        ),
+                    }
+                    (project_id, result)
+                }),
+        )
+        .await;
+
+        let mut failures = results
+            .into_iter()
+            .filter_map(|(project_id, result)| result.err().map(|error| (project_id, error)))
+            .map(|(project_id, error)| format!("{project_id}: {error}"))
+            .collect::<Vec<_>>();
+        if let Err(error) = self
+            .shared
+            .background_tasks
+            .close_and_wait(BACKGROUND_TASK_SHUTDOWN_TIMEOUT)
+            .await
+        {
+            error!(%error, "registry background tasks did not drain during server shutdown");
+            failures.push(error.to_string());
+        }
+        if timeout(LEDGER_SHUTDOWN_TIMEOUT, self.shared.ledger.shutdown())
+            .await
+            .is_err()
+        {
+            let error = format!(
+                "token ledger did not shut down within {} ms",
+                LEDGER_SHUTDOWN_TIMEOUT.as_millis()
+            );
+            error!(
+                action = "shutdown_token_ledger",
+                timeout_ms = LEDGER_SHUTDOWN_TIMEOUT.as_millis(),
+                "{error}"
+            );
+            failures.push(error);
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(HarnessError::Protocol(format!(
+                "one or more registry components failed to shut down: {}",
+                failures.join("; ")
+            )))
+        }
+    }
+
     pub async fn delete_project(&self, project_id: ProjectId) -> Result<(), HarnessError> {
         let thread_ids = self
             .shared
@@ -1217,10 +1507,18 @@ impl HarnessRegistry {
             self.stop_passive_subagent_monitor(*thread_id).await?;
         }
 
-        let harness = self.shared.harnesses.lock().await.get(&project_id).cloned();
+        let harness = {
+            let mut harnesses = self.shared.harnesses.lock().await;
+            harnesses.begin_delete(project_id)?
+        };
         if let Some(harness) = harness {
-            harness.shutdown().await?;
-            self.shared.harnesses.lock().await.remove(&project_id);
+            if let Err(error) = harness.shutdown().await {
+                let mut harnesses = self.shared.harnesses.lock().await;
+                harnesses.rollback_delete(project_id, harness);
+                return Err(error);
+            }
+            let mut harnesses = self.shared.harnesses.lock().await;
+            harnesses.finish_delete(project_id, &harness);
         }
 
         let removed_thread_ids = {
@@ -1878,11 +2176,8 @@ async fn materialize_subagent_thread(
     let model_efforts = parent_file.model_efforts.clone();
 
     let harness = shared
-        .harnesses
-        .lock()
+        .active_harness(project_id)
         .await
-        .get(&project_id)
-        .cloned()
         .ok_or(HarnessError::ThreadNotFound(parent_thread_id))?;
     // The harness already runs this child inside its parent's turn, so its cwd is the parent's
     // workspace. Passing the project's checkout instead would be ignored while the child is live
@@ -1996,17 +2291,43 @@ async fn materialize_subagent_thread(
 
 async fn enqueue_subagent_materialization(
     parent_thread_id: ThreadId,
-    job: SubagentMaterializationJob,
+    mut job: SubagentMaterializationJob,
     shared: Arc<RegistryShared>,
 ) {
-    let should_start_worker = {
+    let worker_permit = {
         let mut queues = shared.subagent_materialization_queues.lock().await;
-        let should_start = !queues.contains_key(&parent_thread_id);
+        let permit = if queues.contains_key(&parent_thread_id) {
+            None
+        } else {
+            match shared.background_tasks.register() {
+                Some(permit) => Some(permit),
+                None => {
+                    warn!(
+                        project_id = %job.project_id,
+                        %parent_thread_id,
+                        turn_id = %job.spawned_by_turn_id,
+                        item_id = %job.item_id,
+                        origin = %job.origin,
+                        reason = "registry_shutting_down",
+                        "rejecting sub-agent materialization job"
+                    );
+                    if let Some(result) = job.result.take() {
+                        let _ = result.send(Err(HarnessError::Protocol(
+                            "server is shutting down; refusing sub-agent materialization".into(),
+                        )));
+                    }
+                    return;
+                }
+            }
+        };
         queues.entry(parent_thread_id).or_default().push_back(job);
-        should_start
+        permit
     };
-    if should_start_worker {
-        tokio::spawn(run_subagent_materialization_queue(parent_thread_id, shared));
+    if let Some(permit) = worker_permit {
+        tokio::spawn(async move {
+            let _permit = permit;
+            run_subagent_materialization_queue(parent_thread_id, shared).await;
+        });
     }
 }
 
@@ -2101,11 +2422,8 @@ async fn ensure_subagent_thread_open(
         return Ok(binding.handle.agent_name.clone());
     }
     let harness = shared
-        .harnesses
-        .lock()
+        .active_harness(project_config.id)
         .await
-        .get(&project_config.id)
-        .cloned()
         .ok_or(HarnessError::ThreadNotFound(thread_file.id))?;
     // Reopening a persisted sub-agent is that cold resume: resolve from the chain, not from the
     // child's own record, which never names a worktree.
@@ -2196,11 +2514,8 @@ async fn start_passive_subagent_monitor(
         drop(threads);
 
         let harness = shared
-            .harnesses
-            .lock()
+            .active_harness(project_id)
             .await
-            .get(&project_id)
-            .cloned()
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
 
         let stream = harness.subscribe(&handle);
@@ -2227,7 +2542,20 @@ async fn start_passive_subagent_monitor(
 
         let cleanup_shared = shared.clone();
         let cleanup_tasks = shared.passive_monitor_tasks.clone();
+        let Some(permit) = shared.background_tasks.register() else {
+            warn!(
+                %project_id,
+                %thread_id,
+                action = "start_passive_subagent_monitor",
+                reason = "registry_shutting_down",
+                "refusing to start passive sub-agent monitor forwarder"
+            );
+            return Err(HarnessError::Protocol(
+                "server is shutting down; refusing passive monitor forwarder".into(),
+            ));
+        };
         tokio::spawn(async move {
+            let _permit = permit;
             forward_events(shared, thread_id, project_id, stream, ctx, None).await;
             if let Some(metadata) = take_passive_subagent_monitor_metadata(
                 &cleanup_shared.passive_monitors,
@@ -2292,6 +2620,7 @@ async fn observe_external_subagent_with_context(
             Ok(result) => result,
             Err(error) => {
                 error!(
+                    %project_id,
                     %thread_id,
                     %error,
                     "passive sub-agent monitor setup task failed"
@@ -2418,15 +2747,18 @@ async fn persist_terminal_subagent_fallback(
 
 async fn broadcast_event_with_context(
     hub: &Arc<Hub>,
+    project_id: ProjectId,
     thread_id: ThreadId,
     event: AgentEvent,
     ctx: &TurnContext,
 ) {
-    broadcast_event_with_user_input(hub, thread_id, event, live_turn_user_input(ctx)).await;
+    broadcast_event_with_user_input(hub, project_id, thread_id, event, live_turn_user_input(ctx))
+        .await;
 }
 
 async fn broadcast_event_with_user_input(
     hub: &Arc<Hub>,
+    project_id: ProjectId,
     thread_id: ThreadId,
     event: AgentEvent,
     user_input: Option<UserInput>,
@@ -2438,10 +2770,12 @@ async fn broadcast_event_with_user_input(
             user_input,
         },
         other => {
+            let event_kind = event_kind(&other);
+            let event_turn = event_turn_id(&other);
+            let event_item = event_item_id(&other);
             let Some(agent_event) = WireAgentEvent::from_agent_event(other) else {
-                warn!(
-                    %thread_id,
-                    "refusing to broadcast a metadata-only event on the transcript stream"
+                log_metadata_only_event_rejection(
+                    project_id, thread_id, event_kind, event_turn, event_item,
                 );
                 return;
             };
@@ -2465,13 +2799,13 @@ struct SyntheticSubagentPrompt {
 }
 
 async fn synthesize_passive_subagent_prompt_item(
+    project_id: ProjectId,
     thread_id: ThreadId,
     turn: TurnId,
     ctx: &TurnContext,
     current_turn_items: &mut CurrentTurnItems,
     prompt: &mut SyntheticSubagentPrompt,
-    hub: &Arc<Hub>,
-    runtime: &ThreadRuntimeRegistry,
+    shared: &RegistryShared,
 ) {
     let Some(text) = passive_subagent_prompt_text(ctx) else {
         return;
@@ -2493,10 +2827,10 @@ async fn synthesize_passive_subagent_prompt_item(
         turn,
         item,
     };
-    let applied = runtime.apply_event(thread_id, &event, true);
+    let applied = shared.runtime.apply_event(thread_id, &event, true);
     debug!(%thread_id, event_sequence = ?applied.sequence, "applied synthetic prompt event");
-    publish_applied_runtime_effects(hub, thread_id, applied).await;
-    broadcast_event_with_context(hub, thread_id, event, ctx).await;
+    publish_applied_runtime_effects(&shared.hub, thread_id, applied).await;
+    broadcast_event_with_context(&shared.hub, project_id, thread_id, event, ctx).await;
 }
 
 enum PassivePreTurnOutcome {
@@ -2562,6 +2896,21 @@ async fn passive_pre_turn_recv(
             }
         }
     }
+}
+
+fn launch_event_forwarder(
+    shared: Arc<RegistryShared>,
+    thread_id: ThreadId,
+    project_id: ProjectId,
+    stream: giskard_harness::AgentEventStream,
+    ctx: TurnContext,
+    turn_gate: Option<ThreadTurnLease>,
+    permit: RegistryTaskPermit,
+) {
+    tokio::spawn(async move {
+        let _permit = permit;
+        forward_events(shared, thread_id, project_id, stream, ctx, turn_gate).await;
+    });
 }
 
 async fn forward_events(
@@ -2710,13 +3059,7 @@ async fn forward_events(
                 }
                 let event_thread = event.thread_id();
                 if event_thread != thread_id {
-                    error!(
-                        %thread_id,
-                        event_thread_id = %event_thread,
-                        event_kind = event_kind(&event),
-                        event_turn_id = ?event_turn_id(&event),
-                        "dropping harness event for a different thread"
-                    );
+                    log_foreign_thread_event_drop(project_id, thread_id, event_thread, &event);
                     continue;
                 }
 
@@ -2805,14 +3148,13 @@ async fn forward_events(
                     if let Some(turn) = event_turn {
                         if turn != owned {
                             if !owned_turn_completed {
-                                warn!(
-                                    %project_id,
-                                    %thread_id,
-                                    owned_turn = %owned,
-                                    event_turn = %turn,
-                                    event_kind = event_kind(&event),
-                                    elapsed_ms = forwarder_started.elapsed().as_millis(),
-                                    "dropping harness event for a different turn on the same thread"
+                                log_cross_turn_event_drop(
+                                    project_id,
+                                    thread_id,
+                                    owned,
+                                    turn,
+                                    &event,
+                                    forwarder_started.elapsed().as_millis(),
                                 );
                             }
                             continue;
@@ -2847,6 +3189,7 @@ async fn forward_events(
                         let Some(permit) = runtime.event_application_permit(thread_id) else {
                             break ForwarderExitReason::RuntimeAuthorityReplaced;
                         };
+                        let preparation_diagnostics = completed_item_diagnostics(&event);
                         let preparation_runtime = runtime.clone();
                         match tokio::task::spawn_blocking(move || {
                             preparation_runtime.prepare_item_output(event)
@@ -2858,6 +3201,10 @@ async fn forward_events(
                                 tracing::error!(
                                     %project_id,
                                     %thread_id,
+                                    turn_id = preparation_diagnostics.as_ref().map(|value| tracing::field::display(value.turn_id)),
+                                    item_id = preparation_diagnostics.as_ref().map(|value| tracing::field::display(value.item_id)),
+                                    harness_item_id = preparation_diagnostics.as_ref().map(|value| value.harness_item_id.as_str()),
+                                    item_payload_kind = preparation_diagnostics.as_ref().map(|value| value.payload_kind),
                                     error = %error,
                                     "addressable item-output event preparation task failed"
                                 );
@@ -2900,10 +3247,11 @@ async fn forward_events(
                                 %thread_id,
                                 %turn,
                                 item_id = %item.id,
+                                harness_item_id = %item.harness_item_id,
                                 "deferred durable command-output update for already-persisted turn"
                             );
                         }
-                        log_command_completion_after_terminate(before.as_ref(), &event);
+                        log_command_completion_after_terminate(project_id, before.as_ref(), &event);
                         debug!(
                             %thread_id,
                             event_sequence = ?applied.sequence,
@@ -2914,7 +3262,7 @@ async fn forward_events(
                         publish_applied_runtime_effects(&hub, thread_id, applied).await;
                         changed
                     } else {
-                        log_ignored_seen_turn_running_task_start(&event);
+                        log_ignored_seen_turn_running_task_start(project_id, &event);
                         false
                     };
                     if is_terminal_command_completion(&event) {
@@ -2937,7 +3285,7 @@ async fn forward_events(
                         }
                     }
                     if let AgentEvent::ItemCompleted { turn, item, .. } = &event
-                        && matches!(item.payload, ItemPayload::ToolCall { .. })
+                        && let ItemPayload::ToolCall { name, server, .. } = &item.payload
                     {
                         shared.runtime.remove_tool_output(thread_id, *turn, item.id);
                         if completed_tool_has_terminal_output(item) {
@@ -2946,6 +3294,9 @@ async fn forward_events(
                                 %thread_id,
                                 %turn,
                                 item_id = %item.id,
+                                harness_item_id = %item.harness_item_id,
+                                tool_name = %name,
+                                tool_server = server.as_deref(),
                                 "ignoring completed tool output for an already-persisted turn"
                             );
                         }
@@ -3031,13 +3382,13 @@ async fn forward_events(
                         && !matches!(event, AgentEvent::TurnStarted { .. })
                     {
                         synthesize_passive_subagent_prompt_item(
+                            project_id,
                             thread_id,
                             turn,
                             &ctx,
                             &mut current_turn_items,
                             &mut synthetic_subagent_prompt,
-                            &hub,
-                            &runtime,
+                            &shared,
                         )
                         .await;
                     }
@@ -3310,17 +3661,17 @@ async fn forward_events(
                     break ForwarderExitReason::NormalTurnCompleted;
                 }
 
-                broadcast_event_with_context(&hub, thread_id, event, &ctx).await;
+                broadcast_event_with_context(&hub, project_id, thread_id, event, &ctx).await;
 
                 if is_turn_start && let Some(turn) = event_turn {
                     synthesize_passive_subagent_prompt_item(
+                        project_id,
                         thread_id,
                         turn,
                         &ctx,
                         &mut current_turn_items,
                         &mut synthetic_subagent_prompt,
-                        &hub,
-                        &runtime,
+                        &shared,
                     )
                     .await;
                 }
@@ -3585,6 +3936,7 @@ async fn persist_subagent_fallback_transcript(
         publish_applied_runtime_effects(&shared.hub, thread_id, applied).await;
         broadcast_event_with_user_input(
             &shared.hub,
+            project_id,
             thread_id,
             event,
             Some(ctx.user_input.clone()),
@@ -3834,7 +4186,109 @@ fn event_kind(event: &AgentEvent) -> &'static str {
     }
 }
 
-fn log_ignored_seen_turn_running_task_start(event: &AgentEvent) {
+fn event_item_id(event: &AgentEvent) -> Option<ItemId> {
+    match event {
+        AgentEvent::ItemStarted { item, .. } => Some(item.id),
+        AgentEvent::ItemDelta { item_id, .. } => Some(*item_id),
+        AgentEvent::ItemCompleted { item, .. } => Some(item.id),
+        _ => None,
+    }
+}
+
+fn event_item_delta_kind(event: &AgentEvent) -> Option<&'static str> {
+    match event {
+        AgentEvent::ItemDelta {
+            delta: ItemDelta::Text { .. },
+            ..
+        } => Some("text"),
+        AgentEvent::ItemDelta {
+            delta: ItemDelta::CommandOutput { .. },
+            ..
+        } => Some("command_output"),
+        _ => None,
+    }
+}
+
+struct CompletedItemDiagnostics {
+    turn_id: TurnId,
+    item_id: ItemId,
+    harness_item_id: String,
+    payload_kind: &'static str,
+}
+
+fn completed_item_diagnostics(event: &AgentEvent) -> Option<CompletedItemDiagnostics> {
+    let AgentEvent::ItemCompleted { turn, item, .. } = event else {
+        return None;
+    };
+    Some(CompletedItemDiagnostics {
+        turn_id: *turn,
+        item_id: item.id,
+        harness_item_id: item.harness_item_id.clone(),
+        payload_kind: match item.payload {
+            ItemPayload::CommandExecution { .. } => "command_execution",
+            ItemPayload::ToolCall { .. } => "tool_call",
+            _ => "other",
+        },
+    })
+}
+
+fn log_foreign_thread_event_drop(
+    project_id: ProjectId,
+    thread_id: ThreadId,
+    event_thread_id: ThreadId,
+    event: &AgentEvent,
+) {
+    error!(
+        %project_id,
+        %thread_id,
+        %event_thread_id,
+        event_kind = event_kind(event),
+        event_turn_id = event_turn_id(event).map(tracing::field::display),
+        event_item_id = event_item_id(event).map(tracing::field::display),
+        item_delta_kind = event_item_delta_kind(event),
+        "dropping harness event for a different thread"
+    );
+}
+
+fn log_metadata_only_event_rejection(
+    project_id: ProjectId,
+    thread_id: ThreadId,
+    event_kind: &'static str,
+    event_turn_id: Option<TurnId>,
+    event_item_id: Option<ItemId>,
+) {
+    warn!(
+        %project_id,
+        %thread_id,
+        event_kind,
+        event_turn_id = event_turn_id.map(tracing::field::display),
+        event_item_id = event_item_id.map(tracing::field::display),
+        "refusing to broadcast a metadata-only event on the transcript stream"
+    );
+}
+
+fn log_cross_turn_event_drop(
+    project_id: ProjectId,
+    thread_id: ThreadId,
+    owned_turn: TurnId,
+    event_turn: TurnId,
+    event: &AgentEvent,
+    elapsed_ms: u128,
+) {
+    warn!(
+        %project_id,
+        %thread_id,
+        %owned_turn,
+        %event_turn,
+        event_kind = event_kind(event),
+        event_item_id = event_item_id(event).map(tracing::field::display),
+        item_delta_kind = event_item_delta_kind(event),
+        elapsed_ms,
+        "dropping harness event for a different turn on the same thread"
+    );
+}
+
+fn log_ignored_seen_turn_running_task_start(project_id: ProjectId, event: &AgentEvent) {
     let AgentEvent::ItemStarted { thread, turn, item } = event else {
         return;
     };
@@ -3846,6 +4300,7 @@ fn log_ignored_seen_turn_running_task_start(event: &AgentEvent) {
         return;
     }
     warn!(
+        %project_id,
         thread_id = %thread,
         turn_id = %turn,
         item_id = %item.id,
@@ -3879,7 +4334,11 @@ async fn terminating_command_before_terminal_completion(
     command.terminating.then_some(command)
 }
 
-fn log_command_completion_after_terminate(command: Option<&RunningTask>, event: &AgentEvent) {
+fn log_command_completion_after_terminate(
+    project_id: ProjectId,
+    command: Option<&RunningTask>,
+    event: &AgentEvent,
+) {
     let Some(command) = command else {
         return;
     };
@@ -3903,6 +4362,7 @@ fn log_command_completion_after_terminate(command: Option<&RunningTask>, event: 
     }
 
     warn!(
+        %project_id,
         thread_id = %thread,
         turn_id = %turn,
         item_id = %item.id,
@@ -4286,6 +4746,8 @@ async fn persist_turn(
 mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use chrono::Utc;
     use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalRequest};
@@ -4293,7 +4755,7 @@ mod tests {
     use giskard_core::event::AgentEvent;
     use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
     use giskard_core::item::{
-        CommandExecutionStart, Item, ItemKind, ItemPayload, ItemStart, SubagentAction,
+        CommandExecutionStart, Item, ItemDelta, ItemKind, ItemPayload, ItemStart, SubagentAction,
         SubagentStatus,
     };
     use giskard_core::model::ModelRef;
@@ -4301,7 +4763,10 @@ mod tests {
     use giskard_core::token::{TokenLedger, TokenUsage};
     use giskard_core::turn::{Mode, PermissionPreset, Turn, TurnStatus, TurnStatusKind};
     use giskard_core::user_input::UserInput;
-    use giskard_harness::{AgentEventStream, ThreadHandle, ThreadUpdate};
+    use giskard_harness::{
+        AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+        ThreadUpdate,
+    };
     use giskard_persist::PersistStore;
     use giskard_persist::store::{ProjectConfig, ThreadFile};
     use giskard_proto::{ServerMessage, WireAgentEvent};
@@ -4309,17 +4774,154 @@ mod tests {
     use tokio::task::JoinHandle;
 
     use super::{
-        CurrentTurnItems, TurnContext, TurnContextKind, command_completion_is_normal_success,
-        command_status_is_running, completed_tool_has_terminal_output, forward_events,
-        late_command_completion_message, passive_subagent_prompt_text,
-        persist_subagent_fallback_transcript, prepare_thread_updates,
+        CurrentTurnItems, ProjectHarnessState, TurnContext, TurnContextKind,
+        command_completion_is_normal_success, command_status_is_running,
+        completed_tool_has_terminal_output, event_item_delta_kind, event_item_id, event_turn_id,
+        forward_events, late_command_completion_message, log_cross_turn_event_drop,
+        log_foreign_thread_event_drop, log_metadata_only_event_rejection,
+        passive_subagent_prompt_text, persist_subagent_fallback_transcript, prepare_thread_updates,
         should_refresh_subagent_title, spawn_thread_update_forwarder, subagent_monitor_policy,
         subagent_path_leaf, take_passive_subagent_monitor_metadata, track_item_identity,
         turn_reservation, update_passive_subagent_metadata,
     };
     use crate::hub::Hub;
     use crate::ledger;
+    use crate::test_logs::CapturedLogWriter;
     use crate::thread_runtime::ThreadRuntimeRegistry;
+
+    fn capture_logs(log: impl FnOnce()) -> String {
+        let output = Arc::new(StdMutex::new(Vec::new()));
+        let writer_output = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || CapturedLogWriter(writer_output.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, log);
+        String::from_utf8(output.lock().unwrap().clone()).unwrap()
+    }
+
+    fn capture_cross_turn_warning(event: &AgentEvent) -> String {
+        capture_logs(|| {
+            log_cross_turn_event_drop(
+                ProjectId::new(),
+                ThreadId::new(),
+                TurnId::new(),
+                event_turn_id(event).unwrap(),
+                event,
+                42,
+            );
+        })
+    }
+
+    #[test]
+    fn cross_turn_item_delta_warning_reports_bare_identity_without_content() {
+        let item_id = ItemId::new();
+        let event = AgentEvent::ItemDelta {
+            thread: ThreadId::new(),
+            turn: TurnId::new(),
+            item_id,
+            delta: ItemDelta::CommandOutput {
+                chunk: "sensitive output".into(),
+            },
+        };
+
+        assert_eq!(event_item_id(&event), Some(item_id));
+        assert_eq!(event_item_delta_kind(&event), Some("command_output"));
+
+        let output = capture_cross_turn_warning(&event);
+        assert!(
+            output.contains(&format!("event_item_id={item_id}")),
+            "{output}"
+        );
+        assert!(
+            output.contains("item_delta_kind=\"command_output\""),
+            "{output}"
+        );
+        assert!(output.contains("elapsed_ms=42"), "{output}");
+        assert!(!output.contains("Some("), "{output}");
+        assert!(!output.contains("sensitive output"), "{output}");
+
+        let text_event = AgentEvent::ItemDelta {
+            thread: ThreadId::new(),
+            turn: TurnId::new(),
+            item_id: ItemId::new(),
+            delta: ItemDelta::Text {
+                text: "sensitive text".into(),
+            },
+        };
+        assert_eq!(event_item_delta_kind(&text_event), Some("text"));
+        let output = capture_cross_turn_warning(&text_event);
+        assert!(output.contains("item_delta_kind=\"text\""), "{output}");
+        assert!(!output.contains("sensitive text"), "{output}");
+
+        let turn_event = AgentEvent::TurnStarted {
+            thread: ThreadId::new(),
+            turn: TurnId::new(),
+        };
+        let output = capture_cross_turn_warning(&turn_event);
+        assert!(!output.contains("event_item_id"), "{output}");
+        assert!(!output.contains("item_delta_kind"), "{output}");
+    }
+
+    #[test]
+    fn dropped_and_rejected_event_logs_include_bare_identity_without_content() {
+        let project_id = ProjectId::new();
+        let expected_thread_id = ThreadId::new();
+        let event_thread_id = ThreadId::new();
+        let turn_id = TurnId::new();
+        let item_id = ItemId::new();
+        let event = AgentEvent::ItemDelta {
+            thread: event_thread_id,
+            turn: turn_id,
+            item_id,
+            delta: ItemDelta::Text {
+                text: "foreign sensitive text".into(),
+            },
+        };
+
+        let output = capture_logs(|| {
+            log_foreign_thread_event_drop(project_id, expected_thread_id, event_thread_id, &event);
+        });
+        for expected in [
+            format!("project_id={project_id}"),
+            format!("thread_id={expected_thread_id}"),
+            format!("event_thread_id={event_thread_id}"),
+            format!("event_turn_id={turn_id}"),
+            format!("event_item_id={item_id}"),
+            "event_kind=\"item_delta\"".into(),
+            "item_delta_kind=\"text\"".into(),
+        ] {
+            assert!(output.contains(&expected), "missing {expected}: {output}");
+        }
+        assert!(!output.contains("foreign sensitive text"), "{output}");
+        assert!(!output.contains("Some("), "{output}");
+
+        let output = capture_logs(|| {
+            log_metadata_only_event_rejection(
+                project_id,
+                expected_thread_id,
+                "context_window_updated",
+                Some(turn_id),
+                None,
+            );
+        });
+        assert!(
+            output.contains(&format!("project_id={project_id}")),
+            "{output}"
+        );
+        assert!(
+            output.contains(&format!("event_turn_id={turn_id}")),
+            "{output}"
+        );
+        assert!(
+            output.contains("event_kind=\"context_window_updated\""),
+            "{output}"
+        );
+        assert!(!output.contains("event_item_id"), "{output}");
+        assert!(!output.contains("Some("), "{output}");
+    }
 
     #[test]
     fn late_tool_warning_requires_terminal_output() {
@@ -4395,6 +4997,72 @@ mod tests {
 
     struct UnusedHarnessFactory;
 
+    struct ShutdownHarness {
+        calls: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentHarness for ShutdownHarness {
+        fn capabilities(&self) -> HarnessCapabilities {
+            HarnessCapabilities::default()
+        }
+
+        async fn list_models(&self) -> Result<Vec<giskard_core::ModelDescriptor>, HarnessError> {
+            Ok(Vec::new())
+        }
+
+        async fn open_thread(
+            &self,
+            _opts: OpenThreadOptions,
+        ) -> Result<ThreadHandle, HarnessError> {
+            Err(HarnessError::Unsupported("unused".into()))
+        }
+
+        async fn start_turn(
+            &self,
+            _thread: &ThreadHandle,
+            _input: UserInput,
+            _overrides: giskard_core::turn::TurnOverrides,
+        ) -> Result<TurnId, HarnessError> {
+            Err(HarnessError::Unsupported("unused".into()))
+        }
+
+        fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
+            let (_, receiver) = broadcast::channel(1);
+            AgentEventStream::new(receiver)
+        }
+
+        async fn respond_approval(
+            &self,
+            _req: ApprovalId,
+            _decision: ApprovalDecision,
+        ) -> Result<(), HarnessError> {
+            Err(HarnessError::Unsupported("unused".into()))
+        }
+
+        async fn respond_server_request(
+            &self,
+            _req: ServerRequestId,
+            _response: giskard_core::server_request::ServerRequestResponse,
+        ) -> Result<(), HarnessError> {
+            Err(HarnessError::Unsupported("unused".into()))
+        }
+
+        async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
+            Err(HarnessError::Unsupported("unused".into()))
+        }
+
+        async fn shutdown(&self) -> Result<(), HarnessError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                Err(HarnessError::Protocol("injected shutdown failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     #[async_trait::async_trait]
     impl super::HarnessFactory for UnusedHarnessFactory {
         async fn create(
@@ -4405,6 +5073,158 @@ mod tests {
                 "unused test harness factory was called".into(),
             ))
         }
+    }
+
+    #[tokio::test]
+    async fn registry_shutdown_attempts_every_harness_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let hub = Arc::new(Hub::new());
+        let registry = super::HarnessRegistry::new(
+            Arc::new(UnusedHarnessFactory),
+            hub,
+            store.clone(),
+            ledger::spawn(store),
+        );
+        let successful_calls = Arc::new(AtomicUsize::new(0));
+        let failing_calls = Arc::new(AtomicUsize::new(0));
+        {
+            let mut harnesses = registry.shared.harnesses.lock().await;
+            harnesses.by_project.insert(
+                ProjectId::new(),
+                ProjectHarnessState::Active(Arc::new(ShutdownHarness {
+                    calls: successful_calls.clone(),
+                    fail: false,
+                })),
+            );
+            harnesses.by_project.insert(
+                ProjectId::new(),
+                ProjectHarnessState::Active(Arc::new(ShutdownHarness {
+                    calls: failing_calls.clone(),
+                    fail: true,
+                })),
+            );
+        }
+
+        let error = registry.shutdown().await.unwrap_err();
+        assert!(error.to_string().contains("injected shutdown failure"));
+        assert_eq!(successful_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(failing_calls.load(Ordering::SeqCst), 1);
+
+        registry.shutdown().await.unwrap();
+        assert_eq!(successful_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(failing_calls.load(Ordering::SeqCst), 1);
+        assert!(registry.shared.harnesses.lock().await.shutting_down);
+    }
+
+    #[tokio::test]
+    async fn registry_task_shutdown_waits_and_refuses_late_registration() {
+        let tracker = Arc::new(super::RegistryTaskTracker::default());
+        let permit = tracker.register().unwrap();
+        let waiting = tokio::spawn({
+            let tracker = tracker.clone();
+            async move {
+                tracker
+                    .close_and_wait(std::time::Duration::from_secs(1))
+                    .await
+            }
+        });
+
+        tokio::task::yield_now().await;
+        assert!(tracker.register().is_none());
+        assert!(!waiting.is_finished());
+        drop(permit);
+        waiting.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_registry_rejects_materialization_without_stranding_queue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let registry = super::HarnessRegistry::new(
+            Arc::new(UnusedHarnessFactory),
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store),
+        );
+        registry
+            .shared
+            .background_tasks
+            .close_and_wait(std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        let parent_thread_id = ThreadId::new();
+        let (result, receiver) = tokio::sync::oneshot::channel();
+        super::enqueue_subagent_materialization(
+            parent_thread_id,
+            super::SubagentMaterializationJob {
+                project_id: ProjectId::new(),
+                spawned_by_turn_id: TurnId::new(),
+                item_id: ItemId::new(),
+                origin: "test",
+                info: super::SubagentActivityInfo {
+                    native_thread_id: "native-child".into(),
+                    agent_name: None,
+                    agent_path: None,
+                    initial_prompt: None,
+                    title: None,
+                    action: SubagentAction::Spawned,
+                    status: None,
+                    fallback: None,
+                },
+                result: Some(result),
+            },
+            registry.shared.clone(),
+        )
+        .await;
+        assert!(receiver.await.unwrap().is_err());
+        assert!(
+            !registry
+                .shared
+                .subagent_materialization_queues
+                .lock()
+                .await
+                .contains_key(&parent_thread_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_harness_cannot_be_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let registry = super::HarnessRegistry::new(
+            Arc::new(UnusedHarnessFactory),
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store),
+        );
+        let project_id = ProjectId::new();
+        let harness: Arc<dyn AgentHarness> = Arc::new(ShutdownHarness {
+            calls: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+        });
+        registry
+            .shared
+            .harnesses
+            .lock()
+            .await
+            .by_project
+            .insert(project_id, ProjectHarnessState::Deleting(harness));
+        let config: ProjectConfig = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "id": project_id,
+            "name": "test",
+            "dir": "/tmp",
+            "harness": "replay",
+            "created_at": "2026-08-26T00:00:00Z",
+            "updated_at": "2026-08-26T00:00:00Z"
+        }))
+        .unwrap();
+        let error = match registry.get_or_create_harness(project_id, &config).await {
+            Ok(_) => panic!("deleting harness must not be replaced"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("being deleted"));
     }
 
     #[test]
@@ -5071,7 +5891,8 @@ mod tests {
         ));
         let (sink, stream, permit) = prepare_thread_updates(&shared, thread_id);
         let forwarder =
-            spawn_thread_update_forwarder(shared.clone(), project_id, thread_id, stream, permit);
+            spawn_thread_update_forwarder(shared.clone(), project_id, thread_id, stream, permit)
+                .unwrap();
         sink.send(ThreadUpdate::ContextWindowRestored {
             model: model.clone(),
             context_window: 258_400,
@@ -5128,7 +5949,8 @@ mod tests {
                 stale_thread_id,
                 stream,
                 permit,
-            );
+            )
+            .unwrap();
             sink.send(ThreadUpdate::ContextWindowRestored {
                 model: model.clone(),
                 context_window: 400_000,

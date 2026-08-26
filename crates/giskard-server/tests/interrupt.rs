@@ -430,6 +430,34 @@ async fn connect_ws(addr: SocketAddr, cookie: &str) -> TestWs {
 }
 
 #[tokio::test]
+async fn server_shutdown_closes_websocket_with_away_frame() {
+    let app = spawn_test_app().await;
+    let mut ws = app.connect_ws().await;
+
+    app.state.shutdown.trigger();
+
+    let frame = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let message = ws
+                .next()
+                .await
+                .expect("server should send a close frame")
+                .expect("close frame should be readable");
+            if let tokio_tungstenite::tungstenite::Message::Close(Some(frame)) = message {
+                break frame;
+            }
+        }
+    })
+    .await
+    .expect("server should close WebSocket promptly");
+    assert_eq!(
+        frame.code,
+        tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Away
+    );
+    assert_eq!(frame.reason, "server shutting down");
+}
+
+#[tokio::test]
 async fn websocket_interrupt_reaches_live_harness_turn() {
     let app = spawn_test_app().await;
     let mut ws = app.connect_ws().await;

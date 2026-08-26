@@ -7,10 +7,10 @@ use axum::{
     Router,
     extract::{
         DefaultBodyLimit, Path as AxumPath, Query, State,
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code},
     },
-    middleware,
-    response::{IntoResponse, Json},
+    middleware::{self, Next},
+    response::{IntoResponse, Json, Response},
     routing::{delete, get, patch, post},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -62,6 +62,27 @@ const MAX_ATTACHMENT_NAME_BYTES: usize = 255;
 const MAX_ATTACHMENT_MIME_BYTES: usize = 127;
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_HISTORY_PAGE_TURNS: usize = 100;
+
+#[derive(Clone)]
+struct HttpRequestContext {
+    method: axum::http::Method,
+    path: String,
+}
+
+tokio::task_local! {
+    static HTTP_REQUEST_CONTEXT: HttpRequestContext;
+}
+
+pub(crate) async fn http_request_context_middleware(
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let context = HttpRequestContext {
+        method: request.method().clone(),
+        path: request.uri().path().to_owned(),
+    };
+    HTTP_REQUEST_CONTEXT.scope(context, next.run(request)).await
+}
 
 pub fn protected_routes(state: AppState) -> Router<AppState> {
     Router::new()
@@ -4590,6 +4611,9 @@ async fn send_activity_bootstrap(
 }
 
 async fn handle_ws(socket: WebSocket, state: AppState) {
+    const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+    const SHUTDOWN_WRITER_GRACE: Duration = Duration::from_millis(100);
+
     let (tx, mut rx) = mpsc::channel::<ServerMessage>(256);
     let client_id = state.hub.next_client_id();
 
@@ -4597,6 +4621,7 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
 
     let replacements = state.hub.register_client(client_id, tx.clone()).await;
     let (writer_done_tx, mut writer_done_rx) = oneshot::channel();
+    let writer_shutdown = state.shutdown.clone();
 
     // Order matters, and is load-bearing in both directions:
     //
@@ -4610,12 +4635,38 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
     // A live broadcast can therefore land ahead of the bootstrap. That is harmless: the live event
     // claims the notification dedup key, so the replay for the same approval is suppressed rather
     // than alerting twice.
-    let send_task = tokio::spawn(async move {
+    let mut send_task = tokio::spawn(async move {
         loop {
             // Replacement state bypasses the ordered FIFO. It stays latest-by-key until the
             // socket writer actually selects it, so obsolete metadata cannot consume event
             // capacity or make a domain producer wait on a slow peer.
             let msg = tokio::select! {
+                () = writer_shutdown.wait() => {
+                    let close = Message::Close(Some(CloseFrame {
+                        code: close_code::AWAY,
+                        reason: "server shutting down".into(),
+                    }));
+                    match tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, ws_sender.send(close)).await {
+                        Ok(Ok(())) => debug!(
+                            %client_id,
+                            action = "close_ws_for_shutdown",
+                            "sent WebSocket shutdown close frame"
+                        ),
+                        Ok(Err(error)) => debug!(
+                            %client_id,
+                            action = "close_ws_for_shutdown",
+                            %error,
+                            "could not send WebSocket shutdown close frame"
+                        ),
+                        Err(_) => warn!(
+                            %client_id,
+                            action = "close_ws_for_shutdown",
+                            timeout_ms = SHUTDOWN_CLOSE_TIMEOUT.as_millis(),
+                            "timed out sending WebSocket shutdown close frame"
+                        ),
+                    }
+                    break;
+                }
                 ordered = rx.recv() => {
                     let Some(message) = ordered else { break; };
                     message
@@ -4650,9 +4701,20 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
     send_activity_bootstrap(&state, client_id, &tx).await;
 
     let hub = state.hub.clone();
+    let receiver_shutdown = state.shutdown.clone();
+    let mut shutting_down = false;
 
     loop {
         let incoming = tokio::select! {
+            () = receiver_shutdown.wait() => {
+                shutting_down = true;
+                debug!(
+                    %client_id,
+                    action = "stop_ws_receiver_for_shutdown",
+                    "stopping WebSocket receive loop for server shutdown"
+                );
+                break;
+            }
             incoming = ws_receiver.next() => incoming,
             _ = &mut writer_done_rx => {
                 debug!(
@@ -4668,7 +4730,12 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
                 let msg: ClientMessage = match serde_json::from_str(&text) {
                     Ok(m) => m,
                     Err(e) => {
-                        warn!("invalid WS message: {e}");
+                        warn!(
+                            %client_id,
+                            action = "parse_ws_message",
+                            error = %e,
+                            "invalid WebSocket message"
+                        );
                         let _ = tx
                             .send(
                                 WsError::new(
@@ -4695,9 +4762,11 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
                 if let Err(mut e) = handle_client_msg(&state, client_id, &tx, msg).await {
                     e.info.request_id = metadata_request_id;
                     error!(
+                        %client_id,
                         code = %e.info.code,
                         severity = ?e.info.severity,
                         thread_id = ?e.info.thread_id,
+                        request_id = ?e.info.request_id,
                         action = ?e.info.action,
                         detail = ?e.info.detail,
                         "WS handler error: {}",
@@ -4708,7 +4777,12 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
             }
             Some(Ok(_)) => {}
             Some(Err(e)) => {
-                warn!("WS receive error: {e}");
+                warn!(
+                    %client_id,
+                    action = "read_ws_message",
+                    error = %e,
+                    "WebSocket receive error"
+                );
                 break;
             }
             None => break,
@@ -4716,6 +4790,10 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
     }
 
     hub.disconnect(client_id).await;
+    if shutting_down {
+        let writer_wait = SHUTDOWN_CLOSE_TIMEOUT + SHUTDOWN_WRITER_GRACE;
+        let _ = tokio::time::timeout(writer_wait, &mut send_task).await;
+    }
     if !send_task.is_finished() {
         send_task.abort();
     }
@@ -6258,15 +6336,18 @@ enum ApiErrorLogLevel {
 }
 
 fn log_api_error(status: axum::http::StatusCode, message: &str, level: ApiErrorLogLevel) {
+    let context = HTTP_REQUEST_CONTEXT.try_with(Clone::clone).ok();
+    let method = context.as_ref().map(|context| context.method.as_str());
+    let path = context.as_ref().map(|context| context.path.as_str());
     match level {
         ApiErrorLogLevel::Debug => {
-            debug!(status = %status.as_u16(), message, "HTTP handler returned client error");
+            debug!(status = %status.as_u16(), method, path, action = "http_request", message, "HTTP handler returned client error");
         }
         ApiErrorLogLevel::Warn => {
-            warn!(status = %status.as_u16(), message, "HTTP handler returned conflict");
+            warn!(status = %status.as_u16(), method, path, action = "http_request", message, "HTTP handler returned conflict");
         }
         ApiErrorLogLevel::Error => {
-            error!(status = %status.as_u16(), message, "HTTP handler returned internal error");
+            error!(status = %status.as_u16(), method, path, action = "http_request", message, "HTTP handler returned internal error");
         }
     }
 }

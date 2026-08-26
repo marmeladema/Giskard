@@ -14,6 +14,18 @@ bind = "127.0.0.1:8787"
 # loads. Set true in production behind HTTPS/TLS.
 secure_cookies = false
 
+[logging.file]
+# Optional daily rolling file sink in addition to console output. Relative paths are resolved from
+# GISKARD_DATA_DIR using normal filesystem semantics, so `..` may select a location outside it. A
+# dedicated writer thread consumes a bounded queue and applies backpressure rather than dropping
+# records when the queue fills. The configured file name is a prefix: this example writes files
+# named giskard-server.log.YYYY-MM-DD, with UTC rotation boundaries. Giskard does not prune old
+# daily log files; use an external retention mechanism if they should expire. Missing or invalid
+# config and file-sink setup failures are printed directly to stderr; logging begins after both
+# load.
+enabled = false
+path = "logs/giskard-server.log"
+
 [auth]
 # Argon2 hash of the single shared app password (never the plaintext). Generate via
 # `giskard-admin set-password`. May instead be provided via the GISKARD_PASSWORD_HASH env var.

@@ -11,7 +11,6 @@ mod mapping;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, Weak};
 use std::time::{Duration, Instant};
 
@@ -19,7 +18,7 @@ use async_trait::async_trait;
 use rand::RngCore;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 
 use giskard_core::approval::ApprovalDecision;
@@ -282,9 +281,12 @@ enum ControlCommand {
         cwd: String,
         response: oneshot::Sender<Result<Vec<ModelDescriptor>, HarnessError>>,
     },
-    Shutdown {
-        response: oneshot::Sender<Result<(), HarnessError>>,
-    },
+}
+
+struct WorkerReceivers {
+    commands: mpsc::Receiver<QueuedHarnessCommand>,
+    controls: mpsc::Receiver<QueuedControlCommand>,
+    shutdown: watch::Receiver<bool>,
 }
 
 type SenderMap = Arc<StdMutex<HashMap<ThreadId, broadcast::Sender<AgentEvent>>>>;
@@ -309,6 +311,8 @@ struct WorkerQueueToken {
     id: u64,
     kind: WorkerQueueKind,
     action: &'static str,
+    project_id: Option<ProjectId>,
+    thread_id: Option<ThreadId>,
     enqueued_at: Instant,
 }
 
@@ -317,6 +321,8 @@ struct WorkerQueueEntrySnapshot {
     id: u64,
     kind: WorkerQueueKind,
     action: &'static str,
+    project_id: Option<ProjectId>,
+    thread_id: Option<ThreadId>,
     elapsed_ms: u128,
 }
 
@@ -353,12 +359,20 @@ impl WorkerQueueWatchdog {
         }
     }
 
-    fn enqueue(&self, kind: WorkerQueueKind, action: &'static str) -> WorkerQueueToken {
+    fn enqueue(
+        &self,
+        kind: WorkerQueueKind,
+        action: &'static str,
+        project_id: Option<ProjectId>,
+        thread_id: Option<ThreadId>,
+    ) -> WorkerQueueToken {
         let mut state = self.lock_state();
         let token = WorkerQueueToken {
             id: state.next_id,
             kind,
             action,
+            project_id,
+            thread_id,
             enqueued_at: Instant::now(),
         };
         state.next_id = state.next_id.saturating_add(1);
@@ -431,6 +445,8 @@ fn snapshot_queue_token(token: WorkerQueueToken, now: Instant) -> WorkerQueueEnt
         id: token.id,
         kind: token.kind,
         action: token.action,
+        project_id: token.project_id,
+        thread_id: token.thread_id,
         elapsed_ms: now.duration_since(token.enqueued_at).as_millis(),
     }
 }
@@ -459,10 +475,14 @@ async fn run_worker_queue_watchdog(watchdog: Weak<WorkerQueueWatchdog>) {
                 active_id = ?snapshot.active.as_ref().map(|entry| entry.id),
                 active_kind = ?snapshot.active.as_ref().map(|entry| entry.kind.as_str()),
                 active_action = ?snapshot.active.as_ref().map(|entry| entry.action),
+                active_project_id = snapshot.active.as_ref().and_then(|entry| entry.project_id).map(tracing::field::display),
+                active_thread_id = snapshot.active.as_ref().and_then(|entry| entry.thread_id).map(tracing::field::display),
                 active_elapsed_ms = ?snapshot.active.as_ref().map(|entry| entry.elapsed_ms),
                 oldest_pending_id = ?snapshot.oldest_pending.as_ref().map(|entry| entry.id),
                 oldest_pending_kind = ?snapshot.oldest_pending.as_ref().map(|entry| entry.kind.as_str()),
                 oldest_pending_action = ?snapshot.oldest_pending.as_ref().map(|entry| entry.action),
+                oldest_pending_project_id = snapshot.oldest_pending.as_ref().and_then(|entry| entry.project_id).map(tracing::field::display),
+                oldest_pending_thread_id = snapshot.oldest_pending.as_ref().and_then(|entry| entry.thread_id).map(tracing::field::display),
                 oldest_pending_elapsed_ms = ?snapshot.oldest_pending.as_ref().map(|entry| entry.elapsed_ms),
                 command_pending = snapshot.command_pending,
                 control_pending = snapshot.control_pending,
@@ -766,7 +786,6 @@ async fn codex_respond_error_json(
             started.elapsed(),
             "Codex JSON-RPC error response timed out; worker will resume processing commands",
         );
-        warn!(code, "Codex JSON-RPC error response timed out");
         HarnessError::Timeout(format!(
             "Codex JSON-RPC error response {id_for_log} timed out"
         ))
@@ -786,7 +805,8 @@ pub struct CodexHarness {
     control_tx: mpsc::Sender<QueuedControlCommand>,
     senders: SenderMap,
     worker_queue: Arc<WorkerQueueWatchdog>,
-    shutdown_called: AtomicBool,
+    shutdown_tx: watch::Sender<bool>,
+    worker_done: watch::Receiver<bool>,
     capabilities: HarnessCapabilities,
 }
 
@@ -823,6 +843,8 @@ impl CodexHarness {
         let (control_tx, control_rx) = mpsc::channel(64);
         let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
         let worker_queue = Arc::new(WorkerQueueWatchdog::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (worker_done_tx, worker_done) = watch::channel(false);
 
         let harness = Arc::new(Self {
             workspace_root: workspace_root.clone(),
@@ -831,7 +853,8 @@ impl CodexHarness {
             control_tx,
             senders: senders.clone(),
             worker_queue: worker_queue.clone(),
-            shutdown_called: AtomicBool::new(false),
+            shutdown_tx,
+            worker_done,
             capabilities: HarnessCapabilities {
                 live_approvals: true,
                 plan_build_modes: true,
@@ -850,15 +873,22 @@ impl CodexHarness {
         });
 
         tokio::spawn(run_worker_queue_watchdog(Arc::downgrade(&worker_queue)));
-        tokio::spawn(background_task(
-            client,
-            cmd_rx,
-            control_rx,
-            senders,
-            worker_queue,
-            workspace_root,
-            writable_roots,
-        ));
+        tokio::spawn(async move {
+            background_task(
+                client,
+                WorkerReceivers {
+                    commands: cmd_rx,
+                    controls: control_rx,
+                    shutdown: shutdown_rx,
+                },
+                senders,
+                worker_queue,
+                workspace_root,
+                writable_roots,
+            )
+            .await;
+            worker_done_tx.send_replace(true);
+        });
         Ok(harness)
     }
 
@@ -867,7 +897,13 @@ impl CodexHarness {
         action: &'static str,
         command: HarnessCommand,
     ) -> Result<(), HarnessError> {
-        let token = self.worker_queue.enqueue(WorkerQueueKind::Command, action);
+        let (project_id, thread_id) = match &command {
+            HarnessCommand::OpenThread { opts, .. } => (Some(opts.project), opts.thread),
+            HarnessCommand::StartTurn { thread, .. } => (None, Some(thread.thread)),
+        };
+        let token =
+            self.worker_queue
+                .enqueue(WorkerQueueKind::Command, action, project_id, thread_id);
         self.cmd_tx
             .send(QueuedHarnessCommand { token, command })
             .await
@@ -882,7 +918,18 @@ impl CodexHarness {
         action: &'static str,
         command: ControlCommand,
     ) -> Result<(), HarnessError> {
-        let token = self.worker_queue.enqueue(WorkerQueueKind::Control, action);
+        let thread_id = match &command {
+            ControlCommand::Interrupt { thread, .. }
+            | ControlCommand::TerminateCommand { thread, .. }
+            | ControlCommand::CompactThread { thread, .. }
+            | ControlCommand::SetThreadName { thread, .. }
+            | ControlCommand::SetThreadArchived { thread, .. }
+            | ControlCommand::DeleteThread { thread, .. } => Some(thread.thread),
+            _ => None,
+        };
+        let token = self
+            .worker_queue
+            .enqueue(WorkerQueueKind::Control, action, None, thread_id);
         self.control_tx
             .send(QueuedControlCommand { token, command })
             .await
@@ -1291,22 +1338,22 @@ impl AgentHarness for CodexHarness {
     }
 
     async fn shutdown(&self) -> Result<(), HarnessError> {
-        if self.shutdown_called.swap(true, Ordering::SeqCst) {
-            return Ok(());
+        // This update is synchronous and idempotent. Unlike enqueueing on the bounded control
+        // queue, shutdown initiation therefore survives cancellation of this caller.
+        self.shutdown_tx.send_replace(true);
+        let mut worker_done = self.worker_done.clone();
+        while !*worker_done.borrow_and_update() {
+            if worker_done.changed().await.is_err() {
+                break;
+            }
         }
-        let (tx, rx) = oneshot::channel();
-        let _ = self
-            .enqueue_control("shutdown", ControlCommand::Shutdown { response: tx })
-            .await;
-        let _ = rx.await;
         Ok(())
     }
 }
 
 async fn background_task<C>(
     mut client: C,
-    mut cmd_rx: mpsc::Receiver<QueuedHarnessCommand>,
-    mut control_rx: mpsc::Receiver<QueuedControlCommand>,
+    receivers: WorkerReceivers,
     senders: SenderMap,
     worker_queue: Arc<WorkerQueueWatchdog>,
     workspace_root: PathBuf,
@@ -1314,6 +1361,11 @@ async fn background_task<C>(
 ) where
     C: CodexTransport,
 {
+    let WorkerReceivers {
+        mut commands,
+        mut controls,
+        mut shutdown,
+    } = receivers;
     let mut mapper = CodexMapper::new(workspace_root.clone());
     let mut pending_compactions: HashMap<ThreadId, PendingCompaction> = HashMap::new();
     let mut pending_context_restores: HashMap<String, PendingContextRestore> = HashMap::new();
@@ -1322,6 +1374,12 @@ async fn background_task<C>(
 
     loop {
         tokio::select! {
+            biased;
+            _ = wait_for_shutdown_request(&mut shutdown) => {
+                cleanup_all_active_turn_uploads(&mut client, &mut active_turns).await;
+                shutdown_codex_transport(client, &workspace_root).await;
+                break;
+            }
             msg = client.next_message(), if should_poll_codex_messages(&mapper, &active_turns, &pending_compactions) || !pending_context_restores.is_empty() => {
                 match msg {
                     Ok(Some(msg)) => {
@@ -1347,7 +1405,7 @@ async fn background_task<C>(
                             }
                             StreamOutcome::Shutdown => {
                                 cleanup_all_active_turn_uploads(&mut client, &mut active_turns).await;
-                                shutdown_codex_transport(client).await;
+                                shutdown_codex_transport(client, &workspace_root).await;
                                 break;
                             }
                         }
@@ -1363,6 +1421,8 @@ async fn background_task<C>(
                         .await;
                         if !pending_compactions.is_empty() {
                             warn!(
+                                action = "read_codex_stream",
+                                workspace_root = %workspace_root.display(),
                                 pending_compactions = pending_compactions.len(),
                                 pending_compaction_states = ?pending_compaction_states(&pending_compactions),
                                 "Codex message stream ended with pending context compactions"
@@ -1390,18 +1450,23 @@ async fn background_task<C>(
                         let message = e.to_string();
                         if active_turns.is_empty() {
                             warn!(
+                                action = "read_codex_stream",
+                                error = %message,
                                 pending_compactions = pending_compactions.len(),
                                 pending_compaction_states = ?pending_compaction_states(&pending_compactions),
                                 workspace_root = %workspace_root.display(),
-                                "Codex idle stream failed while background work was running: {message}"
+                                "Codex idle stream failed while background work was running"
                             );
                         } else {
                             warn!(
+                                action = "read_codex_stream",
+                                error = %message,
                                 active_turns = active_turns.len(),
+                                active_turn_states = ?active_turn_states(&active_turns),
                                 pending_compactions = pending_compactions.len(),
                                 pending_compaction_states = ?pending_compaction_states(&pending_compactions),
                                 workspace_root = %workspace_root.display(),
-                                "Codex stream failed before all active turns completed: {message}"
+                                "Codex stream failed before all active turns completed"
                             );
                             cleanup_all_active_turn_uploads(&mut client, &mut active_turns).await;
                             emit_incomplete_active_turns(
@@ -1416,7 +1481,7 @@ async fn background_task<C>(
                     }
                 }
             }
-            queued = cmd_rx.recv() => {
+            queued = commands.recv() => {
                 let queued = match queued {
                     Some(queued) => queued,
                     None => {
@@ -1483,7 +1548,7 @@ async fn background_task<C>(
                 }
                 worker_queue.mark_finished(queued.token);
             }
-            queued = control_rx.recv() => {
+            queued = controls.recv() => {
                 let Some(queued) = queued else {
                     cleanup_all_active_turn_uploads(&mut client, &mut active_turns).await;
                     break;
@@ -1504,7 +1569,7 @@ async fn background_task<C>(
                 worker_queue.mark_finished(token);
                 if matches!(outcome, StreamOutcome::Shutdown) {
                     cleanup_all_active_turn_uploads(&mut client, &mut active_turns).await;
-                    shutdown_codex_transport(client).await;
+                    shutdown_codex_transport(client, &workspace_root).await;
                     break;
                 }
             }
@@ -1516,7 +1581,15 @@ async fn background_task<C>(
     worker_queue.close();
 }
 
-async fn shutdown_codex_transport<C>(client: C)
+async fn wait_for_shutdown_request(shutdown: &mut watch::Receiver<bool>) {
+    if *shutdown.borrow_and_update() {
+        return;
+    }
+    // A closed sender also means the harness owner disappeared, so the worker should tear down.
+    let _ = shutdown.changed().await;
+}
+
+async fn shutdown_codex_transport<C>(client: C, workspace_root: &std::path::Path)
 where
     C: CodexTransport,
 {
@@ -1524,18 +1597,25 @@ where
     match tokio::time::timeout(CODEX_SHUTDOWN_TIMEOUT, client.shutdown_transport()).await {
         Ok(Ok(())) => {
             info!(
+                action = "shutdown_codex_transport",
+                workspace_root = %workspace_root.display(),
                 elapsed_ms = started.elapsed().as_millis(),
                 "Codex transport shutdown completed"
             );
         }
         Ok(Err(error)) => {
             warn!(
+                action = "shutdown_codex_transport",
+                workspace_root = %workspace_root.display(),
+                error = %error,
                 elapsed_ms = started.elapsed().as_millis(),
-                "Codex transport shutdown failed: {error}"
+                "Codex transport shutdown failed"
             );
         }
         Err(_) => {
             warn!(
+                action = "shutdown_codex_transport",
+                workspace_root = %workspace_root.display(),
                 elapsed_ms = started.elapsed().as_millis(),
                 timeout_ms = CODEX_SHUTDOWN_TIMEOUT.as_millis(),
                 "Codex transport shutdown timed out; dropping transport"
@@ -1583,6 +1663,23 @@ impl ActiveTurn {
 }
 
 type ActiveTurns = HashMap<ThreadId, ActiveTurn>;
+
+fn active_turn_states(active_turns: &ActiveTurns) -> Vec<String> {
+    active_turns
+        .values()
+        .map(|active| {
+            format!(
+                "thread_id={},harness_thread_id={},acknowledged_turn={},active_turn={}",
+                active.thread.thread,
+                active.thread.harness_thread_id,
+                active.acknowledged_turn,
+                active
+                    .active_turn
+                    .map_or_else(|| "none".into(), |turn| turn.to_string())
+            )
+        })
+        .collect()
+}
 
 struct StartedTurn {
     turn: TurnId,
@@ -1708,16 +1805,27 @@ async fn handle_background_server_message(
                     return StreamOutcome::CompactionCompleted { thread, elapsed_ms };
                 }
             } else if let Some(message) = mapping::fatal_turn_error(&notif) {
+                let (harness_thread_id, native_turn_id) = match &notif {
+                    codex_codes::messages::Notification::Error(error) => {
+                        (Some(error.thread_id.as_str()), Some(error.turn_id.as_str()))
+                    }
+                    _ => (None, notif.turn_id()),
+                };
                 warn!(
+                    action = "map_fatal_notification",
+                    method = notif.method(),
+                    harness_thread_id,
+                    native_turn_id,
                     fallback_thread = %fallback_thread,
-                    "dropping fatal Codex error notification that could not be mapped to a known thread: {message}"
+                    error = %message,
+                    "dropping fatal Codex error notification that could not be mapped to a known thread"
                 );
             }
             StreamOutcome::TurnEnded
         }
         codex_codes::ServerMessage::Request { id, request } => {
             let Some(event) = mapper.map_server_request(&id, &request, fallback_thread) else {
-                respond_unroutable_server_request(client, &id).await;
+                respond_unroutable_server_request(client, &id, &request).await;
                 return StreamOutcome::TurnEnded;
             };
             let thread = event_thread(&event);
@@ -1831,10 +1939,12 @@ async fn handle_control_command(
                 }
                 Err(error) => {
                     warn!(
-                        thread = %thread.thread,
+                        action = "compact_thread",
+                        thread_id = %thread.thread,
                         harness_thread_id = %thread.harness_thread_id,
+                        error = %error,
                         elapsed_ms = started.elapsed().as_millis(),
-                        "Codex context compaction request failed: {error}"
+                        "Codex context compaction request failed"
                     );
                 }
             }
@@ -1939,10 +2049,6 @@ async fn handle_control_command(
             .await;
             let _ = response.send(result);
             StreamOutcome::TurnEnded
-        }
-        Some(ControlCommand::Shutdown { response }) => {
-            let _ = response.send(Ok(()));
-            StreamOutcome::Shutdown
         }
         None => StreamOutcome::Shutdown,
     }
@@ -2232,7 +2338,14 @@ fn observe_pending_context_restore(
         context_window,
     };
     if let Err(error) = restore.sink.send(update) {
-        warn!(thread_id = %restore.thread, ?error, "failed to forward resumed context window");
+        warn!(
+            action = "forward_resumed_context_window",
+            thread_id = %restore.thread,
+            harness_thread_id = %notification.thread_id,
+            native_turn_id = %notification.turn_id,
+            error = ?error,
+            "failed to forward resumed context window"
+        );
     }
 }
 
@@ -2305,6 +2418,8 @@ fn effective_model(
     model_provider: &str,
     reported_effort: Option<giskard_core::model::Effort>,
     requested: Option<&giskard_core::model::ModelRef>,
+    context: CodexOperationContext<'_>,
+    reported_harness_thread_id: &str,
 ) -> Option<giskard_core::model::ModelRef> {
     if model.is_empty() || model_provider.is_empty() {
         // An import has no requested model to fall back on, so this is the difference between a
@@ -2314,7 +2429,10 @@ fn effective_model(
             model_empty = model.is_empty(),
             model_provider_empty = model_provider.is_empty(),
             requested = ?requested.map(giskard_core::model::ModelRef::key),
-            action = "effective_model",
+            action = context.action,
+            project_id = context.project_id.map(tracing::field::display),
+            thread_id = context.thread_id.map(tracing::field::display),
+            harness_thread_id = reported_harness_thread_id,
             "Codex reported no effective model for the opened thread"
         );
         return None;
@@ -2359,6 +2477,8 @@ async fn resume_thread(
             .as_ref()
             .map(|effort| giskard_core::model::Effort::new(effort.0.clone())),
         model,
+        context,
+        &resp.thread.id,
     );
     Ok(OpenedNativeThread {
         harness_thread_id: resp.thread.id,
@@ -2405,7 +2525,14 @@ async fn start_thread(
         &params,
     )
     .await?;
-    let started = effective_model(&resp.model, &resp.model_provider, None, Some(initial_model));
+    let started = effective_model(
+        &resp.model,
+        &resp.model_provider,
+        None,
+        Some(initial_model),
+        context,
+        &resp.thread.id,
+    );
     Ok(OpenedNativeThread {
         harness_thread_id: resp.thread.id,
         model: started,
@@ -2766,15 +2893,73 @@ fn ensure_thread_sender(
 async fn respond_unroutable_server_request(
     client: &mut dyn CodexTransport,
     id: &codex_codes::jsonrpc::RequestId,
+    request: &codex_codes::messages::ServerRequest,
 ) {
     let message = "Giskard cannot route this Codex server request to a known thread.";
     let context =
         CodexOperationContext::new("reject_unroutable_server_request").with_request_id(id);
     if let Err(error) = codex_respond_error_json(client, context, id.clone(), -32000, message).await
     {
-        warn!(%id, %error, "failed to reject unroutable Codex server request");
+        let (harness_thread_id, native_turn_id) = server_request_native_scope(request);
+        warn!(
+            action = "reject_unroutable_server_request",
+            method = request.method(),
+            request_id = %id,
+            harness_thread_id,
+            native_turn_id,
+            error = %error,
+            "failed to reject unroutable Codex server request"
+        );
     } else {
-        warn!(%id, "rejected unroutable Codex server request");
+        let (harness_thread_id, native_turn_id) = server_request_native_scope(request);
+        warn!(
+            action = "reject_unroutable_server_request",
+            method = request.method(),
+            request_id = %id,
+            harness_thread_id,
+            native_turn_id,
+            "rejected unroutable Codex server request"
+        );
+    }
+}
+
+fn server_request_native_scope(
+    request: &codex_codes::messages::ServerRequest,
+) -> (Option<String>, Option<String>) {
+    use codex_codes::messages::ServerRequest;
+    match request {
+        ServerRequest::CmdExecApproval(params) => {
+            (Some(params.thread_id.clone()), Some(params.turn_id.clone()))
+        }
+        ServerRequest::FileChangeApproval(params) => {
+            (Some(params.thread_id.clone()), Some(params.turn_id.clone()))
+        }
+        ServerRequest::ToolRequestUserInput(params) => {
+            (Some(params.thread_id.clone()), Some(params.turn_id.clone()))
+        }
+        ServerRequest::PermissionsRequestApproval(params) => {
+            (Some(params.thread_id.clone()), Some(params.turn_id.clone()))
+        }
+        ServerRequest::ItemToolCall(params) => {
+            (Some(params.thread_id.clone()), Some(params.turn_id.clone()))
+        }
+        ServerRequest::ApplyPatchApproval(params) => (Some(params.conversation_id.0.clone()), None),
+        ServerRequest::ExecCommandApproval(params) => {
+            (Some(params.conversation_id.0.clone()), None)
+        }
+        ServerRequest::Unknown { params, .. } => {
+            let string_at = |key: &str| {
+                params
+                    .as_ref()
+                    .and_then(|value| value.get(key))
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+            };
+            (string_at("threadId"), string_at("turnId"))
+        }
+        ServerRequest::McpServerElicitationRequest(_)
+        | ServerRequest::ChatgptAuthTokensRefresh(_)
+        | ServerRequest::AttestationGenerate(_) => (None, None),
     }
 }
 
@@ -3578,6 +3763,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn worker_queue_snapshot_preserves_operation_identity() {
+        let watchdog = WorkerQueueWatchdog::new();
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let token = watchdog.enqueue(
+            WorkerQueueKind::Command,
+            "open_thread",
+            Some(project_id),
+            Some(thread_id),
+        );
+        watchdog.mark_started(token);
+
+        let active = watchdog.snapshot().active.expect("active queue entry");
+        assert_eq!(active.project_id, Some(project_id));
+        assert_eq!(active.thread_id, Some(thread_id));
+        assert_eq!(active.action, "open_thread");
+    }
+
+    #[test]
+    fn active_turn_diagnostics_preserve_thread_identities() {
+        let thread = test_thread();
+        let thread_id = thread.thread;
+        let harness_thread_id = thread.harness_thread_id.clone();
+        let turn = TurnId::new();
+        let active_turns = HashMap::from([(thread_id, ActiveTurn::new(thread, turn))]);
+
+        let states = active_turn_states(&active_turns);
+        assert_eq!(states.len(), 1);
+        assert!(states[0].contains(&format!("thread_id={thread_id}")));
+        assert!(states[0].contains(&format!("harness_thread_id={harness_thread_id}")));
+        assert!(states[0].contains(&format!("acknowledged_turn={turn}")));
+    }
+
+    #[test]
+    fn unknown_server_request_diagnostics_extract_only_native_scope() {
+        let request = codex_codes::messages::ServerRequest::Unknown {
+            method: "future/request".into(),
+            params: Some(json!({
+                "threadId": "native-thread-7",
+                "turnId": "native-turn-9",
+                "prompt": "sensitive and intentionally ignored"
+            })),
+        };
+
+        assert_eq!(
+            server_request_native_scope(&request),
+            (Some("native-thread-7".into()), Some("native-turn-9".into()))
+        );
+    }
+
     #[derive(Debug, Clone, PartialEq)]
     struct FakeRequest {
         method: String,
@@ -3619,6 +3855,8 @@ mod tests {
         config_model_provider: Option<String>,
         hang_response_json: bool,
         hang_shutdown: bool,
+        block_shutdown: bool,
+        shutdown_release: Arc<tokio::sync::Notify>,
         requests: Vec<FakeRequest>,
         responses: Vec<FakeResponse>,
         response_errors: Vec<FakeResponseError>,
@@ -3717,6 +3955,14 @@ mod tests {
 
         async fn hang_shutdown(&self) {
             self.state.lock().await.hang_shutdown = true;
+        }
+
+        async fn block_shutdown(&self) {
+            self.state.lock().await.block_shutdown = true;
+        }
+
+        async fn release_shutdown(&self) {
+            self.state.lock().await.shutdown_release.notify_one();
         }
     }
 
@@ -3982,6 +4228,10 @@ mod tests {
             if state.hang_shutdown {
                 drop(state);
                 std::future::pending().await
+            } else if state.block_shutdown {
+                let release = state.shutdown_release.clone();
+                drop(state);
+                release.notified().await;
             }
             Ok(())
         }
@@ -5568,7 +5818,7 @@ mod tests {
 
         timeout(Duration::from_secs(1), harness.shutdown())
             .await
-            .expect("shutdown command should be acknowledged before transport shutdown")
+            .expect("bounded transport shutdown should complete")
             .unwrap();
         assert_eq!(controller.shutdowns().await, 1);
 
@@ -5580,6 +5830,60 @@ mod tests {
         .expect("bounded shutdown should eventually drop the worker receiver")
         .expect_err("worker should be closed after shutdown");
         assert!(matches!(err, HarnessError::Transport(_)));
+    }
+
+    #[tokio::test]
+    async fn cancelled_shutdown_caller_does_not_cancel_worker_teardown() {
+        let (harness, controller) = spawn_fake_harness();
+        controller.block_shutdown().await;
+
+        let first_harness = harness.clone();
+        let first = tokio::spawn(async move { first_harness.shutdown().await });
+        timeout(Duration::from_secs(1), async {
+            while controller.shutdowns().await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("transport shutdown should start");
+        assert!(!first.is_finished());
+        first.abort();
+
+        let second_harness = harness.clone();
+        let second = tokio::spawn(async move { second_harness.shutdown().await });
+        tokio::task::yield_now().await;
+        assert!(
+            !second.is_finished(),
+            "later callers must await transport completion"
+        );
+        controller.release_shutdown().await;
+        second.await.unwrap().unwrap();
+        assert_eq!(controller.shutdowns().await, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_shutdown_callers_wait_for_one_worker_teardown() {
+        let (harness, controller) = spawn_fake_harness();
+        controller.block_shutdown().await;
+
+        let first_harness = harness.clone();
+        let first = tokio::spawn(async move { first_harness.shutdown().await });
+        let second_harness = harness.clone();
+        let second = tokio::spawn(async move { second_harness.shutdown().await });
+        timeout(Duration::from_secs(1), async {
+            while controller.shutdowns().await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("transport shutdown should start");
+        assert!(!first.is_finished());
+        assert!(!second.is_finished());
+
+        controller.release_shutdown().await;
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert_eq!(controller.shutdowns().await, 1);
     }
 
     #[test]

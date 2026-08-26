@@ -818,7 +818,7 @@ impl ThreadRuntimeRegistry {
                 update_prepared_item_output_authority(entry, prepared);
             } else {
                 update_command_output_authority(entry, *turn, item);
-                update_tool_output_authority(entry, *turn, item);
+                update_tool_output_authority(entry, thread_id, *turn, item);
             }
         }
         let tasks_changed = entry.tasks.apply_event(event);
@@ -1391,7 +1391,12 @@ fn update_prepared_item_output_authority(
     }
 }
 
-fn update_tool_output_authority(entry: &mut ThreadRuntimeEntry, turn_id: TurnId, item: &Item) {
+fn update_tool_output_authority(
+    entry: &mut ThreadRuntimeEntry,
+    thread_id: ThreadId,
+    turn_id: TurnId,
+    item: &Item,
+) {
     let key = (turn_id, item.id);
     let ItemPayload::ToolCall { output, status, .. } = &item.payload else {
         entry.tool_outputs.remove(&key);
@@ -1415,7 +1420,19 @@ fn update_tool_output_authority(entry: &mut ThreadRuntimeEntry, turn_id: TurnId,
                 .insert(key, RuntimeToolOutput { bytes, descriptor });
         }
         Err(error) => {
-            tracing::error!(%turn_id, item_id = %item.id, %error, "could not serialize completed tool output");
+            let project_id = entry
+                .active_turn
+                .as_ref()
+                .map(|owner| tracing::field::display(owner.reservation.project_id));
+            tracing::error!(
+                project_id,
+                %thread_id,
+                %turn_id,
+                item_id = %item.id,
+                action = "serialize_completed_tool_output",
+                %error,
+                "could not serialize completed tool output"
+            );
             entry.tool_outputs.remove(&key);
         }
     }

@@ -29,6 +29,7 @@ rand = { workspace = true }
 base64 = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
 chrono = { workspace = true }
 toml = { workspace = true }
 time = "0.3"

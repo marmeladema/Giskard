@@ -2098,6 +2098,14 @@ configuration (§9).
 - **Idle shutdown (optional, configurable):** a project's process may be terminated after a
   configurable idle timeout to reclaim memory; threads are resumed on next use via
   `thread/resume`. Default: keep alive while the app runs (given the ~10-thread scale).
+- **Server shutdown:** SIGINT and SIGTERM stop HTTP acceptance, allow in-flight requests a bounded
+  drain, then shut every project harness down concurrently. Harness shutdown is completion-based:
+  the adapter closes its transport before returning, with a bounded timeout for a stuck provider.
+  Registry background tasks receive the closed streams and get a bounded drain window for final
+  persistence, then the token-ledger actor flushes queued updates before the process releases its
+  data-directory lock and logging guard. A second shutdown signal cancels that sequence and forces
+  termination after a short, bounded file-log flush. The deterministic replay server follows the
+  same shutdown sequence.
 - **Crash handling:** if the child exits unexpectedly, the server marks the project's active
   threads as "disconnected", surfaces an `Error` event to the UI, and offers a "reconnect"
   action that respawns and resumes.
@@ -3967,6 +3975,15 @@ supports, including `collaborationMode` and `item/tool/requestUserInput`.
 [server]
 bind = "127.0.0.1:8787"
 secure_cookies = true          # set false only for local plain-HTTP dev
+
+[logging.file]
+# Optional in addition to the always-on console sink. Relative paths are resolved from the data dir
+# with normal filesystem semantics (`..` may resolve outside it). A dedicated writer consumes a
+# bounded queue and applies backpressure rather than dropping records when it fills. The filename
+# is a UTC-daily rolling prefix (for example, giskard-server.log.YYYY-MM-DD). Giskard does not
+# prune old daily files; deployments may apply external retention.
+enabled = false
+path = "logs/giskard-server.log"
 
 [auth]
 # generate with: giskard-admin set-password

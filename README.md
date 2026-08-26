@@ -158,8 +158,8 @@ cumulative totals can legitimately exceed the model's context window over a long
 
 ## Logging
 
-`giskard-server` logs to the server process output using Rust's standard `RUST_LOG` filter syntax.
-When `RUST_LOG` is unset, the server defaults to:
+`giskard-server` always logs to the server process output using Rust's standard `RUST_LOG` filter
+syntax. When `RUST_LOG` is unset, the server defaults to:
 
 ```bash
 giskard=info,tower_http=info
@@ -195,6 +195,33 @@ RUST_LOG=giskard_server::registry=trace,giskard_harness_codex=trace,giskard=info
 Use `debug` first for most issues. `trace` can be very verbose, but it is useful when diagnosing
 stuck turns, harness protocol failures, WebSocket forwarding, or command/tool lifecycle bugs.
 
+An optional daily file sink can retain the same filtered events alongside the console. A dedicated
+writer thread consumes a bounded queue; if that queue fills, the thread emitting a log waits rather
+than dropping the record. Broad `trace` filters can therefore delay request and event processing
+when file storage is slow; prefer the narrow, component-scoped filters shown above:
+
+```toml
+[logging.file]
+enabled = true
+path = "logs/giskard-server.log"
+```
+
+A relative `path` is resolved from `GISKARD_DATA_DIR`; an absolute path is used as written. Normal
+filesystem path semantics apply, so relative paths containing `..` may resolve outside the data
+directory. The file name is a rolling prefix, so the example produces
+`logs/giskard-server.log.YYYY-MM-DD` with UTC day boundaries. Giskard does not prune old daily log
+files; use an external retention mechanism if they should expire. File output has no ANSI escapes.
+Missing or invalid config and file-sink setup failures are printed directly to stderr because no
+configured sink exists yet. After config and the sink load, all startup and runtime tracing goes to
+both outputs. Logs can contain commands, filesystem paths, and provider errors, so protect the
+destination appropriately.
+
+SIGINT and SIGTERM trigger bounded graceful shutdown: HTTP traffic drains first, then every active
+project harness closes its Codex transport, registry background tasks finish their final
+persistence, and queued token-ledger updates flush before the file logger does. A second signal
+cancels that sequence and forces termination after a short, bounded file-log flush. The
+deterministic replay server follows the same shutdown sequence.
+
 For browser-side issues, open Settings → **Browser diagnostics** in the Giskard UI. The panel keeps
 a bounded local buffer of recent WebSocket status changes, notification lifecycle events, approval
 routing decisions, and visibility/focus state. Use **Copy** from that panel when reporting a
@@ -215,6 +242,8 @@ service does not silently run with an empty provider list.
 |---------|-----|---------|---------|
 | `[server]` | `bind` | `127.0.0.1:8787` | HTTP/WS listen address. |
 | | `secure_cookies` | `true` | `Secure` flag on the session cookie. **Set `false` for plain-HTTP local dev.** |
+| `[logging.file]` | `enabled` | `false` | Write the console-filtered events to daily rolling files as well. |
+| | `path` | `logs/giskard-server.log` | Absolute rolling filename prefix, or one relative to `GISKARD_DATA_DIR`. |
 | `[auth]` | `password_hash` | — | Argon2 hash of the shared password (or env `GISKARD_PASSWORD_HASH`). Generate with `giskard-admin set-password`. |
 | | `session_days` | `30` | Session lifetime, sliding: requests in the second half of the window re-issue the cookie for a full window. |
 | `[browse]` | `roots` | `[]` (whole FS) | Confine the filesystem picker **and project creation** to these absolute subtrees (see [Security](#security)). |
@@ -359,6 +388,7 @@ $GISKARD_DATA_DIR/
 ├── config.toml                  # this config
 ├── .giskard.lock                # advisory lock: one Giskard process per data directory
 ├── session.key                  # 32-byte local key for signed browser sessions
+├── logs/                        # optional daily server logs when file logging is enabled
 ├── projects.json                # project index (id, name, dir, created_at, order)
 ├── projects/<project_id>/
 │   ├── project.json             # workspace root, harness kind
