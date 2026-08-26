@@ -18,6 +18,8 @@ use chrono::Utc;
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 
+use crate::log_fields::display_opt;
+
 use futures::{SinkExt, StreamExt};
 use giskard_core::error::{HarnessError, PersistError};
 use giskard_core::ids::{ProjectId, ThreadId};
@@ -581,7 +583,7 @@ async fn list_threads(
             error!(
                 %project_id,
                 thread_id = %thread.id,
-                parent_thread_id = ?thread.parent_thread_id,
+                parent_thread_id = display_opt(thread.parent_thread_id),
                 kind = ?thread.kind,
                 issue,
                 action = "list_threads",
@@ -636,8 +638,8 @@ async fn open_thread(
         .unwrap_or(&project_config.dir);
     debug!(
         %project_id,
-        thread_id = ?req.thread_id,
-        resume = ?req.resume,
+        thread_id = display_opt(req.thread_id),
+        resume = display_opt(req.resume.as_deref()),
         action = "open_thread",
         "open thread request"
     );
@@ -4765,10 +4767,10 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
                         %client_id,
                         code = %e.info.code,
                         severity = ?e.info.severity,
-                        thread_id = ?e.info.thread_id,
-                        request_id = ?e.info.request_id,
-                        action = ?e.info.action,
-                        detail = ?e.info.detail,
+                        thread_id = display_opt(e.info.thread_id),
+                        request_id = display_opt(e.info.request_id.as_deref()),
+                        action = display_opt(e.info.action.as_deref()),
+                        detail = display_opt(e.info.detail.as_deref()),
                         "WS handler error: {}",
                         e.info.message
                     );
@@ -4820,7 +4822,7 @@ async fn handle_client_msg(
                     warn!(
                         %thread_id,
                         code = %attach_error.info.code,
-                        detail = ?attach_error.info.detail,
+                        detail = display_opt(attach_error.info.detail.as_deref()),
                         "thread harness attach failed; serving read-only history"
                     );
                     (
