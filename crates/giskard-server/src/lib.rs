@@ -20,5 +20,8 @@ pub mod throttle;
 pub mod tokens;
 pub mod worktree;
 
-pub use app::{AppState, build_app};
+#[cfg(test)]
+pub(crate) mod test_logs;
+
+pub use app::{AppShutdown, AppState, build_app};
 pub use registry::{HarnessFactory, HarnessRegistry};

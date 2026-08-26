@@ -25,7 +25,7 @@ use std::sync::Arc;
 use argon2::PasswordHasher;
 use async_trait::async_trait;
 use tokio::sync::broadcast;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalMetadata, ApprovalRequest};
 use giskard_core::error::HarnessError;
@@ -44,12 +44,15 @@ use giskard_harness::{
 use giskard_persist::store::ProjectConfig;
 use giskard_server::{AppState, HarnessFactory, build_app};
 
+mod common;
+
 /// The scripted agent's fixed reply. Tests assert on this exact string, so keep it stable.
 const SCRIPTED_REPLY: &str = "Hello from the scripted replay harness!";
 const SCRIPTED_DIFF_TRIGGER: &str = "Trigger two scripted lazy diffs.";
 const SCRIPTED_DIFF_PATH: &str = "src/lazy-diff.rs";
 const SCRIPTED_DIFF_REPLACEMENT_DELAY: std::time::Duration = std::time::Duration::from_millis(1200);
 const SCRIPTED_DIFF_COMPLETION_DELAY: std::time::Duration = std::time::Duration::from_millis(1000);
+const HTTP_GRACEFUL_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const SCRIPTED_SUBAGENT_TRIGGER: &str = "Spawn the scripted linked sub-agent.";
 const SCRIPTED_NESTED_SUBAGENT_TRIGGER: &str = "Spawn a scripted nested sub-agent.";
 const SCRIPTED_SUBAGENT_PROMPT: &str = "Review the linked child task.";
@@ -929,13 +932,28 @@ async fn main() {
         )
         .init();
 
-    if let Err(e) = run().await {
-        eprintln!("giskard-server-replay: {e}");
-        std::process::exit(1);
+    let shutdown = common::shutdown::install_signal_handler();
+    match common::shutdown::run_until_forced(run(shutdown.clone()), shutdown).await {
+        common::shutdown::RunOutcome::Completed(Ok(())) => {}
+        common::shutdown::RunOutcome::Completed(Err(error)) => {
+            error!(%error, "replay server stopped with an error");
+            eprintln!("giskard-server-replay: {error}");
+            std::process::exit(1);
+        }
+        common::shutdown::RunOutcome::Forced(signal) => {
+            error!(
+                signal,
+                "second shutdown signal received; forcing process exit"
+            );
+            eprintln!("giskard-server-replay: second {signal} received; forcing process exit");
+            std::process::exit(1);
+        }
     }
 }
 
-async fn run() -> Result<(), String> {
+async fn run(
+    shutdown: tokio::sync::watch::Receiver<common::shutdown::Phase>,
+) -> Result<(), String> {
     let data_dir = env_path("GISKARD_DATA_DIR").unwrap_or_else(|| {
         std::env::temp_dir().join(format!("giskard-replay-{}", std::process::id()))
     });
@@ -1018,16 +1036,24 @@ async fn run() -> Result<(), String> {
         Some(&config.viz),
         Some(&config.retention),
     );
+    let registry = state.registry.clone();
+    let app_shutdown = state.shutdown.clone();
     let app = build_app(state);
 
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .map_err(|e| format!("cannot bind {bind}: {e}"))?;
     info!(bind = %bind, data_dir = %data_dir.display(), "giskard-server-replay listening");
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| format!("server error: {e}"))?;
-    Ok(())
+    common::shutdown::serve_then_shutdown_registry(
+        listener,
+        app,
+        app_shutdown,
+        shutdown,
+        HTTP_GRACEFUL_SHUTDOWN_TIMEOUT,
+        "giskard-server-replay",
+        &registry,
+    )
+    .await
 }
 
 fn seed_git_workspace(workspace: &Path) -> Result<(), String> {

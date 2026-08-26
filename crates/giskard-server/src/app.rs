@@ -10,10 +10,37 @@ use crate::hub::Hub;
 use crate::ledger::{self, LedgerHandle};
 use crate::models::ProjectModelCatalogStore;
 use crate::registry::{HarnessFactory, HarnessRegistry};
-use crate::routes::{protected_routes, public_routes};
+use crate::routes::{http_request_context_middleware, protected_routes, public_routes};
 use crate::thread_metadata::ThreadMetadataService;
 use crate::thread_runtime::ThreadRuntimeRegistry;
 use crate::throttle::LoginThrottle;
+
+#[derive(Clone)]
+pub struct AppShutdown {
+    sender: tokio::sync::watch::Sender<bool>,
+}
+
+impl Default for AppShutdown {
+    fn default() -> Self {
+        let (sender, _) = tokio::sync::watch::channel(false);
+        Self { sender }
+    }
+}
+
+impl AppShutdown {
+    pub fn trigger(&self) {
+        self.sender.send_replace(true);
+    }
+
+    pub async fn wait(&self) {
+        let mut receiver = self.sender.subscribe();
+        while !*receiver.borrow_and_update() {
+            if receiver.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
 
 /// Shared application state passed to all Axum handlers and middleware.
 ///
@@ -33,6 +60,8 @@ pub struct AppState {
     pub session_key: Arc<[u8]>,
     /// Global brute-force throttle for `/api/login`.
     pub login_throttle: Arc<LoginThrottle>,
+    /// Process-shutdown notification for long-lived upgraded connections.
+    pub shutdown: AppShutdown,
 }
 
 impl AppState {
@@ -87,6 +116,7 @@ impl AppState {
             ledger,
             session_key: session_key.into(),
             login_throttle: Arc::new(LoginThrottle::new()),
+            shutdown: AppShutdown::default(),
         }
     }
 }
@@ -96,5 +126,6 @@ pub fn build_app(state: AppState) -> Router {
         .merge(public_routes())
         .merge(protected_routes(state.clone()))
         .layer(middleware::from_fn(security_headers_middleware))
+        .layer(middleware::from_fn(http_request_context_middleware))
         .with_state(state)
 }

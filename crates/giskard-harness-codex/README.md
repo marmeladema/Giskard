@@ -278,6 +278,13 @@ Cleanup failures are logged but do not replace the turn result. Giskard omits
 raw attachment bytes from persisted history and the parsed in-memory history
 cache.
 
+Harness shutdown is completion-based: every caller waits until the single worker has cleaned active
+turn uploads and closed the Codex transport. Transport shutdown is bounded; on timeout the adapter
+drops the transport and then reports the worker complete. Concurrent and repeated shutdown calls
+share that same completion and do not start another teardown. Initiation uses a dedicated
+idempotent signal rather than the bounded command queues, so cancelling the initiating caller does
+not cancel worker teardown.
+
 ## Permission presets
 
 Giskard sends Codex `turn/start` overrides for every turn. Plan/Build mode maps

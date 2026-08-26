@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct Config {
     pub server: ServerConfig,
+    pub logging: LoggingConfig,
     pub auth: AuthConfig,
     pub browse: BrowseConfig,
     pub plan: PlanConfig,
@@ -21,6 +22,44 @@ pub struct Config {
     /// every restart and change which model a draft starts on when none is marked default.
     pub providers: IndexMap<String, ProviderConfig>,
     pub harness: HarnessConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoggingConfig {
+    pub file: FileLoggingConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FileLoggingConfig {
+    pub enabled: bool,
+    /// File-name prefix. Relative paths are resolved from the Giskard data directory using normal
+    /// filesystem path semantics, including `..` components.
+    #[serde(deserialize_with = "deserialize_non_empty_log_path")]
+    pub path: String,
+}
+
+fn deserialize_non_empty_log_path<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.trim().is_empty() {
+        return Err(serde::de::Error::custom(
+            "logging file path must not be empty",
+        ));
+    }
+    Ok(value)
+}
+
+impl Default for FileLoggingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: "logs/giskard-server.log".into(),
+        }
+    }
 }
 
 /// Retention limits for agent-produced content (spec Appendix C).
@@ -238,6 +277,27 @@ impl Default for HarnessConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_logging_defaults_disabled_and_validates_path() {
+        let defaults: Config = toml::from_str("").unwrap();
+        assert!(!defaults.logging.file.enabled);
+        assert_eq!(defaults.logging.file.path, "logs/giskard-server.log");
+
+        let configured: Config = toml::from_str(
+            "[logging.file]\nenabled = true\npath = \"/var/log/giskard/server.log\"\n",
+        )
+        .unwrap();
+        assert!(configured.logging.file.enabled);
+        assert_eq!(configured.logging.file.path, "/var/log/giskard/server.log");
+
+        let error = toml::from_str::<Config>("[logging.file]\npath = \"  \"\n").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("logging file path must not be empty")
+        );
+    }
 
     #[test]
     fn parse_full_config() {

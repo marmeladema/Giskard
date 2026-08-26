@@ -245,10 +245,24 @@ async fn rollback_worktree(repo_root: &Path, path: &Path, branch: &str) {
     {
         Ok(output) if output.status.success() => {}
         Ok(output) => {
-            warn!(worktree = %path, stderr = %stderr_or(&output, ""), "could not roll back a half-created worktree")
+            warn!(
+                repo = %repo_root.display(),
+                worktree = %path,
+                branch,
+                action = "rollback_worktree",
+                stderr = %stderr_or(&output, ""),
+                "could not roll back a half-created worktree"
+            )
         }
         Err(error) => {
-            warn!(worktree = %path, %error, "could not roll back a half-created worktree")
+            warn!(
+                repo = %repo_root.display(),
+                worktree = %path,
+                branch,
+                action = "rollback_worktree",
+                %error,
+                "could not roll back a half-created worktree"
+            )
         }
     }
     // `worktree remove` above de-registers a checkout even when its directory is already gone, but
@@ -259,9 +273,23 @@ async fn rollback_worktree(repo_root: &Path, path: &Path, branch: &str) {
     match run_git(repo_root, &["branch", "-D", branch], GIT_QUERY_TIMEOUT).await {
         Ok(output) if output.status.success() => {}
         Ok(output) => {
-            warn!(branch, stderr = %stderr_or(&output, ""), "could not roll back a half-created branch")
+            warn!(
+                repo = %repo_root.display(),
+                worktree = %path,
+                branch,
+                action = "rollback_branch",
+                stderr = %stderr_or(&output, ""),
+                "could not roll back a half-created branch"
+            )
         }
-        Err(error) => warn!(branch, %error, "could not roll back a half-created branch"),
+        Err(error) => warn!(
+            repo = %repo_root.display(),
+            worktree = %path,
+            branch,
+            action = "rollback_branch",
+            %error,
+            "could not roll back a half-created branch"
+        ),
     }
 }
 
@@ -312,7 +340,13 @@ pub async fn delete_branch(worktree: &ThreadWorktree) -> Result<Option<String>, 
         // A branch the agent renamed or deleted itself is not an error worth failing a deletion
         // over; there is simply nothing of ours left to remove.
         if message.contains("not found") {
-            warn!(branch = %worktree.branch, "thread branch was already gone");
+            warn!(
+                repo = %worktree.repo_root,
+                worktree = %worktree.path,
+                branch = %worktree.branch,
+                action = "delete_thread_branch",
+                "thread branch was already gone"
+            );
             return Ok(None);
         }
         return Err(WorktreeError::Git(message));
@@ -325,7 +359,10 @@ pub async fn delete_branch(worktree: &ThreadWorktree) -> Result<Option<String>, 
         // above, which never had a commit to report. Git deleting a symbolic ref, a reworded
         // report, or a locale that is not `C` all land here.
         warn!(
+            repo = %worktree.repo_root,
+            worktree = %worktree.path,
             branch = %worktree.branch,
+            action = "delete_thread_branch",
             report = %stdout.trim(),
             "deleted the thread's branch but could not read the commit it pointed at"
         );
