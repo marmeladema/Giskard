@@ -55,6 +55,13 @@ const MCP_TOOL_APPROVAL_LABEL_CANCEL: &str = "Cancel";
 type NativeItemKey = (ThreadId, TurnId, String);
 type NativeTurnKey = (ThreadId, String);
 
+#[derive(Debug)]
+struct UnknownNativeThread {
+    native_thread_id: String,
+}
+
+type MappingResult<T> = Result<T, UnknownNativeThread>;
+
 /// Maps Codex app-server messages onto `giskard-core` events, owning the id-translation registries
 /// (spec §4.7): native `threadId → ThreadId` (B4),
 /// `(ThreadId, native turnId) → TurnId`, and
@@ -206,22 +213,19 @@ impl CodexMapper {
     /// Codex legitimately omits `threadId` on a few global messages; those keep using the caller's
     /// scoped fallback. Once at least one native thread is registered, however, a non-empty unknown
     /// native id is a routing bug and must not be relabeled as the fallback thread.
-    fn resolve_thread(&self, native: &str, fallback: ThreadId) -> Option<ThreadId> {
+    fn resolve_thread(&self, native: &str, fallback: ThreadId) -> MappingResult<ThreadId> {
         if native.is_empty() {
-            return Some(fallback);
+            return Ok(fallback);
         }
         if let Some(thread) = self.thread_ids.get(native).copied() {
-            return Some(thread);
+            return Ok(thread);
         }
         if self.thread_ids.is_empty() {
-            return Some(fallback);
+            return Ok(fallback);
         }
-        warn!(
-            native_thread_id = native,
-            fallback_thread = %fallback,
-            "dropping Codex message for unknown native thread"
-        );
-        None
+        Err(UnknownNativeThread {
+            native_thread_id: native.to_owned(),
+        })
     }
 
     /// Resolve (get-or-mint) the owned `TurnId` for a native turn id in one Giskard thread.
@@ -251,7 +255,29 @@ impl CodexMapper {
         notif: &Notification,
         fallback_thread: ThreadId,
     ) -> Option<AgentEvent> {
-        match notif {
+        match self.try_map_notification(notif, fallback_thread) {
+            Ok(event) => event,
+            Err(error) => {
+                warn!(
+                    native_thread_id = error.native_thread_id,
+                    fallback_thread = %fallback_thread,
+                    notification_method = notif.method(),
+                    native_turn_id = display_opt(notif.turn_id()),
+                    native_item_id = display_opt(notification_item_id(notif)),
+                    native_request_id = display_opt(notification_request_id(notif)),
+                    "dropping Codex notification for unknown native thread"
+                );
+                None
+            }
+        }
+    }
+
+    fn try_map_notification(
+        &mut self,
+        notif: &Notification,
+        fallback_thread: ThreadId,
+    ) -> MappingResult<Option<AgentEvent>> {
+        Ok(match notif {
             Notification::TurnStarted(TurnStartedNotification { thread_id, turn }) => {
                 let thread = self.resolve_thread(thread_id, fallback_thread)?;
                 self.active_turns.insert(thread, turn.id.clone());
@@ -300,7 +326,7 @@ impl CodexMapper {
             Notification::ThreadTokenUsageUpdated(n) => {
                 let thread = self.resolve_thread(&n.thread_id, fallback_thread)?;
                 if n.turn_id.is_empty() {
-                    return None;
+                    return Ok(None);
                 }
                 // Codex replays historical usage after resume. It is metadata for the thread,
                 // not usage belonging to a newly active Giskard turn.
@@ -309,13 +335,15 @@ impl CodexMapper {
                         native_turn_id = %n.turn_id,
                         active_native_turn_id = display_opt(self.active_turns.get(&thread)),
                         "routing Codex usage outside the active turn ledger");
-                    return None;
+                    return Ok(None);
                 }
                 let key = (thread, n.turn_id.clone());
                 self.turn_usage
                     .insert(key.clone(), breakdown_to_usage(&n.token_usage.last));
 
-                let native_context_window = n.token_usage.model_context_window?;
+                let Some(native_context_window) = n.token_usage.model_context_window else {
+                    return Ok(None);
+                };
                 let Ok(context_window) = u32::try_from(native_context_window) else {
                     if self.invalid_context_window_turns.insert(key) {
                         warn!(
@@ -325,7 +353,7 @@ impl CodexMapper {
                             "ignoring invalid Codex model context window"
                         );
                     }
-                    return None;
+                    return Ok(None);
                 };
                 if context_window == 0 {
                     if self.invalid_context_window_turns.insert(key) {
@@ -335,11 +363,11 @@ impl CodexMapper {
                             "ignoring zero Codex model context window"
                         );
                     }
-                    return None;
+                    return Ok(None);
                 }
                 self.invalid_context_window_turns.remove(&key);
                 if self.turn_context_windows.get(&key) == Some(&context_window) {
-                    return None;
+                    return Ok(None);
                 }
                 let Some(model) = self.turn_models.get(&key).cloned() else {
                     if self.missing_context_model_turns.insert(key) {
@@ -350,7 +378,7 @@ impl CodexMapper {
                             "ignoring Codex model context window without a registered turn model"
                         );
                     }
-                    return None;
+                    return Ok(None);
                 };
                 self.turn_context_windows.insert(key, context_window);
                 Some(AgentEvent::ContextWindowUpdated {
@@ -416,7 +444,7 @@ impl CodexMapper {
                 item_id,
                 thread_id,
                 turn_id,
-            }) => self.map_text_delta(thread_id, turn_id, item_id, delta, fallback_thread),
+            }) => self.map_text_delta(thread_id, turn_id, item_id, delta, fallback_thread)?,
 
             Notification::CmdOutputDelta(CommandExecutionOutputDeltaNotification {
                 delta,
@@ -443,7 +471,7 @@ impl CodexMapper {
                 &n.item_id,
                 &n.delta,
                 fallback_thread,
-            ),
+            )?,
 
             Notification::FileChangePatchUpdated(n) => {
                 let text = summarize_file_changes(&n.changes);
@@ -453,7 +481,7 @@ impl CodexMapper {
                     (thread, turn, n.item_id.clone()),
                     map_file_changes(&n.changes),
                 );
-                self.map_text_delta(&n.thread_id, &n.turn_id, &n.item_id, &text, fallback_thread)
+                self.map_text_delta(&n.thread_id, &n.turn_id, &n.item_id, &text, fallback_thread)?
             }
 
             Notification::ReasoningDelta(n) => self.map_text_delta(
@@ -462,7 +490,7 @@ impl CodexMapper {
                 &n.item_id,
                 &n.delta,
                 fallback_thread,
-            ),
+            )?,
 
             Notification::ReasoningTextDelta(n) => self.map_text_delta(
                 &n.thread_id,
@@ -470,7 +498,7 @@ impl CodexMapper {
                 &n.item_id,
                 &n.delta,
                 fallback_thread,
-            ),
+            )?,
 
             Notification::PlanDelta(n) => self.map_text_delta(
                 &n.thread_id,
@@ -478,7 +506,7 @@ impl CodexMapper {
                 &n.item_id,
                 &n.delta,
                 fallback_thread,
-            ),
+            )?,
 
             Notification::McpToolCallProgress(n) => self.map_text_delta(
                 &n.thread_id,
@@ -486,7 +514,7 @@ impl CodexMapper {
                 &n.item_id,
                 &n.message,
                 fallback_thread,
-            ),
+            )?,
 
             Notification::ReasoningSummaryPartAdded(n) => {
                 let thread = self.resolve_thread(&n.thread_id, fallback_thread)?;
@@ -614,7 +642,7 @@ impl CodexMapper {
                     .thread_id
                     .as_deref()
                     .map(|id| self.resolve_thread(id, fallback_thread))
-                    .unwrap_or(Some(fallback_thread))?;
+                    .unwrap_or(Ok(fallback_thread))?;
                 Some(AgentEvent::Notice {
                     thread,
                     turn: None,
@@ -658,7 +686,7 @@ impl CodexMapper {
             }),
 
             _ => None,
-        }
+        })
     }
 
     fn track_command_start(
@@ -737,20 +765,20 @@ impl CodexMapper {
         item_id: &str,
         text: &str,
         fallback_thread: ThreadId,
-    ) -> Option<AgentEvent> {
+    ) -> MappingResult<Option<AgentEvent>> {
         if text.is_empty() {
-            return None;
+            return Ok(None);
         }
         let thread = self.resolve_thread(thread_id, fallback_thread)?;
         let turn = self.resolve_turn(thread, turn_id);
-        Some(AgentEvent::ItemDelta {
+        Ok(Some(AgentEvent::ItemDelta {
             thread,
             turn,
             item_id: self.resolve_item(thread, turn, item_id),
             delta: ItemDelta::Text {
                 text: text.to_owned(),
             },
-        })
+        }))
     }
 
     fn activity_event<T: Serialize>(
@@ -787,9 +815,33 @@ impl CodexMapper {
         request: &CodexServerRequest,
         fallback_thread: ThreadId,
     ) -> Option<AgentEvent> {
+        match self.try_map_server_request(id, request, fallback_thread) {
+            Ok(event) => event,
+            Err(error) => {
+                let scope = server_request_native_scope(request);
+                warn!(
+                    native_thread_id = error.native_thread_id,
+                    fallback_thread = %fallback_thread,
+                    request_method = request.method(),
+                    request_id = %request_id_to_string(id),
+                    native_turn_id = display_opt(scope.turn_id),
+                    native_item_id = display_opt(scope.item_id),
+                    "dropping Codex server request for unknown native thread"
+                );
+                None
+            }
+        }
+    }
+
+    fn try_map_server_request(
+        &mut self,
+        id: &RequestId,
+        request: &CodexServerRequest,
+        fallback_thread: ThreadId,
+    ) -> MappingResult<Option<AgentEvent>> {
         let req_id = request_id_to_string(id);
 
-        match request {
+        Ok(match request {
             CodexServerRequest::CmdExecApproval(params) => {
                 let thread = self.resolve_thread(&params.thread_id, fallback_thread)?;
                 let turn = self.resolve_turn(thread, &params.turn_id);
@@ -936,7 +988,7 @@ impl CodexMapper {
                         method = request.method(),
                         "dropping Codex approval request without an active turn"
                     );
-                    return None;
+                    return Ok(None);
                 };
                 let approval_id = ApprovalId(req_id);
                 self.pending_approval_responses.insert(
@@ -980,7 +1032,7 @@ impl CodexMapper {
                         method = request.method(),
                         "dropping Codex approval request without an active turn"
                     );
-                    return None;
+                    return Ok(None);
                 };
                 let approval_id = ApprovalId(req_id);
                 self.pending_approval_responses.insert(
@@ -1044,7 +1096,7 @@ impl CodexMapper {
                                 req_id,
                                 request,
                                 fallback_thread,
-                            )
+                            )?
                         }
                     }
                     None => self.map_generic_server_request(
@@ -1052,7 +1104,7 @@ impl CodexMapper {
                         req_id,
                         request,
                         fallback_thread,
-                    ),
+                    )?,
                 }
             }
             CodexServerRequest::McpServerElicitationRequest(params) => {
@@ -1080,7 +1132,7 @@ impl CodexMapper {
                                 req_id,
                                 request,
                                 fallback_thread,
-                            )
+                            )?
                         }
                     }
                     None => self.map_generic_server_request(
@@ -1088,11 +1140,11 @@ impl CodexMapper {
                         req_id,
                         request,
                         fallback_thread,
-                    ),
+                    )?,
                 }
             }
-            _ => self.map_generic_server_request(id.clone(), req_id, request, fallback_thread),
-        }
+            _ => self.map_generic_server_request(id.clone(), req_id, request, fallback_thread)?,
+        })
     }
 
     pub fn map_approval_response(
@@ -1229,7 +1281,7 @@ impl CodexMapper {
         req_id: String,
         request: &CodexServerRequest,
         fallback_thread: ThreadId,
-    ) -> Option<AgentEvent> {
+    ) -> MappingResult<Option<AgentEvent>> {
         let (thread, turn) = self.server_request_scope(request, fallback_thread)?;
         let server_request_id = ServerRequestId(req_id);
         self.pending_server_requests.insert(
@@ -1240,7 +1292,7 @@ impl CodexMapper {
                 turn,
             },
         );
-        Some(AgentEvent::ServerRequestReceived {
+        Ok(Some(AgentEvent::ServerRequestReceived {
             thread,
             turn,
             request: GiskardServerRequest {
@@ -1249,44 +1301,44 @@ impl CodexMapper {
                 params: server_request_params(request),
                 received_at: Utc::now(),
             },
-        })
+        }))
     }
 
     fn server_request_scope(
         &mut self,
         request: &CodexServerRequest,
         fallback_thread: ThreadId,
-    ) -> Option<(ThreadId, Option<TurnId>)> {
-        match request {
+    ) -> MappingResult<(ThreadId, Option<TurnId>)> {
+        Ok(match request {
             CodexServerRequest::ToolRequestUserInput(params) => {
                 let thread = self.resolve_thread(&params.thread_id, fallback_thread)?;
                 let turn = (!params.turn_id.is_empty())
                     .then(|| self.resolve_turn(thread, &params.turn_id));
-                Some((thread, turn))
+                (thread, turn)
             }
             CodexServerRequest::ItemToolCall(params) => {
                 let thread = self.resolve_thread(&params.thread_id, fallback_thread)?;
                 let turn = (!params.turn_id.is_empty())
                     .then(|| self.resolve_turn(thread, &params.turn_id));
-                Some((thread, turn))
+                (thread, turn)
             }
             CodexServerRequest::McpServerElicitationRequest(params) => {
-                self.server_request_scope_from_meta(mcp_elicitation_meta(params), fallback_thread)
+                self.server_request_scope_from_meta(mcp_elicitation_meta(params), fallback_thread)?
             }
             CodexServerRequest::Unknown { params, .. } => {
-                self.server_request_scope_from_meta(params.as_ref(), fallback_thread)
+                self.server_request_scope_from_meta(params.as_ref(), fallback_thread)?
             }
-            _ => Some((fallback_thread, None)),
-        }
+            _ => (fallback_thread, None),
+        })
     }
 
     fn server_request_scope_from_meta(
         &mut self,
         meta: Option<&Value>,
         fallback_thread: ThreadId,
-    ) -> Option<(ThreadId, Option<TurnId>)> {
+    ) -> MappingResult<(ThreadId, Option<TurnId>)> {
         let Some(meta) = meta.and_then(Value::as_object) else {
-            return Some((fallback_thread, None));
+            return Ok((fallback_thread, None));
         };
         let native_thread = string_field(meta, "threadId")
             .or_else(|| string_field(meta, "thread_id"))
@@ -1296,14 +1348,14 @@ impl CodexMapper {
             .or_else(|| string_field(meta, "turn_id"))
             .filter(|native| !native.is_empty())
             .map(|native| self.resolve_turn(thread, native));
-        Some((thread, turn))
+        Ok((thread, turn))
     }
 
     fn thread_from_native_value(
         &self,
         native_value: Option<&Value>,
         fallback_thread: ThreadId,
-    ) -> Option<ThreadId> {
+    ) -> MappingResult<ThreadId> {
         let native = native_value.and_then(Value::as_str).unwrap_or_default();
         self.resolve_thread(native, fallback_thread)
     }
@@ -2218,6 +2270,10 @@ fn breakdown_to_usage(b: &codex_codes::protocol::TokenUsageBreakdown) -> TokenUs
 
 /// Extract the native item id string from a Codex `ThreadItem`.
 fn thread_item_id(item: &codex_codes::ThreadItem) -> String {
+    thread_item_id_ref(item).to_owned()
+}
+
+fn thread_item_id_ref(item: &codex_codes::ThreadItem) -> &str {
     match item {
         codex_codes::ThreadItem::UserMessage { id, .. }
         | codex_codes::ThreadItem::HookPrompt { id, .. }
@@ -2236,7 +2292,93 @@ fn thread_item_id(item: &codex_codes::ThreadItem) -> String {
         | codex_codes::ThreadItem::ImageGeneration { id, .. }
         | codex_codes::ThreadItem::EnteredReviewMode { id, .. }
         | codex_codes::ThreadItem::ExitedReviewMode { id, .. }
-        | codex_codes::ThreadItem::ContextCompaction { id, .. } => id.clone(),
+        | codex_codes::ThreadItem::ContextCompaction { id, .. } => id,
+    }
+}
+
+fn notification_item_id(notification: &Notification) -> Option<&str> {
+    if let Some(item) = notification.thread_item() {
+        return Some(thread_item_id_ref(item));
+    }
+    match notification {
+        Notification::AgentMessageDelta(n) => Some(&n.item_id),
+        Notification::CmdOutputDelta(n) => Some(&n.item_id),
+        Notification::FileChangeOutputDelta(n) => Some(&n.item_id),
+        Notification::FileChangePatchUpdated(n) => Some(&n.item_id),
+        Notification::ReasoningDelta(n) => Some(&n.item_id),
+        Notification::ReasoningTextDelta(n) => Some(&n.item_id),
+        Notification::PlanDelta(n) => Some(&n.item_id),
+        Notification::McpToolCallProgress(n) => Some(&n.item_id),
+        Notification::ReasoningSummaryPartAdded(n) => Some(&n.item_id),
+        _ => None,
+    }
+}
+
+fn notification_request_id(notification: &Notification) -> Option<String> {
+    let Notification::ServerRequestResolved(notification) = notification else {
+        return None;
+    };
+    Some(protocol_request_id_to_string(&notification.request_id))
+}
+
+struct NativeMessageScope<'a> {
+    turn_id: Option<&'a str>,
+    item_id: Option<&'a str>,
+}
+
+fn server_request_native_scope(request: &CodexServerRequest) -> NativeMessageScope<'_> {
+    let direct = |turn_id, item_id| NativeMessageScope {
+        turn_id: trimmed_non_empty(turn_id),
+        item_id: trimmed_non_empty(item_id),
+    };
+    match request {
+        CodexServerRequest::CmdExecApproval(params) => direct(&params.turn_id, &params.item_id),
+        CodexServerRequest::FileChangeApproval(params) => direct(&params.turn_id, &params.item_id),
+        CodexServerRequest::ToolRequestUserInput(params) => {
+            direct(&params.turn_id, &params.item_id)
+        }
+        CodexServerRequest::McpServerElicitationRequest(params) => {
+            native_scope_from_value(mcp_elicitation_meta(params))
+        }
+        CodexServerRequest::PermissionsRequestApproval(params) => {
+            direct(&params.turn_id, &params.item_id)
+        }
+        CodexServerRequest::ItemToolCall(params) => direct(&params.turn_id, ""),
+        CodexServerRequest::AttestationGenerate(params) => {
+            native_scope_from_fields(Some(&params.extra))
+        }
+        CodexServerRequest::Unknown { params, .. } => native_scope_from_value(params.as_ref()),
+        CodexServerRequest::ChatgptAuthTokensRefresh(_)
+        | CodexServerRequest::ApplyPatchApproval(_)
+        | CodexServerRequest::ExecCommandApproval(_) => NativeMessageScope {
+            turn_id: None,
+            item_id: None,
+        },
+    }
+}
+
+fn native_scope_from_value(value: Option<&Value>) -> NativeMessageScope<'_> {
+    native_scope_from_fields(value.and_then(Value::as_object))
+}
+
+fn native_scope_from_fields(
+    fields: Option<&serde_json::Map<String, Value>>,
+) -> NativeMessageScope<'_> {
+    let meta = fields
+        .and_then(|fields| fields.get("_meta"))
+        .and_then(Value::as_object);
+    let value = |camel: &str, snake: &str| {
+        fields
+            .and_then(|fields| string_field(fields, camel).or_else(|| string_field(fields, snake)))
+            .or_else(|| {
+                meta.and_then(|meta| {
+                    string_field(meta, camel).or_else(|| string_field(meta, snake))
+                })
+            })
+    };
+    NativeMessageScope {
+        turn_id: value("turnId", "turn_id"),
+        item_id: value("itemId", "item_id"),
     }
 }
 
@@ -2932,7 +3074,182 @@ fn parse_hunk_header(line: &str) -> Option<(u32, u32, u32, u32)> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+
+    #[derive(Clone)]
+    struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_logs(log: impl FnOnce()) -> String {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer_output = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || CapturedLogWriter(writer_output.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, log);
+        String::from_utf8(output.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn unknown_native_thread_warning_identifies_notification_without_payload() {
+        let fallback = ThreadId::new();
+        let mut mapper = CodexMapper::new(PathBuf::new());
+        mapper.register_thread("known-thread".into(), fallback);
+        let notification = Notification::AgentMessageDelta(AgentMessageDeltaNotification {
+            thread_id: "unknown-thread".into(),
+            turn_id: "native-turn".into(),
+            item_id: "native-item".into(),
+            delta: "sensitive delta payload".into(),
+        });
+
+        let output = capture_logs(|| {
+            assert!(mapper.map_notification(&notification, fallback).is_none());
+        });
+
+        assert!(output.contains("notification_method=\"item/agentMessage/delta\""));
+        assert!(output.contains("native_thread_id=\"unknown-thread\""));
+        assert!(output.contains("native_turn_id=native-turn"));
+        assert!(output.contains("native_item_id=native-item"));
+        assert!(output.contains(&format!("fallback_thread={fallback}")));
+        assert!(!output.contains("sensitive delta payload"));
+    }
+
+    #[test]
+    fn unknown_native_thread_resolved_request_warning_includes_request_id() {
+        let fallback = ThreadId::new();
+        let mut mapper = CodexMapper::new(PathBuf::new());
+        mapper.register_thread("known-thread".into(), fallback);
+        let notification = Notification::ServerRequestResolved(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "unknown-thread",
+                "requestId": "native-request"
+            }))
+            .unwrap(),
+        );
+
+        let output = capture_logs(|| {
+            assert!(mapper.map_notification(&notification, fallback).is_none());
+        });
+
+        assert!(output.contains("notification_method=\"serverRequest/resolved\""));
+        assert!(output.contains("native_thread_id=\"unknown-thread\""));
+        assert!(output.contains("native_request_id=native-request"));
+        assert!(output.contains(&format!("fallback_thread={fallback}")));
+    }
+
+    #[test]
+    fn unknown_native_thread_warning_identifies_server_request_without_payload() {
+        let fallback = ThreadId::new();
+        let mut mapper = CodexMapper::new(PathBuf::new());
+        mapper.register_thread("known-thread".into(), fallback);
+        let sensitive_payload = "sensitive request payload".repeat(65_536);
+        let request = CodexServerRequest::ToolRequestUserInput(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "unknown-thread",
+                "turnId": "native-turn",
+                "itemId": "native-item",
+                "questions": [{
+                    "id": "question-1",
+                    "header": "Secret",
+                    "question": sensitive_payload
+                }]
+            }))
+            .unwrap(),
+        );
+
+        let output = capture_logs(|| {
+            assert!(
+                mapper
+                    .map_server_request(&RequestId::Integer(42), &request, fallback)
+                    .is_none()
+            );
+        });
+
+        assert!(output.contains("request_method=\"item/tool/requestUserInput\""));
+        assert!(output.contains("request_id=42"));
+        assert!(output.contains("native_thread_id=\"unknown-thread\""));
+        assert!(output.contains("native_turn_id=native-turn"));
+        assert!(output.contains("native_item_id=native-item"));
+        assert!(output.contains(&format!("fallback_thread={fallback}")));
+        assert!(!output.contains("sensitive request payload"));
+    }
+
+    #[test]
+    fn server_request_native_scope_borrows_direct_fields() {
+        let request = CodexServerRequest::ToolRequestUserInput(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "native-thread",
+                "turnId": "native-turn",
+                "itemId": "native-item",
+                "questions": []
+            }))
+            .unwrap(),
+        );
+        let CodexServerRequest::ToolRequestUserInput(params) = &request else {
+            panic!("expected request-user-input params");
+        };
+
+        let scope = server_request_native_scope(&request);
+
+        assert_eq!(scope.turn_id, Some(params.turn_id.as_str()));
+        assert_eq!(scope.item_id, Some(params.item_id.as_str()));
+    }
+
+    #[test]
+    fn server_request_native_scope_borrows_elicitation_meta_fields() {
+        let request = CodexServerRequest::McpServerElicitationRequest(
+            serde_json::from_value(serde_json::json!({
+                "mode": "form",
+                "_meta": {
+                    "turn_id": "meta-turn",
+                    "item_id": "meta-item"
+                },
+                "message": "Need input",
+                "requestedSchema": { "type": "object" }
+            }))
+            .unwrap(),
+        );
+
+        let scope = server_request_native_scope(&request);
+
+        assert_eq!(scope.turn_id, Some("meta-turn"));
+        assert_eq!(scope.item_id, Some("meta-item"));
+    }
+
+    #[test]
+    fn server_request_native_scope_reads_unknown_nested_meta() {
+        let request = CodexServerRequest::Unknown {
+            method: "future/request".into(),
+            params: Some(serde_json::json!({
+                "payload": "not inspected",
+                "_meta": {
+                    "turnId": "meta-turn",
+                    "itemId": "meta-item"
+                }
+            })),
+        };
+
+        let scope = server_request_native_scope(&request);
+
+        assert_eq!(scope.turn_id, Some("meta-turn"));
+        assert_eq!(scope.item_id, Some("meta-item"));
+    }
 
     #[test]
     fn attachment_only_user_input_maps_without_empty_text() {
