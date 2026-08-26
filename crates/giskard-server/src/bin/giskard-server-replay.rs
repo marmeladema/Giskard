@@ -98,6 +98,12 @@ const SCRIPTED_SERVER_REQUEST_QUESTION: &str = "Which branch should I use?";
 const SCRIPTED_SERVER_REQUEST_THEN_ERROR_TRIGGER: &str =
     "Trigger a server request followed by an error.";
 const SCRIPTED_SERVER_REQUEST_THEN_ERROR_MESSAGE: &str = "Scripted non-fatal harness error.";
+/// Prompt that makes the harness stream a reasoning note before the canned reply, so browser tests
+/// can drive the collapsible "thinking" row (§7.3). The note is Markdown with a bold first line —
+/// the collapsed row summarizes that line with its emphasis marks stripped.
+const SCRIPTED_REASONING_TRIGGER: &str = "Think out loud before replying.";
+const SCRIPTED_REASONING_SUMMARY: &str = "Weighing the scripted options";
+const SCRIPTED_REASONING_DETAIL: &str = "Then answering with the deterministic scripted reply.";
 /// How long a scripted turn waits for the server's event forwarder to subscribe before giving up.
 const RECEIVER_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const RECEIVER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
@@ -481,6 +487,7 @@ impl AgentHarness for ScriptedHarness {
         let raise_server_request =
             input_text == Some(SCRIPTED_SERVER_REQUEST_TRIGGER) || raise_server_request_then_error;
         let raise_lazy_diffs = input_text == Some(SCRIPTED_DIFF_TRIGGER);
+        let stream_reasoning = input_text == Some(SCRIPTED_REASONING_TRIGGER);
 
         // Stream the canned reply the way a real harness would: start, incremental deltas, then a
         // completed item and a turn-completed with token usage. Emitted off-task with yields so the
@@ -702,6 +709,47 @@ impl AgentHarness for ScriptedHarness {
                 turn,
             });
             tokio::task::yield_now().await;
+            if stream_reasoning {
+                // Stream the note the way a real harness does — start, text deltas, completion — so
+                // the browser exercises both the live "thinking" row and its persisted form.
+                let reasoning_id = ItemId::new();
+                let reasoning_text =
+                    format!("**{SCRIPTED_REASONING_SUMMARY}**\n\n{SCRIPTED_REASONING_DETAIL}");
+                let _ = sender.send(AgentEvent::ItemStarted {
+                    thread: thread_id,
+                    turn,
+                    item: ItemStart {
+                        id: reasoning_id,
+                        harness_item_id: "scripted_reasoning_1".into(),
+                        kind: ItemKind::Reasoning,
+                        command: None,
+                        tool: None,
+                    },
+                });
+                tokio::task::yield_now().await;
+                for chunk in reasoning_text.split_inclusive(' ') {
+                    let _ = sender.send(AgentEvent::ItemDelta {
+                        thread: thread_id,
+                        turn,
+                        item_id: reasoning_id,
+                        delta: ItemDelta::Text { text: chunk.into() },
+                    });
+                    tokio::task::yield_now().await;
+                }
+                let _ = sender.send(AgentEvent::ItemCompleted {
+                    thread: thread_id,
+                    turn,
+                    item: Item {
+                        id: reasoning_id,
+                        harness_item_id: "scripted_reasoning_1".into(),
+                        payload: ItemPayload::Reasoning {
+                            text: reasoning_text,
+                        },
+                        created_at: chrono::Utc::now(),
+                    },
+                });
+                tokio::task::yield_now().await;
+            }
             let _ = sender.send(AgentEvent::ItemStarted {
                 thread: thread_id,
                 turn,

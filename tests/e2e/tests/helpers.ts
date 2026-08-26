@@ -60,6 +60,15 @@ export const SCRIPTED_SUBAGENT_APPROVAL_ID = "scripted-subagent-approval-1";
 export const SCRIPTED_SUBAGENT_APPROVAL_COMMAND = "rm -rf ./child-build";
 export const SCRIPTED_APPROVAL_SUBAGENT_NAME = "Approval child";
 
+/**
+ * Prompt that makes the scripted replay harness stream a reasoning note before the canned reply, so
+ * the collapsible "thinking" row can be driven from the browser. Kept in sync with
+ * `SCRIPTED_REASONING_*` in `crates/giskard-server/src/bin/giskard-server-replay.rs`.
+ */
+export const SCRIPTED_REASONING_TRIGGER = "Think out loud before replying.";
+export const SCRIPTED_REASONING_SUMMARY = "Weighing the scripted options";
+export const SCRIPTED_REASONING_DETAIL = "Then answering with the deterministic scripted reply.";
+
 /** One entry recorded by the notification stub installed by {@link stubNotifications}. */
 export type RecordedNotification = {
   title: string;

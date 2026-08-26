@@ -130,7 +130,10 @@ Then open **http://127.0.0.1:8787**, log in, and:
    commands/tools, **Sub-agents** monitor, **MCP** status menu, and **Context** usage button;
    scrolling the transcript to the top lazy-loads older history. Completed command rows carry only
    a bounded preview; opening one fetches its retained output and resolves path links by command
-   identity, without uploading that potentially large output from the browser. When the project's workspace is a
+   identity, without uploading that potentially large output from the browser. Reasoning notes are
+   collapsible: a note stays open while it is the newest row — so the live turn's thinking is
+   readable — and folds to a one-line summary as soon as the next row arrives. The summary line
+   reopens it, and a note you opened yourself stays open. When the project's workspace is a
    Git repository, a one-line **Git status** sits just above the composer — branch, ahead/behind,
    changed-file count and total diffstat — and expands in place into the changed files, each
    opening its diff. It refreshes as the agent changes the tree, so it stays current during a turn.

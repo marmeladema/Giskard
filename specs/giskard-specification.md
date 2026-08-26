@@ -9,7 +9,7 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.74
+**Version:** 1.75
 
 > **Amendment — strict running-task ownership (1.74).** `RunningTasks` is a revisioned replacement
 > projection for the Tasks menu and controls only. `RunningTask` carries no output, output-only
@@ -55,6 +55,21 @@
 
 **Changelog (1.70 → 1.71), overlay title path truncation:**
 - **L8:** The diff view and code overlay title bar shows the workspace-relative path (the same truncation the transcript diff row uses) instead of the raw checkout/worktree-prefixed path. The raw path is still kept for the download/file API.
+
+**Changelog (1.74 → 1.75), collapsible reasoning rows:**
+- **RN1:** A reasoning note is a collapsible transcript row: a one-line summary — the note's first
+  line with its Markdown markers stripped — sits above the rendered note, and collapsing hides the
+  note body only. The row's text is never discarded, so the row copy button still yields the whole
+  note and expanding costs no re-render or fetch. This is browser-side presentation: the wire
+  contract, the payload, and persistence are unchanged.
+- **RN2:** A note is expanded while it is the newest row in the transcript — including after its
+  item completes — and collapses when any row is appended after it, so the live turn's thinking
+  stays readable until the next row arrives and history renders every superseded note collapsed.
+  Auto-collapse is one-way: a note is never reopened on its own, so removing the rows below one
+  does not pop it back open. A row the user toggled keeps that choice for as long as its thread
+  stays open, superseded or not. The choice is held against the row's turn/item identity, not its
+  element, so it survives the row being re-rendered — including an authoritative snapshot that
+  rebuilds the whole transcript — and is dropped only when the thread is left.
 
 **Changelog (1.73 → 1.74), strict running-task ownership:**
 - **TK2:** `RunningTask` no longer carries output. Output/progress deltas do not change task state
@@ -2573,7 +2588,12 @@ Auto-generate an initial title from the first user message (truncated); user-edi
   download reuse the command overlay behavior. A separate loaded-state flag preserves fetched JSON
   `null` as data rather than confusing it with not-yet-loaded state. Tool-call status remains in the
   command-style meta position with the same lifecycle wording.
-- Reasoning notes (if the model/effort emits them) render in a collapsible "thinking" block.
+- Reasoning notes (if the model/effort emits them) render in a collapsible "thinking" block: a
+  summary line taken from the note's first line, above the rendered note. A note stays open while
+  it is the newest row — its `ItemCompleted` does not fold it — and collapses once a row is
+  appended after it; history renders every superseded note collapsed. A row the user toggles keeps
+  that state for the session, and collapsing hides the body without dropping the text, so the row
+  copy button still yields the whole note (RN1, RN2).
 - Each item ends with `ItemCompleted` carrying its final, canonical form (this is what gets
   persisted; deltas are transient).
 

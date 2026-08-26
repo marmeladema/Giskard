@@ -163,6 +163,12 @@ let state = {
   toolPayloadsByItemId:new Map(), toolBodyElsByItemId:new Map(),
   activeTaskGroup:null, taskGroupSeq:0, taskItemSeq:0, taskGroupsById:new Map(), taskGroupsByItemId:new Map(),
   expandedTaskGroups:new Set(), manuallyToggledTaskGroups:new Set(), expandedTaskDetails:new Map(),
+  // Per-row expand/collapse choices for reasoning rows, keyed by `<turn>:<item>`. Only rows the
+  // user actually toggled appear here; everything else follows the default (open while the note is
+  // the newest row, folded once a row is appended after it). Outliving `resetRenderState` is the
+  // point: a resync rebuilds the same items under the same keys, so the choices still apply. They
+  // are dropped only when the thread they belong to is left (see clearReasoningChoices).
+  reasoningChoicesByRowKey:new Map(),
   linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, codeOverlaySource:null, outputOverlay:null, outputOverlayRequestSeq:0, activeTurn:false, interruptPending:false, compactPending:false,
   awaitingInitialThreadState:false, awaitingThreadResync:false, awaitingIncrementalResync:false, resyncStickBottom:false, contextWindow:0, contextUsed:null, permissionPreset:"ask_first", currentModel:null,
   threadAuthorities:new Map(), pendingDetailConflictResyncs:new Set(),
@@ -203,6 +209,9 @@ const activeAttachmentReaders = new Set();
 // text is always one click away in the output overlay.
 const INLINE_PREVIEW_LINES = 7;
 const INLINE_PREVIEW_BYTES = 2 * 1024;
+// A collapsed reasoning row shows one line of its own text as the summary, capped here so the
+// preview stays a single line on a narrow viewport.
+const REASONING_SUMMARY_MAX = 140;
 const THREAD_TITLE_MAX = 120;
 const EFFORT_OPTIONS = [
   { value:"minimal", label:"Minimal" },
@@ -2080,6 +2089,7 @@ function clearThreadView(tid) {
   state.pendingLiveSnapshotReconcile = false;
   resetGitState();
   resetRenderState();
+  clearReasoningChoices();
   $("thrHeader").style.display="none"; $("composer").style.display="none";
   $("pickerBar").style.display="none"; closeModelPicker(); closeTurnPicker();
   $("transcript").innerHTML="";
@@ -2470,6 +2480,7 @@ function openDraftThread(pid) {
   state.resyncStickBottom = false;
   state.pendingLiveSnapshotReconcile = false;
   resetRenderState();
+  clearReasoningChoices();
   syncActiveThreadHighlight();   // state.threadId is null for a draft, so this clears any selection
   $("thrHeader").style.display="flex"; $("composer").style.display="flex";
   $("pickerBar").style.display="flex";
@@ -2548,6 +2559,7 @@ async function openThread(pid, tid, title, opts) {
   state.awaitingIncrementalResync = false; state.resyncStickBottom = false;
   state.pendingLiveSnapshotReconcile = false;
   resetRenderState();
+  clearReasoningChoices();
   syncActiveThreadHighlight();
   renderAllThreadActivityIndicators();
   $("thrHeader").style.display="flex"; $("composer").style.display="flex";
@@ -3876,6 +3888,8 @@ function renderHistoryPage(msg) {
   const heightBefore = t.scrollHeight;
   const anchor = t.firstChild;   // insert before current top-most content (or append if empty)
   while (container.firstChild) t.insertBefore(container.firstChild, anchor);
+  // The page's last row now has content below it, so any note it left open is superseded.
+  collapseSupersededReasoningRows(t);
   if (older) {
     // Preserve the viewport so it doesn't jump while older content is inserted (infinite scroll).
     t.scrollTop += t.scrollHeight - heightBefore;
@@ -3938,6 +3952,7 @@ function renderHistoryDelta(msg) {
     const t = $("transcript");
     const anchor = !completedLiveTurn ? firstLiveTurnRow(liveId) : null;
     while (container.firstChild) t.insertBefore(container.firstChild, anchor);
+    collapseSupersededReasoningRows(t);
     state.newestPersistedTurnId = turns[turns.length - 1].id;   // advance the resume cursor
     updateGaugeFromTurns(turns);   // a live snapshot, if any, overrides this next
   }
@@ -5089,6 +5104,8 @@ function appendBubble(cls, role) {
   if (followBottom) el.dataset.followBottom = "true";
   const t = renderTarget();
   t.append(el);
+  // This row now stands below any open reasoning note, which is what folds the note away.
+  collapseSupersededReasoningRows(t);
   keepTranscriptAtBottom(followBottom);
   return body;
 }
@@ -5570,6 +5587,134 @@ function clearRowToggle(msg) {
   msg.removeAttribute("aria-expanded");
   msg.onclick = null;
   msg.onkeydown = null;
+}
+
+// ===== Collapsible reasoning rows (spec §7.3) =====
+// A reasoning note is a "thinking" block: useful on demand, noise in bulk. The row keeps the full
+// note in its `.body` and puts a one-line summary in a toggle button beside it, so collapsing only
+// hides the body — the text stays in the DOM for the row copy button and re-expands without a
+// re-render. The toggle is its own button rather than a whole-row click handler (as command/tool
+// rows once used) because the body is rendered Markdown: clicking a path link or selecting text
+// inside a note must not collapse it.
+//
+// Default state: a note is open while it is the newest row in the transcript — the live turn's
+// thinking is worth watching, and it stays readable after its item completes — and folds to its
+// summary as soon as any row is appended after it. Auto-collapse is one-way: a row is never
+// re-opened on its own, so removing the rows below one (a resync) does not pop it back open. A row
+// the user opened stays open for the rest of the session, superseded or not.
+function reasoningSummaryText(text) {
+  for (const raw of String(text || "").split(/\r?\n/)) {
+    const line = raw
+      .trim()
+      .replace(/^#{1,6}\s+/, "")          // heading marker
+      .replace(/^>\s?/, "")               // quote marker
+      .replace(/^([-*+]|\d+[.)])\s+/, "") // list marker
+      .replace(/[*`~]/g, "")              // emphasis, code and strike marks
+      // Underscores too, but not the ones holding an identifier or path together.
+      .replace(/_+/g, (mark, at, whole) =>
+        /\w/.test(whole[at - 1] || "") && /\w/.test(whole[at + mark.length] || "") ? mark : "")
+      .trim();
+    if (!line) continue;
+    return line.length > REASONING_SUMMARY_MAX
+      ? line.slice(0, REASONING_SUMMARY_MAX - 1).trimEnd() + "…"
+      : line;
+  }
+  return "Thinking";
+}
+// Identity for remembering a row's expand/collapse choice. Rows are re-created on resync and on
+// reopening a thread, so the key is the item identity the row carries, not the element.
+function reasoningRowKey(msg) {
+  const turn = msg.dataset.turn || "";
+  const item = identityTokens(msg.dataset.item)[0] || "";
+  if (item) return scopedItemKey(turn, item);
+  const harness = identityTokens(msg.dataset.harnessItem)[0] || "";
+  return scopedHarnessKey(turn, harness);
+}
+// Drop the toggle from a row that is no longer a reasoning note (an item id re-rendered as another
+// kind). Rows without one are left alone: `collapsed`/`expanded` mean other things elsewhere.
+function removeReasoningToggle(msg) {
+  const toggle = msg.querySelector(":scope > .reasoning-toggle");
+  if (!toggle) return;
+  toggle.remove();
+  msg.classList.remove("reasoning-collapsible", "collapsed", "expanded");
+}
+function setReasoningExpanded(msg, expanded, opts) {
+  const manual = !!(opts && opts.manual);
+  msg.classList.toggle("expanded", expanded);
+  msg.classList.toggle("collapsed", !expanded);
+  const toggle = msg.querySelector(":scope > .reasoning-toggle");
+  if (toggle) {
+    toggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+    toggle.title = expanded ? "Collapse this reasoning note" : "Expand this reasoning note";
+    const caret = toggle.querySelector(".reasoning-caret");
+    if (caret) caret.textContent = expanded ? "▾" : "▸";
+  }
+  if (!manual) return;
+  const key = reasoningRowKey(msg);
+  if (key) state.reasoningChoicesByRowKey.set(key, expanded);
+}
+// Re-apply the reader's stored choice for a row whose identity arrived after it was rendered.
+function restoreReasoningChoice(msg) {
+  const key = reasoningRowKey(msg);
+  const choice = key ? state.reasoningChoicesByRowKey.get(key) : undefined;
+  if (choice === undefined) return;
+  setReasoningExpanded(msg, choice, { manual:false });
+}
+// Collapse every reasoning row that something has been appended after. Only ever collapses, and
+// only rows the reader has not opened by hand. `root` is the container rows are being rendered
+// into: the transcript, or the detached container a history page is built in.
+function collapseSupersededReasoningRows(root) {
+  const scope = root || $("transcript");
+  if (!scope) return;
+  for (const msg of scope.querySelectorAll(".msg.reasoning-collapsible.expanded")) {
+    if (!msg.nextElementSibling) continue;
+    const key = reasoningRowKey(msg);
+    if (key && state.reasoningChoicesByRowKey.get(key) === true) continue;
+    setReasoningExpanded(msg, false, { manual:false });
+  }
+}
+// Give a reasoning row its summary toggle and apply the row's current expand/collapse state.
+// `text` is the note as it stands (streaming buffer or completed payload). Re-rendering a row that
+// already has a toggle — a delta, an `ItemCompleted`, a resync — never changes what it shows: the
+// state is decided once, when the row first becomes a reasoning row, and afterwards only by an
+// appended row or by the reader.
+function applyReasoningRow(msg, text) {
+  const body = msg.querySelector(":scope > .body");
+  if (!body) return;
+  let toggle = msg.querySelector(":scope > .reasoning-toggle");
+  // The row's state is carried by the toggle's `aria-expanded`, not by the row's classes: a
+  // re-render resets `className` before this runs, so the classes are already gone by now.
+  const previous = toggle ? toggle.getAttribute("aria-expanded") === "true" : null;
+  if (!toggle) {
+    toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "reasoning-toggle";
+    const caret = document.createElement("span");
+    caret.className = "reasoning-caret";
+    caret.setAttribute("aria-hidden", "true");
+    const label = document.createElement("span");
+    label.className = "reasoning-summary";
+    toggle.append(caret, label);
+    toggle.onclick = (e) => {
+      e.stopPropagation();
+      // Toggling changes the row's height. Read whether the view is at the bottom *now* — not from
+      // the row's creation-time follow flag — so a transcript being followed stays followed and one
+      // scrolled back to an older note is left where the reader put it.
+      const stick = transcriptShouldStickToBottom();
+      setReasoningExpanded(msg, !msg.classList.contains("expanded"), { manual:true });
+      keepTranscriptAtBottom(stick);
+    };
+    msg.insertBefore(toggle, body);
+  }
+  msg.classList.add("reasoning-collapsible");
+  const label = toggle.querySelector(".reasoning-summary");
+  if (label) label.textContent = reasoningSummaryText(text);
+  const key = reasoningRowKey(msg);
+  const choice = key ? state.reasoningChoicesByRowKey.get(key) : undefined;
+  const expanded = choice !== undefined
+    ? choice
+    : (previous === null ? !msg.nextElementSibling : previous);
+  setReasoningExpanded(msg, expanded, { manual:false });
 }
 function renderCommandOutputBlock(body, opts) {
   const itemId = idKey(opts.itemId);
@@ -6862,6 +7007,11 @@ function appendStream(turnId, text, itemId, deltaType) {
     out.append(document.createTextNode(text));
   } else {
     body.textContent += text;
+    // A streaming reasoning note keeps its summary line in step with the text arriving under it.
+    const row = body.parentElement;
+    if (row && row.classList.contains("reasoning")) {
+      applyReasoningRow(row, body.textContent);
+    }
   }
   $("transcript").scrollTop = $("transcript").scrollHeight;
 }
@@ -7029,6 +7179,11 @@ function addItem(item, turnId, fromHistory) {
   if (p.kind==="command_execution") finishRunningCommand(item, turnId);
   markRenderedItem(item, turnId);
 }
+// A reasoning row's expand/collapse choice belongs to its thread: leaving or opening a thread
+// drops it, while rebuilding the current thread's transcript (a resync) keeps it.
+function clearReasoningChoices() {
+  state.reasoningChoicesByRowKey = new Map();
+}
 function resetRenderState() {
   clearPlanCard();   // dropping/switching threads clears any pinned plan
   state.streamEl = null;
@@ -7123,6 +7278,10 @@ function registerRenderedItemBody(body, item, turnId) {
   if (keys.itemKey) state.renderedItemBodyByKey.set(keys.itemKey, body);
   if (keys.harnessKey) state.renderedItemBodyByKey.set(keys.harnessKey, body);
   if (keys.itemKey) fulfillPendingTaskIntent(keys.itemKey);
+  // A row is rendered before it is identified (see addItem), so a reasoning row rebuilt by a
+  // resync cannot look up the reader's expand/collapse choice while it renders. Apply it here,
+  // where the identity that keys the choice has just been stamped.
+  if (row.classList.contains("reasoning-collapsible")) restoreReasoningChoice(row);
 }
 function isRenderedItem(item, turnId) {
   const keys = itemIdentityKeys(item, turnId);
@@ -7218,6 +7377,10 @@ function renderItemBody(body, p) {
     body.innerHTML = renderActivity(p);
     attachSubagentLinkActions(body, p);
   }
+  // A reasoning note keeps whatever state its row already has; a fresh one opens if it is the
+  // newest row. Completion is not what folds it — the next appended row is.
+  if (p.kind==="reasoning") applyReasoningRow(msg, p.text || "");
+  else removeReasoningToggle(msg);
   const taskItemId = msg.dataset.commandItemId || msg.dataset.toolItemId || "";
   if (taskItemId) {
     syncTaskGroupItem(taskItemId);

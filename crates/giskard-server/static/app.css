@@ -342,6 +342,29 @@
   .msg.user { background:var(--accent); color:#fff; margin-left:auto; }
   .msg.agent { background:var(--panel2); }
   .msg.reasoning { background:transparent; border:1px dashed var(--border); color:var(--muted); font-size:13px; }
+  /* Collapsible reasoning rows: the toggle is a full-width summary line carrying the note's first
+     line, and collapsing hides the body only — the text stays in the DOM, so the row copy button
+     still yields the whole note and re-expanding costs no re-render. The right padding keeps that
+     one-line summary clear of the row's hover copy button. */
+  .reasoning-toggle {
+    display:flex; align-items:baseline; gap:6px; width:100%; padding:0 58px 0 0;
+    border:0; background:transparent; color:inherit; font:inherit; text-align:left;
+    white-space:nowrap; cursor:pointer;
+  }
+  .reasoning-toggle:hover .reasoning-summary { color:var(--fg); }
+  .reasoning-toggle:focus-visible { outline:1px solid var(--accent); outline-offset:2px; border-radius:4px; }
+  .reasoning-caret { flex:0 0 auto; width:1em; font-size:11px; opacity:.8; }
+  .reasoning-summary { min-width:0; overflow:hidden; text-overflow:ellipsis; }
+  .msg.reasoning-collapsible > .body { margin-top:5px; }
+  .msg.reasoning-collapsible.collapsed > .body { display:none; }
+  /* The IDE/Terminal appearances lay a row out as a grid (role gutter + content column). Both the
+     summary and the body belong in the content column, on their own rows. The negative line
+     numbers resolve to the last column either way, so this holds for the two-column desktop grid
+     and for the single-column phone grid below. */
+  [data-appearance="ide"] .msg.reasoning-collapsible > .reasoning-toggle,
+  [data-appearance="ide"] .msg.reasoning-collapsible > .body,
+  [data-appearance="terminal"] .msg.reasoning-collapsible > .reasoning-toggle,
+  [data-appearance="terminal"] .msg.reasoning-collapsible > .body { grid-column:-2 / -1; }
   .msg.cmd { background:#0b0e13; border:1px solid var(--border); }
   .msg.file { background:#101820; border:1px solid #28445f; }
   .msg.tool { background:#151521; border:1px solid #3b3b67; }
