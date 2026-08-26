@@ -35,6 +35,7 @@ use giskard_proto::{RunningTask, ServerMessage, WireAgentEvent, WireItem};
 
 use crate::hub::Hub;
 use crate::ledger::LedgerHandle;
+use crate::log_fields::{display_opt, rfc3339, rfc3339_opt};
 use crate::thread_graph::{
     ExistingLinkDisposition, classify_existing_link, load_thread_graph, parent_chain_is_valid,
     should_refresh_subagent_title,
@@ -628,8 +629,8 @@ impl HarnessRegistry {
     ) -> Result<ThreadHandle, HarnessError> {
         debug!(
             project_id = %config.id,
-            thread_id = ?thread,
-            resume = ?resume,
+            thread_id = display_opt(thread),
+            resume = display_opt(resume.as_deref()),
             ?resume_policy,
             "opening harness thread"
         );
@@ -2104,7 +2105,7 @@ async fn materialize_subagent_thread(
                 %parent_thread_id,
                 existing_thread_id = %existing.id,
                 existing_kind = ?existing.kind,
-                existing_parent_thread_id = ?existing.parent_thread_id,
+                existing_parent_thread_id = display_opt(existing.parent_thread_id),
                 linked_harness_thread_id = %info.native_thread_id,
                 disposition = ?disposition,
                 reason = disposition.reason(),
@@ -2828,7 +2829,7 @@ async fn synthesize_passive_subagent_prompt_item(
         item,
     };
     let applied = shared.runtime.apply_event(thread_id, &event, true);
-    debug!(%thread_id, event_sequence = ?applied.sequence, "applied synthetic prompt event");
+    debug!(%thread_id, event_sequence = display_opt(applied.sequence), "applied synthetic prompt event");
     publish_applied_runtime_effects(&shared.hub, thread_id, applied).await;
     broadcast_event_with_context(&shared.hub, project_id, thread_id, event, ctx).await;
 }
@@ -2982,7 +2983,9 @@ async fn forward_events(
                     debug!(
                         %project_id,
                         %thread_id,
-                        timeout_ms = ?ctx.passive_pre_turn_timeout.map(|value| value.as_millis()),
+                        timeout_ms = ctx
+                            .passive_pre_turn_timeout
+                            .map(|value| tracing::field::display(value.as_millis())),
                         "passive subagent monitor adopted active lifecycle evidence"
                     );
                     continue;
@@ -3067,7 +3070,7 @@ async fn forward_events(
                     debug!(
                         %project_id,
                         %thread_id,
-                        event_turn_id = ?event_turn_id(&event),
+                        event_turn_id = display_opt(event_turn_id(&event)),
                         "skipping duplicate harness notice"
                     );
                     continue;
@@ -3254,7 +3257,7 @@ async fn forward_events(
                         log_command_completion_after_terminate(project_id, before.as_ref(), &event);
                         debug!(
                             %thread_id,
-                            event_sequence = ?applied.sequence,
+                            event_sequence = display_opt(applied.sequence),
                             event_kind = event_kind(&event),
                             "applied late terminal event to thread runtime"
                         );
@@ -3314,7 +3317,7 @@ async fn forward_events(
                     let applied = shared.runtime.apply_event(thread_id, &event, false);
                     debug!(
                         %thread_id,
-                        event_sequence = ?applied.sequence,
+                        event_sequence = display_opt(applied.sequence),
                         event_kind = event_kind(&event),
                         "applied turnless agent event to thread runtime"
                     );
@@ -3595,7 +3598,7 @@ async fn forward_events(
                     };
                     debug!(
                         %thread_id,
-                        event_sequence = ?applied.sequence,
+                        event_sequence = display_opt(applied.sequence),
                         event_kind = event_kind(&event),
                         "applied agent event to thread runtime"
                     );
@@ -3607,7 +3610,7 @@ async fn forward_events(
                         %project_id,
                         %thread_id,
                         turn = %completed_turn,
-                        started_turn = ?turn_id,
+                        started_turn = display_opt(turn_id),
                         status = ?status.kind,
                         context_kind = turn_context_kind_label(ctx.kind),
                         items_buffered = current_turn_items.len(),
@@ -3738,8 +3741,8 @@ async fn forward_events(
                         %project_id,
                         %thread_id,
                         ?e,
-                        ?owned_turn,
-                        ?turn_id,
+                        owned_turn = display_opt(owned_turn),
+                        turn_id = display_opt(turn_id),
                         saw_context_compaction_marker,
                         items_buffered = current_turn_items.len(),
                         live_buffer_active,
@@ -3766,9 +3769,9 @@ async fn forward_events(
                         mode = ?ctx.mode,
                         provider = %ctx.model.provider,
                         model = %ctx.model.model,
-                        ?owned_turn,
-                        ?turn_id,
-                        stream_error = ?stream_error,
+                        owned_turn = display_opt(owned_turn),
+                        turn_id = display_opt(turn_id),
+                        stream_error = display_opt(stream_error.as_deref()),
                         items_buffered = current_turn_items.len(),
                         diffs_buffered = diffs.len(),
                         live_buffer_active,
@@ -3819,10 +3822,10 @@ async fn forward_events(
             mode = ?ctx.mode,
             provider = %ctx.model.provider,
             model = %ctx.model.model,
-            ?owned_turn,
-            ?turn_id,
+            owned_turn = display_opt(owned_turn),
+            turn_id = display_opt(turn_id),
             exit_reason = forwarder_exit_reason_label(exit_reason),
-            stream_error = ?stream_error,
+            stream_error = display_opt(stream_error.as_deref()),
             items_buffered = current_turn_items.len(),
             diffs_buffered = diffs.len(),
             saw_context_compaction_marker,
@@ -3834,12 +3837,12 @@ async fn forward_events(
             %project_id,
             %thread_id,
             context_kind = turn_context_kind_label(ctx.kind),
-            ?owned_turn,
-            ?turn_id,
+            owned_turn = display_opt(owned_turn),
+            turn_id = display_opt(turn_id),
             owned_turn_completed,
             turn_gate_held,
             exit_reason = forwarder_exit_reason_label(exit_reason),
-            stream_error = ?stream_error,
+            stream_error = display_opt(stream_error.as_deref()),
             elapsed_ms = forwarder_started.elapsed().as_millis(),
             "event forwarder exited"
         );
@@ -3929,7 +3932,7 @@ async fn persist_subagent_fallback_transcript(
         let applied = shared.runtime.apply_event(thread_id, &event, false);
         debug!(
             %thread_id,
-            event_sequence = ?applied.sequence,
+            event_sequence = display_opt(applied.sequence),
             event_kind = event_kind(&event),
             "applied fallback transcript event to thread runtime"
         );
@@ -3987,7 +3990,7 @@ async fn complete_forwarded_turn(
             %thread_id,
             turn = %tid,
             completed_turn = %completed_turn,
-            started_turn = ?turn_id,
+            started_turn = display_opt(turn_id),
             item_count,
             has_context_compaction_marker,
             status = ?status.kind,
@@ -4243,8 +4246,8 @@ fn log_foreign_thread_event_drop(
         %thread_id,
         %event_thread_id,
         event_kind = event_kind(event),
-        event_turn_id = event_turn_id(event).map(tracing::field::display),
-        event_item_id = event_item_id(event).map(tracing::field::display),
+        event_turn_id = display_opt(event_turn_id(event)),
+        event_item_id = display_opt(event_item_id(event)),
         item_delta_kind = event_item_delta_kind(event),
         "dropping harness event for a different thread"
     );
@@ -4261,8 +4264,8 @@ fn log_metadata_only_event_rejection(
         %project_id,
         %thread_id,
         event_kind,
-        event_turn_id = event_turn_id.map(tracing::field::display),
-        event_item_id = event_item_id.map(tracing::field::display),
+        event_turn_id = display_opt(event_turn_id),
+        event_item_id = display_opt(event_item_id),
         "refusing to broadcast a metadata-only event on the transcript stream"
     );
 }
@@ -4281,7 +4284,7 @@ fn log_cross_turn_event_drop(
         %owned_turn,
         %event_turn,
         event_kind = event_kind(event),
-        event_item_id = event_item_id(event).map(tracing::field::display),
+        event_item_id = display_opt(event_item_id(event)),
         item_delta_kind = event_item_delta_kind(event),
         elapsed_ms,
         "dropping harness event for a different turn on the same thread"
@@ -4305,7 +4308,7 @@ fn log_ignored_seen_turn_running_task_start(project_id: ProjectId, event: &Agent
         turn_id = %turn,
         item_id = %item.id,
         harness_item_id = %item.harness_item_id,
-        process_id = ?command.process_id,
+        process_id = display_opt(command.process_id.as_deref()),
         command = %command.command,
         status,
         "ignoring running command start for already-persisted turn"
@@ -4367,11 +4370,11 @@ fn log_command_completion_after_terminate(
         turn_id = %turn,
         item_id = %item.id,
         harness_item_id = %item.harness_item_id,
-        process_id = ?command.process_id,
+        process_id = display_opt(command.process_id.as_deref()),
         command = %command.command,
         status = %status,
-        exit_code = ?exit_code,
-        duration_ms = ?duration_ms,
+        exit_code = display_opt(exit_code.as_ref()),
+        duration_ms = display_opt(duration_ms.as_ref()),
         "command completed normally after stop request; Codex did not terminate the process"
     );
 }
@@ -4681,8 +4684,8 @@ async fn persist_turn(
         status = ?status_kind,
         item_count,
         diff_count,
-        started_at = %started_at,
-        completed_at = ?completed_at,
+        started_at = %rfc3339(&started_at),
+        completed_at = rfc3339_opt(completed_at.as_ref()),
         "appended completed turn to history"
     );
 

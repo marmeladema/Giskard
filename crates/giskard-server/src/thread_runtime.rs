@@ -20,6 +20,7 @@ use giskard_core::user_input::UserInput;
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
+use crate::log_fields::display_opt;
 use crate::runtime_live::LiveTurnState;
 use crate::runtime_tasks::RunningTaskState;
 use giskard_proto::{LiveTurnSnapshot, RunningTask};
@@ -885,7 +886,7 @@ impl ThreadRuntimeRegistry {
                     debug!(
                         %thread_id,
                         project_id = %owner.reservation.project_id,
-                        turn_id = ?owner.acknowledged_turn,
+                        turn_id = display_opt(owner.acknowledged_turn),
                         elapsed_ms = owner.reserved_at.elapsed().as_millis(),
                         "committed persisted turn and released thread runtime"
                     );
@@ -915,7 +916,7 @@ impl ThreadRuntimeRegistry {
             warn!(
                 %thread_id,
                 owner_project_id = %existing.reservation.project_id,
-                owner_turn_id = ?existing.acknowledged_turn,
+                owner_turn_id = display_opt(existing.acknowledged_turn),
                 owner_harness_thread_id = %existing.reservation.harness_thread_id,
                 owner_context_kind = existing.reservation.context_kind,
                 owner_mode = ?existing.reservation.mode,
@@ -972,7 +973,7 @@ impl ThreadRuntimeRegistry {
             debug!(
                 %thread_id,
                 project_id = %owner.reservation.project_id,
-                turn_id = ?owner.acknowledged_turn,
+                turn_id = display_opt(owner.acknowledged_turn),
                 elapsed_ms = owner.reserved_at.elapsed().as_millis(),
                 "released active thread runtime"
             );

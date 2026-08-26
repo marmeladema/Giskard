@@ -7,7 +7,10 @@
 //! See the crate README for Codex-native identifier scopes, item and process
 //! lifecycles, background-command ownership, and termination routing.
 
+mod log_fields;
 mod mapping;
+
+use crate::log_fields::display_opt;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -472,18 +475,44 @@ async fn run_worker_queue_watchdog(watchdog: Weak<WorkerQueueWatchdog>) {
             .is_some_and(|pending| pending.elapsed_ms >= WORKER_QUEUE_WARN_AFTER.as_millis());
         if active_is_slow || pending_is_slow {
             warn!(
-                active_id = ?snapshot.active.as_ref().map(|entry| entry.id),
-                active_kind = ?snapshot.active.as_ref().map(|entry| entry.kind.as_str()),
-                active_action = ?snapshot.active.as_ref().map(|entry| entry.action),
-                active_project_id = snapshot.active.as_ref().and_then(|entry| entry.project_id).map(tracing::field::display),
-                active_thread_id = snapshot.active.as_ref().and_then(|entry| entry.thread_id).map(tracing::field::display),
-                active_elapsed_ms = ?snapshot.active.as_ref().map(|entry| entry.elapsed_ms),
-                oldest_pending_id = ?snapshot.oldest_pending.as_ref().map(|entry| entry.id),
-                oldest_pending_kind = ?snapshot.oldest_pending.as_ref().map(|entry| entry.kind.as_str()),
-                oldest_pending_action = ?snapshot.oldest_pending.as_ref().map(|entry| entry.action),
-                oldest_pending_project_id = snapshot.oldest_pending.as_ref().and_then(|entry| entry.project_id).map(tracing::field::display),
-                oldest_pending_thread_id = snapshot.oldest_pending.as_ref().and_then(|entry| entry.thread_id).map(tracing::field::display),
-                oldest_pending_elapsed_ms = ?snapshot.oldest_pending.as_ref().map(|entry| entry.elapsed_ms),
+                active_id = display_opt(snapshot.active.as_ref().map(|entry| entry.id)),
+                active_kind =
+                    display_opt(snapshot.active.as_ref().map(|entry| entry.kind.as_str())),
+                active_action = display_opt(snapshot.active.as_ref().map(|entry| entry.action)),
+                active_project_id =
+                    display_opt(snapshot.active.as_ref().and_then(|entry| entry.project_id)),
+                active_thread_id =
+                    display_opt(snapshot.active.as_ref().and_then(|entry| entry.thread_id)),
+                active_elapsed_ms =
+                    display_opt(snapshot.active.as_ref().map(|entry| entry.elapsed_ms)),
+                oldest_pending_id =
+                    display_opt(snapshot.oldest_pending.as_ref().map(|entry| entry.id)),
+                oldest_pending_kind = display_opt(
+                    snapshot
+                        .oldest_pending
+                        .as_ref()
+                        .map(|entry| entry.kind.as_str())
+                ),
+                oldest_pending_action =
+                    display_opt(snapshot.oldest_pending.as_ref().map(|entry| entry.action)),
+                oldest_pending_project_id = display_opt(
+                    snapshot
+                        .oldest_pending
+                        .as_ref()
+                        .and_then(|entry| entry.project_id)
+                ),
+                oldest_pending_thread_id = display_opt(
+                    snapshot
+                        .oldest_pending
+                        .as_ref()
+                        .and_then(|entry| entry.thread_id)
+                ),
+                oldest_pending_elapsed_ms = display_opt(
+                    snapshot
+                        .oldest_pending
+                        .as_ref()
+                        .map(|entry| entry.elapsed_ms)
+                ),
                 command_pending = snapshot.command_pending,
                 control_pending = snapshot.control_pending,
                 "Codex worker queue has slow active or pending work"
@@ -573,15 +602,15 @@ impl<'a> CodexOperationContext<'a> {
     fn log_timeout(self, method: Option<&str>, elapsed: Duration, message: &'static str) {
         warn!(
             action = self.action,
-            method,
-            project_id = ?self.project_id,
-            thread_id = ?self.thread_id,
-            turn_id = ?self.turn_id,
-            harness_thread_id = ?self.harness_thread_id,
-            native_turn_id = ?self.native_turn_id,
-            process_id = ?self.process_id,
-            server = ?self.server,
-            request_id = ?self.request_id,
+            method = display_opt(method),
+            project_id = display_opt(self.project_id),
+            thread_id = display_opt(self.thread_id),
+            turn_id = display_opt(self.turn_id),
+            harness_thread_id = display_opt(self.harness_thread_id),
+            native_turn_id = display_opt(self.native_turn_id),
+            process_id = display_opt(self.process_id),
+            server = display_opt(self.server),
+            request_id = display_opt(self.request_id),
             elapsed_ms = elapsed.as_millis(),
             timeout_ms = CODEX_JSON_RPC_TIMEOUT.as_millis(),
             "{message}"
@@ -1719,7 +1748,7 @@ fn warn_slow_first_events(active_turns: &mut ActiveTurns) {
                 thread_id = %active.thread.thread,
                 harness_thread_id = %active.thread.harness_thread_id,
                 acknowledged_turn = %active.acknowledged_turn,
-                active_turn = ?active.active_turn,
+                active_turn = display_opt(active.active_turn),
                 elapsed_ms = active.started_at.elapsed().as_millis(),
                 "Codex accepted turn/start but has not emitted a server message yet"
             );
@@ -1769,8 +1798,8 @@ async fn handle_background_server_message(
                 {
                     debug!(
                         %thread,
-                        acknowledged_turn = ?active_turns.get(&thread).map(|active| active.acknowledged_turn),
-                        event_turn = ?agent_event_turn(&event),
+                        acknowledged_turn = display_opt(active_turns.get(&thread).map(|active| active.acknowledged_turn)),
+                        event_turn = display_opt(agent_event_turn(&event)),
                         "ignoring Codex turn completion for a non-current turn"
                     );
                 }
@@ -2065,11 +2094,11 @@ async fn timeout_codex_control<T>(
     let result = future.await;
     if matches!(result, Err(HarnessError::Timeout(_))) {
         warn!(
-            thread_id = ?thread.map(|thread| thread.thread),
-            harness_thread_id = ?thread.map(|thread| thread.harness_thread_id.as_str()),
+            thread_id = display_opt(thread.map(|thread| thread.thread)),
+            harness_thread_id = display_opt(thread.map(|thread| thread.harness_thread_id.as_str())),
             action,
-            process_id = ?process_id,
-            native_turn_id = ?native_turn_id,
+            process_id = display_opt(process_id),
+            native_turn_id = display_opt(native_turn_id),
             elapsed_ms = started.elapsed().as_millis(),
             timeout_ms = CODEX_JSON_RPC_TIMEOUT.as_millis(),
             "Codex control request timed out; worker will resume processing commands"
@@ -2129,7 +2158,7 @@ fn observe_pending_compaction(
     let completed = pending.observe(event);
     info!(
         %thread,
-        ?event_turn,
+        event_turn = display_opt(event_turn),
         event = event_name,
         saw_turn_started_before,
         saw_turn_started_after = pending.saw_turn_started,
@@ -2337,13 +2366,13 @@ fn observe_pending_context_restore(
         model: restore.model,
         context_window,
     };
-    if let Err(error) = restore.sink.send(update) {
+    if restore.sink.send(update).is_err() {
         warn!(
             action = "forward_resumed_context_window",
             thread_id = %restore.thread,
             harness_thread_id = %notification.thread_id,
             native_turn_id = %notification.turn_id,
-            error = ?error,
+            cause = "thread update receiver closed",
             "failed to forward resumed context window"
         );
     }
@@ -2428,10 +2457,10 @@ fn effective_model(
         warn!(
             model_empty = model.is_empty(),
             model_provider_empty = model_provider.is_empty(),
-            requested = ?requested.map(giskard_core::model::ModelRef::key),
+            requested = display_opt(requested.map(giskard_core::model::ModelRef::key)),
             action = context.action,
-            project_id = context.project_id.map(tracing::field::display),
-            thread_id = context.thread_id.map(tracing::field::display),
+            project_id = display_opt(context.project_id),
+            thread_id = display_opt(context.thread_id),
             harness_thread_id = reported_harness_thread_id,
             "Codex reported no effective model for the opened thread"
         );
@@ -2905,8 +2934,8 @@ async fn respond_unroutable_server_request(
             action = "reject_unroutable_server_request",
             method = request.method(),
             request_id = %id,
-            harness_thread_id,
-            native_turn_id,
+            harness_thread_id = display_opt(harness_thread_id.as_deref()),
+            native_turn_id = display_opt(native_turn_id.as_deref()),
             error = %error,
             "failed to reject unroutable Codex server request"
         );
@@ -2916,8 +2945,8 @@ async fn respond_unroutable_server_request(
             action = "reject_unroutable_server_request",
             method = request.method(),
             request_id = %id,
-            harness_thread_id,
-            native_turn_id,
+            harness_thread_id = display_opt(harness_thread_id.as_deref()),
+            native_turn_id = display_opt(native_turn_id.as_deref()),
             "rejected unroutable Codex server request"
         );
     }

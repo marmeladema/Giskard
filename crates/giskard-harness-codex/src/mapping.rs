@@ -31,6 +31,8 @@ use codex_codes::protocol::{
     TurnCompletedNotification, TurnDiffUpdatedNotification, TurnStartedNotification,
 };
 
+use crate::log_fields::display_opt;
+
 // ---- MCP tool-call approval detection (spec §9.2) ----
 //
 // Codex surfaces MCP tool-call approvals as generic `ToolRequestUserInput` or
@@ -305,7 +307,7 @@ impl CodexMapper {
                 if self.active_turns.get(&thread) != Some(&n.turn_id) {
                     debug!(%thread, native_thread_id = %n.thread_id,
                         native_turn_id = %n.turn_id,
-                        active_native_turn_id = ?self.active_turns.get(&thread),
+                        active_native_turn_id = display_opt(self.active_turns.get(&thread)),
                         "routing Codex usage outside the active turn ledger");
                     return None;
                 }

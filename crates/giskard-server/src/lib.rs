@@ -6,6 +6,7 @@ pub mod highlight;
 pub mod hub;
 pub mod ledger;
 pub mod linkify;
+mod log_fields;
 pub mod markdown;
 pub mod models;
 pub mod plan;
