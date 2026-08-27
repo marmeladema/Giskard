@@ -48,6 +48,37 @@ Codex threadId
     -> originating Codex turnId while the command is known running
 ```
 
+### Where the thread mapping comes from
+
+`Codex threadId -> Giskard ThreadId` is populated three ways, and the order
+matters because Codex can talk about a thread before Giskard opens it.
+
+**Pre-registered at harness creation.** `AgentHarness::bind_known_threads` hands
+the adapter every `(harness_thread_id, ThreadId)` pair the project has already
+persisted, read from the same thread files the server's thread graph is built
+from. This happens before the harness is published to callers, so it precedes
+any thread being opened on it and therefore any Codex traffic.
+
+It exists because Codex announces a sub-agent's thread as soon as it loads one,
+which for a child persisted in an earlier run happens before the parent's tool
+call names it. Without the pair already in hand the adapter meets a native id it
+has never seen and has to invent a `ThreadId` for a thread that already has one —
+two identities for one thread, and every registry above keyed by whichever came
+first. Pre-registration removes the second identity rather than reconciling it.
+
+**On open.** `open_thread` binds the native id it opened or resumed. An explicit
+`OpenThreadOptions::thread` wins, because the caller knows the thread's durable
+identity. Otherwise the adapter reuses an existing binding for the native id
+being resumed if it has one, and only mints a fresh `ThreadId` when the native
+thread is genuinely unknown: passing `None` says the caller has no opinion about
+the id, not that this is a new thread.
+
+**Never inferred from traffic.** A non-empty native thread id that resolves to
+nothing is a routing failure, reported as such. It is only attributed to the
+caller's fallback thread while the adapter knows of no threads at all — which,
+for a project with persisted threads, stops being true the moment its harness is
+created.
+
 These registries belong to one adapter worker and are rebuilt when its Codex
 app-server process is respawned. Durable Giskard IDs and completed transcript
 items remain in Giskard persistence; native live-process state does not.

@@ -398,6 +398,34 @@ struct RegistryShared {
     ledger: LedgerHandle,
 }
 
+/// The project's harness if one is running, or `None` if one should be created.
+///
+/// Errors on the states where creating is wrong: a server shutting down, or a harness midway
+/// through deletion. Shared by both passes of `get_or_create_harness` so the second cannot drift
+/// from the first.
+fn harness_slot(
+    harnesses: &Harnesses,
+    project: ProjectId,
+) -> Result<Option<Arc<dyn AgentHarness>>, HarnessError> {
+    if harnesses.shutting_down {
+        return Err(HarnessError::Protocol(
+            "server is shutting down; refusing to start a harness".into(),
+        ));
+    }
+    if let Some(harness) = harnesses.active(project) {
+        return Ok(Some(harness));
+    }
+    if matches!(
+        harnesses.by_project.get(&project),
+        Some(ProjectHarnessState::Deleting(_))
+    ) {
+        return Err(HarnessError::Protocol(format!(
+            "project {project} harness is being deleted"
+        )));
+    }
+    Ok(None)
+}
+
 impl RegistryShared {
     async fn active_harness(&self, project_id: ProjectId) -> Option<Arc<dyn AgentHarness>> {
         self.harnesses.lock().await.active(project_id)
@@ -556,28 +584,84 @@ impl HarnessRegistry {
         project: ProjectId,
         config: &ProjectConfig,
     ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
-        let mut harnesses = self.shared.harnesses.lock().await;
-        if harnesses.shutting_down {
-            return Err(HarnessError::Protocol(
-                "server is shutting down; refusing to start a harness".into(),
-            ));
+        // Fast path. This lock is a single global one guarding every project's harness and is
+        // taken on ordinary per-event work, so the usual answer — "already running" — must not
+        // wait behind anything slower than a map lookup.
+        {
+            let harnesses = self.shared.harnesses.lock().await;
+            if let Some(harness) = harness_slot(&harnesses, project)? {
+                return Ok(harness);
+            }
         }
-        if let Some(harness) = harnesses.active(project) {
+
+        // Nothing is running for this project yet, so read the bindings the new harness will need.
+        //
+        // The thread graph belongs to the project, not to any harness, so it is read with the
+        // lock released: it is a directory scan plus a file per thread, and every other project's
+        // work would queue behind it. A racing caller may create the harness while this runs, in
+        // which case the re-check below returns theirs and this read is discarded — the cost of a
+        // wasted scan on a path that runs once per project, against holding a global lock across
+        // I/O on every path that does not.
+        let bindings = self.known_thread_bindings(project).await;
+
+        let mut harnesses = self.shared.harnesses.lock().await;
+        if let Some(harness) = harness_slot(&harnesses, project)? {
             return Ok(harness);
         }
-        if matches!(
-            harnesses.by_project.get(&project),
-            Some(ProjectHarnessState::Deleting(_))
-        ) {
-            return Err(HarnessError::Protocol(format!(
-                "project {project} harness is being deleted"
-            )));
-        }
         let h = self.factory.create(config).await?;
+
+        // Hand the bindings over *before* publishing the harness.
+        //
+        // Codex announces a sub-agent's thread as soon as it loads one, which for a child we
+        // persisted in an earlier run happens before the parent's tool call names it. Without
+        // these bindings the adapter meets a native id it has never seen and invents a ThreadId
+        // for a thread that already has one.
+        //
+        // The ordering is the whole point, so it is enforced rather than assumed: the harness
+        // enters the map only once bound, so no concurrent caller can take it out and open a
+        // thread on it in between.
+        if let Some(bindings) = bindings {
+            debug!(
+                project_id = %project,
+                bindings = bindings.len(),
+                "handing known thread bindings to a new harness"
+            );
+            h.bind_known_threads(bindings).await;
+        }
+
         harnesses
             .by_project
             .insert(project, ProjectHarnessState::Active(h.clone()));
         Ok(h)
+    }
+
+    /// Every `(native id, ThreadId)` pair this project has already persisted.
+    ///
+    /// `None` when they could not be read: not fatal, because the harness still works and a thread
+    /// Giskard opens itself registers on the way through. What is lost is the guarantee for
+    /// children Codex announces before Giskard opens them, so it is worth a warning.
+    ///
+    /// Read from the same thread files the thread graph is built from; nothing else is loaded, and
+    /// turn files are never touched.
+    async fn known_thread_bindings(&self, project: ProjectId) -> Option<Vec<(String, ThreadId)>> {
+        match load_thread_graph(&self.shared.store, project).await {
+            Ok(graph) => Some(
+                graph
+                    .values()
+                    .filter(|thread| !thread.harness_thread_id.is_empty())
+                    .map(|thread| (thread.harness_thread_id.clone(), thread.id))
+                    .collect(),
+            ),
+            Err(error) => {
+                warn!(
+                    project_id = %project,
+                    %error,
+                    "could not read known thread bindings; sub-agent threads announced before \
+                     Giskard opens them may be routed under a fresh id"
+                );
+                None
+            }
+        }
     }
 
     pub async fn open_thread(
@@ -5076,6 +5160,168 @@ mod tests {
                 "unused test harness factory was called".into(),
             ))
         }
+    }
+
+    /// A harness that records whether it was bound, and how many threads were opened on it
+    /// before that happened.
+    struct BindingOrderHarness {
+        bound: Arc<AtomicUsize>,
+        opened_before_bound: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentHarness for BindingOrderHarness {
+        fn capabilities(&self) -> HarnessCapabilities {
+            HarnessCapabilities::default()
+        }
+
+        async fn list_models(&self) -> Result<Vec<giskard_core::ModelDescriptor>, HarnessError> {
+            Ok(Vec::new())
+        }
+
+        async fn bind_known_threads(&self, bindings: Vec<(String, ThreadId)>) {
+            // Held open so a second caller is certainly inside the window between the harness
+            // existing and its bindings landing. Without this the test only catches the bug when
+            // the scheduler happens to interleave, which is not a test.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            self.bound.store(bindings.len().max(1), Ordering::SeqCst);
+        }
+
+        async fn open_thread(
+            &self,
+            _opts: giskard_harness::OpenThreadOptions,
+        ) -> Result<ThreadHandle, HarnessError> {
+            if self.bound.load(Ordering::SeqCst) == 0 {
+                self.opened_before_bound.fetch_add(1, Ordering::SeqCst);
+            }
+            Err(HarnessError::Protocol("not needed by this test".into()))
+        }
+
+        async fn start_turn(
+            &self,
+            _thread: &ThreadHandle,
+            _input: UserInput,
+            _overrides: giskard_core::turn::TurnOverrides,
+        ) -> Result<TurnId, HarnessError> {
+            Err(HarnessError::Protocol("not needed by this test".into()))
+        }
+
+        fn subscribe(&self, _thread: &ThreadHandle) -> giskard_harness::AgentEventStream {
+            let (_, rx) = tokio::sync::broadcast::channel(1);
+            giskard_harness::AgentEventStream::new(rx)
+        }
+
+        async fn respond_approval(
+            &self,
+            _req: ApprovalId,
+            _decision: ApprovalDecision,
+        ) -> Result<(), HarnessError> {
+            Ok(())
+        }
+
+        async fn respond_server_request(
+            &self,
+            _req: ServerRequestId,
+            _response: giskard_core::server_request::ServerRequestResponse,
+        ) -> Result<(), HarnessError> {
+            Ok(())
+        }
+
+        async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
+            Ok(())
+        }
+
+        async fn shutdown(&self) -> Result<(), HarnessError> {
+            Ok(())
+        }
+    }
+
+    struct BindingOrderFactory {
+        harness: Arc<BindingOrderHarness>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::HarnessFactory for BindingOrderFactory {
+        async fn create(
+            &self,
+            _config: &ProjectConfig,
+        ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
+            Ok(self.harness.clone())
+        }
+    }
+
+    /// The bindings only prevent a second identity if they are in place before anything can open a
+    /// thread. Publishing the harness first and binding afterwards would let a concurrent caller
+    /// take it out of the map in between — so the harness must not be reachable until it is bound.
+    #[tokio::test]
+    async fn a_harness_is_not_reachable_until_its_bindings_are_registered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        store
+            .create_project(project_id, "proj", "/tmp/test")
+            .await
+            .unwrap();
+        let harness = Arc::new(BindingOrderHarness {
+            bound: Arc::new(AtomicUsize::new(0)),
+            opened_before_bound: Arc::new(AtomicUsize::new(0)),
+        });
+        let registry = Arc::new(super::HarnessRegistry::new(
+            Arc::new(BindingOrderFactory {
+                harness: harness.clone(),
+            }),
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store.clone()),
+        ));
+        let config = store
+            .load_project(project_id)
+            .await
+            .unwrap()
+            .expect("the project we just created");
+
+        // One caller creates the harness; binding it takes 300ms.
+        let creator = {
+            let registry = registry.clone();
+            let config = config.clone();
+            tokio::spawn(async move { registry.get_or_create_harness(project_id, &config).await })
+        };
+
+        // Others arrive while that binding is still in flight — the exact window in which a
+        // harness published too early would be handed out unbound.
+        let mut racers = Vec::new();
+        for _ in 0..4 {
+            let registry = registry.clone();
+            let config = config.clone();
+            racers.push(tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                if let Ok(h) = registry.get_or_create_harness(project_id, &config).await {
+                    let (updates, _) = giskard_harness::thread_update_channel();
+                    let _ = h
+                        .open_thread(giskard_harness::OpenThreadOptions {
+                            project: project_id,
+                            thread: None,
+                            workspace_root: "/tmp/test".into(),
+                            resume: Some("native-child".into()),
+                            resume_policy: giskard_harness::ResumePolicy::AllowFreshFallback,
+                            initial_model: None,
+                            updates,
+                        })
+                        .await;
+                }
+            }));
+        }
+        creator.await.unwrap().expect("harness is created");
+        for racer in racers {
+            racer.await.unwrap();
+        }
+
+        assert!(harness.bound.load(Ordering::SeqCst) > 0, "bindings ran");
+        assert_eq!(
+            harness.opened_before_bound.load(Ordering::SeqCst),
+            0,
+            "no thread may be opened on a harness that has not been given its bindings"
+        );
     }
 
     #[tokio::test]
