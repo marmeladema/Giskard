@@ -43,7 +43,7 @@ use giskard_harness::{
     OpenThreadOptions, ProviderAuth, ProviderAuthCommand, ResumePolicy, ThreadHandle, ThreadUpdate,
 };
 
-use mapping::CodexMapper;
+use mapping::{CodexMapper, NativeThreadId};
 
 const BROADCAST_CAPACITY: usize = 256;
 const TURN_FIRST_EVENT_WARN_AFTER: Duration = Duration::from_secs(15);
@@ -1726,15 +1726,25 @@ fn should_poll_codex_messages(
         || !pending_compactions.is_empty()
 }
 
-fn fallback_thread(mapper: &CodexMapper, active_turns: &ActiveTurns) -> ThreadId {
+/// The native thread to attribute a message Codex sent without a thread id to.
+///
+/// Unchanged in spirit from naming a fallback `ThreadId`: a running command's thread first, then
+/// the single active turn if there is exactly one. An unnamed scope when nothing disambiguates,
+/// which labels as the nil `ThreadId` — exactly what this returned before.
+fn fallback_scope(mapper: &CodexMapper, active_turns: &ActiveTurns) -> NativeThreadId {
     mapper
-        .running_command_fallback_thread()
+        .running_command_fallback_scope()
         .or_else(|| {
             (active_turns.len() == 1)
-                .then(|| active_turns.keys().next().copied())
+                .then(|| {
+                    active_turns
+                        .keys()
+                        .next()
+                        .and_then(|thread| mapper.scope_for_thread(*thread))
+                })
                 .flatten()
         })
-        .unwrap_or_default()
+        .unwrap_or_else(|| NativeThreadId::new(""))
 }
 
 fn warn_slow_first_events(active_turns: &mut ActiveTurns) {
@@ -1775,10 +1785,10 @@ async fn handle_background_server_message(
     active_turns: &mut ActiveTurns,
     msg: codex_codes::ServerMessage,
 ) -> StreamOutcome {
-    let fallback_thread = fallback_thread(mapper, active_turns);
+    let fallback = fallback_scope(mapper, active_turns);
     match msg {
         codex_codes::ServerMessage::Notification(notif) => {
-            if let Some(event) = mapper.map_notification(&notif, fallback_thread) {
+            if let Some(event) = mapper.map_notification(&notif, &fallback) {
                 let thread = event_thread(&event);
                 if let Some(active) = active_turns.get_mut(&thread) {
                     active.mark_server_message();
@@ -1816,7 +1826,9 @@ async fn handle_background_server_message(
                 if let Some(turn) = completed_active_turn {
                     cleanup_active_turn_upload(client, active_turns, thread).await;
                     active_turns.remove(&thread);
-                    mapper.clear_active_turn(thread);
+                    if let Some(scope) = mapper.scope_for_thread(thread) {
+                        mapper.clear_active_turn(&scope);
+                    }
                     debug!(
                         %thread,
                         %turn,
@@ -1828,7 +1840,9 @@ async fn handle_background_server_message(
                 {
                     cleanup_active_turn_upload(client, active_turns, thread).await;
                     active_turns.remove(&thread);
-                    mapper.clear_active_turn(thread);
+                    if let Some(scope) = mapper.scope_for_thread(thread) {
+                        mapper.clear_active_turn(&scope);
+                    }
                 }
                 if let Some(elapsed_ms) = completed_compaction {
                     return StreamOutcome::CompactionCompleted { thread, elapsed_ms };
@@ -1845,7 +1859,7 @@ async fn handle_background_server_message(
                     method = notif.method(),
                     harness_thread_id,
                     native_turn_id,
-                    fallback_thread = %fallback_thread,
+                    fallback_scope = %fallback,
                     error = %message,
                     "dropping fatal Codex error notification that could not be mapped to a known thread"
                 );
@@ -1853,7 +1867,7 @@ async fn handle_background_server_message(
             StreamOutcome::TurnEnded
         }
         codex_codes::ServerMessage::Request { id, request } => {
-            let Some(event) = mapper.map_server_request(&id, &request, fallback_thread) else {
+            let Some(event) = mapper.map_server_request(&id, &request, &fallback) else {
                 respond_unroutable_server_request(client, &id, &request).await;
                 return StreamOutcome::TurnEnded;
             };
@@ -1898,7 +1912,7 @@ async fn handle_control_command(
         }
         Some(ControlCommand::Interrupt { thread, response }) => {
             let native_turn_id = mapper
-                .active_native_turn_for_thread(thread.thread)
+                .active_native_turn_for_thread(&NativeThreadId::new(&thread.harness_thread_id))
                 .map(str::to_owned);
             let result = timeout_codex_control(
                 "interrupt",
@@ -1926,8 +1940,15 @@ async fn handle_control_command(
             response,
         }) => {
             let native_turn_id = mapper
-                .native_turn_for_process(thread.thread, &process_id)
-                .or_else(|| mapper.active_native_turn_for_thread(thread.thread))
+                .native_turn_for_process(
+                    &NativeThreadId::new(&thread.harness_thread_id),
+                    &process_id,
+                )
+                .or_else(|| {
+                    mapper.active_native_turn_for_thread(&NativeThreadId::new(
+                        &thread.harness_thread_id,
+                    ))
+                })
                 .map(str::to_owned);
             let result = timeout_codex_control(
                 "terminate_command",
@@ -2612,9 +2633,16 @@ async fn handle_start_turn(
     };
 
     let turn = if let Some(model) = overrides.model.clone() {
-        mapper.register_active_turn_with_model(thread.thread, &resp.turn.id, model)
+        mapper.register_active_turn_with_model(
+            &NativeThreadId::new(&thread.harness_thread_id),
+            &resp.turn.id,
+            model,
+        )
     } else {
-        mapper.register_active_turn(thread.thread, &resp.turn.id)
+        mapper.register_active_turn(
+            &NativeThreadId::new(&thread.harness_thread_id),
+            &resp.turn.id,
+        )
     };
     match turn {
         Some(turn) => Ok(StartedTurn {
@@ -3076,7 +3104,9 @@ async fn emit_incomplete_active_turns(
         .collect();
     for (thread, turn) in turns {
         emit_incomplete_turn(senders, thread, turn, message.clone()).await;
-        mapper.clear_active_turn(thread);
+        if let Some(scope) = mapper.scope_for_thread(thread) {
+            mapper.clear_active_turn(&scope);
+        }
     }
     active_turns.clear();
 }
@@ -3175,7 +3205,7 @@ async fn handle_respond_server_request(
         .map_err(HarnessError::Protocol)?;
     let request_id = pending.request_id.clone();
     let context = CodexOperationContext::new("respond_server_request")
-        .with_thread_id(pending.thread)
+        .with_thread_id(mapper.thread_id_for(&pending.scope))
         .with_request_id(&request_id);
     match response {
         ServerRequestResponse::Result { value } => {
@@ -3186,7 +3216,7 @@ async fn handle_respond_server_request(
         }
     }
     mapper.resolve_server_request(id);
-    let thread = pending.thread;
+    let thread = mapper.thread_id_for(&pending.scope);
     let turn = pending.turn;
     let request_id = id.clone();
     let _ = broadcast_event(senders, thread, || AgentEvent::ServerRequestResolved {
@@ -3204,8 +3234,11 @@ async fn reject_pending_requests_for_interrupted_thread(
     senders: &SenderMap,
     thread: ThreadId,
 ) {
-    let approval_ids = mapper.pending_approval_ids_for_thread(thread);
-    let server_request_ids = mapper.pending_server_request_ids_for_thread(thread);
+    let Some(scope) = mapper.scope_for_thread(thread) else {
+        return;
+    };
+    let approval_ids = mapper.pending_approval_ids_for_thread(&scope);
+    let server_request_ids = mapper.pending_server_request_ids_for_thread(&scope);
 
     if approval_ids.is_empty() && server_request_ids.is_empty() {
         debug!(
@@ -3253,7 +3286,7 @@ async fn handle_interrupt(
     thread: &ThreadHandle,
 ) -> Result<(), HarnessError> {
     let native_turn_id = mapper
-        .active_native_turn_for_thread(thread.thread)
+        .active_native_turn_for_thread(&NativeThreadId::new(&thread.harness_thread_id))
         .ok_or_else(|| HarnessError::Unsupported("no active Codex turn to interrupt".into()))?;
     handle_interrupt_turn(
         client,
