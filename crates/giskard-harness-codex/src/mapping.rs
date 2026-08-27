@@ -203,7 +203,8 @@ impl CodexMapper {
     }
 
     /// B4: bind a native thread id to its owned `ThreadId`. Called at `open_thread` for both fresh
-    /// `thread/start` and `thread/resume` (and re-bound after a resume-fallback, §4.7/C5).
+    /// `thread/start` and `thread/resume` (and re-bound after a resume-fallback, §4.7/C5), and
+    /// provisionally when Codex announces a native thread Giskard has not opened yet.
     pub fn register_thread(&mut self, harness_thread_id: String, thread: ThreadId) {
         self.thread_ids.insert(harness_thread_id, thread);
     }
@@ -214,6 +215,44 @@ impl CodexMapper {
     /// by, instead of inventing a second identity for it.
     pub fn thread_for_native(&self, harness_thread_id: &str) -> Option<ThreadId> {
         self.thread_ids.get(harness_thread_id).copied()
+    }
+
+    /// Drop a native thread binding and every scoped registry keyed by the `ThreadId` it owned.
+    ///
+    /// Used to retire a provisional binding the server never took ownership of. Leaving the
+    /// id-translation registries behind would keep minting stable `TurnId`s and `ItemId`s for a
+    /// thread nothing will ever persist, and would make a later re-announcement of the same native
+    /// id resolve to a `ThreadId` no longer bound to it.
+    ///
+    /// Returns the JSON-RPC ids of any requests Codex is still waiting on for this thread, or
+    /// `None` if the native id was not bound. They are the caller's to answer: forgetting one
+    /// silently leaves Codex blocked on a reply that can no longer be routed, where an unroutable
+    /// request would have been refused outright.
+    pub fn unregister_thread(&mut self, harness_thread_id: &str) -> Option<Vec<RequestId>> {
+        let thread = self.thread_ids.remove(harness_thread_id)?;
+        self.clear_active_turn(thread);
+        self.turn_ids.retain(|(owner, _), _| *owner != thread);
+        self.item_ids.retain(|(owner, _, _), _| *owner != thread);
+        self.running_command_turns
+            .retain(|(owner, _), _| *owner != thread);
+        self.running_commands
+            .retain(|(owner, _, _)| *owner != thread);
+        let mut unanswered = Vec::new();
+        self.pending_approval_responses.retain(|_, pending| {
+            let owned = pending.thread == thread;
+            if owned {
+                unanswered.push(pending.request_id.clone());
+            }
+            !owned
+        });
+        self.pending_server_requests.retain(|_, pending| {
+            let owned = pending.thread == thread;
+            if owned {
+                unanswered.push(pending.request_id.clone());
+            }
+            !owned
+        });
+        Some(unanswered)
     }
 
     /// Resolve a native thread id to its owned `ThreadId`.

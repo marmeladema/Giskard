@@ -603,6 +603,7 @@ dependencies = [
  "codex-codes",
  "giskard-core",
  "giskard-harness",
+ "indexmap",
  "rand 0.8.6",
  "serde",
  "serde_json",

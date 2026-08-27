@@ -121,6 +121,7 @@ async fn open_thread_one_turn_assert_state() {
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
             }),
+            retain_until_subscribed: false,
         })
         .await
         .expect("open_thread failed");
@@ -258,6 +259,7 @@ async fn replay_persisted_state_roundtrip() {
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
             }),
+            retain_until_subscribed: false,
         })
         .await
         .unwrap();

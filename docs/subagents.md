@@ -67,6 +67,55 @@ The Codex adapter maps both known protocols into the same harness-neutral sub-ag
 Giskard does not decrypt or inspect Codex rollout storage to recover a missing prompt. It uses only
 the fields exposed through the adapter protocol.
 
+## Events a child produces before Giskard imports it
+
+A child is already working before Giskard can know it exists. Codex creates the child's thread and
+submits its first turn *before* it completes the parent tool call that names the child, and the
+import that follows still has to read the project, validate the ownership chain, create the child's
+thread record, and start its monitor. Everything Codex emits for the child in that window belongs
+to the child's first turn.
+
+Those events are kept rather than dropped. The Codex adapter binds a native thread to a `ThreadId`
+as soon as Codex announces it — which the protocol guarantees happens before that thread's own
+notifications are forwarded — and holds the child's events until the monitor attaches, at which
+point they are replayed. Replay preserves each item's own order, not the exact interleaving Codex
+produced: coalescing an item's deltas moves later ones forward to the position of that item's first
+delta, ahead of unrelated items streamed in between. The import adopts the identity the adapter
+already bound, so the retained events belong to the thread the server persists. See
+[Native thread announcement and event
+retention](../crates/giskard-harness-codex/README.md#native-thread-announcement-and-event-retention)
+for the mechanism.
+
+Two consequences are visible:
+
+- An approval the child raises in that window is delivered to the browser once the monitor attaches,
+  instead of being refused on the child's behalf.
+- Everything the child completed in that window survives the wait. What is retained shrinks as the
+  child works rather than growing with everything it streams: an item's streamed deltas collapse
+  into one entry, and are discarded outright once that item completes, since the completion carries
+  its final content. A child that finished several items before its monitor attached replays their
+  completions and no streaming at all.
+
+Retention is not unconditional, and the cases where it ends without a subscriber are worth naming
+rather than glossing:
+
+- **Deadline expiry.** A native thread Codex announces that Giskard never imports — one belonging to
+  another owner, or one whose import was rejected — is retired after `PROVISIONAL_THREAD_TTL`. Its
+  retained events are discarded with a warning naming the thread and how many went with it, and any
+  Codex request still outstanding on it is refused, because Codex blocks until one is answered.
+- **Retention released after import.** A thread the server *did* take but never attached a forwarder
+  to has its retention released on the same schedule, keeping the binding. Those events are gone:
+  this is the one case where a server-side failure between opening a child and forwarding it loses
+  that child's opening events.
+- **Never announced.** Traffic for an unknown native thread that was never announced is still
+  dropped, with a warning. This is the original failure this mechanism exists to close, and it
+  remains the fallback if Codex ever stops emitting `thread/status/changed` before a thread's own
+  notifications.
+
+Beyond retention, a subscriber that falls far enough behind a *live* thread can outrun the harness
+channel's ring buffer and skip events. That is a separate, still-open gap: see the `Lagged` arm of
+the server's event forwarder.
+
 ## Passive monitoring lifecycle
 
 Opening or materializing a child and monitoring it are separate decisions:
@@ -76,6 +125,25 @@ Opening or materializing a child and monitoring it are separate decisions:
 | `spawned`, `started`, `interacted`, `pending`, or `running` | Start or retain a passive monitor until the native child turn or a terminal lifecycle event arrives. Before a turn, ten minutes with no stream event releases a monitor whose terminal event was missed. |
 | `interrupted`, `completed`, `failed`, `shutdown`, or `not_found` | Never start a new monitor. Wake an existing idle monitor immediately and recover terminal output when necessary. |
 | Existing child reopened with no lifecycle evidence | Do not start another monitor. |
+
+One monitor task serves every lifecycle a child is observed to start, rather than one task per
+lifecycle. Forwarders are per-turn and exit at their own turn's completion, while an observation
+arriving before the task releases monitor ownership is merged into its metadata instead of starting
+a monitor of its own — so the exiting task is the only thing that can pick that lifecycle up. It
+checks for one and releases ownership in a single step under the registration lock: doing the two
+separately would leave a gap where an observation merges into a monitor that is already going away,
+and the child's next turn would sit in the harness's retention with nobody to claim it. Because the
+"active lifecycle observed" flag latches, the check counts observations instead, so a monitor can
+tell the one it was started for from one that arrived while it was finishing.
+
+That check steps through pending lifecycles one at a time rather than jumping to the newest, since
+a forwarder ends at its own turn's completion and can only serve one. An unserved lifecycle also
+outranks a terminal observation: terminal evidence says the child has finished, not that its turns
+were recorded, and its fallback transcript is skipped once the thread has history — so releasing on
+it would strand a turn that did happen. The replacement cannot hang on a child that really is over,
+because the pre-turn wait polls the stream ahead of the lifecycle signal: it serves whatever was
+retained and only then stops on the terminal flag. Cancellation still suppresses the handoff, since
+it says to stop rather than that there is nothing left.
 
 The ten-minute bound is restarted by every event. After `TurnStarted`, the forwarder waits for
 normal completion regardless of how long the turn runs.

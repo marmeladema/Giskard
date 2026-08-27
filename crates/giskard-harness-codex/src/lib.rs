@@ -12,7 +12,7 @@ mod mapping;
 
 use crate::log_fields::display_opt;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, Weak};
 use std::time::{Duration, Instant};
@@ -24,10 +24,13 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 
+use indexmap::IndexMap;
+
 use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ApprovalId, ProjectId, ServerRequestId, ThreadId, TurnId};
+use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
+use giskard_core::item::ItemDelta;
 use giskard_core::mcp::{
     McpAuthStatus, McpOauthStart, McpResource, McpResourceTemplate, McpServerInfo, McpServerStatus,
     McpTool,
@@ -47,6 +50,23 @@ use mapping::CodexMapper;
 
 const BROADCAST_CAPACITY: usize = 256;
 const TURN_FIRST_EVENT_WARN_AFTER: Duration = Duration::from_secs(15);
+/// How long a native thread Codex announced may stay bound before the server claims it.
+///
+/// Long enough to cover a sub-agent import under contention — the project lifecycle lock, three
+/// store reads, a metadata fsync, and up to `STRICT_RESUME_RETRY_DELAYS_MS` of resume backoff —
+/// and short enough that a thread Giskard was never going to own does not hold its retained
+/// events indefinitely.
+#[cfg(not(test))]
+const PROVISIONAL_THREAD_TTL: Duration = Duration::from_secs(120);
+#[cfg(test)]
+const PROVISIONAL_THREAD_TTL: Duration = Duration::from_millis(500);
+/// Upper bound on concurrently unclaimed announced threads. Past this the adapter reverts to
+/// dropping unknown-thread traffic with the existing warning rather than growing without limit.
+const MAX_PROVISIONAL_THREADS: usize = 32;
+#[cfg(not(test))]
+const PROVISIONAL_SWEEP_INTERVAL: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const PROVISIONAL_SWEEP_INTERVAL: Duration = Duration::from_millis(50);
 const STRICT_RESUME_RETRY_DELAYS_MS: [u64; 7] = [10, 20, 40, 80, 160, 320, 500];
 #[cfg(not(test))]
 const CODEX_JSON_RPC_TIMEOUT: Duration = Duration::from_secs(10);
@@ -67,6 +87,23 @@ struct PendingContextRestore {
     thread: ThreadId,
     model: ModelRef,
     sink: giskard_harness::ThreadUpdateSink,
+}
+
+/// A native Codex thread that announced itself before Giskard knew what it was.
+///
+/// Codex spawns a sub-agent by creating its thread, submitting its first turn, and only then
+/// completing the parent's tool call that names the child. Giskard therefore learns the child's
+/// identity from the parent *after* the child has begun producing events, and the server needs a
+/// further round of store reads and validation before it can import it. Binding the announced
+/// native id to a `ThreadId` here — ahead of any of that — is what keeps the child's opening
+/// events routable instead of unattributable.
+///
+/// The binding is provisional in one specific sense: nothing has yet established that this thread
+/// is a sub-agent of a thread Giskard owns, or that it is Giskard's to own at all. The server
+/// confirms it by subscribing; [`sweep_provisional_threads`] retires it otherwise.
+struct ProvisionalThread {
+    thread: ThreadId,
+    announced_at: Instant,
 }
 
 struct OpenThreadOutcome {
@@ -297,7 +334,221 @@ struct WorkerReceivers {
     shutdown: watch::Receiver<bool>,
 }
 
-type SenderMap = Arc<StdMutex<HashMap<ThreadId, broadcast::Sender<AgentEvent>>>>;
+/// One thread's event channel, plus the events it holds while nothing is subscribed.
+///
+/// `broadcast::Sender::send` discards the value outright when the channel has no receivers, and a
+/// receiver created later starts at the current tail rather than replaying the ring. Between the
+/// harness binding a thread and the server subscribing to it there is real work — metadata
+/// creation, an fsync, ownership validation — and a sub-agent is already running throughout, so
+/// those events need somewhere to go.
+///
+/// Retention is a queue rather than the channel's own ring because the ring evicts by age, and age
+/// is the wrong order: an `ItemCompleted` is the only record of its item, while the deltas that
+/// preceded it are reconstructible from it. A ring under pressure drops them in exactly the wrong
+/// priority. [`RetainedEvents`] drops by redundancy instead.
+struct ThreadChannel {
+    sender: broadcast::Sender<AgentEvent>,
+    /// Whether a forwarder has ever attached to this thread.
+    ///
+    /// Tracked separately from `retained` because the two answer different questions and only
+    /// coincide at first: retention is *also* released on a deadline, so an absent queue stops
+    /// meaning "somebody took it". Inferring one from the other lets a binding whose retention
+    /// timed out leave the provisional set as though it had been subscribed — un-retired, still
+    /// bound to a `ThreadId` nobody owns, and with whatever Codex is blocked on never refused.
+    subscribed: bool,
+    /// `Some` while no subscriber has attached: events are queued here instead of broadcast.
+    /// Taken by the first `subscribe`, which replays it ahead of the live stream. `None` is also
+    /// how the worker's sweep tells a channel the server has claimed from one it never did.
+    retained: Option<RetainedEvents>,
+    /// Whether Codex's last status announcement for this thread said it was running.
+    ///
+    /// `Active` is not a turn-opening signal on its own: Codex republishes it whenever a turn's
+    /// active flags change, so an approval or user-input request mid-turn arrives as another
+    /// `Active`. Only the edge into it opens a lifecycle, and only that edge may restart the
+    /// mirror; treating every `Active` as one would discard the turn's opening events the moment
+    /// it asked for approval.
+    announced_active: bool,
+}
+
+/// Events held for a thread whose subscriber has not attached yet.
+///
+/// Ordered by insertion so a replay preserves the order Codex produced, and keyed so a delta can
+/// find the accumulator it continues however many other items interleaved with it. Two rules keep
+/// what this holds proportional to what the thread actually did rather than to how much it
+/// streamed:
+///
+/// - **Deltas for one item accumulate into a single entry.** A run of deltas is pure
+///   concatenation — the browser appends each to the same element, and the server's own live
+///   buffer already compacts such a run into one delta — so this is that same operation done
+///   earlier. Keying by item rather than folding into the tail means an item whose stream
+///   interleaves with another's still costs one entry.
+/// - **An item's deltas are dropped once its completion arrives.** `ItemCompleted` carries the
+///   item's final content and is the only thing the server assembles a persisted turn from, so
+///   the deltas ahead of it describe a state nothing will ever read; `runtime_live` deletes them
+///   for the same reason once the turn is live.
+///
+/// What survives is the thread's lifecycle plus the partial stream of whatever item is still
+/// open — bounded by the shape of a turn rather than by a limit to tune.
+/// Replay is therefore *not* the exact order Codex produced. Accumulating into the slot a delta
+/// first occupied moves later text ahead of unrelated events that arrived in between, so `A1, B1,
+/// A2` replays as `A1A2, B1`. The reordering is bounded to unrelated items: a delta cannot move
+/// ahead of its own `TurnStarted`, which precedes the slot, nor behind its own `ItemCompleted`,
+/// which deletes it. Everything that is not a delta keeps its position exactly.
+///
+/// # There is deliberately no size limit
+///
+/// This queue is unbounded, and that is a decision rather than an oversight. A bound has to say
+/// what happens when it is hit, and every answer that deletes is wrong here: outside the deltas,
+/// which compaction already handles, each retained event is the sole record of something the child
+/// did — an `ItemCompleted` is the only source of a persisted turn item, and a `TurnCompleted` the
+/// only thing that closes a turn. Evicting any of them buys bounded memory with permanent, silent
+/// history loss, which is precisely the failure this whole mechanism exists to close.
+///
+/// Growth is not open-ended in practice: what is held is proportional to what the child *completed*
+/// while unsubscribed, not to what it streamed, and [`PROVISIONAL_THREAD_TTL`] puts a wall-clock
+/// ceiling on how long any thread can accumulate before its retention is released.
+///
+/// If a hard bound is ever needed, it must refuse or apply backpressure at the producer — decline
+/// to retain further, or stop reading Codex's stream — never delete what it already holds.
+struct RetainedEvents {
+    slots: IndexMap<RetainedSlot, AgentEvent>,
+    next_passthrough: u64,
+    retained_since: Instant,
+    merged_deltas: usize,
+    compacted_deltas: usize,
+}
+
+/// Where one retained event sits in the replay order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RetainedSlot {
+    /// One item's accumulated stream of one delta kind. Kinds stay separate because they render
+    /// in different places.
+    Delta {
+        turn: TurnId,
+        item: ItemId,
+        kind: RetainedDeltaKind,
+    },
+    /// Everything else, each at its own position, never merged and never dropped.
+    Passthrough(u64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RetainedDeltaKind {
+    Text,
+    CommandOutput,
+}
+
+impl RetainedDeltaKind {
+    fn of(delta: &ItemDelta) -> Self {
+        match delta {
+            ItemDelta::Text { .. } => Self::Text,
+            ItemDelta::CommandOutput { .. } => Self::CommandOutput,
+        }
+    }
+}
+
+impl RetainedEvents {
+    fn new() -> Self {
+        Self {
+            slots: IndexMap::new(),
+            next_passthrough: 0,
+            retained_since: Instant::now(),
+            merged_deltas: 0,
+            compacted_deltas: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// How many retained events would actually be missed if this retention were dropped.
+    ///
+    /// Every channel retains its own `ThreadOpened` by construction, and the runtime assigns it no
+    /// sequence, so a retention holding only that held nothing anyone was waiting for.
+    fn discardable_len(&self) -> usize {
+        self.slots
+            .values()
+            .filter(|event| !matches!(event, AgentEvent::ThreadOpened { .. }))
+            .count()
+    }
+
+    fn push(&mut self, event: AgentEvent) {
+        match &event {
+            AgentEvent::ItemDelta {
+                turn,
+                item_id,
+                delta,
+                ..
+            } => {
+                let slot = RetainedSlot::Delta {
+                    turn: *turn,
+                    item: *item_id,
+                    kind: RetainedDeltaKind::of(delta),
+                };
+                if let Some(AgentEvent::ItemDelta {
+                    delta: accumulated, ..
+                }) = self.slots.get_mut(&slot)
+                {
+                    append_delta(accumulated, delta);
+                    self.merged_deltas += 1;
+                    return;
+                }
+                self.slots.insert(slot, event);
+            }
+            AgentEvent::ItemCompleted { turn, item, .. } => {
+                self.compact_item_deltas(*turn, item.id);
+                self.push_passthrough(event);
+            }
+            _ => self.push_passthrough(event),
+        }
+    }
+
+    /// Drop the accumulated stream of an item that has just completed.
+    ///
+    /// `shift_remove` keeps the relative order of everything that survives, so compaction only
+    /// ever deletes from the replay — it never reorders it.
+    fn compact_item_deltas(&mut self, turn: TurnId, item: ItemId) {
+        for kind in [RetainedDeltaKind::Text, RetainedDeltaKind::CommandOutput] {
+            if self
+                .slots
+                .shift_remove(&RetainedSlot::Delta { turn, item, kind })
+                .is_some()
+            {
+                self.compacted_deltas += 1;
+            }
+        }
+    }
+
+    fn push_passthrough(&mut self, event: AgentEvent) {
+        self.slots
+            .insert(RetainedSlot::Passthrough(self.next_passthrough), event);
+        self.next_passthrough += 1;
+    }
+
+    fn into_backlog(self) -> VecDeque<AgentEvent> {
+        self.slots.into_values().collect()
+    }
+}
+
+/// Concatenate one delta onto the accumulator it continues.
+///
+/// Mismatched kinds cannot reach here: they hash to different slots.
+fn append_delta(accumulated: &mut ItemDelta, delta: &ItemDelta) {
+    match (accumulated, delta) {
+        (ItemDelta::Text { text: into }, ItemDelta::Text { text })
+        | (ItemDelta::CommandOutput { chunk: into }, ItemDelta::CommandOutput { chunk: text }) => {
+            into.push_str(text)
+        }
+        (into, from) => debug_assert_eq!(
+            std::mem::discriminant(&*into),
+            std::mem::discriminant(from),
+            "delta kinds are part of the retention slot key"
+        ),
+    }
+}
+
+type SenderMap = Arc<StdMutex<HashMap<ThreadId, ThreadChannel>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerQueueKind {
@@ -1231,9 +1482,14 @@ impl AgentHarness for CodexHarness {
     }
 
     fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Some(sender) = sender_for_thread(&self.senders, thread.thread) {
-            return AgentEventStream::new(sender.subscribe());
+        if let Some(stream) = subscribe_thread(&self.senders, thread.thread) {
+            return stream;
         }
+        warn!(
+            thread_id = %thread.thread,
+            harness_thread_id = %thread.harness_thread_id,
+            "subscribing to a Codex thread with no event channel; the stream will be empty"
+        );
         let (_, rx) = broadcast::channel(1);
         AgentEventStream::new(rx)
     }
@@ -1434,7 +1690,9 @@ async fn background_task<C>(
     let mut pending_compactions: HashMap<ThreadId, PendingCompaction> = HashMap::new();
     let mut pending_context_restores: HashMap<String, PendingContextRestore> = HashMap::new();
     let mut active_turns: ActiveTurns = HashMap::new();
+    let mut provisional_threads: HashMap<String, ProvisionalThread> = HashMap::new();
     let mut first_event_warn_tick = tokio::time::interval(Duration::from_secs(1));
+    let mut provisional_sweep_tick = tokio::time::interval(PROVISIONAL_SWEEP_INTERVAL);
 
     loop {
         tokio::select! {
@@ -1448,6 +1706,12 @@ async fn background_task<C>(
                 match msg {
                     Ok(Some(msg)) => {
                         observe_pending_context_restore(&mut pending_context_restores, &msg);
+                        observe_native_thread_announcement(
+                            &mut mapper,
+                            &senders,
+                            &mut provisional_threads,
+                            &msg,
+                        );
                         match handle_background_server_message(
                                 &mut client,
                                 &mut mapper,
@@ -1557,8 +1821,14 @@ async fn background_task<C>(
 
                 match queued.command {
                     HarnessCommand::OpenThread { opts, response } => {
-                        let result =
-                            handle_open_thread(&mut client, &mut mapper, &opts, &senders).await;
+                        let result = handle_open_thread(
+                            &mut client,
+                            &mut mapper,
+                            &opts,
+                            &senders,
+                            &mut provisional_threads,
+                        )
+                        .await;
                         match result {
                             Ok(outcome) => {
                                 let handle = outcome.handle;
@@ -1639,6 +1909,15 @@ async fn background_task<C>(
             }
             _ = first_event_warn_tick.tick(), if !active_turns.is_empty() => {
                 warn_slow_first_events(&mut active_turns);
+            }
+            _ = provisional_sweep_tick.tick() => {
+                sweep_provisional_threads(
+                    &mut client,
+                    &mut mapper,
+                    &senders,
+                    &mut provisional_threads,
+                )
+                .await;
             }
         }
     }
@@ -2274,12 +2553,16 @@ async fn handle_open_thread(
     mapper: &mut CodexMapper,
     opts: &OpenThreadOptions,
     senders: &SenderMap,
+    provisional: &mut HashMap<String, ProvisionalThread>,
 ) -> Result<OpenThreadOutcome, HarnessError> {
     let cwd = opts.workspace_root.to_string_lossy().to_string();
     // An explicit id wins — the caller knows this thread's durable identity. Otherwise, if the
     // native thread being resumed is already bound, reuse that binding rather than inventing an
     // id: a caller passing `None` is saying it has no opinion, not that this is a new thread, and
     // minting here would give one thread two identities for everything downstream to reconcile.
+    //
+    // An announcement registers its provisional id here too, so this one lookup covers both a
+    // thread the server pre-registered and one Codex told us about first.
     let thread_id = opts
         .thread
         .or_else(|| {
@@ -2339,9 +2622,23 @@ async fn handle_open_thread(
 
     // B4: bind the (possibly re-established) native id to the durable ThreadId.
     mapper.register_thread(opened.harness_thread_id.clone(), thread_id);
+    // An explicit ThreadId outranks a provisional binding for the same native thread: the caller
+    // already knows this thread's durable identity. Retire the provisional one rather than leave
+    // an orphan channel buffering for a ThreadId nothing is bound to.
+    discard_superseded_provisional(senders, provisional, &opened.harness_thread_id, thread_id);
+    provisional.remove(&opened.harness_thread_id);
+    // The server has taken ownership of this native thread, so the binding stops being a guess and
+    // the sweep must stop treating it as one. It can still decline the import afterwards, which
+    // strands a mapping and an empty channel until the harness restarts — the lesser cost, since
+    // retiring a thread the server *did* keep would leave a persisted thread permanently
+    // unroutable: reopening it short-circuits on the live binding and never rebinds the native id.
 
-    let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
-    ensure_thread_sender(senders, thread_id, tx);
+    ensure_thread_channel(senders, thread_id);
+    if opts.retain_until_subscribed {
+        // Reopening a thread whose previous forwarder is gone: the caller subscribes only after
+        // further work, and this thread is running in the meantime.
+        retain_thread_channel(senders, thread_id, RetainReason::ReopenedThread);
+    }
 
     let _ = broadcast_event(senders, thread_id, || AgentEvent::ThreadOpened {
         thread: thread_id,
@@ -2376,6 +2673,279 @@ async fn handle_open_thread(
         },
         resume_replay_model,
     })
+}
+/// Drop a provisional binding that an explicit `ThreadId` has just superseded for the same native
+/// thread, so nothing is left buffering under the abandoned identity.
+fn discard_superseded_provisional(
+    senders: &SenderMap,
+    provisional: &mut HashMap<String, ProvisionalThread>,
+    native_thread_id: &str,
+    adopted: ThreadId,
+) {
+    let Some(entry) = provisional.get(native_thread_id) else {
+        return;
+    };
+    if entry.thread == adopted {
+        return;
+    }
+    let superseded = entry.thread;
+    provisional.remove(native_thread_id);
+    lock_senders(senders).remove(&superseded);
+    warn!(
+        native_thread_id,
+        provisional_thread = %superseded,
+        %adopted,
+        "discarding a provisional Codex thread binding superseded by an explicit thread id"
+    );
+}
+
+/// Bind a native thread Codex has just announced, before it starts producing events.
+///
+/// The app server attaches a client listener to a newly loaded thread in two steps: it publishes
+/// `thread/status/changed` for the thread, and only then starts forwarding that thread's own
+/// notifications. Both travel the same connection in order, so an announcement always precedes
+/// the announced thread's first event — which is the property that lets the adapter bind the id
+/// ahead of the traffic rather than racing it.
+///
+/// Only `thread/status/changed` is treated as an announcement today, because it is the one Codex
+/// emits for a spawned sub-agent: `thread/start` and `thread/fork` announce their threads with
+/// the silent variant, and `thread/started` is reserved for threads a client asked for by name
+/// (plus detached review threads, which Giskard does not import). If Giskard ever imports forks or
+/// review threads, `thread/started` becomes the second announcement to handle here.
+fn observe_native_thread_announcement(
+    mapper: &mut CodexMapper,
+    senders: &SenderMap,
+    provisional: &mut HashMap<String, ProvisionalThread>,
+    message: &codex_codes::ServerMessage,
+) {
+    let codex_codes::ServerMessage::Notification(
+        codex_codes::messages::Notification::ThreadStatusChanged(notification),
+    ) = message
+    else {
+        return;
+    };
+    let native_thread_id = notification.thread_id.trim();
+    if native_thread_id.is_empty() {
+        return;
+    }
+    // An unload is the opposite of an announcement: the thread has just stopped producing. Neither
+    // binding one nor re-arming retention for one is right, and Codex reports a status transition
+    // per thread rather than only for threads a client is attached to. Every other status is
+    // treated as an announcement: a child is often still `Idle` when its listener attaches,
+    // because the app server publishes the transition before the child's first turn registers as
+    // running.
+    if matches!(notification.status, codex_codes::ThreadStatus::NotLoaded) {
+        if let Some(thread) = mapper.thread_for_native(native_thread_id) {
+            forget_announced_activity(senders, thread);
+        }
+        return;
+    }
+
+    // An announcement for a thread we already know is not nothing. It still means Codex is about
+    // to forward that thread's events, and there may be nothing able to receive them:
+    //
+    // - a thread pre-registered at harness creation is mapped but has no channel at all, so its
+    //   events would be dropped for want of one;
+    // - a thread whose monitor has since ended has a channel, but its retention was taken by that
+    //   subscriber or released by the sweep, so its events would be broadcast to no receiver.
+    //
+    // Both are the same loss the initial-import case suffers, arrived at from a reopen instead.
+    // Give the events somewhere to go — and, when the thread goes from quiet to running, give the
+    // new turn somewhere to go even though a receiver is attached, because that receiver may be a
+    // forwarder about to exit at the previous turn's completion. Retention mirrors rather than
+    // diverts in that case, so the live consumer is never starved.
+    //
+    // Whether an `Active` opens a turn depends on what the previous announcement said, so
+    // `retain_thread_channel` makes that call: only it holds that state.
+    if let Some(thread) = mapper.thread_for_native(native_thread_id) {
+        let reason = if matches!(
+            notification.status,
+            codex_codes::ThreadStatus::Active { .. }
+        ) {
+            RetainReason::AnnouncedActive
+        } else {
+            RetainReason::AnnouncedQuiet
+        };
+        ensure_thread_channel(senders, thread);
+        retain_thread_channel(senders, thread, reason);
+        return;
+    }
+
+    if provisional.len() >= MAX_PROVISIONAL_THREADS {
+        warn!(
+            native_thread_id,
+            provisional_threads = provisional.len(),
+            "refusing to bind another announced Codex thread; its events will be dropped as unknown"
+        );
+        return;
+    }
+    let thread = ThreadId::new();
+    mapper.register_thread(native_thread_id.to_owned(), thread);
+    ensure_thread_channel(senders, thread);
+    provisional.insert(
+        native_thread_id.to_owned(),
+        ProvisionalThread {
+            thread,
+            announced_at: Instant::now(),
+        },
+    );
+    debug!(
+        %thread,
+        native_thread_id,
+        provisional_threads = provisional.len(),
+        "bound a Codex-announced native thread provisionally"
+    );
+}
+
+/// Retire announced threads the server never took ownership of, and stale retention on threads it
+/// did.
+///
+/// A binding leaves this set the moment `open_thread` adopts it: from then on the server owns the
+/// thread, and retiring it would leave a persisted thread with no route back to Codex. What
+/// remains here is the genuinely provisional case — a native thread Codex announced that Giskard
+/// turned out not to want, or never got to.
+async fn sweep_provisional_threads(
+    client: &mut dyn CodexTransport,
+    mapper: &mut CodexMapper,
+    senders: &SenderMap,
+    provisional: &mut HashMap<String, ProvisionalThread>,
+) {
+    struct Retired {
+        native_thread_id: String,
+        thread: ThreadId,
+        age: Duration,
+        retained_events: usize,
+        gone: bool,
+    }
+
+    let mut retired: Vec<Retired> = Vec::new();
+    let mut released: Vec<(ThreadId, usize)> = Vec::new();
+    {
+        let mut guard = lock_senders(senders);
+        provisional.retain(|native_thread_id, entry| {
+            let age = entry.announced_at.elapsed();
+            let Some(channel) = guard.get(&entry.thread) else {
+                // The channel went away under us (an explicit thread deletion). Retire the binding
+                // with it rather than leave a native id resolving to a thread nothing can deliver
+                // to, which would silently discard its events from here on.
+                retired.push(Retired {
+                    native_thread_id: native_thread_id.clone(),
+                    thread: entry.thread,
+                    age,
+                    retained_events: 0,
+                    gone: true,
+                });
+                return false;
+            };
+            if channel.subscribed {
+                // Adoption should already have taken this binding out of the provisional set, so
+                // this is belt and braces — but retiring a thread with a live forwarder is
+                // precisely the failure worth being paranoid about.
+                return false;
+            }
+            let retained_events = channel.retained.as_ref().map_or(0, RetainedEvents::len);
+            if age < PROVISIONAL_THREAD_TTL {
+                return true;
+            }
+            retired.push(Retired {
+                native_thread_id: native_thread_id.clone(),
+                thread: entry.thread,
+                age,
+                retained_events,
+                gone: false,
+            });
+            false
+        });
+        for entry in &retired {
+            guard.remove(&entry.thread);
+        }
+        // A thread the server did take can still hold retention nobody used, when it never
+        // attached a forwarder at all or a reopen re-armed retention for one that had already
+        // finished. Release it so the channel stops holding events for a consumer that is not
+        // coming.
+        for (thread, channel) in guard.iter_mut() {
+            let discarded = channel
+                .retained
+                .as_ref()
+                .filter(|retained| retained.retained_since.elapsed() >= PROVISIONAL_THREAD_TTL)
+                .map(RetainedEvents::discardable_len);
+            if let Some(discarded) = discarded {
+                channel.retained = None;
+                released.push((*thread, discarded));
+            }
+        }
+    }
+
+    for entry in retired {
+        let unanswered = mapper
+            .unregister_thread(&entry.native_thread_id)
+            .unwrap_or_default();
+        if entry.gone {
+            debug!(
+                thread = %entry.thread,
+                native_thread_id = entry.native_thread_id,
+                "retiring an announced Codex thread whose channel was already removed"
+            );
+        } else {
+            warn!(
+                thread = %entry.thread,
+                native_thread_id = entry.native_thread_id,
+                age_ms = entry.age.as_millis(),
+                ttl_ms = PROVISIONAL_THREAD_TTL.as_millis(),
+                retained_events = entry.retained_events,
+                unanswered_requests = unanswered.len(),
+                "discarding a Codex-announced native thread Giskard never imported"
+            );
+        }
+        // Codex blocks on a server request until it is answered. Refusing here is what the
+        // adapter would have done had this thread never been routable in the first place.
+        for request_id in unanswered {
+            respond_retired_thread_request(client, &entry.native_thread_id, request_id).await;
+        }
+    }
+
+    for (thread, discarded) in released {
+        if discarded == 0 {
+            debug!(
+                %thread,
+                ttl_ms = PROVISIONAL_THREAD_TTL.as_millis(),
+                "releasing unused Codex event retention for an idle thread"
+            );
+            continue;
+        }
+        warn!(
+            %thread,
+            ttl_ms = PROVISIONAL_THREAD_TTL.as_millis(),
+            discarded_events = discarded,
+            "discarding retained Codex events for a thread that never attached a forwarder"
+        );
+    }
+}
+
+/// Refuse a request belonging to a native thread the adapter has just stopped routing.
+async fn respond_retired_thread_request(
+    client: &mut dyn CodexTransport,
+    native_thread_id: &str,
+    request_id: codex_codes::jsonrpc::RequestId,
+) {
+    let context = CodexOperationContext::new("refuse_retired_thread_request")
+        .with_harness_thread_id(native_thread_id)
+        .with_request_id(&request_id);
+    if let Err(error) = codex_respond_error_json(
+        client,
+        context,
+        request_id.clone(),
+        -32000,
+        "Giskard is no longer tracking the thread this request belongs to.",
+    )
+    .await
+    {
+        warn!(
+            native_thread_id,
+            error = %error,
+            "failed to refuse a request for a retired Codex thread"
+        );
+    }
 }
 
 fn observe_pending_context_restore(
@@ -2941,15 +3511,46 @@ fn runtime_workspace_roots(
 }
 
 async fn broadcast_event<F: FnOnce() -> AgentEvent>(senders: &SenderMap, thread: ThreadId, f: F) {
-    let sender = sender_for_thread(senders, thread);
-    if let Some(sender) = sender {
-        let _ = sender.send(f());
+    let mut guard = lock_senders(senders);
+    let Some(channel) = guard.get_mut(&thread) else {
+        // The mapper resolved this event to a thread whose channel is gone — a deletion, or a
+        // retirement that removed the channel just before it unbound the native id. Same loss as
+        // the receiver-less case below and worth the same warning: silence here is what made the
+        // original drop invisible.
+        warn!(
+            %thread,
+            event_kind = f().kind(),
+            "dropping a mapped Codex event for a thread with no channel"
+        );
+        return;
+    };
+    // Retaining and sending are decided under the same lock the first subscriber takes, so an
+    // event can neither be queued after the queue was handed away nor sent before it was.
+    let event = f();
+    if let Some(retained) = channel.retained.as_mut() {
+        retained.push(event.clone());
+        // With nothing attached, the queue *is* the delivery path and there is nobody to send to.
+        // With a receiver attached the queue is a mirror instead: the receiver may be a forwarder
+        // finishing the previous turn, which will drop everything still queued behind it when it
+        // exits, so the same event has to reach both the live receiver and the replacement that
+        // takes over from it.
+        if channel.sender.receiver_count() == 0 {
+            return;
+        }
+    }
+    // A thread retains from the moment its channel exists, so a send that finds no receiver means
+    // every consumer went away while the thread was still producing. That is a lost protocol
+    // event, not a routing failure: the mapper already resolved it to this thread.
+    if let Err(error) = channel.sender.send(event) {
+        warn!(
+            %thread,
+            event_kind = error.0.kind(),
+            "dropping a mapped Codex event with no receiver attached to its thread"
+        );
     }
 }
 
-fn lock_senders(
-    senders: &SenderMap,
-) -> StdMutexGuard<'_, HashMap<ThreadId, broadcast::Sender<AgentEvent>>> {
+fn lock_senders(senders: &SenderMap) -> StdMutexGuard<'_, HashMap<ThreadId, ThreadChannel>> {
     match senders.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
@@ -2959,19 +3560,129 @@ fn lock_senders(
     }
 }
 
-fn sender_for_thread(
-    senders: &SenderMap,
-    thread: ThreadId,
-) -> Option<broadcast::Sender<AgentEvent>> {
-    lock_senders(senders).get(&thread).cloned()
+/// Hand out this thread's event stream, replaying anything retained for it first.
+///
+/// Taking the queue and creating the receiver together is what keeps the seam invisible: an event
+/// the worker produces from here on finds retention already gone and goes to the receiver.
+fn subscribe_thread(senders: &SenderMap, thread: ThreadId) -> Option<AgentEventStream> {
+    let mut guard = lock_senders(senders);
+    let channel = guard.get_mut(&thread)?;
+    let receiver = channel.sender.subscribe();
+    channel.subscribed = true;
+    Some(match channel.retained.take() {
+        Some(retained) => {
+            debug!(
+                %thread,
+                replayed_events = retained.len(),
+                merged_deltas = retained.merged_deltas,
+                compacted_deltas = retained.compacted_deltas,
+                retained_ms = retained.retained_since.elapsed().as_millis(),
+                "replaying Codex events retained before this thread had a subscriber"
+            );
+            AgentEventStream::with_backlog(retained.into_backlog(), receiver)
+        }
+        None => AgentEventStream::new(receiver),
+    })
 }
 
-fn ensure_thread_sender(
-    senders: &SenderMap,
-    thread: ThreadId,
-    sender: broadcast::Sender<AgentEvent>,
-) {
-    lock_senders(senders).entry(thread).or_insert(sender);
+/// Why a thread is being asked to retain its events again.
+///
+/// These differ only in what they imply about a receiver that is already attached, which is
+/// exactly where the decision is hard.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetainReason {
+    /// A caller reopened this thread and will subscribe to it only after further work.
+    ///
+    /// Whatever is attached now, if anything, is the consumer this reopen is handing over from;
+    /// there is no new work for it to miss yet.
+    ReopenedThread,
+    /// Codex announced this thread as running.
+    ///
+    /// A receiver attached at this moment is not proof the work has a consumer: forwarders are
+    /// per-turn and exit at their own turn's completion, so one still finishing the previous turn
+    /// will drop everything queued behind it, including the next turn's opening.
+    ///
+    /// Only the *edge* into running says a turn is opening. Codex republishes `Active` whenever a
+    /// turn's active flags change — an approval or user-input request mid-turn is another `Active`
+    /// — so this reason arms the mirror only when the thread was not already believed to be
+    /// running.
+    AnnouncedActive,
+    /// Codex announced this thread as not running: idle, or reporting a system error.
+    ///
+    /// Never opens a lifecycle. The app server publishes `idle` just *before* a turn completes, so
+    /// a mirror started here would hold nothing but that completion, and the replacement forwarder
+    /// would replay it and exit before doing any work. It still records that the run ended, so the
+    /// next `Active` reads as an edge.
+    AnnouncedQuiet,
+}
+
+/// Start retaining this thread's events again, so the next subscriber does not begin at the tail.
+///
+/// With nothing attached this simply reinstates the queue, keeping any queue already there because
+/// it holds events nobody has seen. With a receiver attached the queue becomes a mirror: events
+/// still reach the live receiver, so it is never starved, and a replacement can pick up from the
+/// announcement instead of from wherever the channel happens to be.
+///
+/// An announcement that opens a lifecycle restarts the mirror rather than extending it. A receiver
+/// that is still alive has seen everything up to this point, so only the new turn is worth keeping
+/// — and a replay that opened with the *previous* turn's completion would make the replacement
+/// forwarder exit immediately, losing the turn it was created for. Forwarders break on any
+/// completion they see rather than only their own turn's, so that replay is not merely redundant.
+fn retain_thread_channel(senders: &SenderMap, thread: ThreadId, reason: RetainReason) {
+    let mut guard = lock_senders(senders);
+    let Some(channel) = guard.get_mut(&thread) else {
+        return;
+    };
+    // Track what Codex last said before deciding anything, so a status that arms nothing still
+    // moves the belief the *next* announcement is compared against.
+    let opens_a_lifecycle = match reason {
+        RetainReason::ReopenedThread => false,
+        RetainReason::AnnouncedQuiet => {
+            channel.announced_active = false;
+            false
+        }
+        RetainReason::AnnouncedActive => {
+            let edge = !channel.announced_active;
+            channel.announced_active = true;
+            edge
+        }
+    };
+    if channel.sender.receiver_count() == 0 {
+        channel.retained.get_or_insert_with(RetainedEvents::new);
+    } else if opens_a_lifecycle {
+        channel.retained = Some(RetainedEvents::new());
+    }
+}
+
+/// Forget that Codex reported this thread as running.
+///
+/// An unload is not an announcement — it neither binds a thread nor re-arms its retention — but it
+/// does end whatever run was reported, so a reload afterwards has to read as a fresh turn opening
+/// rather than as another mid-turn flag change on a run that is long over.
+fn forget_announced_activity(senders: &SenderMap, thread: ThreadId) {
+    if let Some(channel) = lock_senders(senders).get_mut(&thread) {
+        channel.announced_active = false;
+    }
+}
+
+/// Create this thread's event channel if it does not have one yet, retaining from the first event.
+///
+/// A new channel holds no receiver, so it starts out retaining rather than broadcasting; nothing
+/// this thread produces is sent anywhere until a subscriber attaches and takes the queue.
+///
+/// Reopening a thread that already has a channel keeps the existing one: its retention may already
+/// have been claimed by a live forwarder, and replacing it would strand that forwarder on a
+/// channel nothing sends to.
+fn ensure_thread_channel(senders: &SenderMap, thread: ThreadId) {
+    lock_senders(senders).entry(thread).or_insert_with(|| {
+        let (sender, _) = broadcast::channel(BROADCAST_CAPACITY);
+        ThreadChannel {
+            sender,
+            subscribed: false,
+            retained: Some(RetainedEvents::new()),
+            announced_active: false,
+        }
+    });
 }
 
 async fn respond_unroutable_server_request(
@@ -4347,6 +5058,7 @@ mod tests {
             resume_policy: ResumePolicy::AllowFreshFallback,
             initial_model: Some(test_model(None)),
             updates,
+            retain_until_subscribed: false,
         }
     }
 
@@ -5290,6 +6002,7 @@ mod tests {
                 resume_policy: ResumePolicy::AllowFreshFallback,
                 initial_model: None,
                 updates: giskard_harness::thread_update_channel().0,
+                retain_until_subscribed: false,
             }),
         )
         .await
@@ -5335,6 +6048,7 @@ mod tests {
                 resume_policy: ResumePolicy::AllowFreshFallback,
                 initial_model: Some(test_model(None)),
                 updates,
+                retain_until_subscribed: false,
             })
             .await
             .unwrap();
@@ -6025,22 +6739,27 @@ mod tests {
         assert_eq!(controller.shutdowns().await, 1);
     }
 
-    #[test]
-    fn opening_thread_preserves_existing_sender() {
+    /// Open a thread's channel and subscribe to it, the way the server does.
+    fn open_test_channel(senders: &SenderMap, thread: ThreadId) -> AgentEventStream {
+        ensure_thread_channel(senders, thread);
+        subscribe_thread(senders, thread).expect("channel exists after ensure_thread_channel")
+    }
+
+    #[tokio::test]
+    async fn opening_thread_preserves_existing_channel() {
         let thread = ThreadId::new();
         let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
-        let (first_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
-        let mut first_rx = first_tx.subscribe();
-        ensure_thread_sender(&senders, thread, first_tx);
+        let mut first_rx = open_test_channel(&senders, thread);
 
-        let (replacement_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
-        ensure_thread_sender(&senders, thread, replacement_tx);
+        // Reopening must not swap the channel out from under a subscriber that already attached.
+        ensure_thread_channel(&senders, thread);
 
         let turn = TurnId::new();
-        sender_for_thread(&senders, thread)
-            .expect("sender exists")
-            .send(AgentEvent::TurnStarted { thread, turn })
-            .unwrap();
+        broadcast_event(&senders, thread, || AgentEvent::TurnStarted {
+            thread,
+            turn,
+        })
+        .await;
         assert!(matches!(
             first_rx.try_recv(),
             Ok(AgentEvent::TurnStarted { thread: got_thread, turn: got_turn })
@@ -6094,8 +6813,7 @@ mod tests {
     async fn incomplete_stream_without_turn_emits_error_event() {
         let thread = ThreadId::new();
         let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
-        let (tx, mut rx) = broadcast::channel(BROADCAST_CAPACITY);
-        ensure_thread_sender(&senders, thread, tx);
+        let mut rx = open_test_channel(&senders, thread);
 
         emit_incomplete_turn(&senders, thread, None, "stream ended").await;
 
@@ -6118,8 +6836,7 @@ mod tests {
         let thread = ThreadId::new();
         let turn = TurnId::new();
         let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
-        let (tx, mut rx) = broadcast::channel(BROADCAST_CAPACITY);
-        ensure_thread_sender(&senders, thread, tx);
+        let mut rx = open_test_channel(&senders, thread);
 
         emit_incomplete_turn(&senders, thread, Some(turn), "stream failed").await;
 
@@ -6145,8 +6862,7 @@ mod tests {
         let thread = ThreadId::new();
         let turn = TurnId::new();
         let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
-        let (tx, mut rx) = broadcast::channel(BROADCAST_CAPACITY);
-        ensure_thread_sender(&senders, thread, tx);
+        let mut rx = open_test_channel(&senders, thread);
 
         assert!(emit_fatal_turn_completion(&senders, thread, Some(turn), "quota exceeded").await);
 
@@ -6171,8 +6887,7 @@ mod tests {
     async fn fatal_error_without_turn_does_not_synthesize_completion() {
         let thread = ThreadId::new();
         let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
-        let (tx, mut rx) = broadcast::channel(BROADCAST_CAPACITY);
-        ensure_thread_sender(&senders, thread, tx);
+        let mut rx = open_test_channel(&senders, thread);
 
         assert!(!emit_fatal_turn_completion(&senders, thread, None, "quota exceeded").await);
 
@@ -6491,5 +7206,1078 @@ mod tests {
         assert!(params.get("sandboxPolicy").is_none());
         assert_eq!(params["approvalPolicy"], "never");
         assert_eq!(params["permissions"], ":danger-full-access");
+    }
+
+    // ---- sub-agent admission: announcement, retention, adoption, sweep ----
+
+    fn thread_status_changed(native_thread_id: &str) -> codex_codes::ServerMessage {
+        codex_codes::ServerMessage::Notification(
+            codex_codes::messages::Notification::ThreadStatusChanged(
+                serde_json::from_value(json!({
+                    "threadId": native_thread_id,
+                    "status": { "type": "active", "activeFlags": [] },
+                }))
+                .expect("thread/status/changed fixture"),
+            ),
+        )
+    }
+
+    fn child_turn_started(
+        native_thread_id: &str,
+        native_turn_id: &str,
+    ) -> codex_codes::ServerMessage {
+        codex_codes::ServerMessage::Notification(codex_codes::messages::Notification::TurnStarted(
+            serde_json::from_value(json!({
+                "threadId": native_thread_id,
+                "turn": { "id": native_turn_id, "status": "inProgress" },
+            }))
+            .expect("turn/started fixture"),
+        ))
+    }
+
+    /// Codex republishes `active` whenever a turn's flags change — an approval request mid-turn
+    /// arrives as another `active`, not as a new turn.
+    fn thread_status_waiting_on_approval(native_thread_id: &str) -> codex_codes::ServerMessage {
+        codex_codes::ServerMessage::Notification(
+            codex_codes::messages::Notification::ThreadStatusChanged(
+                serde_json::from_value(json!({
+                    "threadId": native_thread_id,
+                    "status": { "type": "active", "activeFlags": ["waitingOnApproval"] },
+                }))
+                .expect("active thread/status/changed fixture with flags"),
+            ),
+        )
+    }
+
+    fn thread_status_not_loaded(native_thread_id: &str) -> codex_codes::ServerMessage {
+        codex_codes::ServerMessage::Notification(
+            codex_codes::messages::Notification::ThreadStatusChanged(
+                serde_json::from_value(json!({
+                    "threadId": native_thread_id,
+                    "status": { "type": "notLoaded" },
+                }))
+                .expect("notLoaded thread/status/changed fixture"),
+            ),
+        )
+    }
+
+    fn thread_status_idle(native_thread_id: &str) -> codex_codes::ServerMessage {
+        codex_codes::ServerMessage::Notification(
+            codex_codes::messages::Notification::ThreadStatusChanged(
+                serde_json::from_value(json!({
+                    "threadId": native_thread_id,
+                    "status": { "type": "idle" },
+                }))
+                .expect("idle thread/status/changed fixture"),
+            ),
+        )
+    }
+
+    fn child_turn_completed(
+        native_thread_id: &str,
+        native_turn_id: &str,
+    ) -> codex_codes::ServerMessage {
+        codex_codes::ServerMessage::Notification(
+            codex_codes::messages::Notification::TurnCompleted(
+                serde_json::from_value(json!({
+                    "threadId": native_thread_id,
+                    "turn": { "id": native_turn_id, "status": "completed" },
+                }))
+                .expect("turn/completed fixture"),
+            ),
+        )
+    }
+
+    fn child_message_delta(
+        native_thread_id: &str,
+        native_turn_id: &str,
+        text: &str,
+    ) -> codex_codes::ServerMessage {
+        codex_codes::ServerMessage::Notification(
+            codex_codes::messages::Notification::AgentMessageDelta(
+                serde_json::from_value(json!({
+                    "threadId": native_thread_id,
+                    "turnId": native_turn_id,
+                    "itemId": "child-item-1",
+                    "delta": text,
+                }))
+                .expect("item/agentMessage/delta fixture"),
+            ),
+        )
+    }
+
+    /// Open a parent thread and leave it mid-turn, so the worker keeps reading Codex messages.
+    async fn parent_thread_with_active_turn(harness: &Arc<CodexHarness>) -> ThreadHandle {
+        let parent = harness
+            .open_thread(open_opts(None, None))
+            .await
+            .expect("parent thread opens");
+        harness
+            .start_turn(&parent, UserInput::text("delegate"), build_turn_overrides())
+            .await
+            .expect("parent turn starts");
+        parent
+    }
+
+    fn subagent_open_opts(resume: &str) -> OpenThreadOptions {
+        let (updates, _) = giskard_harness::thread_update_channel();
+        OpenThreadOptions {
+            project: ProjectId::new(),
+            thread: None,
+            workspace_root: PathBuf::from("/tmp"),
+            resume: Some(resume.to_owned()),
+            resume_policy: ResumePolicy::RequireExisting,
+            initial_model: Some(test_model(None)),
+            updates,
+            retain_until_subscribed: true,
+        }
+    }
+
+    /// Retention is released on a deadline as well as by a subscriber taking it, so an absent
+    /// queue does not mean somebody attached. Reading it that way drops the binding from the
+    /// provisional set without retiring it: the native id stays bound to a `ThreadId` nobody owns,
+    /// and Codex is left blocked on a request that will never be answered.
+    #[tokio::test]
+    async fn released_retention_is_not_mistaken_for_a_subscriber() {
+        let (mut client, controller) = fake_codex();
+        let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let mut provisional = HashMap::new();
+        let thread = ThreadId::new();
+        mapper.register_thread("native-child".to_owned(), thread);
+        ensure_thread_channel(&senders, thread);
+
+        // Codex is blocked on an approval this thread raised.
+        let request_id = codex_codes::jsonrpc::RequestId::Integer(9);
+        let request = codex_codes::messages::ServerRequest::CmdExecApproval(
+            serde_json::from_value(json!({
+                "approvalId": "appr-9", "commandActions": [], "cwd": "/tmp",
+                "environmentId": "env_1", "itemId": "i1",
+                "threadId": "native-child", "turnId": "t1", "startedAtMs": 1
+            }))
+            .expect("approval fixture"),
+        );
+        assert!(
+            mapper
+                .map_server_request(&request_id, &request, thread)
+                .is_some()
+        );
+
+        // Retention released by the deadline, while the binding is still provisional and young.
+        {
+            let mut guard = lock_senders(&senders);
+            guard.get_mut(&thread).expect("channel").retained = None;
+        }
+        provisional.insert(
+            "native-child".to_owned(),
+            ProvisionalThread {
+                thread,
+                announced_at: Instant::now() - PROVISIONAL_THREAD_TTL - Duration::from_secs(1),
+            },
+        );
+
+        sweep_provisional_threads(&mut client, &mut mapper, &senders, &mut provisional).await;
+
+        assert!(
+            !provisional.contains_key("native-child"),
+            "the expired binding leaves the set"
+        );
+        assert_eq!(
+            mapper.thread_for_native("native-child"),
+            None,
+            "and is retired rather than left bound to a thread nobody owns"
+        );
+        assert_eq!(
+            controller.response_errors().await.len(),
+            1,
+            "a binding dropped from the set must not leave Codex blocked"
+        );
+    }
+
+    /// A persisted child is already mapped — pre-registered at harness creation, or opened
+    /// earlier in this run — so an announcement for it takes the already-known path. That path
+    /// still has to arm retention: Codex announces the thread and then forwards its events, and
+    /// between a previous monitor ending and the next one attaching there is nothing to receive
+    /// them. Returning early because the mapping exists loses exactly what the initial-import
+    /// case was fixed to keep.
+    /// The other half of that: re-arming while a forwarder is attached would divert events into a
+    /// queue instead of to the consumer waiting on them, starving a live monitor. An announcement
+    /// for a thread somebody is already watching has to be a no-op.
+    #[tokio::test]
+    async fn re_announcing_a_watched_thread_does_not_starve_its_forwarder() {
+        let (harness, controller) = spawn_fake_harness();
+        let child = harness
+            .open_thread(open_opts(None, Some("native-child")))
+            .await
+            .expect("child opens");
+        let mut stream = harness.subscribe(&child);
+
+        controller
+            .send_server_message(thread_status_changed("native-child"))
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        controller
+            .send_server_message(child_turn_started("native-child", "child-turn-1"))
+            .await;
+        controller
+            .send_server_message(child_message_delta("native-child", "child-turn-1", "live"))
+            .await;
+
+        let mut texts = Vec::new();
+        while let Ok(Ok(event)) = timeout(Duration::from_millis(300), stream.recv()).await {
+            if let AgentEvent::ItemDelta {
+                delta: ItemDelta::Text { text },
+                ..
+            } = event
+            {
+                texts.push(text);
+            }
+        }
+        assert_eq!(
+            texts,
+            vec!["live".to_owned()],
+            "events must still reach the forwarder that is already attached"
+        );
+    }
+
+    #[tokio::test]
+    async fn re_announcing_a_known_thread_re_arms_retention_for_its_next_subscriber() {
+        let (harness, controller) = spawn_fake_harness();
+        let child = harness
+            .open_thread(open_opts(None, Some("native-child")))
+            .await
+            .expect("child opens");
+
+        // A monitor ran and ended: the initial retention was taken, and its stream is gone.
+        drop(harness.subscribe(&child));
+
+        // Codex announces the thread it already knows about, then the child works.
+        controller
+            .send_server_message(thread_status_changed("native-child"))
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        controller
+            .send_server_message(child_turn_started("native-child", "child-turn-1"))
+            .await;
+        controller
+            .send_server_message(child_message_delta(
+                "native-child",
+                "child-turn-1",
+                "work done while nothing was attached",
+            ))
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The next monitor attaches and must find that work waiting for it.
+        let mut stream = harness.subscribe(&child);
+        let mut texts = Vec::new();
+        while let Ok(Ok(event)) = timeout(Duration::from_millis(300), stream.recv()).await {
+            if let AgentEvent::ItemDelta {
+                delta: ItemDelta::Text { text },
+                ..
+            } = event
+            {
+                texts.push(text);
+            }
+        }
+        assert_eq!(
+            texts,
+            vec!["work done while nothing was attached".to_owned()],
+            "a re-announced thread's events must be held for its next subscriber"
+        );
+    }
+
+    #[tokio::test]
+    async fn changing_active_flags_mid_turn_does_not_discard_the_turns_opening() {
+        let (harness, controller) = spawn_fake_harness();
+        let child = harness
+            .open_thread(open_opts(None, Some("native-child")))
+            .await
+            .expect("child opens");
+
+        // A forwarder is watching the child's first turn, which then completes.
+        let mut first = harness.subscribe(&child);
+        controller
+            .send_server_message(child_turn_started("native-child", "turn-1"))
+            .await;
+        controller
+            .send_server_message(child_turn_completed("native-child", "turn-1"))
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The next turn opens and the mirror takes its opening, the first forwarder still being
+        // attached and about to exit at the completion above.
+        controller
+            .send_server_message(thread_status_changed("native-child"))
+            .await;
+        controller
+            .send_server_message(child_turn_started("native-child", "turn-2"))
+            .await;
+        controller
+            .send_server_message(child_message_delta("native-child", "turn-2", "working"))
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // That turn now asks for approval, which Codex reports as another `active` with different
+        // flags. It is the same turn: restarting the mirror here would throw away everything the
+        // replacement forwarder still needs.
+        controller
+            .send_server_message(thread_status_waiting_on_approval("native-child"))
+            .await;
+        controller
+            .send_server_message(child_message_delta("native-child", "turn-2", " on it"))
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut saw_completion = false;
+        while let Ok(Ok(event)) = timeout(Duration::from_millis(100), first.recv()).await {
+            if matches!(event, AgentEvent::TurnCompleted { .. }) {
+                saw_completion = true;
+                break;
+            }
+        }
+        assert!(
+            saw_completion,
+            "the first forwarder sees its own completion"
+        );
+        drop(first);
+
+        // The replacement must find turn 2 whole: its opening and every delta since, not just
+        // what happened to arrive after the approval request.
+        let mut second = harness.subscribe(&child);
+        let mut opened = false;
+        let mut text = String::new();
+        while let Ok(Ok(event)) = timeout(Duration::from_millis(200), second.recv()).await {
+            match event {
+                AgentEvent::TurnStarted { .. } => opened = true,
+                AgentEvent::ItemDelta {
+                    delta: ItemDelta::Text { text: chunk },
+                    ..
+                } => text.push_str(&chunk),
+                _ => {}
+            }
+        }
+        assert!(
+            opened,
+            "the replacement sees the turn open despite the mid-turn flag change"
+        );
+        assert_eq!(
+            text, "working on it",
+            "the replacement sees the whole turn, not only what followed the flag change"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reload_opens_a_new_lifecycle_even_though_the_thread_was_active() {
+        let (harness, controller) = spawn_fake_harness();
+        let child = harness
+            .open_thread(open_opts(None, Some("native-child")))
+            .await
+            .expect("child opens");
+        let mut first = harness.subscribe(&child);
+
+        // The thread runs, is unloaded mid-turn, and is loaded again. Codex reports the reload as
+        // `active`, and it opens a genuinely new turn: the run the earlier `active` described
+        // ended with the unload.
+        controller
+            .send_server_message(thread_status_changed("native-child"))
+            .await;
+        controller
+            .send_server_message(child_turn_started("native-child", "turn-1"))
+            .await;
+        controller
+            .send_server_message(child_turn_completed("native-child", "turn-1"))
+            .await;
+        controller
+            .send_server_message(thread_status_not_loaded("native-child"))
+            .await;
+        controller
+            .send_server_message(thread_status_changed("native-child"))
+            .await;
+        controller
+            .send_server_message(child_turn_started("native-child", "turn-2"))
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        while let Ok(Ok(event)) = timeout(Duration::from_millis(100), first.recv()).await {
+            if matches!(event, AgentEvent::TurnCompleted { .. }) {
+                break;
+            }
+        }
+        drop(first);
+
+        let mut second = harness.subscribe(&child);
+        let mut kinds = Vec::new();
+        while let Ok(Ok(event)) = timeout(Duration::from_millis(200), second.recv()).await {
+            match event {
+                AgentEvent::TurnStarted { .. } => kinds.push("started"),
+                AgentEvent::TurnCompleted { .. } => kinds.push("completed"),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            kinds,
+            vec!["started"],
+            "the reload re-arms the mirror, so the replacement finds the turn it opened"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_idle_announcement_does_not_re_arm_retention_under_a_live_forwarder() {
+        let (harness, controller) = spawn_fake_harness();
+        let child = harness
+            .open_thread(open_opts(None, Some("native-child")))
+            .await
+            .expect("child opens");
+        let mut first = harness.subscribe(&child);
+
+        // Codex publishes `idle` just before the turn completes. Re-arming there would leave a
+        // mirror holding nothing but the completion, and the next forwarder would replay it and
+        // exit before doing any work.
+        controller
+            .send_server_message(child_turn_started("native-child", "turn-1"))
+            .await;
+        controller
+            .send_server_message(thread_status_idle("native-child"))
+            .await;
+        controller
+            .send_server_message(child_turn_completed("native-child", "turn-1"))
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        while let Ok(Ok(event)) = timeout(Duration::from_millis(100), first.recv()).await {
+            if matches!(event, AgentEvent::TurnCompleted { .. }) {
+                break;
+            }
+        }
+        drop(first);
+
+        let mut second = harness.subscribe(&child);
+        let replayed = timeout(Duration::from_millis(100), second.recv()).await;
+        assert!(
+            replayed.is_err(),
+            "an idle announcement leaves nothing to replay to the next forwarder, got {replayed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forwarder_finishing_its_turn_does_not_swallow_the_next_turns_opening() {
+        let (harness, controller) = spawn_fake_harness();
+        let child = harness
+            .open_thread(open_opts(None, Some("native-child")))
+            .await
+            .expect("child opens");
+
+        // A forwarder is watching the child's first turn.
+        let mut first = harness.subscribe(&child);
+        controller
+            .send_server_message(child_turn_started("native-child", "turn-1"))
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // That turn completes and Codex immediately announces and starts the next one. The first
+        // forwarder is still attached at the announcement, but it is finishing the *previous*
+        // turn: it will exit at that completion and drop turn 2 from behind its receiver.
+        controller
+            .send_server_message(child_turn_completed("native-child", "turn-1"))
+            .await;
+        controller
+            .send_server_message(thread_status_changed("native-child"))
+            .await;
+        controller
+            .send_server_message(child_turn_started("native-child", "turn-2"))
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The first forwarder consumes only up to its own completion, then exits.
+        let mut saw_completion = false;
+        while let Ok(Ok(event)) = timeout(Duration::from_millis(100), first.recv()).await {
+            if matches!(event, AgentEvent::TurnCompleted { .. }) {
+                saw_completion = true;
+                break;
+            }
+        }
+        assert!(
+            saw_completion,
+            "the first forwarder sees its own completion"
+        );
+        drop(first);
+
+        // The replacement monitor attaches and must still find turn 2 whole: its opening, and no
+        // replay of the previous completion, which would make it exit before doing any work.
+        let mut second = harness.subscribe(&child);
+        let mut kinds = Vec::new();
+        while let Ok(Ok(event)) = timeout(Duration::from_millis(200), second.recv()).await {
+            match event {
+                AgentEvent::TurnStarted { .. } => kinds.push("started"),
+                AgentEvent::TurnCompleted { .. } => kinds.push("completed"),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            kinds,
+            vec!["started"],
+            "the replacement sees the next turn open, and not the previous turn's completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn retains_thread_events_until_the_server_subscribes() {
+        let (harness, controller) = spawn_fake_harness();
+        let parent = parent_thread_with_active_turn(&harness).await;
+
+        let child = harness
+            .open_thread(subagent_open_opts("native-child"))
+            .await
+            .expect("child resumes");
+        controller
+            .send_server_message(child_turn_started("native-child", "child-turn-1"))
+            .await;
+        controller
+            .send_server_message(child_message_delta("native-child", "child-turn-1", "hi"))
+            .await;
+
+        // The real server creates thread metadata and validates ownership before it attaches.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut events = harness.subscribe(&child);
+
+        let mut kinds = Vec::new();
+        while let Ok(Ok(event)) = timeout(Duration::from_millis(200), events.recv()).await {
+            kinds.push(event.kind());
+            if kinds.len() == 3 {
+                break;
+            }
+        }
+        assert_eq!(kinds, vec!["thread_opened", "turn_started", "item_delta"]);
+        assert_ne!(child.thread, parent.thread);
+    }
+
+    #[tokio::test]
+    async fn binds_an_announced_native_thread_before_its_first_event() {
+        let (harness, controller) = spawn_fake_harness();
+        let _parent = parent_thread_with_active_turn(&harness).await;
+
+        // Codex announces the sub-agent, then it starts producing — all before Giskard is told
+        // which parent owns it and can issue the open.
+        controller
+            .send_server_message(thread_status_changed("native-child"))
+            .await;
+        controller
+            .send_server_message(child_turn_started("native-child", "child-turn-1"))
+            .await;
+        controller
+            .send_server_message(child_message_delta("native-child", "child-turn-1", "early"))
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let child = harness
+            .open_thread(subagent_open_opts("native-child"))
+            .await
+            .expect("child resumes");
+        let mut events = harness.subscribe(&child);
+
+        let mut kinds = Vec::new();
+        while let Ok(Ok(event)) = timeout(Duration::from_millis(200), events.recv()).await {
+            kinds.push(event.kind());
+            if kinds.len() == 3 {
+                break;
+            }
+        }
+        // The events that arrived before the open are delivered, in their original order.
+        assert_eq!(kinds, vec!["turn_started", "item_delta", "thread_opened"]);
+    }
+
+    #[tokio::test]
+    async fn an_announced_thread_keeps_its_provisional_id_when_the_server_opens_it() {
+        let (harness, controller) = spawn_fake_harness();
+        let _parent = parent_thread_with_active_turn(&harness).await;
+
+        controller
+            .send_server_message(thread_status_changed("native-child"))
+            .await;
+        controller
+            .send_server_message(child_turn_started("native-child", "child-turn-1"))
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let child = harness
+            .open_thread(subagent_open_opts("native-child"))
+            .await
+            .expect("child resumes");
+        let mut events = harness.subscribe(&child);
+
+        // Adoption is what makes the retained TurnStarted belong to the handle the server
+        // persists: a freshly minted ThreadId would have left it under an abandoned identity.
+        let event = timeout(Duration::from_millis(200), events.recv())
+            .await
+            .expect("an event is retained")
+            .expect("stream is open");
+        match event {
+            AgentEvent::TurnStarted { thread, .. } => assert_eq!(thread, child.thread),
+            other => panic!("expected the retained turn start, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_explicit_thread_id_supersedes_a_provisional_binding() {
+        let (harness, controller) = spawn_fake_harness();
+        let _parent = parent_thread_with_active_turn(&harness).await;
+
+        controller
+            .send_server_message(thread_status_changed("native-child"))
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let explicit = ThreadId::new();
+        let mut opts = subagent_open_opts("native-child");
+        opts.thread = Some(explicit);
+        let child = harness.open_thread(opts).await.expect("child resumes");
+        assert_eq!(child.thread, explicit);
+
+        controller
+            .send_server_message(child_turn_started("native-child", "child-turn-1"))
+            .await;
+        let mut events = harness.subscribe(&child);
+        let event = timeout(Duration::from_millis(200), events.recv())
+            .await
+            .expect("an event arrives")
+            .expect("stream is open");
+        assert_eq!(event.thread_id(), explicit);
+    }
+
+    #[tokio::test]
+    async fn sweep_retires_an_unclaimed_announced_thread_and_keeps_a_claimed_one() {
+        let (mut client, _controller) = fake_codex();
+        let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let mut provisional = HashMap::new();
+
+        let expired_thread = ThreadId::new();
+        let claimed_thread = ThreadId::new();
+        for (native, thread, age) in [
+            ("native-expired", expired_thread, PROVISIONAL_THREAD_TTL),
+            ("native-claimed", claimed_thread, PROVISIONAL_THREAD_TTL),
+        ] {
+            mapper.register_thread(native.to_owned(), thread);
+            ensure_thread_channel(&senders, thread);
+            provisional.insert(
+                native.to_owned(),
+                ProvisionalThread {
+                    thread,
+                    announced_at: Instant::now() - age - Duration::from_secs(1),
+                },
+            );
+        }
+        // A forwarder is attached to one of them — a state adoption normally prevents from being
+        // provisional at all, asserted here because retiring it would strand a live consumer.
+        let _claimed = subscribe_thread(&senders, claimed_thread).expect("channel exists");
+
+        sweep_provisional_threads(&mut client, &mut mapper, &senders, &mut provisional).await;
+
+        assert!(provisional.is_empty(), "both leave the provisional set");
+        assert_eq!(mapper.thread_for_native("native-expired"), None);
+        assert_eq!(
+            mapper.thread_for_native("native-claimed"),
+            Some(claimed_thread)
+        );
+        let guard = lock_senders(&senders);
+        assert!(!guard.contains_key(&expired_thread));
+        assert!(guard.contains_key(&claimed_thread));
+    }
+
+    /// A binding the server opened is no longer provisional, whether or not a forwarder ever
+    /// attaches to it — and a sub-agent imported on terminal evidence never starts a monitor, so
+    /// "opened but unsubscribed" is a normal resting state rather than a failure.
+    ///
+    /// Retiring one would leave a persisted thread with no route back to Codex: reopening it
+    /// short-circuits on the live binding, so nothing would rebind the native id and every event
+    /// for it would be dropped as unknown.
+    #[tokio::test]
+    async fn an_opened_thread_survives_the_sweep_without_a_subscriber() {
+        let (harness, controller) = spawn_fake_harness();
+        let _parent = parent_thread_with_active_turn(&harness).await;
+
+        controller
+            .send_server_message(thread_status_changed("native-child"))
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let child = harness
+            .open_thread(subagent_open_opts("native-child"))
+            .await
+            .expect("child resumes");
+
+        // Nobody subscribes, and the sweep runs several times over the TTL.
+        tokio::time::sleep(PROVISIONAL_THREAD_TTL * 3).await;
+
+        // The native id must still route: this is what a later user turn on the thread needs.
+        let mut stream = harness.subscribe(&child);
+        controller
+            .send_server_message(child_turn_started("native-child", "child-turn-1"))
+            .await;
+        let event = timeout(Duration::from_millis(500), stream.recv())
+            .await
+            .expect("an event arrives after the sweep")
+            .expect("stream is open");
+        assert_eq!(event.thread_id(), child.thread);
+    }
+
+    /// An unload is the opposite of an announcement. Binding on one spends a provisional slot on a
+    /// thread that has just stopped producing, and Codex reports a status transition per thread
+    /// rather than only for the ones a client is attached to — so unloads elsewhere could exhaust
+    /// the slots that real sub-agent announcements need.
+    #[tokio::test]
+    async fn an_unload_status_is_not_an_announcement() {
+        let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let mut provisional = HashMap::new();
+        mapper.register_thread("native-known".to_owned(), ThreadId::new());
+
+        for (native, status) in [
+            ("native-unloaded", json!({ "type": "notLoaded" })),
+            ("native-idle", json!({ "type": "idle" })),
+        ] {
+            observe_native_thread_announcement(
+                &mut mapper,
+                &senders,
+                &mut provisional,
+                &codex_codes::ServerMessage::Notification(
+                    codex_codes::messages::Notification::ThreadStatusChanged(
+                        serde_json::from_value(json!({ "threadId": native, "status": status }))
+                            .expect("thread/status/changed fixture"),
+                    ),
+                ),
+            );
+        }
+
+        assert_eq!(mapper.thread_for_native("native-unloaded"), None);
+        // A child is often still idle when its listener attaches: the app server publishes the
+        // transition before the child's first turn registers as running.
+        assert!(mapper.thread_for_native("native-idle").is_some());
+        assert_eq!(provisional.len(), 1);
+    }
+
+    /// Codex blocks until a server request is answered, so a binding that carries one into
+    /// retirement must refuse it rather than forget the id — an unroutable request would have been
+    /// refused outright.
+    #[tokio::test]
+    async fn retiring_an_announced_thread_refuses_the_requests_codex_is_blocked_on() {
+        let (mut client, controller) = fake_codex();
+        let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let mut provisional = HashMap::new();
+        let thread = ThreadId::new();
+        mapper.register_thread("native-child".to_owned(), thread);
+        ensure_thread_channel(&senders, thread);
+        provisional.insert(
+            "native-child".to_owned(),
+            ProvisionalThread {
+                thread,
+                announced_at: Instant::now() - PROVISIONAL_THREAD_TTL - Duration::from_secs(1),
+            },
+        );
+
+        let request_id = codex_codes::jsonrpc::RequestId::Integer(41);
+        let request = codex_codes::messages::ServerRequest::CmdExecApproval(
+            serde_json::from_value(json!({
+                "threadId": "native-child",
+                "turnId": "child-turn-1",
+                "itemId": "child-item-1",
+                "command": "ls",
+                "cwd": "/tmp",
+            }))
+            .expect("approval params fixture"),
+        );
+        assert!(
+            mapper
+                .map_server_request(&request_id, &request, thread)
+                .is_some(),
+            "the approval routes while the binding is live"
+        );
+
+        sweep_provisional_threads(&mut client, &mut mapper, &senders, &mut provisional).await;
+
+        let errors = controller.response_errors().await;
+        assert_eq!(errors.len(), 1, "the blocked request must be answered");
+        assert_eq!(errors[0].id, request_id);
+        assert_eq!(mapper.thread_for_native("native-child"), None);
+    }
+
+    fn text_delta(thread: ThreadId, turn: TurnId, item_id: ItemId, text: &str) -> AgentEvent {
+        AgentEvent::ItemDelta {
+            thread,
+            turn,
+            item_id,
+            delta: ItemDelta::Text { text: text.into() },
+        }
+    }
+
+    fn completed_message(
+        thread: ThreadId,
+        turn: TurnId,
+        item_id: ItemId,
+        text: &str,
+    ) -> AgentEvent {
+        AgentEvent::ItemCompleted {
+            thread,
+            turn,
+            item: giskard_core::item::Item {
+                id: item_id,
+                harness_item_id: format!("native-{item_id}"),
+                payload: giskard_core::item::ItemPayload::AgentMessage { text: text.into() },
+                created_at: Utc::now(),
+            },
+        }
+    }
+
+    /// Deltas for one item accumulate into a single entry, and keying by item rather than folding
+    /// into the tail is what lets that survive interleaving: two items streaming at once still
+    /// cost one entry each.
+    #[tokio::test]
+    async fn retention_accumulates_interleaved_deltas_per_item() {
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let first = ItemId::new();
+        let second = ItemId::new();
+        let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
+        ensure_thread_channel(&senders, thread);
+
+        for (item, chunk) in [
+            (first, "Hel"),
+            (second, "one "),
+            (first, "lo, "),
+            (second, "two "),
+            (first, "world"),
+            (second, "three"),
+        ] {
+            broadcast_event(&senders, thread, || text_delta(thread, turn, item, chunk)).await;
+        }
+
+        let mut stream = subscribe_thread(&senders, thread).expect("channel exists");
+        let mut replayed = Vec::new();
+        while let Ok(event) = stream.try_recv() {
+            match event {
+                AgentEvent::ItemDelta {
+                    item_id,
+                    delta: ItemDelta::Text { text },
+                    ..
+                } => replayed.push((item_id, text)),
+                other => panic!("unexpected retained event: {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            replayed,
+            vec![
+                (first, "Hello, world".to_owned()),
+                (second, "one two three".to_owned()),
+            ],
+            "each item keeps one accumulator, positioned where its stream began"
+        );
+    }
+
+    /// Text and command output for one item render in different places, so they must not be
+    /// concatenated into each other even though both are deltas of that item.
+    #[tokio::test]
+    async fn retention_keeps_delta_kinds_for_one_item_apart() {
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let item = ItemId::new();
+        let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
+        ensure_thread_channel(&senders, thread);
+
+        broadcast_event(&senders, thread, || {
+            text_delta(thread, turn, item, "narration")
+        })
+        .await;
+        broadcast_event(&senders, thread, || AgentEvent::ItemDelta {
+            thread,
+            turn,
+            item_id: item,
+            delta: ItemDelta::CommandOutput {
+                chunk: "stdout".into(),
+            },
+        })
+        .await;
+
+        let mut stream = subscribe_thread(&senders, thread).expect("channel exists");
+        let mut replayed = Vec::new();
+        while let Ok(event) = stream.try_recv() {
+            if let AgentEvent::ItemDelta { delta, .. } = event {
+                replayed.push(delta);
+            }
+        }
+
+        assert_eq!(
+            replayed,
+            vec![
+                ItemDelta::Text {
+                    text: "narration".into()
+                },
+                ItemDelta::CommandOutput {
+                    chunk: "stdout".into()
+                },
+            ]
+        );
+    }
+
+    /// An item's completion carries its final content and is the only thing the server assembles a
+    /// persisted turn from, so once it is retained the deltas ahead of it describe a state nothing
+    /// will ever read. Dropping them is what keeps retention proportional to the turn rather than
+    /// to how much the agent streamed.
+    #[tokio::test]
+    async fn retention_compacts_an_items_deltas_once_it_completes() {
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let done = ItemId::new();
+        let still_open = ItemId::new();
+        let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
+        ensure_thread_channel(&senders, thread);
+
+        broadcast_event(&senders, thread, || text_delta(thread, turn, done, "draft")).await;
+        broadcast_event(&senders, thread, || {
+            text_delta(thread, turn, still_open, "partial")
+        })
+        .await;
+        broadcast_event(&senders, thread, || {
+            completed_message(thread, turn, done, "final")
+        })
+        .await;
+
+        let retained_slots = {
+            let guard = lock_senders(&senders);
+            guard
+                .get(&thread)
+                .expect("channel exists")
+                .retained
+                .as_ref()
+                .expect("still retaining")
+                .len()
+        };
+        assert_eq!(
+            retained_slots, 2,
+            "the completed item's stream is gone; its completion and the open item's stream remain"
+        );
+
+        let mut stream = subscribe_thread(&senders, thread).expect("channel exists");
+        let mut replayed = Vec::new();
+        while let Ok(event) = stream.try_recv() {
+            replayed.push(event);
+        }
+        // Compaction deletes; it never reorders what survives.
+        assert!(matches!(
+            replayed.as_slice(),
+            [
+                AgentEvent::ItemDelta {
+                    item_id,
+                    delta: ItemDelta::Text { text },
+                    ..
+                },
+                AgentEvent::ItemCompleted { item, .. },
+            ] if *item_id == still_open && text == "partial" && item.id == done
+        ));
+    }
+
+    /// Retention holds no delta for an item that streamed and completed before anyone subscribed,
+    /// however much it streamed — the completion is the whole record of it.
+    #[tokio::test]
+    async fn retention_of_a_finished_turn_is_its_completions_alone() {
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
+        ensure_thread_channel(&senders, thread);
+
+        let mut completions = Vec::new();
+        for batch in 0..8usize {
+            let item = ItemId::new();
+            for chunk in 0..500 {
+                broadcast_event(&senders, thread, || {
+                    text_delta(thread, turn, item, &format!("chunk-{chunk} "))
+                })
+                .await;
+            }
+            completions.push(item);
+            broadcast_event(&senders, thread, || {
+                completed_message(thread, turn, item, &format!("message {batch}"))
+            })
+            .await;
+        }
+
+        let mut stream = subscribe_thread(&senders, thread).expect("channel exists");
+        let mut replayed = Vec::new();
+        while let Ok(event) = stream.try_recv() {
+            replayed.push(event);
+        }
+
+        let replayed_completions: Vec<_> = replayed
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ItemCompleted { item, .. } => Some(item.id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(replayed_completions, completions);
+        assert_eq!(
+            replayed.len(),
+            completions.len(),
+            "4000 deltas for finished items should leave nothing behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_keeps_an_announced_thread_within_its_ttl() {
+        let (mut client, _controller) = fake_codex();
+        let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let mut provisional = HashMap::new();
+        let thread = ThreadId::new();
+        mapper.register_thread("native-child".to_owned(), thread);
+        ensure_thread_channel(&senders, thread);
+        provisional.insert(
+            "native-child".to_owned(),
+            ProvisionalThread {
+                thread,
+                announced_at: Instant::now(),
+            },
+        );
+
+        sweep_provisional_threads(&mut client, &mut mapper, &senders, &mut provisional).await;
+
+        assert!(provisional.contains_key("native-child"));
+        assert_eq!(mapper.thread_for_native("native-child"), Some(thread));
+    }
+
+    #[tokio::test]
+    async fn an_unannounced_unknown_native_thread_is_still_dropped() {
+        let (harness, controller) = spawn_fake_harness();
+        let parent = parent_thread_with_active_turn(&harness).await;
+        let mut parent_events = harness.subscribe(&parent);
+
+        // No announcement: this is a foreign or stale native thread, and it stays unroutable.
+        controller
+            .send_server_message(child_turn_started("native-foreign", "foreign-turn"))
+            .await;
+        controller
+            .send_server_message(child_turn_started(&parent.harness_thread_id, "parent-turn"))
+            .await;
+
+        let event = timeout(Duration::from_millis(500), parent_events.recv())
+            .await
+            .expect("the parent's own event still arrives")
+            .expect("stream is open");
+        assert_eq!(event.thread_id(), parent.thread);
+    }
+
+    #[test]
+    fn unregistering_a_thread_clears_its_scoped_registries() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let thread = ThreadId::new();
+        mapper.register_thread("native-child".to_owned(), thread);
+        mapper.register_active_turn(thread, "child-turn-1");
+        assert!(mapper.has_active_turns());
+
+        assert_eq!(mapper.unregister_thread("native-child"), Some(Vec::new()));
+        assert_eq!(mapper.thread_for_native("native-child"), None);
+        assert!(!mapper.has_active_turns());
+        assert!(mapper.unregister_thread("native-child").is_none());
     }
 }

@@ -269,6 +269,14 @@ struct PassiveSubagentMetadata {
     initial_prompt: Option<String>,
     fallback: Option<SubagentFallbackTranscript>,
     active_lifecycle_observed: bool,
+    /// How many active lifecycles have been signalled for this thread.
+    ///
+    /// `active_lifecycle_observed` latches, so it cannot tell the observation that started the
+    /// running monitor from one that arrived while it was finishing. A monitor records the count
+    /// it was started for and compares on the way out: a higher count means another lifecycle was
+    /// merged into this metadata rather than starting a monitor of its own, because this one still
+    /// held ownership, and the exiting monitor has to serve it instead of leaving it unclaimed.
+    active_lifecycle_seq: u64,
     terminal_observed: bool,
     cancelled: bool,
     lifecycle_notify: Arc<Notify>,
@@ -733,6 +741,9 @@ impl HarnessRegistry {
                 resume_policy,
                 initial_model: initial_model.clone(),
                 updates,
+                // Every caller of this path subscribes before it starts a turn, so there is
+                // nothing to retain: the thread is idle between the two steps.
+                retain_until_subscribed: false,
             })
             .await?;
         // A known thread can begin another lifecycle while its harness open is in flight, so its
@@ -2002,6 +2013,7 @@ fn merge_passive_subagent_metadata(
         LifecycleSignal::None => {}
         LifecycleSignal::Active => {
             entry.active_lifecycle_observed = true;
+            entry.active_lifecycle_seq += 1;
             entry.lifecycle_notify.notify_one();
         }
         LifecycleSignal::Terminal => {
@@ -2019,7 +2031,7 @@ async fn register_passive_subagent_monitor(
     initial_prompt: Option<String>,
     fallback: Option<SubagentFallbackTranscript>,
     signal: LifecycleSignal,
-) -> bool {
+) -> Option<u64> {
     // Monitor ownership and metadata are published atomically under the same lock order used by
     // terminal recovery. A terminal observation therefore either updates this monitor or runs
     // fallback recovery itself; it cannot slip between metadata creation and monitor insertion.
@@ -2028,10 +2040,62 @@ async fn register_passive_subagent_monitor(
     let mut metadata = passive_subagent_metadata.lock().await;
     let entry = metadata.entry(thread_id).or_default();
     merge_passive_subagent_metadata(entry, initial_prompt, fallback, signal);
+    // The count this caller is responsible for, so its monitor can tell later observations from
+    // its own on the way out. A merge into a monitor that already exists returns `None`: that
+    // observation is now the running monitor's to serve, and the raised count is how it learns so.
+    let served = entry.active_lifecycle_seq;
     if inserted {
         passive_monitor_tasks.register(thread_id).await;
+        return Some(served);
     }
-    inserted
+    None
+}
+
+/// What an exiting passive monitor should do about the ownership it still holds.
+enum PassiveMonitorHandoff {
+    /// Another active lifecycle was signalled while this forwarder ran. Ownership is *kept*, so
+    /// nothing else can start a monitor for it, and this task serves it instead.
+    ContinueWith(u64),
+    /// Ownership released, along with whatever metadata was left for terminal fallback.
+    Released(Option<PassiveSubagentMetadata>),
+}
+
+/// Release a finished monitor's ownership, unless a newer lifecycle arrived while it was running.
+///
+/// This has to be one step under the same lock order registration uses. Checking for newer work
+/// and releasing ownership separately would leave a gap in between where an observation finds the
+/// monitor still registered — so it merges instead of starting one — and is then dropped by the
+/// release that follows. Its events would sit in the harness's mirror with nobody to claim them
+/// until the retention deadline discarded them.
+async fn hand_off_or_release_passive_monitor(
+    passive_monitors: &Arc<Mutex<HashSet<ThreadId>>>,
+    passive_subagent_metadata: &PassiveSubagentMetadataMap,
+    thread_id: ThreadId,
+    served: u64,
+) -> PassiveMonitorHandoff {
+    let mut monitors = passive_monitors.lock().await;
+    let mut metadata = passive_subagent_metadata.lock().await;
+    // An unserved lifecycle outranks a terminal observation. Terminal evidence says the child has
+    // finished, not that its turns were recorded, and the fallback transcript it carries is only a
+    // substitute for a transcript nobody captured — it is skipped outright once the thread has
+    // history. Releasing here would strand a turn that did happen and whose events are sitting in
+    // the harness's retention. The replacement is not at risk of hanging on a child that really is
+    // over: the pre-turn wait polls the stream ahead of the lifecycle signal, so it serves whatever
+    // was retained and only then stops on the terminal flag. Cancellation is different — it says
+    // to stop, so it still suppresses the handoff.
+    if let Some(entry) = metadata.get(&thread_id)
+        && !entry.cancelled
+        && entry.active_lifecycle_seq > served
+    {
+        // One lifecycle per handoff, not a jump to the newest. A forwarder ends at its own turn's
+        // completion, so it can only serve one; advancing `served` to the latest count would mark
+        // the lifecycles in between as done while their turns were never forwarded, and the next
+        // check would find nothing left to do. Stepping by one leaves the rest pending, and this
+        // same check picks them up one at a time.
+        return PassiveMonitorHandoff::ContinueWith(served + 1);
+    }
+    monitors.remove(&thread_id);
+    PassiveMonitorHandoff::Released(metadata.remove(&thread_id))
 }
 
 async fn finish_passive_subagent_monitor_task(
@@ -2279,6 +2343,10 @@ async fn materialize_subagent_thread(
             resume_policy: ResumePolicy::RequireExisting,
             initial_model: Some(model.clone()),
             updates,
+            // The child is already running its first turn. Metadata creation, the ownership
+            // checks below, and the monitor handshake all happen before this thread's forwarder
+            // attaches, and everything Codex emits in that window belongs to this turn.
+            retain_until_subscribed: true,
         })
         .await?;
     let restore_permit = shared.runtime.restoration_permit(handle.thread);
@@ -2523,6 +2591,9 @@ async fn ensure_subagent_thread_open(
             resume_policy: ResumePolicy::RequireExisting,
             initial_model: Some(thread_file.current_model.clone()),
             updates,
+            // Reopening a child the parent just interacted with again: it resumes work
+            // immediately, while the passive monitor is still being set up.
+            retain_until_subscribed: true,
         })
         .await?;
     // This path calls the harness directly rather than `open_thread_with_resume_policy`, so retain
@@ -2558,6 +2629,56 @@ async fn ensure_subagent_thread_open(
     Ok(agent_name)
 }
 
+/// Subscribe a passive monitor to its thread and build the turn context for one lifecycle.
+///
+/// Called once per lifecycle rather than once per monitor: a monitor that hands off into a newly
+/// signalled turn subscribes again here, and that fresh subscribe is what claims the events the
+/// harness mirrored while the previous turn was completing.
+async fn attach_passive_subagent_monitor(
+    shared: &Arc<RegistryShared>,
+    thread_id: ThreadId,
+    effective_model: &ModelRef,
+    mode: Mode,
+    initial_prompt: Option<&str>,
+    fallback: Option<SubagentFallbackTranscript>,
+    pre_turn_timeout: Option<Duration>,
+) -> Result<
+    (
+        ProjectId,
+        ThreadHandle,
+        giskard_harness::AgentEventStream,
+        TurnContext,
+    ),
+    HarnessError,
+> {
+    let threads = shared.threads.lock().await;
+    let binding = threads
+        .get(&thread_id)
+        .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+    let project_id = binding.project;
+    let handle = binding.handle.clone();
+    drop(threads);
+
+    let harness = shared
+        .active_harness(project_id)
+        .await
+        .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+
+    let stream = harness.subscribe(&handle);
+    let prompt_text = initial_prompt.and_then(trimmed_non_empty);
+    let ctx = TurnContext {
+        user_input: UserInput::text(prompt_text.unwrap_or("Sub-agent turn")),
+        model: effective_model.clone(),
+        mode,
+        kind: TurnContextKind::PassiveSubagent,
+        passive_input_is_fallback: prompt_text.is_none(),
+        subagent_fallback: fallback,
+        passive_subagent_metadata: Some(shared.passive_subagent_metadata.clone()),
+        passive_pre_turn_timeout: pre_turn_timeout,
+    };
+    Ok((project_id, handle, stream, ctx))
+}
+
 async fn start_passive_subagent_monitor(
     thread_id: ThreadId,
     observation: SubagentObservation,
@@ -2570,7 +2691,7 @@ async fn start_passive_subagent_monitor(
         policy,
         fallback,
     } = observation;
-    if !register_passive_subagent_monitor(
+    let Some(served_lifecycle) = register_passive_subagent_monitor(
         &shared.passive_monitors,
         &shared.passive_subagent_metadata,
         &shared.passive_monitor_tasks,
@@ -2584,9 +2705,12 @@ async fn start_passive_subagent_monitor(
         },
     )
     .await
-    {
+    else {
+        // A monitor is already registered for this thread, so this observation was merged into its
+        // metadata instead. That monitor is now responsible for it, including handing off into it
+        // if the observation arrived while the monitor was finishing an earlier turn.
         return Ok(());
-    }
+    };
 
     let error_cleanup_shared = shared.clone();
     // Kept out of the block below because the failure path needs them after everything inside has
@@ -2594,33 +2718,22 @@ async fn start_passive_subagent_monitor(
     let error_cleanup_model = effective_model.clone();
     let error_cleanup_mode = mode;
     let result = async {
-        let threads = shared.threads.lock().await;
-        let binding = threads
-            .get(&thread_id)
-            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
-        let project_id = binding.project;
-        let handle = binding.handle.clone();
-        drop(threads);
-
-        let harness = shared
-            .active_harness(project_id)
-            .await
-            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
-
-        let stream = harness.subscribe(&handle);
+        let (project_id, handle, stream, ctx) = attach_passive_subagent_monitor(
+            &shared,
+            thread_id,
+            &effective_model,
+            mode,
+            initial_prompt.as_deref(),
+            fallback.clone(),
+            policy.pre_turn_timeout,
+        )
+        .await?;
         let cleanup_model = effective_model.clone();
         let cleanup_mode = mode;
-        let prompt_text = initial_prompt.as_deref().and_then(trimmed_non_empty);
-        let ctx = TurnContext {
-            user_input: UserInput::text(prompt_text.unwrap_or("Sub-agent turn")),
-            model: effective_model,
-            mode,
-            kind: TurnContextKind::PassiveSubagent,
-            passive_input_is_fallback: prompt_text.is_none(),
-            subagent_fallback: fallback,
-            passive_subagent_metadata: Some(shared.passive_subagent_metadata.clone()),
-            passive_pre_turn_timeout: policy.pre_turn_timeout,
-        };
+        let loop_model = effective_model.clone();
+        let loop_prompt = initial_prompt.clone();
+        let loop_fallback = fallback.clone();
+        let loop_pre_turn_timeout = policy.pre_turn_timeout;
 
         info!(
             %project_id,
@@ -2645,14 +2758,78 @@ async fn start_passive_subagent_monitor(
         };
         tokio::spawn(async move {
             let _permit = permit;
-            forward_events(shared, thread_id, project_id, stream, ctx, None).await;
-            if let Some(metadata) = take_passive_subagent_monitor_metadata(
-                &cleanup_shared.passive_monitors,
-                &cleanup_shared.passive_subagent_metadata,
-                thread_id,
-            )
-            .await
-            {
+            let mut stream = stream;
+            let mut ctx = ctx;
+            let mut served = served_lifecycle;
+            // One task serves every lifecycle this thread is observed to start, rather than one
+            // task per lifecycle. Forwarders are per-turn and exit at their own turn's completion,
+            // and an observation arriving before this task gives up ownership is merged into its
+            // metadata instead of starting a monitor — so the exiting forwarder is the only thing
+            // that can pick that lifecycle up. Going around again re-subscribes, which claims the
+            // events the harness mirrored while the previous turn was ending.
+            let released = loop {
+                forward_events(
+                    cleanup_shared.clone(),
+                    thread_id,
+                    project_id,
+                    stream,
+                    ctx,
+                    None,
+                )
+                .await;
+                let handoff = hand_off_or_release_passive_monitor(
+                    &cleanup_shared.passive_monitors,
+                    &cleanup_shared.passive_subagent_metadata,
+                    thread_id,
+                    served,
+                )
+                .await;
+                let next = match handoff {
+                    PassiveMonitorHandoff::Released(metadata) => break metadata,
+                    PassiveMonitorHandoff::ContinueWith(seq) => seq,
+                };
+                match attach_passive_subagent_monitor(
+                    &cleanup_shared,
+                    thread_id,
+                    &loop_model,
+                    cleanup_mode,
+                    loop_prompt.as_deref(),
+                    loop_fallback.clone(),
+                    loop_pre_turn_timeout,
+                )
+                .await
+                {
+                    Ok((_, _, next_stream, next_ctx)) => {
+                        info!(
+                            %project_id,
+                            %thread_id,
+                            lifecycle = next,
+                            "passive sub-agent monitor handing off into a newly observed lifecycle"
+                        );
+                        served = next;
+                        stream = next_stream;
+                        ctx = next_ctx;
+                    }
+                    Err(error) => {
+                        // The thread or its harness went away between the handoff and the
+                        // re-subscribe. Ownership is still held, so release it the ordinary way
+                        // rather than leaving this thread permanently unmonitorable.
+                        warn!(
+                            %project_id,
+                            %thread_id,
+                            %error,
+                            "passive sub-agent monitor could not attach to the observed lifecycle"
+                        );
+                        break take_passive_subagent_monitor_metadata(
+                            &cleanup_shared.passive_monitors,
+                            &cleanup_shared.passive_subagent_metadata,
+                            thread_id,
+                        )
+                        .await;
+                    }
+                }
+            };
+            if let Some(metadata) = released {
                 if metadata.cancelled {
                     debug!(
                         %project_id,
@@ -2885,7 +3062,7 @@ async fn broadcast_event_with_user_input(
             user_input,
         },
         other => {
-            let event_kind = event_kind(&other);
+            let event_kind = other.kind();
             let event_turn = event_turn_id(&other);
             let event_item = event_item_id(&other);
             let Some(agent_event) = WireAgentEvent::from_agent_event(other) else {
@@ -3080,6 +3257,11 @@ async fn forward_events(
     );
 
     let exit_reason = loop {
+        // Anything still queued in the stream is a replay of what the thread produced before this
+        // forwarder attached, and exactly one event leaves the stream per iteration — so this says
+        // whether the event about to arrive is history or live. The duplicate-forwarder guard
+        // below is the consumer that needs to know.
+        let replaying = stream.backlog_len() > 0;
         let recv_result = if ctx.kind == TurnContextKind::PassiveSubagent
             && owned_turn.is_none()
             && turn_id.is_none()
@@ -3148,15 +3330,22 @@ async fn forward_events(
         };
         match recv_result {
             Ok(event) => {
+                // This guard reads a turnless event as proof that another forwarder owns the
+                // thread's turn. A replayed event proves nothing of the sort: it is history the
+                // harness retained before this forwarder attached, and the backlog opens with
+                // exactly such events — `ThreadOpened`, and the `Error` a resume warning emits
+                // beside it. Exempting the whole replay rather than naming variants keeps the
+                // guard from firing on the backlog this forwarder attached to deliver.
                 if ctx.kind == TurnContextKind::PassiveSubagent
                     && turn_gate.is_none()
                     && event_turn_id(&event).is_none()
+                    && !replaying
                     && shared.runtime.has_active_turn(thread_id)
                 {
                     warn!(
                         %project_id,
                         %thread_id,
-                        event_kind = event_kind(&event),
+                        event_kind = event.kind(),
                         "passive sub-agent forwarder yielded turnless event to an active forwarder"
                     );
                     break ForwarderExitReason::DuplicateForwarder;
@@ -3226,7 +3415,7 @@ async fn forward_events(
                                 %project_id,
                                 %thread_id,
                                 %passive_turn,
-                                event_kind = event_kind(&event),
+                                event_kind = event.kind(),
                                 "passive subscriber yielded to the existing turn forwarder"
                             );
                             break ForwarderExitReason::DuplicateForwarder;
@@ -3251,7 +3440,7 @@ async fn forward_events(
                         %project_id,
                         %thread_id,
                         turn_id = %event_turn,
-                        event_kind = event_kind(&event),
+                        event_kind = event.kind(),
                         harness_item_id,
                         existing_item_id = %existing_item_id,
                         conflicting_item_id = %conflicting_item_id,
@@ -3372,7 +3561,7 @@ async fn forward_events(
                         debug!(
                             %thread_id,
                             event_sequence = display_opt(applied.sequence),
-                            event_kind = event_kind(&event),
+                            event_kind = event.kind(),
                             "applied late terminal event to thread runtime"
                         );
                         let changed = applied.tasks_changed;
@@ -3432,7 +3621,7 @@ async fn forward_events(
                     debug!(
                         %thread_id,
                         event_sequence = display_opt(applied.sequence),
-                        event_kind = event_kind(&event),
+                        event_kind = event.kind(),
                         "applied turnless agent event to thread runtime"
                     );
                     publish_applied_runtime_effects(&hub, thread_id, applied).await;
@@ -3686,7 +3875,7 @@ async fn forward_events(
                             %thread_id,
                             %buffer_turn,
                             %existing_turn,
-                            event_kind = event_kind(&event),
+                            event_kind = event.kind(),
                             "not buffering an event for a different turn; live delivery and persistence continue"
                         );
                         append_to_live_buffer = false;
@@ -3713,7 +3902,7 @@ async fn forward_events(
                     debug!(
                         %thread_id,
                         event_sequence = display_opt(applied.sequence),
-                        event_kind = event_kind(&event),
+                        event_kind = event.kind(),
                         "applied agent event to thread runtime"
                     );
                     publish_applied_runtime_effects(&hub, thread_id, applied).await;
@@ -3846,6 +4035,37 @@ async fn forward_events(
                     }
                     break ForwarderExitReason::SyntheticCompactionCompleted;
                 }
+            }
+            // A forwarder that falls far enough behind a live thread outruns the harness channel's
+            // ring. Events retained before this forwarder attached are replayed from a queue and
+            // cannot lag, so this is a slow consumer rather than a slow import — but the response
+            // is the same either way, because ending the forwarder here would escalate a gap in
+            // the transcript into an interrupted turn. `complete_forwarded_turn` still names the
+            // turn from its completion when the `TurnStarted` that would have named it was
+            // skipped.
+            //
+            // Continuing recovers the stream, not the events: this arm is a known gap, not a fix.
+            // Whatever the ring dropped is gone for good, and two residuals follow. Any
+            // `ItemCompleted` among the skipped events is absent from the persisted turn —
+            // completions are the sole source of a turn's items, so that part of the transcript is
+            // permanently missing. And if the skipped events include the turn's own
+            // `TurnCompleted`, nothing completes the turn here: it reads as running until the
+            // stream ends, at which point the recovery path below persists it as `Interrupted`
+            // with zero usage. Both need the consumer to fall a full ring behind the producer past
+            // the event in question, so neither is reachable without sustained backpressure.
+            // Closing them needs the harness channel to stop discarding on overflow, which is a
+            // larger change than this arm.
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(
+                    %project_id,
+                    %thread_id,
+                    skipped,
+                    context_kind = turn_context_kind_label(ctx.kind),
+                    turn_id = display_opt(turn_id),
+                    elapsed_ms = forwarder_started.elapsed().as_millis(),
+                    "harness event backlog overflowed; continuing with a gap"
+                );
+                continue;
             }
             Err(e) => {
                 stream_error = Some(e.to_string());
@@ -4047,7 +4267,7 @@ async fn persist_subagent_fallback_transcript(
         debug!(
             %thread_id,
             event_sequence = display_opt(applied.sequence),
-            event_kind = event_kind(&event),
+            event_kind = event.kind(),
             "applied fallback transcript event to thread runtime"
         );
         publish_applied_runtime_effects(&shared.hub, thread_id, applied).await;
@@ -4285,24 +4505,6 @@ fn track_item_identity(
     }
 }
 
-fn event_kind(event: &AgentEvent) -> &'static str {
-    match event {
-        AgentEvent::ThreadOpened { .. } => "thread_opened",
-        AgentEvent::TurnStarted { .. } => "turn_started",
-        AgentEvent::ContextWindowUpdated { .. } => "context_window_updated",
-        AgentEvent::ItemStarted { .. } => "item_started",
-        AgentEvent::ItemDelta { .. } => "item_delta",
-        AgentEvent::ItemCompleted { .. } => "item_completed",
-        AgentEvent::DiffUpdated { .. } => "diff_updated",
-        AgentEvent::ApprovalRequested { .. } => "approval_requested",
-        AgentEvent::ServerRequestReceived { .. } => "server_request_received",
-        AgentEvent::ServerRequestResolved { .. } => "server_request_resolved",
-        AgentEvent::TurnCompleted { .. } => "turn_completed",
-        AgentEvent::Error { .. } => "error",
-        AgentEvent::Notice { .. } => "notice",
-    }
-}
-
 fn event_item_id(event: &AgentEvent) -> Option<ItemId> {
     match event {
         AgentEvent::ItemStarted { item, .. } => Some(item.id),
@@ -4359,7 +4561,7 @@ fn log_foreign_thread_event_drop(
         %project_id,
         %thread_id,
         %event_thread_id,
-        event_kind = event_kind(event),
+        event_kind = event.kind(),
         event_turn_id = display_opt(event_turn_id(event)),
         event_item_id = display_opt(event_item_id(event)),
         item_delta_kind = event_item_delta_kind(event),
@@ -4397,7 +4599,7 @@ fn log_cross_turn_event_drop(
         %thread_id,
         %owned_turn,
         %event_turn,
-        event_kind = event_kind(event),
+        event_kind = event.kind(),
         event_item_id = display_opt(event_item_id(event)),
         item_delta_kind = event_item_delta_kind(event),
         elapsed_ms,
@@ -5336,6 +5538,7 @@ mod tests {
                             resume_policy: giskard_harness::ResumePolicy::AllowFreshFallback,
                             initial_model: None,
                             updates,
+                            retain_until_subscribed: false,
                         })
                         .await;
                 }
@@ -5804,6 +6007,360 @@ mod tests {
             assert_eq!(saved_child.kind, giskard_core::ThreadKind::Subagent);
             assert_eq!(saved_child.parent_thread_id, Some(parent_id));
         }
+    }
+
+    /// A stand-in for the Codex adapter's channel: a live broadcast plus the queue it retains for
+    /// a thread with no subscriber. `subscribe` counts its calls and replays the queue ahead of the
+    /// live stream, exactly as the adapter hands a mirrored turn to a replacement forwarder — which
+    /// is the thing a handoff exists to claim.
+    struct HandoffHarness {
+        events: broadcast::Sender<AgentEvent>,
+        retained: Arc<StdMutex<std::collections::VecDeque<AgentEvent>>>,
+        subscribes: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentHarness for HandoffHarness {
+        fn capabilities(&self) -> HarnessCapabilities {
+            HarnessCapabilities::default()
+        }
+
+        async fn list_models(&self) -> Result<Vec<giskard_core::ModelDescriptor>, HarnessError> {
+            Ok(Vec::new())
+        }
+
+        async fn open_thread(
+            &self,
+            _opts: OpenThreadOptions,
+        ) -> Result<ThreadHandle, HarnessError> {
+            Err(HarnessError::Unsupported("unused".into()))
+        }
+
+        async fn start_turn(
+            &self,
+            _thread: &ThreadHandle,
+            _input: UserInput,
+            _overrides: giskard_core::turn::TurnOverrides,
+        ) -> Result<TurnId, HarnessError> {
+            Err(HarnessError::Unsupported("unused".into()))
+        }
+
+        fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
+            self.subscribes.fetch_add(1, Ordering::SeqCst);
+            let receiver = self.events.subscribe();
+            let backlog = std::mem::take(&mut *self.retained.lock().unwrap());
+            AgentEventStream::with_backlog(backlog, receiver)
+        }
+
+        async fn respond_approval(
+            &self,
+            _req: ApprovalId,
+            _decision: ApprovalDecision,
+        ) -> Result<(), HarnessError> {
+            Err(HarnessError::Unsupported("unused".into()))
+        }
+
+        async fn respond_server_request(
+            &self,
+            _req: ServerRequestId,
+            _response: giskard_core::server_request::ServerRequestResponse,
+        ) -> Result<(), HarnessError> {
+            Err(HarnessError::Unsupported("unused".into()))
+        }
+
+        async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
+            Err(HarnessError::Unsupported("unused".into()))
+        }
+
+        async fn shutdown(&self) -> Result<(), HarnessError> {
+            Ok(())
+        }
+    }
+
+    async fn wait_for<F>(what: &str, mut ready: F)
+    where
+        F: FnMut() -> bool,
+    {
+        for _ in 0..200 {
+            if ready() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// Everything a passive-monitor handoff test needs: a project and sub-agent thread on disk, a
+    /// binding, and a harness whose subscribes are countable.
+    struct HandoffFixture {
+        _tmp: tempfile::TempDir,
+        store: Arc<PersistStore>,
+        shared: Arc<super::RegistryShared>,
+        project_id: ProjectId,
+        thread_id: ThreadId,
+        events: broadcast::Sender<AgentEvent>,
+        retained: Arc<StdMutex<std::collections::VecDeque<AgentEvent>>>,
+        subscribes: Arc<AtomicUsize>,
+        model: ModelRef,
+    }
+
+    impl HandoffFixture {
+        async fn new() -> Self {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+            let project_id = ProjectId::new();
+            let thread_id = ThreadId::new();
+            store
+                .create_project(project_id, "proj", "/tmp/test")
+                .await
+                .unwrap();
+            let model = ModelRef {
+                provider: "openai".into(),
+                model: "gpt-5.5".into(),
+                reasoning_effort: None,
+            };
+            let now = Utc::now();
+            store
+                .save_thread(
+                    project_id,
+                    &ThreadFile {
+                        revision: 0,
+                        version: 1,
+                        id: thread_id,
+                        project_id,
+                        title: "Sub-agent".into(),
+                        harness_thread_id: "native-child".into(),
+                        parent_thread_id: Some(ThreadId::new()),
+                        spawned_by_turn_id: Some(TurnId::new()),
+                        kind: giskard_core::ThreadKind::Subagent,
+                        mode: Mode::Build,
+                        current_model: model.clone(),
+                        context_window: 128_000,
+                        model_context_windows: Default::default(),
+                        permission_preset: PermissionPreset::AskFirst,
+                        model_efforts: Default::default(),
+                        tokens: TokenLedger::default(),
+                        created_at: now,
+                        updated_at: now,
+                        archived: false,
+                        git_workspace: None,
+                    },
+                )
+                .await
+                .unwrap();
+
+            let shared = Arc::new(super::RegistryShared::new(
+                Arc::new(Hub::new()),
+                store.clone(),
+                ledger::spawn(store.clone()),
+            ));
+            shared.threads.lock().await.insert(
+                thread_id,
+                super::ThreadBinding {
+                    project: project_id,
+                    handle: ThreadHandle::detached(thread_id, "native-child".into()),
+                    native_model: None,
+                },
+            );
+            let (events, _) = broadcast::channel(64);
+            let retained = Arc::new(StdMutex::new(std::collections::VecDeque::new()));
+            let subscribes = Arc::new(AtomicUsize::new(0));
+            shared.harnesses.lock().await.by_project.insert(
+                project_id,
+                super::ProjectHarnessState::Active(Arc::new(HandoffHarness {
+                    events: events.clone(),
+                    retained: retained.clone(),
+                    subscribes: subscribes.clone(),
+                })),
+            );
+            Self {
+                _tmp: tmp,
+                store,
+                shared,
+                project_id,
+                thread_id,
+                events,
+                retained,
+                subscribes,
+                model,
+            }
+        }
+
+        fn active_observation(&self) -> super::SubagentObservation {
+            super::SubagentObservation {
+                effective_model: self.model.clone(),
+                mode: Mode::Build,
+                initial_prompt: Some("delegated prompt".into()),
+                policy: subagent_monitor_policy(Some(SubagentAction::Started), None),
+                fallback: None,
+            }
+        }
+
+        /// Observe another active lifecycle. While a monitor is registered this only merges into
+        /// its metadata — the running monitor becomes responsible for serving it.
+        async fn observe_active(&self) {
+            super::start_passive_subagent_monitor(
+                self.thread_id,
+                self.active_observation(),
+                self.shared.clone(),
+            )
+            .await
+            .expect("observation is accepted");
+        }
+
+        /// The merge a terminal observation performs when it finds a monitor registered.
+        async fn observe_terminal(&self) {
+            super::update_passive_subagent_metadata(
+                &self.shared.passive_subagent_metadata,
+                self.thread_id,
+                None,
+                Some(super::SubagentFallbackTranscript {
+                    message: "the child reported this".into(),
+                    status: SubagentStatus::Completed,
+                }),
+                super::LifecycleSignal::Terminal,
+            )
+            .await;
+        }
+
+        async fn await_subscribes(&self, count: usize) {
+            let subscribes = self.subscribes.clone();
+            wait_for(&format!("{count} monitor subscribes"), move || {
+                subscribes.load(Ordering::SeqCst) >= count
+            })
+            .await;
+        }
+
+        fn turn_events(&self, turn: TurnId) -> [AgentEvent; 2] {
+            [
+                AgentEvent::TurnStarted {
+                    thread: self.thread_id,
+                    turn,
+                },
+                AgentEvent::TurnCompleted {
+                    thread: self.thread_id,
+                    turn,
+                    usage: Default::default(),
+                    status: TurnStatus {
+                        kind: TurnStatusKind::Completed,
+                        message: None,
+                    },
+                },
+            ]
+        }
+
+        /// Drive one complete turn to whatever forwarder is attached right now.
+        fn run_turn_live(&self) -> TurnId {
+            let turn = TurnId::new();
+            for event in self.turn_events(turn) {
+                self.events.send(event).expect("a forwarder is attached");
+            }
+            turn
+        }
+
+        /// Mirror one complete turn the way the adapter does for a thread whose forwarder is busy
+        /// finishing the previous one. The next `subscribe` replays it.
+        fn retain_turn(&self) -> TurnId {
+            let turn = TurnId::new();
+            let mut retained = self.retained.lock().unwrap();
+            retained.extend(self.turn_events(turn));
+            turn
+        }
+
+        async fn persisted_turn_ids(&self, at_least: usize) -> Vec<TurnId> {
+            let mut ids = Vec::new();
+            for _ in 0..200 {
+                ids = self
+                    .store
+                    .load_all_turns(self.project_id, self.thread_id)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|turn| turn.id)
+                    .collect();
+                if ids.len() >= at_least {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            ids
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lifecycle_observed_while_a_monitor_is_registered_is_still_served() {
+        let fixture = HandoffFixture::new().await;
+        fixture.observe_active().await;
+        fixture.await_subscribes(1).await;
+
+        // The parent's next interaction is materialized while the first monitor is still
+        // registered, so this observation is merged into its metadata rather than starting a
+        // monitor of its own. Nothing else will ever subscribe for it.
+        fixture.observe_active().await;
+        let second_turn = fixture.retain_turn();
+        let first_turn = fixture.run_turn_live();
+
+        // The exiting monitor is the only thing that can claim that mirror, and it does so by
+        // subscribing again.
+        fixture.await_subscribes(2).await;
+
+        let ids = fixture.persisted_turn_ids(2).await;
+        assert!(
+            ids.contains(&first_turn) && ids.contains(&second_turn),
+            "both lifecycles are persisted, got {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_terminal_observation_does_not_bury_a_lifecycle_that_was_never_served() {
+        let fixture = HandoffFixture::new().await;
+        fixture.observe_active().await;
+        fixture.await_subscribes(1).await;
+
+        // The child's next turn is observed and mirrored, and the child then reports itself
+        // finished — all while the first monitor is still winding down. Terminal evidence says the
+        // child is over, not that its turn was recorded, and the fallback transcript it carries is
+        // skipped once the thread has history, so releasing here would lose that turn outright.
+        fixture.observe_active().await;
+        let second_turn = fixture.retain_turn();
+        fixture.observe_terminal().await;
+        let first_turn = fixture.run_turn_live();
+
+        fixture.await_subscribes(2).await;
+
+        let ids = fixture.persisted_turn_ids(2).await;
+        assert!(
+            ids.contains(&first_turn) && ids.contains(&second_turn),
+            "the unserved lifecycle outranks the terminal fallback, got {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_lifecycles_queued_before_one_handoff_are_each_served() {
+        let fixture = HandoffFixture::new().await;
+        fixture.observe_active().await;
+        fixture.await_subscribes(1).await;
+
+        // Two more lifecycles are observed before the monitor releases ownership. A forwarder ends
+        // at its own turn's completion, so one handoff cannot serve both: collapsing them marks
+        // the second as served without ever forwarding it.
+        fixture.observe_active().await;
+        fixture.observe_active().await;
+        let second_turn = fixture.retain_turn();
+        let first_turn = fixture.run_turn_live();
+
+        // First handoff: claims the mirror holding turn 2, serves it, exits.
+        fixture.await_subscribes(2).await;
+        // Second handoff, which only happens if the queued lifecycles were stepped through one at
+        // a time rather than collapsed into the first.
+        fixture.await_subscribes(3).await;
+        let third_turn = fixture.run_turn_live();
+
+        let ids = fixture.persisted_turn_ids(3).await;
+        assert!(
+            ids.contains(&first_turn) && ids.contains(&second_turn) && ids.contains(&third_turn),
+            "every queued lifecycle is served in turn, got {ids:?}"
+        );
     }
 
     #[tokio::test]
@@ -7749,6 +8306,219 @@ mod tests {
             .await
             .expect("user forwarder should exit after stream close")
             .unwrap();
+    }
+
+    /// A passive monitor whose thread already has an active turn must not read its own replayed
+    /// backlog as evidence of a duplicate forwarder. The backlog opens with exactly the turnless
+    /// events the guard keys on — `ThreadOpened`, and the `Error` a resume warning emits beside
+    /// it — so a guard that only knew about the first would end the forwarder on the second,
+    /// discarding the very replay it attached to deliver.
+    #[tokio::test]
+    async fn passive_forwarder_tolerates_its_own_replayed_backlog() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: None,
+        };
+        store
+            .create_project(project_id, "proj", "/tmp/test")
+            .await
+            .unwrap();
+        let (tx, _) = broadcast::channel(16);
+        // What the harness retained before this forwarder attached, replayed ahead of the live
+        // stream: the thread opening, then the warning the failed resume raised beside it.
+        let backlog = std::collections::VecDeque::from(vec![
+            AgentEvent::ThreadOpened {
+                thread: thread_id,
+                harness_thread_id: "native-thread".into(),
+            },
+            AgentEvent::Error {
+                thread: thread_id,
+                turn: None,
+                error: HarnessError::Transport(
+                    "Agent context was lost; started a fresh Codex session.".into(),
+                ),
+            },
+        ]);
+        let passive_stream = AgentEventStream::with_backlog(backlog, tx.subscribe());
+        let hub = Arc::new(Hub::new());
+        let (client_tx, _client_rx) = mpsc::channel(16);
+        let _replacements = hub.register_client(1, client_tx).await;
+        assert!(hub.subscribe(thread_id, 1).await);
+        let shared = Arc::new(super::RegistryShared::new(
+            hub,
+            store.clone(),
+            ledger::spawn(store),
+        ));
+        let ctx = TurnContext {
+            user_input: UserInput::text("Sub-agent turn"),
+            model: model.clone(),
+            mode: Mode::Build,
+            kind: TurnContextKind::PassiveSubagent,
+            passive_input_is_fallback: true,
+            subagent_fallback: None,
+            passive_subagent_metadata: Some(shared.passive_subagent_metadata.clone()),
+            passive_pre_turn_timeout: Some(tokio::time::Duration::from_secs(2)),
+        };
+        // Something else already holds an active turn on this thread.
+        let handle = ThreadHandle::detached(thread_id, "native-thread".into());
+        let user_ctx = TurnContext {
+            kind: TurnContextKind::User,
+            passive_input_is_fallback: false,
+            passive_subagent_metadata: None,
+            ..ctx.clone()
+        };
+        let _lease = shared
+            .runtime
+            .reserve_turn(thread_id, turn_reservation(project_id, &handle, &user_ctx))
+            .unwrap();
+        assert!(shared.runtime.has_active_turn(thread_id));
+
+        shared.passive_monitors.lock().await.insert(thread_id);
+        shared.passive_monitor_tasks.register(thread_id).await;
+        let passive_forwarder = tokio::spawn(forward_events(
+            shared.clone(),
+            thread_id,
+            project_id,
+            passive_stream,
+            ctx,
+            None,
+        ));
+
+        // The backlog is already queued, so the forwarder drains it without anything being sent.
+        // Neither replayed event is projected to the browser, so the observable is that the
+        // forwarder is still running: mistaking either for another forwarder's turnless traffic
+        // would have ended this one.
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        assert!(
+            !passive_forwarder.is_finished(),
+            "passive forwarder must not exit on its own replayed backlog"
+        );
+
+        drop(tx);
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), passive_forwarder)
+            .await
+            .expect("passive forwarder should exit after the stream closes")
+            .unwrap();
+    }
+
+    /// Overflowing the harness's retention ring costs the oldest events, not the turn: the
+    /// forwarder reports the gap and keeps going, and `TurnCompleted` still names the turn even
+    /// though the `TurnStarted` that would have introduced it was skipped.
+    #[tokio::test]
+    async fn forwarder_survives_a_lagged_event_backlog() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: None,
+        };
+        store
+            .create_project(project_id, "proj", "/tmp/test")
+            .await
+            .unwrap();
+        let history_store = store.clone();
+        // A ring far smaller than what the thread produces before the forwarder starts reading.
+        let (tx, _) = broadcast::channel(4);
+        let stream = AgentEventStream::new(tx.subscribe());
+        let hub = Arc::new(Hub::new());
+        let (client_tx, mut client_rx) = mpsc::channel(64);
+        let _replacements = hub.register_client(1, client_tx).await;
+        assert!(hub.subscribe(thread_id, 1).await);
+        let shared = Arc::new(super::RegistryShared::new(
+            hub,
+            store.clone(),
+            ledger::spawn(store),
+        ));
+        let ctx = TurnContext {
+            user_input: UserInput::text("user turn"),
+            model: model.clone(),
+            mode: Mode::Build,
+            kind: TurnContextKind::User,
+            passive_input_is_fallback: false,
+            subagent_fallback: None,
+            passive_subagent_metadata: None,
+            passive_pre_turn_timeout: None,
+        };
+        let handle = ThreadHandle::detached(thread_id, "native-thread".into());
+        let lease = shared
+            .runtime
+            .reserve_turn(thread_id, turn_reservation(project_id, &handle, &ctx))
+            .unwrap();
+
+        // Overflow the ring before anything reads it, losing TurnStarted and the early notices.
+        let turn = TurnId::new();
+        tx.send(AgentEvent::TurnStarted {
+            thread: thread_id,
+            turn,
+        })
+        .unwrap();
+        for index in 0..8 {
+            tx.send(AgentEvent::Notice {
+                thread: thread_id,
+                turn: Some(turn),
+                message: format!("early {index}"),
+            })
+            .unwrap();
+        }
+        tx.send(AgentEvent::TurnCompleted {
+            thread: thread_id,
+            turn,
+            usage: giskard_core::token::TokenUsage::default(),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        })
+        .unwrap();
+
+        let forwarder = tokio::spawn(forward_events(
+            shared.clone(),
+            thread_id,
+            project_id,
+            stream,
+            ctx,
+            Some(lease),
+        ));
+
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
+            loop {
+                match client_rx.recv().await {
+                    Some(ServerMessage::Event { agent_event, .. })
+                        if matches!(*agent_event, WireAgentEvent::TurnCompleted { .. }) =>
+                    {
+                        return;
+                    }
+                    Some(_) => {}
+                    None => panic!("forwarder exited before completing the turn"),
+                }
+            }
+        })
+        .await
+        .expect("a lagged backlog must not end the forwarder");
+
+        drop(tx);
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), forwarder)
+            .await
+            .expect("forwarder should exit after the stream closes")
+            .unwrap();
+
+        // The turn is persisted despite never seeing its own TurnStarted.
+        let (turns, _) = history_store
+            .load_history(project_id, thread_id, None, 16)
+            .await
+            .expect("history loads");
+        assert!(
+            turns.iter().any(|persisted| persisted.id == turn),
+            "the completed turn should persist even though its start was skipped"
+        );
     }
 
     #[tokio::test]

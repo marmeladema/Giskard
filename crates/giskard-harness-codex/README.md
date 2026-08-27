@@ -78,6 +78,11 @@ nothing is a routing failure, reported as such. It is only attributed to the
 caller's fallback thread while the adapter knows of no threads at all — which,
 for a project with persisted threads, stops being true the moment its harness is
 created.
+The thread mapping is normally established at `open_thread`; it is also
+established provisionally when Codex announces a native thread Giskard has not
+opened yet, so a sub-agent's opening events are routable before the server can
+import it (see [Native thread announcement and event
+retention](#native-thread-announcement-and-event-retention)).
 
 These registries belong to one adapter worker and are rebuilt when its Codex
 app-server process is respawned. Durable Giskard IDs and completed transcript
@@ -122,6 +127,127 @@ Reusing `call_7` in another turn or thread produces another Giskard `ItemId`.
 Some Codex notifications carry an item ID without producing a visible Giskard
 item. The mapper may seed the scoped item registry from those notifications so
 that later deltas and completion still resolve to the same `ItemId`.
+
+## Native thread announcement and event retention
+
+A sub-agent's opening events reach the adapter before Giskard knows the thread
+exists. Codex spawns a child by creating its thread, submitting its first turn,
+and only then completing the parent's tool call that names the child, so the
+parent link Giskard imports from arrives after the child has begun working. The
+server then needs a further round of store reads, ownership validation, and
+metadata creation before its forwarder can attach. Two mechanisms cover that
+window; neither pauses the Codex stream.
+
+**Announcement.** The app server attaches a client listener to a newly loaded
+thread in two ordered steps: it publishes `thread/status/changed` for the
+thread, and only then starts forwarding that thread's own notifications. Both
+travel the same connection, so an announcement always precedes the announced
+thread's first event. On seeing one for a native id it does not know, the
+adapter mints a `ThreadId`, binds the native id to it, and opens its event
+channel — all before the first child event arrives, so nothing has to be routed
+without a mapping.
+
+The binding is provisional: nothing has yet established that the thread belongs
+to a Giskard parent, or is Giskard's to own at all. `open_thread` adopts it when
+the server imports the thread under a strict linked resume, which is what keeps
+everything already retained attached to the identity the server persists. An
+explicit `ThreadId` supersedes it instead, retiring the provisional channel.
+
+Adoption also ends the binding's provisional status, whether or not a forwarder
+ever attaches — a sub-agent imported on terminal evidence starts no monitor, so
+"opened but never subscribed" is a resting state rather than a failure. Retiring
+such a thread would leave it persisted with no route back to Codex: reopening it
+short-circuits on the live binding, so nothing would rebind the native id. The
+cost of that choice is that an import the server declines *after* opening
+strands a mapping and an empty channel until the harness restarts.
+
+Only `thread/status/changed` is treated as an announcement, and not the
+`notLoaded` transition, which reports a thread going away rather than arriving.
+Every other status counts, including `idle`: a child is often still idle when
+its listener attaches, because the app server publishes the transition before
+the child's first turn registers as running. `thread/start` and `thread/fork`
+announce their threads with the silent variant, and `thread/started` is reserved
+for threads a client asked for by name plus detached review threads, which
+Giskard does not import. If Giskard ever imports forks or review threads,
+`thread/started` becomes the second announcement to handle.
+
+**Retention.** While a thread has no subscriber, its events are queued rather
+than broadcast — a broadcast send discards its value outright when no receiver is
+attached, and a receiver created later starts at the current tail. The first
+`subscribe` takes the queue and replays it ahead of the live stream, under the
+same lock, so no event can fall between the two.
+`OpenThreadOptions::retain_until_subscribed` re-arms retention when a caller
+reopens a thread it will only subscribe to after further work.
+
+An attached receiver is not proof that new work has a consumer. Forwarders are
+per-turn: one exits at its own turn's completion and drops whatever is still
+queued behind its receiver, while the replacement subscribes at the channel tail
+— so a turn announced while the previous turn's forwarder is still draining
+would be lost between them. When Codex announces a thread going `active`,
+retention is therefore re-armed even under a live receiver, and behaves as a
+mirror rather than a diversion: each event goes to both the queue and the
+receiver, so the live forwarder is never starved and its replacement still finds
+the new turn from the announcement onwards.
+
+That announcement restarts the mirror instead of extending it. A receiver that
+is still alive has seen everything up to that point, and a replay opening with
+the previous turn's completion would make the replacement forwarder exit before
+doing any work — forwarders break on any completion they see, not only their own
+turn's, so such a replay abandons the turn its forwarder was created for. That
+is also why `idle` does not re-arm under a live receiver: the app server
+publishes it just before a turn completes, so a mirror started there would hold
+nothing but that completion.
+
+Only the *edge* into `active` counts. Codex republishes `active` whenever a
+turn's active flags change, so an approval or user-input request arrives mid-turn
+as another `active` on the same run; restarting the mirror there would discard
+the opening events the replacement still needs. Each channel therefore remembers
+whether the last announcement said the thread was running, and re-arms only on
+the transition into it. `notLoaded` clears that memory without re-arming
+anything: it ends the run it reported, so a reload afterwards reads as a fresh
+turn rather than as one more flag change on a run that is over.
+
+Retention is ordered by insertion and keyed by item, so what it holds stays
+proportional to what the thread did rather than to how much it streamed. Two
+rules do that work.
+
+Deltas for one item accumulate into a single entry. A run of deltas is pure
+concatenation — the browser appends each to the same element, and the server's
+own live buffer already compacts such a run into one delta — so this is that same
+operation done earlier. Keying by item rather than folding into the tail is what
+lets it survive interleaving: two items streaming at once still cost one entry
+each. Text and command output for one item stay apart, because they render in
+different places.
+
+An item's deltas are dropped once its completion arrives. `ItemCompleted`
+carries the item's final content and is the only thing the server assembles a
+persisted turn from, so the deltas ahead of it describe a state nothing will ever
+read; `runtime_live` deletes them for the same reason once the turn is live.
+Compaction only ever deletes from the replay — the relative order of everything
+that survives is preserved.
+
+Accumulation does move things, so replay is not the exact order Codex produced: a
+later delta joins the slot its item first took, ahead of unrelated events that
+arrived in between, and `A1, B1, A2` replays as `A1A2, B1`. The reordering is
+bounded to unrelated items — a delta cannot move ahead of its own `TurnStarted`,
+which precedes the slot, nor behind its own `ItemCompleted`, which deletes it —
+and nothing that is not a delta ever changes position.
+
+What is left is the thread's lifecycle plus the partial stream of whatever item
+is still open, which is bounded by the shape of a turn rather than by a limit to
+tune. A thread that streamed and finished several items before anyone subscribed
+retains their completions and nothing else.
+
+A binding the server never adopts — a native thread Giskard turned out not to
+want, or never got to — is retired by a periodic sweep after
+`PROVISIONAL_THREAD_TTL`, unbinding the native id and discarding its retained
+events with a warning. Because Codex blocks until a server request is answered,
+retiring a binding refuses any request still outstanding on it, which is what an
+unroutable request would have received in the first place. Retention on a thread
+that *was* adopted but never attached a forwarder is released on the same
+schedule, leaving the binding intact. Unannounced unknown native threads keep the
+existing behaviour: their traffic is dropped with a diagnostic warning that names
+the protocol identifiers but no payload.
 
 ## Sub-agent links
 

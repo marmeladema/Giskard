@@ -549,6 +549,7 @@ mod tests {
                     model: "gpt-5.5".into(),
                     reasoning_effort: None,
                 }),
+                retain_until_subscribed: false,
             })
             .await
             .unwrap();
@@ -613,6 +614,7 @@ mod tests {
                     model: "gpt-5.5".into(),
                     reasoning_effort: None,
                 }),
+                retain_until_subscribed: false,
             })
             .await
             .unwrap();

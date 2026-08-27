@@ -118,6 +118,28 @@ impl AgentEvent {
             | Self::Notice { thread, .. } => *thread,
         }
     }
+
+    /// Stable, payload-free label for this event, for structured logs and diagnostics.
+    ///
+    /// Carries no agent-driven content, so it is safe in any warning: callers that need to say
+    /// *what* was dropped or delayed can name the kind without leaking the payload.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::ThreadOpened { .. } => "thread_opened",
+            Self::TurnStarted { .. } => "turn_started",
+            Self::ContextWindowUpdated { .. } => "context_window_updated",
+            Self::ItemStarted { .. } => "item_started",
+            Self::ItemDelta { .. } => "item_delta",
+            Self::ItemCompleted { .. } => "item_completed",
+            Self::DiffUpdated { .. } => "diff_updated",
+            Self::ApprovalRequested { .. } => "approval_requested",
+            Self::ServerRequestReceived { .. } => "server_request_received",
+            Self::ServerRequestResolved { .. } => "server_request_resolved",
+            Self::TurnCompleted { .. } => "turn_completed",
+            Self::Error { .. } => "error",
+            Self::Notice { .. } => "notice",
+        }
+    }
 }
 
 #[cfg(test)]

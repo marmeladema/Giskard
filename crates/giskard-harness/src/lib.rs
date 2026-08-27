@@ -1,5 +1,6 @@
 //! The `AgentHarness` abstraction — the keystone of the harness-agnostic design (spec §4).
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -311,6 +312,19 @@ pub struct OpenThreadOptions {
     pub initial_model: Option<ModelRef>,
     /// Bounded, non-blocking destination for metadata discovered after open returns.
     pub updates: ThreadUpdateSink,
+    /// Re-arm retention of this thread's events for a caller that will subscribe only after
+    /// further work.
+    ///
+    /// A thread retains from the moment the harness opens its channel, so a *first* open needs
+    /// nothing from this flag. It matters on reopen: the previous forwarder consumed the earlier
+    /// retention, and a thread that is already running will produce events before a new one can
+    /// attach. Opening and subscribing are back to back for most callers, on a thread that is not
+    /// running, so nothing is produced in between; a linked sub-agent is the exception, because
+    /// its work is already under way while its metadata and ownership are still being settled.
+    ///
+    /// Has no effect while a subscriber is attached: retention holds events back from the
+    /// channel, so re-arming under a live forwarder would starve it.
+    pub retain_until_subscribed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -420,33 +434,63 @@ pub struct HarnessNotice {
     pub detail: Option<String>,
 }
 
-/// A typed wrapper around a `broadcast::Receiver<AgentEvent>`.
+/// A typed wrapper around a `broadcast::Receiver<AgentEvent>`, optionally preceded by events the
+/// harness retained for this thread before any subscriber existed.
 pub struct AgentEventStream {
+    /// Drained before the live receiver, so a subscriber that attaches after the thread started
+    /// producing still sees its opening events, in order.
+    backlog: VecDeque<AgentEvent>,
     rx: broadcast::Receiver<AgentEvent>,
 }
 
 impl AgentEventStream {
     pub fn new(rx: broadcast::Receiver<AgentEvent>) -> Self {
-        Self { rx }
+        Self {
+            backlog: VecDeque::new(),
+            rx,
+        }
     }
 
-    /// Returns the underlying receiver.
-    pub fn into_inner(self) -> broadcast::Receiver<AgentEvent> {
-        self.rx
+    /// Build a stream that replays `backlog` before switching to live events.
+    pub fn with_backlog(
+        backlog: VecDeque<AgentEvent>,
+        rx: broadcast::Receiver<AgentEvent>,
+    ) -> Self {
+        Self { backlog, rx }
+    }
+
+    /// How many replayed events are still queued ahead of the live stream.
+    ///
+    /// Non-zero means the next `recv` returns history the thread produced before this stream
+    /// existed, rather than something happening now. Consumers whose behaviour depends on an
+    /// event being live — anything reading an event as evidence of concurrent activity — have to
+    /// tell the two apart.
+    pub fn backlog_len(&self) -> usize {
+        self.backlog.len()
     }
 
     /// Recv next event (awaits).
     pub async fn recv(&mut self) -> Result<AgentEvent, broadcast::error::RecvError> {
+        if let Some(event) = self.backlog.pop_front() {
+            return Ok(event);
+        }
         self.rx.recv().await
+    }
+
+    /// Take the next event if one is already available, without awaiting.
+    pub fn try_recv(&mut self) -> Result<AgentEvent, broadcast::error::TryRecvError> {
+        if let Some(event) = self.backlog.pop_front() {
+            return Ok(event);
+        }
+        self.rx.try_recv()
     }
 
     /// Convert to a `BoxStream` for ergonomic use with `futures`.
     pub fn into_stream(self) -> BoxStream<'static, AgentEvent> {
         use futures::StreamExt;
-        let rx = self.rx;
-        futures::stream::unfold(rx, |mut rx| async move {
-            match rx.recv().await {
-                Ok(event) => Some((event, rx)),
+        futures::stream::unfold(self, |mut stream| async move {
+            match stream.recv().await {
+                Ok(event) => Some((event, stream)),
                 Err(_) => None,
             }
         })
