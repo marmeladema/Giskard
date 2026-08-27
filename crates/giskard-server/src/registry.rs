@@ -2589,6 +2589,10 @@ async fn start_passive_subagent_monitor(
     }
 
     let error_cleanup_shared = shared.clone();
+    // Kept out of the block below because the failure path needs them after everything inside has
+    // been moved into the turn context.
+    let error_cleanup_model = effective_model.clone();
+    let error_cleanup_mode = mode;
     let result = async {
         let threads = shared.threads.lock().await;
         let binding = threads
@@ -2676,12 +2680,38 @@ async fn start_passive_subagent_monitor(
     .await;
 
     if result.is_err() {
-        take_passive_subagent_monitor_metadata(
+        // Setup failed, so no monitor will run and nothing will hand this thread its summary. The
+        // metadata carries the terminal fallback the monitor would have been given; taking it
+        // without persisting it is the one path that drops the child's transcript entirely, so
+        // write it here exactly as the success path's cleanup does.
+        if let Some(metadata) = take_passive_subagent_monitor_metadata(
             &error_cleanup_shared.passive_monitors,
             &error_cleanup_shared.passive_subagent_metadata,
             thread_id,
         )
-        .await;
+        .await
+            && !metadata.cancelled
+            && let Some(fallback) = metadata.fallback
+        {
+            let project_id = error_cleanup_shared
+                .threads
+                .lock()
+                .await
+                .get(&thread_id)
+                .map(|binding| binding.project);
+            if let Some(project_id) = project_id {
+                persist_terminal_subagent_fallback(
+                    project_id,
+                    thread_id,
+                    error_cleanup_model,
+                    error_cleanup_mode,
+                    metadata.initial_prompt,
+                    fallback,
+                    error_cleanup_shared.clone(),
+                )
+                .await;
+            }
+        }
         finish_passive_subagent_monitor_task(
             &error_cleanup_shared.passive_monitor_tasks,
             thread_id,
@@ -5774,6 +5804,90 @@ mod tests {
             assert_eq!(saved_child.kind, giskard_core::ThreadKind::Subagent);
             assert_eq!(saved_child.parent_thread_id, Some(parent_id));
         }
+    }
+
+    #[tokio::test]
+    async fn monitor_setup_failure_still_persists_the_terminal_fallback() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        store
+            .create_project(project_id, "proj", "/tmp/test")
+            .await
+            .unwrap();
+        let shared = Arc::new(super::RegistryShared::new(
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store.clone()),
+        ));
+        // A thread record to attach the transcript to, but deliberately no harness for the
+        // project — setup fails looking one up, which is the path that used to drop the summary.
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: None,
+        };
+        let now = Utc::now();
+        store
+            .save_thread(
+                project_id,
+                &ThreadFile {
+                    revision: 0,
+                    version: 1,
+                    id: thread_id,
+                    project_id,
+                    title: "Sub-agent".into(),
+                    harness_thread_id: "native-child".into(),
+                    parent_thread_id: Some(ThreadId::new()),
+                    spawned_by_turn_id: Some(TurnId::new()),
+                    kind: giskard_core::ThreadKind::Subagent,
+                    mode: Mode::Build,
+                    current_model: model.clone(),
+                    context_window: 128_000,
+                    model_context_windows: Default::default(),
+                    permission_preset: PermissionPreset::AskFirst,
+                    model_efforts: Default::default(),
+                    tokens: TokenLedger::default(),
+                    created_at: now,
+                    updated_at: now,
+                    archived: false,
+                    git_workspace: None,
+                },
+            )
+            .await
+            .unwrap();
+        shared.threads.lock().await.insert(
+            thread_id,
+            super::ThreadBinding {
+                project: project_id,
+                handle: ThreadHandle::detached(thread_id, "native-child".into()),
+                native_model: None,
+            },
+        );
+
+        let observation = super::SubagentObservation {
+            effective_model: model,
+            mode: Mode::Build,
+            initial_prompt: Some("delegated prompt".into()),
+            policy: subagent_monitor_policy(Some(SubagentAction::Started), None),
+            fallback: Some(super::SubagentFallbackTranscript {
+                message: "the child reported this".into(),
+                status: SubagentStatus::Completed,
+            }),
+        };
+
+        let result = super::start_passive_subagent_monitor(thread_id, observation, shared).await;
+        assert!(result.is_err(), "setup must fail without a harness");
+
+        let turns = store.load_all_turns(project_id, thread_id).await.unwrap();
+        assert!(
+            turns.iter().any(|turn| turn
+                .items
+                .iter()
+                .any(|item| { format!("{item:?}").contains("the child reported this") })),
+            "a failed monitor setup must still write the summary nobody else will, got {turns:?}"
+        );
     }
 
     #[tokio::test]
