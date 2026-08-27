@@ -227,6 +227,11 @@ enum HarnessCommand {
 }
 
 enum ControlCommand {
+    /// Bindings Giskard already had, handed over before any thread is opened.
+    BindKnownThreads {
+        bindings: Vec<(String, ThreadId)>,
+        response: oneshot::Sender<()>,
+    },
     RespondApproval {
         id: ApprovalId,
         decision: ApprovalDecision,
@@ -1271,6 +1276,36 @@ impl AgentHarness for CodexHarness {
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
 
+    async fn bind_known_threads(&self, bindings: Vec<(String, ThreadId)>) {
+        if bindings.is_empty() {
+            return;
+        }
+        // Waited on, not fired and forgotten: the caller's contract is that these are in place
+        // before any thread is opened, and returning early would let an open — and the Codex
+        // traffic it triggers — race the registration this exists to guarantee.
+        let (tx, rx) = oneshot::channel();
+        if let Err(error) = self
+            .enqueue_control(
+                "bind_known_threads",
+                ControlCommand::BindKnownThreads {
+                    bindings,
+                    response: tx,
+                },
+            )
+            .await
+        {
+            // Either failure leaves this harness running without the bindings, which is the exact
+            // situation the call exists to prevent — a sub-agent Codex announces will be given a
+            // second id and nothing later will say why. Nothing can be done about it here, so the
+            // only thing owed is a diagnosable record.
+            warn!(%error, "could not hand known thread bindings to the Codex worker");
+            return;
+        }
+        if rx.await.is_err() {
+            warn!("Codex worker stopped before acknowledging known thread bindings");
+        }
+    }
+
     async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
         let (tx, rx) = oneshot::channel();
         self.enqueue_control(
@@ -1896,6 +1931,15 @@ async fn handle_control_command(
             let _ = response.send(result);
             StreamOutcome::TurnEnded
         }
+        Some(ControlCommand::BindKnownThreads { bindings, response }) => {
+            let count = bindings.len();
+            for (harness_thread_id, thread) in bindings {
+                mapper.register_thread(harness_thread_id, thread);
+            }
+            debug!(count, "registered thread bindings Giskard already knew");
+            let _ = response.send(());
+            StreamOutcome::TurnEnded
+        }
         Some(ControlCommand::Interrupt { thread, response }) => {
             let native_turn_id = mapper
                 .active_native_turn_for_thread(thread.thread)
@@ -2232,7 +2276,18 @@ async fn handle_open_thread(
     senders: &SenderMap,
 ) -> Result<OpenThreadOutcome, HarnessError> {
     let cwd = opts.workspace_root.to_string_lossy().to_string();
-    let thread_id = opts.thread.unwrap_or_default();
+    // An explicit id wins — the caller knows this thread's durable identity. Otherwise, if the
+    // native thread being resumed is already bound, reuse that binding rather than inventing an
+    // id: a caller passing `None` is saying it has no opinion, not that this is a new thread, and
+    // minting here would give one thread two identities for everything downstream to reconcile.
+    let thread_id = opts
+        .thread
+        .or_else(|| {
+            opts.resume
+                .as_deref()
+                .and_then(|native| mapper.thread_for_native(native))
+        })
+        .unwrap_or_default();
 
     // Track whether resume-by-id failed and we fell back to a fresh native thread (C5), so we can
     // warn the caller that agent context was lost while keeping the Giskard-side history.
@@ -4309,6 +4364,61 @@ mod tests {
         )
         .expect("fake harness should spawn");
         (harness, controller)
+    }
+
+    /// A sub-agent Giskard persisted in an earlier run already has a `ThreadId` — the one its
+    /// history is filed under. Handing that binding over before anything opens means the adapter
+    /// reuses it rather than inventing a second identity for the same thread.
+    #[tokio::test]
+    async fn a_known_binding_is_reused_instead_of_inventing_a_second_identity() {
+        let (harness, _controller) = spawn_fake_harness();
+        let persisted = ThreadId::new();
+
+        // What the server read out of the child's own thread.json.
+        harness
+            .bind_known_threads(vec![("native-child".to_owned(), persisted)])
+            .await;
+
+        // The caller has no id to offer — it is resuming by native id alone.
+        let opened = harness
+            .open_thread(open_opts(None, Some("native-child")))
+            .await
+            .expect("child resumes");
+
+        assert_eq!(
+            opened.thread, persisted,
+            "a thread Giskard already named must not be given a second id"
+        );
+    }
+
+    /// The converse, and the property that makes reuse safe rather than merely convenient: a
+    /// native thread nobody has bound gets a fresh id, and *that* id is then the binding — so
+    /// reopening the same native thread keeps it, while a different one gets its own.
+    #[tokio::test]
+    async fn an_unbound_native_thread_gets_one_id_and_then_keeps_it() {
+        let (harness, _controller) = spawn_fake_harness();
+
+        let first = harness
+            .open_thread(open_opts(None, Some("native-unbound")))
+            .await
+            .expect("thread opens");
+        let reopened = harness
+            .open_thread(open_opts(None, Some("native-unbound")))
+            .await
+            .expect("thread reopens");
+        assert_eq!(
+            reopened.thread, first.thread,
+            "the id chosen on the first open is the thread's identity from then on"
+        );
+
+        let other = harness
+            .open_thread(open_opts(None, Some("native-other")))
+            .await
+            .expect("other thread opens");
+        assert_ne!(
+            other.thread, first.thread,
+            "a different native thread must not inherit another's id"
+        );
     }
 
     #[tokio::test]

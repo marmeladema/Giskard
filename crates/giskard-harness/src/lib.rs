@@ -518,6 +518,23 @@ pub trait AgentHarness: Send + Sync {
     /// Subscribe to the stream of neutral events for a thread.
     fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream;
 
+    /// Tell the harness which native threads Giskard already has durable ids for.
+    ///
+    /// A harness can be told about a thread by the agent before Giskard opens it — Codex creates a
+    /// sub-agent's thread and starts its first turn before the tool call naming the child returns.
+    /// A harness routing those events has no id to route them to unless it invents one, and an
+    /// invented id for a thread Giskard already persisted is a *second* identity for one thread:
+    /// two ids, one of them wrong, and everything keyed by either has to be reconciled afterwards.
+    ///
+    /// Supplying the bindings up front removes that problem rather than making it cheaper. Every
+    /// `(native id, ThreadId)` pair Giskard already knows is one the harness never has to guess.
+    ///
+    /// Called once per harness, before any thread is opened on it. Idempotent, and harnesses that
+    /// do not translate ids ignore it.
+    async fn bind_known_threads(&self, bindings: Vec<(String, ThreadId)>) {
+        let _ = bindings;
+    }
+
     /// Respond to a pending approval request.
     async fn respond_approval(
         &self,
