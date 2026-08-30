@@ -141,8 +141,8 @@ Then open **http://127.0.0.1:8787**, log in, and:
    checkout.
 4. Linked child threads appear in the **Sub-agents** monitor and can be opened from their activity
    rows; their header **Parent** button returns to the owning thread. See
-   [Sub-agent threads](docs/subagents.md) for spawning protocols, monitoring, prompts, direct
-   follow-ups, ownership, and deletion behavior.
+   [Sub-agent threads](docs/subagents.md) for spawning protocols, read-only event ownership,
+   prompts, approvals, and deletion behavior.
 
 The header context value is a context-window indicator, not a billing total. Codex currently exposes
 the latest turn's input tokens rather than a dedicated context-occupancy field, so Giskard uses that

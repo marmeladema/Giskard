@@ -1889,12 +1889,6 @@ async fn archive_thread(
     AxumPath((project_id, thread_id)): AxumPath<(ProjectId, ThreadId)>,
     Json(req): Json<ArchiveThreadRequest>,
 ) -> Result<Json<ThreadSummary>, ApiError> {
-    if state.registry.thread_has_passive_monitor(thread_id).await {
-        return Err(ApiError::Conflict(
-            "thread has delegated sub-agent work; wait for it to finish before archiving".into(),
-        ));
-    }
-    reject_thread_mutation_if_live(&state, thread_id).await?;
     let project_config = state
         .store
         .load_project(project_id)
@@ -1907,6 +1901,14 @@ async fn archive_thread(
         .ok_or(ApiError::NotFound)?;
     state
         .registry
+        .ensure_thread_writable(project_id, thread_id)
+        .await
+        .map_err(harness_api_error)?;
+    // Durable ownership decides whether archive is a supported operation at all. Only writable
+    // primary threads proceed to transient active-turn/running-task validation.
+    reject_thread_mutation_if_live(&state, thread_id).await?;
+    state
+        .registry
         .set_thread_archived(
             &project_config,
             thread_id,
@@ -1914,7 +1916,7 @@ async fn archive_thread(
             req.archived,
         )
         .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        .map_err(harness_api_error)?;
     let tf = state
         .thread_metadata
         .mutate_with_recency(project_id, thread_id, ThreadRecency::TouchIfChanged, |tf| {
@@ -1933,7 +1935,6 @@ async fn rename_thread(
     AxumPath((project_id, thread_id)): AxumPath<(ProjectId, ThreadId)>,
     Json(req): Json<RenameThreadRequest>,
 ) -> Result<Json<ThreadSummary>, ApiError> {
-    let title = normalize_thread_title(&req.title)?;
     let project_config = state
         .store
         .load_project(project_id)
@@ -1944,6 +1945,12 @@ async fn rename_thread(
         .load_thread(project_id, thread_id)
         .await?
         .ok_or(ApiError::NotFound)?;
+    state
+        .registry
+        .ensure_thread_writable(project_id, thread_id)
+        .await
+        .map_err(harness_api_error)?;
+    let title = normalize_thread_title(&req.title)?;
     if thread_file.title == title {
         let workspace_root = thread_workspace_root(&state, &project_config, &thread_file).await?;
         return Ok(Json(thread_summary(&thread_file, workspace_root)));
@@ -1958,7 +1965,7 @@ async fn rename_thread(
             title.clone(),
         )
         .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        .map_err(harness_api_error)?;
     let tf = state
         .thread_metadata
         .mutate_with_recency(project_id, thread_id, ThreadRecency::TouchIfChanged, |tf| {
@@ -1986,6 +1993,11 @@ async fn thread_deletion_impact(
     if deletion_order.is_empty() {
         return Err(ApiError::NotFound);
     }
+    state
+        .registry
+        .ensure_thread_writable(project_id, thread_id)
+        .await
+        .map_err(harness_api_error)?;
     let mut worktrees = Vec::new();
     for candidate in &deletion_order {
         let Some(worktree) = graph
@@ -2037,6 +2049,11 @@ async fn delete_thread(
         .lock_project_lifecycle_with_timeout(project_id, PROJECT_LIFECYCLE_LOCK_TIMEOUT)
         .await
         .map_err(harness_api_error)?;
+    state
+        .registry
+        .ensure_thread_writable(project_id, thread_id)
+        .await
+        .map_err(harness_api_error)?;
     let graph = load_thread_graph(&state.store, project_id).await?;
     let deletion_order = descendant_deletion_order(&graph, thread_id);
     if deletion_order.is_empty() {
@@ -2044,19 +2061,6 @@ async fn delete_thread(
     }
     // Preflight the complete subtree before deleting any native or local record. A busy descendant
     // must reject the entire request instead of leaving a partially deleted ownership tree.
-    for candidate in &deletion_order {
-        reject_thread_mutation_if_live(&state, *candidate).await?;
-    }
-    // Idle pre-turn monitors are cancellable delegated subscriptions, not durable work. Stop the
-    // complete subtree before deleting anything, then preflight again so a child turn that raced
-    // the first check rejects the request without leaving a partially deleted ownership graph.
-    for candidate in &deletion_order {
-        state
-            .registry
-            .stop_passive_subagent_monitor(*candidate)
-            .await
-            .map_err(harness_api_error)?;
-    }
     for candidate in &deletion_order {
         reject_thread_mutation_if_live(&state, *candidate).await?;
     }
@@ -3956,6 +3960,9 @@ fn harness_api_error(error: HarnessError) -> ApiError {
         HarnessError::ThreadBusy { .. } => {
             ApiError::Conflict("Thread already has an active turn.".into())
         }
+        HarnessError::ThreadReadOnly { .. } => {
+            ApiError::Conflict("Agent-owned threads are read-only.".into())
+        }
         HarnessError::Timeout(message) => ApiError::Unavailable(message),
         other => ApiError::Internal(other.to_string()),
     }
@@ -4093,6 +4100,9 @@ impl WsError {
             }
             HarnessError::ThreadBusy { .. } => {
                 ("thread_turn_active", "Thread already has an active turn.")
+            }
+            HarnessError::ThreadReadOnly { .. } => {
+                ("thread_read_only", "Agent-owned threads are read-only.")
             }
             HarnessError::Timeout(_) => ("harness_timeout", "Codex operation timed out."),
         };
@@ -4972,6 +4982,14 @@ async fn handle_client_msg(
             text,
             attachments,
         } => {
+            let project_id = project_for_readonly(state, thread_id, "send_input").await?;
+            state
+                .registry
+                .ensure_thread_writable(project_id, thread_id)
+                .await
+                .map_err(|error| WsError::from_harness(error, "send_input", Some(thread_id)))?;
+            // Only a writable primary may cause a cold harness attach.
+            project_for(state, thread_id, "send_input").await?;
             let text = text.trim().to_string();
             if text.is_empty() && attachments.is_empty() {
                 return Err(WsError::new(
@@ -4992,7 +5010,6 @@ async fn handle_client_msg(
                 .thread(thread_id)
                 .action("send_input")
             })?;
-            let project_id = project_for(state, thread_id, "send_input").await?;
             let app_config = state
                 .store
                 .load_config()
@@ -5077,7 +5094,12 @@ async fn handle_client_msg(
             request_id,
             mode,
         } => {
-            let project_id = project_for(state, thread_id, "switch_mode").await?;
+            let project_id = project_for_readonly(state, thread_id, "switch_mode").await?;
+            state
+                .registry
+                .ensure_thread_writable(project_id, thread_id)
+                .await
+                .map_err(|error| WsError::from_harness(error, "switch_mode", Some(thread_id)))?;
             let tf = state
                 .thread_metadata
                 .mutate_with_recency(project_id, thread_id, ThreadRecency::TouchIfChanged, |tf| {
@@ -5111,6 +5133,11 @@ async fn handle_client_msg(
             // a *cold* thread too — that is exactly how an orphaned thread (provider removed from
             // config) gets rescued.
             let project_id = project_for_readonly(state, thread_id, "select_model").await?;
+            state
+                .registry
+                .ensure_thread_writable(project_id, thread_id)
+                .await
+                .map_err(|error| WsError::from_harness(error, "select_model", Some(thread_id)))?;
             let config = state
                 .store
                 .load_config()
@@ -5249,7 +5276,15 @@ async fn handle_client_msg(
             request_id,
             preset,
         } => {
-            let project_id = project_for(state, thread_id, "set_permission_preset").await?;
+            let project_id =
+                project_for_readonly(state, thread_id, "set_permission_preset").await?;
+            state
+                .registry
+                .ensure_thread_writable(project_id, thread_id)
+                .await
+                .map_err(|error| {
+                    WsError::from_harness(error, "set_permission_preset", Some(thread_id))
+                })?;
             let tf = state
                 .thread_metadata
                 .mutate_with_recency(project_id, thread_id, ThreadRecency::TouchIfChanged, |tf| {
@@ -5391,7 +5426,16 @@ async fn handle_client_msg(
                 .map_err(|e| WsError::from_harness(e, "interrupt", Some(thread_id)))?;
         }
         ClientMessage::CompactContext { thread_id } => {
-            let project_id = project_for(state, thread_id, "compact_context").await?;
+            let project_id = project_for_readonly(state, thread_id, "compact_context").await?;
+            state
+                .registry
+                .ensure_thread_writable(project_id, thread_id)
+                .await
+                .map_err(|error| {
+                    WsError::from_harness(error, "compact_context", Some(thread_id))
+                })?;
+            // Only a writable primary may cause a cold harness attach.
+            project_for(state, thread_id, "compact_context").await?;
             let tf = state
                 .store
                 .load_thread(project_id, thread_id)
@@ -5516,6 +5560,12 @@ async fn handle_client_msg(
             }
         }
         ClientMessage::SavePlan { thread_id, path } => {
+            let project_id = project_for_readonly(state, thread_id, "save_plan").await?;
+            state
+                .registry
+                .ensure_thread_writable(project_id, thread_id)
+                .await
+                .map_err(|error| WsError::from_harness(error, "save_plan", Some(thread_id)))?;
             let written = save_plan(state, thread_id, &path).await.map_err(|e| {
                 WsError::new(
                     "save_plan_failed",

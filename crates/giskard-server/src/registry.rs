@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::future::join_all;
-use tokio::sync::{Mutex, Notify, OwnedMutexGuard, oneshot, watch};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard, broadcast, oneshot, watch};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
@@ -15,8 +15,8 @@ use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{
-    Item, ItemDelta, ItemPayload, SubagentAction, SubagentStatus, command_status_is_running,
-    normalized_command_status, tool_status_is_running,
+    Item, ItemDelta, ItemPayload, command_status_is_running, normalized_command_status,
+    tool_status_is_running,
 };
 use giskard_core::mcp::{McpOauthStart, McpServerStatus};
 use giskard_core::model::{ModelDescriptor, ModelRef};
@@ -58,24 +58,17 @@ struct TurnContext {
     model: ModelRef,
     mode: Mode,
     kind: TurnContextKind,
-    passive_input_is_fallback: bool,
-    subagent_fallback: Option<SubagentFallbackTranscript>,
-    passive_subagent_metadata: Option<PassiveSubagentMetadataMap>,
-    passive_pre_turn_timeout: Option<Duration>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TurnContextKind {
     User,
     ManualCompaction,
-    PassiveSubagent,
+    ExternalSubagent,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ForwarderExitReason {
-    NormalTurnCompleted,
-    SyntheticCompactionCompleted,
-    AfterTurnCommandsDrained,
     StreamEndedRecovered,
     StreamEndedWithoutTurn,
     DuplicateForwarder,
@@ -86,9 +79,6 @@ enum ForwarderExitReason {
 
 fn forwarder_exit_reason_label(reason: ForwarderExitReason) -> &'static str {
     match reason {
-        ForwarderExitReason::NormalTurnCompleted => "normal_turn_completed",
-        ForwarderExitReason::SyntheticCompactionCompleted => "synthetic_compaction_completed",
-        ForwarderExitReason::AfterTurnCommandsDrained => "after_turn_commands_drained",
         ForwarderExitReason::StreamEndedRecovered => "stream_ended_recovered",
         ForwarderExitReason::StreamEndedWithoutTurn => "stream_ended_without_turn",
         ForwarderExitReason::DuplicateForwarder => "duplicate_forwarder",
@@ -102,7 +92,7 @@ fn turn_context_kind_label(kind: TurnContextKind) -> &'static str {
     match kind {
         TurnContextKind::User => "user",
         TurnContextKind::ManualCompaction => "manual_compaction",
-        TurnContextKind::PassiveSubagent => "passive_subagent",
+        TurnContextKind::ExternalSubagent => "external_subagent",
     }
 }
 
@@ -122,7 +112,7 @@ fn turn_reservation(
 }
 
 fn live_turn_user_input(ctx: &TurnContext) -> Option<UserInput> {
-    if ctx.kind != TurnContextKind::PassiveSubagent {
+    if ctx.kind != TurnContextKind::ExternalSubagent {
         return None;
     }
     ctx.user_input
@@ -131,21 +121,8 @@ fn live_turn_user_input(ctx: &TurnContext) -> Option<UserInput> {
         .map(UserInput::text)
 }
 
-fn passive_subagent_prompt_text(ctx: &TurnContext) -> Option<String> {
-    if ctx.kind != TurnContextKind::PassiveSubagent || ctx.passive_input_is_fallback {
-        return None;
-    }
-    ctx.user_input
-        .as_text()
-        .and_then(trimmed_non_empty)
-        .map(ToOwned::to_owned)
-}
-
-type PassiveSubagentMetadataMap = Arc<Mutex<HashMap<ThreadId, PassiveSubagentMetadata>>>;
-type PassiveMonitorTasks = Arc<PassiveMonitorTaskTracker>;
 type ProjectLifecycleLocks = Arc<Mutex<HashMap<ProjectId, Weak<Mutex<()>>>>>;
-const ACTIVE_SUBAGENT_PRE_TURN_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-const PASSIVE_MONITOR_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+type ThreadOwnerLocks = Arc<Mutex<HashMap<ThreadId, Weak<Mutex<()>>>>>;
 const HARNESS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const BACKGROUND_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const LEDGER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -205,57 +182,8 @@ impl RegistryTaskTracker {
     }
 }
 
-struct PassiveMonitorTaskTracker {
-    counts: Mutex<HashMap<ThreadId, usize>>,
-    completion: watch::Sender<u64>,
-}
-
-impl Default for PassiveMonitorTaskTracker {
-    fn default() -> Self {
-        let (completion, _) = watch::channel(0);
-        Self {
-            counts: Mutex::new(HashMap::new()),
-            completion,
-        }
-    }
-}
-
-impl PassiveMonitorTaskTracker {
-    async fn register(&self, thread_id: ThreadId) {
-        *self.counts.lock().await.entry(thread_id).or_default() += 1;
-    }
-
-    async fn contains(&self, thread_id: ThreadId) -> bool {
-        self.counts.lock().await.contains_key(&thread_id)
-    }
-
-    async fn finish(&self, thread_id: ThreadId) {
-        let mut counts = self.counts.lock().await;
-        match counts.get_mut(&thread_id) {
-            Some(count) if *count > 1 => *count -= 1,
-            Some(_) => {
-                counts.remove(&thread_id);
-            }
-            None => {
-                warn!(
-                    %thread_id,
-                    "passive sub-agent monitor task completed without a registered task"
-                );
-            }
-        }
-        drop(counts);
-        self.completion.send_modify(|generation| {
-            *generation = generation.wrapping_add(1);
-        });
-    }
-
-    fn subscribe(&self) -> watch::Receiver<u64> {
-        self.completion.subscribe()
-    }
-}
-
 #[derive(Clone)]
-struct ThreadBinding {
+struct BindingData {
     project: ProjectId,
     handle: ThreadHandle,
     /// The model the harness reports this native thread is on. `None` when neither the caller nor
@@ -264,28 +192,427 @@ struct ThreadBinding {
     native_model: Option<ModelRef>,
 }
 
-#[derive(Clone, Default)]
-struct PassiveSubagentMetadata {
-    initial_prompt: Option<String>,
-    fallback: Option<SubagentFallbackTranscript>,
-    active_lifecycle_observed: bool,
-    terminal_observed: bool,
-    cancelled: bool,
-    lifecycle_notify: Arc<Notify>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CoordinatorToken {
+    generation: u64,
+    sequence: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PassiveMonitorSignal {
-    Continue,
-    Terminal,
-    Cancelled,
+enum ClassificationPhase {
+    Primary,
+    Subagent,
 }
 
-#[derive(Clone, Copy)]
-enum LifecycleSignal {
-    None,
+impl From<ThreadKind> for ClassificationPhase {
+    fn from(kind: ThreadKind) -> Self {
+        match kind {
+            ThreadKind::Primary => Self::Primary,
+            ThreadKind::Subagent => Self::Subagent,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct EventOwnerControl {
+    cancel: watch::Sender<bool>,
+    completed: watch::Receiver<bool>,
+}
+
+enum OwnerPhase {
+    Installing,
+    Live(EventOwnerControl),
+    Draining(EventOwnerControl),
+    Retired,
+    Failed(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeActivity {
+    Unknown,
+    Idle,
     Active,
-    Terminal,
+    Unloaded,
+}
+
+struct PreparedOperation {
+    token: CoordinatorToken,
+    context: TurnContext,
+    turn_gate: ThreadTurnLease,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeTurnOrigin {
+    Prepared(CoordinatorToken),
+    External,
+}
+
+struct OwnedNativeTurn {
+    token: CoordinatorToken,
+    turn_id: TurnId,
+    origin: NativeTurnOrigin,
+    context: TurnContext,
+    turn_gate: Option<ThreadTurnLease>,
+}
+
+struct ClaimedNativeTurn {
+    token: CoordinatorToken,
+    context: TurnContext,
+    external: bool,
+}
+
+struct ThreadCoordinatorState {
+    generation: u64,
+    next_sequence: u64,
+    binding: BindingData,
+    classification: ClassificationPhase,
+    owner: OwnerPhase,
+    operation: Option<PreparedOperation>,
+    native_turn: Option<OwnedNativeTurn>,
+    native_activity: NativeActivity,
+}
+
+struct ThreadCoordinator {
+    state: Mutex<ThreadCoordinatorState>,
+    changed: Notify,
+}
+
+type ThreadBinding = Arc<ThreadCoordinator>;
+
+impl ThreadCoordinatorState {
+    fn token(&mut self) -> CoordinatorToken {
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        CoordinatorToken {
+            generation: self.generation,
+            sequence: self.next_sequence,
+        }
+    }
+
+    fn token_is_current(&self, token: CoordinatorToken) -> bool {
+        self.generation == token.generation
+    }
+}
+
+impl ThreadCoordinator {
+    fn new(binding: BindingData, classification: ClassificationPhase) -> Self {
+        Self {
+            state: Mutex::new(ThreadCoordinatorState {
+                generation: 1,
+                next_sequence: 0,
+                binding,
+                classification,
+                owner: OwnerPhase::Installing,
+                operation: None,
+                native_turn: None,
+                native_activity: NativeActivity::Unknown,
+            }),
+            changed: Notify::new(),
+        }
+    }
+
+    async fn binding(&self) -> BindingData {
+        self.state.lock().await.binding.clone()
+    }
+
+    async fn classification(&self) -> ClassificationPhase {
+        self.state.lock().await.classification
+    }
+
+    async fn activate_owner(&self, control: EventOwnerControl) -> Result<(), HarnessError> {
+        let mut state = self.state.lock().await;
+        if !matches!(state.owner, OwnerPhase::Installing) {
+            return Err(HarnessError::Protocol(format!(
+                "thread {} event owner was installed more than once",
+                state.binding.handle.thread
+            )));
+        }
+        state.owner = OwnerPhase::Live(control);
+        state.native_activity = NativeActivity::Idle;
+        Ok(())
+    }
+
+    async fn prepare_operation(
+        &self,
+        context: TurnContext,
+        turn_gate: ThreadTurnLease,
+    ) -> Result<CoordinatorToken, (HarnessError, ThreadTurnLease)> {
+        let mut state = self.state.lock().await;
+        if state.classification != ClassificationPhase::Primary {
+            return Err((
+                HarnessError::ThreadReadOnly {
+                    thread: state.binding.handle.thread,
+                },
+                turn_gate,
+            ));
+        }
+        if let OwnerPhase::Failed(reason) = &state.owner {
+            return Err((
+                HarnessError::Protocol(format!(
+                    "thread {} event owner failed: {reason}",
+                    state.binding.handle.thread
+                )),
+                turn_gate,
+            ));
+        }
+        if !matches!(state.owner, OwnerPhase::Live(_)) {
+            return Err((
+                HarnessError::Protocol(format!(
+                    "thread {} has no live event owner",
+                    state.binding.handle.thread
+                )),
+                turn_gate,
+            ));
+        }
+        if state.operation.is_some() || state.native_turn.is_some() {
+            return Err((
+                HarnessError::ThreadBusy {
+                    thread: state.binding.handle.thread,
+                },
+                turn_gate,
+            ));
+        }
+        let token = state.token();
+        state.operation = Some(PreparedOperation {
+            token,
+            context,
+            turn_gate,
+        });
+        Ok(token)
+    }
+
+    async fn abort_operation(&self, token: CoordinatorToken) -> Option<ThreadTurnLease> {
+        let mut state = self.state.lock().await;
+        if state.operation.as_ref()?.token != token {
+            return None;
+        }
+        let operation = state.operation.take()?;
+        drop(state);
+        self.changed.notify_waiters();
+        Some(operation.turn_gate)
+    }
+
+    /// Clear an operation that never reached a native turn. The event owner calls this when its
+    /// stream exits, so both gate-less admission and an installed runtime lease have one terminal
+    /// cleanup path.
+    async fn take_unclaimed_operation(&self) -> Option<ThreadTurnLease> {
+        let mut state = self.state.lock().await;
+        let operation = state.operation.take();
+        if operation.is_some() {
+            drop(state);
+            self.changed.notify_waiters();
+        }
+        operation.map(|operation| operation.turn_gate)
+    }
+
+    async fn reusable_handle(
+        &self,
+        project: ProjectId,
+        thread_id: ThreadId,
+        native_thread_id: Option<&str>,
+        classification: ClassificationPhase,
+    ) -> Result<ThreadHandle, HarnessError> {
+        let state = self.state.lock().await;
+        if state.binding.project != project
+            || state.binding.handle.thread != thread_id
+            || native_thread_id.is_some_and(|native_id| {
+                native_id != state.binding.handle.harness_thread_id.as_str()
+            })
+            || state.classification != classification
+        {
+            return Err(HarnessError::Protocol(format!(
+                "thread {} already has an incompatible event owner",
+                thread_id
+            )));
+        }
+        match &state.owner {
+            OwnerPhase::Live(_) => Ok(state.binding.handle.clone()),
+            OwnerPhase::Failed(reason) => Err(HarnessError::Protocol(format!(
+                "thread {} event owner failed: {reason}",
+                thread_id
+            ))),
+            OwnerPhase::Installing | OwnerPhase::Draining(_) | OwnerPhase::Retired => Err(
+                HarnessError::Protocol(format!("thread {} event owner is not reusable", thread_id)),
+            ),
+        }
+    }
+
+    async fn acknowledge_operation_turn(&self, token: CoordinatorToken, turn_id: TurnId) {
+        let mut state = self.state.lock().await;
+        if let Some(operation) = state
+            .operation
+            .as_mut()
+            .filter(|operation| operation.token == token)
+        {
+            let _ = operation.turn_gate.acknowledge_turn(turn_id);
+            return;
+        }
+        if let Some(native_turn) = state.native_turn.as_mut()
+            && native_turn.origin == NativeTurnOrigin::Prepared(token)
+            && let Some(turn_gate) = native_turn.turn_gate.as_mut()
+        {
+            let _ = turn_gate.acknowledge_turn(turn_id);
+        }
+    }
+
+    async fn claim_native_turn(
+        &self,
+        turn_id: TurnId,
+        external_context: TurnContext,
+    ) -> Result<ClaimedNativeTurn, HarnessError> {
+        let mut state = self.state.lock().await;
+        if let Some(native_turn) = state.native_turn.as_ref() {
+            if native_turn.turn_id != turn_id {
+                return Err(HarnessError::Protocol(format!(
+                    "native thread {} emitted turn {turn_id} while turn {} is active",
+                    state.binding.handle.harness_thread_id, native_turn.turn_id
+                )));
+            }
+            return Ok(ClaimedNativeTurn {
+                token: native_turn.token,
+                context: native_turn.context.clone(),
+                external: native_turn.origin == NativeTurnOrigin::External,
+            });
+        }
+
+        let (token, context, turn_gate, origin) = if let Some(operation) = state.operation.take() {
+            (
+                operation.token,
+                operation.context,
+                Some(operation.turn_gate),
+                NativeTurnOrigin::Prepared(operation.token),
+            )
+        } else {
+            let token = state.token();
+            (token, external_context, None, NativeTurnOrigin::External)
+        };
+        let external = origin == NativeTurnOrigin::External;
+        state.native_turn = Some(OwnedNativeTurn {
+            token,
+            turn_id,
+            origin,
+            context: context.clone(),
+            turn_gate,
+        });
+        state.native_activity = NativeActivity::Active;
+        Ok(ClaimedNativeTurn {
+            token,
+            context,
+            external,
+        })
+    }
+
+    async fn install_native_turn_gate(
+        &self,
+        token: CoordinatorToken,
+        turn_id: TurnId,
+        turn_gate: ThreadTurnLease,
+    ) -> Result<(), ThreadTurnLease> {
+        let mut state = self.state.lock().await;
+        let Some(native_turn) = state.native_turn.as_mut().filter(|turn| {
+            turn.token == token && turn.turn_id == turn_id && turn.turn_gate.is_none()
+        }) else {
+            return Err(turn_gate);
+        };
+        native_turn.turn_gate = Some(turn_gate);
+        Ok(())
+    }
+
+    async fn acknowledge_native_turn(
+        &self,
+        token: CoordinatorToken,
+        turn_id: TurnId,
+    ) -> Option<giskard_proto::ThreadRuntimeOverview> {
+        let mut state = self.state.lock().await;
+        state
+            .native_turn
+            .as_mut()
+            .filter(|turn| turn.token == token && turn.turn_id == turn_id)
+            .and_then(|turn| turn.turn_gate.as_mut())
+            .and_then(|turn_gate| turn_gate.acknowledge_turn(turn_id))
+    }
+
+    async fn take_native_turn_gate(
+        &self,
+        token: CoordinatorToken,
+        turn_id: TurnId,
+    ) -> Option<ThreadTurnLease> {
+        let mut state = self.state.lock().await;
+        state
+            .native_turn
+            .as_mut()
+            .filter(|turn| turn.token == token && turn.turn_id == turn_id)
+            .and_then(|turn| turn.turn_gate.take())
+    }
+
+    async fn finish_native_turn(&self, token: CoordinatorToken, turn_id: TurnId) {
+        let mut state = self.state.lock().await;
+        if state.native_turn.as_ref().is_some_and(|turn| {
+            turn.token == token && turn.turn_id == turn_id && state.token_is_current(token)
+        }) {
+            state.native_turn = None;
+            state.native_activity = NativeActivity::Idle;
+            drop(state);
+            self.changed.notify_waiters();
+        }
+    }
+
+    async fn owner_finished(&self, cancelled: bool) {
+        let mut state = self.state.lock().await;
+        let retired = match state.owner {
+            OwnerPhase::Draining(_) if cancelled => {
+                state.generation = state.generation.wrapping_add(1);
+                state.owner = OwnerPhase::Retired;
+                state.native_activity = NativeActivity::Unloaded;
+                true
+            }
+            OwnerPhase::Live(_) => {
+                state.owner = OwnerPhase::Failed("native event stream ended".into());
+                state.native_activity = NativeActivity::Unknown;
+                false
+            }
+            _ => false,
+        };
+        drop(state);
+        if retired {
+            self.changed.notify_waiters();
+        }
+    }
+
+    async fn begin_retirement(&self) -> Option<EventOwnerControl> {
+        let mut state = self.state.lock().await;
+        match &state.owner {
+            OwnerPhase::Live(control) | OwnerPhase::Draining(control) => {
+                let control = control.clone();
+                state.owner = OwnerPhase::Draining(control.clone());
+                Some(control)
+            }
+            OwnerPhase::Installing | OwnerPhase::Retired | OwnerPhase::Failed(_) => None,
+        }
+    }
+
+    async fn draining_control(&self) -> Option<EventOwnerControl> {
+        let state = self.state.lock().await;
+        match &state.owner {
+            OwnerPhase::Draining(control) => Some(control.clone()),
+            _ => None,
+        }
+    }
+
+    async fn is_retired(&self) -> bool {
+        matches!(self.state.lock().await.owner, OwnerPhase::Retired)
+    }
+
+    async fn finish_retirement(&self) {
+        let mut state = self.state.lock().await;
+        if matches!(state.owner, OwnerPhase::Retired) {
+            return;
+        }
+        state.generation = state.generation.wrapping_add(1);
+        state.owner = OwnerPhase::Retired;
+        state.native_activity = NativeActivity::Unloaded;
+        drop(state);
+        self.changed.notify_waiters();
+    }
 }
 
 #[derive(Clone)]
@@ -380,17 +707,13 @@ impl ProjectHarnessState {
 struct RegistryShared {
     harnesses: Arc<Mutex<Harnesses>>,
     threads: Arc<Mutex<HashMap<ThreadId, ThreadBinding>>>,
-    passive_monitors: Arc<Mutex<HashSet<ThreadId>>>,
-    passive_subagent_metadata: PassiveSubagentMetadataMap,
-    /// Generation count spanning subscription and post-forwarder fallback persistence. A new
-    /// monitor may start after an old subscription exits, so deletion waits for all generations.
-    passive_monitor_tasks: PassiveMonitorTasks,
     background_tasks: Arc<RegistryTaskTracker>,
-    /// Per-parent FIFO for linked lifecycle evidence. Harness events are ordered, so preserving
-    /// that order here prevents a later terminal observation from racing ahead of an active one.
+    /// Per-parent FIFO serializes relationship materialization. It does not order child lifecycle:
+    /// only the child's native event owner may mutate that state.
     subagent_materialization_queues:
         Arc<Mutex<HashMap<ThreadId, VecDeque<SubagentMaterializationJob>>>>,
     project_lifecycle_locks: ProjectLifecycleLocks,
+    thread_owner_locks: ThreadOwnerLocks,
     hub: Arc<Hub>,
     runtime: Arc<ThreadRuntimeRegistry>,
     store: Arc<PersistStore>,
@@ -431,6 +754,48 @@ impl RegistryShared {
         self.harnesses.lock().await.active(project_id)
     }
 
+    async fn abort_admitted_operation(
+        &self,
+        coordinator: &ThreadCoordinator,
+        operation: CoordinatorToken,
+    ) {
+        if let Some(mut turn_gate) = coordinator.abort_operation(operation).await
+            && let Some(overview) = turn_gate.release()
+        {
+            self.hub.publish_runtime_overview(overview).await;
+        }
+    }
+
+    async fn admit_operation(
+        &self,
+        coordinator: &ThreadCoordinator,
+        project_id: ProjectId,
+        handle: &ThreadHandle,
+        context: &TurnContext,
+    ) -> Result<CoordinatorToken, HarnessError> {
+        let turn_gate = match self
+            .runtime
+            .reserve_turn(handle.thread, turn_reservation(project_id, handle, context))
+        {
+            Ok(turn_gate) => turn_gate,
+            Err(error) => return Err(error),
+        };
+        let operation = match coordinator
+            .prepare_operation(context.clone(), turn_gate)
+            .await
+        {
+            Ok(operation) => operation,
+            Err((error, mut turn_gate)) => {
+                if let Some(overview) = turn_gate.release() {
+                    self.hub.publish_runtime_overview(overview).await;
+                }
+                return Err(error);
+            }
+        };
+        publish_runtime_overview(self).await;
+        Ok(operation)
+    }
+
     #[cfg(test)]
     fn new(hub: Arc<Hub>, store: Arc<PersistStore>, ledger: LedgerHandle) -> Self {
         Self::new_with_runtime(hub, Arc::new(ThreadRuntimeRegistry::new()), store, ledger)
@@ -446,12 +811,10 @@ impl RegistryShared {
         Self {
             harnesses: Arc::new(Mutex::new(Harnesses::default())),
             threads: Arc::new(Mutex::new(HashMap::new())),
-            passive_monitors: Arc::new(Mutex::new(HashSet::new())),
-            passive_subagent_metadata: Arc::new(Mutex::new(HashMap::new())),
-            passive_monitor_tasks: Arc::new(PassiveMonitorTaskTracker::default()),
             background_tasks: Arc::new(RegistryTaskTracker::default()),
             subagent_materialization_queues: Arc::new(Mutex::new(HashMap::new())),
             project_lifecycle_locks: Arc::new(Mutex::new(HashMap::new())),
+            thread_owner_locks: Arc::new(Mutex::new(HashMap::new())),
             hub,
             runtime,
             store,
@@ -525,6 +888,24 @@ fn spawn_thread_update_forwarder(
 }
 
 impl HarnessRegistry {
+    pub async fn ensure_thread_writable(
+        &self,
+        project_id: ProjectId,
+        thread_id: ThreadId,
+    ) -> Result<(), HarnessError> {
+        let thread = self
+            .shared
+            .store
+            .load_thread(project_id, thread_id)
+            .await
+            .map_err(|error| HarnessError::Protocol(error.to_string()))?
+            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+        match thread.kind {
+            ThreadKind::Primary => Ok(()),
+            ThreadKind::Subagent => Err(HarnessError::ThreadReadOnly { thread: thread_id }),
+        }
+    }
+
     #[cfg(test)]
     pub fn new(
         factory: Arc<dyn HarnessFactory>,
@@ -711,6 +1092,10 @@ impl HarnessRegistry {
         initial_model: Option<ModelRef>,
         resume_policy: ResumePolicy,
     ) -> Result<ThreadHandle, HarnessError> {
+        let classification = match resume_policy {
+            ResumePolicy::AllowFreshFallback => ClassificationPhase::Primary,
+            ResumePolicy::RequireExisting => ClassificationPhase::Subagent,
+        };
         debug!(
             project_id = %config.id,
             thread_id = display_opt(thread),
@@ -718,6 +1103,21 @@ impl HarnessRegistry {
             ?resume_policy,
             "opening harness thread"
         );
+        // Serialize the cold check and native open for an already-known thread. Locking only when
+        // publishing the owner is too late: two callers could both open the native thread and the
+        // losing open may invalidate the stream already owned by the winner.
+        let owner_guard = if let Some(thread_id) = thread {
+            Some(lock_thread_owner_after_drain(&self.shared, thread_id).await)
+        } else {
+            None
+        };
+        if let Some(thread_id) = thread
+            && let Some(existing) = self.shared.threads.lock().await.get(&thread_id).cloned()
+        {
+            return existing
+                .reusable_handle(config.id, thread_id, resume.as_deref(), classification)
+                .await;
+        }
         let harness = self.get_or_create_harness(config.id, config).await?;
         let requested_native_id = resume.clone();
         let (updates, update_stream) = thread_update_channel();
@@ -760,22 +1160,25 @@ impl HarnessRegistry {
             .resumed_model
             .clone()
             .or_else(|| initial_model.clone());
-        drop(spawn_thread_update_forwarder(
-            self.shared.clone(),
-            config.id,
-            handle.thread,
-            update_stream,
-            restore_permit,
-        ));
-        let mut threads = self.shared.threads.lock().await;
-        threads.insert(
-            handle.thread,
-            ThreadBinding {
-                project: config.id,
-                handle: handle.clone(),
-                native_model,
-            },
-        );
+        let binding = BindingData {
+            project: config.id,
+            handle: handle.clone(),
+            native_model,
+        };
+        let owner_installed = if owner_guard.is_some() {
+            install_event_owner_locked(&self.shared, &harness, binding, classification).await?
+        } else {
+            install_event_owner(&self.shared, &harness, binding, classification).await?
+        };
+        if owner_installed {
+            drop(spawn_thread_update_forwarder(
+                self.shared.clone(),
+                config.id,
+                handle.thread,
+                update_stream,
+                restore_permit,
+            ));
+        }
         debug!(
             project_id = %config.id,
             thread_id = %handle.thread,
@@ -796,22 +1199,17 @@ impl HarnessRegistry {
         overrides: TurnOverrides,
         effective_model: ModelRef,
     ) -> Result<TurnId, HarnessError> {
-        let threads = self.shared.threads.lock().await;
-        let binding = threads
+        let coordinator = self
+            .shared
+            .threads
+            .lock()
+            .await
             .get(&thread_id)
+            .cloned()
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+        let binding = coordinator.binding().await;
         let project_id = binding.project;
         let handle = binding.handle.clone();
-        drop(threads);
-        if self.thread_has_passive_monitor(thread_id).await {
-            warn!(
-                %project_id,
-                %thread_id,
-                harness_thread_id = %handle.harness_thread_id,
-                "refusing direct turn while passive sub-agent monitoring owns the thread"
-            );
-            return Err(HarnessError::ThreadBusy { thread: thread_id });
-        }
         debug!(
             %project_id,
             %thread_id,
@@ -833,84 +1231,73 @@ impl HarnessRegistry {
             model: effective_model,
             mode: overrides.mode,
             kind: TurnContextKind::User,
-            passive_input_is_fallback: false,
-            subagent_fallback: None,
-            passive_subagent_metadata: None,
-            passive_pre_turn_timeout: None,
         };
         let request_started = Instant::now();
-        let mut turn_gate = self
+        let operation = self
             .shared
-            .runtime
-            .reserve_turn(thread_id, turn_reservation(project_id, &handle, &ctx))?;
-        publish_runtime_overview(&self.shared).await;
-
-        let shared = self.shared.clone();
-
-        let stream = harness.subscribe(&handle);
-        let Some(forwarder_permit) = shared.background_tasks.register() else {
-            warn!(
-                %project_id,
-                %thread_id,
-                action = "start_turn",
-                reason = "registry_shutting_down",
-                "refusing to start turn event forwarder"
-            );
-            if let Some(overview) = turn_gate.release() {
-                self.shared.hub.publish_runtime_overview(overview).await;
-            }
+            .admit_operation(&coordinator, project_id, &handle, &ctx)
+            .await?;
+        let Some(task_permit) = self.shared.background_tasks.register() else {
+            self.shared
+                .abort_admitted_operation(&coordinator, operation)
+                .await;
             return Err(HarnessError::Protocol(
-                "server is shutting down; refusing to start turn forwarder".into(),
+                "server is shutting down; refusing to start a turn".into(),
             ));
         };
-        let turn_id = match harness.start_turn(&handle, input, overrides).await {
-            Ok(turn_id) => {
-                info!(
-                    %project_id,
-                    %thread_id,
-                    %turn_id,
-                    harness_thread_id = %handle.harness_thread_id,
-                    mode = ?ctx.mode,
-                    provider = %ctx.model.provider,
-                    model = %ctx.model.model,
-                    ack_elapsed_ms = request_started.elapsed().as_millis(),
-                    "harness accepted turn start request"
-                );
-                // Published by the unconditional `publish_runtime_overview` after this match.
-                let _acknowledged = turn_gate.acknowledge_turn(turn_id);
-                turn_id
-            }
-            Err(error) => {
-                warn!(
-                    %project_id,
-                    %thread_id,
-                    harness_thread_id = %handle.harness_thread_id,
-                    mode = ?ctx.mode,
-                    provider = %ctx.model.provider,
-                    model = %ctx.model.model,
-                    error = %error,
-                    ack_elapsed_ms = request_started.elapsed().as_millis(),
-                    "harness rejected turn start request"
-                );
-                if let Some(overview) = turn_gate.release() {
-                    self.shared.hub.publish_runtime_overview(overview).await;
+        let task_coordinator = coordinator.clone();
+        let task_shared = self.shared.clone();
+        let task = tokio::spawn(async move {
+            let _task_permit = task_permit;
+            match harness.start_turn(&handle, input, overrides).await {
+                Ok(turn_id) => {
+                    info!(
+                        %project_id,
+                        %thread_id,
+                        %turn_id,
+                        harness_thread_id = %handle.harness_thread_id,
+                        mode = ?ctx.mode,
+                        provider = %ctx.model.provider,
+                        model = %ctx.model.model,
+                        ack_elapsed_ms = request_started.elapsed().as_millis(),
+                        "harness accepted turn start request"
+                    );
+                    task_coordinator
+                        .acknowledge_operation_turn(operation, turn_id)
+                        .await;
+                    publish_runtime_overview(&task_shared).await;
+                    Ok(turn_id)
                 }
-                return Err(error);
+                Err(error) => {
+                    warn!(
+                        %project_id,
+                        %thread_id,
+                        harness_thread_id = %handle.harness_thread_id,
+                        mode = ?ctx.mode,
+                        provider = %ctx.model.provider,
+                        model = %ctx.model.model,
+                        error = %error,
+                        ack_elapsed_ms = request_started.elapsed().as_millis(),
+                        "harness rejected turn start request"
+                    );
+                    task_shared
+                        .abort_admitted_operation(&task_coordinator, operation)
+                        .await;
+                    Err(error)
+                }
             }
-        };
-        publish_runtime_overview(&self.shared).await;
-
-        launch_event_forwarder(
-            shared,
-            thread_id,
-            project_id,
-            stream,
-            ctx,
-            Some(turn_gate),
-            forwarder_permit,
-        );
-
-        Ok(turn_id)
+        });
+        match task.await {
+            Ok(result) => result,
+            Err(error) => {
+                self.shared
+                    .abort_admitted_operation(&coordinator, operation)
+                    .await;
+                Err(HarnessError::Protocol(format!(
+                    "turn start task failed: {error}"
+                )))
+            }
+        }
     }
 
     /// Route an approval decision to the harness that raised it (§9.2).
@@ -1119,10 +1506,15 @@ impl HarnessRegistry {
         effective_model: ModelRef,
         mode: Mode,
     ) -> Result<(), HarnessError> {
-        let handle = self
-            .get_thread_handle(thread_id)
+        let coordinator = self
+            .shared
+            .threads
+            .lock()
             .await
+            .get(&thread_id)
+            .cloned()
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+        let handle = coordinator.binding().await.handle;
         let project_id = self
             .get_project_for_thread(thread_id)
             .await
@@ -1148,59 +1540,53 @@ impl HarnessRegistry {
             model: effective_model,
             mode,
             kind: TurnContextKind::ManualCompaction,
-            passive_input_is_fallback: false,
-            subagent_fallback: None,
-            passive_subagent_metadata: None,
-            passive_pre_turn_timeout: None,
         };
-        let mut turn_gate = self
+        let operation = self
             .shared
-            .runtime
-            .reserve_turn(thread_id, turn_reservation(project_id, &handle, &ctx))?;
-        publish_runtime_overview(&self.shared).await;
-
-        let shared = self.shared.clone();
-
-        let stream = harness.subscribe(&handle);
-        let Some(forwarder_permit) = shared.background_tasks.register() else {
-            warn!(
-                %project_id,
-                %thread_id,
-                action = "compact_context",
-                reason = "registry_shutting_down",
-                "refusing to start compaction event forwarder"
-            );
-            if let Some(overview) = turn_gate.release() {
-                self.shared.hub.publish_runtime_overview(overview).await;
-            }
+            .admit_operation(&coordinator, project_id, &handle, &ctx)
+            .await?;
+        let Some(task_permit) = self.shared.background_tasks.register() else {
+            self.shared
+                .abort_admitted_operation(&coordinator, operation)
+                .await;
             return Err(HarnessError::Protocol(
-                "server is shutting down; refusing to start compaction forwarder".into(),
+                "server is shutting down; refusing context compaction".into(),
             ));
         };
-        if let Err(error) = harness.compact_thread(&handle).await {
-            if let Some(overview) = turn_gate.release() {
-                self.shared.hub.publish_runtime_overview(overview).await;
+        let task_coordinator = coordinator.clone();
+        let task_shared = self.shared.clone();
+        let task = tokio::spawn(async move {
+            let _task_permit = task_permit;
+            match harness.compact_thread(&handle).await {
+                Ok(()) => {
+                    info!(
+                        %project_id,
+                        %thread_id,
+                        harness_thread_id = %handle.harness_thread_id,
+                        ack_elapsed_ms = request_started.elapsed().as_millis(),
+                        "harness accepted context compaction request"
+                    );
+                    Ok(())
+                }
+                Err(error) => {
+                    task_shared
+                        .abort_admitted_operation(&task_coordinator, operation)
+                        .await;
+                    Err(error)
+                }
             }
-            return Err(error);
+        });
+        match task.await {
+            Ok(result) => result,
+            Err(error) => {
+                self.shared
+                    .abort_admitted_operation(&coordinator, operation)
+                    .await;
+                Err(HarnessError::Protocol(format!(
+                    "context compaction task failed: {error}"
+                )))
+            }
         }
-        info!(
-            %project_id,
-            %thread_id,
-            harness_thread_id = %handle.harness_thread_id,
-            ack_elapsed_ms = request_started.elapsed().as_millis(),
-            "harness accepted context compaction request"
-        );
-
-        launch_event_forwarder(
-            shared,
-            thread_id,
-            project_id,
-            stream,
-            ctx,
-            Some(turn_gate),
-            forwarder_permit,
-        );
-        Ok(())
     }
 
     pub(crate) async fn open_subagent_link(
@@ -1302,6 +1688,7 @@ impl HarnessRegistry {
         harness_thread_id: String,
         archived: bool,
     ) -> Result<(), HarnessError> {
+        self.ensure_thread_writable(config.id, thread_id).await?;
         let harness = self.get_or_create_harness(config.id, config).await?;
         let handle = self
             .get_thread_handle(thread_id)
@@ -1317,6 +1704,7 @@ impl HarnessRegistry {
         harness_thread_id: String,
         name: String,
     ) -> Result<(), HarnessError> {
+        self.ensure_thread_writable(config.id, thread_id).await?;
         let harness = self.get_or_create_harness(config.id, config).await?;
         let handle = self
             .get_thread_handle(thread_id)
@@ -1387,7 +1775,6 @@ impl HarnessRegistry {
         thread_id: ThreadId,
         harness_thread_id: String,
     ) -> Result<(), HarnessError> {
-        self.stop_passive_subagent_monitor(thread_id).await?;
         let harness = self.get_or_create_harness(config.id, config).await?;
         let handle = self
             .get_thread_handle(thread_id)
@@ -1399,86 +1786,52 @@ impl HarnessRegistry {
     }
 
     pub async fn get_thread_handle(&self, thread_id: ThreadId) -> Option<ThreadHandle> {
-        let threads = self.shared.threads.lock().await;
-        threads
-            .get(&thread_id)
-            .map(|binding| binding.handle.clone())
+        let coordinator = self.shared.threads.lock().await.get(&thread_id).cloned()?;
+        Some(coordinator.binding().await.handle)
     }
 
     pub async fn get_thread_native_model(&self, thread_id: ThreadId) -> Option<ModelRef> {
-        let threads = self.shared.threads.lock().await;
-        threads
-            .get(&thread_id)
-            .and_then(|binding| binding.native_model.clone())
+        let coordinator = self.shared.threads.lock().await.get(&thread_id).cloned()?;
+        coordinator.binding().await.native_model
     }
 
     pub async fn get_project_for_thread(&self, thread_id: ThreadId) -> Option<ProjectId> {
-        let threads = self.shared.threads.lock().await;
-        threads.get(&thread_id).map(|binding| binding.project)
+        let coordinator = self.shared.threads.lock().await.get(&thread_id).cloned()?;
+        Some(coordinator.binding().await.project)
     }
 
     pub async fn thread_has_active_turn(&self, thread_id: ThreadId) -> bool {
         self.shared.runtime.has_active_turn(thread_id)
     }
 
-    pub async fn thread_has_passive_monitor(&self, thread_id: ThreadId) -> bool {
-        if self
-            .shared
-            .passive_monitors
-            .lock()
-            .await
-            .contains(&thread_id)
-        {
-            return true;
-        }
-        self.shared.passive_monitor_tasks.contains(thread_id).await
-    }
-
-    pub async fn stop_passive_subagent_monitor(
-        &self,
-        thread_id: ThreadId,
-    ) -> Result<(), HarnessError> {
-        let monitor_exists = {
-            let monitors = self.shared.passive_monitors.lock().await;
-            if !monitors.contains(&thread_id) {
-                self.shared
-                    .passive_subagent_metadata
-                    .lock()
-                    .await
-                    .remove(&thread_id);
-                false
-            } else {
-                let mut metadata = self.shared.passive_subagent_metadata.lock().await;
-                let entry = metadata.entry(thread_id).or_default();
-                entry.cancelled = true;
-                entry.lifecycle_notify.notify_one();
-                true
-            }
-        };
-        if !monitor_exists && !self.shared.passive_monitor_tasks.contains(thread_id).await {
-            return Ok(());
-        }
-
-        let deadline = tokio::time::Instant::now() + PASSIVE_MONITOR_STOP_TIMEOUT;
-        let mut completions = self.shared.passive_monitor_tasks.subscribe();
-        loop {
-            if !self.shared.passive_monitor_tasks.contains(thread_id).await {
-                return Ok(());
-            }
-            if tokio::time::timeout_at(deadline, completions.changed())
-                .await
-                .is_err()
-            {
-                return Err(HarnessError::Protocol(format!(
-                    "timed out stopping passive sub-agent monitor for thread {thread_id}"
-                )));
-            }
-        }
-    }
-
     pub async fn forget_thread(&self, thread_id: ThreadId) {
-        let mut threads = self.shared.threads.lock().await;
-        threads.remove(&thread_id);
+        let owner_guard = lock_thread_owner(&self.shared.thread_owner_locks, thread_id).await;
+        let coordinator = self.shared.threads.lock().await.get(&thread_id).cloned();
+        let control = match coordinator.as_ref() {
+            Some(coordinator) => coordinator.begin_retirement().await,
+            None => None,
+        };
+        if let Some(control) = control.as_ref() {
+            let _ = control.cancel.send(true);
+        }
+        drop(owner_guard);
+
+        if let Some(mut control) = control {
+            wait_for_owner_completion(&mut control).await;
+        }
+
+        let _owner_guard = lock_thread_owner(&self.shared.thread_owner_locks, thread_id).await;
+        if let Some(coordinator) = coordinator {
+            let mut threads = self.shared.threads.lock().await;
+            if threads
+                .get(&thread_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &coordinator))
+            {
+                threads.remove(&thread_id);
+            }
+            drop(threads);
+            coordinator.finish_retirement().await;
+        }
     }
 
     pub async fn retire_thread(&self, thread_id: ThreadId) {
@@ -1578,20 +1931,20 @@ impl HarnessRegistry {
     }
 
     pub async fn delete_project(&self, project_id: ProjectId) -> Result<(), HarnessError> {
-        let thread_ids = self
+        let coordinators = self
             .shared
             .threads
             .lock()
             .await
             .iter()
-            .filter_map(|(thread_id, binding)| {
-                (binding.project == project_id).then_some(*thread_id)
-            })
-            .collect::<HashSet<_>>();
-        for thread_id in &thread_ids {
-            self.stop_passive_subagent_monitor(*thread_id).await?;
+            .map(|(thread_id, coordinator)| (*thread_id, coordinator.clone()))
+            .collect::<Vec<_>>();
+        let mut thread_ids = HashSet::new();
+        for (thread_id, coordinator) in coordinators {
+            if coordinator.binding().await.project == project_id {
+                thread_ids.insert(thread_id);
+            }
         }
-
         let harness = {
             let mut harnesses = self.shared.harnesses.lock().await;
             harnesses.begin_delete(project_id)?
@@ -1606,17 +1959,10 @@ impl HarnessRegistry {
             harnesses.finish_delete(project_id, &harness);
         }
 
-        let removed_thread_ids = {
-            let mut threads = self.shared.threads.lock().await;
-            let removed_thread_ids = threads
-                .iter()
-                .filter_map(|(thread_id, binding)| {
-                    (binding.project == project_id).then_some(*thread_id)
-                })
-                .collect::<HashSet<_>>();
-            threads.retain(|_, binding| binding.project != project_id);
-            removed_thread_ids
-        };
+        for thread_id in &thread_ids {
+            self.forget_thread(*thread_id).await;
+        }
+        let removed_thread_ids = thread_ids;
 
         self.shared.runtime.forget_threads(&removed_thread_ids);
         publish_runtime_overview(&self.shared).await;
@@ -1644,6 +1990,77 @@ async fn lock_project_lifecycle(
     lock.lock_owned().await
 }
 
+async fn lock_thread_owner(locks: &ThreadOwnerLocks, thread_id: ThreadId) -> OwnedMutexGuard<()> {
+    let lock = {
+        let mut locks = locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        match locks.get(&thread_id).and_then(Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(Mutex::new(()));
+                locks.insert(thread_id, Arc::downgrade(&lock));
+                lock
+            }
+        }
+    };
+    lock.lock_owned().await
+}
+
+async fn wait_for_owner_completion(control: &mut EventOwnerControl) {
+    while !*control.completed.borrow() {
+        if control.completed.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+/// Lock an owner slot only after its previous generation has finished draining. Waiting happens
+/// without the slot lock, so retirement and owner-task completion can always make progress.
+async fn lock_thread_owner_after_drain(
+    shared: &RegistryShared,
+    thread_id: ThreadId,
+) -> OwnedMutexGuard<()> {
+    loop {
+        let owner_guard = lock_thread_owner(&shared.thread_owner_locks, thread_id).await;
+        let coordinator = shared.threads.lock().await.get(&thread_id).cloned();
+        let Some(coordinator) = coordinator else {
+            return owner_guard;
+        };
+        if coordinator.is_retired().await {
+            let mut threads = shared.threads.lock().await;
+            if threads
+                .get(&thread_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &coordinator))
+            {
+                threads.remove(&thread_id);
+            }
+            return owner_guard;
+        }
+        let Some(mut control) = coordinator.draining_control().await else {
+            return owner_guard;
+        };
+        if *control.completed.borrow() {
+            drop(owner_guard);
+            tokio::task::yield_now().await;
+            continue;
+        }
+        if control.completed.has_changed().is_err() {
+            let mut threads = shared.threads.lock().await;
+            if threads
+                .get(&thread_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &coordinator))
+            {
+                threads.remove(&thread_id);
+            }
+            drop(threads);
+            coordinator.finish_retirement().await;
+            return owner_guard;
+        }
+        drop(owner_guard);
+        wait_for_owner_completion(&mut control).await;
+    }
+}
+
 async fn publish_runtime_overview(shared: &RegistryShared) {
     shared
         .hub
@@ -1656,11 +2073,7 @@ struct SubagentActivityInfo {
     native_thread_id: String,
     agent_name: Option<String>,
     agent_path: Option<String>,
-    initial_prompt: Option<String>,
     title: Option<String>,
-    action: SubagentAction,
-    status: Option<SubagentStatus>,
-    fallback: Option<SubagentFallbackTranscript>,
 }
 
 type SubagentMaterializationResult = Result<Option<ThreadId>, HarnessError>;
@@ -1674,40 +2087,12 @@ struct SubagentMaterializationJob {
     result: Option<oneshot::Sender<SubagentMaterializationResult>>,
 }
 
-#[derive(Clone)]
-struct SubagentFallbackTranscript {
-    message: String,
-    status: SubagentStatus,
-}
-
-struct FallbackTurnContext {
-    user_input: UserInput,
-    model: ModelRef,
-    mode: Mode,
-}
-
-impl From<&TurnContext> for FallbackTurnContext {
-    fn from(ctx: &TurnContext) -> Self {
-        Self {
-            user_input: ctx.user_input.clone(),
-            model: ctx.model.clone(),
-            mode: ctx.mode,
-        }
-    }
-}
-
 fn subagent_activity_info(item: &Item) -> Option<SubagentActivityInfo> {
     match &item.payload {
         ItemPayload::Activity {
             title, subagent, ..
-        } => subagent_link_info(subagent.as_ref(), Some(title.clone()), None),
-        ItemPayload::ToolCall {
-            input, subagent, ..
-        } => subagent_link_info(
-            subagent.as_ref(),
-            None,
-            subagent_prompt_from_tool_input(input),
-        ),
+        } => subagent_link_info(subagent.as_ref(), Some(title.clone())),
+        ItemPayload::ToolCall { subagent, .. } => subagent_link_info(subagent.as_ref(), None),
         _ => None,
     }
 }
@@ -1790,17 +2175,12 @@ async fn resolve_reverse_subagent_target(
 
 fn subagent_start_info(item: &giskard_core::item::ItemStart) -> Option<SubagentActivityInfo> {
     let tool = item.tool.as_ref()?;
-    subagent_link_info(
-        tool.subagent.as_ref(),
-        None,
-        subagent_prompt_from_tool_input(&tool.input),
-    )
+    subagent_link_info(tool.subagent.as_ref(), None)
 }
 
 fn subagent_link_info(
     subagent: Option<&giskard_core::item::SubagentLink>,
     title: Option<String>,
-    prompt_fallback: Option<String>,
 ) -> Option<SubagentActivityInfo> {
     let subagent = subagent?;
     let native_thread_id = trimmed_non_empty(&subagent.harness_thread_id)?;
@@ -1809,129 +2189,12 @@ fn subagent_link_info(
         .as_deref()
         .and_then(trimmed_non_empty)
         .map(ToOwned::to_owned);
-    let initial_prompt = subagent
-        .initial_prompt
-        .as_deref()
-        .and_then(trimmed_non_empty)
-        .map(ToOwned::to_owned)
-        .or(prompt_fallback);
     Some(SubagentActivityInfo {
         native_thread_id: native_thread_id.to_owned(),
         agent_name: None,
         agent_path,
-        initial_prompt,
         title,
-        action: subagent.action,
-        status: subagent.status,
-        fallback: subagent_fallback_transcript(subagent),
     })
-}
-
-fn subagent_prompt_from_tool_input(input: &serde_json::Value) -> Option<String> {
-    for key in ["prompt", "message", "task", "instructions"] {
-        if let Some(prompt) = input
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .and_then(trimmed_non_empty)
-        {
-            return Some(prompt.to_owned());
-        }
-    }
-    input
-        .get("items")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|items| {
-            items.iter().find_map(|item| {
-                item.get("text")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(trimmed_non_empty)
-                    .map(ToOwned::to_owned)
-            })
-        })
-}
-
-fn subagent_fallback_transcript(
-    subagent: &giskard_core::item::SubagentLink,
-) -> Option<SubagentFallbackTranscript> {
-    terminal_subagent_fallback(subagent.status, subagent.message.as_deref())
-}
-
-fn terminal_subagent_fallback(
-    status: Option<SubagentStatus>,
-    message: Option<&str>,
-) -> Option<SubagentFallbackTranscript> {
-    let status = status?;
-    if !matches!(
-        status,
-        SubagentStatus::Completed
-            | SubagentStatus::Interrupted
-            | SubagentStatus::Failed
-            | SubagentStatus::Shutdown
-            | SubagentStatus::NotFound
-    ) {
-        return None;
-    }
-    let message = message.and_then(trimmed_non_empty)?.to_owned();
-    Some(SubagentFallbackTranscript { message, status })
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SubagentMonitorPolicy {
-    should_monitor: bool,
-    terminal_observed: bool,
-    active_observed: bool,
-    pre_turn_timeout: Option<Duration>,
-}
-
-struct SubagentObservation {
-    effective_model: ModelRef,
-    mode: Mode,
-    initial_prompt: Option<String>,
-    policy: SubagentMonitorPolicy,
-    fallback: Option<SubagentFallbackTranscript>,
-}
-
-fn subagent_monitor_policy(
-    action: Option<SubagentAction>,
-    status: Option<SubagentStatus>,
-) -> SubagentMonitorPolicy {
-    let terminal_observed = subagent_observation_is_terminal(action, status);
-    let active_observed = !terminal_observed
-        && (matches!(
-            status,
-            Some(SubagentStatus::Pending | SubagentStatus::Running)
-        ) || matches!(
-            action,
-            Some(SubagentAction::Spawned | SubagentAction::Started | SubagentAction::Interacted)
-        ));
-    SubagentMonitorPolicy {
-        should_monitor: active_observed,
-        terminal_observed,
-        active_observed,
-        // Active evidence gets a generous no-event safety bound so a missed terminal event cannot
-        // block direct follow-ups forever. Any stream event restarts the bound, and once a native
-        // turn begins normal turn completion—not this pre-turn timeout—owns the lifecycle.
-        pre_turn_timeout: active_observed.then_some(ACTIVE_SUBAGENT_PRE_TURN_IDLE_TIMEOUT),
-    }
-}
-
-fn subagent_observation_is_terminal(
-    action: Option<SubagentAction>,
-    status: Option<SubagentStatus>,
-) -> bool {
-    matches!(
-        action,
-        Some(SubagentAction::Interrupted | SubagentAction::Completed)
-    ) || matches!(
-        status,
-        Some(
-            SubagentStatus::Completed
-                | SubagentStatus::Interrupted
-                | SubagentStatus::Failed
-                | SubagentStatus::Shutdown
-                | SubagentStatus::NotFound
-        )
-    )
 }
 
 fn subagent_thread_title(info: &SubagentActivityInfo) -> String {
@@ -1976,122 +2239,6 @@ fn subagent_info_with_agent_name(
     info
 }
 
-async fn update_passive_subagent_metadata(
-    map: &PassiveSubagentMetadataMap,
-    thread_id: ThreadId,
-    initial_prompt: Option<String>,
-    fallback: Option<SubagentFallbackTranscript>,
-    signal: LifecycleSignal,
-) {
-    let mut metadata = map.lock().await;
-    let entry = metadata.entry(thread_id).or_default();
-    merge_passive_subagent_metadata(entry, initial_prompt, fallback, signal);
-}
-
-fn merge_passive_subagent_metadata(
-    entry: &mut PassiveSubagentMetadata,
-    initial_prompt: Option<String>,
-    fallback: Option<SubagentFallbackTranscript>,
-    signal: LifecycleSignal,
-) {
-    if let Some(initial_prompt) = initial_prompt {
-        entry.initial_prompt = Some(initial_prompt);
-    }
-    if let Some(fallback) = fallback {
-        entry.fallback = Some(fallback);
-    }
-    match signal {
-        LifecycleSignal::None => {}
-        LifecycleSignal::Active => {
-            entry.active_lifecycle_observed = true;
-            entry.lifecycle_notify.notify_one();
-        }
-        LifecycleSignal::Terminal => {
-            entry.terminal_observed = true;
-            entry.lifecycle_notify.notify_one();
-        }
-    }
-}
-
-async fn register_passive_subagent_monitor(
-    passive_monitors: &Arc<Mutex<HashSet<ThreadId>>>,
-    passive_subagent_metadata: &PassiveSubagentMetadataMap,
-    passive_monitor_tasks: &PassiveMonitorTasks,
-    thread_id: ThreadId,
-    initial_prompt: Option<String>,
-    fallback: Option<SubagentFallbackTranscript>,
-    signal: LifecycleSignal,
-) -> bool {
-    // Monitor ownership and metadata are published atomically under the same lock order used by
-    // terminal recovery. A terminal observation therefore either updates this monitor or runs
-    // fallback recovery itself; it cannot slip between metadata creation and monitor insertion.
-    let mut monitors = passive_monitors.lock().await;
-    let inserted = monitors.insert(thread_id);
-    let mut metadata = passive_subagent_metadata.lock().await;
-    let entry = metadata.entry(thread_id).or_default();
-    merge_passive_subagent_metadata(entry, initial_prompt, fallback, signal);
-    if inserted {
-        passive_monitor_tasks.register(thread_id).await;
-    }
-    inserted
-}
-
-async fn finish_passive_subagent_monitor_task(
-    passive_monitor_tasks: &PassiveMonitorTasks,
-    thread_id: ThreadId,
-) {
-    passive_monitor_tasks.finish(thread_id).await;
-}
-
-async fn take_passive_subagent_monitor_metadata(
-    passive_monitors: &Arc<Mutex<HashSet<ThreadId>>>,
-    passive_subagent_metadata: &PassiveSubagentMetadataMap,
-    thread_id: ThreadId,
-) -> Option<PassiveSubagentMetadata> {
-    // Keep monitor ownership and metadata removal under one lock order. Terminal observations use
-    // the same order, so either the live monitor receives the fallback or teardown claims it for
-    // immediate recovery; there is no gap where a result can be attached to an exited forwarder.
-    let mut monitors = passive_monitors.lock().await;
-    monitors.remove(&thread_id);
-    passive_subagent_metadata.lock().await.remove(&thread_id)
-}
-
-async fn refresh_passive_subagent_context(
-    thread_id: ThreadId,
-    ctx: &mut TurnContext,
-) -> PassiveMonitorSignal {
-    if ctx.kind != TurnContextKind::PassiveSubagent {
-        return PassiveMonitorSignal::Continue;
-    }
-    let Some(metadata_map) = ctx.passive_subagent_metadata.as_ref() else {
-        return PassiveMonitorSignal::Continue;
-    };
-    let Some(metadata) = metadata_map.lock().await.get(&thread_id).cloned() else {
-        return PassiveMonitorSignal::Continue;
-    };
-    if let Some(initial_prompt) = metadata
-        .initial_prompt
-        .as_deref()
-        .and_then(trimmed_non_empty)
-    {
-        ctx.user_input = UserInput::text(initial_prompt);
-        ctx.passive_input_is_fallback = false;
-    }
-    if metadata.fallback.is_some() {
-        ctx.subagent_fallback = metadata.fallback;
-    }
-    if metadata.active_lifecycle_observed {
-        ctx.passive_pre_turn_timeout = Some(ACTIVE_SUBAGENT_PRE_TURN_IDLE_TIMEOUT);
-    }
-    if metadata.cancelled {
-        PassiveMonitorSignal::Cancelled
-    } else if metadata.terminal_observed {
-        PassiveMonitorSignal::Terminal
-    } else {
-        PassiveMonitorSignal::Continue
-    }
-}
-
 async fn materialize_subagent_thread(
     parent_thread_id: ThreadId,
     project_id: ProjectId,
@@ -2121,16 +2268,23 @@ async fn materialize_subagent_thread(
                 "parent thread {parent_thread_id} disappeared while importing sub-agent"
             ))
         })?;
-    let live_existing_id = shared
+    let live_bindings = shared
         .threads
         .lock()
         .await
         .iter()
-        .find_map(|(thread_id, binding)| {
-            (binding.project == project_id
-                && binding.handle.harness_thread_id == info.native_thread_id)
-                .then_some(*thread_id)
-        });
+        .map(|(thread_id, binding)| (*thread_id, binding.clone()))
+        .collect::<Vec<_>>();
+    let mut live_existing_id = None;
+    for (thread_id, coordinator) in live_bindings {
+        let binding = coordinator.binding().await;
+        if binding.project == project_id
+            && binding.handle.harness_thread_id == info.native_thread_id
+        {
+            live_existing_id = Some(thread_id);
+            break;
+        }
+    }
     let (mut graph, existing) = if let Some(existing_id) = live_existing_id {
         let existing = shared
             .store
@@ -2199,17 +2353,8 @@ async fn materialize_subagent_thread(
             );
             return Ok(None);
         }
-        let policy = subagent_monitor_policy(Some(info.action), info.status);
-        let opened_agent_name = if policy.should_monitor {
-            ensure_subagent_thread_open(&project_config, &existing, &shared).await?
-        } else {
-            shared
-                .threads
-                .lock()
-                .await
-                .get(&existing.id)
-                .and_then(|binding| binding.handle.agent_name.clone())
-        };
+        let opened_agent_name =
+            ensure_subagent_thread_open(&project_config, &existing, &shared).await?;
         let refreshed_info = subagent_info_with_agent_name(info.clone(), opened_agent_name);
         let desired_title = subagent_thread_title(&refreshed_info);
         if should_refresh_subagent_title(&existing.title, &desired_title) {
@@ -2223,19 +2368,6 @@ async fn materialize_subagent_thread(
                 .await
                 .map_err(|error| HarnessError::Protocol(error.to_string()))?;
         }
-        observe_external_subagent_with_context(
-            project_id,
-            existing.id,
-            SubagentObservation {
-                effective_model: existing.current_model.clone(),
-                mode: existing.mode,
-                initial_prompt: refreshed_info.initial_prompt,
-                policy,
-                fallback: refreshed_info.fallback,
-            },
-            shared,
-        )
-        .await?;
         return Ok(Some(existing.id));
     }
 
@@ -2337,42 +2469,33 @@ async fn materialize_subagent_thread(
         .map_err(|error| HarnessError::Protocol(error.to_string()))?;
     // The bounded channel retains an early replay while the thread is being created. Start the
     // forwarder only after metadata exists, so restoration cannot race creation and be lost.
-    drop(spawn_thread_update_forwarder(
-        shared.clone(),
-        project_id,
-        handle.thread,
-        update_stream,
-        restore_permit,
-    ));
     let native_model = Some(current_model.clone());
-    shared.threads.lock().await.insert(
-        handle.thread,
-        ThreadBinding {
+    let owner_installed = install_event_owner(
+        &shared,
+        &harness,
+        BindingData {
             project: project_id,
             handle: handle.clone(),
             native_model,
         },
-    );
+        ClassificationPhase::Subagent,
+    )
+    .await?;
+    if owner_installed {
+        drop(spawn_thread_update_forwarder(
+            shared.clone(),
+            project_id,
+            handle.thread,
+            update_stream,
+            restore_permit,
+        ));
+    }
     // The thread and binding are durable even if observation setup below fails. Publish the
     // creation now so a retry cannot leave the catalog unaware of an already-existing child.
     shared
         .thread_metadata
         .publish_created(project_id, &thread_file)
         .await;
-    let policy = subagent_monitor_policy(Some(info.action), info.status);
-    observe_external_subagent_with_context(
-        project_id,
-        handle.thread,
-        SubagentObservation {
-            effective_model: current_model,
-            mode,
-            initial_prompt: info.initial_prompt,
-            policy,
-            fallback: info.fallback,
-        },
-        shared.clone(),
-    )
-    .await?;
     Ok(Some(handle.thread))
 }
 
@@ -2505,9 +2628,6 @@ async fn ensure_subagent_thread_open(
     thread_file: &ThreadFile,
     shared: &Arc<RegistryShared>,
 ) -> Result<Option<String>, HarnessError> {
-    if let Some(binding) = shared.threads.lock().await.get(&thread_file.id) {
-        return Ok(binding.handle.agent_name.clone());
-    }
     let harness = shared
         .active_harness(project_config.id)
         .await
@@ -2515,6 +2635,18 @@ async fn ensure_subagent_thread_open(
     // Reopening a persisted sub-agent is that cold resume: resolve from the chain, not from the
     // child's own record, which never names a worktree.
     let workspace_root = subagent_workspace_root(shared, project_config, thread_file).await?;
+    let _owner_guard = lock_thread_owner_after_drain(shared, thread_file.id).await;
+    if let Some(coordinator) = shared.threads.lock().await.get(&thread_file.id).cloned() {
+        let handle = coordinator
+            .reusable_handle(
+                project_config.id,
+                thread_file.id,
+                Some(&thread_file.harness_thread_id),
+                ClassificationPhase::Subagent,
+            )
+            .await?;
+        return Ok(handle.agent_name);
+    }
     let (updates, update_stream, restore_permit) = prepare_thread_updates(shared, thread_file.id);
     let handle = harness
         .open_thread(OpenThreadOptions {
@@ -2535,13 +2667,6 @@ async fn ensure_subagent_thread_open(
             handle.harness_thread_id, thread_file.harness_thread_id
         )));
     }
-    drop(spawn_thread_update_forwarder(
-        shared.clone(),
-        project_config.id,
-        handle.thread,
-        update_stream,
-        restore_permit,
-    ));
     let native_model = Some(
         handle
             .resumed_model
@@ -2549,287 +2674,27 @@ async fn ensure_subagent_thread_open(
             .unwrap_or_else(|| thread_file.current_model.clone()),
     );
     let agent_name = handle.agent_name.clone();
-    shared.threads.lock().await.insert(
-        handle.thread,
-        ThreadBinding {
+    let owner_installed = install_event_owner_locked(
+        shared,
+        &harness,
+        BindingData {
             project: project_config.id,
             handle,
             native_model,
         },
-    );
+        ClassificationPhase::Subagent,
+    )
+    .await?;
+    if owner_installed {
+        drop(spawn_thread_update_forwarder(
+            shared.clone(),
+            project_config.id,
+            thread_file.id,
+            update_stream,
+            restore_permit,
+        ));
+    }
     Ok(agent_name)
-}
-
-async fn start_passive_subagent_monitor(
-    thread_id: ThreadId,
-    observation: SubagentObservation,
-    shared: Arc<RegistryShared>,
-) -> Result<(), HarnessError> {
-    let SubagentObservation {
-        effective_model,
-        mode,
-        initial_prompt,
-        policy,
-        fallback,
-    } = observation;
-    if !register_passive_subagent_monitor(
-        &shared.passive_monitors,
-        &shared.passive_subagent_metadata,
-        &shared.passive_monitor_tasks,
-        thread_id,
-        initial_prompt.clone(),
-        fallback.clone(),
-        if policy.active_observed {
-            LifecycleSignal::Active
-        } else {
-            LifecycleSignal::None
-        },
-    )
-    .await
-    {
-        return Ok(());
-    }
-
-    let error_cleanup_shared = shared.clone();
-    let result = async {
-        let threads = shared.threads.lock().await;
-        let binding = threads
-            .get(&thread_id)
-            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
-        let project_id = binding.project;
-        let handle = binding.handle.clone();
-        drop(threads);
-
-        let harness = shared
-            .active_harness(project_id)
-            .await
-            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
-
-        let stream = harness.subscribe(&handle);
-        let cleanup_model = effective_model.clone();
-        let cleanup_mode = mode;
-        let prompt_text = initial_prompt.as_deref().and_then(trimmed_non_empty);
-        let ctx = TurnContext {
-            user_input: UserInput::text(prompt_text.unwrap_or("Sub-agent turn")),
-            model: effective_model,
-            mode,
-            kind: TurnContextKind::PassiveSubagent,
-            passive_input_is_fallback: prompt_text.is_none(),
-            subagent_fallback: fallback,
-            passive_subagent_metadata: Some(shared.passive_subagent_metadata.clone()),
-            passive_pre_turn_timeout: policy.pre_turn_timeout,
-        };
-
-        info!(
-            %project_id,
-            %thread_id,
-            harness_thread_id = %handle.harness_thread_id,
-            "starting passive monitor for external harness turn"
-        );
-
-        let cleanup_shared = shared.clone();
-        let cleanup_tasks = shared.passive_monitor_tasks.clone();
-        let Some(permit) = shared.background_tasks.register() else {
-            warn!(
-                %project_id,
-                %thread_id,
-                action = "start_passive_subagent_monitor",
-                reason = "registry_shutting_down",
-                "refusing to start passive sub-agent monitor forwarder"
-            );
-            return Err(HarnessError::Protocol(
-                "server is shutting down; refusing passive monitor forwarder".into(),
-            ));
-        };
-        tokio::spawn(async move {
-            let _permit = permit;
-            forward_events(shared, thread_id, project_id, stream, ctx, None).await;
-            if let Some(metadata) = take_passive_subagent_monitor_metadata(
-                &cleanup_shared.passive_monitors,
-                &cleanup_shared.passive_subagent_metadata,
-                thread_id,
-            )
-            .await
-            {
-                if metadata.cancelled {
-                    debug!(
-                        %project_id,
-                        %thread_id,
-                        "passive sub-agent monitor cleanup skipped fallback after cancellation"
-                    );
-                } else if let Some(fallback) = metadata.fallback {
-                    persist_terminal_subagent_fallback(
-                        project_id,
-                        thread_id,
-                        cleanup_model,
-                        cleanup_mode,
-                        metadata.initial_prompt,
-                        fallback,
-                        cleanup_shared,
-                    )
-                    .await;
-                }
-            }
-            finish_passive_subagent_monitor_task(&cleanup_tasks, thread_id).await;
-        });
-
-        Ok(())
-    }
-    .await;
-
-    if result.is_err() {
-        take_passive_subagent_monitor_metadata(
-            &error_cleanup_shared.passive_monitors,
-            &error_cleanup_shared.passive_subagent_metadata,
-            thread_id,
-        )
-        .await;
-        finish_passive_subagent_monitor_task(
-            &error_cleanup_shared.passive_monitor_tasks,
-            thread_id,
-        )
-        .await;
-    }
-    result
-}
-
-async fn observe_external_subagent_with_context(
-    project_id: ProjectId,
-    thread_id: ThreadId,
-    observation: SubagentObservation,
-    shared: Arc<RegistryShared>,
-) -> Result<(), HarnessError> {
-    if observation.policy.should_monitor {
-        // Setup is cancellation-shielded after the child record has been persisted. The detached
-        // task owns monitor registration and cleanup even if its HTTP importer disconnects.
-        let task = launch_passive_subagent_monitor(thread_id, observation, shared);
-        return match task.await {
-            Ok(result) => result,
-            Err(error) => {
-                error!(
-                    %project_id,
-                    %thread_id,
-                    %error,
-                    "passive sub-agent monitor setup task failed"
-                );
-                Err(HarnessError::Protocol(format!(
-                    "passive sub-agent monitor setup task failed: {error}"
-                )))
-            }
-        };
-    }
-
-    if observation.policy.terminal_observed {
-        return recover_terminal_subagent_fallback(
-            project_id,
-            thread_id,
-            observation.effective_model,
-            observation.mode,
-            observation.initial_prompt,
-            observation.fallback,
-            shared,
-        )
-        .await;
-    }
-
-    debug!(
-        %thread_id,
-        "skipping passive monitor for sub-agent observation without active work"
-    );
-    Ok(())
-}
-
-fn launch_passive_subagent_monitor(
-    thread_id: ThreadId,
-    observation: SubagentObservation,
-    shared: Arc<RegistryShared>,
-) -> tokio::task::JoinHandle<Result<(), HarnessError>> {
-    tokio::spawn(start_passive_subagent_monitor(
-        thread_id,
-        observation,
-        shared,
-    ))
-}
-
-async fn recover_terminal_subagent_fallback(
-    project_id: ProjectId,
-    thread_id: ThreadId,
-    effective_model: ModelRef,
-    mode: Mode,
-    initial_prompt: Option<String>,
-    fallback: Option<SubagentFallbackTranscript>,
-    shared: Arc<RegistryShared>,
-) -> Result<(), HarnessError> {
-    let attached_to_monitor = {
-        let monitors = shared.passive_monitors.lock().await;
-        if monitors.contains(&thread_id) {
-            update_passive_subagent_metadata(
-                &shared.passive_subagent_metadata,
-                thread_id,
-                initial_prompt.clone(),
-                fallback.clone(),
-                LifecycleSignal::Terminal,
-            )
-            .await;
-            true
-        } else {
-            false
-        }
-    };
-    if attached_to_monitor {
-        debug!(
-            %thread_id,
-            "attached terminal fallback to active passive sub-agent monitor"
-        );
-        return Ok(());
-    }
-
-    let Some(fallback) = fallback else {
-        debug!(
-            %thread_id,
-            "terminal sub-agent observation requires no monitor or fallback recovery"
-        );
-        return Ok(());
-    };
-
-    persist_terminal_subagent_fallback(
-        project_id,
-        thread_id,
-        effective_model,
-        mode,
-        initial_prompt,
-        fallback,
-        shared,
-    )
-    .await;
-    Ok(())
-}
-
-async fn persist_terminal_subagent_fallback(
-    project_id: ProjectId,
-    thread_id: ThreadId,
-    effective_model: ModelRef,
-    mode: Mode,
-    initial_prompt: Option<String>,
-    fallback: SubagentFallbackTranscript,
-    shared: Arc<RegistryShared>,
-) {
-    let prompt_text = initial_prompt.as_deref().and_then(trimmed_non_empty);
-    let ctx = FallbackTurnContext {
-        user_input: UserInput::text(prompt_text.unwrap_or("Sub-agent turn")),
-        model: effective_model,
-        mode,
-    };
-    let mut seen_turn_ids = persisted_turn_ids(&shared.store, project_id, thread_id).await;
-    persist_subagent_fallback_transcript(
-        thread_id,
-        project_id,
-        &ctx,
-        fallback,
-        &mut seen_turn_ids,
-        &shared,
-    )
-    .await;
 }
 
 async fn broadcast_event_with_context(
@@ -2879,135 +2744,149 @@ async fn broadcast_event_with_user_input(
     .await;
 }
 
-#[derive(Default)]
-struct SyntheticSubagentPrompt {
-    item_id: Option<ItemId>,
-    text: Option<String>,
-}
-
-async fn synthesize_passive_subagent_prompt_item(
-    project_id: ProjectId,
-    thread_id: ThreadId,
-    turn: TurnId,
-    ctx: &TurnContext,
-    current_turn_items: &mut CurrentTurnItems,
-    prompt: &mut SyntheticSubagentPrompt,
-    shared: &RegistryShared,
-) {
-    let Some(text) = passive_subagent_prompt_text(ctx) else {
-        return;
-    };
-    if prompt.text.as_deref() == Some(text.as_str()) {
-        return;
-    }
-    let item_id = *prompt.item_id.get_or_insert_with(ItemId::new);
-    prompt.text = Some(text.clone());
-    let item = Item {
-        id: item_id,
-        harness_item_id: format!("subagent_prompt:{turn}"),
-        payload: ItemPayload::UserMessage { text },
-        created_at: Utc::now(),
-    };
-    current_turn_items.upsert_first(&item);
-    let event = AgentEvent::ItemCompleted {
-        thread: thread_id,
-        turn,
-        item,
-    };
-    let applied = shared.runtime.apply_event(thread_id, &event, true);
-    debug!(%thread_id, event_sequence = display_opt(applied.sequence), "applied synthetic prompt event");
-    publish_applied_runtime_effects(&shared.hub, thread_id, applied).await;
-    broadcast_event_with_context(&shared.hub, project_id, thread_id, event, ctx).await;
-}
-
-enum PassivePreTurnOutcome {
-    Event(Box<Result<AgentEvent, tokio::sync::broadcast::error::RecvError>>),
-    EvidenceAdopted,
-    Stop(PassivePreTurnStop),
-}
-
-enum PassivePreTurnStop {
-    Cancelled,
-    Terminal,
-    TimedOut { timeout: Option<Duration> },
-}
-
-async fn passive_pre_turn_recv(
-    stream: &mut giskard_harness::AgentEventStream,
-    lifecycle_notify: Option<&Arc<Notify>>,
-    thread_id: ThreadId,
-    ctx: &mut TurnContext,
-) -> PassivePreTurnOutcome {
-    let wait_for_event = async {
-        if let Some(notify) = lifecycle_notify {
-            tokio::select! {
-                biased;
-                result = stream.recv() => Some(result),
-                _ = notify.notified() => None,
-            }
-        } else {
-            Some(stream.recv().await)
-        }
-    };
-    let wait_result = if let Some(pre_turn_timeout) = ctx.passive_pre_turn_timeout {
-        timeout(pre_turn_timeout, wait_for_event).await.ok()
-    } else {
-        Some(wait_for_event.await)
-    };
-
-    match wait_result {
-        Some(Some(result)) => PassivePreTurnOutcome::Event(Box::new(result)),
-        Some(None) => match refresh_passive_subagent_context(thread_id, ctx).await {
-            PassiveMonitorSignal::Continue => PassivePreTurnOutcome::EvidenceAdopted,
-            PassiveMonitorSignal::Cancelled => {
-                PassivePreTurnOutcome::Stop(PassivePreTurnStop::Cancelled)
-            }
-            PassiveMonitorSignal::Terminal => {
-                PassivePreTurnOutcome::Stop(PassivePreTurnStop::Terminal)
-            }
-        },
-        None => {
-            let elapsed_timeout = ctx.passive_pre_turn_timeout;
-            match refresh_passive_subagent_context(thread_id, ctx).await {
-                PassiveMonitorSignal::Cancelled => {
-                    PassivePreTurnOutcome::Stop(PassivePreTurnStop::Cancelled)
-                }
-                PassiveMonitorSignal::Terminal => {
-                    PassivePreTurnOutcome::Stop(PassivePreTurnStop::Terminal)
-                }
-                PassiveMonitorSignal::Continue => {
-                    PassivePreTurnOutcome::Stop(PassivePreTurnStop::TimedOut {
-                        timeout: elapsed_timeout,
-                    })
-                }
-            }
-        }
-    }
-}
-
 fn launch_event_forwarder(
     shared: Arc<RegistryShared>,
-    thread_id: ThreadId,
-    project_id: ProjectId,
+    coordinator: Arc<ThreadCoordinator>,
     stream: giskard_harness::AgentEventStream,
-    ctx: TurnContext,
-    turn_gate: Option<ThreadTurnLease>,
+    cancel: watch::Receiver<bool>,
+    completed: watch::Sender<bool>,
     permit: RegistryTaskPermit,
 ) {
     tokio::spawn(async move {
         let _permit = permit;
-        forward_events(shared, thread_id, project_id, stream, ctx, turn_gate).await;
+        let cancellation_probe = cancel.clone();
+        let thread_id = coordinator.binding().await.handle.thread;
+        let exit_reason = forward_events(shared.clone(), coordinator.clone(), stream, cancel).await;
+        let cancelled = *cancellation_probe.borrow();
+        if !cancelled && exit_reason != ForwarderExitReason::PersistenceBlocked {
+            coordinator.owner_finished(false).await;
+            let mut threads = shared.threads.lock().await;
+            if threads
+                .get(&thread_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &coordinator))
+            {
+                threads.remove(&thread_id);
+                warn!(
+                    %thread_id,
+                    exit_reason = forwarder_exit_reason_label(exit_reason),
+                    "removed failed event owner so the thread can be reopened"
+                );
+            }
+        } else {
+            coordinator.owner_finished(cancelled).await;
+        }
+        let _ = completed.send(true);
     });
+}
+
+async fn install_event_owner(
+    shared: &Arc<RegistryShared>,
+    harness: &Arc<dyn AgentHarness>,
+    binding: BindingData,
+    classification: ClassificationPhase,
+) -> Result<bool, HarnessError> {
+    let thread_id = binding.handle.thread;
+    let _owner_guard = lock_thread_owner_after_drain(shared, thread_id).await;
+    install_event_owner_locked(shared, harness, binding, classification).await
+}
+
+async fn install_event_owner_locked(
+    shared: &Arc<RegistryShared>,
+    harness: &Arc<dyn AgentHarness>,
+    binding: BindingData,
+    classification: ClassificationPhase,
+) -> Result<bool, HarnessError> {
+    let thread_id = binding.handle.thread;
+    let project_id = binding.project;
+    let existing = shared.threads.lock().await.get(&thread_id).cloned();
+    if let Some(existing) = existing {
+        existing
+            .reusable_handle(
+                project_id,
+                thread_id,
+                Some(&binding.handle.harness_thread_id),
+                classification,
+            )
+            .await?;
+        debug!(%project_id, %thread_id, "reused existing long-lived native event owner");
+        return Ok(false);
+    }
+
+    let stream = harness.subscribe(&binding.handle);
+    let Some(permit) = shared.background_tasks.register() else {
+        return Err(HarnessError::Protocol(
+            "server is shutting down; refusing to install event owner".into(),
+        ));
+    };
+    let coordinator = Arc::new(ThreadCoordinator::new(binding, classification));
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let (completed_tx, completed_rx) = watch::channel(false);
+    coordinator
+        .activate_owner(EventOwnerControl {
+            cancel: cancel_tx,
+            completed: completed_rx,
+        })
+        .await?;
+    shared
+        .threads
+        .lock()
+        .await
+        .insert(thread_id, coordinator.clone());
+    launch_event_forwarder(
+        shared.clone(),
+        coordinator.clone(),
+        stream,
+        cancel_rx,
+        completed_tx,
+        permit,
+    );
+    debug!(%project_id, %thread_id, "installed long-lived native event owner");
+    Ok(true)
 }
 
 async fn forward_events(
     shared: Arc<RegistryShared>,
-    thread_id: ThreadId,
-    project_id: ProjectId,
+    coordinator: Arc<ThreadCoordinator>,
     mut stream: giskard_harness::AgentEventStream,
-    mut ctx: TurnContext,
-    mut turn_gate: Option<ThreadTurnLease>,
-) {
+    mut cancel: watch::Receiver<bool>,
+) -> ForwarderExitReason {
+    let binding = coordinator.binding().await;
+    let thread_id = binding.handle.thread;
+    let project_id = binding.project;
+    let persisted = shared
+        .store
+        .load_thread(project_id, thread_id)
+        .await
+        .ok()
+        .flatten();
+    let classification = coordinator.classification().await;
+    let external_context = TurnContext {
+        user_input: if classification == ClassificationPhase::Subagent {
+            UserInput::text("Sub-agent turn")
+        } else {
+            UserInput::text("")
+        },
+        model: persisted
+            .as_ref()
+            .map(|thread| thread.current_model.clone())
+            .or(binding.native_model.clone())
+            .unwrap_or_else(|| ModelRef {
+                provider: "unknown".into(),
+                model: "unknown".into(),
+                reasoning_effort: None,
+            }),
+        mode: persisted
+            .as_ref()
+            .map(|thread| thread.mode)
+            .unwrap_or(Mode::Build),
+        kind: if classification == ClassificationPhase::Subagent {
+            TurnContextKind::ExternalSubagent
+        } else {
+            TurnContextKind::User
+        },
+    };
+    let mut ctx = external_context.clone();
+    let mut turn_gate: Option<ThreadTurnLease> = None;
     let hub = shared.hub.clone();
     let runtime = shared.runtime.clone();
     // Establish the authority once. Per-event permits must only observe this entry, never recreate
@@ -3016,29 +2895,16 @@ async fn forward_events(
     let store = shared.store.clone();
     let mut turn_id: Option<TurnId> = None;
     let mut owned_turn: Option<TurnId> = None;
-    let mut owned_turn_completed = false;
+    let mut owned_token: Option<CoordinatorToken> = None;
     let mut started_at = Utc::now();
     let mut current_turn_items = CurrentTurnItems::default();
     let mut diffs: Vec<giskard_core::FileDiff> = Vec::new();
     let mut seen_turn_ids = persisted_turn_ids(&store, project_id, thread_id).await;
     let mut seen_notices = HashSet::new();
     let mut item_ids_by_harness: HashMap<(TurnId, String), ItemId> = HashMap::new();
-    let mut synthetic_subagent_prompt = SyntheticSubagentPrompt::default();
     let forwarder_started = Instant::now();
     let mut saw_context_compaction_marker = false;
     let mut stream_error: Option<String> = None;
-    let passive_lifecycle_notify = if ctx.kind == TurnContextKind::PassiveSubagent {
-        match ctx.passive_subagent_metadata.as_ref() {
-            Some(metadata) => metadata
-                .lock()
-                .await
-                .get(&thread_id)
-                .map(|entry| entry.lifecycle_notify.clone()),
-            None => None,
-        }
-    } else {
-        None
-    };
     debug!(
         %project_id,
         %thread_id,
@@ -3052,100 +2918,17 @@ async fn forward_events(
     );
 
     let exit_reason = loop {
-        let recv_result = if ctx.kind == TurnContextKind::PassiveSubagent
-            && owned_turn.is_none()
-            && turn_id.is_none()
-        {
-            match passive_pre_turn_recv(
-                &mut stream,
-                passive_lifecycle_notify.as_ref(),
-                thread_id,
-                &mut ctx,
-            )
-            .await
-            {
-                PassivePreTurnOutcome::Event(result) => *result,
-                PassivePreTurnOutcome::EvidenceAdopted => {
-                    debug!(
-                        %project_id,
-                        %thread_id,
-                        timeout_ms = ctx
-                            .passive_pre_turn_timeout
-                            .map(|value| tracing::field::display(value.as_millis())),
-                        "passive subagent monitor adopted active lifecycle evidence"
-                    );
-                    continue;
-                }
-                PassivePreTurnOutcome::Stop(stop) => {
-                    if !matches!(stop, PassivePreTurnStop::Cancelled)
-                        && let Some(fallback) = ctx.subagent_fallback.clone()
-                    {
-                        let fallback_ctx = FallbackTurnContext::from(&ctx);
-                        persist_subagent_fallback_transcript(
-                            thread_id,
-                            project_id,
-                            &fallback_ctx,
-                            fallback,
-                            &mut seen_turn_ids,
-                            &shared,
-                        )
-                        .await;
-                    }
-                    match stop {
-                        PassivePreTurnStop::Cancelled => info!(
-                            %project_id,
-                            %thread_id,
-                            elapsed_ms = forwarder_started.elapsed().as_millis(),
-                            "passive subagent monitor cancelled before observing a turn"
-                        ),
-                        PassivePreTurnStop::Terminal => info!(
-                            %project_id,
-                            %thread_id,
-                            elapsed_ms = forwarder_started.elapsed().as_millis(),
-                            "passive subagent monitor stopped after terminal observation before a turn"
-                        ),
-                        PassivePreTurnStop::TimedOut { timeout } => info!(
-                            %project_id,
-                            %thread_id,
-                            timeout_ms = timeout.map(|value| value.as_millis()).unwrap_or_default(),
-                            elapsed_ms = forwarder_started.elapsed().as_millis(),
-                            "passive subagent monitor timed out before observing a turn"
-                        ),
-                    }
+        let recv_result = tokio::select! {
+            changed = cancel.changed() => {
+                if changed.is_err() || *cancel.borrow() {
                     break ForwarderExitReason::StreamEndedWithoutTurn;
                 }
+                continue;
             }
-        } else {
-            stream.recv().await
+            result = stream.recv() => result,
         };
         match recv_result {
             Ok(event) => {
-                if ctx.kind == TurnContextKind::PassiveSubagent
-                    && turn_gate.is_none()
-                    && event_turn_id(&event).is_none()
-                    && shared.runtime.has_active_turn(thread_id)
-                {
-                    warn!(
-                        %project_id,
-                        %thread_id,
-                        event_kind = event_kind(&event),
-                        "passive sub-agent forwarder yielded turnless event to an active forwarder"
-                    );
-                    break ForwarderExitReason::DuplicateForwarder;
-                }
-                if ctx.kind == TurnContextKind::PassiveSubagent
-                    && owned_turn.is_none()
-                    && turn_id.is_none()
-                    && refresh_passive_subagent_context(thread_id, &mut ctx).await
-                        == PassiveMonitorSignal::Cancelled
-                {
-                    info!(
-                        %project_id,
-                        %thread_id,
-                        "passive subagent monitor cancelled before processing a queued event"
-                    );
-                    break ForwarderExitReason::StreamEndedWithoutTurn;
-                }
                 let event_thread = event.thread_id();
                 if event_thread != thread_id {
                     log_foreign_thread_event_drop(project_id, thread_id, event_thread, &event);
@@ -3160,60 +2943,6 @@ async fn forward_events(
                         "skipping duplicate harness notice"
                     );
                     continue;
-                }
-
-                if ctx.kind == TurnContextKind::PassiveSubagent
-                    && turn_gate.is_none()
-                    && let Some(passive_turn) = event_turn_id(&event)
-                    && !seen_turn_ids.contains(&passive_turn)
-                {
-                    let handle = shared
-                        .threads
-                        .lock()
-                        .await
-                        .get(&thread_id)
-                        .map(|binding| binding.handle.clone());
-                    let Some(handle) = handle else {
-                        error!(
-                            %project_id,
-                            %thread_id,
-                            %passive_turn,
-                            "passive sub-agent forwarder lost its thread binding"
-                        );
-                        break ForwarderExitReason::DuplicateForwarder;
-                    };
-                    match shared
-                        .runtime
-                        .reserve_turn(thread_id, turn_reservation(project_id, &handle, &ctx))
-                    {
-                        Ok(mut lease) => {
-                            // The reservation changed the projection as well, so the publish below
-                            // carries both transitions.
-                            let _acknowledged = lease.acknowledge_turn(passive_turn);
-                            turn_gate = Some(lease);
-                            publish_runtime_overview(&shared).await;
-                        }
-                        Err(HarnessError::ThreadBusy { .. }) => {
-                            warn!(
-                                %project_id,
-                                %thread_id,
-                                %passive_turn,
-                                event_kind = event_kind(&event),
-                                "passive subscriber yielded to the existing turn forwarder"
-                            );
-                            break ForwarderExitReason::DuplicateForwarder;
-                        }
-                        Err(error) => {
-                            error!(
-                                %project_id,
-                                %thread_id,
-                                %passive_turn,
-                                %error,
-                                "passive subscriber could not reserve turn ownership"
-                            );
-                            break ForwarderExitReason::DuplicateForwarder;
-                        }
-                    }
                 }
 
                 if let Some((event_turn, harness_item_id, existing_item_id, conflicting_item_id)) =
@@ -3235,25 +2964,66 @@ async fn forward_events(
                 let event_turn = event_turn_id(&event);
                 if let Some(owned) = owned_turn {
                     if let Some(turn) = event_turn {
-                        if turn != owned {
-                            if !owned_turn_completed {
-                                log_cross_turn_event_drop(
-                                    project_id,
-                                    thread_id,
-                                    owned,
-                                    turn,
-                                    &event,
-                                    forwarder_started.elapsed().as_millis(),
-                                );
-                            }
+                        // A command may outlive its persisted turn. Its terminal replacement must
+                        // still reach the late-event path while a newer turn is active; it updates
+                        // runtime task state only and cannot enter the newer turn's transcript.
+                        // Events for any other non-owned, non-persisted turn remain a protocol
+                        // violation and are dropped before they mutate runtime or persistence.
+                        if turn != owned && !seen_turn_ids.contains(&turn) {
+                            log_cross_turn_event_drop(
+                                project_id,
+                                thread_id,
+                                owned,
+                                turn,
+                                &event,
+                                forwarder_started.elapsed().as_millis(),
+                            );
                             continue;
                         }
-                    } else if owned_turn_completed {
-                        continue;
                     }
                 } else if let Some(turn) = event_turn
                     && !seen_turn_ids.contains(&turn)
                 {
+                    let claim = match coordinator
+                        .claim_native_turn(turn, external_context.clone())
+                        .await
+                    {
+                        Ok(claim) => claim,
+                        Err(error) => {
+                            error!(%project_id, %thread_id, %turn, %error,
+                                "event owner could not claim native turn");
+                            break ForwarderExitReason::DuplicateForwarder;
+                        }
+                    };
+                    ctx = claim.context;
+                    if claim.external {
+                        match runtime.reserve_turn(
+                            thread_id,
+                            turn_reservation(project_id, &binding.handle, &ctx),
+                        ) {
+                            Ok(mut lease) => {
+                                let _ = lease.acknowledge_turn(turn);
+                                if let Err(mut lease) = coordinator
+                                    .install_native_turn_gate(claim.token, turn, lease)
+                                    .await
+                                {
+                                    if let Some(overview) = lease.release() {
+                                        shared.hub.publish_runtime_overview(overview).await;
+                                    }
+                                    coordinator.finish_native_turn(claim.token, turn).await;
+                                    break ForwarderExitReason::RuntimeAuthorityReplaced;
+                                }
+                                publish_runtime_overview(&shared).await;
+                            }
+                            Err(error) => {
+                                error!(%project_id, %thread_id, %turn, %error,
+                                    "event owner could not reserve an external native turn");
+                                coordinator.finish_native_turn(claim.token, turn).await;
+                                break ForwarderExitReason::RuntimeAuthorityReplaced;
+                            }
+                        }
+                    }
+                    owned_token = Some(claim.token);
                     owned_turn = Some(turn);
                     if !matches!(event, AgentEvent::TurnStarted { .. }) {
                         debug!(
@@ -3390,12 +3160,6 @@ async fn forward_events(
                             );
                         }
                     }
-                    if owned_turn_completed
-                        && let Some(owned) = owned_turn
-                        && !runtime.has_running_for_turn(thread_id, owned)
-                    {
-                        break ForwarderExitReason::AfterTurnCommandsDrained;
-                    }
                     continue;
                 }
 
@@ -3465,24 +3229,6 @@ async fn forward_events(
                 // persistence assembly, or browser projection can observe the event.
                 let event = runtime.capture_event_diffs(thread_id, event);
 
-                if ctx.kind == TurnContextKind::PassiveSubagent {
-                    refresh_passive_subagent_context(thread_id, &mut ctx).await;
-                    if let Some(turn) = event_turn
-                        && !matches!(event, AgentEvent::TurnStarted { .. })
-                    {
-                        synthesize_passive_subagent_prompt_item(
-                            project_id,
-                            thread_id,
-                            turn,
-                            &ctx,
-                            &mut current_turn_items,
-                            &mut synthetic_subagent_prompt,
-                            &shared,
-                        )
-                        .await;
-                    }
-                }
-
                 if let AgentEvent::ContextWindowUpdated {
                     turn,
                     model,
@@ -3520,8 +3266,9 @@ async fn forward_events(
                         turn_id = Some(*turn);
                         started_at = Utc::now();
                         current_turn_items.rebuild_indexes();
-                        if let Some(turn_gate) = turn_gate.as_mut()
-                            && let Some(overview) = turn_gate.acknowledge_turn(*turn)
+                        if let Some(token) = owned_token
+                            && let Some(overview) =
+                                coordinator.acknowledge_native_turn(token, *turn).await
                         {
                             // A lease reserved before the harness named its turn learns the id
                             // here. Nothing else publishes this transition, so a dropped overview
@@ -3586,7 +3333,7 @@ async fn forward_events(
                                 "context compaction marker received"
                             );
                         }
-                        if !owned_turn_completed && current_turn_items.upsert(item) {
+                        if current_turn_items.upsert(item) {
                             error!(
                                 %project_id,
                                 %thread_id,
@@ -3608,7 +3355,6 @@ async fn forward_events(
                     _ => {}
                 }
 
-                let is_turn_start = matches!(event, AgentEvent::TurnStarted { .. });
                 let completed = if let AgentEvent::TurnCompleted {
                     turn,
                     usage,
@@ -3619,16 +3365,6 @@ async fn forward_events(
                     Some((*turn, *usage, status.clone()))
                 } else {
                     None
-                };
-                let synthetic_compaction_completed = match &event {
-                    AgentEvent::ItemCompleted { turn, item, .. }
-                        if ctx.kind == TurnContextKind::ManualCompaction
-                            && turn_id.is_none()
-                            && is_context_compaction_item(item) =>
-                    {
-                        Some(*turn)
-                    }
-                    _ => None,
                 };
 
                 // A harness may deliver an item for an unseen turn before TurnStarted. Start the
@@ -3716,6 +3452,11 @@ async fn forward_events(
                             "context compaction turn completed"
                         );
                     }
+                    if let Some(token) = owned_token {
+                        turn_gate = coordinator
+                            .take_native_turn_gate(token, completed_turn)
+                            .await;
+                    }
                     let Some(tid) = complete_forwarded_turn(
                         thread_id,
                         project_id,
@@ -3735,7 +3476,6 @@ async fn forward_events(
                     else {
                         break ForwarderExitReason::PersistenceBlocked;
                     };
-                    owned_turn_completed = true;
                     hub.broadcast_event(thread_id, event).await;
                     if runtime.has_running_for_turn(thread_id, tid) {
                         info!(
@@ -3745,83 +3485,34 @@ async fn forward_events(
                             elapsed_ms = forwarder_started.elapsed().as_millis(),
                             "event forwarder monitoring after-turn running commands"
                         );
-                        continue;
                     }
-                    break ForwarderExitReason::NormalTurnCompleted;
+                    if let Some(token) = owned_token.take() {
+                        coordinator.finish_native_turn(token, tid).await;
+                    }
+                    turn_gate = None;
+                    turn_id = None;
+                    owned_turn = None;
+                    ctx = external_context.clone();
+                    started_at = Utc::now();
+                    current_turn_items = CurrentTurnItems::default();
+                    diffs.clear();
+                    seen_notices.clear();
+                    item_ids_by_harness.clear();
+                    saw_context_compaction_marker = false;
+                    continue;
                 }
 
                 broadcast_event_with_context(&hub, project_id, thread_id, event, &ctx).await;
-
-                if is_turn_start && let Some(turn) = event_turn {
-                    synthesize_passive_subagent_prompt_item(
-                        project_id,
-                        thread_id,
-                        turn,
-                        &ctx,
-                        &mut current_turn_items,
-                        &mut synthetic_subagent_prompt,
-                        &shared,
-                    )
-                    .await;
-                }
-
-                if let Some(completed_turn) = synthetic_compaction_completed {
-                    info!(
-                        %project_id,
-                        %thread_id,
-                        turn = %completed_turn,
-                        turn_started_seen = turn_id.is_some(),
-                        items_buffered = current_turn_items.len(),
-                        elapsed_ms = forwarder_started.elapsed().as_millis(),
-                        "context compaction completed from marker without turn completion"
-                    );
-                    let status = TurnStatus {
-                        kind: TurnStatusKind::Completed,
-                        message: None,
-                    };
-                    let completion_event = AgentEvent::TurnCompleted {
-                        thread: thread_id,
-                        turn: completed_turn,
-                        usage: giskard_core::token::TokenUsage::default(),
-                        status: status.clone(),
-                    };
-                    let Some(tid) = complete_forwarded_turn(
-                        thread_id,
-                        project_id,
-                        completed_turn,
-                        giskard_core::token::TokenUsage::default(),
-                        status,
-                        &ctx,
-                        &mut current_turn_items,
-                        &mut diffs,
-                        started_at,
-                        turn_id,
-                        &mut seen_turn_ids,
-                        &shared,
-                        turn_gate.as_mut(),
-                    )
-                    .await
-                    else {
-                        break ForwarderExitReason::PersistenceBlocked;
-                    };
-                    owned_turn_completed = true;
-                    hub.broadcast_event(thread_id, completion_event).await;
-                    if runtime.has_running_for_turn(thread_id, tid) {
-                        info!(
-                            %project_id,
-                            %thread_id,
-                            turn = %tid,
-                            elapsed_ms = forwarder_started.elapsed().as_millis(),
-                            "event forwarder monitoring after-turn running commands"
-                        );
-                        continue;
-                    }
-                    break ForwarderExitReason::SyntheticCompactionCompleted;
-                }
             }
             Err(e) => {
+                let lagged = matches!(e, broadcast::error::RecvError::Lagged(_));
                 stream_error = Some(e.to_string());
-                if ctx.kind == TurnContextKind::ManualCompaction && !owned_turn_completed {
+                if turn_gate.is_none()
+                    && let (Some(token), Some(turn)) = (owned_token, owned_turn)
+                {
+                    turn_gate = coordinator.take_native_turn_gate(token, turn).await;
+                }
+                if ctx.kind == TurnContextKind::ManualCompaction {
                     let live_buffer_active = runtime.live_is_active(thread_id);
                     warn!(
                         %project_id,
@@ -3845,7 +3536,11 @@ async fn forward_events(
                         turn_gate.as_ref().is_some_and(|lease| !lease.is_released());
                     let status = TurnStatus {
                         kind: TurnStatusKind::Interrupted,
-                        message: Some("Harness event stream ended before turn completion".into()),
+                        message: Some(if lagged {
+                            "Harness event stream lagged before turn completion".into()
+                        } else {
+                            "Harness event stream ended before turn completion".into()
+                        }),
                     };
                     warn!(
                         %project_id,
@@ -3890,17 +3585,50 @@ async fn forward_events(
                     else {
                         break ForwarderExitReason::PersistenceBlocked;
                     };
-                    owned_turn_completed = true;
                     hub.broadcast_event(thread_id, completion_event).await;
+                    if let Some(token) = owned_token.take() {
+                        coordinator.finish_native_turn(token, incomplete_turn).await;
+                    }
+                    if lagged {
+                        turn_gate = None;
+                        turn_id = None;
+                        owned_turn = None;
+                        ctx = external_context.clone();
+                        started_at = Utc::now();
+                        current_turn_items = CurrentTurnItems::default();
+                        diffs.clear();
+                        seen_notices.clear();
+                        item_ids_by_harness.clear();
+                        saw_context_compaction_marker = false;
+                        stream_error = None;
+                        continue;
+                    }
                     break ForwarderExitReason::StreamEndedRecovered;
+                } else if lagged {
+                    error!(
+                        %project_id,
+                        %thread_id,
+                        ?e,
+                        "event owner lagged while idle; continuing with retained events"
+                    );
+                    stream_error = None;
+                    continue;
                 } else {
                     break ForwarderExitReason::StreamEndedWithoutTurn;
                 }
             }
         }
     };
+    if turn_gate.is_none()
+        && let (Some(token), Some(turn)) = (owned_token, owned_turn)
+    {
+        turn_gate = coordinator.take_native_turn_gate(token, turn).await;
+    }
+    if owned_turn.is_none() {
+        turn_gate = coordinator.take_unclaimed_operation().await;
+    }
     let turn_gate_held = turn_gate.as_ref().is_some_and(|lease| !lease.is_released());
-    if turn_gate_held && !owned_turn_completed {
+    if turn_gate_held {
         warn!(
             %project_id,
             %thread_id,
@@ -3925,7 +3653,6 @@ async fn forward_events(
             context_kind = turn_context_kind_label(ctx.kind),
             owned_turn = display_opt(owned_turn),
             turn_id = display_opt(turn_id),
-            owned_turn_completed,
             turn_gate_held,
             exit_reason = forwarder_exit_reason_label(exit_reason),
             stream_error = display_opt(stream_error.as_deref()),
@@ -3938,116 +3665,10 @@ async fn forward_events(
     {
         shared.hub.publish_runtime_overview(overview).await;
     }
-}
-
-async fn persist_subagent_fallback_transcript(
-    thread_id: ThreadId,
-    project_id: ProjectId,
-    ctx: &FallbackTurnContext,
-    fallback: SubagentFallbackTranscript,
-    seen_turn_ids: &mut HashSet<TurnId>,
-    shared: &RegistryShared,
-) {
-    if !seen_turn_ids.is_empty() {
-        debug!(
-            %project_id,
-            %thread_id,
-            persisted_turn_count = seen_turn_ids.len(),
-            "skipping sub-agent fallback transcript because history already exists"
-        );
-        return;
+    if let (Some(token), Some(turn)) = (owned_token, owned_turn) {
+        coordinator.finish_native_turn(token, turn).await;
     }
-
-    let turn_id = TurnId::new();
-    let item = Item {
-        id: ItemId::new(),
-        harness_item_id: format!("subagent_fallback:{turn_id}"),
-        payload: ItemPayload::AgentMessage {
-            text: fallback.message,
-        },
-        created_at: Utc::now(),
-    };
-    let status = TurnStatus {
-        kind: subagent_status_turn_kind(fallback.status),
-        message: None,
-    };
-    let started_at = Utc::now();
-    let turn = Turn {
-        id: turn_id,
-        user_input: ctx.user_input.clone(),
-        items: vec![item.clone()],
-        model: ctx.model.clone(),
-        mode: ctx.mode,
-        status: status.clone(),
-        usage: giskard_core::token::TokenUsage::default(),
-        diffs: Vec::new(),
-        started_at,
-        completed_at: Some(Utc::now()),
-    };
-    let outcome = persist_turn(
-        &shared.thread_metadata,
-        &shared.ledger,
-        project_id,
-        thread_id,
-        &turn,
-        &[],
-    )
-    .await;
-    if !outcome.history_appended {
-        return;
-    }
-    seen_turn_ids.insert(turn_id);
-
-    for event in [
-        AgentEvent::TurnStarted {
-            thread: thread_id,
-            turn: turn_id,
-        },
-        AgentEvent::ItemCompleted {
-            thread: thread_id,
-            turn: turn_id,
-            item,
-        },
-        AgentEvent::TurnCompleted {
-            thread: thread_id,
-            turn: turn_id,
-            usage: giskard_core::token::TokenUsage::default(),
-            status,
-        },
-    ] {
-        let applied = shared.runtime.apply_event(thread_id, &event, false);
-        debug!(
-            %thread_id,
-            event_sequence = display_opt(applied.sequence),
-            event_kind = event_kind(&event),
-            "applied fallback transcript event to thread runtime"
-        );
-        publish_applied_runtime_effects(&shared.hub, thread_id, applied).await;
-        broadcast_event_with_user_input(
-            &shared.hub,
-            project_id,
-            thread_id,
-            event,
-            Some(ctx.user_input.clone()),
-        )
-        .await;
-    }
-    info!(
-        %project_id,
-        %thread_id,
-        turn = %turn_id,
-        "persisted fallback transcript for completed sub-agent"
-    );
-}
-
-fn subagent_status_turn_kind(status: SubagentStatus) -> TurnStatusKind {
-    match status {
-        SubagentStatus::Interrupted | SubagentStatus::Shutdown => TurnStatusKind::Interrupted,
-        SubagentStatus::Failed | SubagentStatus::NotFound => TurnStatusKind::Failed,
-        SubagentStatus::Pending | SubagentStatus::Running | SubagentStatus::Completed => {
-            TurnStatusKind::Completed
-        }
-    }
+    exit_reason
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4607,12 +4228,6 @@ impl CurrentTurnItems {
         false
     }
 
-    fn upsert_first(&mut self, item: &Item) {
-        self.items.retain(|existing| existing.id != item.id);
-        self.items.insert(0, item.clone());
-        self.rebuild_indexes();
-    }
-
     fn append_indexed(&mut self, item: &Item) {
         let idx = self.items.len();
         self.items.push(item.clone());
@@ -4844,8 +4459,7 @@ mod tests {
     use giskard_core::event::AgentEvent;
     use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
     use giskard_core::item::{
-        CommandExecutionStart, Item, ItemDelta, ItemKind, ItemPayload, ItemStart, SubagentAction,
-        SubagentStatus,
+        CommandExecutionStart, Item, ItemDelta, ItemKind, ItemPayload, ItemStart,
     };
     use giskard_core::model::ModelRef;
     use giskard_core::server_request::ServerRequest;
@@ -4859,7 +4473,7 @@ mod tests {
     use giskard_persist::PersistStore;
     use giskard_persist::store::{ProjectConfig, ThreadFile};
     use giskard_proto::{ServerMessage, WireAgentEvent};
-    use tokio::sync::{Mutex, broadcast, mpsc};
+    use tokio::sync::{broadcast, mpsc};
     use tokio::task::JoinHandle;
 
     use super::{
@@ -4867,11 +4481,8 @@ mod tests {
         command_completion_is_normal_success, command_status_is_running,
         completed_tool_has_terminal_output, event_item_delta_kind, event_item_id, event_turn_id,
         forward_events, late_command_completion_message, log_cross_turn_event_drop,
-        log_foreign_thread_event_drop, log_metadata_only_event_rejection,
-        passive_subagent_prompt_text, persist_subagent_fallback_transcript, prepare_thread_updates,
-        should_refresh_subagent_title, spawn_thread_update_forwarder, subagent_monitor_policy,
-        subagent_path_leaf, take_passive_subagent_monitor_metadata, track_item_identity,
-        turn_reservation, update_passive_subagent_metadata,
+        log_foreign_thread_event_drop, log_metadata_only_event_rejection, prepare_thread_updates,
+        spawn_thread_update_forwarder, track_item_identity, turn_reservation,
     };
     use crate::hub::Hub;
     use crate::ledger;
@@ -5417,11 +5028,7 @@ mod tests {
                     native_thread_id: "native-child".into(),
                     agent_name: None,
                     agent_path: None,
-                    initial_prompt: None,
                     title: None,
-                    action: SubagentAction::Spawned,
-                    status: None,
-                    fallback: None,
                 },
                 result: Some(result),
             },
@@ -5492,126 +5099,108 @@ mod tests {
         assert!(!command_completion_is_normal_success("interrupted", None));
     }
 
-    #[test]
-    fn active_subagent_monitor_uses_a_long_pre_turn_idle_timeout() {
-        for action in [
-            SubagentAction::Spawned,
-            SubagentAction::Started,
-            SubagentAction::Interacted,
-        ] {
-            let policy = subagent_monitor_policy(Some(action), None);
-            assert!(policy.should_monitor);
-            assert!(policy.active_observed);
-            assert_eq!(
-                policy.pre_turn_timeout,
-                Some(super::ACTIVE_SUBAGENT_PRE_TURN_IDLE_TIMEOUT)
-            );
-        }
-        assert!(
-            subagent_monitor_policy(Some(SubagentAction::Spawned), Some(SubagentStatus::Pending))
-                .should_monitor
-        );
-        assert!(
-            subagent_monitor_policy(Some(SubagentAction::Spawned), Some(SubagentStatus::Running))
-                .should_monitor
-        );
-
-        let ignored = subagent_monitor_policy(None, None);
-        assert!(!ignored.should_monitor);
-
-        // Codex reports both terminal outcomes as an action of their own, with no status attached.
-        for action in [SubagentAction::Interrupted, SubagentAction::Completed] {
-            let policy = subagent_monitor_policy(Some(action), None);
-            assert!(!policy.should_monitor, "{action:?} must not arm a monitor");
-            assert!(policy.terminal_observed, "{action:?} is terminal evidence");
-        }
-        for status in [
-            SubagentStatus::Completed,
-            SubagentStatus::Interrupted,
-            SubagentStatus::Failed,
-            SubagentStatus::Shutdown,
-            SubagentStatus::NotFound,
-        ] {
-            let policy = subagent_monitor_policy(Some(SubagentAction::Started), Some(status));
-            assert!(!policy.should_monitor);
-            assert!(policy.terminal_observed);
-        }
+    fn test_coordinator(classification: super::ClassificationPhase) -> super::ThreadCoordinator {
+        super::ThreadCoordinator::new(
+            super::BindingData {
+                project: ProjectId::new(),
+                handle: ThreadHandle::detached(ThreadId::new(), "native-test".into()),
+                native_model: None,
+            },
+            classification,
+        )
     }
 
-    #[test]
-    fn real_prompt_equal_to_fallback_copy_is_not_suppressed() {
-        let mut ctx = TurnContext {
-            user_input: UserInput::text("Sub-agent turn"),
+    fn test_turn_context() -> TurnContext {
+        TurnContext {
+            user_input: UserInput::text("test"),
             model: ModelRef {
                 provider: "openai".into(),
-                model: "gpt-5.6-sol".into(),
+                model: "test".into(),
                 reasoning_effort: None,
             },
             mode: Mode::Build,
-            kind: TurnContextKind::PassiveSubagent,
-            passive_input_is_fallback: false,
-            subagent_fallback: None,
-            passive_subagent_metadata: None,
-            passive_pre_turn_timeout: None,
-        };
-        assert_eq!(
-            passive_subagent_prompt_text(&ctx).as_deref(),
-            Some("Sub-agent turn")
-        );
+            kind: TurnContextKind::User,
+        }
+    }
 
-        ctx.passive_input_is_fallback = true;
-        assert_eq!(passive_subagent_prompt_text(&ctx), None);
+    async fn prepare_test_operation(
+        coordinator: &super::ThreadCoordinator,
+        runtime: &ThreadRuntimeRegistry,
+        context: TurnContext,
+    ) -> super::CoordinatorToken {
+        let binding = coordinator.binding().await;
+        let lease = runtime
+            .reserve_turn(
+                binding.handle.thread,
+                turn_reservation(binding.project, &binding.handle, &context),
+            )
+            .unwrap();
+        match coordinator.prepare_operation(context, lease).await {
+            Ok(operation) => operation,
+            Err((error, _)) => panic!("test operation was rejected: {error}"),
+        }
     }
 
     #[tokio::test]
-    async fn passive_monitor_releases_after_pre_turn_idle_timeout() {
-        let tmp = tempfile::TempDir::new().unwrap();
+    async fn subagent_coordinator_rejects_prepared_operations() {
+        let coordinator = test_coordinator(super::ClassificationPhase::Subagent);
+        let runtime = ThreadRuntimeRegistry::new();
+        let binding = coordinator.binding().await;
+        let context = test_turn_context();
+        let lease = runtime
+            .reserve_turn(
+                binding.handle.thread,
+                turn_reservation(binding.project, &binding.handle, &context),
+            )
+            .unwrap();
+        let error = match coordinator.prepare_operation(context, lease).await {
+            Ok(_) => panic!("sub-agent operation must be rejected"),
+            Err((error, _)) => error,
+        };
+        assert!(matches!(error, HarnessError::ThreadReadOnly { .. }));
+    }
+
+    #[tokio::test]
+    async fn cancelling_operation_admission_cannot_leave_runtime_reserved() {
+        let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
-        let project_id = ProjectId::new();
-        let thread_id = ThreadId::new();
-        let model = ModelRef {
-            provider: "openai".into(),
-            model: "gpt-5.6-sol".into(),
-            reasoning_effort: None,
-        };
-        store
-            .create_project(project_id, "proj", "/tmp/test")
-            .await
-            .unwrap();
-        let (tx, _) = broadcast::channel(8);
-        let hub = Arc::new(Hub::new());
-        let ledger = ledger::spawn(store.clone());
-        let shared = Arc::new(super::RegistryShared::new(hub, store, ledger));
-        let ctx = TurnContext {
-            user_input: UserInput::text("Sub-agent turn"),
-            model,
-            mode: Mode::Build,
-            kind: TurnContextKind::PassiveSubagent,
-            passive_input_is_fallback: true,
-            subagent_fallback: None,
-            passive_subagent_metadata: None,
-            passive_pre_turn_timeout: Some(tokio::time::Duration::from_millis(20)),
-        };
-
-        let forwarder = tokio::spawn(forward_events(
-            shared,
-            thread_id,
-            project_id,
-            AgentEventStream::new(tx.subscribe()),
-            ctx,
-            None,
+        let shared = Arc::new(super::RegistryShared::new(
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store),
         ));
+        let coordinator = Arc::new(test_coordinator(super::ClassificationPhase::Primary));
+        let binding = coordinator.binding().await;
+        let thread_id = binding.handle.thread;
+        let state_guard = coordinator.state.lock().await;
+        let task_shared = shared.clone();
+        let task_coordinator = coordinator.clone();
+        let context = test_turn_context();
+        let task = tokio::spawn(async move {
+            task_shared
+                .admit_operation(
+                    &task_coordinator,
+                    binding.project,
+                    &binding.handle,
+                    &context,
+                )
+                .await
+        });
 
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), forwarder)
-            .await
-            .expect("idle passive monitor should honor its pre-turn timeout")
-            .unwrap();
-        drop(tx);
+        while !shared.runtime.has_active_turn(thread_id) {
+            tokio::task::yield_now().await;
+        }
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(state_guard);
+
+        assert!(!shared.runtime.has_active_turn(thread_id));
+        assert!(coordinator.state.lock().await.operation.is_none());
     }
 
     #[tokio::test]
-    async fn monitor_stop_waits_for_post_forwarder_cleanup() {
-        let tmp = tempfile::TempDir::new().unwrap();
+    async fn closing_owner_cannot_deadlock_forget_thread_behind_owner_lock() {
+        let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
         let registry = Arc::new(super::HarnessRegistry::new(
             Arc::new(UnusedHarnessFactory),
@@ -5619,307 +5208,314 @@ mod tests {
             store.clone(),
             ledger::spawn(store),
         ));
-        let thread_id = ThreadId::new();
+        let coordinator = Arc::new(test_coordinator(super::ClassificationPhase::Primary));
+        let thread_id = coordinator.binding().await.handle.thread;
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (completed_tx, completed_rx) = tokio::sync::watch::channel(false);
+        coordinator
+            .activate_owner(super::EventOwnerControl {
+                cancel: cancel_tx,
+                completed: completed_rx,
+            })
+            .await
+            .unwrap();
         registry
             .shared
-            .passive_monitor_tasks
-            .register(thread_id)
-            .await;
-
-        let stopping = {
-            let registry = registry.clone();
-            tokio::spawn(async move { registry.stop_passive_subagent_monitor(thread_id).await })
-        };
-        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-        assert!(
-            !stopping.is_finished(),
-            "monitor stop returned before cleanup completed"
+            .threads
+            .lock()
+            .await
+            .insert(thread_id, coordinator.clone());
+        let permit = registry.shared.background_tasks.register().unwrap();
+        let (events, _) = broadcast::channel(2);
+        super::launch_event_forwarder(
+            registry.shared.clone(),
+            coordinator,
+            AgentEventStream::new(events.subscribe()),
+            cancel_rx,
+            completed_tx,
+            permit,
         );
 
-        super::finish_passive_subagent_monitor_task(
-            &registry.shared.passive_monitor_tasks,
-            thread_id,
-        )
-        .await;
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), stopping)
+        let owner_guard =
+            super::lock_thread_owner(&registry.shared.thread_owner_locks, thread_id).await;
+        let registry_forget = registry.clone();
+        let forget = tokio::spawn(async move {
+            registry_forget.forget_thread(thread_id).await;
+        });
+        tokio::task::yield_now().await;
+        drop(events);
+        tokio::task::yield_now().await;
+        drop(owner_guard);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), forget)
             .await
-            .expect("monitor stop should finish after cleanup")
-            .unwrap()
+            .expect("forget_thread must not deadlock with a self-exiting owner")
             .unwrap();
     }
 
-    #[test]
-    fn generated_subagent_title_refresh_is_idempotent() {
-        assert!(!should_refresh_subagent_title(
-            "Sub-agent: Linnaeus",
-            "Sub-agent: Linnaeus"
-        ));
-        assert!(should_refresh_subagent_title(
-            "Sub-agent: server_lifecycle_audit",
-            "Sub-agent: Linnaeus"
-        ));
-        assert!(!should_refresh_subagent_title(
-            "My reviewer",
-            "Sub-agent: Linnaeus"
-        ));
-    }
-
-    #[test]
-    fn subagent_thread_path_uses_its_final_non_empty_component() {
-        assert_eq!(
-            subagent_path_leaf("/root/nested_reload_parent"),
-            Some("nested_reload_parent")
-        );
-        assert_eq!(subagent_path_leaf("///"), None);
-    }
-
     #[tokio::test]
-    async fn reverse_parent_materialization_is_navigation_only_when_bound_or_cold() {
-        for parent_is_bound in [false, true] {
-            let tmp = tempfile::TempDir::new().unwrap();
-            let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
-            let project_id = ProjectId::new();
-            store
-                .create_project(project_id, "project", "/tmp/project")
-                .await
-                .unwrap();
-            let parent_id = ThreadId::new();
-            let child_id = ThreadId::new();
-            let model = ModelRef {
-                provider: "openai".into(),
-                model: "gpt-5.5".into(),
-                reasoning_effort: None,
-            };
-            let now = Utc::now();
-            let thread = |id, harness_thread_id: &str, kind, parent_thread_id| ThreadFile {
-                revision: 0,
-                version: 1,
-                id,
-                project_id,
-                title: "thread".into(),
-                harness_thread_id: harness_thread_id.into(),
-                parent_thread_id,
-                spawned_by_turn_id: None,
-                kind,
-                mode: Mode::Build,
-                current_model: model.clone(),
-                context_window: 128_000,
-                model_context_windows: Default::default(),
-                permission_preset: PermissionPreset::AskFirst,
-                model_efforts: Default::default(),
-                tokens: TokenLedger::default(),
-                created_at: now,
-                updated_at: now,
-                archived: false,
-                git_workspace: None,
-            };
-            let parent = thread(
-                parent_id,
-                "native-parent",
-                giskard_core::ThreadKind::Primary,
-                None,
-            );
-            let child = thread(
-                child_id,
-                "native-child",
-                giskard_core::ThreadKind::Subagent,
-                Some(parent_id),
-            );
-            store.save_thread(project_id, &parent).await.unwrap();
-            store.save_thread(project_id, &child).await.unwrap();
-
-            let shared = Arc::new(super::RegistryShared::new(
-                Arc::new(Hub::new()),
-                store.clone(),
-                ledger::spawn(store.clone()),
-            ));
-            if parent_is_bound {
-                shared.threads.lock().await.insert(
-                    parent_id,
-                    super::ThreadBinding {
-                        project: project_id,
-                        handle: ThreadHandle::detached(parent_id, "native-parent".into()),
-                        native_model: Some(model.clone()),
-                    },
-                );
-            }
-
-            let result = super::materialize_subagent_thread(
-                child_id,
-                project_id,
-                TurnId::new(),
-                super::SubagentActivityInfo {
-                    native_thread_id: "native-parent".into(),
-                    agent_name: None,
-                    agent_path: Some("/root".into()),
-                    initial_prompt: None,
-                    title: Some("Sub-agent root interacted".into()),
-                    action: SubagentAction::Interacted,
-                    status: None,
-                    fallback: None,
-                },
-                shared,
-            )
+    async fn installer_waits_for_draining_owner_without_holding_owner_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let shared = Arc::new(super::RegistryShared::new(
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store),
+        ));
+        let coordinator = Arc::new(test_coordinator(super::ClassificationPhase::Primary));
+        let thread_id = coordinator.binding().await.handle.thread;
+        let (cancel_tx, _) = tokio::sync::watch::channel(false);
+        let (completed_tx, completed_rx) = tokio::sync::watch::channel(false);
+        coordinator
+            .activate_owner(super::EventOwnerControl {
+                cancel: cancel_tx,
+                completed: completed_rx,
+            })
             .await
             .unwrap();
+        coordinator.begin_retirement().await.unwrap();
+        shared
+            .threads
+            .lock()
+            .await
+            .insert(thread_id, coordinator.clone());
 
-            assert_eq!(result, None);
-            let saved_parent = store
-                .load_thread(project_id, parent_id)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(saved_parent.kind, giskard_core::ThreadKind::Primary);
-            assert_eq!(saved_parent.parent_thread_id, None);
-            let saved_child = store
-                .load_thread(project_id, child_id)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(saved_child.kind, giskard_core::ThreadKind::Subagent);
-            assert_eq!(saved_child.parent_thread_id, Some(parent_id));
-        }
-    }
+        let waiter_shared = shared.clone();
+        let waiter = tokio::spawn(async move {
+            super::lock_thread_owner_after_drain(&waiter_shared, thread_id).await
+        });
+        tokio::task::yield_now().await;
 
-    #[tokio::test]
-    async fn monitor_teardown_claims_late_terminal_fallback() {
-        let thread_id = ThreadId::new();
-        let passive_monitors = Arc::new(Mutex::new(HashSet::from([thread_id])));
-        let passive_subagent_metadata = Arc::new(Mutex::new(Default::default()));
-        let fallback = super::SubagentFallbackTranscript {
-            message: "late terminal result".into(),
-            status: SubagentStatus::Completed,
-        };
-
-        update_passive_subagent_metadata(
-            &passive_subagent_metadata,
-            thread_id,
-            Some("late prompt".into()),
-            Some(fallback),
-            super::LifecycleSignal::Terminal,
-        )
-        .await;
-
-        let claimed = take_passive_subagent_monitor_metadata(
-            &passive_monitors,
-            &passive_subagent_metadata,
-            thread_id,
+        let independent_guard = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            super::lock_thread_owner(&shared.thread_owner_locks, thread_id),
         )
         .await
-        .expect("teardown should claim monitor metadata");
-        assert_eq!(claimed.initial_prompt.as_deref(), Some("late prompt"));
+        .expect("an installer waiting for completion must release the owner lock");
+        drop(independent_guard);
+        coordinator.owner_finished(true).await;
+        completed_tx.send(true).unwrap();
+        let owner_guard = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("the installer should resume after the draining owner completes")
+            .unwrap();
+
+        assert!(!shared.threads.lock().await.contains_key(&thread_id));
+        assert!(matches!(
+            coordinator.state.lock().await.owner,
+            super::OwnerPhase::Retired
+        ));
+        drop(owner_guard);
+    }
+
+    #[tokio::test]
+    async fn installer_retires_a_draining_owner_whose_completion_sender_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let shared = Arc::new(super::RegistryShared::new(
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store),
+        ));
+        let coordinator = Arc::new(test_coordinator(super::ClassificationPhase::Primary));
+        let thread_id = coordinator.binding().await.handle.thread;
+        let (cancel_tx, _) = tokio::sync::watch::channel(false);
+        let (completed_tx, completed_rx) = tokio::sync::watch::channel(false);
+        coordinator
+            .activate_owner(super::EventOwnerControl {
+                cancel: cancel_tx,
+                completed: completed_rx,
+            })
+            .await
+            .unwrap();
+        coordinator.begin_retirement().await.unwrap();
+        shared
+            .threads
+            .lock()
+            .await
+            .insert(thread_id, coordinator.clone());
+        drop(completed_tx);
+
+        let owner_guard = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            super::lock_thread_owner_after_drain(&shared, thread_id),
+        )
+        .await
+        .expect("a closed completion channel must terminate draining");
+
+        assert!(!shared.threads.lock().await.contains_key(&thread_id));
+        assert!(matches!(
+            coordinator.state.lock().await.owner,
+            super::OwnerPhase::Retired
+        ));
+        drop(owner_guard);
+    }
+
+    #[tokio::test]
+    async fn stale_operation_token_cannot_abort_a_later_operation() {
+        let coordinator = test_coordinator(super::ClassificationPhase::Primary);
+        let (cancel, _) = tokio::sync::watch::channel(false);
+        let (_, completed) = tokio::sync::watch::channel(false);
+        coordinator
+            .activate_owner(super::EventOwnerControl { cancel, completed })
+            .await
+            .unwrap();
+        let runtime = ThreadRuntimeRegistry::new();
+        let stale = prepare_test_operation(&coordinator, &runtime, test_turn_context()).await;
+        let mut stale_lease = coordinator.abort_operation(stale).await.unwrap();
+        let _ = stale_lease.release();
+        let current = prepare_test_operation(&coordinator, &runtime, test_turn_context()).await;
+
+        let _ = coordinator.abort_operation(stale).await;
+
+        let state = coordinator.state.lock().await;
+        assert_eq!(state.operation.as_ref().map(|op| op.token), Some(current));
+    }
+
+    #[tokio::test]
+    async fn stale_operation_acknowledgement_cannot_acknowledge_a_later_lease() {
+        let coordinator = test_coordinator(super::ClassificationPhase::Primary);
+        let binding = coordinator.binding().await;
+        let runtime = ThreadRuntimeRegistry::new();
+        let context = test_turn_context();
+        let (cancel, _) = tokio::sync::watch::channel(false);
+        let (_, completed) = tokio::sync::watch::channel(false);
+        coordinator
+            .activate_owner(super::EventOwnerControl { cancel, completed })
+            .await
+            .unwrap();
+
+        let stale_lease = runtime
+            .reserve_turn(
+                binding.handle.thread,
+                turn_reservation(binding.project, &binding.handle, &context),
+            )
+            .unwrap();
+        let stale = match coordinator
+            .prepare_operation(context.clone(), stale_lease)
+            .await
+        {
+            Ok(operation) => operation,
+            Err((error, _)) => panic!("stale test operation was rejected: {error}"),
+        };
+        let mut stale_lease = coordinator.abort_operation(stale).await.unwrap();
+        let _ = stale_lease.release();
+
+        let current_lease = runtime
+            .reserve_turn(
+                binding.handle.thread,
+                turn_reservation(binding.project, &binding.handle, &context),
+            )
+            .unwrap();
+        let current = match coordinator
+            .prepare_operation(context.clone(), current_lease)
+            .await
+        {
+            Ok(operation) => operation,
+            Err((error, _)) => panic!("current test operation was rejected: {error}"),
+        };
+
+        coordinator
+            .acknowledge_operation_turn(stale, TurnId::new())
+            .await;
+        let summary = runtime
+            .current_overview()
+            .threads
+            .into_iter()
+            .find(|summary| summary.thread_id == binding.handle.thread)
+            .unwrap();
+        assert!(matches!(
+            summary.turn_state,
+            giskard_proto::RuntimeTurnState::Active { turn_id: None }
+        ));
+        let mut current_lease = coordinator.abort_operation(current).await.unwrap();
+        let _ = current_lease.release();
+    }
+
+    #[tokio::test]
+    async fn stale_native_completion_cannot_clear_a_later_turn() {
+        let coordinator = test_coordinator(super::ClassificationPhase::Subagent);
+        let first_turn = TurnId::new();
+        let first = coordinator
+            .claim_native_turn(first_turn, test_turn_context())
+            .await
+            .unwrap();
+        coordinator
+            .finish_native_turn(first.token, first_turn)
+            .await;
+
+        let second_turn = TurnId::new();
+        let second = coordinator
+            .claim_native_turn(second_turn, test_turn_context())
+            .await
+            .unwrap();
+        coordinator
+            .finish_native_turn(first.token, first_turn)
+            .await;
+
+        let state = coordinator.state.lock().await;
         assert_eq!(
-            claimed
-                .fallback
+            state
+                .native_turn
                 .as_ref()
-                .map(|value| value.message.as_str()),
-            Some("late terminal result")
-        );
-        assert!(!passive_monitors.lock().await.contains(&thread_id));
-        assert!(
-            !passive_subagent_metadata
-                .lock()
-                .await
-                .contains_key(&thread_id)
+                .map(|turn| (turn.token, turn.turn_id)),
+            Some((second.token, second_turn))
         );
     }
 
     #[tokio::test]
-    async fn subagent_fallback_transcript_persists_when_history_is_empty() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
-        let project_id = ProjectId::new();
-        let thread_id = ThreadId::new();
-        let model = ModelRef {
-            provider: "openai".into(),
-            model: "gpt-5.6-sol".into(),
-            reasoning_effort: None,
-        };
-        store
-            .create_project(project_id, "proj", "/tmp/test")
+    async fn mismatched_native_start_preserves_the_active_turn() {
+        let coordinator = test_coordinator(super::ClassificationPhase::Subagent);
+        let active_turn = TurnId::new();
+        let active = coordinator
+            .claim_native_turn(active_turn, test_turn_context())
             .await
             .unwrap();
-        let now = Utc::now();
-        store
-            .save_thread(
-                project_id,
-                &ThreadFile {
-                    revision: 0,
-                    version: 1,
-                    id: thread_id,
-                    project_id,
-                    title: "Sub-agent".into(),
-                    harness_thread_id: "native-child".into(),
-                    parent_thread_id: Some(ThreadId::new()),
-                    spawned_by_turn_id: Some(TurnId::new()),
-                    kind: giskard_core::ThreadKind::Subagent,
-                    mode: Mode::Build,
-                    current_model: model.clone(),
-                    context_window: 128_000,
-                    model_context_windows: Default::default(),
-                    permission_preset: PermissionPreset::AskFirst,
-                    model_efforts: Default::default(),
-                    tokens: TokenLedger::default(),
-                    created_at: now,
-                    updated_at: now,
-                    archived: false,
-                    git_workspace: None,
-                },
+
+        let other_turn = TurnId::new();
+        let error = match coordinator
+            .claim_native_turn(other_turn, test_turn_context())
+            .await
+        {
+            Ok(_) => panic!("a second native turn must not replace the active turn"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, HarnessError::Protocol(_)));
+        let state = coordinator.state.lock().await;
+        assert_eq!(
+            state
+                .native_turn
+                .as_ref()
+                .map(|turn| (turn.token, turn.turn_id)),
+            Some((active.token, active_turn))
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_owner_rejects_new_preparation_before_io() {
+        let coordinator = test_coordinator(super::ClassificationPhase::Primary);
+        let (cancel, _) = tokio::sync::watch::channel(false);
+        let (_, completed) = tokio::sync::watch::channel(false);
+        coordinator
+            .activate_owner(super::EventOwnerControl { cancel, completed })
+            .await
+            .unwrap();
+        coordinator.owner_finished(false).await;
+        let runtime = ThreadRuntimeRegistry::new();
+        let binding = coordinator.binding().await;
+        let context = test_turn_context();
+        let lease = runtime
+            .reserve_turn(
+                binding.handle.thread,
+                turn_reservation(binding.project, &binding.handle, &context),
             )
-            .await
             .unwrap();
-
-        let hub = Arc::new(Hub::new());
-        let (client_tx, mut client_rx) = mpsc::channel(8);
-        let _replacements = hub.register_client(1, client_tx).await;
-        assert!(hub.subscribe(thread_id, 1).await);
-        let shared = Arc::new(super::RegistryShared::new(
-            hub,
-            store.clone(),
-            ledger::spawn(store.clone()),
-        ));
-        let ctx = super::FallbackTurnContext {
-            user_input: UserInput::text("Sub-agent turn"),
-            model,
-            mode: Mode::Build,
+        let error = match coordinator.prepare_operation(context, lease).await {
+            Ok(_) => panic!("failed owner must reject operation"),
+            Err((error, _)) => error,
         };
-        let mut seen_turn_ids = HashSet::new();
-
-        persist_subagent_fallback_transcript(
-            thread_id,
-            project_id,
-            &ctx,
-            super::SubagentFallbackTranscript {
-                message: "Completed child work".into(),
-                status: SubagentStatus::Completed,
-            },
-            &mut seen_turn_ids,
-            &shared,
-        )
-        .await;
-
-        let turns = store.load_all_turns(project_id, thread_id).await.unwrap();
-        assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].user_input.as_text(), Some("Sub-agent turn"));
-        assert!(matches!(
-            &turns[0].items[0].payload,
-            ItemPayload::AgentMessage { text } if text == "Completed child work"
-        ));
-        assert_eq!(turns[0].status.kind, TurnStatusKind::Completed);
-
-        let mut saw_item = false;
-        while let Ok(message) = client_rx.try_recv() {
-            if let ServerMessage::Event { agent_event, .. } = message
-                && let WireAgentEvent::ItemCompleted { item, .. } = *agent_event
-            {
-                saw_item = matches!(
-                    item.payload,
-                    giskard_proto::WireItemPayload::AgentMessage { ref text }
-                        if text == "Completed child work"
-                );
-            }
-        }
-        assert!(saw_item, "fallback transcript should be broadcast live");
+        assert!(matches!(error, HarnessError::Protocol(_)));
+        assert!(coordinator.state.lock().await.operation.is_none());
     }
 
     #[test]
@@ -6183,10 +5779,6 @@ mod tests {
                     model: model.clone(),
                     mode: Mode::Build,
                     kind: TurnContextKind::User,
-                    passive_input_is_fallback: false,
-                    subagent_fallback: None,
-                    passive_subagent_metadata: None,
-                    passive_pre_turn_timeout: None,
                 };
                 let _lease = shared
                     .runtime
@@ -6312,6 +5904,7 @@ mod tests {
             },
         })
         .unwrap();
+        drop(tx);
 
         tokio::time::timeout(tokio::time::Duration::from_secs(2), handle)
             .await
@@ -6420,6 +6013,7 @@ mod tests {
             },
         })
         .unwrap();
+        drop(tx);
 
         tokio::time::timeout(tokio::time::Duration::from_secs(2), handle)
             .await
@@ -6460,7 +6054,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_turn_forwarders_do_not_persist_later_turns() {
+    async fn one_long_lived_forwarder_persists_successive_native_turns() {
         let tmp = tempfile::TempDir::new().unwrap();
         let data_dir = tmp.path().to_path_buf();
         let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
@@ -6556,16 +6150,6 @@ mod tests {
             crate::thread_runtime::RuntimeDiffLookup::Missing
         ));
 
-        spawn_forwarder(
-            thread_id,
-            project_id,
-            AgentEventStream::new(tx.subscribe()),
-            hub,
-            store.clone(),
-            ledger,
-            model,
-            "second",
-        );
         for event in turn_events(
             thread_id,
             second_turn,
@@ -6602,7 +6186,7 @@ mod tests {
         assert_eq!(saved[0].id, first_turn);
         assert_eq!(saved[0].user_input, UserInput::text("first"));
         assert_eq!(saved[1].id, second_turn);
-        assert_eq!(saved[1].user_input, UserInput::text("second"));
+        assert_eq!(saved[1].user_input, UserInput::text(""));
     }
 
     #[tokio::test]
@@ -6653,7 +6237,7 @@ mod tests {
         let (tx, _) = broadcast::channel(64);
         let hub = Arc::new(Hub::new());
         let ledger = ledger::spawn(store.clone());
-        let (handle, runtime) = spawn_forwarder_handle_with_runtime(
+        let (handle, runtime, _coordinator) = spawn_forwarder_handle_with_runtime(
             thread_id,
             project_id,
             AgentEventStream::new(tx.subscribe()),
@@ -6728,6 +6312,16 @@ mod tests {
         assert!(tasks[0].after_turn);
         assert!(tasks[0].process_id.is_none());
 
+        // A newer turn may begin while a process from the persisted turn is still running. The
+        // old process's terminal replacement must update running-task state without being mistaken
+        // for an event belonging to the new turn.
+        let next_turn = TurnId::new();
+        tx.send(AgentEvent::TurnStarted {
+            thread: thread_id,
+            turn: next_turn,
+        })
+        .unwrap();
+
         tx.send(AgentEvent::ItemCompleted {
             thread: thread_id,
             turn,
@@ -6751,12 +6345,41 @@ mod tests {
         })
         .unwrap();
 
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+        while !runtime.tasks_snapshot(thread_id).1.is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "old command completion was not applied while the next turn was active"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(runtime.has_active_turn(thread_id));
+
+        tx.send(AgentEvent::TurnCompleted {
+            thread: thread_id,
+            turn: next_turn,
+            usage: TokenUsage::default(),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        })
+        .unwrap();
+        wait_for_turn_count(&store, project_id, thread_id, 2).await;
+        let turns = store.load_all_turns(project_id, thread_id).await.unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].id, turn);
+        assert_eq!(turns[1].id, next_turn);
+        assert!(turns[1].items.is_empty());
+        drop(tx);
+
         tokio::time::timeout(tokio::time::Duration::from_secs(2), handle)
             .await
-            .expect("forwarder should exit after after-turn command completion")
+            .expect("forwarder should exit after the event stream closes")
             .unwrap();
 
         assert!(runtime.tasks_snapshot(thread_id).1.is_empty());
+        assert!(!runtime.has_active_turn(thread_id));
     }
 
     #[tokio::test]
@@ -6807,7 +6430,7 @@ mod tests {
         let (tx, _) = broadcast::channel(64);
         let hub = Arc::new(Hub::new());
         let ledger = ledger::spawn(store.clone());
-        let (handle, runtime) = spawn_forwarder_handle_with_runtime(
+        let (handle, runtime, _coordinator) = spawn_forwarder_handle_with_runtime(
             thread_id,
             project_id,
             AgentEventStream::new(tx.subscribe()),
@@ -6875,6 +6498,53 @@ mod tests {
         let tasks = runtime.tasks_snapshot(thread_id).1;
         assert_eq!(tasks.len(), 1);
         assert!(tasks[0].after_turn);
+    }
+
+    #[tokio::test]
+    async fn stream_end_before_turn_started_releases_prepared_operation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: None,
+        };
+        store
+            .create_project(project_id, "proj", "/tmp/test")
+            .await
+            .unwrap();
+
+        let (tx, _) = broadcast::channel(8);
+        let hub = Arc::new(Hub::new());
+        let ledger = ledger::spawn(store.clone());
+        let (handle, runtime, coordinator) = spawn_forwarder_handle_with_runtime(
+            thread_id,
+            project_id,
+            AgentEventStream::new(tx.subscribe()),
+            hub,
+            store,
+            ledger,
+            model.clone(),
+            "never started",
+        );
+        drop(tx);
+
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), handle)
+            .await
+            .expect("forwarder should exit after the event stream closes")
+            .unwrap();
+        assert!(!runtime.has_active_turn(thread_id));
+
+        let replacement_context = TurnContext {
+            user_input: UserInput::text("replacement"),
+            model,
+            mode: Mode::Build,
+            kind: TurnContextKind::User,
+        };
+        let replacement = prepare_test_operation(&coordinator, &runtime, replacement_context).await;
+        let _ = coordinator.abort_operation(replacement).await;
     }
 
     #[tokio::test]
@@ -7522,128 +7192,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn passive_forwarder_does_not_duplicate_turnless_event_owned_by_user_forwarder() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
-        let project_id = ProjectId::new();
-        let thread_id = ThreadId::new();
-        let model = ModelRef {
-            provider: "openai".into(),
-            model: "gpt-5.5".into(),
-            reasoning_effort: None,
-        };
-        store
-            .create_project(project_id, "proj", "/tmp/test")
-            .await
-            .unwrap();
-        let (tx, _) = broadcast::channel(16);
-        let user_stream = AgentEventStream::new(tx.subscribe());
-        let passive_stream = AgentEventStream::new(tx.subscribe());
-        let hub = Arc::new(Hub::new());
-        let (client_tx, mut client_rx) = mpsc::channel(16);
-        let _replacements = hub.register_client(1, client_tx).await;
-        assert!(hub.subscribe(thread_id, 1).await);
-        let shared = Arc::new(super::RegistryShared::new(
-            hub,
-            store.clone(),
-            ledger::spawn(store),
-        ));
-        let user_ctx = TurnContext {
-            user_input: UserInput::text("user turn"),
-            model: model.clone(),
-            mode: Mode::Build,
-            kind: TurnContextKind::User,
-            passive_input_is_fallback: false,
-            subagent_fallback: None,
-            passive_subagent_metadata: None,
-            passive_pre_turn_timeout: None,
-        };
-        let handle = ThreadHandle::detached(thread_id, "native-thread".into());
-        let lease = shared
-            .runtime
-            .reserve_turn(thread_id, turn_reservation(project_id, &handle, &user_ctx))
-            .unwrap();
-        let user_forwarder = tokio::spawn(forward_events(
-            shared.clone(),
-            thread_id,
-            project_id,
-            user_stream,
-            user_ctx,
-            Some(lease),
-        ));
-
-        shared.passive_monitors.lock().await.insert(thread_id);
-        shared.passive_monitor_tasks.register(thread_id).await;
-        let passive_forwarder = tokio::spawn(forward_events(
-            shared.clone(),
-            thread_id,
-            project_id,
-            passive_stream,
-            TurnContext {
-                user_input: UserInput::text("Sub-agent turn"),
-                model,
-                mode: Mode::Build,
-                kind: TurnContextKind::PassiveSubagent,
-                passive_input_is_fallback: true,
-                subagent_fallback: None,
-                passive_subagent_metadata: Some(shared.passive_subagent_metadata.clone()),
-                passive_pre_turn_timeout: Some(tokio::time::Duration::from_secs(1)),
-            },
-            None,
-        ));
-
-        tx.send(AgentEvent::Notice {
-            thread: thread_id,
-            turn: None,
-            message: "one owner".into(),
-        })
-        .unwrap();
-
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), async {
-            match client_rx
-                .recv()
-                .await
-                .expect("subscriber should remain connected")
-            {
-                ServerMessage::Event { agent_event, .. }
-                    if matches!(*agent_event, WireAgentEvent::Notice { .. }) => {}
-                other => panic!("expected turnless notice event, got {other:?}"),
-            }
-        })
-        .await
-        .expect("normal forwarder should broadcast the turnless notice");
-        let duplicate = tokio::time::timeout(tokio::time::Duration::from_millis(100), async {
-            loop {
-                match client_rx.recv().await {
-                    Some(ServerMessage::Event { agent_event, .. })
-                        if matches!(*agent_event, WireAgentEvent::Notice { .. }) =>
-                    {
-                        return true;
-                    }
-                    Some(_) => {}
-                    None => return false,
-                }
-            }
-        })
-        .await;
-        assert!(
-            duplicate.is_err() || matches!(duplicate, Ok(false)),
-            "passive and user forwarders must not both broadcast the same turnless event"
-        );
-
-        drop(tx);
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), passive_forwarder)
-            .await
-            .expect("passive duplicate forwarder should exit")
-            .unwrap();
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), user_forwarder)
-            .await
-            .expect("user forwarder should exit after stream close")
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn forwarder_deduplicates_identical_notices_in_one_turn() {
+    async fn forwarder_deduplicates_notices_per_turn_and_resets_between_turns() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
         let project_id = ProjectId::new();
@@ -7748,10 +7297,50 @@ mod tests {
 
         assert!(completed, "turn should complete");
         assert_eq!(notice_count, 1);
+
+        let next_turn = TurnId::new();
+        tx.send(AgentEvent::TurnStarted {
+            thread: thread_id,
+            turn: next_turn,
+        })
+        .unwrap();
+        tx.send(AgentEvent::Notice {
+            thread: thread_id,
+            turn: Some(next_turn),
+            message: "Heads up: Long threads and multiple compactions can cause drift.".into(),
+        })
+        .unwrap();
+        tx.send(AgentEvent::TurnCompleted {
+            thread: thread_id,
+            turn: next_turn,
+            usage: TokenUsage::default(),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        })
+        .unwrap();
+
+        let mut second_notice_count = 0;
+        loop {
+            if let ServerMessage::Event { agent_event, .. } =
+                tokio::time::timeout(tokio::time::Duration::from_secs(5), client_rx.recv())
+                    .await
+                    .expect("second turn events should arrive")
+                    .expect("subscriber should remain connected")
+            {
+                match *agent_event {
+                    WireAgentEvent::Notice { .. } => second_notice_count += 1,
+                    WireAgentEvent::TurnCompleted { turn, .. } if turn == next_turn => break,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(second_notice_count, 1);
     }
 
     #[tokio::test]
-    async fn manual_compaction_item_completes_turn_and_releases_gate() {
+    async fn forwarder_lag_recovers_but_truncates_the_interrupted_native_turn() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
         let project_id = ProjectId::new();
@@ -7774,8 +7363,8 @@ mod tests {
                     version: 1,
                     id: thread_id,
                     project_id,
-                    title: "t".into(),
-                    harness_thread_id: "th".into(),
+                    title: "lag test".into(),
+                    harness_thread_id: "th-lag".into(),
                     parent_thread_id: None,
                     spawned_by_turn_id: None,
                     kind: giskard_core::ThreadKind::Primary,
@@ -7795,101 +7384,190 @@ mod tests {
             .await
             .unwrap();
 
-        let (tx, _) = broadcast::channel(64);
+        let (tx, _) = broadcast::channel(2);
+        let stream = AgentEventStream::new(tx.subscribe());
+        for sequence in 0..3 {
+            tx.send(AgentEvent::Notice {
+                thread: thread_id,
+                turn: None,
+                message: format!("queued notice {sequence}"),
+            })
+            .unwrap();
+        }
         let hub = Arc::new(Hub::new());
         let (client_tx, mut client_rx) = mpsc::channel(16);
         let _replacements = hub.register_client(1, client_tx).await;
         assert!(hub.subscribe(thread_id, 1).await);
         let ledger = ledger::spawn(store.clone());
-        let stream = AgentEventStream::new(tx.subscribe());
-        let ctx = TurnContext {
-            user_input: UserInput::text("/compact"),
-            model: model.clone(),
-            mode: Mode::Build,
-            kind: TurnContextKind::ManualCompaction,
-            passive_input_is_fallback: false,
-            subagent_fallback: None,
-            passive_subagent_metadata: None,
-            passive_pre_turn_timeout: None,
-        };
-        let gate = Arc::new(ThreadRuntimeRegistry::new());
-        let handle = ThreadHandle::opened(
+        let (forwarder, _runtime, coordinator) = spawn_forwarder_handle_with_runtime(
             thread_id,
-            "native-test-thread".into(),
-            std::path::PathBuf::from("/tmp/test-workspace"),
-        );
-        let lease = gate
-            .reserve_turn(thread_id, turn_reservation(project_id, &handle, &ctx))
-            .unwrap();
-        let ctx_for_second_reserve = ctx.clone();
-        let shared = super::RegistryShared::new_with_runtime(
-            hub.clone(),
-            gate.clone(),
+            project_id,
+            stream,
+            hub,
             store.clone(),
             ledger,
+            model,
+            "lag test",
         );
-        let shared = Arc::new(shared);
+        drop(forwarder);
 
-        tokio::spawn({
-            async move {
-                forward_events(shared, thread_id, project_id, stream, ctx, Some(lease)).await;
+        tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    client_rx.recv().await,
+                    Some(ServerMessage::Event { agent_event, .. })
+                        if matches!(*agent_event, WireAgentEvent::Notice { .. })
+                ) {
+                    break;
+                }
             }
-        });
+        })
+        .await
+        .expect("the forwarder should continue after reporting lag");
 
         let turn = TurnId::new();
-        tx.send(AgentEvent::ItemCompleted {
+        tx.send(AgentEvent::TurnStarted {
             thread: thread_id,
             turn,
-            item: Item {
-                id: ItemId::new(),
-                harness_item_id: format!("context_compacted:{turn}"),
-                payload: ItemPayload::Activity {
-                    title: "Context compacted".into(),
-                    detail: None,
-                    metadata: None,
-                    subagent: None,
-                },
-                created_at: Utc::now(),
+        })
+        .unwrap();
+        tx.send(AgentEvent::TurnCompleted {
+            thread: thread_id,
+            turn,
+            usage: TokenUsage::default(),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
             },
         })
         .unwrap();
 
-        let mut completed = false;
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-        while tokio::time::Instant::now() < deadline && !completed {
-            match tokio::time::timeout(tokio::time::Duration::from_secs(1), client_rx.recv()).await
-            {
-                Ok(Some(ServerMessage::Event { agent_event, .. })) => {
-                    if matches!(*agent_event, WireAgentEvent::TurnCompleted { .. }) {
-                        completed = true;
-                    }
+        tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+            loop {
+                if store
+                    .load_all_turns(project_id, thread_id)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|saved| saved.id == turn)
+                {
+                    break;
                 }
-                Ok(Some(_)) => {}
-                _ => {}
+                tokio::task::yield_now().await;
             }
-        }
-        assert!(
-            completed,
-            "compaction marker should synthesize turn completion"
-        );
+        })
+        .await
+        .expect("a turn after lag should be persisted normally");
 
-        wait_for_turn_count(&store, project_id, thread_id, 1).await;
-        let saved = store.load_all_turns(project_id, thread_id).await.unwrap();
-        assert_eq!(saved[0].id, turn);
-        assert_eq!(saved[0].user_input.as_text(), Some("/compact"));
-        assert!(matches!(saved[0].status.kind, TurnStatusKind::Completed));
-        assert!(saved[0].items.iter().any(|item| matches!(
-            &item.payload,
-            ItemPayload::Activity { title, .. } if title == "Context compacted"
-        )));
-        assert!(
-            gate.reserve_turn(
-                thread_id,
-                turn_reservation(project_id, &handle, &ctx_for_second_reserve)
-            )
-            .is_ok(),
-            "manual compaction completion should release the turn gate"
-        );
+        let lagged_turn = TurnId::new();
+        tx.send(AgentEvent::TurnStarted {
+            thread: thread_id,
+            turn: lagged_turn,
+        })
+        .unwrap();
+        tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+            loop {
+                if coordinator
+                    .state
+                    .lock()
+                    .await
+                    .native_turn
+                    .as_ref()
+                    .is_some_and(|native| native.turn_id == lagged_turn)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the native turn should become active before forcing lag");
+
+        for sequence in 0..3 {
+            tx.send(AgentEvent::Notice {
+                thread: thread_id,
+                turn: Some(lagged_turn),
+                message: format!("lagging active turn {sequence}"),
+            })
+            .unwrap();
+        }
+        tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+            loop {
+                if store
+                    .load_all_turns(project_id, thread_id)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|saved| {
+                        saved.id == lagged_turn && saved.status.kind == TurnStatusKind::Interrupted
+                    })
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("lag should persist the active native turn as interrupted");
+
+        tx.send(AgentEvent::TurnCompleted {
+            thread: thread_id,
+            turn: lagged_turn,
+            usage: TokenUsage::default(),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        })
+        .unwrap();
+        tx.send(AgentEvent::Notice {
+            thread: thread_id,
+            turn: None,
+            message: "completion fence after lag".into(),
+        })
+        .unwrap();
+        tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    client_rx.recv().await,
+                    Some(ServerMessage::Event { agent_event, .. })
+                        if matches!(&*agent_event, WireAgentEvent::Notice { message, .. } if message == "completion fence after lag")
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the owner should consume the real completion after lag");
+        let following_turn = TurnId::new();
+        tx.send(AgentEvent::TurnStarted {
+            thread: thread_id,
+            turn: following_turn,
+        })
+        .unwrap();
+        tx.send(AgentEvent::TurnCompleted {
+            thread: thread_id,
+            turn: following_turn,
+            usage: TokenUsage::default(),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        })
+        .unwrap();
+        tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+            loop {
+                let turns = store.load_all_turns(project_id, thread_id).await.unwrap();
+                if turns.iter().any(|saved| saved.id == following_turn) {
+                    let lagged = turns.iter().find(|saved| saved.id == lagged_turn).unwrap();
+                    assert_eq!(lagged.status.kind, TurnStatusKind::Interrupted);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the real completion is ignored and later native turns still proceed");
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7903,7 +7581,7 @@ mod tests {
         model: ModelRef,
         user_input: &str,
     ) -> Arc<ThreadRuntimeRegistry> {
-        let (handle, runtime) = spawn_forwarder_handle_with_runtime(
+        let (handle, runtime, _coordinator) = spawn_forwarder_handle_with_runtime(
             thread_id, project_id, stream, hub, store, ledger, model, user_input,
         );
         std::mem::drop(handle);
@@ -7937,24 +7615,57 @@ mod tests {
         ledger: ledger::LedgerHandle,
         model: ModelRef,
         user_input: &str,
-    ) -> (JoinHandle<()>, Arc<ThreadRuntimeRegistry>) {
+    ) -> (
+        JoinHandle<()>,
+        Arc<ThreadRuntimeRegistry>,
+        Arc<super::ThreadCoordinator>,
+    ) {
         let ctx = TurnContext {
             user_input: UserInput::text(user_input),
-            model,
+            model: model.clone(),
             mode: Mode::Build,
             kind: TurnContextKind::User,
-            passive_input_is_fallback: false,
-            subagent_fallback: None,
-            passive_subagent_metadata: None,
-            passive_pre_turn_timeout: None,
         };
         let shared = super::RegistryShared::new(hub, store, ledger);
         let shared = Arc::new(shared);
         let runtime = shared.runtime.clone();
+        let native_handle = ThreadHandle::detached(thread_id, format!("native-{thread_id}"));
+        let coordinator = Arc::new(super::ThreadCoordinator::new(
+            super::BindingData {
+                project: project_id,
+                handle: native_handle.clone(),
+                native_model: Some(model),
+            },
+            super::ClassificationPhase::Primary,
+        ));
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (_completed_tx, completed_rx) = tokio::sync::watch::channel(false);
+        let coordinator_for_task = coordinator.clone();
         let handle = tokio::spawn(async move {
-            forward_events(shared, thread_id, project_id, stream, ctx, None).await;
+            coordinator_for_task
+                .activate_owner(super::EventOwnerControl {
+                    cancel: cancel_tx,
+                    completed: completed_rx,
+                })
+                .await
+                .unwrap();
+            let lease = shared
+                .runtime
+                .reserve_turn(
+                    thread_id,
+                    turn_reservation(project_id, &native_handle, &ctx),
+                )
+                .unwrap();
+            match coordinator_for_task
+                .prepare_operation(ctx.clone(), lease)
+                .await
+            {
+                Ok(_) => {}
+                Err((error, _)) => panic!("forwarder test operation was rejected: {error}"),
+            }
+            forward_events(shared, coordinator_for_task, stream, cancel_rx).await;
         });
-        (handle, runtime)
+        (handle, runtime, coordinator)
     }
 
     fn turn_events(

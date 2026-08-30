@@ -25,6 +25,8 @@ pub enum HarnessError {
     ThreadNotFound(ThreadId),
     #[error("thread already has an active turn: {thread}")]
     ThreadBusy { thread: ThreadId },
+    #[error("thread is read-only: {thread}")]
+    ThreadReadOnly { thread: ThreadId },
     #[error("operation timed out: {0}")]
     Timeout(String),
 }

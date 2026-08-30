@@ -11,6 +11,17 @@
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
 **Version:** 1.76
 
+> **Amendment — long-lived native event ownership (1.76).** Every loaded native thread has one
+> coordinator and one long-lived event-stream owner. Starting a turn or compaction records a
+> prepared operation in that coordinator; it never creates another subscriber. The owner claims
+> the first event for each real native turn, persists that turn, resets its per-turn context, and
+> continues reading the same stream. Sub-agent threads are agent-owned and read-only: send,
+> compact, settings, rename, archive, direct delete, and workspace writes such as `SavePlan` fail
+> with
+> `thread_read_only` before harness I/O. Matched approval/server-request replies, interrupting
+> active work, and terminating commands remain available. Parent activity creates relationships
+> only; it does not start, stop, time out, synthesize, or otherwise infer a child lifecycle.
+
 > **Amendment — strict running-task ownership (1.74).** `RunningTasks` is a revisioned replacement
 > projection for the Tasks menu and controls only. `RunningTask` carries no output, output-only
 > deltas do not advance its revision, and task snapshots never create or reconcile transcript rows.
@@ -405,44 +416,31 @@ runtime overview; the hoisting and notification behavior remains current.
   Giskard uses `Sub-agent turn` rather than deriving input from inherited parent history. Their
   visible activity label uses the
   final non-empty agent-path component as the task name and omits the native child id; both full
-  values remain in server-side link metadata. Browser wire links redact native thread IDs. Passive
-  `TurnStarted` events and live snapshots carry the best known input; when a real prompt is
-  available, a stable synthetic `user_message` is inserted or upgraded in place before output.
-  Live and persisted transcripts therefore contain exactly one ordered prompt row, including
-  server-resolved imports and prompts whose metadata arrives late. Synthetic fallback state is
-  explicit rather than inferred from the literal text, so a real prompt equal to `Sub-agent turn`
-  remains genuine input.
+  values remain in server-side link metadata. Browser wire links redact native thread IDs. A real
+  promptless child native turn uses `Sub-agent turn` as its input label. Giskard does not synthesize
+  prompt items or terminal fallback turns from parent activity.
 
   Linked-thread discovery never changes established ownership: primary threads are not reclassified,
   children are not reparented, and self-links, cycles, invalid parent chains, and native-parent
-  mismatches are rejected. Invalid persisted graphs are logged and remain visible in the primary
-  sidebar for recovery. Reverse child-to-parent activity remains a navigation link and never creates
-  a duplicate thread.
+  mismatches are rejected. Invalid persisted sub-agent graphs are logged and quarantined: their
+  records remain on disk but are hidden from ordinary sidebar thread rows, and the project shows a
+  damaged-record count. Project deletion removes them recursively; targeted offline removal is a
+  follow-up `giskard-admin` milestone. Reverse child-to-parent activity remains a navigation link
+  and never creates a duplicate thread.
 
-  Materializing or reopening a child is separate from monitoring it. Giskard starts a passive
-  forwarder only for explicit non-terminal lifecycle evidence (`spawned`, `started`, `interacted`,
-  `pending`, or `running`). Explicit active evidence has a ten-minute no-event pre-turn safety bound
-  that restarts on activity and no longer applies after a turn starts. Terminal observations (the
-  actions `interrupted` and `completed`, and the statuses `interrupted`, `completed`, `failed`,
-  `shutdown`, or `not_found`) wake an existing idle monitor but never start a new one. Reopening a
-  persisted child without lifecycle evidence does not arm a monitor, and an unchanged generated
-  title does not rewrite its metadata.
+  Materializing or reopening a child installs its single long-lived native event owner. Parent
+  lifecycle labels do not arm a second monitor and do not control how long the owner remains.
 
   Linked children require an identity-preserving native resume. Codex may emit the activity link
   immediately before the new rollout becomes readable, so the adapter retries only the exact
   matching missing-rollout response for a short bounded window. It must return the advertised
   native ID and must never use the primary-thread fresh-session fallback for a child; otherwise the
-  passive monitor can attach to a replacement thread and miss early commentary and command-start
+  event owner can attach to a replacement thread and miss early commentary and command-start
   events from the real child. Primary thread recovery remains unchanged.
 
-  Passive and interactive forwarders share the per-thread turn gate, so only one subscriber can
-  persist a native turn. Direct child turns fail with `thread_turn_active` while delegated work owns
-  the child; once idle, follow-ups are normal persisted turns that neither change ownership nor
-  automatically report results to the parent. If terminal output arrives without native child
-  events, its fallback is persisted immediately unless history already exists; monitor teardown
-  and setup atomically claim a racing fallback so terminal results are neither lost nor duplicated.
-  Idle monitors are cancellable and awaited by deletion, which performs another active-work
-  preflight before removing any subtree records.
+  Direct child turns and mutations always fail with `thread_read_only`, including while the child
+  is idle. Only real child-native events create child transcript turns. Deleting a primary thread
+  still deletes its descendants recursively; deleting a child as the requested root is rejected.
 
   A turn-scoped event can precede `TurnStarted`; the first such event creates the exact live-turn
   reconnect buffer, and the later start notification reuses it without discarding accumulated
@@ -1709,8 +1707,8 @@ pub trait AgentHarness: Send + Sync {
 > is used to keep `async fn` in the trait object-safe.
 
 `AgentEventStream` is an `impl Stream<Item = AgentEvent>` (or a typed wrapper around a
-`tokio::sync::broadcast::Receiver`). Multiple subscribers per thread are supported (e.g. two
-browser tabs).
+`tokio::sync::broadcast::Receiver`). The registry installs exactly one consuming event owner per
+loaded native thread. Browser tabs subscribe to the registry's projections, not to harness streams.
 
 ### 4.4 The neutral event model (`AgentEvent`)
 
@@ -3540,19 +3538,13 @@ thread. The browser marks a turn active immediately after successfully sending `
 any harness `TurnStarted` event, and clears that optimistic state if the server rejects the send for
 anything other than `thread_turn_active`.
 
-Passive sub-agent monitoring uses that same per-thread gate. It is armed only by explicit
-non-terminal lifecycle evidence; reopening an existing child without such evidence and terminal
-lifecycle events do not start a monitor. Its first turn-bearing
-event reserves and acknowledges the native turn before any live-buffer, broadcast, or persistence
-mutation. If a normal forwarder already owns the thread, the passive subscriber exits without
-processing it. A terminal observation wakes an idle passive subscriber immediately so queued child
-events win, then fallback recovery or clean exit occurs without waiting for the idle timeout.
-Explicit active evidence has a renewable ten-minute no-event pre-turn safety bound; any stream or
-lifecycle activity restarts it, and it no longer applies once a native turn starts. Direct user
-input is rejected while that passive ownership is registered, then allowed as a normal child turn
-after delegated work becomes idle; it never changes parentage or implicitly forwards the result to
-the parent. Passive and interactive subscribers do not both rebroadcast turnless events: when the
-interactive forwarder owns the turn gate, the passive subscriber yields before broadcasting.
+The per-thread coordinator serializes prepared primary operations with externally observed native
+turns. `SendInput` and `CompactContext` attach context and a runtime lease to the coordinator before
+harness I/O. The long-lived owner atomically consumes that preparation when the first event for the
+native turn arrives; a promptless external turn instead receives context from durable thread
+metadata. Completion clears only the matching generation/token, so a stale completion cannot
+release or overwrite a later turn. No coordinator lock is held while awaiting harness, persistence,
+runtime publication, or owner shutdown.
 
 > **Durable settings switches (P2/P3).** `SwitchMode`, `SelectModel`, and `SetPermissionPreset`
 > persist immediately to `<thread_id>.json` before the server acknowledges, then broadcast a

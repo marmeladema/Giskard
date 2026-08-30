@@ -35,6 +35,7 @@ const NEW_PROVIDER: &str = "opencodex";
 struct SwitchHarness {
     report_provider: Option<String>,
     opened_workspace_roots: Arc<Mutex<Vec<String>>>,
+    events: broadcast::Sender<giskard_core::event::AgentEvent>,
 }
 
 #[async_trait::async_trait]
@@ -86,8 +87,7 @@ impl AgentHarness for SwitchHarness {
     }
 
     fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-        let (_tx, rx) = broadcast::channel(8);
-        AgentEventStream::new(rx)
+        AgentEventStream::new(self.events.subscribe())
     }
 
     async fn respond_approval(
@@ -120,6 +120,7 @@ impl AgentHarness for SwitchHarness {
 struct SwitchFactory {
     report_provider: Option<String>,
     opened_workspace_roots: Arc<Mutex<Vec<String>>>,
+    events: broadcast::Sender<giskard_core::event::AgentEvent>,
 }
 
 #[async_trait::async_trait]
@@ -128,6 +129,7 @@ impl HarnessFactory for SwitchFactory {
         Ok(Arc::new(SwitchHarness {
             report_provider: self.report_provider.clone(),
             opened_workspace_roots: self.opened_workspace_roots.clone(),
+            events: self.events.clone(),
         }))
     }
 }
@@ -304,11 +306,13 @@ model_listing = false
         .unwrap();
 
     let opened_workspace_roots = Arc::new(Mutex::new(Vec::new()));
+    let (events, _) = broadcast::channel(8);
     let state = AppState::new(
         store,
         Arc::new(SwitchFactory {
             report_provider,
             opened_workspace_roots: opened_workspace_roots.clone(),
+            events,
         }),
         (0..32u8).collect(),
     );
