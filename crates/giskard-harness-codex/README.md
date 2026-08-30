@@ -148,22 +148,19 @@ the adapter. Both native spawning protocols are supported:
   so the server uses its explicit `Sub-agent turn` fallback rather than misidentifying an inherited
   parent turn as the task.
 
-The server imports the child from either representation and passively monitors only lifecycle
-evidence that can denote active work (`spawned`, `started`, `interacted`, `pending`, or `running`).
-A `subAgentActivity` whose kind is `completed` or `interrupted` is terminal evidence and never arms
-a monitor.
-An explicitly active monitor has a 10-minute no-event pre-turn safety bound; any event restarts it,
-and a started turn may run without that bound. Terminal evidence wakes an already-armed idle monitor
-and never creates a new one; reopening a persisted child without lifecycle evidence does not monitor
-it. The browser addresses links by Giskard parent-thread and item IDs; the server resolves native
-routing and lifecycle metadata from its authoritative item, and native thread IDs are redacted from
-browser-facing sub-agent payloads. Linked children use strict native resume: Codex can advertise a
-newly spawned child milliseconds before its rollout is readable, so the adapter retries only the exact matching
+The server imports the child from either representation and installs one long-lived native event
+owner for it. Parent lifecycle evidence establishes or refreshes the relationship only; it does not
+start a second monitor, synthesize a fallback turn, or stop the owner after a timeout. The browser
+addresses links by Giskard parent-thread and item IDs; the server resolves native routing metadata
+from its authoritative item, and native thread IDs are redacted from browser-facing sub-agent
+payloads. Linked children use strict native resume: Codex can advertise a newly spawned child
+milliseconds before its rollout is readable, so the adapter retries only the exact matching
 `no rollout found` response for a short bounded window. It never applies the normal fresh-thread
 fallback to a linked child, because that would replace the advertised routing identity and miss the
 child's early commentary and command-start events. Primary threads retain the existing fresh-session
-recovery when their stored native rollout is genuinely gone. Idle child threads accept direct user
-follow-ups, while sends are rejected during delegated work. See
+recovery when their stored native rollout is genuinely gone. Sub-agent threads are always read-only;
+matched provider-request responses, active-work interrupt, and command termination remain supported.
+See
 [Sub-agent threads](../../docs/subagents.md) for the complete lifecycle and ownership contract. When
 opening or resuming a Codex thread, the adapter also maps
 `thread.agent_nickname` to

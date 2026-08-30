@@ -4,8 +4,8 @@ Giskard represents a delegated agent as a real linked thread, not as a copied tr
 child keeps its native harness thread ID and its own persisted turns while remaining owned by the
 thread that spawned it.
 
-This document describes the supported Codex event shapes, passive monitoring, prompt persistence,
-direct follow-ups, ownership, and deletion behavior.
+This document describes the supported Codex event shapes, native event ownership, read-only child
+behavior, prompt persistence, approvals, and deletion behavior.
 
 ## Finding and opening children
 
@@ -32,7 +32,7 @@ thread summaries or sub-agent item payloads sent to the browser.
 Codex may publish the child's activity link just before its rollout becomes readable through
 `thread/resume`. Giskard briefly retries that exact transient missing-rollout response and requires
 the resumed native ID to equal the link's ID. A linked import never starts a fresh replacement
-thread: doing so would monitor the wrong identity and could hide early commentary or a running
+thread: doing so would observe the wrong identity and could hide early commentary or a running
 command until completion. Reopening a primary thread keeps its separate lost-context recovery.
 
 ## Ownership model
@@ -56,7 +56,7 @@ The Codex adapter maps both known protocols into the same harness-neutral sub-ag
 - Legacy `collabAgentToolCall` / `spawnAgent` starts do not yet contain a child ID. The completion
   exposes the child and retains the delegated prompt. State is selected by the linked native thread
   ID, never by map order. Single-child `sendInput`, `wait`, `resumeAgent`, and `closeAgent` calls
-  also update lifecycle evidence; multi-child waits stay unlinked because one transcript item
+  may expose relationship links; multi-child waits stay unlinked because one transcript item
   cannot represent several child links safely.
 - Current `subAgentActivity` events report actions such as `started`, `interacted`, `interrupted`,
   or `completed`. Activity rows use the last non-empty agent-path component as the readable task
@@ -67,29 +67,36 @@ The Codex adapter maps both known protocols into the same harness-neutral sub-ag
 Giskard does not decrypt or inspect Codex rollout storage to recover a missing prompt. It uses only
 the fields exposed through the adapter protocol.
 
-## Passive monitoring lifecycle
+## Long-lived native event ownership
 
-Opening or materializing a child and monitoring it are separate decisions:
+Opening or materializing a child installs one coordinator and one long-lived subscriber for that
+native thread. The same owner processes every native turn until the binding is explicitly retired;
+parent activity does not start a second subscriber, hand ownership between tasks, or stop the owner
+after a timeout.
 
-| Observed evidence | Monitor behavior |
-| --- | --- |
-| `spawned`, `started`, `interacted`, `pending`, or `running` | Start or retain a passive monitor until the native child turn or a terminal lifecycle event arrives. Before a turn, ten minutes with no stream event releases a monitor whose terminal event was missed. |
-| `interrupted` or `completed` as an action, or `interrupted`, `completed`, `failed`, `shutdown`, or `not_found` as a status | Never start a new monitor. Wake an existing idle monitor immediately and recover terminal output when necessary. |
-| Existing child reopened with no lifecycle evidence | Do not start another monitor. |
+Owner retirement changes the slot from `Live` to `Draining` while holding the per-thread owner
+lock, requests cancellation, then releases the lock before waiting for task completion. Cold opens
+that encounter `Draining` also release the lock and wait before retrying. Consequently no task ever
+waits for another task while holding the owner lock, and a replacement subscriber cannot overlap
+the draining generation.
 
-The ten-minute bound is restarted by every event. After `TurnStarted`, the forwarder waits for
-normal completion regardless of how long the turn runs.
+The first event carrying a previously unseen native turn ID atomically claims that turn before any
+live-buffer, browser, or persistence mutation. `TurnStarted` may arrive later. On completion the
+owner commits the real native turn, clears only the matching coordinator token, discards that
+turn's prompt context, and continues reading the same stream. Parent lifecycle labels establish or
+refresh links only: they never synthesize a child turn or terminal result.
 
-Terminal notifications are coordinated with monitor setup and teardown. A result arriving while
-an idle monitor is starting or shutting down is claimed exactly once rather than being attached to
-an absent or exited task. Linked evidence is processed in parent-event order, so a later terminal
-observation cannot overtake an earlier active observation and leave a new idle monitor behind.
-Queued native child events take priority over terminal fallback output.
+The current broadcast transport can report that a receiver lagged after dropping events. If that
+happens during a turn, Giskard persists the received prefix as `Interrupted` and keeps the owner
+usable. Later events for that native turn, including its real completion, are treated as belonging
+to the already-persisted turn and do not amend its transcript. This deliberate truncation is removed
+by the M3 bounded, backpressured transport, which prevents receiver lag instead of reconstructing
+missing events.
 
 ## Approvals raised inside a child
 
 A child's approval routes like any other: the harness maps it to the child's Giskard thread, the
-passive monitor registers it, and answering it from the child transcript reaches the right harness.
+long-lived owner registers it, and answering it from the child transcript reaches the right harness.
 The child is resumable, so its pending approval also survives a browser reload through the live-turn
 snapshot.
 
@@ -127,30 +134,21 @@ new page session and alerts again.
 
 ## Prompts and transcript persistence
 
-When the delegated prompt is available, Giskard persists it as `Turn.user_input` and shows one
-ordered prompt row before child output. Late prompt metadata can update the live passive context
-without creating a duplicate prompt row.
+Only a real native child turn creates a persisted turn. When its native event stream does not expose
+the delegated prompt, Giskard uses `Sub-agent turn` as that real turn's input label. It does not
+derive a prompt from inherited parent history, insert a synthetic prompt item, or persist terminal
+parent activity as a fallback child turn.
 
-When the current Codex activity protocol does not expose the prompt, Giskard uses the visible
-`Sub-agent turn` fallback. It does not treat inherited parent messages found in the child rollout as
-the delegation prompt. Fallback state is tracked explicitly, so a real delegated prompt whose text
-is exactly `Sub-agent turn` is still preserved as genuine input.
+## Read-only child behavior
 
-If terminal lifecycle evidence carries an output message but no native child turn was observed,
-Giskard persists that message as a fallback child turn. Existing child history prevents a duplicate
-fallback from being appended.
+Sub-agent threads are agent-owned and always read-only, including while idle. Direct messages,
+compaction, model/mode/permission changes, rename, archive, individual deletion, and worktree
+mutations such as `SavePlan` return `thread_read_only` before harness I/O. The browser disables the
+corresponding composer and controls.
 
-## Direct user follow-ups
-
-An imported child is a resumable native thread, so Giskard allows direct user messages after the
-delegated turn becomes idle. A follow-up creates and persists a normal turn in the child thread.
-
-While delegated work owns the passive monitor, a direct send is rejected with
-`thread_turn_active`. This prevents a user turn and the externally started child turn from racing
-for the same native thread.
-
-A direct child follow-up does not automatically send its result to the parent. It also does not
-detach, promote, or reparent the child; deletion still follows the original ownership tree.
+Read-only does not prevent resolving work the child is already waiting on. Matched approval and
+server-request responses, interrupting an active child turn, terminating a command, transcript and
+history reads, and navigation remain supported.
 
 ## Link-open API
 
@@ -159,7 +157,7 @@ The browser uses:
 `POST /api/projects/{project_id}/threads/{parent_thread_id}/subagent-links/{item_id}/open`
 
 The server resolves the item from the parent's live buffer or persisted turns. It derives the
-native child ID, delegated prompt, lifecycle action/status/message, and `spawned_by_turn_id` from
+native child ID, display metadata, and `spawned_by_turn_id` from
 that trusted item instead of accepting those values from the client. A reverse child-to-parent item
 returns the existing parent. Unknown items, non-link items, invalid ownership, and mismatched native
 parents are rejected.
@@ -168,7 +166,7 @@ parents are rejected.
 `thread_id` or `resume`; it cannot fabricate sub-agent ownership. Harness-observed and explicit
 link-open materialization share one per-project lifecycle lock, while linked evidence from one
 parent is processed through a FIFO. Concurrent attempts therefore cannot persist two Giskard
-threads for one native child or apply lifecycle evidence out of order. Browser HTTP operations
+threads for one native child or install competing owners. Browser HTTP operations
 waiting on that lifecycle serialization return `503 Service Unavailable` after five seconds rather
 than hanging indefinitely. First-time materialization runs outside the parent event-forwarding
 path; repeated activity reuses the live binding without rescanning every thread file.
@@ -176,18 +174,22 @@ path; repeated activity reuses the live binding without rescanning every thread 
 Turn-scoped child events may arrive before the harness emits `TurnStarted`. The server starts the
 live reconnect buffer from the first such event and reuses it when `TurnStarted` arrives, preserving
 the complete in-flight transcript across a browser reload regardless of notification order.
-A genuine new `TurnStarted` also replaces a stale reconnect buffer left by an interrupted
-forwarder; a conflicting non-start event remains live and persistable without being mixed into the
-wrong buffer.
+A genuine new `TurnStarted` also replaces a stale reconnect buffer left by an interrupted owner; a
+conflicting non-start event remains live and persistable without being mixed into the wrong buffer.
 
 ## Deletion and recovery
 
-Deleting a parent deletes its complete ownership subtree in leaf-first order, including native
-harness threads and local transcripts. Before deleting anything, Giskard rejects the operation if
-the parent or any descendant has an active turn or running task. Idle pre-turn monitors are
-cancelled and awaited across the entire subtree, followed by a second active-work preflight, so a
-late child event cannot recreate storage after deletion. Imports and deletion share the same
-project lifecycle lock.
+A graph-invalid persisted sub-agent is quarantined instead of becoming a broken ordinary sidebar
+row. Its files remain on disk, the project shows a damaged-record count, and project deletion
+removes it. Targeted offline inspection and removal through `giskard-admin` is deferred to a
+follow-up milestone.
+
+Deleting a primary thread deletes its complete ownership subtree in leaf-first order, including
+native harness threads and local transcripts. An individual sub-agent cannot be the requested
+deletion root. Before deleting anything, Giskard rejects the operation if the primary or any
+descendant has an active turn or running task. Each long-lived owner is retired as its binding is
+removed, so a late child event cannot recreate storage after deletion. Imports and deletion share
+the same project lifecycle lock.
 
 Codex may report that a native rollout is already absent. Only the exact matching missing-rollout
 response is treated as idempotent success, allowing stale local metadata to be removed. Other native

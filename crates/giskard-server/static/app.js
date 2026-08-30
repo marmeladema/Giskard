@@ -1175,12 +1175,15 @@ function runProjectThreadRefresh(pid, refresh) {
 function renderProjectThreads(pid) {
   const box = $("threads-"+pid); if (!box) return;
   const renderedThreads = knownProjectThreads(pid);
+  const quarantined = renderedThreads.filter(
+    t => t.kind === "subagent" && !isManagedSubagentThread(t, renderedThreads)
+  );
   box.innerHTML="";
   appendThreadRows(box, pid, renderedThreads.filter(
-    t => !t.archived && !isManagedSubagentThread(t, renderedThreads)
+    t => !t.archived && t.kind !== "subagent"
   ));
   const archived = renderedThreads.filter(
-    t => t.archived && !isManagedSubagentThread(t, renderedThreads)
+    t => t.archived && t.kind !== "subagent"
   );
   if (archived.length) {
     const label = document.createElement("div");
@@ -1188,6 +1191,15 @@ function renderProjectThreads(pid) {
     label.textContent = "Archived";
     box.append(label);
     appendThreadRows(box, pid, archived);
+  }
+  if (quarantined.length) {
+    const warning = document.createElement("div");
+    warning.className = "thread-section-label";
+    warning.textContent = `${quarantined.length} damaged agent-owned thread record${
+      quarantined.length === 1 ? " is" : "s are"
+    } hidden. Project deletion removes ${quarantined.length === 1 ? "it" : "them"}; `+
+      "targeted cleanup is planned.";
+    box.append(warning);
   }
   syncActiveThreadHighlight();
 }
@@ -1312,13 +1324,13 @@ function appendThreadRows(box, pid, threads) {
     for (const child of byParent.get(id) || []) appendOne(child);
   };
   for (const t of roots) appendOne(t);
-  // A corrupted parent cycle has no root and would otherwise vanish; keep every visible thread
-  // rendered so malformed records stay reachable for repair or deletion.
+  // Keep this generic tree renderer total even if a caller supplies a cycle. The sidebar filters
+  // graph-invalid sub-agents before calling it.
   for (const t of threads) appendOne(t);
 }
 
-// Hide only sub-agents whose ownership chain is complete and terminates at a primary root.
-// Dangling, malformed, and cyclic metadata stays in the main sidebar as a recovery path.
+// A sub-agent is managed only when its ownership chain is complete and reaches a primary root.
+// Invalid chains are quarantined from ordinary thread rows and counted by the project warning.
 function isManagedSubagentThread(t, threads) {
   if (!t || t.kind !== "subagent" || !t.parent_thread_id) return false;
   const byId = new Map((threads || []).map(thread => [String(thread.id), thread]));
@@ -2856,18 +2868,33 @@ function setWsStatus(status, detail) {
   updateComposerControls();
 }
 /// Persistent banner above the composer while a thread is read-only; hidden otherwise.
+function managedThreadReadOnly() {
+  if (!state.threadId || isDraftThread()) return false;
+  const meta = threadMetaForId(state.threadId) || composedThreadDetail(String(state.threadId));
+  return !!meta && (meta.kind === "subagent" || meta.kind === "orphan");
+}
+
+function threadMetadataPending() {
+  if (!state.threadId || isDraftThread()) return false;
+  return !(threadMetaForId(state.threadId) || composedThreadDetail(String(state.threadId)));
+}
+
 function updateReadOnlyBanner() {
   const banner = $("readOnlyBanner");
   if (!banner) return;
-  banner.hidden = !state.threadReadOnly;
-  banner.textContent = state.threadReadOnly ? (state.readOnlyMessage || "This thread is read-only.") : "";
+  const managedReadOnly = managedThreadReadOnly();
+  banner.hidden = !state.threadReadOnly && !managedReadOnly;
+  banner.textContent = managedReadOnly ? "This agent-owned thread is read-only." :
+    state.threadReadOnly ? (state.readOnlyMessage || "This thread is read-only.") : "";
 }
 
 function updateComposerControls() {
+  updateReadOnlyBanner();
   const ready = state.wsStatus==="open";
   const draft = isDraftThread();
   const hasThreadSurface = !!state.threadId || draft;
-  const readOnly = state.threadReadOnly && !draft;
+  const managedReadOnly = managedThreadReadOnly() && !draft;
+  const readOnly = (state.threadReadOnly || managedReadOnly || threadMetadataPending()) && !draft;
   const attachmentsLoading = pendingAttachmentOperationCount() > 0;
   const attachmentInputAllowed = hasThreadSurface && !readOnly && !state.updateRequired &&
     !state.uiVersionCheckPending &&
@@ -2885,7 +2912,8 @@ function updateComposerControls() {
   // The send arrow and the stop square share one slot: hide the arrow while a turn is running so
   // only the red stop square is visible (no disabled send button alongside it).
   $("sendBtn").hidden = state.activeTurn && !draft;
-  $("sendBtn").title = readOnly ? "Read-only thread — pick a model from a configured provider to reactivate it." :
+  $("sendBtn").title = managedReadOnly ? "Agent-owned threads are read-only." :
+    readOnly ? "Read-only thread — pick a model from a configured provider to reactivate it." :
     attachmentsLoading ? "Wait for attached files to finish loading." :
     modelUnresolved ? draftModelUnavailableReason() :
     nothingToSend ? "Type a message, or attach a file, to send." : "Send";
@@ -2901,16 +2929,17 @@ function updateComposerControls() {
   $("attachBtn").disabled = !attachmentInputAllowed;
   const modelCatalogReady = projectModelCatalogReady();
   const modelMutationPending = !draft && pendingMetadataGroup(state.threadId, "model");
-  $("modelSel").disabled = !hasThreadSurface || !modelCatalogReady || modelMutationPending || (!ready && !draft);
-  $("modelPickerBtn").disabled = !hasThreadSurface || !modelCatalogReady || modelMutationPending || (!ready && !draft);
-  $("effortSel").disabled = !hasThreadSurface || !modelCatalogReady || modelMutationPending || (!ready && !draft);
+  $("modelSel").disabled = managedReadOnly || !hasThreadSurface || !modelCatalogReady || modelMutationPending || (!ready && !draft);
+  $("modelPickerBtn").disabled = managedReadOnly || !hasThreadSurface || !modelCatalogReady || modelMutationPending || (!ready && !draft);
+  $("effortSel").disabled = managedReadOnly || !hasThreadSurface || !modelCatalogReady || modelMutationPending || (!ready && !draft);
   const compactBtn = $("compactBtn");
   if (compactBtn) {
-    compactBtn.disabled = !state.threadId || draft || state.activeTurn || state.compactPending || !ready;
+    compactBtn.disabled = managedReadOnly || !state.threadId || draft || state.activeTurn || state.compactPending || !ready;
     compactBtn.textContent = state.compactPending ? "Compacting..." : "Compact context";
   }
   $("input").disabled = !hasThreadSurface || readOnly;
   $("input").placeholder =
+    managedReadOnly ? "Agent-owned threads are read-only." :
     readOnly ? "Read-only thread — pick a model above to reactivate it." :
     state.activeTurn ? "Draft your next message…" :
     draft ? `Ask Giskard…  (${COMPOSER_HINT})` :
@@ -2918,9 +2947,9 @@ function updateComposerControls() {
     state.wsStatus==="connecting" ? "Connecting to agent…" :
     state.wsStatus==="reconnecting" ? "Reconnecting… keep drafting here." :
     "Disconnected from agent.";
-  $("permissionPresetSel").disabled = !hasThreadSurface ||
+  $("permissionPresetSel").disabled = managedReadOnly || !hasThreadSurface ||
     (!draft && pendingMetadataGroup(state.threadId, "permission")) || (!ready && !draft);
-  $("modeSel").disabled = !hasThreadSurface ||
+  $("modeSel").disabled = managedReadOnly || !hasThreadSurface ||
     (!draft && pendingMetadataGroup(state.threadId, "mode")) || (!ready && !draft);
   $("turnPickerBtn").disabled = !hasThreadSurface || (!ready && !draft);
 }

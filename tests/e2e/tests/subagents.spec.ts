@@ -1,7 +1,6 @@
 import { test, expect } from "@playwright/test";
 import {
   SCRIPTED_NESTED_SUBAGENT_TRIGGER,
-  SCRIPTED_SUBAGENT_PROMPT,
   SCRIPTED_SUBAGENT_REPLY,
   SCRIPTED_SUBAGENT_TRIGGER,
   login,
@@ -40,9 +39,9 @@ test.describe("linked sub-agent threads", () => {
 
     await parentLink.click();
     await expect(transcript.locator(".msg.agent", { hasText: SCRIPTED_SUBAGENT_REPLY })).toBeVisible();
-    await expect(transcript.locator(".msg.user", { hasText: SCRIPTED_SUBAGENT_PROMPT })).toHaveCount(1);
+    await expect(transcript.locator(".msg.user", { hasText: "Sub-agent turn" })).toHaveCount(1);
 
-    const promptRow = transcript.locator(".msg.user", { hasText: SCRIPTED_SUBAGENT_PROMPT });
+    const promptRow = transcript.locator(".msg.user", { hasText: "Sub-agent turn" });
     const replyRow = transcript.locator(".msg.agent", { hasText: SCRIPTED_SUBAGENT_REPLY });
     const promptBeforeReply = await promptRow.evaluate(
       (prompt, reply) => !!(prompt.compareDocumentPosition(reply as Node) & Node.DOCUMENT_POSITION_FOLLOWING),
@@ -56,6 +55,15 @@ test.describe("linked sub-agent threads", () => {
     expect(childSelection?.tid).not.toBe(parentSelection.tid);
     const parentButton = page.getByRole("button", { name: /Back to parent thread:/ });
     await expect(parentButton).toBeVisible();
+    await expect(page.locator("#readOnlyBanner")).toHaveText("This agent-owned thread is read-only.");
+    await expect(page.locator("#input")).toBeDisabled();
+    await expect(page.locator("#sendBtn")).toBeDisabled();
+    await expect(page.locator("#modelPickerBtn")).toBeDisabled();
+    await page.getByRole("button", { name: "Context usage" }).click();
+    await expect(page.locator("#compactBtn")).toBeDisabled();
+    await expect(page.locator("#modeSel")).toBeDisabled();
+    await expect(page.locator("#permissionPresetSel")).toBeDisabled();
+    await page.locator("#usageClose").click();
 
     await page.reload();
     await expect(transcript.locator(".msg.agent", { hasText: SCRIPTED_SUBAGENT_REPLY })).toBeVisible();
@@ -116,41 +124,13 @@ test.describe("linked sub-agent threads", () => {
     expect(remainingIds).not.toContain(childSelection.tid);
   });
 
-  test("keeps one prompt row before output for early and late metadata", async ({ page }) => {
+  test("recognizes only valid managed sub-agent ownership chains", async ({ page }) => {
     const result = await page.evaluate(() => {
       const app = window as unknown as {
-        resetTranscriptForAuthoritativeSnapshot: () => void;
-        renderLiveTurnUserInput: (turn: string, input: { type: string; text: string }) => void;
-        addItem: (item: unknown, turn: string, fromHistory: boolean) => void;
         isManagedSubagentThread: (thread: unknown, threads: unknown[]) => boolean;
-      };
-      const transcript = document.querySelector("#transcript") as HTMLElement;
-      const run = (turn: string, prompt: string, provisionalFirst: boolean) => {
-        app.resetTranscriptForAuthoritativeSnapshot();
-        if (provisionalFirst) {
-          app.renderLiveTurnUserInput(turn, { type: "text", text: prompt });
-        }
-        app.addItem({
-          id: `${turn}-output`,
-          harness_item_id: `${turn}-output`,
-          payload: { kind: "agent_message", text: `${turn} output` },
-        }, turn, false);
-        app.addItem({
-          id: `${turn}-prompt`,
-          harness_item_id: `subagent_prompt:${turn}`,
-          payload: { kind: "user_message", text: prompt },
-        }, turn, false);
-        const rows = Array.from(transcript.querySelectorAll(`.msg[data-turn="${turn}"]`));
-        return {
-          userRows: rows.filter(row => row.classList.contains("user")).length,
-          promptFirst: rows[0]?.classList.contains("user") === true,
-          texts: rows.map(row => row.textContent || ""),
-        };
       };
 
       return {
-        early: run("browser-early", "early child prompt", true),
-        late: run("browser-late", "late child prompt", false),
         validChain: app.isManagedSubagentThread(
           { id: "child", kind: "subagent", parent_thread_id: "root" },
           [
@@ -169,14 +149,38 @@ test.describe("linked sub-agent threads", () => {
       };
     });
 
-    expect(result.early.userRows).toBe(1);
-    expect(result.early.promptFirst).toBe(true);
-    expect(result.early.texts[0]).toContain("early child prompt");
-    expect(result.late.userRows).toBe(1);
-    expect(result.late.promptFirst).toBe(true);
-    expect(result.late.texts[0]).toContain("late child prompt");
     expect(result.validChain).toBe(true);
     expect(result.malformedIntermediate).toBe(false);
+  });
+
+  test("quarantines invalid sub-agent chains from ordinary sidebar rows", async ({ page }) => {
+    const result = await page.evaluate(() => {
+      const projectId = "quarantine-test";
+      const box = document.createElement("div");
+      box.id = `threads-${projectId}`;
+      document.body.append(box);
+      const appState = (window as any).eval("state");
+      appState.projectThreads.set(projectId, [
+        {
+          id: "damaged-child",
+          kind: "subagent",
+          parent_thread_id: "missing-parent",
+          archived: false,
+        },
+      ]);
+      (window as any).renderProjectThreads(projectId);
+      const rendered = {
+        rows: box.querySelectorAll(".thread-row").length,
+        warning: box.textContent || "",
+      };
+      appState.projectThreads.delete(projectId);
+      box.remove();
+      return rendered;
+    });
+
+    expect(result.rows).toBe(0);
+    expect(result.warning).toContain("1 damaged agent-owned thread record is hidden");
+    expect(result.warning).toContain("targeted cleanup is planned");
   });
 
   test("restores a running nested sub-agent activity after reload", async ({ page }) => {

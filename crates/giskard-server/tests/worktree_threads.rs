@@ -1264,10 +1264,10 @@ async fn opening_a_subagent_attaches_in_its_parents_worktree() {
     );
 }
 
-/// The inheritance is a lookup, not a copy: the worktree stays owned by the thread that created it,
-/// so removing a sub-agent must leave its parent's checkout and branch untouched.
+/// A sub-agent inherits its parent's worktree and cannot be deleted independently. Rejecting that
+/// operation must leave both the child record and the parent's checkout and branch untouched.
 #[tokio::test]
-async fn deleting_a_subagent_leaves_its_parents_worktree_alone() {
+async fn deleting_a_subagent_is_rejected_without_touching_its_parents_worktree() {
     let server = start(/*git_repo*/ true).await;
     let (_, body) = server.start_thread("Isolate this work", true).await;
     let started: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -1277,10 +1277,16 @@ async fn deleting_a_subagent_leaves_its_parents_worktree_alone() {
     let child = server.persist_subagent(parent_id).await;
 
     let response = server.delete_thread(child, /*force*/ false).await;
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
     assert!(
-        response.status().is_success(),
-        "deleting a sub-agent failed: {}",
-        response.text().await.unwrap_or_default()
+        server
+            .state
+            .store
+            .load_thread(server.project_id, child)
+            .await
+            .unwrap()
+            .is_some(),
+        "rejected deletion removed the sub-agent record"
     );
 
     assert!(

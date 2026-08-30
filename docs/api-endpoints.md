@@ -157,6 +157,13 @@ again with its history intact. The same verified switch works for any thread tha
 opened since the server started; threads with a live agent session stay bound to their provider
 (create a new thread to change providers there).
 
+Agent-owned sub-agent threads are independently and permanently read-only. Their composer, compact,
+model/mode/permission controls, rename, archive, direct delete, and workspace writes such as
+`SavePlan` are disabled or rejected with `thread_read_only` before harness I/O. This restriction is
+not recoverable through
+a provider switch. Matched approval/server-request responses, interrupting active work, command
+termination, transcript/history reads, and navigation remain supported.
+
 `DELETE /api/projects/{id}/threads/{thread_id}` refuses with `409` when the thread — or any linked
 child it cascades to — has a Git worktree holding work that exists nowhere else: uncommitted
 changes, or commits on its branch that no other ref reaches. The message names what would be
@@ -166,6 +173,10 @@ branches the agent created during the thread are left alone, since they live in 
 repository and are the user's now. Deleting a *project* sweeps its worktrees unconditionally —
 that confirmation is project-scoped and one thread's unfinished work must not strand the rest
 half-deleted.
+
+The requested deletion root must be a primary thread. Requesting deletion of an individual
+sub-agent returns `409 thread_read_only`; deleting a primary recursively removes its linked child
+threads after the existing subtree preflight succeeds.
 
 `GET /api/projects/{id}/threads/{thread_id}/deletion-impact` reports, per worktree in that
 subtree, the branch, the uncommitted-change count, the count of commits reachable from no other
