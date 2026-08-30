@@ -87,6 +87,12 @@ model, and permission messages require a `request_id`; the initiating browser re
 `ThreadMetadataResult` after commit, including for no-op changes, or an `Error` carrying that id.
 `TokenUpdate` no longer exists; thread totals use the revisioned metadata snapshot.
 
+An internal `orphan` native thread is omitted from thread lists and returns not-found from detail,
+history, and browser mutation routes until authoritative relationship evidence classifies the same
+ID as a read-only sub-agent. It cannot be opened or imported as a primary. Model or mode fields may
+be the reserved string `"unknown"` when the provider supplied no authoritative value; clients must
+display that state and must not submit it as a model or mode selection.
+
 Agent-produced diffs are advertised as bounded descriptors in live events and history. `GET
 /api/projects/{id}/threads/{thread_id}/turns/{turn_id}/diffs/{diff_id}` returns the exact captured
 unified or structured content on demand. It reads active runtime state or the immutable completed

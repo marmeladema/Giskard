@@ -9,7 +9,18 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.76
+**Version:** 1.77
+
+> **Amendment — durable native identity foundation (1.77).** Harness construction receives a
+> complete, validated `HarnessBootstrap` before the adapter launches ordinary event dispatch; a failed scan,
+> empty native ID, or non-bijective native/local mapping prevents publication. Every first binding
+> is an authoritative, idempotent route claim with one harness-lifetime epoch. Provider-owned child
+> discovery claims a final Giskard ID without `thread/resume` or other native work; conflicting
+> claims fail instead of rekeying. A relationship not yet known is represented durably as hidden,
+> read-only `ThreadKind::Orphan`, whose only transition is a revision-checked
+> `Orphan -> Subagent`. Native model/mode metadata that has not been reported is persisted and sent
+> on the wire as `TurnModel::Unknown` / `TurnMode::Unknown` (`"unknown"`), never as a fabricated
+> provider, model, or default mode. Its usage remains in totals under an unattributed bucket.
 
 > **Amendment — long-lived native event ownership (1.76).** Every loaded native thread has one
 > coordinator and one long-lived event-stream owner. Starting a turn or compaction records a
@@ -417,8 +428,11 @@ runtime overview; the hoisting and notification behavior remains current.
   visible activity label uses the
   final non-empty agent-path component as the task name and omits the native child id; both full
   values remain in server-side link metadata. Browser wire links redact native thread IDs. A real
-  promptless child native turn uses `Sub-agent turn` as its input label. Giskard does not synthesize
-  prompt items or terminal fallback turns from parent activity.
+  promptless child native turn uses `Sub-agent turn` as its input label, while the same turn on a
+  still-unclassified `Orphan` uses `Unclassified native turn`: a label may name only a relationship
+  Giskard has established. A turn committed before classification keeps the label it was persisted
+  with, exactly as it keeps its historical mode. Giskard does not synthesize prompt items or
+  terminal fallback turns from parent activity.
 
   Linked-thread discovery never changes established ownership: primary threads are not reclassified,
   children are not reparented, and self-links, cycles, invalid parent chains, and native-parent

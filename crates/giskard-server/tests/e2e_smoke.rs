@@ -1,6 +1,7 @@
 mod common;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
@@ -19,8 +20,7 @@ use giskard_core::token::TokenUsage;
 use giskard_core::turn::{Mode, PermissionPreset, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ResumePolicy,
-    ThreadHandle,
+    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
 };
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 use giskard_persist::store::ProjectConfig;
@@ -131,6 +131,7 @@ impl HarnessFactory for TestFactory {
     async fn create(
         &self,
         _config: &ProjectConfig,
+        _bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
         Ok(Arc::new(ReplayHarness::from_fixture(self.fixture.clone())))
     }
@@ -157,6 +158,7 @@ impl HarnessFactory for NoMcpFactory {
     async fn create(
         &self,
         _config: &ProjectConfig,
+        _bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
         Ok(Arc::new(NoMcpHarness))
     }
@@ -167,6 +169,7 @@ impl HarnessFactory for UnsupportedCompactionFactory {
     async fn create(
         &self,
         _config: &ProjectConfig,
+        _bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
         Ok(Arc::new(UnsupportedCompactionHarness::default()))
     }
@@ -177,6 +180,7 @@ impl HarnessFactory for SlowCompactionFactory {
     async fn create(
         &self,
         _config: &ProjectConfig,
+        _bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
         Ok(Arc::new(SlowCompactionHarness::default()))
     }
@@ -187,6 +191,7 @@ impl HarnessFactory for HeldCompactionFactory {
     async fn create(
         &self,
         _config: &ProjectConfig,
+        _bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
         Ok(self.harness.clone())
     }
@@ -197,6 +202,7 @@ impl HarnessFactory for SlowStartFactory {
     async fn create(
         &self,
         _config: &ProjectConfig,
+        _bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
         Ok(self.harness.clone())
     }
@@ -207,6 +213,7 @@ impl HarnessFactory for ActivityFactory {
     async fn create(
         &self,
         _config: &ProjectConfig,
+        _bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
         Ok(self.harness.clone())
     }
@@ -217,6 +224,7 @@ impl HarnessFactory for CountingOpenFactory {
     async fn create(
         &self,
         _config: &ProjectConfig,
+        _bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
         Ok(self.harness.clone())
     }
@@ -247,7 +255,8 @@ struct SlowStartHarness {
 #[derive(Default)]
 struct ActivityHarness {
     threads: tokio::sync::Mutex<HashMap<ThreadId, tokio::sync::broadcast::Sender<AgentEvent>>>,
-    resume_policies: tokio::sync::Mutex<Vec<(String, ResumePolicy)>>,
+    resumed_native_ids: tokio::sync::Mutex<Vec<String>>,
+    claims: tokio::sync::Mutex<Vec<(String, ThreadId)>>,
     hold_native_child_open: AtomicBool,
     native_child_open_started: AtomicBool,
     release_native_child_open: AtomicBool,
@@ -262,6 +271,7 @@ struct ActivityHarness {
 struct CountingOpenHarness {
     threads: tokio::sync::Mutex<HashMap<ThreadId, tokio::sync::broadcast::Sender<AgentEvent>>>,
     open_calls: AtomicUsize,
+    claim_calls: AtomicUsize,
     start_calls: AtomicUsize,
     delete_calls: AtomicUsize,
     shutdown_calls: AtomicUsize,
@@ -329,9 +339,25 @@ impl SlowStartHarness {
     }
 }
 
+/// The native parentage this fake attests, standing in for what the Codex adapter records from
+/// sub-agent link events. A claim reports it without resuming, exactly as the adapter does.
+fn attested_native_parent(harness_thread_id: &str) -> Option<String> {
+    match harness_thread_id {
+        "native-collab-child" | "native-terminal-child" => Some("native-parent".to_string()),
+        "native-grandchild" => Some("native-collab-child".to_string()),
+        "native-foreign-child" => Some("native-other-parent".to_string()),
+        _ => None,
+    }
+}
+
 impl ActivityHarness {
-    async fn resume_policies(&self) -> Vec<(String, ResumePolicy)> {
-        self.resume_policies.lock().await.clone()
+    async fn resumed_native_ids(&self) -> Vec<String> {
+        self.resumed_native_ids.lock().await.clone()
+    }
+
+    /// Native identity claims, which replaced `thread/resume` for provider-owned children.
+    async fn claims(&self) -> Vec<(String, ThreadId)> {
+        self.claims.lock().await.clone()
     }
 
     fn hold_native_child_open(&self) {
@@ -468,6 +494,52 @@ impl ActivityHarness {
         Ok(turn)
     }
 
+    /// An externally started child turn whose transcript names another native thread — the reverse
+    /// link shape. A sub-agent is read-only, so this arrives as provider-owned native work rather
+    /// than through `start_turn`.
+    async fn emit_external_reverse_activity(
+        &self,
+        thread: ThreadId,
+        target_harness_thread_id: &str,
+    ) -> Result<TurnId, HarnessError> {
+        let Some(sender) = self.threads.lock().await.get(&thread).cloned() else {
+            return Err(HarnessError::ThreadNotFound(thread));
+        };
+        let turn = TurnId::new();
+        let item = Item {
+            id: ItemId::new(),
+            harness_item_id: format!("reverse_parent_activity_{turn}"),
+            payload: ItemPayload::Activity {
+                title: "Sub-agent interacted".into(),
+                detail: Some(format!("/root ({target_harness_thread_id})")),
+                metadata: None,
+                subagent: Some(SubagentLink {
+                    harness_thread_id: target_harness_thread_id.to_string(),
+                    path: Some("/root".into()),
+                    initial_prompt: None,
+                    action: SubagentAction::Interacted,
+                    status: None,
+                    message: None,
+                }),
+            },
+            created_at: chrono::Utc::now(),
+        };
+        let _ = sender.send(AgentEvent::TurnStarted { thread, turn });
+        tokio::task::yield_now().await;
+        let _ = sender.send(AgentEvent::ItemCompleted { thread, turn, item });
+        tokio::task::yield_now().await;
+        let _ = sender.send(AgentEvent::TurnCompleted {
+            thread,
+            turn,
+            usage: TokenUsage::default(),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        });
+        Ok(turn)
+    }
+
     async fn emit_external_turn_without_completion(
         &self,
         thread: ThreadId,
@@ -561,6 +633,10 @@ impl ActivityHarness {
 impl CountingOpenHarness {
     fn open_calls(&self) -> usize {
         self.open_calls.load(Ordering::SeqCst)
+    }
+
+    fn claim_calls(&self) -> usize {
+        self.claim_calls.load(Ordering::SeqCst)
     }
 
     async fn opened_models(&self) -> Vec<Option<ModelRef>> {
@@ -878,10 +954,10 @@ impl AgentHarness for ActivityHarness {
 
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
         if let Some(native_thread_id) = opts.resume.as_ref() {
-            self.resume_policies
+            self.resumed_native_ids
                 .lock()
                 .await
-                .push((native_thread_id.clone(), opts.resume_policy));
+                .push(native_thread_id.clone());
         }
         if matches!(
             opts.resume.as_deref(),
@@ -898,13 +974,7 @@ impl AgentHarness for ActivityHarness {
         self.threads.lock().await.insert(thread, tx);
         let harness_thread_id = opts.resume.unwrap_or_else(|| format!("test_{thread}"));
         let agent_name = (harness_thread_id == "native-collab-child").then(|| "James".to_string());
-        let parent_harness_thread_id = match harness_thread_id.as_str() {
-            "native-collab-child" => Some("native-parent".to_string()),
-            "native-terminal-child" => Some("native-parent".to_string()),
-            "native-grandchild" => Some("native-collab-child".to_string()),
-            "native-foreign-child" => Some("native-other-parent".to_string()),
-            _ => None,
-        };
+        let parent_harness_thread_id = attested_native_parent(&harness_thread_id);
         Ok(ThreadHandle {
             resumed_model: opts
                 .initial_model
@@ -913,6 +983,40 @@ impl AgentHarness for ActivityHarness {
             agent_name,
             parent_harness_thread_id,
             ..ThreadHandle::opened(thread, harness_thread_id, opts.workspace_root.clone())
+        })
+    }
+
+    async fn claim_native_thread(
+        &self,
+        thread: ThreadId,
+        harness_thread_id: String,
+        workspace_root: std::path::PathBuf,
+    ) -> Result<ThreadHandle, HarnessError> {
+        if matches!(
+            harness_thread_id.as_str(),
+            "native-child" | "native-terminal-child"
+        ) && self.hold_native_child_open.load(Ordering::SeqCst)
+        {
+            self.native_child_open_started.store(true, Ordering::SeqCst);
+            while !self.release_native_child_open.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        }
+        self.claims
+            .lock()
+            .await
+            .push((harness_thread_id.clone(), thread));
+        let mut threads = self.threads.lock().await;
+        threads.entry(thread).or_insert_with(|| {
+            let (sender, _) = tokio::sync::broadcast::channel(32);
+            sender
+        });
+        // Mirrors the Codex adapter: a claim reports the parentage this harness lifetime already
+        // attested through its own events, and nothing a resume would have to ask for.
+        let parent_harness_thread_id = attested_native_parent(&harness_thread_id);
+        Ok(ThreadHandle {
+            parent_harness_thread_id,
+            ..ThreadHandle::opened(thread, harness_thread_id, workspace_root)
         })
     }
 
@@ -1526,6 +1630,22 @@ impl AgentHarness for CountingOpenHarness {
                 opts.workspace_root.clone(),
             )
         })
+    }
+
+    async fn claim_native_thread(
+        &self,
+        thread: ThreadId,
+        harness_thread_id: String,
+        workspace_root: PathBuf,
+    ) -> Result<ThreadHandle, HarnessError> {
+        self.claim_calls.fetch_add(1, Ordering::SeqCst);
+        let (tx, _) = tokio::sync::broadcast::channel(16);
+        self.threads.lock().await.insert(thread, tx);
+        Ok(ThreadHandle::opened(
+            thread,
+            harness_thread_id,
+            workspace_root,
+        ))
     }
 
     async fn start_turn(
@@ -2345,12 +2465,15 @@ async fn wait_for_native_thread(
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     loop {
         for thread_id in state.store.list_threads(project_id).await.unwrap() {
-            let thread = state
+            let Some(thread) = state
                 .store
                 .load_thread(project_id, thread_id)
                 .await
                 .unwrap()
-                .unwrap();
+            else {
+                // Thread creation rollback can remove an entry after the listing snapshot.
+                continue;
+            };
             if thread.harness_thread_id == harness_thread_id {
                 return thread;
             }
@@ -2823,7 +2946,7 @@ async fn cancelling_start_turn_caller_does_not_abandon_admitted_operation() {
         .unwrap();
 
     let registry = state.registry.clone();
-    let model = thread.current_model.clone();
+    let model = thread.current_model.as_known().unwrap().clone();
     let request = tokio::spawn(async move {
         registry
             .start_turn(
@@ -2831,7 +2954,7 @@ async fn cancelling_start_turn_caller_does_not_abandon_admitted_operation() {
                 UserInput::text("cancelled caller"),
                 TurnOverrides {
                     model: Some(model.clone()),
-                    mode: thread.mode,
+                    mode: thread.mode.as_known().unwrap(),
                     permission_preset: thread.permission_preset,
                 },
                 model,
@@ -2857,11 +2980,11 @@ async fn cancelling_start_turn_caller_does_not_abandon_admitted_operation() {
             thread_id,
             UserInput::text("next turn"),
             TurnOverrides {
-                model: Some(thread.current_model.clone()),
-                mode: thread.mode,
+                model: Some(thread.current_model.as_known().unwrap().clone()),
+                mode: thread.mode.as_known().unwrap(),
                 permission_preset: thread.permission_preset,
             },
-            thread.current_model,
+            thread.current_model.into_known().unwrap(),
         )
         .await
         .expect("the completed detached operation must not strand admission");
@@ -2884,9 +3007,12 @@ async fn cancelling_compaction_caller_does_not_abandon_admitted_operation() {
         .unwrap();
 
     let registry = state.registry.clone();
-    let model = thread.current_model.clone();
-    let request =
-        tokio::spawn(async move { registry.compact_thread(thread_id, model, thread.mode).await });
+    let model = thread.current_model.as_known().unwrap().clone();
+    let request = tokio::spawn(async move {
+        registry
+            .compact_thread(thread_id, model, thread.mode.as_known().unwrap())
+            .await
+    });
     harness.wait_for_compact_calls(1).await;
     request.abort();
     harness.release_compaction();
@@ -2906,11 +3032,11 @@ async fn cancelling_compaction_caller_does_not_abandon_admitted_operation() {
             thread_id,
             UserInput::text("after compaction"),
             TurnOverrides {
-                model: Some(thread.current_model.clone()),
-                mode: thread.mode,
+                model: Some(thread.current_model.as_known().unwrap().clone()),
+                mode: thread.mode.as_known().unwrap(),
                 permission_preset: thread.permission_preset,
             },
-            thread.current_model,
+            thread.current_model.into_known().unwrap(),
         )
         .await
         .expect("the completed detached compaction must not strand admission");
@@ -2946,11 +3072,11 @@ async fn subscribe_thread_state_reports_a_turn_that_ended_before_the_socket_atta
             thread_id,
             UserInput::text("a turn nobody is subscribed to"),
             TurnOverrides {
-                model: Some(thread_file.current_model.clone()),
-                mode: thread_file.mode,
+                model: Some(thread_file.current_model.as_known().unwrap().clone()),
+                mode: thread_file.mode.as_known().unwrap(),
                 permission_preset: thread_file.permission_preset,
             },
-            thread_file.current_model,
+            thread_file.current_model.into_known().unwrap(),
         )
         .await
         .unwrap();
@@ -4009,11 +4135,11 @@ async fn importing_subagent_thread_records_parent_and_reuses_native_child() {
             parent_id,
             UserInput::text("subagent activity"),
             TurnOverrides {
-                model: Some(parent_file.current_model.clone()),
-                mode: parent_file.mode,
+                model: Some(parent_file.current_model.as_known().unwrap().clone()),
+                mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
             },
-            parent_file.current_model.clone(),
+            parent_file.current_model.as_known().unwrap().clone(),
         )
         .await
         .unwrap();
@@ -4053,13 +4179,12 @@ async fn importing_subagent_thread_records_parent_and_reuses_native_child() {
     assert_eq!(saved.spawned_by_turn_id, Some(spawned_by_turn_id));
     assert_eq!(saved.kind, giskard_core::ThreadKind::Subagent);
     assert!(
-        harness
-            .resume_policies()
+        !harness
+            .resumed_native_ids()
             .await
             .iter()
-            .any(|(native_id, policy)| {
-                native_id == "native-child" && *policy == ResumePolicy::RequireExisting
-            })
+            .any(|native_id| native_id == "native-child"),
+        "materializing a read-only sub-agent must not issue a native resume"
     );
 
     harness.wait_for_subscribers(child_id, 1).await;
@@ -4177,11 +4302,11 @@ async fn route_and_forwarder_import_same_native_child_once() {
             parent_id,
             UserInput::text("subagent activity"),
             TurnOverrides {
-                model: Some(parent_file.current_model.clone()),
-                mode: parent_file.mode,
+                model: Some(parent_file.current_model.as_known().unwrap().clone()),
+                mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
             },
-            parent_file.current_model,
+            parent_file.current_model.into_known().unwrap(),
         )
         .await
         .unwrap();
@@ -4241,9 +4366,21 @@ async fn route_and_forwarder_import_same_native_child_once() {
     .collect::<Vec<_>>();
     assert_eq!(native_children.len(), 1);
     assert_eq!(native_children[0].id, route_child_id);
+    // Identity is established once, by a claim: a provider-owned child is never resumed, so the
+    // duplicate-import guard is now visible as a single claim rather than a single resume.
     assert_eq!(
         harness
-            .resume_policies()
+            .resumed_native_ids()
+            .await
+            .iter()
+            .filter(|native_id| *native_id == "native-child")
+            .count(),
+        0,
+        "claiming a native child must not resume it"
+    );
+    assert_eq!(
+        harness
+            .claims()
             .await
             .iter()
             .filter(|(native_id, _)| native_id == "native-child")
@@ -4292,11 +4429,11 @@ async fn passive_subagent_command_start_streams_before_completion() {
             parent_id,
             UserInput::text("subagent activity"),
             TurnOverrides {
-                model: Some(parent_file.current_model.clone()),
-                mode: parent_file.mode,
+                model: Some(parent_file.current_model.as_known().unwrap().clone()),
+                mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
             },
-            parent_file.current_model.clone(),
+            parent_file.current_model.as_known().unwrap().clone(),
         )
         .await
         .unwrap();
@@ -4569,11 +4706,11 @@ async fn collab_agent_spawn_start_imports_subagent_thread() {
             parent_id,
             UserInput::text("collab spawn"),
             TurnOverrides {
-                model: Some(parent_file.current_model.clone()),
-                mode: parent_file.mode,
+                model: Some(parent_file.current_model.as_known().unwrap().clone()),
+                mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
             },
-            parent_file.current_model.clone(),
+            parent_file.current_model.as_known().unwrap().clone(),
         )
         .await
         .unwrap();
@@ -4605,7 +4742,7 @@ async fn collab_agent_spawn_start_imports_subagent_thread() {
     assert_eq!(child.parent_thread_id, Some(parent_id));
     assert_eq!(child.spawned_by_turn_id, Some(spawned_by_turn_id));
     assert_eq!(child.kind, giskard_core::ThreadKind::Subagent);
-    assert_eq!(child.title, "Sub-agent: James");
+    assert_eq!(child.title, "Sub-agent: explorer");
 
     harness.wait_for_subscribers(child.id, 1).await;
     let external_turn = harness
@@ -4667,11 +4804,11 @@ async fn collab_agent_spawn_uses_tool_input_prompt_when_link_prompt_is_missing()
             parent_id,
             UserInput::text("collab spawn input fallback"),
             TurnOverrides {
-                model: Some(parent_file.current_model.clone()),
-                mode: parent_file.mode,
+                model: Some(parent_file.current_model.as_known().unwrap().clone()),
+                mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
             },
-            parent_file.current_model.clone(),
+            parent_file.current_model.as_known().unwrap().clone(),
         )
         .await
         .unwrap();
@@ -4784,11 +4921,11 @@ async fn passive_subagent_prompt_updates_when_spawn_metadata_arrives_late() {
             parent_id,
             UserInput::text("subagent delayed metadata"),
             TurnOverrides {
-                model: Some(parent_file.current_model.clone()),
-                mode: parent_file.mode,
+                model: Some(parent_file.current_model.as_known().unwrap().clone()),
+                mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
             },
-            parent_file.current_model.clone(),
+            parent_file.current_model.as_known().unwrap().clone(),
         )
         .await
         .unwrap();
@@ -4888,11 +5025,11 @@ async fn server_resolved_subagent_link_uses_agent_name_prompt_and_turn() {
             parent_id,
             UserInput::text("collab spawn"),
             TurnOverrides {
-                model: Some(parent_file.current_model.clone()),
-                mode: parent_file.mode,
+                model: Some(parent_file.current_model.as_known().unwrap().clone()),
+                mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
             },
-            parent_file.current_model,
+            parent_file.current_model.into_known().unwrap(),
         )
         .await
         .unwrap();
@@ -4909,7 +5046,7 @@ async fn server_resolved_subagent_link_uses_agent_name_prompt_and_turn() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(child.title, "Sub-agent: James");
+    assert_eq!(child.title, "Sub-agent: explorer");
     assert_eq!(child.parent_thread_id, Some(parent_id));
     assert_eq!(child.spawned_by_turn_id, Some(spawned_by_turn_id));
 
@@ -5018,11 +5155,11 @@ async fn subagent_link_open_rejects_unknown_and_non_link_items() {
             parent_id,
             UserInput::text("plain activity"),
             TurnOverrides {
-                model: Some(parent_file.current_model.clone()),
-                mode: parent_file.mode,
+                model: Some(parent_file.current_model.as_known().unwrap().clone()),
+                mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
             },
-            parent_file.current_model,
+            parent_file.current_model.into_known().unwrap(),
         )
         .await
         .unwrap();
@@ -5085,11 +5222,11 @@ async fn terminal_subagent_link_does_not_synthesize_a_fallback_turn() {
             parent_id,
             UserInput::text("subagent terminal fallback"),
             TurnOverrides {
-                model: Some(parent_file.current_model.clone()),
-                mode: parent_file.mode,
+                model: Some(parent_file.current_model.as_known().unwrap().clone()),
+                mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
             },
-            parent_file.current_model,
+            parent_file.current_model.into_known().unwrap(),
         )
         .await
         .unwrap();
@@ -5184,11 +5321,11 @@ async fn persisted_or_interrupted_subagent_keeps_one_event_owner() {
             parent_id,
             UserInput::text("subagent activity"),
             TurnOverrides {
-                model: Some(parent_file.current_model.clone()),
-                mode: parent_file.mode,
+                model: Some(parent_file.current_model.as_known().unwrap().clone()),
+                mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
             },
-            parent_file.current_model.clone(),
+            parent_file.current_model.as_known().unwrap().clone(),
         )
         .await
         .unwrap();
@@ -5268,11 +5405,11 @@ async fn persisted_or_interrupted_subagent_keeps_one_event_owner() {
             parent_id,
             UserInput::text("subagent interrupted"),
             TurnOverrides {
-                model: Some(parent_file.current_model.clone()),
-                mode: parent_file.mode,
+                model: Some(parent_file.current_model.as_known().unwrap().clone()),
+                mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
             },
-            parent_file.current_model,
+            parent_file.current_model.into_known().unwrap(),
         )
         .await
         .unwrap();
@@ -5364,11 +5501,11 @@ async fn reverse_subagent_activity_preserves_parent_and_uses_one_forwarder() {
             parent_id,
             UserInput::text("collab spawn"),
             TurnOverrides {
-                model: Some(parent_file.current_model.clone()),
-                mode: parent_file.mode,
+                model: Some(parent_file.current_model.as_known().unwrap().clone()),
+                mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
             },
-            parent_file.current_model.clone(),
+            parent_file.current_model.as_known().unwrap().clone(),
         )
         .await
         .unwrap();
@@ -5413,21 +5550,8 @@ async fn reverse_subagent_activity_preserves_parent_and_uses_one_forwarder() {
         .unwrap();
     wait_for_thread_state(&mut child_ws, child.id).await;
 
-    let child_handle = state
-        .registry
-        .get_thread_handle(child.id)
-        .await
-        .expect("materialized child should remain open");
     let child_turn = harness
-        .start_turn(
-            &child_handle,
-            UserInput::text("reverse parent activity"),
-            TurnOverrides {
-                model: Some(child.current_model.clone()),
-                mode: child.mode,
-                permission_preset: child.permission_preset,
-            },
-        )
+        .emit_external_reverse_activity(child.id, "native-parent")
         .await
         .unwrap();
 
@@ -5584,17 +5708,19 @@ async fn reverse_subagent_activity_preserves_parent_and_uses_one_forwarder() {
         })
         .await
         .unwrap();
+    // A provider-owned child has no authoritative model of its own, so the caller has to name one.
+    // The read-only guard rejects the send before any of it is used.
     let error = state
         .registry
         .start_turn(
             child.id,
             UserInput::text("reverse parent activity"),
             TurnOverrides {
-                model: Some(child.current_model.clone()),
-                mode: child.mode,
+                model: Some(fake_native_model()),
+                mode: Mode::Build,
                 permission_preset: child.permission_preset,
             },
-            child.current_model.clone(),
+            fake_native_model(),
         )
         .await
         .unwrap_err();
@@ -5641,11 +5767,11 @@ async fn route_rejects_native_child_with_a_different_parent() {
             parent_id,
             UserInput::text("foreign subagent activity"),
             TurnOverrides {
-                model: Some(parent_file.current_model.clone()),
-                mode: parent_file.mode,
+                model: Some(parent_file.current_model.as_known().unwrap().clone()),
+                mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
             },
-            parent_file.current_model,
+            parent_file.current_model.into_known().unwrap(),
         )
         .await
         .unwrap();
@@ -5691,11 +5817,11 @@ async fn parent_deletion_cascades_to_all_descendants_leaf_first() {
             parent_id,
             UserInput::text("collab spawn"),
             TurnOverrides {
-                model: Some(parent_file.current_model.clone()),
-                mode: parent_file.mode,
+                model: Some(parent_file.current_model.as_known().unwrap().clone()),
+                mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
             },
-            parent_file.current_model,
+            parent_file.current_model.into_known().unwrap(),
         )
         .await
         .unwrap();
@@ -5707,13 +5833,15 @@ async fn parent_deletion_cascades_to_all_descendants_leaf_first() {
         .get_thread_handle(child_id)
         .await
         .expect("materialized child should remain open");
+    // Native work the provider drives on its own child, reproduced by calling the harness
+    // directly: the child is read-only through Giskard and reports no model of its own.
     let child_turn = harness
         .start_turn(
             &child_handle,
             UserInput::text("nested collab spawn"),
             TurnOverrides {
-                model: Some(child.current_model.clone()),
-                mode: child.mode,
+                model: Some(fake_native_model()),
+                mode: Mode::Build,
                 permission_preset: child.permission_preset,
             },
         )
@@ -5807,11 +5935,11 @@ async fn parent_deletion_rejects_active_descendant_before_deleting_anything() {
             parent_id,
             UserInput::text("collab spawn"),
             TurnOverrides {
-                model: Some(parent_file.current_model.clone()),
-                mode: parent_file.mode,
+                model: Some(parent_file.current_model.as_known().unwrap().clone()),
+                mode: parent_file.mode.as_known().unwrap(),
                 permission_preset: parent_file.permission_preset,
             },
-            parent_file.current_model,
+            parent_file.current_model.into_known().unwrap(),
         )
         .await
         .unwrap();
@@ -5831,13 +5959,15 @@ async fn parent_deletion_rejects_active_descendant_before_deleting_anything() {
         .get_thread_handle(child_id)
         .await
         .expect("imported child should remain open");
+    // Provider-driven native work on the read-only child; its own model is unreported, so the
+    // caller names one.
     harness
         .start_turn(
             &child_handle,
             UserInput::text("approval"),
             TurnOverrides {
-                model: Some(child_file.current_model.clone()),
-                mode: child_file.mode,
+                model: Some(fake_native_model()),
+                mode: Mode::Build,
                 permission_preset: child_file.permission_preset,
             },
         )
@@ -6681,8 +6811,8 @@ async fn subscribe_reopens_persisted_thread() {
                 parent_thread_id: None,
                 spawned_by_turn_id: None,
                 kind: giskard_core::ThreadKind::Primary,
-                mode: Mode::Build,
-                current_model: model.clone(),
+                mode: giskard_core::turn::TurnMode::Known(Mode::Build),
+                current_model: giskard_core::turn::TurnModel::Known(model.clone()),
                 context_window: 128_000,
                 model_context_windows: HashMap::from([(
                     "openai".into(),
@@ -6820,8 +6950,8 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
                 parent_thread_id: None,
                 spawned_by_turn_id: None,
                 kind: giskard_core::ThreadKind::Primary,
-                mode: Mode::Build,
-                current_model: model.clone(),
+                mode: giskard_core::turn::TurnMode::Known(Mode::Build),
+                current_model: giskard_core::turn::TurnModel::Known(model.clone()),
                 context_window: 128_000,
                 model_context_windows: Default::default(),
                 permission_preset: PermissionPreset::AskFirst,
@@ -6979,8 +7109,8 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
                 parent_thread_id: None,
                 spawned_by_turn_id: None,
                 kind: giskard_core::ThreadKind::Primary,
-                mode: Mode::Build,
-                current_model: model.clone(),
+                mode: giskard_core::turn::TurnMode::Known(Mode::Build),
+                current_model: giskard_core::turn::TurnModel::Known(model.clone()),
                 context_window: 128_000,
                 model_context_windows: Default::default(),
                 permission_preset: PermissionPreset::AskFirst,
@@ -7021,8 +7151,8 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
                         created_at: now,
                     },
                 ],
-                model: model.clone(),
-                mode: Mode::Build,
+                model: giskard_core::turn::TurnModel::Known(model.clone()),
+                mode: giskard_core::turn::TurnMode::Known(Mode::Build),
                 status: TurnStatus {
                     kind: TurnStatusKind::Completed,
                     message: None,
@@ -7211,8 +7341,8 @@ async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
                 parent_thread_id: None,
                 spawned_by_turn_id: None,
                 kind: giskard_core::ThreadKind::Primary,
-                mode: Mode::Build,
-                current_model: model.clone(),
+                mode: giskard_core::turn::TurnMode::Known(Mode::Build),
+                current_model: giskard_core::turn::TurnModel::Known(model.clone()),
                 context_window: 128_000,
                 model_context_windows: Default::default(),
                 permission_preset: PermissionPreset::AskFirst,
@@ -7245,8 +7375,8 @@ async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
                     },
                     created_at: now,
                 }],
-                model: model.clone(),
-                mode: Mode::Build,
+                model: giskard_core::turn::TurnModel::Known(model.clone()),
+                mode: giskard_core::turn::TurnMode::Known(Mode::Build),
                 status: TurnStatus {
                     kind: TurnStatusKind::Completed,
                     message: None,
@@ -7689,12 +7819,12 @@ async fn open_thread_normalizes_stale_provider_from_configured_model() {
                 parent_thread_id: None,
                 spawned_by_turn_id: None,
                 kind: giskard_core::ThreadKind::Primary,
-                mode: Mode::Build,
-                current_model: ModelRef {
+                mode: giskard_core::turn::TurnMode::Known(Mode::Build),
+                current_model: giskard_core::turn::TurnModel::Known(ModelRef {
                     provider: "openai".into(),
                     model: "gpt-5.5".into(),
                     reasoning_effort: None,
-                },
+                }),
                 context_window: 128_000,
                 model_context_windows: Default::default(),
                 permission_preset: PermissionPreset::AskFirst,
@@ -7719,7 +7849,10 @@ async fn open_thread_normalizes_stale_provider_from_configured_model() {
     assert_eq!(resp.status(), 200);
 
     let saved_thread = state.store.load_thread(pid, tid).await.unwrap().unwrap();
-    assert_eq!(saved_thread.current_model.provider, "proxy");
+    assert_eq!(
+        saved_thread.current_model.as_known().unwrap().provider,
+        "proxy"
+    );
     assert_eq!(saved_thread.context_window, 262_144);
 
     state
@@ -7795,8 +7928,8 @@ async fn open_thread_normalization_reuses_live_handle() {
                 parent_thread_id: None,
                 spawned_by_turn_id: None,
                 kind: giskard_core::ThreadKind::Primary,
-                mode: Mode::Build,
-                current_model: stale_model.clone(),
+                mode: giskard_core::turn::TurnMode::Known(Mode::Build),
+                current_model: giskard_core::turn::TurnModel::Known(stale_model.clone()),
                 context_window: 128_000,
                 model_context_windows: Default::default(),
                 permission_preset: PermissionPreset::AskFirst,
@@ -7842,7 +7975,10 @@ async fn open_thread_normalization_reuses_live_handle() {
     );
 
     let saved_thread = state.store.load_thread(pid, tid).await.unwrap().unwrap();
-    assert_eq!(saved_thread.current_model.provider, "proxy");
+    assert_eq!(
+        saved_thread.current_model.as_known().unwrap().provider,
+        "proxy"
+    );
     assert_eq!(saved_thread.context_window, 262_144);
 }
 
@@ -7907,27 +8043,60 @@ async fn concurrent_subagent_cold_opens_install_one_native_owner() {
         .await
         .unwrap();
     let config = state.store.load_project(project_id).await.unwrap().unwrap();
+    let parent_id = ThreadId::new();
     let thread_id = ThreadId::new();
-    let model = fake_native_model();
+    let now = chrono::Utc::now();
+    let base_thread =
+        |id, native: &str, kind, parent_thread_id| giskard_persist::store::ThreadFile {
+            revision: 0,
+            version: giskard_persist::store::THREAD_METADATA_VERSION,
+            id,
+            project_id,
+            title: native.into(),
+            harness_thread_id: native.into(),
+            parent_thread_id,
+            spawned_by_turn_id: parent_thread_id.map(|_| TurnId::new()),
+            kind,
+            mode: giskard_core::turn::TurnMode::Known(Mode::Build),
+            current_model: giskard_core::turn::TurnModel::Unknown,
+            context_window: 0,
+            model_context_windows: HashMap::new(),
+            permission_preset: PermissionPreset::AskFirst,
+            model_efforts: Default::default(),
+            tokens: Default::default(),
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            git_workspace: None,
+        };
+    state
+        .store
+        .save_thread(
+            project_id,
+            &base_thread(
+                parent_id,
+                "native-parent",
+                giskard_core::ThreadKind::Primary,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+    let child = base_thread(
+        thread_id,
+        "native-child",
+        giskard_core::ThreadKind::Subagent,
+        Some(parent_id),
+    );
+    state.store.save_thread(project_id, &child).await.unwrap();
 
-    let first = state.registry.open_linked_thread(
-        &config,
-        "/tmp/test",
-        Some(thread_id),
-        "native-child".into(),
-        model.clone(),
-    );
-    let second = state.registry.open_linked_thread(
-        &config,
-        "/tmp/test",
-        Some(thread_id),
-        "native-child".into(),
-        model,
-    );
+    let first = state.registry.attach_subagent_thread(&config, &child);
+    let second = state.registry.attach_subagent_thread(&config, &child);
     let (first, second) = tokio::join!(first, second);
     assert_eq!(first.unwrap().harness_thread_id, "native-child");
     assert_eq!(second.unwrap().harness_thread_id, "native-child");
-    assert_eq!(harness.open_calls(), 1);
+    assert_eq!(harness.open_calls(), 0);
+    assert_eq!(harness.claim_calls(), 1);
 }
 
 #[tokio::test]
@@ -8030,9 +8199,15 @@ async fn start_thread_with_initial_message_uses_selected_provider_and_starts_tur
     assert_eq!(harness.started_inputs().await, vec!["Hello".to_string()]);
 
     let saved_thread = state.store.load_thread(pid, tid).await.unwrap().unwrap();
-    assert_eq!(saved_thread.current_model.provider, "proxy");
-    assert_eq!(saved_thread.current_model.model, "glm-5.2-workers-ai");
-    assert_eq!(saved_thread.mode, Mode::Plan);
+    assert_eq!(
+        saved_thread.current_model.as_known().unwrap().provider,
+        "proxy"
+    );
+    assert_eq!(
+        saved_thread.current_model.as_known().unwrap().model,
+        "glm-5.2-workers-ai"
+    );
+    assert_eq!(saved_thread.mode.as_known().unwrap(), Mode::Plan);
     assert_eq!(saved_thread.permission_preset, PermissionPreset::AskFirst);
     assert_eq!(
         saved_thread.harness_thread_id,
@@ -8134,8 +8309,8 @@ async fn select_model_rejects_provider_change_on_non_empty_thread() {
                 id: TurnId::new(),
                 user_input: UserInput::text("previous"),
                 items: vec![],
-                model: openai_model,
-                mode: Mode::Build,
+                model: giskard_core::turn::TurnModel::Known(openai_model),
+                mode: giskard_core::turn::TurnMode::Known(Mode::Build),
                 status: TurnStatus {
                     kind: TurnStatusKind::Completed,
                     message: None,
@@ -8177,7 +8352,10 @@ async fn select_model_rejects_provider_change_on_non_empty_thread() {
     );
     assert_eq!(harness.open_calls(), 1);
     let saved_thread = state.store.load_thread(pid, tid).await.unwrap().unwrap();
-    assert_eq!(saved_thread.current_model.provider, "openai");
+    assert_eq!(
+        saved_thread.current_model.as_known().unwrap().provider,
+        "openai"
+    );
 }
 
 #[tokio::test]
@@ -8229,8 +8407,8 @@ async fn send_input_rejects_persisted_provider_mismatch_on_non_empty_thread() {
                 id: TurnId::new(),
                 user_input: UserInput::text("previous"),
                 items: vec![],
-                model: openai_model,
-                mode: Mode::Build,
+                model: giskard_core::turn::TurnModel::Known(openai_model),
+                mode: giskard_core::turn::TurnMode::Known(Mode::Build),
                 status: TurnStatus {
                     kind: TurnStatusKind::Completed,
                     message: None,
@@ -8246,11 +8424,11 @@ async fn send_input_rejects_persisted_provider_mismatch_on_non_empty_thread() {
     state
         .store
         .update_thread(pid, tid, |thread| {
-            thread.current_model = ModelRef {
+            thread.current_model = giskard_core::turn::TurnModel::Known(ModelRef {
                 provider: "proxy".into(),
                 model: "glm-5.2-workers-ai".into(),
                 reasoning_effort: None,
-            };
+            });
         })
         .await
         .unwrap()

@@ -45,6 +45,7 @@ impl HarnessFactory for CatalogFactory {
     async fn create(
         &self,
         _config: &ProjectConfig,
+        _bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
         Ok(Arc::new(
             ReplayHarness::new()
@@ -64,6 +65,7 @@ impl HarnessFactory for FailingCatalogFactory {
     async fn create(
         &self,
         _config: &ProjectConfig,
+        _bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
         Ok(Arc::new(
             ReplayHarness::new()
@@ -385,14 +387,11 @@ async fn catalog_effort_survives_new_thread_creation() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(thread.current_model.provider, "mock");
-    assert_eq!(thread.current_model.model, "glm-5.2");
+    let current_model = thread.current_model.as_known().unwrap();
+    assert_eq!(current_model.provider, "mock");
+    assert_eq!(current_model.model, "glm-5.2");
     assert_eq!(
-        thread
-            .current_model
-            .reasoning_effort
-            .as_ref()
-            .map(|e| e.as_str()),
+        current_model.reasoning_effort.as_ref().map(|e| e.as_str()),
         Some("high")
     );
 
@@ -422,8 +421,8 @@ async fn catalog_effort_survives_new_thread_creation() {
                 .unwrap();
             if thread
                 .current_model
-                .reasoning_effort
-                .as_ref()
+                .as_known()
+                .and_then(|model| model.reasoning_effort.as_ref())
                 .map(|e| e.as_str())
                 == Some("medium")
             {
@@ -437,6 +436,8 @@ async fn catalog_effort_survives_new_thread_creation() {
     assert_eq!(
         selected
             .current_model
+            .as_known()
+            .unwrap()
             .reasoning_effort
             .as_ref()
             .map(|e| e.as_str()),

@@ -7,6 +7,88 @@ use crate::item::Item;
 use crate::model::ModelRef;
 use crate::token::TokenUsage;
 use crate::user_input::UserInput;
+
+/// Authoritative model attribution for a persisted thread or turn.
+///
+/// `Known` keeps the existing model object as its wire/on-disk representation, so data written
+/// before this type decodes unchanged. `Unknown` is a domain variant meaning the provider reported
+/// no authoritative metadata: it encodes as the reserved string `"unknown"`, which is a different
+/// JSON type from a model object and therefore cannot collide with a provider literally named
+/// `unknown`. It must never be sent to a harness, used for provider selection, looked up in a
+/// model catalog, or used as a context-window key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TurnModel {
+    Unknown,
+    /// Listed last and untagged on purpose: deserialization tries the `"unknown"` string first,
+    /// then falls back to the legacy model object.
+    #[serde(untagged)]
+    Known(ModelRef),
+}
+
+/// Authoritative collaboration-mode attribution for a persisted thread or turn.
+///
+/// `Known` keeps `Mode`'s `"plan"`/`"build"` strings; `Unknown` adds `"unknown"` alongside them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TurnMode {
+    Unknown,
+    #[serde(untagged)]
+    Known(Mode),
+}
+
+impl TurnModel {
+    pub fn known(model: ModelRef) -> Self {
+        Self::Known(model)
+    }
+
+    pub fn as_known(&self) -> Option<&ModelRef> {
+        match self {
+            Self::Known(model) => Some(model),
+            Self::Unknown => None,
+        }
+    }
+
+    pub fn into_known(self) -> Option<ModelRef> {
+        match self {
+            Self::Known(model) => Some(model),
+            Self::Unknown => None,
+        }
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+}
+
+impl From<ModelRef> for TurnModel {
+    fn from(value: ModelRef) -> Self {
+        Self::Known(value)
+    }
+}
+
+impl TurnMode {
+    pub fn known(mode: Mode) -> Self {
+        Self::Known(mode)
+    }
+
+    pub fn as_known(self) -> Option<Mode> {
+        match self {
+            Self::Known(mode) => Some(mode),
+            Self::Unknown => None,
+        }
+    }
+
+    pub fn is_unknown(self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+}
+
+impl From<Mode> for TurnMode {
+    fn from(value: Mode) -> Self {
+        Self::Known(value)
+    }
+}
 /// Thread-level mode (spec §7.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -81,9 +163,9 @@ pub struct Turn {
     #[serde(default)]
     pub items: Vec<Item>,
     /// Model used for this turn (may differ across turns of one thread, §8.4).
-    pub model: ModelRef,
+    pub model: TurnModel,
     /// Plan | build applied to this turn (§7.4).
-    pub mode: Mode,
+    pub mode: TurnMode,
     pub status: TurnStatus,
     /// Per-turn usage; the same `TokenUsage` struct is reused in the ledgers (B3).
     pub usage: TokenUsage,
@@ -107,6 +189,35 @@ mod tests {
         assert_eq!(json, "\"build\"");
         let back: Mode = serde_json::from_str(&json).unwrap();
         assert_eq!(back, Mode::Build);
+    }
+
+    #[test]
+    fn authoritative_metadata_keeps_legacy_known_shape_and_has_an_unknown_sentinel() {
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: None,
+        };
+        assert_eq!(
+            serde_json::to_value(TurnModel::Known(model.clone())).unwrap(),
+            serde_json::to_value(&model).unwrap()
+        );
+        assert_eq!(
+            serde_json::from_value::<TurnModel>(serde_json::to_value(&model).unwrap()).unwrap(),
+            TurnModel::Known(model)
+        );
+        assert_eq!(
+            serde_json::to_value(TurnModel::Unknown).unwrap(),
+            serde_json::json!("unknown")
+        );
+        assert_eq!(
+            serde_json::to_value(TurnMode::Unknown).unwrap(),
+            serde_json::json!("unknown")
+        );
+        assert_eq!(
+            serde_json::from_value::<TurnMode>(serde_json::json!("build")).unwrap(),
+            TurnMode::Known(Mode::Build)
+        );
     }
 
     #[test]

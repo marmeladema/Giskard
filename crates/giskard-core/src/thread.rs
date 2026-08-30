@@ -7,4 +7,5 @@ pub enum ThreadKind {
     #[default]
     Primary,
     Subagent,
+    Orphan,
 }

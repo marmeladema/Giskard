@@ -25,6 +25,7 @@ impl HarnessFactory for DiffFactory {
     async fn create(
         &self,
         _config: &ProjectConfig,
+        _bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
         Ok(Arc::new(ReplayHarness::from_fixture(self.fixture.clone())))
     }
@@ -89,12 +90,12 @@ fn make_turn(text: &str) -> giskard_core::turn::Turn {
             },
             created_at: now,
         }],
-        model: giskard_core::model::ModelRef {
+        model: giskard_core::turn::TurnModel::Known(giskard_core::model::ModelRef {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
-        },
-        mode: giskard_core::turn::Mode::Build,
+        }),
+        mode: giskard_core::turn::TurnMode::Known(giskard_core::turn::Mode::Build),
         status: TurnStatus {
             kind: TurnStatusKind::Completed,
             message: None,

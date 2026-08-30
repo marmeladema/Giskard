@@ -114,8 +114,17 @@ pub(crate) fn classify_existing_link(
     {
         return ExistingLinkDisposition::Parent;
     }
-    if existing.kind == ThreadKind::Primary || existing.parent_thread_id.is_none() {
+    if existing.kind == ThreadKind::Primary {
         return ExistingLinkDisposition::PrimaryThread;
+    }
+    if existing.kind == ThreadKind::Orphan {
+        if parent_chain_reaches(graph, proposed_parent, existing.id) {
+            return ExistingLinkDisposition::WouldCycle;
+        }
+        return ExistingLinkDisposition::OwnedChild;
+    }
+    if existing.parent_thread_id.is_none() {
+        return ExistingLinkDisposition::DifferentParent;
     }
     if existing.parent_thread_id != Some(proposed_parent) {
         return ExistingLinkDisposition::DifferentParent;
@@ -142,6 +151,7 @@ pub(crate) fn parent_chain_is_valid(
         match (thread.kind, thread.parent_thread_id) {
             (ThreadKind::Subagent, Some(parent)) => current = parent,
             (ThreadKind::Primary, None) => return true,
+            (ThreadKind::Orphan, _) => return false,
             _ => return false,
         }
     }
@@ -157,6 +167,7 @@ pub(crate) fn graph_issue(
         (ThreadKind::Subagent, Some(_)) if !parent_chain_is_valid(graph, thread.id) => {
             Some("sub-agent parent chain is missing or cyclic")
         }
+        (ThreadKind::Orphan, Some(_)) => Some("orphan thread unexpectedly has a parent"),
         _ => None,
     }
 }
@@ -247,12 +258,12 @@ mod tests {
             parent_thread_id: parent,
             spawned_by_turn_id: None,
             kind,
-            mode: Mode::Build,
-            current_model: ModelRef {
+            mode: giskard_core::turn::TurnMode::Known(Mode::Build),
+            current_model: giskard_core::turn::TurnModel::Known(ModelRef {
                 provider: "test".into(),
                 model: "test".into(),
                 reasoning_effort: None,
-            },
+            }),
             context_window: 1,
             model_context_windows: HashMap::new(),
             permission_preset: PermissionPreset::AskFirst,

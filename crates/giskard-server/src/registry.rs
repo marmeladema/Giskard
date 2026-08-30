@@ -23,11 +23,13 @@ use giskard_core::model::{ModelDescriptor, ModelRef};
 use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::text::trimmed_non_empty;
 use giskard_core::thread::ThreadKind;
-use giskard_core::turn::{Mode, Turn, TurnOverrides, TurnStatus, TurnStatusKind};
+use giskard_core::turn::{
+    Mode, Turn, TurnMode, TurnModel, TurnOverrides, TurnStatus, TurnStatusKind,
+};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentHarness, HarnessCapabilities, HarnessProvider, OpenThreadOptions, ResumePolicy,
-    ThreadHandle, ThreadUpdate, thread_update_channel,
+    AgentHarness, HarnessBootstrap, HarnessCapabilities, HarnessProvider, KnownThreadBinding,
+    OpenThreadOptions, ThreadHandle, ThreadUpdate, thread_update_channel,
 };
 use giskard_persist::PersistStore;
 use giskard_persist::store::{ProjectConfig, ThreadFile, ThreadMutation, TurnCommitOutcome};
@@ -48,15 +50,22 @@ use crate::thread_runtime::{
 
 #[async_trait]
 pub trait HarnessFactory: Send + Sync {
-    async fn create(&self, config: &ProjectConfig) -> Result<Arc<dyn AgentHarness>, HarnessError>;
+    /// Construct a harness with its complete durable identity table installed before it can
+    /// dispatch ordinary events. The bootstrap is construction input, not a command sent to an
+    /// already-running harness; returning success means every binding was validated and installed.
+    async fn create(
+        &self,
+        config: &ProjectConfig,
+        bootstrap: HarnessBootstrap,
+    ) -> Result<Arc<dyn AgentHarness>, HarnessError>;
 }
 
 /// Context describing the turn being started, used to persist a `Turn` on completion (§7.1).
 #[derive(Clone)]
 struct TurnContext {
     user_input: UserInput,
-    model: ModelRef,
-    mode: Mode,
+    model: TurnModel,
+    mode: TurnMode,
     kind: TurnContextKind,
 }
 
@@ -65,6 +74,7 @@ enum TurnContextKind {
     User,
     ManualCompaction,
     ExternalSubagent,
+    ExternalOrphan,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -93,6 +103,7 @@ fn turn_context_kind_label(kind: TurnContextKind) -> &'static str {
         TurnContextKind::User => "user",
         TurnContextKind::ManualCompaction => "manual_compaction",
         TurnContextKind::ExternalSubagent => "external_subagent",
+        TurnContextKind::ExternalOrphan => "external_orphan",
     }
 }
 
@@ -105,14 +116,35 @@ fn turn_reservation(
         project_id,
         harness_thread_id: handle.harness_thread_id.clone(),
         mode: ctx.mode,
-        provider: ctx.model.provider.clone(),
-        model: ctx.model.model.clone(),
+        model: ctx.model.clone(),
         context_kind: turn_context_kind_label(ctx.kind),
     }
 }
 
+/// The visible input label for a native turn Giskard did not start.
+///
+/// A promptless external turn still gets one row of presentation metadata, and it may only name
+/// what Giskard has actually established. A classified child is a sub-agent turn; an unclassified
+/// native thread has no proven relationship yet, so its turns must not claim one. A `Primary`
+/// thread never reaches this path with an empty label unless Giskard missed the start, so it keeps
+/// the empty input it has always had.
+///
+/// A turn committed while the thread was unclassified keeps this label after classification, for
+/// the same reason its mode is not rewritten: the label records what was known when the turn was
+/// persisted, not what is known now.
+fn external_turn_input_label(classification: ClassificationPhase) -> UserInput {
+    match classification {
+        ClassificationPhase::Primary => UserInput::text(""),
+        ClassificationPhase::Subagent => UserInput::text("Sub-agent turn"),
+        ClassificationPhase::Orphan => UserInput::text("Unclassified native turn"),
+    }
+}
+
 fn live_turn_user_input(ctx: &TurnContext) -> Option<UserInput> {
-    if ctx.kind != TurnContextKind::ExternalSubagent {
+    if !matches!(
+        ctx.kind,
+        TurnContextKind::ExternalSubagent | TurnContextKind::ExternalOrphan
+    ) {
         return None;
     }
     ctx.user_input
@@ -202,6 +234,7 @@ struct CoordinatorToken {
 enum ClassificationPhase {
     Primary,
     Subagent,
+    Orphan,
 }
 
 impl From<ThreadKind> for ClassificationPhase {
@@ -209,6 +242,7 @@ impl From<ThreadKind> for ClassificationPhase {
         match kind {
             ThreadKind::Primary => Self::Primary,
             ThreadKind::Subagent => Self::Subagent,
+            ThreadKind::Orphan => Self::Orphan,
         }
     }
 }
@@ -316,6 +350,21 @@ impl ThreadCoordinator {
 
     async fn classification(&self) -> ClassificationPhase {
         self.state.lock().await.classification
+    }
+
+    async fn classify_orphan_as_subagent(&self) -> Result<(), HarnessError> {
+        let mut state = self.state.lock().await;
+        match state.classification {
+            ClassificationPhase::Orphan => {
+                state.classification = ClassificationPhase::Subagent;
+                Ok(())
+            }
+            ClassificationPhase::Subagent => Ok(()),
+            ClassificationPhase::Primary => Err(HarnessError::Protocol(format!(
+                "primary thread {} cannot be classified as a sub-agent",
+                state.binding.handle.thread
+            ))),
+        }
     }
 
     async fn activate_owner(&self, control: EventOwnerControl) -> Result<(), HarnessError> {
@@ -824,6 +873,7 @@ impl RegistryShared {
     }
 }
 
+#[cfg(test)]
 fn prepare_thread_updates(
     shared: &RegistryShared,
     thread_id: ThreadId,
@@ -902,7 +952,9 @@ impl HarnessRegistry {
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
         match thread.kind {
             ThreadKind::Primary => Ok(()),
-            ThreadKind::Subagent => Err(HarnessError::ThreadReadOnly { thread: thread_id }),
+            ThreadKind::Subagent | ThreadKind::Orphan => {
+                Err(HarnessError::ThreadReadOnly { thread: thread_id })
+            }
         }
     }
 
@@ -983,32 +1035,16 @@ impl HarnessRegistry {
         // which case the re-check below returns theirs and this read is discarded — the cost of a
         // wasted scan on a path that runs once per project, against holding a global lock across
         // I/O on every path that does not.
-        let bindings = self.known_thread_bindings(project).await;
+        let bootstrap = self.known_thread_bindings(project).await?;
 
         let mut harnesses = self.shared.harnesses.lock().await;
         if let Some(harness) = harness_slot(&harnesses, project)? {
             return Ok(harness);
         }
-        let h = self.factory.create(config).await?;
-
-        // Hand the bindings over *before* publishing the harness.
-        //
-        // Codex announces a sub-agent's thread as soon as it loads one, which for a child we
-        // persisted in an earlier run happens before the parent's tool call names it. Without
-        // these bindings the adapter meets a native id it has never seen and invents a ThreadId
-        // for a thread that already has one.
-        //
-        // The ordering is the whole point, so it is enforced rather than assumed: the harness
-        // enters the map only once bound, so no concurrent caller can take it out and open a
-        // thread on it in between.
-        if let Some(bindings) = bindings {
-            debug!(
-                project_id = %project,
-                bindings = bindings.len(),
-                "handing known thread bindings to a new harness"
-            );
-            h.bind_known_threads(bindings).await;
-        }
+        let binding_count = bootstrap.known_threads.len();
+        let h = self.factory.create(config, bootstrap).await?;
+        debug!(project_id = %project, bindings = binding_count,
+            "created harness with durable thread bindings installed");
 
         harnesses
             .by_project
@@ -1018,31 +1054,49 @@ impl HarnessRegistry {
 
     /// Every `(native id, ThreadId)` pair this project has already persisted.
     ///
-    /// `None` when they could not be read: not fatal, because the harness still works and a thread
-    /// Giskard opens itself registers on the way through. What is lost is the guarantee for
-    /// children Codex announces before Giskard opens them, so it is worth a warning.
-    ///
     /// Read from the same thread files the thread graph is built from; nothing else is loaded, and
-    /// turn files are never touched.
-    async fn known_thread_bindings(&self, project: ProjectId) -> Option<Vec<(String, ThreadId)>> {
-        match load_thread_graph(&self.shared.store, project).await {
-            Ok(graph) => Some(
-                graph
-                    .values()
-                    .filter(|thread| !thread.harness_thread_id.is_empty())
-                    .map(|thread| (thread.harness_thread_id.clone(), thread.id))
-                    .collect(),
-            ),
-            Err(error) => {
-                warn!(
-                    project_id = %project,
-                    %error,
-                    "could not read known thread bindings; sub-agent threads announced before \
-                     Giskard opens them may be routed under a fresh id"
-                );
-                None
+    /// turn files are never touched. A failed/incomplete scan or a non-bijective identity table is
+    /// fatal: publishing a harness without every durable binding would reintroduce the startup
+    /// window this bootstrap exists to close.
+    async fn known_thread_bindings(
+        &self,
+        project: ProjectId,
+    ) -> Result<HarnessBootstrap, HarnessError> {
+        let graph = load_thread_graph(&self.shared.store, project)
+            .await
+            .map_err(|error| {
+                HarnessError::Protocol(format!(
+                    "could not load durable thread bindings for project {project}: {error}"
+                ))
+            })?;
+        let mut native_ids = HashSet::new();
+        let mut thread_ids = HashSet::new();
+        let mut known_threads = Vec::with_capacity(graph.len());
+        for thread in graph.values() {
+            if thread.harness_thread_id.is_empty() {
+                return Err(HarnessError::Protocol(format!(
+                    "thread {} has an empty native thread id",
+                    thread.id
+                )));
             }
+            if !native_ids.insert(thread.harness_thread_id.clone()) {
+                return Err(HarnessError::Protocol(format!(
+                    "native thread id {} is bound more than once",
+                    thread.harness_thread_id
+                )));
+            }
+            if !thread_ids.insert(thread.id) {
+                return Err(HarnessError::Protocol(format!(
+                    "thread id {} is bound more than once",
+                    thread.id
+                )));
+            }
+            known_threads.push(KnownThreadBinding {
+                harness_thread_id: thread.harness_thread_id.clone(),
+                thread_id: thread.id,
+            });
         }
+        Ok(HarnessBootstrap { known_threads })
     }
 
     pub async fn open_thread(
@@ -1053,54 +1107,41 @@ impl HarnessRegistry {
         resume: Option<String>,
         initial_model: Option<ModelRef>,
     ) -> Result<ThreadHandle, HarnessError> {
-        self.open_thread_with_resume_policy(
-            config,
-            workspace_root,
-            thread,
-            resume,
-            initial_model,
-            ResumePolicy::AllowFreshFallback,
-        )
-        .await
+        self.open_primary_thread(config, workspace_root, thread, resume, initial_model)
+            .await
     }
 
-    pub async fn open_linked_thread(
+    /// Attach a persisted provider-owned child without resuming or nudging native work.
+    pub async fn attach_subagent_thread(
         &self,
         config: &ProjectConfig,
-        workspace_root: &str,
-        thread: Option<ThreadId>,
-        resume: String,
-        initial_model: ModelRef,
+        thread: &ThreadFile,
     ) -> Result<ThreadHandle, HarnessError> {
-        self.open_thread_with_resume_policy(
-            config,
-            workspace_root,
-            thread,
-            Some(resume),
-            Some(initial_model),
-            ResumePolicy::RequireExisting,
-        )
-        .await
+        if thread.kind != ThreadKind::Subagent {
+            return Err(HarnessError::Protocol(format!(
+                "thread {} is not a sub-agent",
+                thread.id
+            )));
+        }
+        self.get_or_create_harness(config.id, config).await?;
+        ensure_subagent_thread_open(config, thread, &self.shared).await?;
+        self.get_thread_handle(thread.id)
+            .await
+            .ok_or(HarnessError::ThreadNotFound(thread.id))
     }
 
-    async fn open_thread_with_resume_policy(
+    async fn open_primary_thread(
         &self,
         config: &ProjectConfig,
         workspace_root: &str,
         thread: Option<ThreadId>,
         resume: Option<String>,
         initial_model: Option<ModelRef>,
-        resume_policy: ResumePolicy,
     ) -> Result<ThreadHandle, HarnessError> {
-        let classification = match resume_policy {
-            ResumePolicy::AllowFreshFallback => ClassificationPhase::Primary,
-            ResumePolicy::RequireExisting => ClassificationPhase::Subagent,
-        };
         debug!(
             project_id = %config.id,
             thread_id = display_opt(thread),
             resume = display_opt(resume.as_deref()),
-            ?resume_policy,
             "opening harness thread"
         );
         // Serialize the cold check and native open for an already-known thread. Locking only when
@@ -1115,11 +1156,15 @@ impl HarnessRegistry {
             && let Some(existing) = self.shared.threads.lock().await.get(&thread_id).cloned()
         {
             return existing
-                .reusable_handle(config.id, thread_id, resume.as_deref(), classification)
+                .reusable_handle(
+                    config.id,
+                    thread_id,
+                    resume.as_deref(),
+                    ClassificationPhase::Primary,
+                )
                 .await;
         }
         let harness = self.get_or_create_harness(config.id, config).await?;
-        let requested_native_id = resume.clone();
         let (updates, update_stream) = thread_update_channel();
         let restore_permit =
             thread.map(|thread_id| self.shared.runtime.restoration_permit(thread_id));
@@ -1130,7 +1175,6 @@ impl HarnessRegistry {
                 thread,
                 workspace_root: workspace_root.into(),
                 resume,
-                resume_policy,
                 initial_model: initial_model.clone(),
                 updates,
             })
@@ -1140,18 +1184,6 @@ impl HarnessRegistry {
         // function returns, making the harness-returned identity safe to capture here.
         let restore_permit =
             restore_permit.unwrap_or_else(|| self.shared.runtime.restoration_permit(handle.thread));
-
-        // This is the harness-neutral identity boundary. Individual adapters may enforce the same
-        // contract internally, but the registry must not rely on adapter-specific validation.
-        if resume_policy == ResumePolicy::RequireExisting
-            && requested_native_id.as_deref() != Some(handle.harness_thread_id.as_str())
-        {
-            return Err(HarnessError::Protocol(format!(
-                "linked-thread resume returned native thread {} instead of {}",
-                handle.harness_thread_id,
-                requested_native_id.as_deref().unwrap_or_default()
-            )));
-        }
 
         // Bind the model the harness reports as effective when it says so — Codex can ignore
         // resume overrides for a loaded thread, and the binding must reflect reality, not the
@@ -1166,9 +1198,21 @@ impl HarnessRegistry {
             native_model,
         };
         let owner_installed = if owner_guard.is_some() {
-            install_event_owner_locked(&self.shared, &harness, binding, classification).await?
+            install_event_owner_locked(
+                &self.shared,
+                &harness,
+                binding,
+                ClassificationPhase::Primary,
+            )
+            .await?
         } else {
-            install_event_owner(&self.shared, &harness, binding, classification).await?
+            install_event_owner(
+                &self.shared,
+                &harness,
+                binding,
+                ClassificationPhase::Primary,
+            )
+            .await?
         };
         if owner_installed {
             drop(spawn_thread_update_forwarder(
@@ -1228,8 +1272,8 @@ impl HarnessRegistry {
 
         let ctx = TurnContext {
             user_input: input.clone(),
-            model: effective_model,
-            mode: overrides.mode,
+            model: TurnModel::Known(effective_model),
+            mode: TurnMode::Known(overrides.mode),
             kind: TurnContextKind::User,
         };
         let request_started = Instant::now();
@@ -1257,8 +1301,7 @@ impl HarnessRegistry {
                         %turn_id,
                         harness_thread_id = %handle.harness_thread_id,
                         mode = ?ctx.mode,
-                        provider = %ctx.model.provider,
-                        model = %ctx.model.model,
+                        model = ?ctx.model,
                         ack_elapsed_ms = request_started.elapsed().as_millis(),
                         "harness accepted turn start request"
                     );
@@ -1274,8 +1317,7 @@ impl HarnessRegistry {
                         %thread_id,
                         harness_thread_id = %handle.harness_thread_id,
                         mode = ?ctx.mode,
-                        provider = %ctx.model.provider,
-                        model = %ctx.model.model,
+                        model = ?ctx.model,
                         error = %error,
                         ack_elapsed_ms = request_started.elapsed().as_millis(),
                         "harness rejected turn start request"
@@ -1537,8 +1579,8 @@ impl HarnessRegistry {
         );
         let ctx = TurnContext {
             user_input: UserInput::text("/compact"),
-            model: effective_model,
-            mode,
+            model: TurnModel::Known(effective_model),
+            mode: TurnMode::Known(mode),
             kind: TurnContextKind::ManualCompaction,
         };
         let operation = self
@@ -2303,7 +2345,7 @@ async fn materialize_subagent_thread(
         (Some(graph), existing)
     };
 
-    if let Some(existing) = existing {
+    if let Some(mut existing) = existing {
         // A reverse link is uncommon and needs the complete graph to distinguish a valid direct
         // parent from the same direct fields inside a dangling or cyclic ownership chain. Keep the
         // hot path for repeated child activity cheap, but make reverse classification identical
@@ -2321,9 +2363,9 @@ async fn materialize_subagent_thread(
         let disposition = match graph.as_ref() {
             Some(graph) => classify_existing_link(graph, parent_thread_id, &existing),
             None if existing.id == parent_thread_id => ExistingLinkDisposition::SelfLink,
-            None if existing.kind == ThreadKind::Primary || existing.parent_thread_id.is_none() => {
-                ExistingLinkDisposition::PrimaryThread
-            }
+            None if existing.kind == ThreadKind::Primary => ExistingLinkDisposition::PrimaryThread,
+            None if existing.kind == ThreadKind::Orphan => ExistingLinkDisposition::OwnedChild,
+            None if existing.parent_thread_id.is_none() => ExistingLinkDisposition::DifferentParent,
             None if existing.parent_thread_id != Some(parent_thread_id) => {
                 ExistingLinkDisposition::DifferentParent
             }
@@ -2352,6 +2394,47 @@ async fn materialize_subagent_thread(
                 "ignoring sub-agent materialization for an existing thread with incompatible ownership"
             );
             return Ok(None);
+        }
+        if existing.kind == ThreadKind::Orphan {
+            let desired_title = subagent_thread_title(&info);
+            let mutation = shared
+                .thread_metadata
+                .classify_orphan(
+                    project_id,
+                    existing.id,
+                    existing.revision,
+                    crate::thread_metadata::OrphanClassification {
+                        parent_thread_id,
+                        spawned_by_turn_id,
+                        title: desired_title,
+                        mode: parent_file.mode,
+                        permission_preset: parent_file.permission_preset,
+                    },
+                )
+                .await
+                .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+            existing = mutation.into_current().ok_or_else(|| {
+                HarnessError::Protocol(format!(
+                    "orphan thread {} disappeared during classification",
+                    existing.id
+                ))
+            })?;
+            if existing.kind != ThreadKind::Subagent
+                || existing.parent_thread_id != Some(parent_thread_id)
+                || existing.spawned_by_turn_id != Some(spawned_by_turn_id)
+            {
+                return Err(HarnessError::Protocol(format!(
+                    "orphan thread {} was classified concurrently with conflicting ownership",
+                    existing.id
+                )));
+            }
+            if let Some(coordinator) = shared.threads.lock().await.get(&existing.id).cloned() {
+                coordinator.classify_orphan_as_subagent().await?;
+            }
+            shared
+                .thread_metadata
+                .publish_created(project_id, &existing)
+                .await;
         }
         let opened_agent_name =
             ensure_subagent_thread_open(&project_config, &existing, &shared).await?;
@@ -2387,12 +2470,8 @@ async fn materialize_subagent_thread(
         return Ok(None);
     }
 
-    let model = parent_file.current_model.clone();
     let mode = parent_file.mode;
-    let context_window = parent_file.context_window;
-    let model_context_windows = parent_file.model_context_windows.clone();
     let permission_preset = parent_file.permission_preset;
-    let model_efforts = parent_file.model_efforts.clone();
 
     let harness = shared
         .active_harness(project_id)
@@ -2403,24 +2482,17 @@ async fn materialize_subagent_thread(
     // and applied on its next cold resume, moving the thread out of the worktree its own earlier
     // work is in.
     let workspace_root = subagent_workspace_root(&shared, &project_config, &parent_file).await?;
-    let (updates, update_stream) = thread_update_channel();
+    let child_thread_id = ThreadId::new();
     let handle = harness
-        .open_thread(OpenThreadOptions {
-            project: project_id,
-            thread: None,
-            workspace_root: workspace_root.into(),
-            resume: Some(info.native_thread_id.clone()),
-            resume_policy: ResumePolicy::RequireExisting,
-            initial_model: Some(model.clone()),
-            updates,
-        })
+        .claim_native_thread(
+            child_thread_id,
+            info.native_thread_id.clone(),
+            workspace_root.into(),
+        )
         .await?;
-    let restore_permit = shared.runtime.restoration_permit(handle.thread);
-    // This path calls the harness directly rather than `open_thread_with_resume_policy`, so retain
-    // the registry's harness-neutral strict-resume check even when the adapter also validates it.
     if handle.harness_thread_id != info.native_thread_id {
         return Err(HarnessError::Protocol(format!(
-            "linked-thread resume returned native thread {} instead of {}",
+            "linked-thread claim returned native thread {} instead of {}",
             handle.harness_thread_id, info.native_thread_id
         )));
     }
@@ -2437,12 +2509,16 @@ async fn materialize_subagent_thread(
         );
         return Ok(None);
     }
-    let current_model = handle.resumed_model.clone().unwrap_or(model);
+    let current_model = handle
+        .resumed_model
+        .clone()
+        .map(TurnModel::Known)
+        .unwrap_or(TurnModel::Unknown);
     let info = subagent_info_with_agent_name(info, handle.agent_name.clone());
     let now = Utc::now();
     let thread_file = ThreadFile {
         revision: 0,
-        version: 1,
+        version: giskard_persist::store::THREAD_METADATA_VERSION,
         id: handle.thread,
         project_id,
         title: subagent_thread_title(&info),
@@ -2452,10 +2528,10 @@ async fn materialize_subagent_thread(
         kind: ThreadKind::Subagent,
         mode,
         current_model: current_model.clone(),
-        context_window,
-        model_context_windows,
+        context_window: 0,
+        model_context_windows: HashMap::new(),
         permission_preset,
-        model_efforts,
+        model_efforts: HashMap::new(),
         tokens: giskard_core::token::TokenLedger::default(),
         created_at: now,
         updated_at: now,
@@ -2469,8 +2545,8 @@ async fn materialize_subagent_thread(
         .map_err(|error| HarnessError::Protocol(error.to_string()))?;
     // The bounded channel retains an early replay while the thread is being created. Start the
     // forwarder only after metadata exists, so restoration cannot race creation and be lost.
-    let native_model = Some(current_model.clone());
-    let owner_installed = install_event_owner(
+    let native_model = current_model.as_known().cloned();
+    install_event_owner(
         &shared,
         &harness,
         BindingData {
@@ -2481,15 +2557,6 @@ async fn materialize_subagent_thread(
         ClassificationPhase::Subagent,
     )
     .await?;
-    if owner_installed {
-        drop(spawn_thread_update_forwarder(
-            shared.clone(),
-            project_id,
-            handle.thread,
-            update_stream,
-            restore_permit,
-        ));
-    }
     // The thread and binding are durable even if observation setup below fails. Publish the
     // creation now so a retry cannot leave the catalog unaware of an already-existing child.
     shared
@@ -2632,8 +2699,8 @@ async fn ensure_subagent_thread_open(
         .active_harness(project_config.id)
         .await
         .ok_or(HarnessError::ThreadNotFound(thread_file.id))?;
-    // Reopening a persisted sub-agent is that cold resume: resolve from the chain, not from the
-    // child's own record, which never names a worktree.
+    // A sub-agent is provider-owned and read-only. Reattach its durable identity to this harness
+    // lifetime without issuing thread/resume or otherwise nudging native work.
     let workspace_root = subagent_workspace_root(shared, project_config, thread_file).await?;
     let _owner_guard = lock_thread_owner_after_drain(shared, thread_file.id).await;
     if let Some(coordinator) = shared.threads.lock().await.get(&thread_file.id).cloned() {
@@ -2647,34 +2714,25 @@ async fn ensure_subagent_thread_open(
             .await?;
         return Ok(handle.agent_name);
     }
-    let (updates, update_stream, restore_permit) = prepare_thread_updates(shared, thread_file.id);
     let handle = harness
-        .open_thread(OpenThreadOptions {
-            project: project_config.id,
-            thread: Some(thread_file.id),
-            workspace_root: workspace_root.into(),
-            resume: Some(thread_file.harness_thread_id.clone()),
-            resume_policy: ResumePolicy::RequireExisting,
-            initial_model: Some(thread_file.current_model.clone()),
-            updates,
-        })
+        .claim_native_thread(
+            thread_file.id,
+            thread_file.harness_thread_id.clone(),
+            workspace_root.into(),
+        )
         .await?;
-    // This path calls the harness directly rather than `open_thread_with_resume_policy`, so retain
-    // the registry's harness-neutral strict-resume check even when the adapter also validates it.
     if handle.harness_thread_id != thread_file.harness_thread_id {
         return Err(HarnessError::Protocol(format!(
-            "linked-thread resume returned native thread {} instead of {}",
+            "linked-thread claim returned native thread {} instead of {}",
             handle.harness_thread_id, thread_file.harness_thread_id
         )));
     }
-    let native_model = Some(
-        handle
-            .resumed_model
-            .clone()
-            .unwrap_or_else(|| thread_file.current_model.clone()),
-    );
+    let native_model = handle
+        .resumed_model
+        .clone()
+        .or_else(|| thread_file.current_model.as_known().cloned());
     let agent_name = handle.agent_name.clone();
-    let owner_installed = install_event_owner_locked(
+    install_event_owner_locked(
         shared,
         &harness,
         BindingData {
@@ -2685,15 +2743,6 @@ async fn ensure_subagent_thread_open(
         ClassificationPhase::Subagent,
     )
     .await?;
-    if owner_installed {
-        drop(spawn_thread_update_forwarder(
-            shared.clone(),
-            project_config.id,
-            thread_file.id,
-            update_stream,
-            restore_permit,
-        ));
-    }
     Ok(agent_name)
 }
 
@@ -2861,28 +2910,20 @@ async fn forward_events(
         .flatten();
     let classification = coordinator.classification().await;
     let external_context = TurnContext {
-        user_input: if classification == ClassificationPhase::Subagent {
-            UserInput::text("Sub-agent turn")
-        } else {
-            UserInput::text("")
-        },
+        user_input: external_turn_input_label(classification),
         model: persisted
             .as_ref()
             .map(|thread| thread.current_model.clone())
-            .or(binding.native_model.clone())
-            .unwrap_or_else(|| ModelRef {
-                provider: "unknown".into(),
-                model: "unknown".into(),
-                reasoning_effort: None,
-            }),
+            .or_else(|| binding.native_model.clone().map(TurnModel::Known))
+            .unwrap_or(TurnModel::Unknown),
         mode: persisted
             .as_ref()
             .map(|thread| thread.mode)
-            .unwrap_or(Mode::Build),
-        kind: if classification == ClassificationPhase::Subagent {
-            TurnContextKind::ExternalSubagent
-        } else {
-            TurnContextKind::User
+            .unwrap_or(TurnMode::Unknown),
+        kind: match classification {
+            ClassificationPhase::Primary => TurnContextKind::User,
+            ClassificationPhase::Subagent => TurnContextKind::ExternalSubagent,
+            ClassificationPhase::Orphan => TurnContextKind::ExternalOrphan,
         },
     };
     let mut ctx = external_context.clone();
@@ -2910,8 +2951,7 @@ async fn forward_events(
         %thread_id,
         context_kind = turn_context_kind_label(ctx.kind),
         mode = ?ctx.mode,
-        provider = %ctx.model.provider,
-        model = %ctx.model.model,
+        model = ?ctx.model,
         turn_gate_held = turn_gate.as_ref().is_some_and(|lease| !lease.is_released()),
         persisted_turn_count = seen_turn_ids.len(),
         "event forwarder started"
@@ -3179,8 +3219,7 @@ async fn forward_events(
                                 %thread_id,
                                 context_kind = turn_context_kind_label(ctx.kind),
                                 mode = ?ctx.mode,
-                                provider = %ctx.model.provider,
-                                model = %ctx.model.model,
+                                model = ?ctx.model,
                                 error = %error,
                                 turn_gate_held = turn_gate
                                     .as_ref()
@@ -3236,18 +3275,22 @@ async fn forward_events(
                     ..
                 } = &event
                 {
-                    if model.provider != ctx.model.provider || model.model != ctx.model.model {
+                    if ctx.model.as_known().is_some_and(|expected| {
+                        model.provider != expected.provider || model.model != expected.model
+                    }) {
                         error!(
                             %project_id,
                             %thread_id,
                             turn = %turn,
-                            expected_provider = %ctx.model.provider,
-                            expected_model = %ctx.model.model,
+                            expected_model = ?ctx.model,
                             event_provider = %model.provider,
                             event_model = %model.model,
                             "dropping context-window update for the wrong turn model"
                         );
                         continue;
+                    }
+                    if ctx.model.as_known().is_none() {
+                        ctx.model = TurnModel::Known(model.clone());
                     }
                     persist_model_context_window(
                         &shared.thread_metadata,
@@ -3548,8 +3591,7 @@ async fn forward_events(
                         turn = %incomplete_turn,
                         context_kind = turn_context_kind_label(ctx.kind),
                         mode = ?ctx.mode,
-                        provider = %ctx.model.provider,
-                        model = %ctx.model.model,
+                        model = ?ctx.model,
                         owned_turn = display_opt(owned_turn),
                         turn_id = display_opt(turn_id),
                         stream_error = display_opt(stream_error.as_deref()),
@@ -3634,8 +3676,7 @@ async fn forward_events(
             %thread_id,
             context_kind = turn_context_kind_label(ctx.kind),
             mode = ?ctx.mode,
-            provider = %ctx.model.provider,
-            model = %ctx.model.model,
+            model = ?ctx.model,
             owned_turn = display_opt(owned_turn),
             turn_id = display_opt(turn_id),
             exit_reason = forwarder_exit_reason_label(exit_reason),
@@ -4343,8 +4384,7 @@ async fn persist_turn(
         turn.status.kind,
         TurnStatusKind::Completed | TurnStatusKind::Interrupted
     );
-    let provider = turn.model.provider.clone();
-    let model = turn.model.model.clone();
+    let model = turn.model.clone();
     let usage = turn.usage;
     let turn_id = turn.id;
     let item_count = turn.items.len();
@@ -4434,9 +4474,14 @@ async fn persist_turn(
     // Fold the same usage into the project + global ledgers via the single-writer actor (§10.2).
     if should_record {
         let date = Utc::now().format("%Y-%m-%d").to_string();
-        ledger
-            .record(project_id, date, provider, model, usage)
-            .await;
+        match model.into_known() {
+            Some(model) => {
+                ledger
+                    .record(project_id, date, model.provider, model.model, usage)
+                    .await;
+            }
+            None => ledger.record_unattributed(project_id, date, usage).await,
+        }
     }
 
     PersistTurnOutcome {
@@ -4464,7 +4509,9 @@ mod tests {
     use giskard_core::model::ModelRef;
     use giskard_core::server_request::ServerRequest;
     use giskard_core::token::{TokenLedger, TokenUsage};
-    use giskard_core::turn::{Mode, PermissionPreset, Turn, TurnStatus, TurnStatusKind};
+    use giskard_core::turn::{
+        Mode, PermissionPreset, Turn, TurnMode, TurnModel, TurnStatus, TurnStatusKind,
+    };
     use giskard_core::user_input::UserInput;
     use giskard_harness::{
         AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
@@ -4768,6 +4815,7 @@ mod tests {
         async fn create(
             &self,
             _config: &ProjectConfig,
+            _bootstrap: giskard_harness::HarnessBootstrap,
         ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
             Err(HarnessError::Protocol(
                 "unused test harness factory was called".into(),
@@ -4790,14 +4838,6 @@ mod tests {
 
         async fn list_models(&self) -> Result<Vec<giskard_core::ModelDescriptor>, HarnessError> {
             Ok(Vec::new())
-        }
-
-        async fn bind_known_threads(&self, bindings: Vec<(String, ThreadId)>) {
-            // Held open so a second caller is certainly inside the window between the harness
-            // existing and its bindings landing. Without this the test only catches the bug when
-            // the scheduler happens to interleave, which is not a test.
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            self.bound.store(bindings.len().max(1), Ordering::SeqCst);
         }
 
         async fn open_thread(
@@ -4858,7 +4898,14 @@ mod tests {
         async fn create(
             &self,
             _config: &ProjectConfig,
+            bootstrap: giskard_harness::HarnessBootstrap,
         ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
+            // Held open so a second caller is certainly inside construction. The harness must not
+            // become reachable until its complete bootstrap has been installed.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            self.harness
+                .bound
+                .store(bootstrap.known_threads.len().max(1), Ordering::SeqCst);
             Ok(self.harness.clone())
         }
     }
@@ -4916,7 +4963,6 @@ mod tests {
                             thread: None,
                             workspace_root: "/tmp/test".into(),
                             resume: Some("native-child".into()),
-                            resume_policy: giskard_harness::ResumePolicy::AllowFreshFallback,
                             initial_model: None,
                             updates,
                         })
@@ -4934,6 +4980,75 @@ mod tests {
             harness.opened_before_bound.load(Ordering::SeqCst),
             0,
             "no thread may be opened on a harness that has not been given its bindings"
+        );
+    }
+
+    #[tokio::test]
+    async fn conflicting_durable_bindings_prevent_harness_publication() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        store
+            .create_project(project_id, "proj", "/tmp/test")
+            .await
+            .unwrap();
+        let now = Utc::now();
+        for thread_id in [ThreadId::new(), ThreadId::new()] {
+            store
+                .save_thread(
+                    project_id,
+                    &ThreadFile {
+                        revision: 0,
+                        version: giskard_persist::store::THREAD_METADATA_VERSION,
+                        id: thread_id,
+                        project_id,
+                        title: "conflict".into(),
+                        harness_thread_id: "duplicate-native-id".into(),
+                        parent_thread_id: None,
+                        spawned_by_turn_id: None,
+                        kind: giskard_core::ThreadKind::Primary,
+                        mode: TurnMode::Known(Mode::Build),
+                        current_model: TurnModel::Known(ModelRef {
+                            provider: "openai".into(),
+                            model: "test".into(),
+                            reasoning_effort: None,
+                        }),
+                        context_window: 128_000,
+                        model_context_windows: Default::default(),
+                        permission_preset: PermissionPreset::AskFirst,
+                        model_efforts: Default::default(),
+                        tokens: TokenLedger::default(),
+                        created_at: now,
+                        updated_at: now,
+                        archived: false,
+                        git_workspace: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let registry = super::HarnessRegistry::new(
+            Arc::new(UnusedHarnessFactory),
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store.clone()),
+        );
+        let config = store.load_project(project_id).await.unwrap().unwrap();
+
+        let error = match registry.get_or_create_harness(project_id, &config).await {
+            Ok(_) => panic!("conflicting durable identities must prevent harness creation"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("bound more than once"));
+        assert!(
+            !registry
+                .shared
+                .harnesses
+                .lock()
+                .await
+                .by_project
+                .contains_key(&project_id),
+            "a conflicting bootstrap must not publish any harness state"
         );
     }
 
@@ -5113,12 +5228,12 @@ mod tests {
     fn test_turn_context() -> TurnContext {
         TurnContext {
             user_input: UserInput::text("test"),
-            model: ModelRef {
+            model: TurnModel::Known(ModelRef {
                 provider: "openai".into(),
                 model: "test".into(),
                 reasoning_effort: None,
-            },
-            mode: Mode::Build,
+            }),
+            mode: TurnMode::Known(Mode::Build),
             kind: TurnContextKind::User,
         }
     }
@@ -5718,8 +5833,8 @@ mod tests {
                     parent_thread_id: None,
                     spawned_by_turn_id: None,
                     kind: giskard_core::ThreadKind::Primary,
-                    mode: Mode::Build,
-                    current_model: model.clone(),
+                    mode: TurnMode::Known(Mode::Build),
+                    current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
@@ -5776,8 +5891,8 @@ mod tests {
                 let handle = ThreadHandle::detached(stale_thread_id, "native-stale".into());
                 let ctx = TurnContext {
                     user_input: UserInput::text("newer turn"),
-                    model: model.clone(),
-                    mode: Mode::Build,
+                    model: TurnModel::Known(model.clone()),
+                    mode: TurnMode::Known(Mode::Build),
                     kind: TurnContextKind::User,
                 };
                 let _lease = shared
@@ -5845,8 +5960,8 @@ mod tests {
                     parent_thread_id: None,
                     spawned_by_turn_id: None,
                     kind: giskard_core::ThreadKind::Primary,
-                    mode: Mode::Build,
-                    current_model: model.clone(),
+                    mode: TurnMode::Known(Mode::Build),
+                    current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
@@ -5958,8 +6073,8 @@ mod tests {
                     parent_thread_id: None,
                     spawned_by_turn_id: None,
                     kind: giskard_core::ThreadKind::Primary,
-                    mode: Mode::Build,
-                    current_model: model.clone(),
+                    mode: TurnMode::Known(Mode::Build),
+                    current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
@@ -6043,7 +6158,10 @@ mod tests {
                 if state.metadata.context_window == 258_400 {
                     matching_states += 1;
                     assert_eq!(state.metadata.revision, persisted.revision);
-                    assert_eq!(state.metadata.current_model, model);
+                    assert_eq!(
+                        state.metadata.current_model,
+                        TurnModel::Known(model.clone())
+                    );
                 }
             }
         }
@@ -6083,8 +6201,8 @@ mod tests {
                     parent_thread_id: None,
                     spawned_by_turn_id: None,
                     kind: giskard_core::ThreadKind::Primary,
-                    mode: Mode::Build,
-                    current_model: model.clone(),
+                    mode: TurnMode::Known(Mode::Build),
+                    current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
@@ -6218,8 +6336,8 @@ mod tests {
                     parent_thread_id: None,
                     spawned_by_turn_id: None,
                     kind: giskard_core::ThreadKind::Primary,
-                    mode: Mode::Build,
-                    current_model: model.clone(),
+                    mode: TurnMode::Known(Mode::Build),
+                    current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
@@ -6411,8 +6529,8 @@ mod tests {
                     parent_thread_id: None,
                     spawned_by_turn_id: None,
                     kind: giskard_core::ThreadKind::Primary,
-                    mode: Mode::Build,
-                    current_model: model.clone(),
+                    mode: TurnMode::Known(Mode::Build),
+                    current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
@@ -6539,8 +6657,8 @@ mod tests {
 
         let replacement_context = TurnContext {
             user_input: UserInput::text("replacement"),
-            model,
-            mode: Mode::Build,
+            model: TurnModel::Known(model),
+            mode: TurnMode::Known(Mode::Build),
             kind: TurnContextKind::User,
         };
         let replacement = prepare_test_operation(&coordinator, &runtime, replacement_context).await;
@@ -6576,8 +6694,8 @@ mod tests {
                     parent_thread_id: None,
                     spawned_by_turn_id: None,
                     kind: giskard_core::ThreadKind::Primary,
-                    mode: Mode::Build,
-                    current_model: model.clone(),
+                    mode: TurnMode::Known(Mode::Build),
+                    current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
@@ -6619,8 +6737,8 @@ mod tests {
                         },
                         created_at: now,
                     }],
-                    model: model.clone(),
-                    mode: Mode::Build,
+                    model: TurnModel::Known(model.clone()),
+                    mode: TurnMode::Known(Mode::Build),
                     status: TurnStatus {
                         kind: TurnStatusKind::Completed,
                         message: None,
@@ -6704,8 +6822,8 @@ mod tests {
                     parent_thread_id: None,
                     spawned_by_turn_id: None,
                     kind: giskard_core::ThreadKind::Primary,
-                    mode: Mode::Build,
-                    current_model: model.clone(),
+                    mode: TurnMode::Known(Mode::Build),
+                    current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
@@ -6747,8 +6865,8 @@ mod tests {
                         },
                         created_at: now,
                     }],
-                    model: model.clone(),
-                    mode: Mode::Build,
+                    model: TurnModel::Known(model.clone()),
+                    mode: TurnMode::Known(Mode::Build),
                     status: TurnStatus {
                         kind: TurnStatusKind::Completed,
                         message: None,
@@ -6860,8 +6978,8 @@ mod tests {
                     parent_thread_id: None,
                     spawned_by_turn_id: None,
                     kind: giskard_core::ThreadKind::Primary,
-                    mode: Mode::Build,
-                    current_model: model.clone(),
+                    mode: TurnMode::Known(Mode::Build),
+                    current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
@@ -6953,8 +7071,8 @@ mod tests {
                     parent_thread_id: None,
                     spawned_by_turn_id: None,
                     kind: giskard_core::ThreadKind::Primary,
-                    mode: Mode::Build,
-                    current_model: model.clone(),
+                    mode: TurnMode::Known(Mode::Build),
+                    current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
@@ -7104,8 +7222,8 @@ mod tests {
                     parent_thread_id: None,
                     spawned_by_turn_id: None,
                     kind: giskard_core::ThreadKind::Primary,
-                    mode: Mode::Build,
-                    current_model: model.clone(),
+                    mode: TurnMode::Known(Mode::Build),
+                    current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
@@ -7220,8 +7338,8 @@ mod tests {
                     parent_thread_id: None,
                     spawned_by_turn_id: None,
                     kind: giskard_core::ThreadKind::Primary,
-                    mode: Mode::Build,
-                    current_model: model.clone(),
+                    mode: TurnMode::Known(Mode::Build),
+                    current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
@@ -7368,8 +7486,8 @@ mod tests {
                     parent_thread_id: None,
                     spawned_by_turn_id: None,
                     kind: giskard_core::ThreadKind::Primary,
-                    mode: Mode::Build,
-                    current_model: model.clone(),
+                    mode: TurnMode::Known(Mode::Build),
+                    current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
@@ -7622,8 +7740,8 @@ mod tests {
     ) {
         let ctx = TurnContext {
             user_input: UserInput::text(user_input),
-            model: model.clone(),
-            mode: Mode::Build,
+            model: TurnModel::Known(model.clone()),
+            mode: TurnMode::Known(Mode::Build),
             kind: TurnContextKind::User,
         };
         let shared = super::RegistryShared::new(hub, store, ledger);
@@ -7666,6 +7784,78 @@ mod tests {
             forward_events(shared, coordinator_for_task, stream, cancel_rx).await;
         });
         (handle, runtime, coordinator)
+    }
+
+    /// Drive an owner over a promptless externally started turn, the way a provider-owned thread
+    /// arrives: no prepared operation, so the turn is claimed as `External` and labelled from the
+    /// coordinator's classification alone.
+    async fn persist_external_turn_input(classification: super::ClassificationPhase) -> UserInput {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let turn = TurnId::new();
+        let ledger = ledger::spawn(store.clone());
+        let shared = Arc::new(super::RegistryShared::new(
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger,
+        ));
+        let native_handle = ThreadHandle::detached(thread_id, format!("native-{thread_id}"));
+        let coordinator = Arc::new(super::ThreadCoordinator::new(
+            super::BindingData {
+                project: project_id,
+                handle: native_handle,
+                native_model: Some(ModelRef {
+                    provider: "openai".into(),
+                    model: "test".into(),
+                    reasoning_effort: None,
+                }),
+            },
+            classification,
+        ));
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (_completed_tx, completed_rx) = tokio::sync::watch::channel(false);
+        coordinator
+            .activate_owner(super::EventOwnerControl {
+                cancel: cancel_tx,
+                completed: completed_rx,
+            })
+            .await
+            .unwrap();
+        let (tx, rx) = broadcast::channel(16);
+        let forwarder = tokio::spawn(forward_events(
+            shared,
+            coordinator,
+            AgentEventStream::new(rx),
+            cancel_rx,
+        ));
+        for event in turn_events(
+            thread_id,
+            turn,
+            "ignored",
+            "external output",
+            TokenUsage::new(1, 1),
+        ) {
+            tx.send(event).unwrap();
+        }
+        drop(tx);
+        forwarder.await.unwrap();
+
+        let turns = store.load_all_turns(project_id, thread_id).await.unwrap();
+        turns
+            .into_iter()
+            .find(|saved| saved.id == turn)
+            .expect("the external turn should be persisted")
+            .user_input
+    }
+
+    #[tokio::test]
+    async fn an_unclassified_native_turn_does_not_claim_to_be_a_sub_agent() {
+        let subagent = persist_external_turn_input(super::ClassificationPhase::Subagent).await;
+        assert_eq!(subagent.as_text().unwrap(), "Sub-agent turn");
+        let orphan = persist_external_turn_input(super::ClassificationPhase::Orphan).await;
+        assert_eq!(orphan.as_text().unwrap(), "Unclassified native turn");
     }
 
     fn turn_events(
@@ -7741,8 +7931,8 @@ mod tests {
                     parent_thread_id: None,
                     spawned_by_turn_id: None,
                     kind: giskard_core::ThreadKind::Primary,
-                    mode: Mode::Build,
-                    current_model: model.clone(),
+                    mode: TurnMode::Known(Mode::Build),
+                    current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
@@ -7778,8 +7968,8 @@ mod tests {
                         },
                         created_at: now,
                     }],
-                    model: model.clone(),
-                    mode: Mode::Build,
+                    model: TurnModel::Known(model.clone()),
+                    mode: TurnMode::Known(Mode::Build),
                     status: TurnStatus {
                         kind: TurnStatusKind::Completed,
                         message: None,
@@ -7934,8 +8124,8 @@ mod tests {
                     parent_thread_id: None,
                     spawned_by_turn_id: None,
                     kind: giskard_core::ThreadKind::Primary,
-                    mode: Mode::Build,
-                    current_model: model.clone(),
+                    mode: TurnMode::Known(Mode::Build),
+                    current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,
@@ -7969,8 +8159,8 @@ mod tests {
                         },
                         created_at: now,
                     }],
-                    model: model.clone(),
-                    mode: Mode::Build,
+                    model: TurnModel::Known(model.clone()),
+                    mode: TurnMode::Known(Mode::Build),
                     status: TurnStatus {
                         kind: TurnStatusKind::Completed,
                         message: None,
@@ -8137,8 +8327,8 @@ mod tests {
                     parent_thread_id: None,
                     spawned_by_turn_id: None,
                     kind: giskard_core::ThreadKind::Primary,
-                    mode: Mode::Build,
-                    current_model: model.clone(),
+                    mode: TurnMode::Known(Mode::Build),
+                    current_model: TurnModel::Known(model.clone()),
                     context_window: 128_000,
                     model_context_windows: Default::default(),
                     permission_preset: PermissionPreset::AskFirst,

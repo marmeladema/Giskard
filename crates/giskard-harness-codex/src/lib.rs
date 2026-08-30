@@ -39,15 +39,15 @@ use giskard_core::token::TokenUsage;
 use giskard_core::turn::{PermissionPreset, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::{AttachmentKind, UserAttachment, UserInput};
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, HarnessNotice, HarnessProvider,
-    OpenThreadOptions, ProviderAuth, ProviderAuthCommand, ResumePolicy, ThreadHandle, ThreadUpdate,
+    AgentEventStream, AgentHarness, HarnessBootstrap, HarnessCapabilities, HarnessNotice,
+    HarnessProvider, OpenThreadOptions, ProviderAuth, ProviderAuthCommand, ThreadHandle,
+    ThreadUpdate,
 };
 
 use mapping::CodexMapper;
 
 const BROADCAST_CAPACITY: usize = 256;
 const TURN_FIRST_EVENT_WARN_AFTER: Duration = Duration::from_secs(15);
-const STRICT_RESUME_RETRY_DELAYS_MS: [u64; 7] = [10, 20, 40, 80, 160, 320, 500];
 #[cfg(not(test))]
 const CODEX_JSON_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
@@ -227,10 +227,11 @@ enum HarnessCommand {
 }
 
 enum ControlCommand {
-    /// Bindings Giskard already had, handed over before any thread is opened.
-    BindKnownThreads {
-        bindings: Vec<(String, ThreadId)>,
-        response: oneshot::Sender<()>,
+    ClaimNativeThread {
+        thread: ThreadId,
+        harness_thread_id: String,
+        workspace_root: PathBuf,
+        response: oneshot::Sender<Result<ThreadHandle, HarnessError>>,
     },
     RespondApproval {
         id: ApprovalId,
@@ -846,11 +847,24 @@ pub struct CodexHarness {
 
 impl CodexHarness {
     pub async fn start(workspace_root: PathBuf) -> Result<Arc<Self>, HarnessError> {
+        Self::start_with_bootstrap(workspace_root, HarnessBootstrap::default()).await
+    }
+
+    pub async fn start_with_bootstrap(
+        workspace_root: PathBuf,
+        bootstrap: HarnessBootstrap,
+    ) -> Result<Arc<Self>, HarnessError> {
         let workspace_root = normalize_workspace_root(workspace_root)?;
         let (mut client, client_version) =
             start_codex_client(codex_codes::AppServerBuilder::new()).await?;
         let writable_roots = configured_workspace_write_roots(&mut client, &workspace_root).await;
-        Self::spawn_harness(client, workspace_root, writable_roots, client_version)
+        Self::spawn_harness(
+            client,
+            workspace_root,
+            writable_roots,
+            client_version,
+            bootstrap,
+        )
     }
 
     pub async fn start_with(
@@ -861,7 +875,13 @@ impl CodexHarness {
         let builder = codex_codes::cli::AppServerBuilder::new().command(codex_path);
         let (mut client, client_version) = start_codex_client(builder).await?;
         let writable_roots = configured_workspace_write_roots(&mut client, &workspace_root).await;
-        Self::spawn_harness(client, workspace_root, writable_roots, client_version)
+        Self::spawn_harness(
+            client,
+            workspace_root,
+            writable_roots,
+            client_version,
+            HarnessBootstrap::default(),
+        )
     }
 
     fn spawn_harness<C>(
@@ -869,13 +889,20 @@ impl CodexHarness {
         workspace_root: PathBuf,
         writable_roots: Vec<PathBuf>,
         client_version: Option<String>,
+        bootstrap: HarnessBootstrap,
     ) -> Result<Arc<Self>, HarnessError>
     where
         C: CodexTransport + 'static,
     {
+        let mut mapper = CodexMapper::new(workspace_root.clone());
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (control_tx, control_rx) = mpsc::channel(64);
         let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
+        for binding in bootstrap.known_threads {
+            mapper.claim_thread(binding.harness_thread_id, binding.thread_id)?;
+            let (sender, _) = broadcast::channel(BROADCAST_CAPACITY);
+            ensure_thread_sender(&senders, binding.thread_id, sender);
+        }
         let worker_queue = Arc::new(WorkerQueueWatchdog::new());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (worker_done_tx, worker_done) = watch::channel(false);
@@ -919,6 +946,7 @@ impl CodexHarness {
                 worker_queue,
                 workspace_root,
                 writable_roots,
+                mapper,
             )
             .await;
             worker_done_tx.send_replace(true);
@@ -953,6 +981,7 @@ impl CodexHarness {
         command: ControlCommand,
     ) -> Result<(), HarnessError> {
         let thread_id = match &command {
+            ControlCommand::ClaimNativeThread { thread, .. } => Some(*thread),
             ControlCommand::Interrupt { thread, .. }
             | ControlCommand::TerminateCommand { thread, .. }
             | ControlCommand::CompactThread { thread, .. }
@@ -1251,6 +1280,27 @@ impl AgentHarness for CodexHarness {
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
 
+    async fn claim_native_thread(
+        &self,
+        thread: ThreadId,
+        harness_thread_id: String,
+        workspace_root: PathBuf,
+    ) -> Result<ThreadHandle, HarnessError> {
+        let (tx, rx) = oneshot::channel();
+        self.enqueue_control(
+            "claim_native_thread",
+            ControlCommand::ClaimNativeThread {
+                thread,
+                harness_thread_id,
+                workspace_root,
+                response: tx,
+            },
+        )
+        .await?;
+        rx.await
+            .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
+    }
+
     async fn start_turn(
         &self,
         thread: &ThreadHandle,
@@ -1316,36 +1366,6 @@ impl AgentHarness for CodexHarness {
         .await?;
         rx.await
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
-    }
-
-    async fn bind_known_threads(&self, bindings: Vec<(String, ThreadId)>) {
-        if bindings.is_empty() {
-            return;
-        }
-        // Waited on, not fired and forgotten: the caller's contract is that these are in place
-        // before any thread is opened, and returning early would let an open — and the Codex
-        // traffic it triggers — race the registration this exists to guarantee.
-        let (tx, rx) = oneshot::channel();
-        if let Err(error) = self
-            .enqueue_control(
-                "bind_known_threads",
-                ControlCommand::BindKnownThreads {
-                    bindings,
-                    response: tx,
-                },
-            )
-            .await
-        {
-            // Either failure leaves this harness running without the bindings, which is the exact
-            // situation the call exists to prevent — a sub-agent Codex announces will be given a
-            // second id and nothing later will say why. Nothing can be done about it here, so the
-            // only thing owed is a diagnosable record.
-            warn!(%error, "could not hand known thread bindings to the Codex worker");
-            return;
-        }
-        if rx.await.is_err() {
-            warn!("Codex worker stopped before acknowledging known thread bindings");
-        }
     }
 
     async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
@@ -1464,6 +1484,7 @@ async fn background_task<C>(
     worker_queue: Arc<WorkerQueueWatchdog>,
     workspace_root: PathBuf,
     writable_roots: Vec<PathBuf>,
+    mut mapper: CodexMapper,
 ) where
     C: CodexTransport,
 {
@@ -1472,7 +1493,6 @@ async fn background_task<C>(
         mut controls,
         mut shutdown,
     } = receivers;
-    let mut mapper = CodexMapper::new(workspace_root.clone());
     let mut pending_compactions: HashMap<ThreadId, PendingCompaction> = HashMap::new();
     let mut pending_context_restores: HashMap<String, PendingContextRestore> = HashMap::new();
     let mut active_turns: ActiveTurns = HashMap::new();
@@ -1954,6 +1974,29 @@ async fn handle_control_command(
     control: Option<ControlCommand>,
 ) -> StreamOutcome {
     match control {
+        Some(ControlCommand::ClaimNativeThread {
+            thread,
+            harness_thread_id,
+            workspace_root,
+            response,
+        }) => {
+            let result = mapper
+                .claim_thread(harness_thread_id.clone(), thread)
+                .map(|_| {
+                    let (sender, _) = broadcast::channel(BROADCAST_CAPACITY);
+                    ensure_thread_sender(senders, thread, sender);
+                    // A claim answers with the identity facts this harness lifetime already
+                    // attested through its own events. It must not resume the thread to learn
+                    // more: the native model stays unreported until an event names it.
+                    let parent_harness_thread_id = mapper.native_parent(&harness_thread_id);
+                    ThreadHandle {
+                        parent_harness_thread_id,
+                        ..ThreadHandle::opened(thread, harness_thread_id, workspace_root)
+                    }
+                });
+            let _ = response.send(result);
+            StreamOutcome::TurnEnded
+        }
         Some(ControlCommand::RespondApproval {
             id,
             decision,
@@ -1971,15 +2014,6 @@ async fn handle_control_command(
             let result =
                 handle_respond_server_request(client, mapper, senders, &id, response_payload).await;
             let _ = response.send(result);
-            StreamOutcome::TurnEnded
-        }
-        Some(ControlCommand::BindKnownThreads { bindings, response }) => {
-            let count = bindings.len();
-            for (harness_thread_id, thread) in bindings {
-                mapper.register_thread(harness_thread_id, thread);
-            }
-            debug!(count, "registered thread bindings Giskard already knew");
-            let _ = response.send(());
             StreamOutcome::TurnEnded
         }
         Some(ControlCommand::Interrupt { thread, response }) => {
@@ -2339,20 +2373,16 @@ async fn handle_open_thread(
         let context = CodexOperationContext::for_project("thread_resume", opts.project)
             .with_thread_id(thread_id)
             .with_harness_thread_id(resume_id);
-        match resume_thread_with_policy(
+        match resume_thread(
             client,
             context,
             resume_id,
             &cwd,
             opts.initial_model.as_ref(),
-            opts.resume_policy,
         )
         .await
         {
             Ok(opened) => opened,
-            Err(error) if opts.resume_policy == ResumePolicy::RequireExisting => {
-                return Err(error);
-            }
             // Recovery needs a model to start on, and importing a thread by native id supplies
             // none — the model was the resumed thread's to report. Nothing sensible to start.
             Err(error) if opts.initial_model.is_none() => return Err(error),
@@ -2380,7 +2410,7 @@ async fn handle_open_thread(
     };
 
     // B4: bind the (possibly re-established) native id to the durable ThreadId.
-    mapper.register_thread(opened.harness_thread_id.clone(), thread_id);
+    mapper.claim_thread(opened.harness_thread_id.clone(), thread_id)?;
 
     let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
     ensure_thread_sender(senders, thread_id, tx);
@@ -2480,54 +2510,6 @@ struct OpenedNativeThread {
     model: Option<giskard_core::model::ModelRef>,
     agent_name: Option<String>,
     parent_harness_thread_id: Option<String>,
-}
-
-async fn resume_thread_with_policy(
-    client: &mut dyn CodexTransport,
-    context: CodexOperationContext<'_>,
-    resume_id: &str,
-    cwd: &str,
-    model: Option<&giskard_core::model::ModelRef>,
-    policy: ResumePolicy,
-) -> Result<OpenedNativeThread, HarnessError> {
-    let mut retry = 0usize;
-    loop {
-        match resume_thread(client, context, resume_id, cwd, model).await {
-            Ok(opened) => {
-                if policy == ResumePolicy::RequireExisting && opened.harness_thread_id != resume_id
-                {
-                    return Err(HarnessError::Protocol(format!(
-                        "strict resume returned native thread {} instead of {resume_id}",
-                        opened.harness_thread_id
-                    )));
-                }
-                if retry > 0 {
-                    info!(
-                        harness_thread_id = %resume_id,
-                        attempts = retry + 1,
-                        "resumed newly materialized native thread after retry"
-                    );
-                }
-                return Ok(opened);
-            }
-            Err(error)
-                if policy == ResumePolicy::RequireExisting
-                    && codex_reports_missing_rollout(&error, resume_id)
-                    && retry < STRICT_RESUME_RETRY_DELAYS_MS.len() =>
-            {
-                let delay_ms = STRICT_RESUME_RETRY_DELAYS_MS[retry];
-                debug!(
-                    harness_thread_id = %resume_id,
-                    attempt = retry + 1,
-                    delay_ms,
-                    "native thread was advertised before its rollout was materialized; retrying strict resume"
-                );
-                retry += 1;
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            }
-            Err(error) => return Err(error),
-        }
-    }
 }
 
 /// The model/provider a `thread/start` / `thread/resume` response reports as effective. Codex can
@@ -4389,7 +4371,6 @@ mod tests {
             thread,
             workspace_root: PathBuf::from("/tmp"),
             resume: resume.map(str::to_owned),
-            resume_policy: ResumePolicy::AllowFreshFallback,
             initial_model: Some(test_model(None)),
             updates,
         }
@@ -4400,12 +4381,19 @@ mod tests {
     }
 
     fn spawn_fake_harness() -> (Arc<CodexHarness>, FakeCodexController) {
+        spawn_fake_harness_with_bootstrap(HarnessBootstrap::default())
+    }
+
+    fn spawn_fake_harness_with_bootstrap(
+        bootstrap: HarnessBootstrap,
+    ) -> (Arc<CodexHarness>, FakeCodexController) {
         let (transport, controller) = fake_codex();
         let harness = CodexHarness::spawn_harness(
             transport,
             PathBuf::from("/tmp"),
             Vec::new(),
             Some("1.2.3".into()),
+            bootstrap,
         )
         .expect("fake harness should spawn");
         (harness, controller)
@@ -4416,13 +4404,13 @@ mod tests {
     /// reuses it rather than inventing a second identity for the same thread.
     #[tokio::test]
     async fn a_known_binding_is_reused_instead_of_inventing_a_second_identity() {
-        let (harness, _controller) = spawn_fake_harness();
         let persisted = ThreadId::new();
-
-        // What the server read out of the child's own thread.json.
-        harness
-            .bind_known_threads(vec![("native-child".to_owned(), persisted)])
-            .await;
+        let (harness, _controller) = spawn_fake_harness_with_bootstrap(HarnessBootstrap {
+            known_threads: vec![giskard_harness::KnownThreadBinding {
+                harness_thread_id: "native-child".to_owned(),
+                thread_id: persisted,
+            }],
+        });
 
         // The caller has no id to offer — it is resuming by native id alone.
         let opened = harness
@@ -5033,65 +5021,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_resume_retries_materialization_without_starting_a_replacement() {
-        let (harness, controller) = spawn_fake_harness();
-        controller.fail_thread_resume_missing_rollout(1).await;
-        let mut opts = open_opts(None, Some("native-emerging-child"));
-        opts.resume_policy = ResumePolicy::RequireExisting;
-
-        let opened = harness.open_thread(opts).await.unwrap();
-
-        assert_eq!(opened.harness_thread_id, "native-emerging-child");
-        let requests = controller.requests().await;
-        assert_eq!(
-            requests
-                .iter()
-                .filter(|request| {
-                    request.method == codex_codes::protocol::methods::THREAD_RESUME
-                })
-                .count(),
-            2
-        );
-        assert!(
-            !requests
-                .iter()
-                .any(|request| { request.method == codex_codes::protocol::methods::THREAD_START })
-        );
-    }
-
-    #[tokio::test]
-    async fn strict_resume_exhaustion_never_starts_a_replacement() {
-        let (harness, controller) = spawn_fake_harness();
-        controller
-            .fail_thread_resume_missing_rollout(STRICT_RESUME_RETRY_DELAYS_MS.len() + 1)
-            .await;
-        let mut opts = open_opts(None, Some("native-unmaterialized-child"));
-        opts.resume_policy = ResumePolicy::RequireExisting;
-
-        let error = harness.open_thread(opts).await.unwrap_err();
-
-        assert!(codex_reports_missing_rollout(
-            &error,
-            "native-unmaterialized-child"
-        ));
-        let requests = controller.requests().await;
-        assert_eq!(
-            requests
-                .iter()
-                .filter(|request| {
-                    request.method == codex_codes::protocol::methods::THREAD_RESUME
-                })
-                .count(),
-            STRICT_RESUME_RETRY_DELAYS_MS.len() + 1
-        );
-        assert!(
-            !requests
-                .iter()
-                .any(|request| { request.method == codex_codes::protocol::methods::THREAD_START })
-        );
-    }
-
-    #[tokio::test]
     async fn normal_resume_keeps_fresh_thread_recovery_after_missing_rollout() {
         let (harness, controller) = spawn_fake_harness();
         controller.fail_thread_resume_missing_rollout(1).await;
@@ -5332,7 +5261,6 @@ mod tests {
                 thread: Some(ThreadId::new()),
                 workspace_root: PathBuf::from("/tmp"),
                 resume: Some("native-existing".into()),
-                resume_policy: ResumePolicy::AllowFreshFallback,
                 initial_model: None,
                 updates: giskard_harness::thread_update_channel().0,
             }),
@@ -5377,7 +5305,6 @@ mod tests {
                 thread: Some(thread),
                 workspace_root: PathBuf::from("/tmp"),
                 resume: Some("native-existing".into()),
-                resume_policy: ResumePolicy::AllowFreshFallback,
                 initial_model: Some(test_model(None)),
                 updates,
             })

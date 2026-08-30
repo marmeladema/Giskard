@@ -398,7 +398,7 @@ $GISKARD_DATA_DIR/
 │   │   ├── turns/<turn_id>.jsonl # that turn's prompt, items and diffs — written atomically
 │   │   └── legacy/               # pre-migration originals, retained until you prune them
 │   ├── worktrees/<thread_id>/    # Git worktree for a thread started isolated (docs/git-worktrees.md)
-│   └── tokens.json               # per-project token ledger (total, by_day, by_model)
+│   └── tokens.json               # per-project token ledger (total, by_day, by_model, unattributed)
 └── tokens-global.json            # cross-project token ledger
 ```
 
@@ -411,6 +411,13 @@ written with an atomic temp-file+fsync+rename, so a payload is complete or absen
 A turn commits payload first, index last: a crash between them leaves a file no record references,
 which every read path simply cannot see. `thread.json` is small metadata + token aggregates that can
 be rebuilt from the index alone.
+
+Native threads whose relationship has not arrived yet are retained as hidden, read-only `orphan`
+records with one final Giskard ID; they are not sidebar threads and cannot be adopted as primaries.
+Once authoritative parent evidence arrives, the same record becomes a read-only sub-agent. If the
+harness has not reported a model or mode, metadata and turn rows store the reserved `"unknown"`
+sentinel rather than inventing a default; usage still contributes to totals through the token
+ledger's `unattributed` bucket.
 
 Each file states its own format: `history.jsonl`'s header line carries the layout version (written
 once, when the thread is created) and each payload file carries its own, so one unreadable turn fails alone

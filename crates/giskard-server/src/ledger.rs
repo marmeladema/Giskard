@@ -16,12 +16,15 @@ use giskard_core::ids::ProjectId;
 use giskard_core::token::{DailyTokenLedger, TokenUsage};
 use giskard_persist::PersistStore;
 
+/// Log-only stand-in for a delta with no authoritative model. It never reaches a ledger key: the
+/// unattributed bucket is a separate field, not a provider/model pair.
+const UNATTRIBUTED_MODEL_FIELD: &str = "<unattributed>";
+
 /// A usage delta to fold into the project + global ledgers.
 struct Record {
     project: ProjectId,
     date: String,
-    provider: String,
-    model: String,
+    model: Option<(String, String)>,
     usage: TokenUsage,
 }
 
@@ -51,10 +54,28 @@ impl LedgerHandle {
         let rec = Record {
             project,
             date,
-            provider,
-            model,
+            model: Some((provider, model)),
             usage,
         };
+        self.enqueue(rec).await;
+    }
+
+    /// Record usage the provider reported without authoritative model metadata (`TurnModel::
+    /// Unknown`). It still counts toward project and global totals, but into an explicit
+    /// unattributed bucket rather than under an invented provider/model key.
+    pub async fn record_unattributed(&self, project: ProjectId, date: String, usage: TokenUsage) {
+        let rec = Record {
+            project,
+            date,
+            model: None,
+            usage,
+        };
+        self.enqueue(rec).await;
+    }
+
+    /// Queue one delta, naming the record precisely if the queue cannot take it. A dropped delta
+    /// is silent in the ledger files, so the log line is the only trace it ever existed.
+    async fn enqueue(&self, rec: Record) {
         if let Err(error) = self.tx.try_send(LedgerMsg::Record(rec)) {
             let Some((reason, record)) = dropped_record_context(error) else {
                 tracing::error!(
@@ -63,11 +84,15 @@ impl LedgerHandle {
                 );
                 return;
             };
+            let (provider, model) = match record.model.as_ref() {
+                Some((provider, model)) => (provider.as_str(), model.as_str()),
+                None => (UNATTRIBUTED_MODEL_FIELD, UNATTRIBUTED_MODEL_FIELD),
+            };
             warn!(
                 project_id = %record.project,
                 date = %record.date,
-                provider = %record.provider,
-                model = %record.model,
+                provider = %provider,
+                model = %model,
                 reason,
                 action = "record_token_usage",
                 "token ledger queue unavailable; dropping a usage delta"
@@ -170,7 +195,10 @@ async fn apply(
     dirty: &mut HashSet<ProjectId>,
     rec: Record,
 ) {
-    global.record(&rec.date, &rec.provider, &rec.model, &rec.usage);
+    match &rec.model {
+        Some((provider, model)) => global.record(&rec.date, provider, model, &rec.usage),
+        None => global.record_unattributed(&rec.date, &rec.usage),
+    }
 
     let ledger = match projects.entry(rec.project) {
         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
@@ -191,7 +219,10 @@ async fn apply(
             e.insert(existing)
         }
     };
-    ledger.record(&rec.date, &rec.provider, &rec.model, &rec.usage);
+    match &rec.model {
+        Some((provider, model)) => ledger.record(&rec.date, provider, model, &rec.usage),
+        None => ledger.record_unattributed(&rec.date, &rec.usage),
+    }
     dirty.insert(rec.project);
 }
 
@@ -206,8 +237,7 @@ mod tests {
         Record {
             project,
             date: "2026-08-26".into(),
-            provider: "openai".into(),
-            model: "gpt-5".into(),
+            model: Some(("openai".into(), "gpt-5".into())),
             usage: TokenUsage::new(12, 3),
         }
     }
@@ -221,8 +251,7 @@ mod tests {
         .unwrap();
         assert_eq!(reason, "full");
         assert_eq!(full.project, full_project);
-        assert_eq!(full.provider, "openai");
-        assert_eq!(full.model, "gpt-5");
+        assert_eq!(full.model, Some(("openai".into(), "gpt-5".into())));
 
         let closed_project = ProjectId::new();
         let (reason, closed) = dropped_record_context(mpsc::error::TrySendError::Closed(
