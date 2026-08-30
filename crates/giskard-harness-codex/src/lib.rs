@@ -999,15 +999,57 @@ async fn start_codex_client(
         .await
         .map_err(|e| HarnessError::Spawn(e.to_string()))?;
     let version = codex_version_from_user_agent(&response.user_agent);
-    if version.is_none() {
-        warn!(
+    match version.as_deref() {
+        Some(version) => warn_if_codex_is_newer_than_tested(version),
+        None => warn!(
             user_agent = %response.user_agent,
             action = "start_codex_client",
             "could not read a Codex version out of the app-server user agent; \
              /models discovery will not identify a client version"
-        );
+        ),
     }
     Ok((client, version))
+}
+
+/// Warn when the running Codex CLI is newer than the release the `codex-codes` bindings were last
+/// tested against, which the crate exposes as `version::tested_cli_version()`.
+///
+/// The bindings' own `check_codex_version` is deliberately not used: it shells out to `codex
+/// --version` on `PATH`, ignoring the configured `codex_path`, and reports through the `log` crate,
+/// which Giskard does not bridge into `tracing`. Giskard already read the running version out of
+/// the initialize user agent, so the comparison costs nothing extra and the warning lands in
+/// Giskard's own structured log.
+///
+/// Drift past the tested release is not fatal — unmapped protocol additions arrive as unknown
+/// notifications and requests — but it is the first thing to check when Codex behavior looks
+/// truncated, so it is stated once per spawned app-server.
+fn warn_if_codex_is_newer_than_tested(version: &str) {
+    let tested = codex_codes::version::tested_cli_version();
+    if version_is_newer(version, tested) {
+        warn!(
+            action = "start_codex_client",
+            codex_version = version,
+            tested_codex_version = tested,
+            "running Codex CLI is newer than the release the codex-codes bindings were tested \
+             against; protocol additions it makes are not mapped and are reported as unknown \
+             notifications and requests"
+        );
+    }
+}
+
+/// Order two `MAJOR.MINOR.PATCH` versions numerically. Anything that does not parse as three
+/// numeric components compares as "not newer" so an unreadable version never raises a false alarm.
+fn version_is_newer(version: &str, baseline: &str) -> bool {
+    fn triple(value: &str) -> Option<(u64, u64, u64)> {
+        let mut parts = value.split('.');
+        let mut next = || parts.next()?.parse::<u64>().ok();
+        let (major, minor, patch) = (next()?, next()?, next()?);
+        parts.next().is_none().then_some((major, minor, patch))
+    }
+    match (triple(version), triple(baseline)) {
+        (Some(version), Some(baseline)) => version > baseline,
+        _ => false,
+    }
 }
 
 /// Pull the Codex version out of the user agent the app-server reports at initialize, in the form
@@ -3664,6 +3706,9 @@ async fn handle_start_mcp_oauth_login(
     name: &str,
 ) -> Result<McpOauthStart, HarnessError> {
     let params = codex_codes::McpServerOauthLoginParams {
+        // Dynamic client registration details are supplied by Codex's own config; Giskard does not
+        // register an OAuth client on the server's behalf.
+        client_registration: None,
         name: name.to_owned(),
         scopes: None,
         thread_id: None,
@@ -6201,7 +6246,9 @@ mod tests {
 
         let mapped = map_mcp_server_status(codex_codes::McpServerStatus {
             auth_status: codex_codes::McpAuthStatus::NotLoggedIn,
+            runtime_status: None,
             name: "cf-mcp".into(),
+            plugin_id: None,
             resource_templates: vec![codex_codes::ResourceTemplate {
                 annotations: None,
                 description: Some("Issue by key".into()),
@@ -6300,6 +6347,39 @@ mod tests {
                 "{unparseable:?} should not yield a version"
             );
         }
+    }
+
+    /// The drift warning fires only for a Codex that is strictly newer than the tested release, so
+    /// an exact match and every older release stay quiet.
+    #[test]
+    fn codex_newer_than_the_tested_release_is_ordered_ahead_of_it() {
+        assert!(version_is_newer("0.151.0", "0.150.1"));
+        assert!(version_is_newer("0.150.2", "0.150.1"));
+        assert!(version_is_newer("1.0.0", "0.150.1"));
+        assert!(!version_is_newer("0.150.1", "0.150.1"));
+        assert!(!version_is_newer("0.150.0", "0.150.1"));
+        assert!(!version_is_newer("0.9.9", "0.150.1"));
+        // Components are compared numerically, not lexically.
+        assert!(version_is_newer("0.150.10", "0.150.9"));
+
+        // A version that is not three numeric components never raises the alarm.
+        assert!(!version_is_newer("0.150", "0.150.1"));
+        assert!(!version_is_newer("0.150.1.2", "0.150.1"));
+        assert!(!version_is_newer("0.150.x", "0.150.1"));
+        assert!(!version_is_newer("", "0.150.1"));
+    }
+
+    /// The pin the warning compares against comes from the bindings, so it must stay readable as
+    /// the same `MAJOR.MINOR.PATCH` shape Giskard parses out of the user agent.
+    #[test]
+    fn tested_codex_release_is_comparable_to_a_reported_version() {
+        let tested = codex_codes::version::tested_cli_version();
+
+        assert!(!version_is_newer(tested, tested), "{tested} vs itself");
+        assert!(
+            version_is_newer("999.0.0", tested),
+            "{tested} should order below a clearly newer release"
+        );
     }
 
     #[test]

@@ -2300,7 +2300,8 @@ fn thread_item_id_ref(item: &codex_codes::ThreadItem) -> &str {
         | codex_codes::ThreadItem::ImageGeneration { id, .. }
         | codex_codes::ThreadItem::EnteredReviewMode { id, .. }
         | codex_codes::ThreadItem::ExitedReviewMode { id, .. }
-        | codex_codes::ThreadItem::ContextCompaction { id, .. } => id,
+        | codex_codes::ThreadItem::ContextCompaction { id, .. }
+        | codex_codes::ThreadItem::FunctionCallOutput { id, .. } => id,
     }
 }
 
@@ -2410,7 +2411,8 @@ fn map_thread_item_start(
         codex_codes::ThreadItem::FileChange { .. } => ItemKind::FileChange,
         codex_codes::ThreadItem::McpToolCall { .. }
         | codex_codes::ThreadItem::DynamicToolCall { .. }
-        | codex_codes::ThreadItem::CollabAgentToolCall { .. } => ItemKind::ToolCall,
+        | codex_codes::ThreadItem::CollabAgentToolCall { .. }
+        | codex_codes::ThreadItem::FunctionCallOutput { .. } => ItemKind::ToolCall,
         codex_codes::ThreadItem::HookPrompt { .. }
         | codex_codes::ThreadItem::SubAgentActivity { .. }
         | codex_codes::ThreadItem::WebSearch { .. }
@@ -2727,6 +2729,24 @@ fn map_thread_item_complete(
             metadata: json_value(item),
             subagent: None,
         },
+        codex_codes::ThreadItem::FunctionCallOutput {
+            name,
+            namespace,
+            output,
+            ..
+        } => ItemPayload::ToolCall {
+            name: name.clone(),
+            // Codex injects this item to carry a tool result the client supplied on turn start
+            // (`turn/start` `toolOutput`); the matching call and its arguments are not part of the
+            // item, so there is no input to record.
+            input: Value::Null,
+            output: function_call_output_value(output),
+            server: namespace.clone(),
+            status: None,
+            metadata: None,
+            subagent: None,
+            error: None,
+        },
     };
 
     let created_at =
@@ -2737,6 +2757,17 @@ fn map_thread_item_complete(
         harness_item_id,
         payload,
         created_at,
+    }
+}
+
+/// Render a `functionCallOutput` body as the opaque tool result Giskard stores.
+///
+/// Codex sends either a bare string or Responses-API content items. The bare string stays a JSON
+/// string so the transcript shows the tool's own text instead of a wrapper object.
+fn function_call_output_value(output: &codex_codes::FunctionCallOutputBody) -> Option<Value> {
+    match output {
+        codex_codes::FunctionCallOutputBody::Text(text) => Some(Value::String(text.clone())),
+        codex_codes::FunctionCallOutputBody::Items(items) => json_value(items),
     }
 }
 
@@ -2835,6 +2866,7 @@ fn subagent_activity_action(kind: &codex_codes::SubAgentActivityKind) -> Subagen
         codex_codes::SubAgentActivityKind::Started => SubagentAction::Started,
         codex_codes::SubAgentActivityKind::Interacted => SubagentAction::Interacted,
         codex_codes::SubAgentActivityKind::Interrupted => SubagentAction::Interrupted,
+        codex_codes::SubAgentActivityKind::Completed => SubagentAction::Completed,
     }
 }
 
@@ -2903,15 +2935,24 @@ fn compose_turn_error(err: &codex_codes::protocol::TurnError, will_retry: bool) 
     if !message.is_empty() {
         body.push_str(message);
     }
-    if let Some(details) = err.additional_details.as_deref() {
-        let details = details.trim();
-        // Skip details already contained in the message to avoid duplication.
-        if !details.is_empty() && !message.contains(details) {
-            if !body.is_empty() {
-                body.push_str(": ");
-            }
-            body.push_str(details);
+    // A misalignment block states its whole reason in `misalignment.detailedExplanation` and leaves
+    // `message` a terse refusal, so that explanation is appended exactly like `additionalDetails`.
+    // Text the body already carries is skipped, which also keeps the two supplements from repeating
+    // each other.
+    let supplements = [
+        err.additional_details.as_deref(),
+        err.misalignment
+            .as_ref()
+            .and_then(|misalignment| misalignment.detailed_explanation.as_deref()),
+    ];
+    for supplement in supplements.into_iter().flatten().map(str::trim) {
+        if supplement.is_empty() || body.contains(supplement) {
+            continue;
         }
+        if !body.is_empty() {
+            body.push_str(": ");
+        }
+        body.push_str(supplement);
     }
     if body.is_empty() {
         body.push_str("Codex reported an unspecified error");
@@ -5562,6 +5603,105 @@ mod tests {
         }
     }
 
+    /// Codex emits `functionCallOutput` for a tool result the client supplied on `turn/start`. The
+    /// item carries the tool's name, namespace, and output but never the arguments, so the recorded
+    /// input stays `null` rather than an invented object.
+    #[test]
+    fn function_call_output_maps_to_a_tool_call_without_input() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let notif = completed_item(serde_json::json!({
+            "type": "functionCallOutput",
+            "id": "function-output",
+            "name": "lookup_invoice",
+            "namespace": "acme",
+            "output": "invoice 42 is paid"
+        }));
+
+        match mapper.map_notification(&notif, ThreadId::new()).unwrap() {
+            AgentEvent::ItemCompleted { item, .. } => {
+                assert_eq!(item.harness_item_id, "function-output");
+                match item.payload {
+                    ItemPayload::ToolCall {
+                        name,
+                        input,
+                        output,
+                        server,
+                        status,
+                        subagent,
+                        ..
+                    } => {
+                        assert_eq!(name, "lookup_invoice");
+                        assert_eq!(input, Value::Null);
+                        // A text body stays a JSON string so the transcript shows the tool's own
+                        // text instead of a wrapper object.
+                        assert_eq!(output, Some(Value::String("invoice 42 is paid".into())));
+                        assert_eq!(server.as_deref(), Some("acme"));
+                        assert_eq!(status, None);
+                        assert_eq!(subagent, None);
+                    }
+                    other => panic!("expected tool call, got {other:?}"),
+                }
+            }
+            other => panic!("expected item completion, got {other:?}"),
+        }
+    }
+
+    /// The Responses-API content-item form of the same body is kept structured, and a namespace-less
+    /// output reports no server.
+    #[test]
+    fn function_call_output_content_items_are_kept_structured() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let notif = completed_item(serde_json::json!({
+            "type": "functionCallOutput",
+            "id": "function-output",
+            "name": "render_chart",
+            "output": [{ "type": "input_text", "text": "done" }]
+        }));
+
+        match mapper.map_notification(&notif, ThreadId::new()).unwrap() {
+            AgentEvent::ItemCompleted { item, .. } => match item.payload {
+                ItemPayload::ToolCall { output, server, .. } => {
+                    assert_eq!(
+                        output,
+                        Some(serde_json::json!([{ "type": "input_text", "text": "done" }]))
+                    );
+                    assert_eq!(server, None);
+                }
+                other => panic!("expected tool call, got {other:?}"),
+            },
+            other => panic!("expected item completion, got {other:?}"),
+        }
+    }
+
+    /// `completed` joins `interrupted` as a terminal sub-agent action; the server reads it as
+    /// evidence that never arms a passive monitor.
+    #[test]
+    fn subagent_activity_completion_maps_to_a_terminal_action() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let notif = completed_item(serde_json::json!({
+            "type": "subAgentActivity",
+            "id": "subagent1",
+            "kind": "completed",
+            "agentThreadId": "child-native",
+            "agentPath": "/root/explorer"
+        }));
+
+        match mapper.map_notification(&notif, ThreadId::new()).unwrap() {
+            AgentEvent::ItemCompleted { item, .. } => match item.payload {
+                ItemPayload::Activity {
+                    title, subagent, ..
+                } => {
+                    assert_eq!(title, "Sub-agent explorer completed");
+                    let subagent = subagent.expect("activity links the child");
+                    assert_eq!(subagent.action, SubagentAction::Completed);
+                    assert_eq!(subagent.harness_thread_id, "child-native");
+                }
+                other => panic!("expected activity, got {other:?}"),
+            },
+            other => panic!("expected item completion, got {other:?}"),
+        }
+    }
+
     #[test]
     fn legacy_wait_with_multiple_receivers_has_no_ambiguous_link() {
         let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
@@ -6018,6 +6158,47 @@ mod tests {
             .unwrap(),
         );
         assert!(fatal_turn_error(&plan).is_none());
+    }
+
+    /// A misalignment block is fatal and puts its reason in `misalignment.detailedExplanation`;
+    /// composing only `message` would surface the refusal without saying what was refused.
+    #[test]
+    fn misalignment_explanation_is_kept_in_the_turn_error() {
+        let blocked: Notification = Notification::Error(
+            serde_json::from_value(serde_json::json!({
+                "willRetry": false,
+                "error": {
+                    "message": "Turn blocked",
+                    "misalignment": {
+                        "errorType": "policy",
+                        "detailedExplanation": "The requested change would disable audit logging",
+                        "steer": { "message": "Confirm you want to proceed" }
+                    }
+                }
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            fatal_turn_error(&blocked).as_deref(),
+            Some("Turn blocked: The requested change would disable audit logging")
+        );
+
+        // An explanation the message already carries is not repeated.
+        let repeated: Notification = Notification::Error(
+            serde_json::from_value(serde_json::json!({
+                "willRetry": false,
+                "error": {
+                    "message": "Turn blocked: audit logging",
+                    "additionalDetails": "audit logging",
+                    "misalignment": { "detailedExplanation": "audit logging" }
+                }
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            fatal_turn_error(&repeated).as_deref(),
+            Some("Turn blocked: audit logging")
+        );
     }
 
     /// A Codex `warning` is a non-fatal advisory: it maps to `Notice`, not `Error`, so it never

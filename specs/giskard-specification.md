@@ -9,7 +9,7 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.75
+**Version:** 1.76
 
 > **Amendment — strict running-task ownership (1.74).** `RunningTasks` is a revisioned replacement
 > projection for the Tasks menu and controls only. `RunningTask` carries no output, output-only
@@ -55,6 +55,28 @@
 
 **Changelog (1.70 → 1.71), overlay title path truncation:**
 - **L8:** The diff view and code overlay title bar shows the workspace-relative path (the same truncation the transcript diff row uses) instead of the raw checkout/worktree-prefixed path. The raw path is still kept for the download/file API.
+
+**Changelog (1.75 → 1.76), refresh Codex protocol SDK:**
+- **CP2:** The Codex harness now builds against `codex-codes` 0.150.1 (tested against Codex CLI
+  0.150.1), up from 0.146.4. Giskard consumes the compatibility-relevant changes only:
+  - A `functionCallOutput` thread item — the tool result a client supplies on `turn/start` — maps to
+    a `ToolCall` item carrying the tool name, its optional namespace, and the output. The item does
+    not contain the call's arguments, so the recorded input is `null` rather than an invented object.
+  - `subAgentActivity` gained a `completed` kind. It becomes `SubagentAction::Completed` and joins
+    `interrupted` as terminal evidence: it wakes an idle passive monitor but never arms a new one.
+  - A misalignment-blocked turn states its reason in `TurnError.misalignment.detailedExplanation`
+    while `message` stays a terse refusal, so the composed turn error now appends that explanation
+    the same way it appends `additionalDetails`, skipping text the message already carries.
+  - The bindings publish the Codex release they were tested against as `version::tested_cli_version()`.
+    The adapter compares it against the version it already reads from the initialize user agent and
+    warns once per spawned app-server when the running Codex is strictly newer. The bindings' own
+    `check_codex_version` is not used: it shells out to `codex --version` on `PATH`, ignoring the
+    configured `codex_path`, and reports through `log`, which Giskard does not bridge into `tracing`.
+  Everything else the release adds — paginated `thread/items/list`, `thread/turns/list` and
+  `thread/revert`, a typed `turn/steer` helper, `McpServerStatus.runtimeStatus`, the realtime item
+  timeline, and the newly typed `project/changed`, `thread/queue/changed`, `thread/reverted`,
+  `mcpServer/event/stream/notification` and auth-recovery notifications — is available but unused;
+  Giskard keeps its own history and ignores notifications it does not map.
 
 **Changelog (1.74 → 1.75), collapsible reasoning rows:**
 - **RN1:** A reasoning note is a collapsible transcript row: a one-line summary — the note's first
@@ -400,10 +422,11 @@ runtime overview; the hoisting and notification behavior remains current.
   Materializing or reopening a child is separate from monitoring it. Giskard starts a passive
   forwarder only for explicit non-terminal lifecycle evidence (`spawned`, `started`, `interacted`,
   `pending`, or `running`). Explicit active evidence has a ten-minute no-event pre-turn safety bound
-  that restarts on activity and no longer applies after a turn starts. Terminal observations (`interrupted`,
-  `completed`, `failed`, `shutdown`, or `not_found`) wake an existing idle monitor but never start a
-  new one. Reopening a persisted child without lifecycle evidence does not arm a monitor, and an
-  unchanged generated title does not rewrite its metadata.
+  that restarts on activity and no longer applies after a turn starts. Terminal observations (the
+  actions `interrupted` and `completed`, and the statuses `interrupted`, `completed`, `failed`,
+  `shutdown`, or `not_found`) wake an existing idle monitor but never start a new one. Reopening a
+  persisted child without lifecycle evidence does not arm a monitor, and an unchanged generated
+  title does not rewrite its metadata.
 
   Linked children require an identity-preserving native resume. Codex may emit the activity link
   immediately before the new rollout becomes readable, so the adapter retries only the exact
@@ -1444,10 +1467,12 @@ A single Cargo workspace with focused crates. Names are prefixed `giskard-`.
 - **Password hashing:** `argon2` (session password verification, §12).
 - **Session cookies:** signed cookies (e.g. `tower-cookies` + an HMAC key), or a signed
   bearer token; see §12.
-- **Codex client:** prefer an existing crate over hand-rolling. Verified options on crates.io
-  (versions checked against the pinned Codex CLI 0.142.5 at implementation time):
-  - **`codex-codes`** (v0.146.4) — **recommended first choice.** Typed Rust SDK for the Codex
-    CLI app-server JSON-RPC protocol, tested against Codex CLI 0.146.x.
+- **Codex client:** prefer an existing crate over hand-rolling. The survey below is the original
+  design review, whose alternatives were checked against the then-pinned Codex CLI 0.142.5; only
+  the selected crate is kept current, and its own line states the Codex CLI it is tested against
+  today:
+  - **`codex-codes`** (v0.150.1) — **recommended first choice.** Typed Rust SDK for the Codex
+    CLI app-server JSON-RPC protocol, tested against Codex CLI 0.150.x.
     Provides `AsyncClient` (Tokio) with `start()` (process spawn), `thread_start`, `turn_start`
     (accepting `model`, `reasoning_effort`, `sandbox_policy` — mapping onto `TurnOverrides`
     + `ModelRef.reasoning_effort`, P1),

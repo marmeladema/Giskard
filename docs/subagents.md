@@ -58,8 +58,8 @@ The Codex adapter maps both known protocols into the same harness-neutral sub-ag
   ID, never by map order. Single-child `sendInput`, `wait`, `resumeAgent`, and `closeAgent` calls
   also update lifecycle evidence; multi-child waits stay unlinked because one transcript item
   cannot represent several child links safely.
-- Current `subAgentActivity` events report actions such as `started`, `interacted`, or
-  `interrupted`. Activity rows use the last non-empty agent-path component as the readable task
+- Current `subAgentActivity` events report actions such as `started`, `interacted`, `interrupted`,
+  or `completed`. Activity rows use the last non-empty agent-path component as the readable task
   name (for example, `/root/nested_reload_parent` is shown as `nested_reload_parent`) and keep the
   native child ID out of the visible copy. The event currently does not expose the delegated
   prompt.
@@ -74,7 +74,7 @@ Opening or materializing a child and monitoring it are separate decisions:
 | Observed evidence | Monitor behavior |
 | --- | --- |
 | `spawned`, `started`, `interacted`, `pending`, or `running` | Start or retain a passive monitor until the native child turn or a terminal lifecycle event arrives. Before a turn, ten minutes with no stream event releases a monitor whose terminal event was missed. |
-| `interrupted`, `completed`, `failed`, `shutdown`, or `not_found` | Never start a new monitor. Wake an existing idle monitor immediately and recover terminal output when necessary. |
+| `interrupted` or `completed` as an action, or `interrupted`, `completed`, `failed`, `shutdown`, or `not_found` as a status | Never start a new monitor. Wake an existing idle monitor immediately and recover terminal output when necessary. |
 | Existing child reopened with no lifecycle evidence | Do not start another monitor. |
 
 The ten-minute bound is restarted by every event. After `TurnStarted`, the forwarder waits for
