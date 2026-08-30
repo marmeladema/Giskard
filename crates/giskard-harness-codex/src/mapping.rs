@@ -10,6 +10,7 @@ use tracing::{debug, warn};
 
 use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalMetadata, ApprovalRequest};
 use giskard_core::diff::{DiffHunk, DiffLine, FileDiff};
+use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{
@@ -70,6 +71,12 @@ type MappingResult<T> = Result<T, UnknownNativeThread>;
 pub struct CodexMapper {
     workspace_root: PathBuf,
     thread_ids: HashMap<String, ThreadId>,
+    native_ids: HashMap<ThreadId, String>,
+    route_epochs: HashMap<String, u64>,
+    next_route_epoch: u64,
+    /// Native parentage the provider attested through its own routing: child native id → parent
+    /// native id. See [`CodexMapper::track_native_parentage`].
+    native_parents: HashMap<String, String>,
     turn_ids: HashMap<NativeTurnKey, TurnId>,
     item_ids: HashMap<NativeItemKey, ItemId>,
     /// Latest per-turn token usage, keyed by owning thread and native turn id. Codex reports usage
@@ -102,6 +109,10 @@ impl CodexMapper {
         Self {
             workspace_root,
             thread_ids: HashMap::new(),
+            native_ids: HashMap::new(),
+            route_epochs: HashMap::new(),
+            next_route_epoch: 0,
+            native_parents: HashMap::new(),
             turn_ids: HashMap::new(),
             item_ids: HashMap::new(),
             turn_usage: HashMap::new(),
@@ -204,8 +215,93 @@ impl CodexMapper {
 
     /// B4: bind a native thread id to its owned `ThreadId`. Called at `open_thread` for both fresh
     /// `thread/start` and `thread/resume` (and re-bound after a resume-fallback, §4.7/C5).
+    pub fn claim_thread(
+        &mut self,
+        harness_thread_id: String,
+        thread: ThreadId,
+    ) -> Result<u64, HarnessError> {
+        let harness_thread_id = harness_thread_id.trim().to_owned();
+        if harness_thread_id.is_empty() {
+            return Err(HarnessError::Protocol(
+                "cannot claim an empty native thread id".into(),
+            ));
+        }
+        if let Some(existing) = self.thread_ids.get(&harness_thread_id) {
+            if *existing != thread {
+                return Err(HarnessError::Protocol(format!(
+                    "native thread {harness_thread_id} is already bound to {existing}, not {thread}"
+                )));
+            }
+            return self
+                .route_epochs
+                .get(&harness_thread_id)
+                .copied()
+                .ok_or_else(|| {
+                    HarnessError::Protocol(format!(
+                        "native thread {harness_thread_id} has no route epoch"
+                    ))
+                });
+        }
+        if let Some(existing) = self.native_ids.get(&thread) {
+            return Err(HarnessError::Protocol(format!(
+                "thread {thread} is already bound to native thread {existing}, not {harness_thread_id}"
+            )));
+        }
+        self.next_route_epoch = self
+            .next_route_epoch
+            .checked_add(1)
+            .ok_or_else(|| HarnessError::Protocol("native route epoch space exhausted".into()))?;
+        let epoch = self.next_route_epoch;
+        self.thread_ids.insert(harness_thread_id.clone(), thread);
+        self.native_ids.insert(thread, harness_thread_id.clone());
+        self.route_epochs.insert(harness_thread_id, epoch);
+        Ok(epoch)
+    }
+
+    /// Record the native parentage a sub-agent link item attests.
+    ///
+    /// A link item is delivered on its owner's native thread, so the provider is stating that
+    /// `child` belongs to `parent` — the same fact `thread/resume` reports as
+    /// `parent_harness_thread_id`. Recording it here lets an identity claim answer with it without
+    /// a resume round trip, which a claim is forbidden to make.
+    ///
+    /// The child of a link may also be an *ancestor*: a child thread reporting activity back to
+    /// its parent produces a link naming the parent. Parentage is a DAG, so an edge is refused
+    /// when it is a self-loop or when it would invert an edge already attested. The spawning link
+    /// always precedes any activity the spawned thread can report, so first write wins.
+    fn track_native_parentage(&mut self, parent: &str, child: &str) {
+        let parent = parent.trim();
+        let child = child.trim();
+        if parent.is_empty() || child.is_empty() || parent == child {
+            return;
+        }
+        if self
+            .native_parents
+            .get(parent)
+            .is_some_and(|existing| existing == child)
+        {
+            debug!(
+                parent_harness_thread_id = parent,
+                child_harness_thread_id = child,
+                "ignoring a sub-agent link that would invert attested native parentage"
+            );
+            return;
+        }
+        self.native_parents
+            .entry(child.to_owned())
+            .or_insert_with(|| parent.to_owned());
+    }
+
+    /// The native parent this harness lifetime has attested for a native thread, if any.
+    pub fn native_parent(&self, harness_thread_id: &str) -> Option<String> {
+        self.native_parents.get(harness_thread_id).cloned()
+    }
+
+    #[cfg(test)]
     pub fn register_thread(&mut self, harness_thread_id: String, thread: ThreadId) {
-        self.thread_ids.insert(harness_thread_id, thread);
+        if let Err(error) = self.claim_thread(harness_thread_id, thread) {
+            warn!(%error, "rejected conflicting native thread identity");
+        }
     }
 
     /// The `ThreadId` already bound to a native thread, if any.
@@ -412,6 +508,9 @@ impl CodexMapper {
                 }
                 let (harness_item_id, kind, command, tool) =
                     map_thread_item_start(item, *started_at_ms);
+                if let Some(link) = tool.as_ref().and_then(|tool| tool.subagent.as_ref()) {
+                    self.track_native_parentage(thread_id, &link.harness_thread_id);
+                }
                 let id = self.resolve_item(thread, turn, &harness_item_id);
                 self.track_command_start(&harness_item_id, command.as_ref(), thread, turn, turn_id);
                 Some(AgentEvent::ItemStarted {
@@ -439,6 +538,9 @@ impl CodexMapper {
                 let id = self.resolve_item(thread, turn, &harness_item_id);
                 let giskard_item =
                     map_thread_item_complete(item, id, harness_item_id, *completed_at_ms);
+                if let Some(link) = completed_item_subagent_link(&giskard_item) {
+                    self.track_native_parentage(thread_id, &link.harness_thread_id);
+                }
                 self.track_completed_item(&giskard_item, thread, turn, turn_id);
                 Some(AgentEvent::ItemCompleted {
                     thread,
@@ -2782,6 +2884,16 @@ fn json_display(value: &Value) -> String {
     }
 }
 
+/// The sub-agent link a completed item carries, whichever payload shape holds it.
+fn completed_item_subagent_link(item: &Item) -> Option<&SubagentLink> {
+    match &item.payload {
+        ItemPayload::Activity { subagent, .. } | ItemPayload::ToolCall { subagent, .. } => {
+            subagent.as_ref()
+        }
+        _ => None,
+    }
+}
+
 fn collab_agent_link(
     tool: &Value,
     agents_states: &impl Serialize,
@@ -3153,6 +3265,63 @@ mod tests {
             .finish();
         tracing::subscriber::with_default(subscriber, log);
         String::from_utf8(output.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn native_parentage_is_attested_by_link_items_and_never_inverted() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+
+        // A spawn link arrives on the parent's own native thread: the provider stating that the
+        // linked child belongs to that parent, which is what `thread/resume` would have reported.
+        mapper.track_native_parentage("native-parent", "native-child");
+        assert_eq!(
+            mapper.native_parent("native-child"),
+            Some("native-parent".to_owned())
+        );
+        assert_eq!(mapper.native_parent("native-parent"), None);
+
+        // The child later reports activity naming its parent. That link must not reverse the
+        // edge already attested, or a claim would answer with the child as its parent's parent.
+        mapper.track_native_parentage("native-child", "native-parent");
+        assert_eq!(mapper.native_parent("native-parent"), None);
+        assert_eq!(
+            mapper.native_parent("native-child"),
+            Some("native-parent".to_owned())
+        );
+
+        // Neither a self-link nor a blank id is parentage.
+        mapper.track_native_parentage("native-child", "native-child");
+        mapper.track_native_parentage("native-parent", "   ");
+        assert_eq!(
+            mapper.native_parent("native-child"),
+            Some("native-parent".to_owned())
+        );
+
+        // A first attestation wins; a later contradicting one does not silently rewrite it.
+        mapper.track_native_parentage("native-other-parent", "native-child");
+        assert_eq!(
+            mapper.native_parent("native-child"),
+            Some("native-parent".to_owned())
+        );
+    }
+
+    #[test]
+    fn native_route_claims_are_idempotent_and_bijective() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let first = ThreadId::new();
+        let second = ThreadId::new();
+
+        let epoch = mapper.claim_thread("native-a".into(), first).unwrap();
+        assert_eq!(
+            mapper.claim_thread("native-a".into(), first).unwrap(),
+            epoch
+        );
+        assert!(mapper.claim_thread("native-a".into(), second).is_err());
+        assert!(mapper.claim_thread("native-b".into(), first).is_err());
+        assert!(mapper.claim_thread("   ".into(), second).is_err());
+
+        let second_epoch = mapper.claim_thread("native-b".into(), second).unwrap();
+        assert!(second_epoch > epoch);
     }
 
     #[test]

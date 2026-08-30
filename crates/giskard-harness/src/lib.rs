@@ -352,6 +352,19 @@ pub fn thread_update_channel() -> (ThreadUpdateSink, ThreadUpdateStream) {
     (ThreadUpdateSink(tx), ThreadUpdateStream(rx))
 }
 
+/// One durable native/local identity installed before a harness can dispatch ordinary events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownThreadBinding {
+    pub harness_thread_id: String,
+    pub thread_id: ThreadId,
+}
+
+/// Complete durable identity input for one harness process lifetime.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HarnessBootstrap {
+    pub known_threads: Vec<KnownThreadBinding>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ResumePolicy {
     #[default]
@@ -507,6 +520,24 @@ pub trait AgentHarness: Send + Sync {
     /// Open (or resume) a thread.
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError>;
 
+    /// Bind a harness-native thread identity without starting or resuming native work.
+    ///
+    /// This is used when an already-running agent reports a child thread. The returned handle is
+    /// immediately subscribable, but the operation must not issue a provider RPC or make the
+    /// read-only child user-operable. Repeating the same pair is idempotent; either side already
+    /// bound to a different identity is a protocol error.
+    async fn claim_native_thread(
+        &self,
+        thread: ThreadId,
+        harness_thread_id: String,
+        workspace_root: PathBuf,
+    ) -> Result<ThreadHandle, HarnessError> {
+        let _ = (thread, harness_thread_id, workspace_root);
+        Err(HarnessError::Unsupported(
+            "native thread identity claims are not supported by this harness".into(),
+        ))
+    }
+
     /// Start a turn: send user input, applying per-turn overrides.
     async fn start_turn(
         &self,
@@ -517,23 +548,6 @@ pub trait AgentHarness: Send + Sync {
 
     /// Subscribe to the stream of neutral events for a thread.
     fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream;
-
-    /// Tell the harness which native threads Giskard already has durable ids for.
-    ///
-    /// A harness can be told about a thread by the agent before Giskard opens it — Codex creates a
-    /// sub-agent's thread and starts its first turn before the tool call naming the child returns.
-    /// A harness routing those events has no id to route them to unless it invents one, and an
-    /// invented id for a thread Giskard already persisted is a *second* identity for one thread:
-    /// two ids, one of them wrong, and everything keyed by either has to be reconciled afterwards.
-    ///
-    /// Supplying the bindings up front removes that problem rather than making it cheaper. Every
-    /// `(native id, ThreadId)` pair Giskard already knows is one the harness never has to guess.
-    ///
-    /// Called once per harness, before any thread is opened on it. Idempotent, and harnesses that
-    /// do not translate ids ignore it.
-    async fn bind_known_threads(&self, bindings: Vec<(String, ThreadId)>) {
-        let _ = bindings;
-    }
 
     /// Respond to a pending approval request.
     async fn respond_approval(

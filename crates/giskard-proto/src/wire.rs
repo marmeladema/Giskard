@@ -22,10 +22,9 @@ use giskard_core::item::{
     ItemDelta, ItemKind, ItemPayload, ItemStart, SubagentAction, SubagentLink, SubagentStatus,
     ToolCallStart, ToolOutputDescriptor,
 };
-use giskard_core::model::ModelRef;
 use giskard_core::server_request::ServerRequest;
 use giskard_core::token::TokenUsage;
-use giskard_core::turn::{Mode, Turn, TurnStatus};
+use giskard_core::turn::{Turn, TurnStatus};
 use giskard_core::user_input::UserInput;
 
 fn path_to_wire(p: &std::path::Path) -> String {
@@ -778,8 +777,8 @@ pub struct WireTurn {
     pub id: TurnId,
     pub user_input: UserInput,
     pub items: Vec<WireItem>,
-    pub model: ModelRef,
-    pub mode: Mode,
+    pub model: giskard_core::turn::TurnModel,
+    pub mode: giskard_core::turn::TurnMode,
     pub status: TurnStatus,
     pub usage: TokenUsage,
     pub diffs: Vec<WireFileDiff>,
@@ -809,6 +808,7 @@ impl From<Turn> for WireTurn {
 mod tests {
     use super::*;
     use giskard_core::approval::{ApprovalKind, ApprovalMetadata};
+    use giskard_core::model::ModelRef;
     use std::path::PathBuf;
 
     #[test]

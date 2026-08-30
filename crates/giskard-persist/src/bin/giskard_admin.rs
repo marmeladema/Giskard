@@ -95,10 +95,14 @@ async fn run() -> Result<(), String> {
                         .map_err(|e| format!("failed to load thread {tid}: {e}"))?
                     {
                         println!(
-                            "{}  {}  [{:?}]  {}",
+                            "{}  {}  [{}]  {}",
                             tid,
                             thread.title,
-                            thread.mode,
+                            match thread.mode.as_known() {
+                                Some(giskard_core::turn::Mode::Plan) => "Plan",
+                                Some(giskard_core::turn::Mode::Build) => "Build",
+                                None => "Unknown",
+                            },
                             thread_archive_status(thread.archived)
                         );
                     }

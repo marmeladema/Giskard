@@ -376,12 +376,12 @@ mod tests {
                 thread_id,
                 revision,
                 title: format!("revision {revision}"),
-                mode: Mode::Build,
-                current_model: ModelRef {
+                mode: giskard_core::turn::TurnMode::Known(Mode::Build),
+                current_model: giskard_core::turn::TurnModel::Known(ModelRef {
                     provider: "test".into(),
                     model: "test".into(),
                     reasoning_effort: None,
-                },
+                }),
                 context_window: 128_000,
                 permission_preset: PermissionPreset::AskFirst,
                 tokens: TokenLedger::default(),
@@ -457,12 +457,12 @@ mod tests {
                     thread_id,
                     revision: 2,
                     title: "Thread".into(),
-                    mode: Mode::Build,
-                    current_model: ModelRef {
+                    mode: giskard_core::turn::TurnMode::Known(Mode::Build),
+                    current_model: giskard_core::turn::TurnModel::Known(ModelRef {
                         provider: "test".into(),
                         model: "test".into(),
                         reasoning_effort: None,
-                    },
+                    }),
                     context_window: 128_000,
                     permission_preset: PermissionPreset::AskFirst,
                     tokens: TokenLedger::default(),

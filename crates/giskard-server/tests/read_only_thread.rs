@@ -101,6 +101,7 @@ impl HarnessFactory for AttachFailsFactory {
     async fn create(
         &self,
         _config: &ProjectConfig,
+        _bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn giskard_harness::AgentHarness>, giskard_core::HarnessError> {
         let inner = if self.advertises_provider_listing {
             ReplayHarness::new().with_providers(self.providers.clone())
@@ -117,6 +118,7 @@ impl HarnessFactory for FailingFactory {
     async fn create(
         &self,
         _config: &ProjectConfig,
+        _bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn giskard_harness::AgentHarness>, giskard_core::HarnessError> {
         Err(giskard_core::HarnessError::Spawn(
             "unknown provider: cloudflare-litellm".into(),
@@ -157,8 +159,8 @@ fn make_turn(text: &str) -> Turn {
             },
             created_at: now,
         }],
-        model: orphaned_model(),
-        mode: Mode::Build,
+        model: giskard_core::turn::TurnModel::Known(orphaned_model()),
+        mode: giskard_core::turn::TurnMode::Known(Mode::Build),
         status: TurnStatus {
             kind: TurnStatusKind::Completed,
             message: None,
@@ -182,8 +184,8 @@ fn seeded_thread(project_id: ProjectId, thread_id: ThreadId) -> ThreadFile {
         parent_thread_id: None,
         spawned_by_turn_id: None,
         kind: giskard_core::ThreadKind::Primary,
-        mode: Mode::Build,
-        current_model: orphaned_model(),
+        mode: giskard_core::turn::TurnMode::Known(Mode::Build),
+        current_model: giskard_core::turn::TurnModel::Known(orphaned_model()),
         context_window: 131_072,
         model_context_windows: Default::default(),
         permission_preset: PermissionPreset::AskFirst,

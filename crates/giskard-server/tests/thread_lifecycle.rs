@@ -27,6 +27,7 @@ impl HarnessFactory for DummyFactory {
     async fn create(
         &self,
         _config: &ProjectConfig,
+        _bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
         Err(giskard_core::HarnessError::Spawn("dummy".into()))
     }
@@ -154,12 +155,12 @@ async fn thread_lifecycle_native_failure_preserves_local_thread() {
                 parent_thread_id: None,
                 spawned_by_turn_id: None,
                 kind: giskard_core::ThreadKind::Primary,
-                mode: Mode::Build,
-                current_model: ModelRef {
+                mode: giskard_core::turn::TurnMode::Known(Mode::Build),
+                current_model: giskard_core::turn::TurnModel::Known(ModelRef {
                     provider: "openai".into(),
                     model: "gpt-5.5".into(),
                     reasoning_effort: None,
-                },
+                }),
                 context_window: 262_144,
                 model_context_windows: Default::default(),
                 permission_preset: PermissionPreset::AskFirst,

@@ -18,6 +18,7 @@ impl HarnessFactory for NoHarnessFactory {
     async fn create(
         &self,
         _config: &ProjectConfig,
+        _bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
         Err(HarnessError::Unsupported(
             "no harness in security tests".into(),

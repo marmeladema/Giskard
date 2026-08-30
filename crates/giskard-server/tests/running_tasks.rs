@@ -163,7 +163,11 @@ struct ToolFactory;
 
 #[async_trait::async_trait]
 impl HarnessFactory for ToolFactory {
-    async fn create(&self, _config: &ProjectConfig) -> Result<Arc<dyn AgentHarness>, HarnessError> {
+    async fn create(
+        &self,
+        _config: &ProjectConfig,
+        _bootstrap: giskard_harness::HarnessBootstrap,
+    ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
         Ok(Arc::new(ToolHarness::new()))
     }
 }

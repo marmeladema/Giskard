@@ -15,7 +15,7 @@ use giskard_core::ids::{ApprovalId, ProjectId, ServerRequestId, ThreadId, TurnId
 use giskard_core::ids::{DiffId, ItemId};
 use giskard_core::item::{Item, ItemPayload, command_status_is_running};
 use giskard_core::server_request::{ServerRequest, ServerRequestResponse};
-use giskard_core::turn::{Mode, Turn};
+use giskard_core::turn::{Turn, TurnMode, TurnModel};
 use giskard_core::user_input::UserInput;
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
@@ -236,9 +236,8 @@ pub(crate) struct RequestClaim {
 pub(crate) struct TurnReservation {
     pub project_id: ProjectId,
     pub harness_thread_id: String,
-    pub mode: Mode,
-    pub provider: String,
-    pub model: String,
+    pub mode: TurnMode,
+    pub model: TurnModel,
     pub context_kind: &'static str,
 }
 
@@ -920,8 +919,7 @@ impl ThreadRuntimeRegistry {
                 owner_harness_thread_id = %existing.reservation.harness_thread_id,
                 owner_context_kind = existing.reservation.context_kind,
                 owner_mode = ?existing.reservation.mode,
-                owner_provider = %existing.reservation.provider,
-                owner_model = %existing.reservation.model,
+                owner_model = ?existing.reservation.model,
                 owner_elapsed_ms = existing.reserved_at.elapsed().as_millis(),
                 "rejecting turn start because thread runtime is already active"
             );
@@ -1789,7 +1787,7 @@ mod tests {
     use chrono::Utc;
     use giskard_core::approval::ApprovalKind;
     use giskard_core::model::ModelRef;
-    use giskard_core::turn::{TurnStatus, TurnStatusKind};
+    use giskard_core::turn::{Mode, TurnMode, TurnModel, TurnStatus, TurnStatusKind};
 
     fn approval(id: &str) -> ApprovalRequest {
         ApprovalRequest {
@@ -1814,9 +1812,12 @@ mod tests {
                 TurnReservation {
                     project_id,
                     harness_thread_id: "native".into(),
-                    mode: Mode::Build,
-                    provider: "provider".into(),
-                    model: "model".into(),
+                    mode: TurnMode::Known(Mode::Build),
+                    model: TurnModel::Known(ModelRef {
+                        provider: "provider".into(),
+                        model: "model".into(),
+                        reasoning_effort: None,
+                    }),
                     context_kind: "test",
                 },
             )
@@ -2402,9 +2403,12 @@ mod tests {
                 TurnReservation {
                     project_id: ProjectId::new(),
                     harness_thread_id: "native".into(),
-                    mode: Mode::Build,
-                    provider: "provider".into(),
-                    model: "model".into(),
+                    mode: TurnMode::Known(Mode::Build),
+                    model: TurnModel::Known(ModelRef {
+                        provider: "provider".into(),
+                        model: "model".into(),
+                        reasoning_effort: None,
+                    }),
                     context_kind: "user",
                 },
             )
@@ -2471,9 +2475,12 @@ mod tests {
                 TurnReservation {
                     project_id: ProjectId::new(),
                     harness_thread_id: "native".into(),
-                    mode: Mode::Build,
-                    provider: "provider".into(),
-                    model: "model".into(),
+                    mode: TurnMode::Known(Mode::Build),
+                    model: TurnModel::Known(ModelRef {
+                        provider: "provider".into(),
+                        model: "model".into(),
+                        reasoning_effort: None,
+                    }),
                     context_kind: "test",
                 },
             )
@@ -2503,9 +2510,12 @@ mod tests {
                 TurnReservation {
                     project_id: ProjectId::new(),
                     harness_thread_id: "native".into(),
-                    mode: Mode::Build,
-                    provider: "provider".into(),
-                    model: "model".into(),
+                    mode: TurnMode::Known(Mode::Build),
+                    model: TurnModel::Known(ModelRef {
+                        provider: "provider".into(),
+                        model: "model".into(),
+                        reasoning_effort: None,
+                    }),
                     context_kind: "user",
                 },
             )
@@ -2580,9 +2590,12 @@ mod tests {
                 TurnReservation {
                     project_id: ProjectId::new(),
                     harness_thread_id: "native".into(),
-                    mode: Mode::Build,
-                    provider: "provider".into(),
-                    model: "model".into(),
+                    mode: TurnMode::Known(Mode::Build),
+                    model: TurnModel::Known(ModelRef {
+                        provider: "provider".into(),
+                        model: "model".into(),
+                        reasoning_effort: None,
+                    }),
                     context_kind: "user",
                 },
             )
@@ -2601,9 +2614,12 @@ mod tests {
         let reservation = TurnReservation {
             project_id: ProjectId::new(),
             harness_thread_id: "native".into(),
-            mode: Mode::Build,
-            provider: "provider".into(),
-            model: "model".into(),
+            mode: TurnMode::Known(Mode::Build),
+            model: TurnModel::Known(ModelRef {
+                provider: "provider".into(),
+                model: "model".into(),
+                reasoning_effort: None,
+            }),
             context_kind: "user",
         };
         let mut lease = runtime
@@ -2619,8 +2635,9 @@ mod tests {
                 provider: "provider".into(),
                 model: "model".into(),
                 reasoning_effort: None,
-            },
-            mode: Mode::Build,
+            }
+            .into(),
+            mode: TurnMode::Known(Mode::Build),
             status: TurnStatus {
                 kind: TurnStatusKind::Completed,
                 message: None,

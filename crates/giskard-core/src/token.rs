@@ -79,12 +79,20 @@ pub struct TokenLedger {
     pub total: TokenUsage,
     #[serde(default)]
     pub by_model: ByModel,
+    /// Usage reported without authoritative model metadata.
+    #[serde(default, skip_serializing_if = "is_zero_usage")]
+    pub unattributed: TokenUsage,
 }
 
 impl TokenLedger {
     pub fn record(&mut self, provider: &str, model: &str, usage: &TokenUsage) {
         self.total.add(usage);
         self.by_model.record(provider, model, usage);
+    }
+
+    pub fn record_unattributed(&mut self, usage: &TokenUsage) {
+        self.total.add(usage);
+        self.unattributed.add(usage);
     }
 }
 
@@ -96,6 +104,9 @@ pub struct DailyTokenLedger {
     pub by_day: std::collections::BTreeMap<String, TokenUsage>,
     #[serde(default)]
     pub by_model: ByModel,
+    /// Usage reported without authoritative model metadata.
+    #[serde(default, skip_serializing_if = "is_zero_usage")]
+    pub unattributed: TokenUsage,
 }
 
 impl DailyTokenLedger {
@@ -103,6 +114,12 @@ impl DailyTokenLedger {
         self.total.add(usage);
         self.by_day.entry(date.to_string()).or_default().add(usage);
         self.by_model.record(provider, model, usage);
+    }
+
+    pub fn record_unattributed(&mut self, date: &str, usage: &TokenUsage) {
+        self.total.add(usage);
+        self.by_day.entry(date.to_string()).or_default().add(usage);
+        self.unattributed.add(usage);
     }
 
     /// Derive weekly totals from `by_day` buckets (spec §10.2).
@@ -158,6 +175,10 @@ impl DailyTokenLedger {
     }
 }
 
+fn is_zero_usage(usage: &TokenUsage) -> bool {
+    *usage == TokenUsage::default()
+}
+
 /// Map a "YYYY-MM-DD" date to its ISO-8601 week key "YYYY-Www" (spec §10.2). Returns `None` if
 /// the date does not parse.
 pub fn iso_week_of(date: &str) -> Option<String> {
@@ -207,6 +228,22 @@ mod tests {
         let gpt = ledger.by_model.get("openai", "gpt-5.5").unwrap();
         assert_eq!(gpt.input, 3000);
         assert_eq!(gpt.output, 600);
+    }
+
+    #[test]
+    fn unattributed_usage_contributes_to_totals_without_inventing_a_model() {
+        let mut ledger = TokenLedger::default();
+        ledger.record_unattributed(&TokenUsage::new(40, 2));
+
+        assert_eq!(ledger.total, TokenUsage::new(40, 2));
+        assert_eq!(ledger.unattributed, TokenUsage::new(40, 2));
+        assert!(ledger.by_model.is_empty());
+
+        let mut daily = DailyTokenLedger::default();
+        daily.record_unattributed("2026-08-31", &TokenUsage::new(8, 1));
+        assert_eq!(daily.total, TokenUsage::new(8, 1));
+        assert_eq!(daily.day_total("2026-08-31"), TokenUsage::new(8, 1));
+        assert!(daily.by_model.is_empty());
     }
 
     #[test]

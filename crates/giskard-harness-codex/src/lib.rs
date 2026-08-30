@@ -39,8 +39,9 @@ use giskard_core::token::TokenUsage;
 use giskard_core::turn::{PermissionPreset, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::{AttachmentKind, UserAttachment, UserInput};
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, HarnessNotice, HarnessProvider,
-    OpenThreadOptions, ProviderAuth, ProviderAuthCommand, ResumePolicy, ThreadHandle, ThreadUpdate,
+    AgentEventStream, AgentHarness, HarnessBootstrap, HarnessCapabilities, HarnessNotice,
+    HarnessProvider, OpenThreadOptions, ProviderAuth, ProviderAuthCommand, ResumePolicy,
+    ThreadHandle, ThreadUpdate,
 };
 
 use mapping::CodexMapper;
@@ -227,10 +228,11 @@ enum HarnessCommand {
 }
 
 enum ControlCommand {
-    /// Bindings Giskard already had, handed over before any thread is opened.
-    BindKnownThreads {
-        bindings: Vec<(String, ThreadId)>,
-        response: oneshot::Sender<()>,
+    ClaimNativeThread {
+        thread: ThreadId,
+        harness_thread_id: String,
+        workspace_root: PathBuf,
+        response: oneshot::Sender<Result<ThreadHandle, HarnessError>>,
     },
     RespondApproval {
         id: ApprovalId,
@@ -846,11 +848,24 @@ pub struct CodexHarness {
 
 impl CodexHarness {
     pub async fn start(workspace_root: PathBuf) -> Result<Arc<Self>, HarnessError> {
+        Self::start_with_bootstrap(workspace_root, HarnessBootstrap::default()).await
+    }
+
+    pub async fn start_with_bootstrap(
+        workspace_root: PathBuf,
+        bootstrap: HarnessBootstrap,
+    ) -> Result<Arc<Self>, HarnessError> {
         let workspace_root = normalize_workspace_root(workspace_root)?;
         let (mut client, client_version) =
             start_codex_client(codex_codes::AppServerBuilder::new()).await?;
         let writable_roots = configured_workspace_write_roots(&mut client, &workspace_root).await;
-        Self::spawn_harness(client, workspace_root, writable_roots, client_version)
+        Self::spawn_harness(
+            client,
+            workspace_root,
+            writable_roots,
+            client_version,
+            bootstrap,
+        )
     }
 
     pub async fn start_with(
@@ -861,7 +876,13 @@ impl CodexHarness {
         let builder = codex_codes::cli::AppServerBuilder::new().command(codex_path);
         let (mut client, client_version) = start_codex_client(builder).await?;
         let writable_roots = configured_workspace_write_roots(&mut client, &workspace_root).await;
-        Self::spawn_harness(client, workspace_root, writable_roots, client_version)
+        Self::spawn_harness(
+            client,
+            workspace_root,
+            writable_roots,
+            client_version,
+            HarnessBootstrap::default(),
+        )
     }
 
     fn spawn_harness<C>(
@@ -869,13 +890,20 @@ impl CodexHarness {
         workspace_root: PathBuf,
         writable_roots: Vec<PathBuf>,
         client_version: Option<String>,
+        bootstrap: HarnessBootstrap,
     ) -> Result<Arc<Self>, HarnessError>
     where
         C: CodexTransport + 'static,
     {
+        let mut mapper = CodexMapper::new(workspace_root.clone());
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (control_tx, control_rx) = mpsc::channel(64);
         let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
+        for binding in bootstrap.known_threads {
+            mapper.claim_thread(binding.harness_thread_id, binding.thread_id)?;
+            let (sender, _) = broadcast::channel(BROADCAST_CAPACITY);
+            ensure_thread_sender(&senders, binding.thread_id, sender);
+        }
         let worker_queue = Arc::new(WorkerQueueWatchdog::new());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (worker_done_tx, worker_done) = watch::channel(false);
@@ -919,6 +947,7 @@ impl CodexHarness {
                 worker_queue,
                 workspace_root,
                 writable_roots,
+                mapper,
             )
             .await;
             worker_done_tx.send_replace(true);
@@ -953,6 +982,7 @@ impl CodexHarness {
         command: ControlCommand,
     ) -> Result<(), HarnessError> {
         let thread_id = match &command {
+            ControlCommand::ClaimNativeThread { thread, .. } => Some(*thread),
             ControlCommand::Interrupt { thread, .. }
             | ControlCommand::TerminateCommand { thread, .. }
             | ControlCommand::CompactThread { thread, .. }
@@ -1251,6 +1281,27 @@ impl AgentHarness for CodexHarness {
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
 
+    async fn claim_native_thread(
+        &self,
+        thread: ThreadId,
+        harness_thread_id: String,
+        workspace_root: PathBuf,
+    ) -> Result<ThreadHandle, HarnessError> {
+        let (tx, rx) = oneshot::channel();
+        self.enqueue_control(
+            "claim_native_thread",
+            ControlCommand::ClaimNativeThread {
+                thread,
+                harness_thread_id,
+                workspace_root,
+                response: tx,
+            },
+        )
+        .await?;
+        rx.await
+            .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
+    }
+
     async fn start_turn(
         &self,
         thread: &ThreadHandle,
@@ -1316,36 +1367,6 @@ impl AgentHarness for CodexHarness {
         .await?;
         rx.await
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
-    }
-
-    async fn bind_known_threads(&self, bindings: Vec<(String, ThreadId)>) {
-        if bindings.is_empty() {
-            return;
-        }
-        // Waited on, not fired and forgotten: the caller's contract is that these are in place
-        // before any thread is opened, and returning early would let an open — and the Codex
-        // traffic it triggers — race the registration this exists to guarantee.
-        let (tx, rx) = oneshot::channel();
-        if let Err(error) = self
-            .enqueue_control(
-                "bind_known_threads",
-                ControlCommand::BindKnownThreads {
-                    bindings,
-                    response: tx,
-                },
-            )
-            .await
-        {
-            // Either failure leaves this harness running without the bindings, which is the exact
-            // situation the call exists to prevent — a sub-agent Codex announces will be given a
-            // second id and nothing later will say why. Nothing can be done about it here, so the
-            // only thing owed is a diagnosable record.
-            warn!(%error, "could not hand known thread bindings to the Codex worker");
-            return;
-        }
-        if rx.await.is_err() {
-            warn!("Codex worker stopped before acknowledging known thread bindings");
-        }
     }
 
     async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
@@ -1464,6 +1485,7 @@ async fn background_task<C>(
     worker_queue: Arc<WorkerQueueWatchdog>,
     workspace_root: PathBuf,
     writable_roots: Vec<PathBuf>,
+    mut mapper: CodexMapper,
 ) where
     C: CodexTransport,
 {
@@ -1472,7 +1494,6 @@ async fn background_task<C>(
         mut controls,
         mut shutdown,
     } = receivers;
-    let mut mapper = CodexMapper::new(workspace_root.clone());
     let mut pending_compactions: HashMap<ThreadId, PendingCompaction> = HashMap::new();
     let mut pending_context_restores: HashMap<String, PendingContextRestore> = HashMap::new();
     let mut active_turns: ActiveTurns = HashMap::new();
@@ -1954,6 +1975,29 @@ async fn handle_control_command(
     control: Option<ControlCommand>,
 ) -> StreamOutcome {
     match control {
+        Some(ControlCommand::ClaimNativeThread {
+            thread,
+            harness_thread_id,
+            workspace_root,
+            response,
+        }) => {
+            let result = mapper
+                .claim_thread(harness_thread_id.clone(), thread)
+                .map(|_| {
+                    let (sender, _) = broadcast::channel(BROADCAST_CAPACITY);
+                    ensure_thread_sender(senders, thread, sender);
+                    // A claim answers with the identity facts this harness lifetime already
+                    // attested through its own events. It must not resume the thread to learn
+                    // more: the native model stays unreported until an event names it.
+                    let parent_harness_thread_id = mapper.native_parent(&harness_thread_id);
+                    ThreadHandle {
+                        parent_harness_thread_id,
+                        ..ThreadHandle::opened(thread, harness_thread_id, workspace_root)
+                    }
+                });
+            let _ = response.send(result);
+            StreamOutcome::TurnEnded
+        }
         Some(ControlCommand::RespondApproval {
             id,
             decision,
@@ -1971,15 +2015,6 @@ async fn handle_control_command(
             let result =
                 handle_respond_server_request(client, mapper, senders, &id, response_payload).await;
             let _ = response.send(result);
-            StreamOutcome::TurnEnded
-        }
-        Some(ControlCommand::BindKnownThreads { bindings, response }) => {
-            let count = bindings.len();
-            for (harness_thread_id, thread) in bindings {
-                mapper.register_thread(harness_thread_id, thread);
-            }
-            debug!(count, "registered thread bindings Giskard already knew");
-            let _ = response.send(());
             StreamOutcome::TurnEnded
         }
         Some(ControlCommand::Interrupt { thread, response }) => {
@@ -2380,7 +2415,7 @@ async fn handle_open_thread(
     };
 
     // B4: bind the (possibly re-established) native id to the durable ThreadId.
-    mapper.register_thread(opened.harness_thread_id.clone(), thread_id);
+    mapper.claim_thread(opened.harness_thread_id.clone(), thread_id)?;
 
     let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
     ensure_thread_sender(senders, thread_id, tx);
@@ -4400,12 +4435,19 @@ mod tests {
     }
 
     fn spawn_fake_harness() -> (Arc<CodexHarness>, FakeCodexController) {
+        spawn_fake_harness_with_bootstrap(HarnessBootstrap::default())
+    }
+
+    fn spawn_fake_harness_with_bootstrap(
+        bootstrap: HarnessBootstrap,
+    ) -> (Arc<CodexHarness>, FakeCodexController) {
         let (transport, controller) = fake_codex();
         let harness = CodexHarness::spawn_harness(
             transport,
             PathBuf::from("/tmp"),
             Vec::new(),
             Some("1.2.3".into()),
+            bootstrap,
         )
         .expect("fake harness should spawn");
         (harness, controller)
@@ -4416,13 +4458,13 @@ mod tests {
     /// reuses it rather than inventing a second identity for the same thread.
     #[tokio::test]
     async fn a_known_binding_is_reused_instead_of_inventing_a_second_identity() {
-        let (harness, _controller) = spawn_fake_harness();
         let persisted = ThreadId::new();
-
-        // What the server read out of the child's own thread.json.
-        harness
-            .bind_known_threads(vec![("native-child".to_owned(), persisted)])
-            .await;
+        let (harness, _controller) = spawn_fake_harness_with_bootstrap(HarnessBootstrap {
+            known_threads: vec![giskard_harness::KnownThreadBinding {
+                harness_thread_id: "native-child".to_owned(),
+                thread_id: persisted,
+            }],
+        });
 
         // The caller has no id to offer — it is resuming by native id alone.
         let opened = harness

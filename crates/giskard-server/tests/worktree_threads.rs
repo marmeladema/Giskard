@@ -282,6 +282,27 @@ impl AgentHarness for RecordingHarness {
         })
     }
 
+    /// Binding a provider-owned child's identity: no resume, no native work, but the workspace it
+    /// is bound against is still recorded — that is what these tests assert about inheritance.
+    async fn claim_native_thread(
+        &self,
+        thread: ThreadId,
+        harness_thread_id: String,
+        workspace_root: std::path::PathBuf,
+    ) -> Result<ThreadHandle, HarnessError> {
+        self.opened_workspace_roots
+            .lock()
+            .await
+            .push(workspace_root.to_string_lossy().into_owned());
+        let (tx, _) = tokio::sync::broadcast::channel(16);
+        self.threads.lock().unwrap().push((thread, tx));
+        Ok(ThreadHandle::opened(
+            thread,
+            harness_thread_id,
+            workspace_root,
+        ))
+    }
+
     async fn start_turn(
         &self,
         thread: &ThreadHandle,
@@ -411,7 +432,11 @@ struct RecordingFactory(Arc<RecordingHarness>);
 
 #[async_trait::async_trait]
 impl HarnessFactory for RecordingFactory {
-    async fn create(&self, _config: &ProjectConfig) -> Result<Arc<dyn AgentHarness>, HarnessError> {
+    async fn create(
+        &self,
+        _config: &ProjectConfig,
+        _bootstrap: giskard_harness::HarnessBootstrap,
+    ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
         Ok(self.0.clone())
     }
 }

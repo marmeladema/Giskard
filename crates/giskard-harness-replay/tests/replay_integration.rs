@@ -310,12 +310,12 @@ async fn replay_persisted_state_roundtrip() {
         parent_thread_id: None,
         spawned_by_turn_id: None,
         kind: giskard_core::ThreadKind::Primary,
-        mode: Mode::Plan,
-        current_model: ModelRef {
+        mode: giskard_core::turn::TurnMode::Known(Mode::Plan),
+        current_model: giskard_core::turn::TurnModel::Known(ModelRef {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
-        },
+        }),
         context_window: 262_144,
         model_context_windows: Default::default(),
         permission_preset: PermissionPreset::AskFirst,
@@ -323,6 +323,7 @@ async fn replay_persisted_state_roundtrip() {
         tokens: giskard_core::token::TokenLedger {
             total: usage,
             by_model: Default::default(),
+            unattributed: Default::default(),
         },
         created_at: now,
         updated_at: now,
@@ -335,7 +336,7 @@ async fn replay_persisted_state_roundtrip() {
     // Reload and verify
     let loaded = store.load_thread(pid, thread_id).await.unwrap().unwrap();
     assert_eq!(loaded.title, "Fix auth");
-    assert_eq!(loaded.mode, Mode::Plan);
+    assert_eq!(loaded.mode, giskard_core::turn::TurnMode::Known(Mode::Plan));
     assert_eq!(loaded.permission_preset, PermissionPreset::AskFirst);
     assert_eq!(loaded.tokens.total.input, 1200);
     assert_eq!(loaded.tokens.total.output, 340);

@@ -191,7 +191,11 @@ struct ApprovalFactory {
 
 #[async_trait]
 impl HarnessFactory for ApprovalFactory {
-    async fn create(&self, _config: &ProjectConfig) -> Result<Arc<dyn AgentHarness>, HarnessError> {
+    async fn create(
+        &self,
+        _config: &ProjectConfig,
+        _bootstrap: giskard_harness::HarnessBootstrap,
+    ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
         Ok(self.harness.clone())
     }
 }

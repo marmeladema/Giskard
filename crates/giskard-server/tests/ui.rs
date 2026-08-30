@@ -11,6 +11,7 @@ impl HarnessFactory for NoFactory {
     async fn create(
         &self,
         _c: &ProjectConfig,
+        _bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn giskard_harness::AgentHarness>, giskard_core::HarnessError> {
         Err(giskard_core::HarnessError::Spawn("unused".into()))
     }
@@ -437,6 +438,20 @@ async fn index_page_is_served_and_public() {
     assert!(
         body.contains("state.threadReadOnly = true;") && body.contains("thread_read_only"),
         "the thread_read_only warning marks the thread read-only in client state"
+    );
+    assert!(
+        body.contains("const UNREPORTED_ATTRIBUTION = \"unknown\";")
+            && body.contains("function knownModel(value)")
+            && body.contains("function knownMode(value)"),
+        "the client rejects unreported model/mode attribution at its boundary"
+    );
+    assert!(
+        body.contains("(model unreported)"),
+        "a thread whose provider never named a model says so instead of showing the project default"
+    );
+    assert!(
+        body.contains("!knownMode(payload.mode) && !attributionIsUnreported(payload.mode)"),
+        "an unreported mode must not make the client discard the whole thread projection"
     );
     assert!(
         body.contains("Thread resumed under provider"),

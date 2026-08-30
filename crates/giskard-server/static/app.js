@@ -954,13 +954,27 @@ function sameThreadProjection(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+// The server reports `"unknown"` where a provider never told it the thread's model or mode. It is
+// an authoritative "not reported", not a value to display, send, or look up in the model catalog,
+// so it is rejected at the boundary and never reaches state as a model object or a mode.
+const UNREPORTED_ATTRIBUTION = "unknown";
+function knownModel(value) {
+  return value && typeof value === "object" && value.provider && value.model ? value : null;
+}
+function knownMode(value) {
+  return value === "plan" || value === "build" ? value : null;
+}
+function attributionIsUnreported(value) {
+  return value === UNREPORTED_ATTRIBUTION;
+}
+
 function validThreadProjection(kind, payload) {
   if (!payload || (kind !== "detail" && kind !== "summary")) return null;
   const rawThreadId = kind === "detail" ? payload.thread_id : payload.id;
   const threadId = rawThreadId === undefined || rawThreadId === null ? "" : String(rawThreadId);
   const revision = validThreadRevision(payload.revision);
   if (!threadId || revision === null || typeof payload.title !== "string" ||
-      (payload.mode !== "build" && payload.mode !== "plan")) return null;
+      (!knownMode(payload.mode) && !attributionIsUnreported(payload.mode))) return null;
   return { threadId, revision };
 }
 
@@ -2092,6 +2106,7 @@ function clearThreadView(tid) {
   state.pendingUserEl = null; state.pendingUserText = null;
   state.compactPending = false;
   state.currentModel = null;
+  state.currentModelUnreported = false;
   $("effortControl").hidden = true;
   setTurnActive(false);
   state.awaitingInitialThreadState = false;
@@ -2463,6 +2478,7 @@ function openDraftThread(pid) {
   state.pendingUserText = null;
   state.compactPending = false;
   state.currentModel = null;
+  state.currentModelUnreported = false;
   prepareProjectModelCatalog(pid);
   resetGitState();
   state.mcpServers = []; state.mcpError = null; state.expandedMcps = new Set();
@@ -2545,6 +2561,7 @@ async function openThread(pid, tid, title, opts) {
   state.draftThread = null;
   state.compactPending = false;
   state.currentModel = null;
+  state.currentModelUnreported = false;
   clearPendingMetadataActions();
   prepareProjectModelCatalog(pid);
   $("effortControl").hidden = true;
@@ -3653,17 +3670,24 @@ function renderCurrentThreadMetadata() {
   const detail = composedThreadDetail(threadId);
   if (!detail) return;
   const effective = Object.assign({}, detail, pendingMetadataOverlay(threadId));
-  setMode(effective.mode || "build");
+  setMode(knownMode(effective.mode) || "build");
   setPermissionPreset(effective.permission_preset || "ask_first");
-  if (effective.current_model) {
-    state.currentModel = effective.current_model;
+  const currentModel = knownModel(effective.current_model);
+  state.currentModelUnreported = attributionIsUnreported(effective.current_model);
+  if (currentModel) {
+    state.currentModel = currentModel;
     if (state.threadReadOnly) {
       if (!state.readOnlyProvider) {
-        state.readOnlyProvider = effective.current_model.provider;
+        state.readOnlyProvider = currentModel.provider;
       }
     }
     if (projectModelCatalogReady()) syncModelControls();
     else renderModelSelect();
+  } else if (state.currentModelUnreported) {
+    // An agent-owned thread whose provider never named a model: say so rather than showing the
+    // project default as though the thread were on it. The control is read-only here anyway.
+    state.currentModel = null;
+    renderModelSelect();
   }
   if (effective.title) setThreadTitle(effective.title);
   if (effective.tokens) renderTokens(effective.tokens);
@@ -9833,6 +9857,14 @@ function renderModelSelect() {
   const sel = $("modelSel");
   const prev = state.currentModel ? modelKey(state.currentModel) : sel.value;
   sel.innerHTML="";
+  if (state.currentModelUnreported) {
+    const unreported = document.createElement("option");
+    unreported.value = UNREPORTED_MODEL_OPTION;
+    unreported.textContent = "(model unreported)";
+    unreported.disabled = true;
+    unreported.selected = true;
+    sel.append(unreported);
+  }
   for (const m of state.models) {
     const o = document.createElement("option");
     o.value = modelKey(m);
@@ -9864,6 +9896,7 @@ function modelOptionLabel(m) {
   const name = m.display_name || m.model || "Model";
   return m.provider ? `${name} [${m.provider}]` : name;
 }
+const UNREPORTED_MODEL_OPTION = "__unreported__";
 function modelKey(m) {
   return m && m.provider && m.model ? `${m.provider}/${m.model}` : "";
 }
@@ -9881,7 +9914,8 @@ function effortOptionsForModel(desc) {
   return EFFORT_OPTIONS;
 }
 function syncModelControls() {
-  if (state.currentModel) setModel(modelKey(state.currentModel));
+  if (state.currentModelUnreported) setModel(UNREPORTED_MODEL_OPTION);
+  else if (state.currentModel) setModel(modelKey(state.currentModel));
   syncModelOptionAvailability();
   syncEffortControl();
 }

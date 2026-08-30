@@ -14,7 +14,7 @@ use giskard_core::item::ItemPayload;
 use giskard_core::model::{Effort, ModelRef};
 use giskard_core::thread::ThreadKind;
 use giskard_core::token::{DailyTokenLedger, TokenLedger};
-use giskard_core::turn::{Mode, PermissionPreset, Turn};
+use giskard_core::turn::{PermissionPreset, Turn, TurnMode, TurnModel};
 
 use crate::PersistError;
 use crate::atomic::{atomic_write, atomic_write_json, read_json, read_json_or_quarantine};
@@ -26,6 +26,7 @@ use giskard_core::diff::CapturedDiffRecord;
 use giskard_core::{CapturedDiffContent, DiffId};
 
 const SCHEMA_VERSION: u32 = 1;
+pub const THREAD_METADATA_VERSION: u32 = 2;
 
 // ---- Persisted types ----
 
@@ -91,8 +92,8 @@ pub struct ThreadFile {
     pub spawned_by_turn_id: Option<TurnId>,
     #[serde(default, skip_serializing_if = "is_primary_thread")]
     pub kind: ThreadKind,
-    pub mode: Mode,
-    pub current_model: ModelRef,
+    pub mode: TurnMode,
+    pub current_model: TurnModel,
     /// Effective context window for `current_model`. This starts from catalog/config metadata and
     /// is replaced when the harness reports an authoritative runtime value.
     #[serde(default)]
@@ -209,8 +210,9 @@ impl ThreadFile {
             .entry(model.provider.clone())
             .or_default()
             .insert(model.model.clone(), context_window);
-        if self.current_model.provider == model.provider && self.current_model.model == model.model
-        {
+        if self.current_model.as_known().is_some_and(|current| {
+            current.provider == model.provider && current.model == model.model
+        }) {
             self.context_window = context_window;
         }
     }
@@ -981,7 +983,18 @@ impl PersistStore {
         project: ProjectId,
         thread: ThreadId,
     ) -> Result<Option<ThreadFile>, PersistError> {
-        read_json_or_quarantine(&self.thread_json_path(project, thread).await).await
+        let path = self.thread_json_path(project, thread).await;
+        let loaded: Option<ThreadFile> = read_json_or_quarantine(&path).await?;
+        if let Some(thread_file) = loaded.as_ref()
+            && thread_file.version > THREAD_METADATA_VERSION
+        {
+            return Err(PersistError::Invalid(format!(
+                "{}: thread metadata version {} is newer than this build understands ({THREAD_METADATA_VERSION})",
+                path.display(),
+                thread_file.version
+            )));
+        }
+        Ok(loaded)
     }
 
     /// Save a thread file atomically.
@@ -1364,7 +1377,12 @@ impl PersistStore {
                 ThreadRecency::RecordActivity,
                 move |thread| {
                     if should_record {
-                        thread.tokens.record(&model.provider, &model.model, &usage);
+                        match model.as_known() {
+                            Some(model) => {
+                                thread.tokens.record(&model.provider, &model.model, &usage)
+                            }
+                            None => thread.tokens.record_unattributed(&usage),
+                        }
                     }
                 },
             )
@@ -1835,7 +1853,10 @@ impl PersistStore {
                     giskard_core::turn::TurnStatusKind::Completed
                         | giskard_core::turn::TurnStatusKind::Interrupted
                 ) {
-                    ledger.record(&record.model.provider, &record.model.model, &record.usage);
+                    match record.model.as_known() {
+                        Some(model) => ledger.record(&model.provider, &model.model, &record.usage),
+                        None => ledger.record_unattributed(&record.usage),
+                    }
                 }
             }
             tf.tokens = ledger;
@@ -2266,6 +2287,7 @@ mod git_workspace_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use giskard_core::turn::Mode;
     use tempfile::TempDir;
 
     fn make_store() -> (TempDir, PersistStore) {
@@ -2346,8 +2368,8 @@ mod tests {
             parent_thread_id: None,
             spawned_by_turn_id: None,
             kind: ThreadKind::Primary,
-            mode: Mode::Build,
-            current_model: test_model(),
+            mode: TurnMode::Known(Mode::Build),
+            current_model: TurnModel::Known(test_model()),
             context_window: 128_000,
             model_context_windows: HashMap::new(),
             permission_preset: PermissionPreset::AskFirst,
@@ -2503,7 +2525,7 @@ mod tests {
                 project_id,
                 thread_id,
                 ThreadRecency::TouchIfChanged,
-                |thread| thread.mode = Mode::Plan,
+                |thread| thread.mode = TurnMode::Known(Mode::Plan),
             )
             .await
             .unwrap()
@@ -2665,8 +2687,8 @@ mod tests {
             parent_thread_id: None,
             spawned_by_turn_id: None,
             kind: ThreadKind::Primary,
-            mode: Mode::Build,
-            current_model: test_model(),
+            mode: TurnMode::Known(Mode::Build),
+            current_model: TurnModel::Known(test_model()),
             context_window: 262_144,
             model_context_windows: HashMap::new(),
             permission_preset: PermissionPreset::AskFirst,
@@ -2687,7 +2709,7 @@ mod tests {
         assert_eq!(loaded.revision, 0);
         assert_eq!(loaded.title, "Fix auth");
         assert_eq!(loaded.harness_thread_id, "th_abc");
-        assert_eq!(loaded.mode, Mode::Build);
+        assert_eq!(loaded.mode, TurnMode::Known(Mode::Build));
 
         let raw = tokio::fs::read_to_string(store.thread_json_path(pid, tid).await)
             .await
@@ -2761,8 +2783,8 @@ mod tests {
             parent_thread_id: None,
             spawned_by_turn_id: None,
             kind: ThreadKind::Primary,
-            mode: Mode::Build,
-            current_model: test_model(),
+            mode: TurnMode::Known(Mode::Build),
+            current_model: TurnModel::Known(test_model()),
             context_window: 262_144,
             model_context_windows: HashMap::new(),
             permission_preset: PermissionPreset::AskFirst,
@@ -2816,8 +2838,8 @@ mod tests {
             parent_thread_id: None,
             spawned_by_turn_id: None,
             kind: ThreadKind::Primary,
-            mode: Mode::Build,
-            current_model: test_model(),
+            mode: TurnMode::Known(Mode::Build),
+            current_model: TurnModel::Known(test_model()),
             context_window: 262_144,
             model_context_windows: HashMap::new(),
             permission_preset: PermissionPreset::AskFirst,
@@ -2865,8 +2887,8 @@ mod tests {
                 parent_thread_id: None,
                 spawned_by_turn_id: None,
                 kind: ThreadKind::Primary,
-                mode: Mode::Plan,
-                current_model: test_model(),
+                mode: TurnMode::Known(Mode::Plan),
+                current_model: TurnModel::Known(test_model()),
                 context_window: 128_000,
                 model_context_windows: HashMap::new(),
                 permission_preset: PermissionPreset::AskFirst,
@@ -2970,8 +2992,8 @@ mod tests {
             id: TurnId::new(),
             user_input: giskard_core::user_input::UserInput::text("hi"),
             items: vec![],
-            model: test_model(),
-            mode: Mode::Build,
+            model: TurnModel::Known(test_model()),
+            mode: TurnMode::Known(Mode::Build),
             status: giskard_core::turn::TurnStatus {
                 kind: giskard_core::turn::TurnStatusKind::Completed,
                 message: None,
@@ -3182,8 +3204,8 @@ mod tests {
                     parent_thread_id: None,
                     spawned_by_turn_id: None,
                     kind: ThreadKind::Primary,
-                    mode: Mode::Build,
-                    current_model: test_model(),
+                    mode: TurnMode::Known(Mode::Build),
+                    current_model: TurnModel::Known(test_model()),
                     context_window: 0,
                     model_context_windows: HashMap::new(),
                     permission_preset: PermissionPreset::AskFirst,
@@ -3516,8 +3538,8 @@ mod tests {
                     parent_thread_id: None,
                     spawned_by_turn_id: None,
                     kind: ThreadKind::Primary,
-                    mode: Mode::Build,
-                    current_model: test_model(),
+                    mode: TurnMode::Known(Mode::Build),
+                    current_model: TurnModel::Known(test_model()),
                     context_window: 0,
                     model_context_windows: HashMap::new(),
                     permission_preset: PermissionPreset::AskFirst,
@@ -3565,8 +3587,8 @@ mod tests {
                     parent_thread_id: None,
                     spawned_by_turn_id: None,
                     kind: ThreadKind::Primary,
-                    mode: Mode::Build,
-                    current_model: test_model(),
+                    mode: TurnMode::Known(Mode::Build),
+                    current_model: TurnModel::Known(test_model()),
                     context_window: 0,
                     model_context_windows: HashMap::new(),
                     permission_preset: PermissionPreset::AskFirst,
@@ -4128,7 +4150,10 @@ mod layout_tests {
         );
         assert_eq!(loaded[1].items, source[1].items);
         assert_eq!(loaded[2].user_input, source[2].user_input);
-        assert_eq!(store.thread_layout(pid, tid).await.history_format(), 2);
+        assert_eq!(
+            store.thread_layout(pid, tid).await.history_format(),
+            crate::layout::HISTORY_FORMAT
+        );
 
         // Metadata survives byte-for-byte, and the originals are relocated, never deleted.
         let paths = store.current_thread_paths(pid, tid);

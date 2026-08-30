@@ -166,7 +166,11 @@ impl CapFactory {
 
 #[async_trait::async_trait]
 impl HarnessFactory for CapFactory {
-    async fn create(&self, _config: &ProjectConfig) -> Result<Arc<dyn AgentHarness>, HarnessError> {
+    async fn create(
+        &self,
+        _config: &ProjectConfig,
+        _bootstrap: giskard_harness::HarnessBootstrap,
+    ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
         Ok(Arc::new(CapturingHarness::with_requests(
             self.captured.clone(),
             self.requested_models.clone(),
@@ -292,11 +296,11 @@ session_days = 30
         .unwrap();
     assert_eq!(
         imported.current_model,
-        ModelRef {
+        giskard_core::turn::TurnModel::Known(ModelRef {
             provider: "openai".into(),
             model: "gpt-5.5".into(),
             reasoning_effort: None,
-        },
+        }),
         "the imported thread takes the model the harness reported for it"
     );
 
@@ -420,7 +424,11 @@ session_days = 30
             .await
             .unwrap()
             .unwrap();
-        if tf.current_model.reasoning_effort.is_none() {
+        if tf
+            .current_model
+            .as_known()
+            .is_some_and(|model| model.reasoning_effort.is_none())
+        {
             break;
         }
         if tokio::time::Instant::now() >= deadline {

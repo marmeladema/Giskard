@@ -25,6 +25,7 @@ impl HarnessFactory for DiffFactory {
     async fn create(
         &self,
         _config: &ProjectConfig,
+        _bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
         Ok(Arc::new(ReplayHarness::from_fixture(self.fixture.clone())))
     }

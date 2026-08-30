@@ -14,7 +14,7 @@ use giskard_core::ids::{ThreadId, TurnId};
 /// Governs the *layout*, not the metadata record (`ThreadFile.version`) and not a turn's payload
 /// (`turns/<id>.jsonl` header `format`). The three evolve independently and each marker says only
 /// what it governs.
-pub const HISTORY_FORMAT: u32 = 2;
+pub const HISTORY_FORMAT: u32 = 3;
 
 /// The per-turn payload schema this build writes (`turns/<id>.jsonl` header `format`).
 ///
