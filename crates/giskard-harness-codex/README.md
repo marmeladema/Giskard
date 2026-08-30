@@ -123,6 +123,11 @@ Some Codex notifications carry an item ID without producing a visible Giskard
 item. The mapper may seed the scoped item registry from those notifications so
 that later deltas and completion still resolve to the same `ItemId`.
 
+A `functionCallOutput` item is mapped to a Giskard `ToolCall`. Codex emits it for a tool result the
+client supplied on `turn/start`, so the item carries the tool name, its optional namespace, and the
+output, but never the arguments — the recorded input is `null` rather than an invented object. A
+text body is kept as a JSON string so the transcript shows the tool's own text instead of a wrapper.
+
 ## Sub-agent links
 
 Codex collaboration items are mapped into harness-neutral `SubagentLink` values before they leave
@@ -145,6 +150,8 @@ the adapter. Both native spawning protocols are supported:
 
 The server imports the child from either representation and passively monitors only lifecycle
 evidence that can denote active work (`spawned`, `started`, `interacted`, `pending`, or `running`).
+A `subAgentActivity` whose kind is `completed` or `interrupted` is terminal evidence and never arms
+a monitor.
 An explicitly active monitor has a 10-minute no-event pre-turn safety bound; any event restarts it,
 and a started turn may run without that bound. Terminal evidence wakes an already-armed idle monitor
 and never creates a new one; reopening a persisted child without lifecycle evidence does not monitor
@@ -448,6 +455,15 @@ Codex's own backend; the metadata never reaches Giskard through `model/list`, wh
 context window at all — hence fetching it directly.
 
 A user agent that does not parse yields `None`, and the parameter is omitted rather than guessed.
+
+The same version doubles as a protocol-drift signal. `codex-codes` publishes the Codex release its
+own suite was last run against as `version::tested_cli_version()`, and the adapter warns once per
+spawned app-server when the running Codex is strictly newer than that. The bindings' own
+`check_codex_version` is not used: it shells out to `codex --version` on `PATH`, ignoring the
+configured `codex_path`, and reports through the `log` crate, which Giskard does not bridge into
+`tracing`. Drift is not fatal — protocol additions the bindings do not model arrive as unknown
+notifications and requests — but it is the first thing to check when Codex behavior looks
+truncated.
 
 ## Resume does not name a model
 

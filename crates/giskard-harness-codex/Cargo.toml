@@ -17,7 +17,7 @@ chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rand = { workspace = true }
-codex-codes = { version = "0.146.4", features = ["async-client"] }
+codex-codes = { version = "0.150.1", features = ["async-client"] }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

@@ -1919,17 +1919,19 @@ fn subagent_observation_is_terminal(
     action: Option<SubagentAction>,
     status: Option<SubagentStatus>,
 ) -> bool {
-    action == Some(SubagentAction::Interrupted)
-        || matches!(
-            status,
-            Some(
-                SubagentStatus::Completed
-                    | SubagentStatus::Interrupted
-                    | SubagentStatus::Failed
-                    | SubagentStatus::Shutdown
-                    | SubagentStatus::NotFound
-            )
+    matches!(
+        action,
+        Some(SubagentAction::Interrupted | SubagentAction::Completed)
+    ) || matches!(
+        status,
+        Some(
+            SubagentStatus::Completed
+                | SubagentStatus::Interrupted
+                | SubagentStatus::Failed
+                | SubagentStatus::Shutdown
+                | SubagentStatus::NotFound
         )
+    )
 }
 
 fn subagent_thread_title(info: &SubagentActivityInfo) -> String {
@@ -5517,9 +5519,12 @@ mod tests {
         let ignored = subagent_monitor_policy(None, None);
         assert!(!ignored.should_monitor);
 
-        let interrupted = subagent_monitor_policy(Some(SubagentAction::Interrupted), None);
-        assert!(!interrupted.should_monitor);
-        assert!(interrupted.terminal_observed);
+        // Codex reports both terminal outcomes as an action of their own, with no status attached.
+        for action in [SubagentAction::Interrupted, SubagentAction::Completed] {
+            let policy = subagent_monitor_policy(Some(action), None);
+            assert!(!policy.should_monitor, "{action:?} must not arm a monitor");
+            assert!(policy.terminal_observed, "{action:?} is terminal evidence");
+        }
         for status in [
             SubagentStatus::Completed,
             SubagentStatus::Interrupted,
