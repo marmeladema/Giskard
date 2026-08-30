@@ -13,7 +13,10 @@ use giskard_core::turn::{Mode, Turn};
 /// history (from the authoritative JSONL, H1). Returns `None` if there is no Plan-mode turn with
 /// agent text yet.
 pub fn extract_plan_markdown(title: &str, turns: &[Turn]) -> Option<String> {
-    let turn = turns.iter().rev().find(|t| t.mode == Mode::Plan)?;
+    let turn = turns
+        .iter()
+        .rev()
+        .find(|t| t.mode == giskard_core::turn::TurnMode::Known(Mode::Plan))?;
 
     let body = turn
         .items
@@ -129,8 +132,8 @@ mod tests {
             id: TurnId::new(),
             user_input: UserInput::text("plan it"),
             items,
-            model: model(),
-            mode,
+            model: giskard_core::turn::TurnModel::Known(model()),
+            mode: giskard_core::turn::TurnMode::Known(mode),
             status: TurnStatus {
                 kind: TurnStatusKind::Completed,
                 message: None,

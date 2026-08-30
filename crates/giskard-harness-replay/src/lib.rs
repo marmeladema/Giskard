@@ -542,7 +542,6 @@ mod tests {
                 thread: None,
                 workspace_root: "/tmp".into(),
                 resume: Some("th_test".into()),
-                resume_policy: giskard_harness::ResumePolicy::AllowFreshFallback,
                 updates: giskard_harness::thread_update_channel().0,
                 initial_model: Some(ModelRef {
                     provider: "openai".into(),
@@ -606,7 +605,6 @@ mod tests {
                 thread: Some(requested_thread),
                 workspace_root: "/tmp".into(),
                 resume: Some("th_test".into()),
-                resume_policy: giskard_harness::ResumePolicy::AllowFreshFallback,
                 updates: giskard_harness::thread_update_channel().0,
                 initial_model: Some(ModelRef {
                     provider: "openai".into(),

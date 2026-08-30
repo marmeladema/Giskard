@@ -39,7 +39,8 @@ use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+    AgentEventStream, AgentHarness, HarnessBootstrap, HarnessCapabilities, OpenThreadOptions,
+    ThreadHandle,
 };
 use giskard_persist::store::ProjectConfig;
 use giskard_server::{AppState, HarnessFactory, build_app};
@@ -116,6 +117,7 @@ const RECEIVER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mi
 struct ScriptedHarness {
     capabilities: HarnessCapabilities,
     threads: tokio::sync::Mutex<Vec<(ThreadId, broadcast::Sender<AgentEvent>)>>,
+    native_bindings: tokio::sync::Mutex<Vec<(String, ThreadId)>>,
     /// Where each in-flight scripted approval was raised, so `respond_approval` can emit its
     /// confirmation item on the right still-open turn (the reload e2e test uses that ack to know the
     /// server has recorded the answer before it reconnects). Keyed by approval id rather than held
@@ -128,8 +130,16 @@ struct ScriptedHarness {
 type ActiveApprovals = Arc<tokio::sync::Mutex<HashMap<ApprovalId, (ThreadId, TurnId)>>>;
 
 impl ScriptedHarness {
-    fn new() -> Self {
-        Self {
+    fn new(bootstrap: HarnessBootstrap) -> Result<Self, HarnessError> {
+        let mut native_bindings = Vec::with_capacity(bootstrap.known_threads.len());
+        for binding in bootstrap.known_threads {
+            Self::claim_binding(
+                &mut native_bindings,
+                binding.harness_thread_id,
+                binding.thread_id,
+            )?;
+        }
+        Ok(Self {
             capabilities: HarnessCapabilities {
                 live_approvals: true,
                 plan_build_modes: true,
@@ -148,8 +158,38 @@ impl ScriptedHarness {
                 context_compaction: false,
             },
             threads: tokio::sync::Mutex::new(Vec::new()),
+            native_bindings: tokio::sync::Mutex::new(native_bindings),
             active_approvals: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        })
+    }
+
+    fn claim_binding(
+        bindings: &mut Vec<(String, ThreadId)>,
+        harness_thread_id: String,
+        thread: ThreadId,
+    ) -> Result<(), HarnessError> {
+        if harness_thread_id.trim().is_empty() {
+            return Err(HarnessError::Protocol(
+                "native thread identity must not be empty".into(),
+            ));
         }
+        if let Some((_, existing_thread)) = bindings
+            .iter()
+            .find(|(native, _)| native == &harness_thread_id)
+        {
+            return (*existing_thread == thread).then_some(()).ok_or_else(|| {
+                HarnessError::Protocol(format!(
+                    "native thread {harness_thread_id} is already bound to {existing_thread}"
+                ))
+            });
+        }
+        if let Some((existing_native, _)) = bindings.iter().find(|(_, local)| *local == thread) {
+            return Err(HarnessError::Protocol(format!(
+                "thread {thread} is already bound to native thread {existing_native}"
+            )));
+        }
+        bindings.push((harness_thread_id, thread));
+        Ok(())
     }
 
     /// Wait for the server's event forwarder to attach before scripting a turn. A `broadcast` sender
@@ -180,6 +220,36 @@ impl ScriptedHarness {
         .find_map(|prefix| native_thread_id.strip_prefix(prefix))
         .and_then(|value| value.rsplit_once('|'))
         .map(|(parent, _)| parent.to_owned())
+    }
+
+    async fn attach_thread(
+        &self,
+        thread: ThreadId,
+        harness_thread_id: &str,
+    ) -> (Option<String>, bool) {
+        let (new_sender, _) = broadcast::channel(256);
+        let mut threads = self.threads.lock().await;
+        let (sender, is_new) =
+            if let Some((_, existing)) = threads.iter().find(|(id, _)| *id == thread) {
+                (existing.clone(), false)
+            } else {
+                threads.push((thread, new_sender.clone()));
+                (new_sender, true)
+            };
+        drop(threads);
+
+        let parent = Self::subagent_parent(harness_thread_id);
+        let blocks_on_approval = harness_thread_id.starts_with(SCRIPTED_APPROVAL_SUBAGENT_PREFIX);
+        if is_new && let Some(parent_id) = parent.clone() {
+            if harness_thread_id.starts_with(SCRIPTED_NESTED_SUBAGENT_PREFIX) {
+                Self::spawn_nested_subagent_turn(sender, thread, harness_thread_id.to_owned());
+            } else if blocks_on_approval {
+                Self::spawn_approval_subagent_turn(sender, thread, self.active_approvals.clone());
+            } else {
+                Self::spawn_subagent_turn(sender, thread, parent_id);
+            }
+        }
+        (parent, blocks_on_approval)
     }
 
     /// Drive a child turn that blocks on an approval and never completes. The parent's own turn has
@@ -399,28 +469,13 @@ impl AgentHarness for ScriptedHarness {
             .clone()
             .unwrap_or_else(|| format!("scripted_{thread}"));
 
-        let (new_sender, _) = broadcast::channel(256);
-        let mut threads = self.threads.lock().await;
-        let (sender, is_new) =
-            if let Some((_, existing)) = threads.iter().find(|(id, _)| *id == thread) {
-                (existing.clone(), false)
-            } else {
-                threads.push((thread, new_sender.clone()));
-                (new_sender, true)
-            };
-        drop(threads);
-
-        let parent_harness_thread_id = Self::subagent_parent(&harness_thread_id);
-        let blocks_on_approval = harness_thread_id.starts_with(SCRIPTED_APPROVAL_SUBAGENT_PREFIX);
-        if is_new && let Some(parent) = parent_harness_thread_id.clone() {
-            if harness_thread_id.starts_with(SCRIPTED_NESTED_SUBAGENT_PREFIX) {
-                Self::spawn_nested_subagent_turn(sender, thread, harness_thread_id.clone());
-            } else if blocks_on_approval {
-                Self::spawn_approval_subagent_turn(sender, thread, self.active_approvals.clone());
-            } else {
-                Self::spawn_subagent_turn(sender, thread, parent);
-            }
+        {
+            let mut bindings = self.native_bindings.lock().await;
+            Self::claim_binding(&mut bindings, harness_thread_id.clone(), thread)?;
         }
+
+        let (parent_harness_thread_id, blocks_on_approval) =
+            self.attach_thread(thread, &harness_thread_id).await;
 
         Ok(ThreadHandle {
             resumed_model: opts
@@ -436,6 +491,33 @@ impl AgentHarness for ScriptedHarness {
             }),
             parent_harness_thread_id,
             ..ThreadHandle::opened(thread, harness_thread_id, opts.workspace_root.clone())
+        })
+    }
+
+    async fn claim_native_thread(
+        &self,
+        thread: ThreadId,
+        harness_thread_id: String,
+        workspace_root: PathBuf,
+    ) -> Result<ThreadHandle, HarnessError> {
+        {
+            let mut bindings = self.native_bindings.lock().await;
+            Self::claim_binding(&mut bindings, harness_thread_id.clone(), thread)?;
+        }
+
+        let (parent_harness_thread_id, blocks_on_approval) =
+            self.attach_thread(thread, &harness_thread_id).await;
+
+        Ok(ThreadHandle {
+            agent_name: parent_harness_thread_id.as_ref().map(|_| {
+                if blocks_on_approval {
+                    SCRIPTED_APPROVAL_SUBAGENT_AGENT_NAME.to_string()
+                } else {
+                    SCRIPTED_SUBAGENT_AGENT_NAME.to_string()
+                }
+            }),
+            parent_harness_thread_id,
+            ..ThreadHandle::opened(thread, harness_thread_id, workspace_root)
         })
     }
 
@@ -876,8 +958,12 @@ struct ScriptedFactory;
 
 #[async_trait]
 impl HarnessFactory for ScriptedFactory {
-    async fn create(&self, _config: &ProjectConfig) -> Result<Arc<dyn AgentHarness>, HarnessError> {
-        Ok(Arc::new(ScriptedHarness::new()))
+    async fn create(
+        &self,
+        _config: &ProjectConfig,
+        bootstrap: HarnessBootstrap,
+    ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
+        Ok(Arc::new(ScriptedHarness::new(bootstrap)?))
     }
 }
 

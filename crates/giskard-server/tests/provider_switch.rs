@@ -125,7 +125,11 @@ struct SwitchFactory {
 
 #[async_trait::async_trait]
 impl HarnessFactory for SwitchFactory {
-    async fn create(&self, _config: &ProjectConfig) -> Result<Arc<dyn AgentHarness>, HarnessError> {
+    async fn create(
+        &self,
+        _config: &ProjectConfig,
+        _bootstrap: giskard_harness::HarnessBootstrap,
+    ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
         Ok(Arc::new(SwitchHarness {
             report_provider: self.report_provider.clone(),
             opened_workspace_roots: self.opened_workspace_roots.clone(),
@@ -174,8 +178,8 @@ fn make_turn(text: &str) -> Turn {
             },
             created_at: now,
         }],
-        model: dead_model(),
-        mode: Mode::Build,
+        model: giskard_core::turn::TurnModel::Known(dead_model()),
+        mode: giskard_core::turn::TurnMode::Known(Mode::Build),
         status: TurnStatus {
             kind: TurnStatusKind::Completed,
             message: None,
@@ -203,8 +207,8 @@ fn seeded_thread(
         parent_thread_id: None,
         spawned_by_turn_id: None,
         kind: giskard_core::ThreadKind::Primary,
-        mode: Mode::Build,
-        current_model: dead_model(),
+        mode: giskard_core::turn::TurnMode::Known(Mode::Build),
+        current_model: giskard_core::turn::TurnModel::Known(dead_model()),
         context_window: 131_072,
         model_context_windows: Default::default(),
         permission_preset: PermissionPreset::AskFirst,
@@ -446,7 +450,7 @@ async fn cold_provider_switch_succeeds_and_binds_the_thread() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(tf.current_model.provider, NEW_PROVIDER);
+    assert_eq!(tf.current_model.as_known().unwrap().provider, NEW_PROVIDER);
     let native = srv
         .state
         .registry
@@ -576,7 +580,7 @@ async fn unconfirmed_provider_switch_is_rejected_and_persists_nothing() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(tf.current_model.provider, DEAD_PROVIDER);
+    assert_eq!(tf.current_model.as_known().unwrap().provider, DEAD_PROVIDER);
     assert!(
         srv.state
             .registry

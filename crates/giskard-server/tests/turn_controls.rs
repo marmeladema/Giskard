@@ -28,6 +28,7 @@ impl HarnessFactory for TestFactory {
     async fn create(
         &self,
         _config: &ProjectConfig,
+        _bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
         // The thread is imported by native id, so the model it starts on is the harness's to
         // report. This test's config only offers `cloudflare-litellm`, and it goes on to select a
@@ -286,8 +287,15 @@ async fn modes_models_approvals_and_plan_dump() {
     }))
     .await
     .unwrap();
-    let tf = poll_thread(&state, pid, tid, |tf| tf.mode == Mode::Plan).await;
-    assert_eq!(tf.mode, Mode::Plan, "mode switch should persist");
+    let tf = poll_thread(&state, pid, tid, |tf| {
+        tf.mode == giskard_core::turn::TurnMode::Known(Mode::Plan)
+    })
+    .await;
+    assert_eq!(
+        tf.mode,
+        giskard_core::turn::TurnMode::Known(Mode::Plan),
+        "mode switch should persist"
+    );
 
     // --- SelectModel -> glm (context window loaded from the configured descriptor) ---
     ws.send(ws_text(&ClientMessage::SelectModel {
@@ -302,7 +310,9 @@ async fn modes_models_approvals_and_plan_dump() {
     .await
     .unwrap();
     let tf = poll_thread(&state, pid, tid, |tf| {
-        tf.current_model.model == "@cf/z-ai/glm-4.7"
+        tf.current_model
+            .as_known()
+            .is_some_and(|model| model.model == "@cf/z-ai/glm-4.7")
     })
     .await;
     assert_eq!(
@@ -396,7 +406,10 @@ async fn modes_models_approvals_and_plan_dump() {
     let tf = poll_thread(&state, pid, tid, |tf| tf.tokens.total.total == 1540).await;
     let turns = state.store.load_all_turns(pid, tid).await.unwrap();
     assert_eq!(turns.len(), 1);
-    assert_eq!(turns[0].mode, Mode::Plan);
+    assert_eq!(
+        turns[0].mode,
+        giskard_core::turn::TurnMode::Known(Mode::Plan)
+    );
     assert!(!turns[0].items.is_empty());
     assert_eq!(
         tf.tokens.total.total, 1540,

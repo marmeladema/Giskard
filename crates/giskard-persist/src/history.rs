@@ -17,9 +17,8 @@ use giskard_core::PersistError;
 use giskard_core::diff::{CapturedDiffContent, CapturedDiffRecord, FileDiff};
 use giskard_core::ids::{DiffId, ItemId, ThreadId, TurnId};
 use giskard_core::item::{Item, ItemPayload};
-use giskard_core::model::ModelRef;
 use giskard_core::token::TokenUsage;
-use giskard_core::turn::{Mode, Turn, TurnStatus};
+use giskard_core::turn::{Turn, TurnMode, TurnModel, TurnStatus};
 use giskard_core::user_input::{AttachmentKind, UserInput};
 
 use crate::layout::{HISTORY_FORMAT, TURN_PAYLOAD_FORMAT};
@@ -65,8 +64,8 @@ pub struct PersistedAttachment {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnRecord {
     pub turn_id: TurnId,
-    pub model: ModelRef,
-    pub mode: Mode,
+    pub model: TurnModel,
+    pub mode: TurnMode,
     /// The turn's outcome. `kind` is strictly bounded and authoritative — the ledger folds it, so
     /// aggregate repair must never have to open a payload file to learn it. `message` is **not**
     /// bounded at the source: it is composed from provider error text, which has no ceiling, so the
@@ -110,6 +109,7 @@ fn is_false(value: &bool) -> bool {
 enum HistoryLine<'a> {
     HistoryHeader(&'a HistoryHeader),
     Turn(&'a TurnRecord),
+    TurnV3(&'a TurnRecord),
 }
 
 /// A line of `turns/<turn_id>.jsonl`.
@@ -234,7 +234,11 @@ impl TurnRecord {
 
     /// The record line, newline included.
     pub fn line(&self) -> Result<String, PersistError> {
-        line_of(&HistoryLine::Turn(self))
+        if self.model.as_known().is_none() || self.mode.as_known().is_none() {
+            line_of(&HistoryLine::TurnV3(self))
+        } else {
+            line_of(&HistoryLine::Turn(self))
+        }
     }
 
     /// Reassemble the whole `Turn` this record indexes from its payload file.
@@ -440,7 +444,7 @@ pub fn parse_history_index(path: &Path, data: &str) -> Result<Vec<TurnRecord>, P
                 }
                 header_seen = true;
             }
-            Some("turn") => {
+            Some("turn" | "turn_v3") => {
                 let record: TurnRecord = match serde_json::from_value(value) {
                     Ok(record) => record,
                     Err(e) if i == last => {
@@ -789,6 +793,41 @@ mod lazy_diff_tests {
     };
 
     #[test]
+    fn unknown_turn_metadata_uses_the_skippable_v3_record_kind() {
+        let now = Utc::now();
+        let record = TurnRecord {
+            turn_id: TurnId::new(),
+            model: TurnModel::Unknown,
+            mode: TurnMode::Unknown,
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+            usage: TokenUsage::new(1, 2),
+            started_at: now,
+            completed_at: Some(now),
+            item_count: 0,
+            prompt_preview: String::new(),
+            prompt_truncated: false,
+            attachments: Vec::new(),
+        };
+        let value: serde_json::Value = serde_json::from_str(record.line().unwrap().trim()).unwrap();
+        assert_eq!(value["kind"], "turn_v3");
+        assert_eq!(value["model"], "unknown");
+        assert_eq!(value["mode"], "unknown");
+
+        let mut known = record;
+        known.model = TurnModel::Known(ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: None,
+        });
+        known.mode = TurnMode::Known(Mode::Build);
+        let value: serde_json::Value = serde_json::from_str(known.line().unwrap().trim()).unwrap();
+        assert_eq!(value["kind"], "turn");
+    }
+
+    #[test]
     fn payload_load_rejects_incomplete_command_output_metadata() {
         let now = chrono::Utc::now();
         let turn = Turn {
@@ -813,12 +852,12 @@ mod lazy_diff_tests {
                 },
                 created_at: now,
             }],
-            model: ModelRef {
+            model: TurnModel::Known(ModelRef {
                 provider: "test".into(),
                 model: "test".into(),
                 reasoning_effort: None,
-            },
-            mode: Mode::Build,
+            }),
+            mode: TurnMode::Known(Mode::Build),
             status: TurnStatus {
                 kind: TurnStatusKind::Completed,
                 message: None,
@@ -912,12 +951,12 @@ mod lazy_diff_tests {
                 },
                 created_at: now,
             }],
-            model: ModelRef {
+            model: TurnModel::Known(ModelRef {
                 provider: "test".into(),
                 model: "test".into(),
                 reasoning_effort: None,
-            },
-            mode: Mode::Build,
+            }),
+            mode: TurnMode::Known(Mode::Build),
             status: TurnStatus {
                 kind: TurnStatusKind::Completed,
                 message: None,

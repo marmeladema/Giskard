@@ -26,7 +26,7 @@ use giskard_core::ids::{ProjectId, ThreadId};
 use giskard_core::model::{ModelDescriptor, ModelRef};
 use giskard_core::text::trimmed_non_empty;
 use giskard_core::thread::ThreadKind;
-use giskard_core::turn::{Mode, PermissionPreset, TurnOverrides};
+use giskard_core::turn::{Mode, PermissionPreset, TurnMode, TurnModel, TurnOverrides};
 use giskard_core::user_input::UserInput;
 use giskard_git_parser::{
     GitNumstatEntry, apply_numstat_counts, index_numstat, parse_git_numstat, parse_git_status,
@@ -598,6 +598,9 @@ async fn list_threads(
         .ok_or(ApiError::NotFound)?;
     let mut threads = Vec::with_capacity(loaded.len());
     for thread in &loaded {
+        if thread.kind == ThreadKind::Orphan {
+            continue;
+        }
         let workspace_root = thread_workspace_root(&state, &project, thread).await?;
         threads.push(thread_summary(thread, workspace_root));
     }
@@ -658,7 +661,15 @@ async fn open_thread(
             normalize_persisted_thread_model(&state, project_id, thread_id, &app_config, &catalog)
                 .await?
                 .ok_or(ApiError::NotFound)?;
-        let current_model = thread_file.current_model.clone();
+        if thread_file.kind == ThreadKind::Orphan {
+            return Err(ApiError::NotFound);
+        }
+        let current_model = thread_file.current_model.as_known().cloned();
+        if thread_file.kind == ThreadKind::Primary && current_model.is_none() {
+            return Err(ApiError::Internal(format!(
+                "primary thread {thread_id} has no authoritative model"
+            )));
+        }
         if let Some(handle) = state.registry.get_thread_handle(thread_id).await {
             return Ok(Json(OpenThreadResponse {
                 thread_id: handle.thread,
@@ -681,13 +692,7 @@ async fn open_thread(
         let open_result = if thread_file.kind == ThreadKind::Subagent {
             state
                 .registry
-                .open_linked_thread(
-                    &project_config,
-                    &ws_root,
-                    Some(thread_id),
-                    thread_file.harness_thread_id.clone(),
-                    current_model.clone(),
-                )
+                .attach_subagent_thread(&project_config, &thread_file)
                 .await
         } else {
             state
@@ -697,7 +702,7 @@ async fn open_thread(
                     &ws_root,
                     Some(thread_id),
                     Some(thread_file.harness_thread_id.clone()),
-                    Some(current_model.clone()),
+                    current_model.clone(),
                 )
                 .await
         };
@@ -712,21 +717,25 @@ async fn open_thread(
                     action = "open_thread",
                     "harness attach failed; opening thread read-only"
                 );
-                let context = ReadOnlyProviderContext {
-                    provider: current_model.provider.clone(),
-                    configured: provider_is_known(
-                        &state,
-                        &project_config,
-                        Some(&app_config),
-                        &current_model.provider,
-                    )
-                    .await,
+                let context = if let Some(current_model) = current_model.as_ref() {
+                    Some(ReadOnlyProviderContext {
+                        provider: current_model.provider.clone(),
+                        configured: provider_is_known(
+                            &state,
+                            &project_config,
+                            Some(&app_config),
+                            &current_model.provider,
+                        )
+                        .await,
+                    })
+                } else {
+                    None
                 };
                 return Ok(Json(OpenThreadResponse {
                     thread_id,
                     harness_thread_id: thread_file.harness_thread_id,
                     warning: Some(read_only_info(
-                        Some(&context),
+                        context.as_ref(),
                         Some(error.to_string()),
                         thread_id,
                         "open_thread",
@@ -780,6 +789,11 @@ async fn open_thread(
         .map_err(harness_api_error)?;
 
     if let Some(existing) = find_thread_by_harness_id(&state, project_id, &resume).await? {
+        if existing.kind == ThreadKind::Orphan {
+            return Err(ApiError::Conflict(format!(
+                "native thread {resume} is already retained as a hidden orphan and cannot be adopted as a primary"
+            )));
+        }
         let (handle, warning) =
             if let Some(handle) = state.registry.get_thread_handle(existing.id).await {
                 (handle, None)
@@ -788,13 +802,7 @@ async fn open_thread(
                 let handle = if existing.kind == ThreadKind::Subagent {
                     state
                         .registry
-                        .open_linked_thread(
-                            &project_config,
-                            &ws_root,
-                            Some(existing.id),
-                            existing.harness_thread_id.clone(),
-                            existing.current_model.clone(),
-                        )
+                        .attach_subagent_thread(&project_config, &existing)
                         .await
                 } else {
                     state
@@ -804,7 +812,7 @@ async fn open_thread(
                             &ws_root,
                             Some(existing.id),
                             Some(existing.harness_thread_id.clone()),
-                            Some(existing.current_model.clone()),
+                            existing.current_model.as_known().cloned(),
                         )
                         .await
                 }
@@ -864,7 +872,7 @@ async fn open_thread(
     let title = "New thread".to_owned();
     let thread_file = ThreadFile {
         revision: 0,
-        version: 1,
+        version: giskard_persist::store::THREAD_METADATA_VERSION,
         id: handle.thread,
         project_id,
         title,
@@ -872,8 +880,8 @@ async fn open_thread(
         parent_thread_id: None,
         spawned_by_turn_id: None,
         kind: ThreadKind::Primary,
-        mode: Mode::Build,
-        current_model: current_model.clone(),
+        mode: TurnMode::Known(Mode::Build),
+        current_model: TurnModel::Known(current_model.clone()),
         context_window,
         model_context_windows: std::collections::HashMap::new(),
         permission_preset: PermissionPreset::AskFirst,
@@ -1064,7 +1072,7 @@ async fn start_thread_with_message(
     };
     let thread_file = ThreadFile {
         revision: 0,
-        version: 1,
+        version: giskard_persist::store::THREAD_METADATA_VERSION,
         id: thread_id,
         project_id,
         title: title.clone(),
@@ -1072,8 +1080,8 @@ async fn start_thread_with_message(
         parent_thread_id: None,
         spawned_by_turn_id: None,
         kind: ThreadKind::Primary,
-        mode: req.mode,
-        current_model: model_ref.clone(),
+        mode: TurnMode::Known(req.mode),
+        current_model: TurnModel::Known(model_ref.clone()),
         context_window: model_descriptor.context_window,
         model_context_windows: std::collections::HashMap::new(),
         permission_preset: req.permission_preset,
@@ -2289,6 +2297,7 @@ mod tests {
         async fn create(
             &self,
             _config: &ProjectConfig,
+            _bootstrap: giskard_harness::HarnessBootstrap,
         ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
             Err(giskard_core::HarnessError::Spawn("unused in test".into()))
         }
@@ -2391,12 +2400,12 @@ mod tests {
             parent_thread_id: None,
             spawned_by_turn_id: None,
             kind: giskard_core::ThreadKind::Primary,
-            mode: giskard_core::turn::Mode::Build,
-            current_model: giskard_core::model::ModelRef {
+            mode: giskard_core::turn::TurnMode::Known(giskard_core::turn::Mode::Build),
+            current_model: giskard_core::turn::TurnModel::Known(giskard_core::model::ModelRef {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
-            },
+            }),
             context_window: 128_000,
             model_context_windows: Default::default(),
             permission_preset: giskard_core::turn::PermissionPreset::AskFirst,
@@ -2417,8 +2426,7 @@ mod tests {
                     project_id,
                     harness_thread_id: thread.harness_thread_id.clone(),
                     mode: thread.mode,
-                    provider: thread.current_model.provider.clone(),
-                    model: thread.current_model.model.clone(),
+                    model: thread.current_model.clone(),
                     context_kind: "test",
                 },
             )
@@ -3598,8 +3606,10 @@ async fn normalize_persisted_thread_model(
     state
         .thread_metadata
         .mutate(project_id, thread_id, |thread| {
-            let current_model =
-                crate::models::normalize_model_ref(config, catalog, &thread.current_model);
+            let Some(stored_model) = thread.current_model.as_known() else {
+                return;
+            };
+            let current_model = crate::models::normalize_model_ref(config, catalog, stored_model);
             let descriptor =
                 crate::models::resolve_catalog_descriptor(catalog, config, &current_model);
             let context_window = crate::models::context_window_with_runtime(
@@ -3607,8 +3617,10 @@ async fn normalize_persisted_thread_model(
                 &descriptor,
                 &thread.model_context_windows,
             );
-            if current_model != thread.current_model || context_window != thread.context_window {
-                thread.current_model = current_model;
+            if Some(&current_model) != thread.current_model.as_known()
+                || context_window != thread.context_window
+            {
+                thread.current_model = TurnModel::Known(current_model);
                 thread.context_window = context_window;
             }
         })
@@ -5034,11 +5046,11 @@ async fn handle_client_msg(
             let tf = state
                 .thread_metadata
                 .mutate(project_id, thread_id, |tf| {
-                    let normalized = crate::models::normalize_model_ref(
-                        &app_config,
-                        &catalog,
-                        &tf.current_model,
-                    );
+                    let Some(current_model) = tf.current_model.as_known() else {
+                        return;
+                    };
+                    let normalized =
+                        crate::models::normalize_model_ref(&app_config, &catalog, current_model);
                     let descriptor = crate::models::resolve_catalog_descriptor(
                         &catalog,
                         &app_config,
@@ -5049,7 +5061,7 @@ async fn handle_client_msg(
                         &descriptor,
                         &tf.model_context_windows,
                     );
-                    tf.current_model = normalized;
+                    tf.current_model = TurnModel::Known(normalized);
                 })
                 .await
                 .map_err(|e| WsError::from_persist(e, "send_input", Some(thread_id)))?
@@ -5065,7 +5077,24 @@ async fn handle_client_msg(
                 })?;
 
             let tf = ensure_send_harness_provider_current(state, project_id, thread_id, tf).await?;
-            let effective_model = tf.current_model.clone();
+            let effective_model = tf.current_model.as_known().cloned().ok_or_else(|| {
+                WsError::new(
+                    "thread_metadata_invalid",
+                    ErrorSeverity::Error,
+                    "This primary thread has no authoritative model.",
+                )
+                .thread(thread_id)
+                .action("send_input")
+            })?;
+            let effective_mode = tf.mode.as_known().ok_or_else(|| {
+                WsError::new(
+                    "thread_metadata_invalid",
+                    ErrorSeverity::Error,
+                    "This primary thread has no authoritative mode.",
+                )
+                .thread(thread_id)
+                .action("send_input")
+            })?;
 
             // Resolved snapshot the harness applies to `turn/start` (§7.5, §8.4/§8.5):
             //  - the thread's current model (carrying its reasoning effort), so a mid-thread
@@ -5074,7 +5103,7 @@ async fn handle_client_msg(
             //  - the thread's persisted permission preset (§9).
             let overrides = TurnOverrides {
                 model: Some(effective_model.clone()),
-                mode: tf.mode,
+                mode: effective_mode,
                 permission_preset: tf.permission_preset,
             };
 
@@ -5103,7 +5132,7 @@ async fn handle_client_msg(
             let tf = state
                 .thread_metadata
                 .mutate_with_recency(project_id, thread_id, ThreadRecency::TouchIfChanged, |tf| {
-                    tf.mode = mode
+                    tf.mode = TurnMode::Known(mode)
                 })
                 .await
                 .map_err(|e| WsError::from_persist(e, "switch_mode", Some(thread_id)))?
@@ -5183,7 +5212,7 @@ async fn handle_client_msg(
                 // model/provider overrides when the thread is not loaded, and we confirm the
                 // response before persisting anything (spec PS1). Same-provider selections need
                 // no attach: persisting is enough, the next open resumes with the new model.
-                let stored_provider = state
+                let stored_model = state
                     .store
                     .load_thread(project_id, thread_id)
                     .await
@@ -5197,9 +5226,17 @@ async fn handle_client_msg(
                         .thread(thread_id)
                         .action("select_model")
                     })?
-                    .current_model
-                    .provider;
-                if stored_provider != model_ref.provider
+                    .current_model;
+                let stored_provider = stored_model.as_known().ok_or_else(|| {
+                    WsError::new(
+                        "thread_metadata_invalid",
+                        ErrorSeverity::Error,
+                        "This primary thread has no authoritative model.",
+                    )
+                    .thread(thread_id)
+                    .action("select_model")
+                })?;
+                if stored_provider.provider != model_ref.provider
                     && let Some(warning) =
                         switch_provider_cold(state, project_id, thread_id, &model_ref).await?
                 {
@@ -5216,23 +5253,28 @@ async fn handle_client_msg(
                     thread_id,
                     ThreadRecency::TouchIfChanged,
                     move |tf| {
-                        let old = crate::models::resolve_catalog_descriptor(
-                            &catalog,
-                            &config,
-                            &tf.current_model,
-                        );
-                        if old.supports_reasoning_effort
-                            && let Some(effort) = tf.current_model.reasoning_effort.clone()
-                        {
-                            tf.model_efforts.insert(tf.current_model.key(), effort);
+                        let current_model = tf.current_model.as_known().cloned();
+                        if let Some(current_model) = current_model.as_ref() {
+                            let old = crate::models::resolve_catalog_descriptor(
+                                &catalog,
+                                &config,
+                                current_model,
+                            );
+                            if old.supports_reasoning_effort
+                                && let Some(effort) = current_model.reasoning_effort.clone()
+                            {
+                                tf.model_efforts.insert(current_model.key(), effort);
+                            }
                         }
 
                         let new_descriptor = crate::models::resolve_catalog_descriptor(
                             &catalog, &config, &model_ref,
                         );
                         let mut new_model = model_ref.clone();
-                        let same_model = tf.current_model.provider == new_model.provider
-                            && tf.current_model.model == new_model.model;
+                        let same_model = current_model.as_ref().is_some_and(|current| {
+                            current.provider == new_model.provider
+                                && current.model == new_model.model
+                        });
                         if new_descriptor.supports_reasoning_effort {
                             if same_model && new_model.reasoning_effort.is_none() {
                                 tf.model_efforts.remove(&new_model.key());
@@ -5249,7 +5291,7 @@ async fn handle_client_msg(
                             &new_descriptor,
                             &tf.model_context_windows,
                         );
-                        tf.current_model = new_model;
+                        tf.current_model = TurnModel::Known(new_model);
                     },
                 )
                 .await
@@ -5452,9 +5494,27 @@ async fn handle_client_msg(
                 })?;
             tokio::time::timeout(
                 HARNESS_CONTROL_TIMEOUT,
-                state
-                    .registry
-                    .compact_thread(thread_id, tf.current_model.clone(), tf.mode),
+                state.registry.compact_thread(
+                    thread_id,
+                    tf.current_model.as_known().cloned().ok_or_else(|| {
+                        WsError::new(
+                            "thread_metadata_invalid",
+                            ErrorSeverity::Error,
+                            "This primary thread has no authoritative model.",
+                        )
+                        .thread(thread_id)
+                        .action("compact_context")
+                    })?,
+                    tf.mode.as_known().ok_or_else(|| {
+                        WsError::new(
+                            "thread_metadata_invalid",
+                            ErrorSeverity::Error,
+                            "This primary thread has no authoritative mode.",
+                        )
+                        .thread(thread_id)
+                        .action("compact_context")
+                    })?,
+                ),
             )
             .await
             .map_err(|_| {
@@ -5648,7 +5708,16 @@ async fn ensure_thread_open(
         .thread(thread_id)
         .action(action)
     })?;
-    let current_model = thread_file.current_model.clone();
+    if thread_file.kind == ThreadKind::Orphan {
+        return Err(WsError::new(
+            "thread_not_found",
+            ErrorSeverity::Error,
+            "Thread not found.",
+        )
+        .thread(thread_id)
+        .action(action));
+    }
+    let current_model = thread_file.current_model.as_known().cloned();
     debug!(
         project_id = %project_config.id,
         %thread_id,
@@ -5659,13 +5728,7 @@ async fn ensure_thread_open(
     let handle = if thread_file.kind == ThreadKind::Subagent {
         state
             .registry
-            .open_linked_thread(
-                &project_config,
-                &ws_root,
-                Some(thread_id),
-                thread_file.harness_thread_id.clone(),
-                current_model,
-            )
+            .attach_subagent_thread(&project_config, &thread_file)
             .await
     } else {
         state
@@ -5675,7 +5738,7 @@ async fn ensure_thread_open(
                 &ws_root,
                 Some(thread_id),
                 Some(thread_file.harness_thread_id.clone()),
-                Some(current_model),
+                current_model,
             )
             .await
     }
@@ -5798,9 +5861,31 @@ async fn project_for_readonly(
     action: &str,
 ) -> Result<ProjectId, WsError> {
     if let Some(project_id) = state.registry.get_project_for_thread(thread_id).await {
-        return Ok(project_id);
+        let visible = state
+            .store
+            .load_thread(project_id, thread_id)
+            .await
+            .map_err(|e| WsError::from_persist(e, action, Some(thread_id)))?
+            .is_some_and(|thread| thread.kind != ThreadKind::Orphan);
+        if visible {
+            return Ok(project_id);
+        }
+        return Err(WsError::new(
+            "thread_not_found",
+            ErrorSeverity::Error,
+            "Thread not found.",
+        )
+        .thread(thread_id)
+        .action(action));
     }
     match find_persisted_thread(state, thread_id, action).await? {
+        Some((_, thread_file)) if thread_file.kind == ThreadKind::Orphan => Err(WsError::new(
+            "thread_not_found",
+            ErrorSeverity::Error,
+            "Thread not found.",
+        )
+        .thread(thread_id)
+        .action(action)),
         Some((project_config, _)) => Ok(project_config.id),
         None => Err(WsError::new(
             "thread_not_found",
@@ -5832,6 +5917,7 @@ async fn read_only_provider_context(
         .await
         .ok()??
         .current_model
+        .into_known()?
         .provider;
     let config = state.store.load_config().await.ok();
     // Without the project we cannot ask its harness which providers exist, so config is all there
@@ -6049,36 +6135,23 @@ async fn switch_provider_cold(
         %project_id,
         %thread_id,
         harness_thread_id = %thread_file.harness_thread_id,
-        from_provider = %thread_file.current_model.provider,
+        from_model = ?thread_file.current_model,
         to_provider = %requested.provider,
         to_model = %requested.model,
         "attempting verified cold-resume provider switch"
     );
 
-    let handle = if thread_file.kind == ThreadKind::Subagent {
-        state
-            .registry
-            .open_linked_thread(
-                &project_config,
-                &ws_root,
-                Some(thread_id),
-                thread_file.harness_thread_id.clone(),
-                requested.clone(),
-            )
-            .await
-    } else {
-        state
-            .registry
-            .open_thread(
-                &project_config,
-                &ws_root,
-                Some(thread_id),
-                Some(thread_file.harness_thread_id.clone()),
-                Some(requested.clone()),
-            )
-            .await
-    }
-    .map_err(|e| WsError::from_harness(e, "select_model", Some(thread_id)))?;
+    let handle = state
+        .registry
+        .open_thread(
+            &project_config,
+            &ws_root,
+            Some(thread_id),
+            Some(thread_file.harness_thread_id.clone()),
+            Some(requested.clone()),
+        )
+        .await
+        .map_err(|e| WsError::from_harness(e, "select_model", Some(thread_id)))?;
 
     let confirmed = handle.resumed_model.as_ref().is_some_and(|effective| {
         effective.provider == requested.provider && effective.model == requested.model
@@ -6183,7 +6256,16 @@ async fn ensure_send_harness_provider_current(
     let Some(native_model) = state.registry.get_thread_native_model(thread_id).await else {
         return Ok(tf);
     };
-    if native_model.provider == tf.current_model.provider {
+    let selected_model = tf.current_model.as_known().ok_or_else(|| {
+        WsError::new(
+            "thread_metadata_invalid",
+            ErrorSeverity::Error,
+            "This primary thread has no authoritative model.",
+        )
+        .thread(thread_id)
+        .action("send_input")
+    })?;
+    if native_model.provider == selected_model.provider {
         return Ok(tf);
     }
 
@@ -6197,8 +6279,8 @@ async fn ensure_send_harness_provider_current(
         %project_id,
         %thread_id,
         native_provider = %native_model.provider,
-        selected_provider = %tf.current_model.provider,
-        selected_model = %tf.current_model.model,
+        selected_provider = %selected_model.provider,
+        selected_model = %selected_model.model,
         active,
         turn_count = turns.len(),
         "rejecting persisted provider mismatch on provider-bound Codex thread"
@@ -6207,7 +6289,7 @@ async fn ensure_send_harness_provider_current(
         thread_id,
         "send_input",
         &native_model.provider,
-        &tf.current_model.provider,
+        &selected_model.provider,
     ))
 }
 

@@ -53,11 +53,13 @@ Codex threadId
 `Codex threadId -> Giskard ThreadId` is populated three ways, and the order
 matters because Codex can talk about a thread before Giskard opens it.
 
-**Pre-registered at harness creation.** `AgentHarness::bind_known_threads` hands
-the adapter every `(harness_thread_id, ThreadId)` pair the project has already
-persisted, read from the same thread files the server's thread graph is built
-from. This happens before the harness is published to callers, so it precedes
-any thread being opened on it and therefore any Codex traffic.
+**Bootstrapped during harness construction.** `HarnessFactory::create` receives a
+complete `HarnessBootstrap` containing every `(harness_thread_id, ThreadId)` pair
+the project has already persisted. The registry rejects an incomplete scan,
+empty IDs, and duplicate mappings. The Codex adapter installs every route and
+event sender before launching its worker and ordinary event dispatch;
+initialization traffic already buffered by the current client cannot be mapped
+first. This is construction input, not a command sent to an already-running harness.
 
 It exists because Codex announces a sub-agent's thread as soon as it loads one,
 which for a child persisted in an earlier run happens before the parent's tool
@@ -66,7 +68,9 @@ has never seen and has to invent a `ThreadId` for a thread that already has one 
 two identities for one thread, and every registry above keyed by whichever came
 first. Pre-registration removes the second identity rather than reconciling it.
 
-**On open.** `open_thread` binds the native id it opened or resumed. An explicit
+**On claim or open.** `claim_native_thread` binds a provider-owned child without
+issuing `thread/resume`, starting work, or fabricating model metadata. `open_thread`
+binds the native id it explicitly started or resumed. An explicit
 `OpenThreadOptions::thread` wins, because the caller knows the thread's durable
 identity. Otherwise the adapter reuses an existing binding for the native id
 being resumed if it has one, and only mints a fresh `ThreadId` when the native
@@ -79,9 +83,13 @@ caller's fallback thread while the adapter knows of no threads at all — which,
 for a project with persisted threads, stops being true the moment its harness is
 created.
 
-These registries belong to one adapter worker and are rebuilt when its Codex
-app-server process is respawned. Durable Giskard IDs and completed transcript
-items remain in Giskard persistence; native live-process state does not.
+Every first binding receives a monotonically allocated route epoch for that
+adapter lifetime. Repeating the same native/local pair is idempotent; binding
+either side to a different identity is a protocol error and never rekeys state.
+These registries belong to one adapter worker and are rebuilt from durable
+bootstrap when its Codex app-server process is respawned. Durable Giskard IDs
+and completed transcript items remain in Giskard persistence; native
+live-process state does not.
 
 The turn key includes the Giskard thread because Codex does not expose a
 protocol contract making turn IDs globally unique across threads. The item key
@@ -153,16 +161,16 @@ owner for it. Parent lifecycle evidence establishes or refreshes the relationshi
 start a second monitor, synthesize a fallback turn, or stop the owner after a timeout. The browser
 addresses links by Giskard parent-thread and item IDs; the server resolves native routing metadata
 from its authoritative item, and native thread IDs are redacted from browser-facing sub-agent
-payloads. Linked children use strict native resume: Codex can advertise a newly spawned child
-milliseconds before its rollout is readable, so the adapter retries only the exact matching
-`no rollout found` response for a short bounded window. It never applies the normal fresh-thread
-fallback to a linked child, because that would replace the advertised routing identity and miss the
-child's early commentary and command-start events. Primary threads retain the existing fresh-session
-recovery when their stored native rollout is genuinely gone. Sub-agent threads are always read-only;
+payloads. Linked children use identity-only claims. Materializing or reattaching one does not call
+`thread/resume`: the child is provider-owned, and observing it must not nudge native work. The
+adapter records parentage attested by sub-agent link events and returns that evidence with the
+claim, preserving mismatched-parent and reverse-link validation without a read RPC. Primary
+threads retain their separate fresh-session recovery when a stored native rollout is genuinely
+gone. Sub-agent threads are always read-only;
 matched provider-request responses, active-work interrupt, and command termination remain supported.
 See
 [Sub-agent threads](../../docs/subagents.md) for the complete lifecycle and ownership contract. When
-opening or resuming a Codex thread, the adapter also maps
+opening or resuming a primary Codex thread, the adapter also maps
 `thread.agent_nickname` to
 `ThreadHandle.agent_name`; Giskard uses that harness-neutral name to title imported sub-agent
 threads and their Sub-agents card entries. It maps `thread.parent_thread_id` to

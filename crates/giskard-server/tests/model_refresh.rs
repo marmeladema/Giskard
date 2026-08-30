@@ -40,6 +40,7 @@ impl HarnessFactory for DiffFactory {
     async fn create(
         &self,
         _config: &ProjectConfig,
+        _bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
         let harness = ReplayHarness::from_fixture(self.fixture.clone());
         let harness = if self.providers.is_empty() {
@@ -321,8 +322,11 @@ model_listing = true
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(imported.current_model.provider, "mock");
-    assert_eq!(imported.current_model.model, "dyn-model-1");
+    assert_eq!(imported.current_model.as_known().unwrap().provider, "mock");
+    assert_eq!(
+        imported.current_model.as_known().unwrap().model,
+        "dyn-model-1"
+    );
     assert_eq!(imported.context_window, 258_400);
 }
 

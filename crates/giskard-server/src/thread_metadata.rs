@@ -6,7 +6,7 @@ use tracing::debug;
 use giskard_core::CapturedDiffRecord;
 use giskard_core::ids::{ProjectId, ThreadId, TurnId};
 use giskard_core::thread::ThreadKind;
-use giskard_core::turn::{Mode, Turn};
+use giskard_core::turn::{Turn, TurnMode, TurnModel};
 use giskard_persist::PersistError;
 use giskard_persist::store::{
     PersistStore, ThreadFile, ThreadGitWorkspace, ThreadMutation, ThreadRecency, TurnCommitOutcome,
@@ -22,6 +22,20 @@ use crate::hub::Hub;
 pub struct ThreadMetadataService {
     store: Arc<PersistStore>,
     hub: Arc<Hub>,
+}
+
+/// The authoritative relationship metadata a classified parent supplies to a hidden orphan.
+///
+/// The child's native model is deliberately absent: a parent proves ownership, mode, and
+/// permission inheritance, but Codex role configuration may put the child on another model, so
+/// `current_model` stays whatever native metadata reported (spec: orphan classification).
+#[derive(Debug, Clone)]
+pub struct OrphanClassification {
+    pub parent_thread_id: ThreadId,
+    pub spawned_by_turn_id: TurnId,
+    pub title: String,
+    pub mode: TurnMode,
+    pub permission_preset: giskard_core::turn::PermissionPreset,
 }
 
 impl ThreadMetadataService {
@@ -108,6 +122,29 @@ impl ThreadMetadataService {
         self.store.create_thread(project_id, thread).await
     }
 
+    /// Classify a hidden native identity exactly once. The revision and kind checks execute under
+    /// the store's per-thread lock, so racing parent claims cannot both commit.
+    pub async fn classify_orphan(
+        &self,
+        project_id: ProjectId,
+        thread_id: ThreadId,
+        expected_revision: u64,
+        classification: OrphanClassification,
+    ) -> Result<ThreadMutation, PersistError> {
+        self.mutate(project_id, thread_id, move |thread| {
+            if thread.revision != expected_revision || thread.kind != ThreadKind::Orphan {
+                return;
+            }
+            thread.kind = ThreadKind::Subagent;
+            thread.parent_thread_id = Some(classification.parent_thread_id);
+            thread.spawned_by_turn_id = Some(classification.spawned_by_turn_id);
+            thread.title = classification.title.clone();
+            thread.mode = classification.mode;
+            thread.permission_preset = classification.permission_preset;
+        })
+        .await
+    }
+
     /// Publish a creation only after its surrounding native/worktree setup has committed.
     pub async fn publish_created(&self, project_id: ProjectId, thread: &ThreadFile) {
         self.invalidate_thread_catalog(project_id, thread.id, thread.revision)
@@ -149,6 +186,9 @@ impl ThreadMetadataService {
         let ThreadMutation::Changed { before, after } = mutation else {
             return;
         };
+        if after.kind == ThreadKind::Orphan {
+            return;
+        }
 
         if ThreadDetailProjection::from(before.as_ref())
             != ThreadDetailProjection::from(after.as_ref())
@@ -202,8 +242,8 @@ struct ThreadDetailProjection {
     // one revision arrive over different transports. Keep both definitions and the browser
     // reconciliation invariant synchronized when adding a browser-visible field.
     title: String,
-    mode: Mode,
-    current_model: giskard_core::model::ModelRef,
+    mode: TurnMode,
+    current_model: TurnModel,
     context_window: u32,
     permission_preset: giskard_core::turn::PermissionPreset,
     tokens: giskard_core::token::TokenLedger,
@@ -230,7 +270,7 @@ struct ThreadCatalogProjection {
     parent_thread_id: Option<ThreadId>,
     spawned_by_turn_id: Option<TurnId>,
     kind: ThreadKind,
-    mode: Mode,
+    mode: TurnMode,
     archived: bool,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -260,7 +300,7 @@ mod tests {
     use chrono::Utc;
     use giskard_core::model::ModelRef;
     use giskard_core::token::TokenLedger;
-    use giskard_core::turn::PermissionPreset;
+    use giskard_core::turn::{Mode, PermissionPreset, TurnMode, TurnModel};
     use giskard_proto::ServerMessage;
     use tempfile::TempDir;
     use tokio::sync::mpsc;
@@ -280,12 +320,12 @@ mod tests {
             parent_thread_id: None,
             spawned_by_turn_id: None,
             kind: ThreadKind::Primary,
-            mode: Mode::Build,
-            current_model: ModelRef {
+            mode: TurnMode::Known(Mode::Build),
+            current_model: TurnModel::Known(ModelRef {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
-            },
+            }),
             context_window: 128_000,
             model_context_windows: HashMap::new(),
             permission_preset: PermissionPreset::AskFirst,
@@ -333,7 +373,7 @@ mod tests {
 
         service
             .mutate(project_id, thread_id, |thread| {
-                let selected = thread.current_model.clone();
+                let selected = thread.current_model.as_known().cloned().unwrap();
                 thread.record_model_context_window(&selected, 258_400);
             })
             .await
@@ -375,6 +415,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn orphan_classification_is_revision_checked_and_cannot_reparent() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(temp.path().to_path_buf()));
+        let service = ThreadMetadataService::new(store.clone(), Arc::new(Hub::new()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let mut orphan = thread(project_id, thread_id);
+        orphan.kind = ThreadKind::Orphan;
+        orphan.current_model = TurnModel::Unknown;
+        orphan.mode = TurnMode::Unknown;
+        let orphan = service.create(project_id, orphan).await.unwrap();
+        let parent = ThreadId::new();
+        let spawned_by = TurnId::new();
+        let classify = |parent_thread_id| OrphanClassification {
+            parent_thread_id,
+            spawned_by_turn_id: spawned_by,
+            title: "Sub-agent".into(),
+            mode: TurnMode::Known(Mode::Plan),
+            permission_preset: PermissionPreset::AskFirst,
+        };
+
+        assert!(matches!(
+            service
+                .classify_orphan(project_id, thread_id, orphan.revision + 1, classify(parent),)
+                .await
+                .unwrap(),
+            ThreadMutation::Unchanged { .. }
+        ));
+        let changed = service
+            .classify_orphan(project_id, thread_id, orphan.revision, classify(parent))
+            .await
+            .unwrap();
+        assert!(matches!(changed, ThreadMutation::Changed { .. }));
+        let classified = store
+            .load_thread(project_id, thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(classified.kind, ThreadKind::Subagent);
+        assert_eq!(classified.parent_thread_id, Some(parent));
+        assert!(classified.current_model.as_known().is_none());
+
+        assert!(matches!(
+            service
+                .classify_orphan(
+                    project_id,
+                    thread_id,
+                    classified.revision,
+                    classify(ThreadId::new()),
+                )
+                .await
+                .unwrap(),
+            ThreadMutation::Unchanged { .. }
+        ));
+        assert_eq!(
+            store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .parent_thread_id,
+            Some(parent)
+        );
+    }
+
+    #[tokio::test]
     async fn turn_commit_and_crash_repair_publish_committed_metadata() {
         use giskard_core::ids::TurnId;
         use giskard_core::token::TokenUsage;
@@ -399,12 +505,12 @@ mod tests {
             id: TurnId::new(),
             user_input: UserInput::text("hello"),
             items: vec![],
-            model: ModelRef {
+            model: TurnModel::Known(ModelRef {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
-            },
-            mode: Mode::Build,
+            }),
+            mode: TurnMode::Known(Mode::Build),
             status: TurnStatus {
                 kind: TurnStatusKind::Completed,
                 message: None,

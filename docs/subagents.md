@@ -29,11 +29,10 @@ the authoritative live or persisted item, extracts the native routing ID and lif
 and idempotently returns the linked Giskard thread. Native harness thread IDs are not included in
 thread summaries or sub-agent item payloads sent to the browser.
 
-Codex may publish the child's activity link just before its rollout becomes readable through
-`thread/resume`. Giskard briefly retries that exact transient missing-rollout response and requires
-the resumed native ID to equal the link's ID. A linked import never starts a fresh replacement
-thread: doing so would observe the wrong identity and could hide early commentary or a running
-command until completion. Reopening a primary thread keeps its separate lost-context recovery.
+Giskard claims the child's advertised native identity directly. Materializing or reattaching a
+provider-owned child never sends `thread/resume` or starts replacement work. The claim is
+idempotent for the same native/local pair and rejects either identity being bound differently.
+Reopening a primary thread keeps its separate lost-context recovery.
 
 ## Ownership model
 
@@ -48,6 +47,11 @@ Ownership is immutable after import. Giskard rejects self-links, cycles, reparen
 under the wrong parent, and a native child whose harness-reported parent disagrees with the proposed
 parent. Malformed or dangling records remain visible in the main sidebar so they can be repaired or
 deleted instead of disappearing with managed children.
+
+A native identity observed before its relationship is authoritative is persisted under one final
+ID as `kind = orphan`. It is hidden and read-only, cannot be adopted as a primary, and retains
+explicit `unknown` model/mode values rather than parent-derived guesses. Its only classification is
+an expected-revision `orphan -> subagent` update on that same ID once parent evidence arrives.
 
 ## Supported Codex spawning events
 
@@ -135,9 +139,12 @@ new page session and alerts again.
 ## Prompts and transcript persistence
 
 Only a real native child turn creates a persisted turn. When its native event stream does not expose
-the delegated prompt, Giskard uses `Sub-agent turn` as that real turn's input label. It does not
-derive a prompt from inherited parent history, insert a synthetic prompt item, or persist terminal
-parent activity as a fallback child turn.
+the delegated prompt, Giskard uses `Sub-agent turn` as that real turn's input label. A native turn
+observed on a thread that is still a hidden orphan uses `Unclassified native turn` instead, because
+no parent relationship has been proven for it yet; turns already committed under that label keep it
+after classification, the same way they keep their historical mode. Giskard does not derive a prompt
+from inherited parent history, insert a synthetic prompt item, or persist terminal parent activity
+as a fallback child turn.
 
 ## Read-only child behavior
 

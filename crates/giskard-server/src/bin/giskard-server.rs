@@ -20,6 +20,7 @@ impl HarnessFactory for CodexFactory {
     async fn create(
         &self,
         config: &ProjectConfig,
+        bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
         if config.harness != "codex" {
             return Err(HarnessError::Unsupported(format!(
@@ -30,8 +31,10 @@ impl HarnessFactory for CodexFactory {
 
         let workspace_root =
             std::path::PathBuf::from(config.workspace_root.as_deref().unwrap_or(&config.dir));
-        let harness = giskard_harness_codex::CodexHarness::start(workspace_root).await?;
-        Ok(harness)
+        Ok(
+            giskard_harness_codex::CodexHarness::start_with_bootstrap(workspace_root, bootstrap)
+                .await?,
+        )
     }
 }
 
