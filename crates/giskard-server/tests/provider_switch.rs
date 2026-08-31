@@ -454,8 +454,9 @@ async fn cold_provider_switch_succeeds_and_binds_the_thread() {
     let native = srv
         .state
         .registry
-        .get_thread_native_model(srv.tid)
+        .loaded_thread_binding(srv.tid)
         .await
+        .and_then(|binding| binding.native_model().cloned())
         .expect("thread must be warm after a confirmed switch");
     assert_eq!(native.provider, NEW_PROVIDER);
 
@@ -584,8 +585,9 @@ async fn unconfirmed_provider_switch_is_rejected_and_persists_nothing() {
     assert!(
         srv.state
             .registry
-            .get_thread_native_model(srv.tid)
+            .loaded_thread_binding(srv.tid)
             .await
+            .and_then(|binding| binding.native_model().cloned())
             .is_none(),
         "failed switch must leave the thread cold"
     );

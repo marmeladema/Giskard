@@ -682,10 +682,11 @@ async fn open_thread(
                 "primary thread {thread_id} has no authoritative model"
             )));
         }
-        if let Some(handle) = state.registry.get_thread_handle(thread_id).await {
+        if let Some(binding) = state.registry.loaded_thread_binding(thread_id).await {
+            let handle = binding.handle();
             return Ok(Json(OpenThreadResponse {
                 thread_id: handle.thread,
-                harness_thread_id: handle.harness_thread_id,
+                harness_thread_id: handle.harness_thread_id.clone(),
                 warning: None,
             }));
         }
@@ -807,8 +808,8 @@ async fn open_thread(
             )));
         }
         let (handle, warning) =
-            if let Some(handle) = state.registry.get_thread_handle(existing.id).await {
-                (handle, None)
+            if let Some(binding) = state.registry.loaded_thread_binding(existing.id).await {
+                (binding.handle().clone(), None)
             } else {
                 let ws_root = thread_workspace_root(&state, &project_config, &existing).await?;
                 let handle = if existing.kind == ThreadKind::Subagent {
@@ -5227,12 +5228,12 @@ async fn handle_client_msg(
             let catalog = project_model_catalog(state, &project_config, &config).await;
             let model_ref = crate::models::normalize_model_ref(&config, &catalog, &model_ref);
 
-            if state
+            let native_model = state
                 .registry
-                .get_thread_native_model(thread_id)
+                .loaded_thread_binding(thread_id)
                 .await
-                .is_some()
-            {
+                .and_then(|binding| binding.native_model().cloned());
+            if let Some(native_model) = native_model.as_ref() {
                 // Warm thread: the provider is bound to the loaded Codex session (PB2) —
                 // cross-provider changes stay rejected because a loaded thread can silently
                 // ignore resume overrides.
@@ -5240,6 +5241,7 @@ async fn handle_client_msg(
                     state,
                     project_id,
                     thread_id,
+                    native_model,
                     &model_ref,
                     "select_model",
                 )
@@ -5704,9 +5706,9 @@ async fn ensure_thread_open(
     thread_id: ThreadId,
     action: &str,
 ) -> Result<ThreadAccess, WsError> {
-    if let Some(project_id) = state.registry.get_project_for_thread(thread_id).await {
+    if let Some(binding) = state.registry.loaded_thread_binding(thread_id).await {
         return Ok(ThreadAccess {
-            project_id,
+            project_id: binding.project_id(),
             warning: None,
         });
     }
@@ -5909,7 +5911,8 @@ async fn project_for_readonly(
     thread_id: ThreadId,
     action: &str,
 ) -> Result<ProjectId, WsError> {
-    if let Some(project_id) = state.registry.get_project_for_thread(thread_id).await {
+    if let Some(binding) = state.registry.loaded_thread_binding(thread_id).await {
+        let project_id = binding.project_id();
         let visible = state
             .store
             .load_thread(project_id, thread_id)
@@ -6262,12 +6265,10 @@ async fn ensure_provider_change_allowed(
     state: &AppState,
     project_id: ProjectId,
     thread_id: ThreadId,
+    native_model: &ModelRef,
     selected_model: &ModelRef,
     action: &str,
 ) -> Result<(), WsError> {
-    let Some(native_model) = state.registry.get_thread_native_model(thread_id).await else {
-        return Ok(());
-    };
     if native_model.provider == selected_model.provider {
         return Ok(());
     }
@@ -6302,7 +6303,10 @@ async fn ensure_send_harness_provider_current(
     thread_id: ThreadId,
     tf: ThreadFile,
 ) -> Result<ThreadFile, WsError> {
-    let Some(native_model) = state.registry.get_thread_native_model(thread_id).await else {
+    let Some(binding) = state.registry.loaded_thread_binding(thread_id).await else {
+        return Ok(tf);
+    };
+    let Some(native_model) = binding.native_model() else {
         return Ok(tf);
     };
     let selected_model = tf.current_model.as_known().ok_or_else(|| {
@@ -6365,11 +6369,12 @@ async fn load_thread(
     state: &AppState,
     thread_id: giskard_core::ids::ThreadId,
 ) -> Result<(ProjectId, ThreadFile), String> {
-    let project_id = state
+    let binding = state
         .registry
-        .get_project_for_thread(thread_id)
+        .loaded_thread_binding(thread_id)
         .await
         .ok_or("thread not open")?;
+    let project_id = binding.project_id();
     let tf = state
         .store
         .load_thread(project_id, thread_id)

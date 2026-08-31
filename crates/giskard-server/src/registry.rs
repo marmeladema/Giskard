@@ -213,14 +213,38 @@ impl RegistryTaskTracker {
     }
 }
 
+/// A loaded-thread identity sampled from one coordinator state.
+///
+/// Presence means the authority had a coordinator when sampled, not that the coordinator remains
+/// installed or that its event owner is live. The cloned values retain neither the authority nor
+/// the coordinator. A missing native model is distinct from a missing loaded binding.
 #[derive(Clone)]
-struct BindingData {
-    project: ProjectId,
+pub struct LoadedThreadBinding {
+    project_id: ProjectId,
     handle: ThreadHandle,
     /// The model the harness reports this native thread is on. `None` when neither the caller nor
     /// the harness named one — callers already treat an unknown native model the same as an
     /// unbound thread.
     native_model: Option<ModelRef>,
+}
+
+impl LoadedThreadBinding {
+    pub fn project_id(&self) -> ProjectId {
+        self.project_id
+    }
+
+    pub fn handle(&self) -> &ThreadHandle {
+        &self.handle
+    }
+
+    pub fn native_model(&self) -> Option<&ModelRef> {
+        self.native_model.as_ref()
+    }
+}
+
+struct ResolvedLoadedThread {
+    authority: Arc<ThreadAuthority>,
+    binding: LoadedThreadBinding,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -297,7 +321,7 @@ struct ClaimedNativeTurn {
 struct ThreadCoordinatorState {
     generation: u64,
     next_sequence: u64,
-    binding: BindingData,
+    binding: LoadedThreadBinding,
     classification: ClassificationPhase,
     owner: OwnerPhase,
     operation: Option<PreparedOperation>,
@@ -369,7 +393,7 @@ impl ThreadCoordinatorState {
 }
 
 impl ThreadCoordinator {
-    fn new(binding: BindingData, classification: ClassificationPhase) -> Self {
+    fn new(binding: LoadedThreadBinding, classification: ClassificationPhase) -> Self {
         Self {
             state: Mutex::new(ThreadCoordinatorState {
                 generation: 1,
@@ -385,7 +409,7 @@ impl ThreadCoordinator {
         }
     }
 
-    async fn binding(&self) -> BindingData {
+    async fn binding(&self) -> LoadedThreadBinding {
         self.state.lock().await.binding.clone()
     }
 
@@ -502,7 +526,7 @@ impl ThreadCoordinator {
         classification: ClassificationPhase,
     ) -> Result<ThreadHandle, HarnessError> {
         let state = self.state.lock().await;
-        if state.binding.project != project
+        if state.binding.project_id != project
             || state.binding.handle.thread != thread_id
             || native_thread_id.is_some_and(|native_id| {
                 native_id != state.binding.handle.harness_thread_id.as_str()
@@ -932,6 +956,14 @@ impl RegistryShared {
         authority.coordinator.lock().await.clone()
     }
 
+    async fn resolve_loaded_thread(&self, thread_id: ThreadId) -> Option<ResolvedLoadedThread> {
+        let authority = self.thread_authority(thread_id).await?;
+        let coordinator = authority.coordinator.lock().await.clone()?;
+        let binding = coordinator.binding().await;
+        drop(coordinator);
+        Some(ResolvedLoadedThread { authority, binding })
+    }
+
     async fn coordinator_snapshot(&self) -> Vec<(ThreadId, ThreadBinding)> {
         let authorities = self
             .threads
@@ -1091,6 +1123,13 @@ fn spawn_thread_update_forwarder(
 impl HarnessRegistry {
     pub async fn thread_authority(&self, thread_id: ThreadId) -> Option<Arc<ThreadAuthority>> {
         self.shared.thread_authority(thread_id).await
+    }
+
+    pub async fn loaded_thread_binding(&self, thread_id: ThreadId) -> Option<LoadedThreadBinding> {
+        self.shared
+            .resolve_loaded_thread(thread_id)
+            .await
+            .map(|resolved| resolved.binding)
     }
 
     pub(crate) async fn verified_thread_authority(
@@ -1325,8 +1364,9 @@ impl HarnessRegistry {
         }
         self.get_or_create_harness(config.id, config).await?;
         ensure_subagent_thread_open(config, thread, &self.shared).await?;
-        self.get_thread_handle(thread.id)
+        self.loaded_thread_binding(thread.id)
             .await
+            .map(|binding| binding.handle)
             .ok_or(HarnessError::ThreadNotFound(thread.id))
     }
 
@@ -1410,8 +1450,8 @@ impl HarnessRegistry {
             .resumed_model
             .clone()
             .or_else(|| initial_model.clone());
-        let binding = BindingData {
-            project: config.id,
+        let binding = LoadedThreadBinding {
+            project_id: config.id,
             handle: handle.clone(),
             native_model,
         };
@@ -1467,7 +1507,7 @@ impl HarnessRegistry {
             .await
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
         let binding = coordinator.binding().await;
-        let project_id = binding.project;
+        let project_id = binding.project_id;
         let handle = binding.handle.clone();
         debug!(
             %project_id,
@@ -1569,15 +1609,12 @@ impl HarnessRegistry {
         request_id: ApprovalId,
         decision: ApprovalDecision,
     ) -> Result<ThreadId, HarnessError> {
-        let authority = self
+        let resolved = self
             .shared
-            .thread_authority(thread_id)
+            .resolve_loaded_thread(thread_id)
             .await
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
-        let project_id = self
-            .get_project_for_thread(thread_id)
-            .await
-            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+        let project_id = resolved.binding.project_id;
 
         let harness = self
             .shared
@@ -1585,10 +1622,10 @@ impl HarnessRegistry {
             .await
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
 
-        let (claim, transition) = self
-            .shared
-            .runtime
-            .claim_request(&authority, RuntimeRequestId::Approval(request_id.clone()))?;
+        let (claim, transition) = self.shared.runtime.claim_request(
+            &resolved.authority,
+            RuntimeRequestId::Approval(request_id.clone()),
+        )?;
         self.publish_request_transition(thread_id, transition).await;
 
         if let Err(error) = harness
@@ -1612,9 +1649,11 @@ impl HarnessRegistry {
         // Record the resolution against the in-flight turn *before* publishing it, so a browser
         // that reloads the instant it sees the resolved state replays this approval as answered
         // rather than re-prompting (spec §13.6).
-        self.shared
-            .runtime
-            .resolve_live_approval(&authority, request_id.clone(), decision);
+        self.shared.runtime.resolve_live_approval(
+            &resolved.authority,
+            request_id.clone(),
+            decision,
+        );
         debug!(
             %thread_id,
             request_id = %request_id.0,
@@ -1632,15 +1671,12 @@ impl HarnessRegistry {
         request_id: ServerRequestId,
         response: ServerRequestResponse,
     ) -> Result<ThreadId, HarnessError> {
-        let authority = self
+        let resolved = self
             .shared
-            .thread_authority(thread_id)
+            .resolve_loaded_thread(thread_id)
             .await
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
-        let project_id = self
-            .get_project_for_thread(thread_id)
-            .await
-            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+        let project_id = resolved.binding.project_id;
 
         let harness = self
             .shared
@@ -1648,10 +1684,10 @@ impl HarnessRegistry {
             .await
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
 
-        let (claim, transition) = self
-            .shared
-            .runtime
-            .claim_request(&authority, RuntimeRequestId::Server(request_id.clone()))?;
+        let (claim, transition) = self.shared.runtime.claim_request(
+            &resolved.authority,
+            RuntimeRequestId::Server(request_id.clone()),
+        )?;
         self.publish_request_transition(thread_id, transition).await;
 
         if let Err(error) = harness
@@ -1678,7 +1714,7 @@ impl HarnessRegistry {
         // would re-prompt and re-answering routes a stale id to the harness (spec §13.6).
         self.shared
             .runtime
-            .resolve_live_server_request(&authority, request_id.clone());
+            .resolve_live_server_request(&resolved.authority, request_id.clone());
         debug!(
             %thread_id,
             request_id = %request_id.0,
@@ -1734,14 +1770,12 @@ impl HarnessRegistry {
     }
 
     pub async fn interrupt(&self, thread_id: ThreadId) -> Result<(), HarnessError> {
-        let handle = self
-            .get_thread_handle(thread_id)
+        let binding = self
+            .loaded_thread_binding(thread_id)
             .await
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
-        let project_id = self
-            .get_project_for_thread(thread_id)
-            .await
-            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+        let project_id = binding.project_id;
+        let handle = binding.handle;
         let harness = self
             .shared
             .active_harness(project_id)
@@ -1786,11 +1820,9 @@ impl HarnessRegistry {
             .coordinator(thread_id)
             .await
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
-        let handle = coordinator.binding().await.handle;
-        let project_id = self
-            .get_project_for_thread(thread_id)
-            .await
-            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+        let binding = coordinator.binding().await;
+        let project_id = binding.project_id;
+        let handle = binding.handle;
         let harness = self
             .shared
             .active_harness(project_id)
@@ -1919,14 +1951,12 @@ impl HarnessRegistry {
         thread_id: ThreadId,
         process_id: String,
     ) -> Result<(), HarnessError> {
-        let handle = self
-            .get_thread_handle(thread_id)
+        let binding = self
+            .loaded_thread_binding(thread_id)
             .await
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
-        let project_id = self
-            .get_project_for_thread(thread_id)
-            .await
-            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+        let project_id = binding.project_id;
+        let handle = binding.handle;
         let harness = self
             .shared
             .active_harness(project_id)
@@ -1973,8 +2003,9 @@ impl HarnessRegistry {
         self.ensure_thread_writable(config.id, thread_id).await?;
         let harness = self.get_or_create_harness(config.id, config).await?;
         let handle = self
-            .get_thread_handle(thread_id)
+            .loaded_thread_binding(thread_id)
             .await
+            .map(|binding| binding.handle)
             .unwrap_or_else(|| ThreadHandle::detached(thread_id, harness_thread_id));
         harness.set_thread_archived(&handle, archived).await
     }
@@ -1989,8 +2020,9 @@ impl HarnessRegistry {
         self.ensure_thread_writable(config.id, thread_id).await?;
         let harness = self.get_or_create_harness(config.id, config).await?;
         let handle = self
-            .get_thread_handle(thread_id)
+            .loaded_thread_binding(thread_id)
             .await
+            .map(|binding| binding.handle)
             .unwrap_or_else(|| ThreadHandle::detached(thread_id, harness_thread_id));
         harness.set_thread_name(&handle, &name).await
     }
@@ -2059,27 +2091,13 @@ impl HarnessRegistry {
     ) -> Result<(), HarnessError> {
         let harness = self.get_or_create_harness(config.id, config).await?;
         let handle = self
-            .get_thread_handle(thread_id)
+            .loaded_thread_binding(thread_id)
             .await
+            .map(|binding| binding.handle)
             .unwrap_or_else(|| ThreadHandle::detached(thread_id, harness_thread_id));
         harness.delete_thread(&handle).await?;
         self.retire_thread(thread_id).await;
         Ok(())
-    }
-
-    pub async fn get_thread_handle(&self, thread_id: ThreadId) -> Option<ThreadHandle> {
-        let coordinator = self.shared.coordinator(thread_id).await?;
-        Some(coordinator.binding().await.handle)
-    }
-
-    pub async fn get_thread_native_model(&self, thread_id: ThreadId) -> Option<ModelRef> {
-        let coordinator = self.shared.coordinator(thread_id).await?;
-        coordinator.binding().await.native_model
-    }
-
-    pub async fn get_project_for_thread(&self, thread_id: ThreadId) -> Option<ProjectId> {
-        let coordinator = self.shared.coordinator(thread_id).await?;
-        Some(coordinator.binding().await.project)
     }
 
     pub async fn thread_has_active_turn(&self, thread_id: ThreadId) -> bool {
@@ -2240,7 +2258,7 @@ impl HarnessRegistry {
         let coordinators = self.shared.coordinator_snapshot().await;
         let mut thread_ids = HashSet::new();
         for (thread_id, coordinator) in coordinators {
-            if coordinator.binding().await.project == project_id {
+            if coordinator.binding().await.project_id == project_id {
                 thread_ids.insert(thread_id);
             }
         }
@@ -2613,7 +2631,7 @@ async fn materialize_subagent_thread(
     let mut live_existing_id = None;
     for (thread_id, coordinator) in live_bindings {
         let binding = coordinator.binding().await;
-        if binding.project == project_id
+        if binding.project_id == project_id
             && binding.handle.harness_thread_id == info.native_thread_id
         {
             live_existing_id = Some(thread_id);
@@ -2842,8 +2860,8 @@ async fn materialize_subagent_thread(
     install_event_owner(
         &shared,
         &harness,
-        BindingData {
-            project: project_id,
+        LoadedThreadBinding {
+            project_id,
             handle: handle.clone(),
             native_model,
         },
@@ -3068,8 +3086,8 @@ async fn ensure_subagent_thread_open(
     install_event_owner_locked(
         shared,
         &harness,
-        BindingData {
-            project: project_config.id,
+        LoadedThreadBinding {
+            project_id: project_config.id,
             handle,
             native_model,
         },
@@ -3172,7 +3190,7 @@ fn launch_event_forwarder(
 async fn install_event_owner(
     shared: &Arc<RegistryShared>,
     harness: &Arc<dyn AgentHarness>,
-    binding: BindingData,
+    binding: LoadedThreadBinding,
     classification: ClassificationPhase,
 ) -> Result<bool, HarnessError> {
     let thread_id = binding.handle.thread;
@@ -3183,11 +3201,11 @@ async fn install_event_owner(
 async fn install_event_owner_locked(
     shared: &Arc<RegistryShared>,
     harness: &Arc<dyn AgentHarness>,
-    binding: BindingData,
+    binding: LoadedThreadBinding,
     classification: ClassificationPhase,
 ) -> Result<bool, HarnessError> {
     let thread_id = binding.handle.thread;
-    let project_id = binding.project;
+    let project_id = binding.project_id;
     let authority = shared
         .intern_thread_authority(thread_id, project_id)
         .await
@@ -3244,7 +3262,7 @@ async fn forward_events(
 ) -> ForwarderExitReason {
     let binding = coordinator.binding().await;
     let thread_id = binding.handle.thread;
-    let project_id = binding.project;
+    let project_id = binding.project_id;
     let persisted = shared
         .store
         .load_thread(project_id, thread_id)
@@ -5825,8 +5843,8 @@ mod tests {
             .await
             .unwrap();
         let coordinator = Arc::new(super::ThreadCoordinator::new(
-            super::BindingData {
-                project: project_id,
+            super::LoadedThreadBinding {
+                project_id,
                 handle: ThreadHandle::detached(parent_thread_id, "native-parent".into()),
                 native_model: None,
             },
@@ -6054,8 +6072,8 @@ mod tests {
 
     fn test_coordinator(classification: super::ClassificationPhase) -> super::ThreadCoordinator {
         super::ThreadCoordinator::new(
-            super::BindingData {
-                project: ProjectId::new(),
+            super::LoadedThreadBinding {
+                project_id: ProjectId::new(),
                 handle: ThreadHandle::detached(ThreadId::new(), "native-test".into()),
                 native_model: None,
             },
@@ -6069,17 +6087,17 @@ mod tests {
     ) -> Arc<super::ThreadAuthority> {
         let binding = coordinator.binding().await;
         let authority = shared
-            .intern_thread_authority(binding.handle.thread, binding.project)
+            .intern_thread_authority(binding.handle.thread, binding.project_id)
             .await
             .unwrap();
         *authority.coordinator.lock().await = Some(coordinator);
         authority
     }
 
-    fn test_authority(binding: &super::BindingData) -> Arc<super::ThreadAuthority> {
+    fn test_authority(binding: &super::LoadedThreadBinding) -> Arc<super::ThreadAuthority> {
         Arc::new(super::ThreadAuthority::new(
             binding.handle.thread,
-            binding.project,
+            binding.project_id,
             Arc::new(tokio::sync::Mutex::new(())),
         ))
     }
@@ -6107,7 +6125,7 @@ mod tests {
         let lease = runtime
             .reserve_turn(
                 &authority,
-                turn_reservation(binding.project, &binding.handle, &context),
+                turn_reservation(binding.project_id, &binding.handle, &context),
             )
             .unwrap();
         match coordinator.prepare_operation(context, lease).await {
@@ -6126,7 +6144,7 @@ mod tests {
         let lease = runtime
             .reserve_turn(
                 &authority,
-                turn_reservation(binding.project, &binding.handle, &context),
+                turn_reservation(binding.project_id, &binding.handle, &context),
             )
             .unwrap();
         let error = match coordinator.prepare_operation(context, lease).await {
@@ -6149,7 +6167,7 @@ mod tests {
         let binding = coordinator.binding().await;
         let thread_id = binding.handle.thread;
         let authority = shared
-            .intern_thread_authority(thread_id, binding.project)
+            .intern_thread_authority(thread_id, binding.project_id)
             .await
             .unwrap();
         let state_guard = coordinator.state.lock().await;
@@ -6162,7 +6180,7 @@ mod tests {
                 .admit_operation(
                     &task_authority,
                     &task_coordinator,
-                    binding.project,
+                    binding.project_id,
                     &binding.handle,
                     &context,
                 )
@@ -6488,9 +6506,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(registry.get_thread_handle(thread_id).await.is_none());
-        assert!(registry.get_thread_native_model(thread_id).await.is_none());
-        assert!(registry.get_project_for_thread(thread_id).await.is_none());
+        assert!(registry.loaded_thread_binding(thread_id).await.is_none());
         assert!(
             registry
                 .shared
@@ -6499,6 +6515,110 @@ mod tests {
                 .into_iter()
                 .all(|(candidate, _)| candidate != thread_id)
         );
+    }
+
+    #[tokio::test]
+    async fn loaded_thread_binding_is_coherent_across_coordinator_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let registry = super::HarnessRegistry::new(
+            Arc::new(UnusedHarnessFactory),
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store),
+        );
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let authority = registry
+            .shared
+            .intern_thread_authority(thread_id, project_id)
+            .await
+            .unwrap();
+        let model_a = ModelRef {
+            provider: "provider-a".into(),
+            model: "model-a".into(),
+            reasoning_effort: None,
+        };
+        let coordinator_a = Arc::new(super::ThreadCoordinator::new(
+            super::LoadedThreadBinding {
+                project_id,
+                handle: ThreadHandle::detached(thread_id, "native-a".into()),
+                native_model: Some(model_a.clone()),
+            },
+            super::ClassificationPhase::Primary,
+        ));
+        *authority.coordinator.lock().await = Some(coordinator_a);
+
+        let snapshot_a = registry.loaded_thread_binding(thread_id).await.unwrap();
+        let model_b = ModelRef {
+            provider: "provider-b".into(),
+            model: "model-b".into(),
+            reasoning_effort: None,
+        };
+        let coordinator_b = Arc::new(super::ThreadCoordinator::new(
+            super::LoadedThreadBinding {
+                project_id,
+                handle: ThreadHandle::detached(thread_id, "native-b".into()),
+                native_model: Some(model_b.clone()),
+            },
+            super::ClassificationPhase::Primary,
+        ));
+        *authority.coordinator.lock().await = Some(coordinator_b);
+
+        assert_eq!(snapshot_a.handle().harness_thread_id, "native-a");
+        assert_eq!(snapshot_a.native_model(), Some(&model_a));
+        let snapshot_b = registry.loaded_thread_binding(thread_id).await.unwrap();
+        assert_eq!(snapshot_b.handle().harness_thread_id, "native-b");
+        assert_eq!(snapshot_b.native_model(), Some(&model_b));
+    }
+
+    #[tokio::test]
+    async fn loaded_thread_binding_distinguishes_absent_unknown_and_known_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let registry = super::HarnessRegistry::new(
+            Arc::new(UnusedHarnessFactory),
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store),
+        );
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let authority = registry
+            .shared
+            .intern_thread_authority(thread_id, project_id)
+            .await
+            .unwrap();
+        assert!(registry.loaded_thread_binding(thread_id).await.is_none());
+
+        let unknown = Arc::new(super::ThreadCoordinator::new(
+            super::LoadedThreadBinding {
+                project_id,
+                handle: ThreadHandle::detached(thread_id, "native-unknown".into()),
+                native_model: None,
+            },
+            super::ClassificationPhase::Primary,
+        ));
+        *authority.coordinator.lock().await = Some(unknown);
+        let unknown = registry.loaded_thread_binding(thread_id).await.unwrap();
+        assert!(unknown.native_model().is_none());
+
+        let model = ModelRef {
+            provider: "provider".into(),
+            model: "model".into(),
+            reasoning_effort: None,
+        };
+        let known = Arc::new(super::ThreadCoordinator::new(
+            super::LoadedThreadBinding {
+                project_id,
+                handle: ThreadHandle::detached(thread_id, "native-known".into()),
+                native_model: Some(model.clone()),
+            },
+            super::ClassificationPhase::Primary,
+        ));
+        *authority.coordinator.lock().await = Some(known);
+        let known = registry.loaded_thread_binding(thread_id).await.unwrap();
+        assert_eq!(known.native_model(), Some(&model));
     }
 
     #[tokio::test]
@@ -6539,7 +6659,7 @@ mod tests {
         let stale_lease = runtime
             .reserve_turn(
                 &authority,
-                turn_reservation(binding.project, &binding.handle, &context),
+                turn_reservation(binding.project_id, &binding.handle, &context),
             )
             .unwrap();
         let stale = match coordinator
@@ -6555,7 +6675,7 @@ mod tests {
         let current_lease = runtime
             .reserve_turn(
                 &authority,
-                turn_reservation(binding.project, &binding.handle, &context),
+                turn_reservation(binding.project_id, &binding.handle, &context),
             )
             .unwrap();
         let current = match coordinator
@@ -6659,7 +6779,7 @@ mod tests {
         let lease = runtime
             .reserve_turn(
                 &authority,
-                turn_reservation(binding.project, &binding.handle, &context),
+                turn_reservation(binding.project_id, &binding.handle, &context),
             )
             .unwrap();
         let error = match coordinator.prepare_operation(context, lease).await {
@@ -8790,8 +8910,8 @@ mod tests {
         let runtime = shared.runtime.clone();
         let native_handle = ThreadHandle::detached(thread_id, format!("native-{thread_id}"));
         let coordinator = Arc::new(super::ThreadCoordinator::new(
-            super::BindingData {
-                project: project_id,
+            super::LoadedThreadBinding {
+                project_id,
                 handle: native_handle.clone(),
                 native_model: Some(model),
             },
@@ -8857,8 +8977,8 @@ mod tests {
         ));
         let native_handle = ThreadHandle::detached(thread_id, format!("native-{thread_id}"));
         let coordinator = Arc::new(super::ThreadCoordinator::new(
-            super::BindingData {
-                project: project_id,
+            super::LoadedThreadBinding {
+                project_id,
                 handle: native_handle,
                 native_model: Some(ModelRef {
                     provider: "openai".into(),
