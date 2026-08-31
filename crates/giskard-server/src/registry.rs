@@ -318,6 +318,8 @@ pub struct ThreadAuthority {
     owner: Arc<Mutex<()>>,
     coordinator: Mutex<Option<ThreadBinding>>,
     pub(crate) runtime: StdMutex<Option<Arc<StdMutex<ThreadRuntimeEntry>>>>,
+    /// Per-parent FIFO presence is also the existing worker-running marker.
+    materialization: Mutex<Option<VecDeque<SubagentMaterializationJob>>>,
 }
 
 impl ThreadAuthority {
@@ -328,6 +330,7 @@ impl ThreadAuthority {
             owner,
             coordinator: Mutex::new(None),
             runtime: StdMutex::new(None),
+            materialization: Mutex::new(None),
         }
     }
 }
@@ -818,16 +821,6 @@ struct RegistryShared {
     harness_transition_gate: Arc<Mutex<HarnessTransitionGate>>,
     threads: Arc<Mutex<ThreadIndex>>,
     background_tasks: Arc<RegistryTaskTracker>,
-    /// Per-parent FIFO serializes relationship materialization. It does not order child lifecycle:
-    /// only the child's native event owner may mutate that state.
-    // ENTITY-AUTHORITY-MIGRATION: milestone 4
-    // Role: Own the per-parent materialization FIFO and mark whether its worker is running.
-    // Source of truth: Entry presence and queue order drive the existing worker protocol.
-    // Structural reason: This baseline parent-thread owner is consolidated after runtime ownership.
-    // Synchronization: The map mutex protects enqueue, worker election, dequeue, and removal.
-    // Invalidation/removal: The worker removes an empty queue; milestone 4 moves it to its authority.
-    subagent_materialization_queues:
-        Arc<Mutex<HashMap<ThreadId, VecDeque<SubagentMaterializationJob>>>>,
     hub: Arc<Hub>,
     runtime: Arc<ThreadRuntimeSupport>,
     store: Arc<PersistStore>,
@@ -1017,7 +1010,6 @@ impl RegistryShared {
             harness_transition_gate: Arc::new(Mutex::new(HarnessTransitionGate::default())),
             threads: Arc::new(Mutex::new(ThreadIndex::default())),
             background_tasks: Arc::new(RegistryTaskTracker::default()),
-            subagent_materialization_queues: Arc::new(Mutex::new(HashMap::new())),
             hub,
             runtime,
             store,
@@ -2872,55 +2864,95 @@ async fn enqueue_subagent_materialization(
     mut job: SubagentMaterializationJob,
     shared: Arc<RegistryShared>,
 ) {
+    let establishment_permit = if shared.thread_authority(parent_thread_id).await.is_none() {
+        match shared.background_tasks.register() {
+            Some(permit) => Some(permit),
+            None => {
+                reject_materialization_during_shutdown(parent_thread_id, &mut job);
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let authority = match shared
+        .intern_thread_authority(parent_thread_id, job.project_id)
+        .await
+    {
+        Ok(authority) => authority,
+        Err(error) => {
+            warn!(
+                project_id = %job.project_id,
+                %parent_thread_id,
+                turn_id = %job.spawned_by_turn_id,
+                item_id = %job.item_id,
+                origin = %job.origin,
+                error = %error,
+                "rejecting sub-agent materialization job for mismatched thread authority"
+            );
+            if let Some(result) = job.result.take() {
+                let _ = result.send(Err(HarnessError::Protocol(error.to_string())));
+            }
+            return;
+        }
+    };
     let worker_permit = {
-        let mut queues = shared.subagent_materialization_queues.lock().await;
-        let permit = if queues.contains_key(&parent_thread_id) {
+        let mut queue = authority.materialization.lock().await;
+        let permit = if queue.is_some() {
             None
+        } else if establishment_permit.is_some() {
+            establishment_permit
         } else {
             match shared.background_tasks.register() {
                 Some(permit) => Some(permit),
                 None => {
-                    warn!(
-                        project_id = %job.project_id,
-                        %parent_thread_id,
-                        turn_id = %job.spawned_by_turn_id,
-                        item_id = %job.item_id,
-                        origin = %job.origin,
-                        reason = "registry_shutting_down",
-                        "rejecting sub-agent materialization job"
-                    );
-                    if let Some(result) = job.result.take() {
-                        let _ = result.send(Err(HarnessError::Protocol(
-                            "server is shutting down; refusing sub-agent materialization".into(),
-                        )));
-                    }
+                    reject_materialization_during_shutdown(parent_thread_id, &mut job);
                     return;
                 }
             }
         };
-        queues.entry(parent_thread_id).or_default().push_back(job);
+        queue.get_or_insert_with(VecDeque::new).push_back(job);
         permit
     };
     if let Some(permit) = worker_permit {
         tokio::spawn(async move {
             let _permit = permit;
-            run_subagent_materialization_queue(parent_thread_id, shared).await;
+            run_subagent_materialization_queue(authority, shared).await;
         });
     }
 }
 
-async fn run_subagent_materialization_queue(
+fn reject_materialization_during_shutdown(
     parent_thread_id: ThreadId,
+    job: &mut SubagentMaterializationJob,
+) {
+    warn!(
+        project_id = %job.project_id,
+        %parent_thread_id,
+        turn_id = %job.spawned_by_turn_id,
+        item_id = %job.item_id,
+        origin = %job.origin,
+        reason = "registry_shutting_down",
+        "rejecting sub-agent materialization job"
+    );
+    if let Some(result) = job.result.take() {
+        let _ = result.send(Err(HarnessError::Protocol(
+            "server is shutting down; refusing sub-agent materialization".into(),
+        )));
+    }
+}
+
+async fn run_subagent_materialization_queue(
+    authority: Arc<ThreadAuthority>,
     shared: Arc<RegistryShared>,
 ) {
+    let parent_thread_id = authority.thread_id;
     loop {
         let job = {
-            let mut queues = shared.subagent_materialization_queues.lock().await;
-            let job = queues
-                .get_mut(&parent_thread_id)
-                .and_then(VecDeque::pop_front);
+            let mut queue = authority.materialization.lock().await;
+            let job = queue.as_mut().and_then(VecDeque::pop_front);
             if job.is_none() {
-                queues.remove(&parent_thread_id);
+                *queue = None;
             }
             job
         };
@@ -5687,13 +5719,156 @@ mod tests {
         .await;
         assert!(receiver.await.unwrap().is_err());
         assert!(
-            !registry
+            registry
                 .shared
-                .subagent_materialization_queues
+                .thread_authority(parent_thread_id)
+                .await
+                .is_none()
+        );
+    }
+
+    fn materialization_job(
+        project_id: ProjectId,
+        item_id: ItemId,
+    ) -> (
+        super::SubagentMaterializationJob,
+        tokio::sync::oneshot::Receiver<super::SubagentMaterializationResult>,
+    ) {
+        let (result, receiver) = tokio::sync::oneshot::channel();
+        (
+            super::SubagentMaterializationJob {
+                project_id,
+                spawned_by_turn_id: TurnId::new(),
+                item_id,
+                origin: "test",
+                info: super::SubagentActivityInfo {
+                    native_thread_id: format!("native-{item_id}"),
+                    agent_name: None,
+                    agent_path: None,
+                    title: None,
+                },
+                result: Some(result),
+            },
+            receiver,
+        )
+    }
+
+    #[tokio::test]
+    async fn parent_materialization_queues_are_fifo_and_independent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project_id, _) = create_test_project(&store, "queues").await;
+        let shared = Arc::new(super::RegistryShared::new(
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store),
+        ));
+        let lifecycle = super::lock_project_lifecycle(&shared.projects, project_id).await;
+        let first_parent = ThreadId::new();
+        let second_parent = ThreadId::new();
+        let first_item = ItemId::new();
+        let second_item = ItemId::new();
+        let other_item = ItemId::new();
+        let (first, first_result) = materialization_job(project_id, first_item);
+        let (second, second_result) = materialization_job(project_id, second_item);
+        let (other, other_result) = materialization_job(project_id, other_item);
+
+        super::enqueue_subagent_materialization(first_parent, first, shared.clone()).await;
+        super::enqueue_subagent_materialization(first_parent, second, shared.clone()).await;
+        super::enqueue_subagent_materialization(second_parent, other, shared.clone()).await;
+        tokio::task::yield_now().await;
+
+        let first_authority = shared.thread_authority(first_parent).await.unwrap();
+        let second_authority = shared.thread_authority(second_parent).await.unwrap();
+        assert!(!Arc::ptr_eq(&first_authority, &second_authority));
+        while first_authority
+            .materialization
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|queue| queue.len() > 1)
+        {
+            tokio::task::yield_now().await;
+        }
+        let first_queue = first_authority.materialization.lock().await;
+        assert_eq!(
+            first_queue
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|job| job.item_id)
+                .collect::<Vec<_>>(),
+            vec![second_item]
+        );
+        drop(first_queue);
+        assert!(second_authority.materialization.lock().await.is_some());
+
+        drop(lifecycle);
+        assert!(first_result.await.unwrap().is_err());
+        assert!(second_result.await.unwrap().is_err());
+        assert!(other_result.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn clearing_coordinator_does_not_replace_active_parent_worker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project_id, _) = create_test_project(&store, "active-worker").await;
+        let shared = Arc::new(super::RegistryShared::new(
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store),
+        ));
+        let parent_thread_id = ThreadId::new();
+        let authority = shared
+            .intern_thread_authority(parent_thread_id, project_id)
+            .await
+            .unwrap();
+        let coordinator = Arc::new(super::ThreadCoordinator::new(
+            super::BindingData {
+                project: project_id,
+                handle: ThreadHandle::detached(parent_thread_id, "native-parent".into()),
+                native_model: None,
+            },
+            super::ClassificationPhase::Primary,
+        ));
+        *authority.coordinator.lock().await = Some(coordinator);
+        let lifecycle = super::lock_project_lifecycle(&shared.projects, project_id).await;
+        let (first, first_result) = materialization_job(project_id, ItemId::new());
+        let (second, second_result) = materialization_job(project_id, ItemId::new());
+
+        super::enqueue_subagent_materialization(parent_thread_id, first, shared.clone()).await;
+        while authority
+            .materialization
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|queue| !queue.is_empty())
+        {
+            tokio::task::yield_now().await;
+        }
+        *authority.coordinator.lock().await = None;
+        super::enqueue_subagent_materialization(parent_thread_id, second, shared.clone()).await;
+
+        let retained = shared.thread_authority(parent_thread_id).await.unwrap();
+        assert!(Arc::ptr_eq(&authority, &retained));
+        assert_eq!(
+            authority
+                .materialization
                 .lock()
                 .await
-                .contains_key(&parent_thread_id)
+                .as_ref()
+                .unwrap()
+                .len(),
+            1,
+            "the active worker dequeued one job and the second remains on its FIFO"
         );
+        drop(lifecycle);
+        assert!(first_result.await.unwrap().is_err());
+        assert!(second_result.await.unwrap().is_err());
+        while authority.materialization.lock().await.is_some() {
+            tokio::task::yield_now().await;
+        }
     }
 
     #[tokio::test]
