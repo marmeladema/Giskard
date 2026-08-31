@@ -500,7 +500,7 @@ async fn delete_project(
         .delete_project(id)
         .await
         .map_err(harness_api_error)?;
-    state.model_catalogs.remove(id).await;
+    state.registry.remove_project_model_catalog(id).await;
     // Forced: the user confirmed a project-scope deletion, and a thread whose worktree still holds
     // work must not be able to strand the whole project half-deleted.
     //
@@ -3585,7 +3585,7 @@ async fn project_model_catalog(
     project_config: &ProjectConfig,
     config: &Config,
 ) -> Vec<ModelDescriptor> {
-    if let Some(models) = state.model_catalogs.get(project_config.id).await {
+    if let Some(models) = state.registry.project_model_catalog(project_config).await {
         return models;
     }
     refresh_project_model_catalog(state, project_config, config)
@@ -3720,8 +3720,8 @@ async fn refresh_project_model_catalog(
         });
     }
     state
-        .model_catalogs
-        .replace(project_config.id, models.clone())
+        .registry
+        .replace_project_model_catalog(project_config, models.clone())
         .await;
     (models, warnings)
 }

@@ -2502,8 +2502,18 @@ yet, so there is no catalog to choose from (§8.3).
 
 - One `codex app-server` per project, spawned lazily (§4.6), reused across the project's
   threads, resumed after idle shutdown or crash.
-- The server keeps a registry: `project_id → HarnessInstance` (holding the `Arc<dyn AgentHarness>`,
-  child process handle, and per-thread subscriber bookkeeping).
+- `RegistryShared` owns the sole strong process-local project map. Each stable `ProjectAuthority`
+  records its verified project ID, the adopted lifecycle mutex, and independently synchronized
+  optional harness and composed-model-catalog slots. An authority shell is process-local identity,
+  not evidence that the durable project exists or that its harness is running, and remains interned
+  after those optional components are cleared.
+- A root-wide, non-keyed harness transition gate preserves ordering across lazy creation, deletion,
+  and shutdown. Bootstrap loading occurs outside the gate; the second existence check, harness
+  creation, and publication remain inside it. Shutdown drains the authority-owned harness slots
+  under the gate and invokes each harness's shutdown after releasing it.
+- Lifecycle locking may precede durable project verification. The root therefore retains weak
+  unpublished lock entries; publishing a verified authority adopts that exact mutex and removes
+  its weak entry atomically under the project-index membership lock.
 - Deleting a project: shut down its harness, then remove `projects/<id>/` and its
   `projects.json` entry (with a confirm dialog; irreversible).
 

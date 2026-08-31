@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::future::join_all;
-use tokio::sync::{Mutex, Notify, OwnedMutexGuard, broadcast, oneshot, watch};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard, RwLock, broadcast, oneshot, watch};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
@@ -153,13 +153,6 @@ fn live_turn_user_input(ctx: &TurnContext) -> Option<UserInput> {
         .map(UserInput::text)
 }
 
-// ENTITY-AUTHORITY-MIGRATION: milestone 1
-// Role: Intern project lifecycle locks before durable project existence is verified.
-// Source of truth: The weak entry points to the mutex used by current project lifecycle callers.
-// Structural reason: Callers must lock an ID before a verified project authority can exist.
-// Synchronization: The map mutex protects lookup, weak-entry pruning, and insertion.
-// Invalidation/removal: Dead weak entries are pruned; milestone 1 makes publication adopt the lock.
-type ProjectLifecycleLocks = Arc<Mutex<HashMap<ProjectId, Weak<Mutex<()>>>>>;
 // ENTITY-AUTHORITY-MIGRATION: milestone 2
 // Role: Intern event-owner locks before a thread coordinator is published.
 // Source of truth: The weak entry points to the mutex used by current owner installers.
@@ -684,34 +677,35 @@ pub struct HarnessRegistry {
 }
 
 #[derive(Default)]
-struct Harnesses {
+struct HarnessTransitionGate {
     shutting_down: bool,
-    // ENTITY-AUTHORITY-MIGRATION: milestone 1
-    // Role: Own the process-local harness slot for every loaded project.
-    // Source of truth: Each value is the current active or deleting harness state.
-    // Structural reason: This is the baseline project-keyed owner being consolidated.
-    // Synchronization: The enclosing Harnesses mutex is the global transition barrier.
-    // Invalidation/removal: Project deletion or shutdown removes entries; milestone 1 relocates them.
-    by_project: HashMap<ProjectId, ProjectHarnessState>,
 }
 
-impl Harnesses {
-    fn active(&self, project_id: ProjectId) -> Option<Arc<dyn AgentHarness>> {
-        self.by_project
-            .get(&project_id)
-            .and_then(ProjectHarnessState::active)
-            .cloned()
+struct ProjectAuthority {
+    project_id: ProjectId,
+    lifecycle: Arc<Mutex<()>>,
+    harness: Mutex<Option<ProjectHarnessState>>,
+    model_catalog: RwLock<Option<Vec<ModelDescriptor>>>,
+}
+
+impl ProjectAuthority {
+    fn new(project_id: ProjectId, lifecycle: Arc<Mutex<()>>) -> Self {
+        Self {
+            project_id,
+            lifecycle,
+            harness: Mutex::new(None),
+            model_catalog: RwLock::new(None),
+        }
     }
 
     fn begin_delete(
-        &mut self,
+        slot: &mut Option<ProjectHarnessState>,
         project_id: ProjectId,
     ) -> Result<Option<Arc<dyn AgentHarness>>, HarnessError> {
-        match self.by_project.get(&project_id) {
+        match slot.as_ref() {
             Some(ProjectHarnessState::Active(harness)) => {
                 let harness = harness.clone();
-                self.by_project
-                    .insert(project_id, ProjectHarnessState::Deleting(harness.clone()));
+                *slot = Some(ProjectHarnessState::Deleting(harness.clone()));
                 Ok(Some(harness))
             }
             Some(ProjectHarnessState::Deleting(_)) => Err(HarnessError::Protocol(format!(
@@ -721,34 +715,36 @@ impl Harnesses {
         }
     }
 
-    fn rollback_delete(&mut self, project_id: ProjectId, harness: Arc<dyn AgentHarness>) {
-        if !self.shutting_down
-            && matches!(
-                self.by_project.get(&project_id),
-                Some(ProjectHarnessState::Deleting(current)) if Arc::ptr_eq(current, &harness)
-            )
-        {
-            self.by_project
-                .insert(project_id, ProjectHarnessState::Active(harness));
+    fn rollback_delete(slot: &mut Option<ProjectHarnessState>, harness: Arc<dyn AgentHarness>) {
+        if matches!(
+            slot.as_ref(),
+            Some(ProjectHarnessState::Deleting(current)) if Arc::ptr_eq(current, &harness)
+        ) {
+            *slot = Some(ProjectHarnessState::Active(harness));
         }
     }
 
-    fn finish_delete(&mut self, project_id: ProjectId, harness: &Arc<dyn AgentHarness>) {
+    fn finish_delete(slot: &mut Option<ProjectHarnessState>, harness: &Arc<dyn AgentHarness>) {
         if matches!(
-            self.by_project.get(&project_id),
+            slot.as_ref(),
             Some(ProjectHarnessState::Deleting(current)) if Arc::ptr_eq(current, harness)
         ) {
-            self.by_project.remove(&project_id);
+            *slot = None;
         }
     }
+}
 
-    fn begin_shutdown(&mut self) -> HashMap<ProjectId, Arc<dyn AgentHarness>> {
-        self.shutting_down = true;
-        std::mem::take(&mut self.by_project)
-            .into_iter()
-            .map(|(project_id, state)| (project_id, state.into_harness()))
-            .collect()
-    }
+#[derive(Default)]
+struct ProjectIndex {
+    // ENTITY-AUTHORITY-OWNER: sole process-local membership for ProjectAuthority.
+    projects: HashMap<ProjectId, Arc<ProjectAuthority>>,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Intern lifecycle locks before durable project existence is verified.
+    // Source of truth: Published authorities own the adopted mutex; unpublished entries are weak.
+    // Structural reason: Callers must lock an ID before a verified authority can be published.
+    // Synchronization: The ProjectIndex mutex protects weak lookup and authority publication.
+    // Invalidation/removal: Publication removes the weak entry; dead unpublished entries are pruned.
+    unpublished_locks: HashMap<ProjectId, Weak<Mutex<()>>>,
 }
 
 enum ProjectHarnessState {
@@ -772,7 +768,8 @@ impl ProjectHarnessState {
 }
 
 struct RegistryShared {
-    harnesses: Arc<Mutex<Harnesses>>,
+    projects: Arc<Mutex<ProjectIndex>>,
+    harness_transition_gate: Arc<Mutex<HarnessTransitionGate>>,
     // ENTITY-AUTHORITY-MIGRATION: milestone 2
     // Role: Own every loaded thread coordinator binding.
     // Source of truth: Map presence defines whether the thread has a loaded coordinator.
@@ -791,7 +788,6 @@ struct RegistryShared {
     // Invalidation/removal: The worker removes an empty queue; milestone 4 moves it to its authority.
     subagent_materialization_queues:
         Arc<Mutex<HashMap<ThreadId, VecDeque<SubagentMaterializationJob>>>>,
-    project_lifecycle_locks: ProjectLifecycleLocks,
     thread_owner_locks: ThreadOwnerLocks,
     hub: Arc<Hub>,
     runtime: Arc<ThreadRuntimeRegistry>,
@@ -806,21 +802,19 @@ struct RegistryShared {
 /// through deletion. Shared by both passes of `get_or_create_harness` so the second cannot drift
 /// from the first.
 fn harness_slot(
-    harnesses: &Harnesses,
+    gate: &HarnessTransitionGate,
+    slot: &Option<ProjectHarnessState>,
     project: ProjectId,
 ) -> Result<Option<Arc<dyn AgentHarness>>, HarnessError> {
-    if harnesses.shutting_down {
+    if gate.shutting_down {
         return Err(HarnessError::Protocol(
             "server is shutting down; refusing to start a harness".into(),
         ));
     }
-    if let Some(harness) = harnesses.active(project) {
-        return Ok(Some(harness));
+    if let Some(harness) = slot.as_ref().and_then(ProjectHarnessState::active) {
+        return Ok(Some(harness.clone()));
     }
-    if matches!(
-        harnesses.by_project.get(&project),
-        Some(ProjectHarnessState::Deleting(_))
-    ) {
+    if matches!(slot, Some(ProjectHarnessState::Deleting(_))) {
         return Err(HarnessError::Protocol(format!(
             "project {project} harness is being deleted"
         )));
@@ -830,7 +824,42 @@ fn harness_slot(
 
 impl RegistryShared {
     async fn active_harness(&self, project_id: ProjectId) -> Option<Arc<dyn AgentHarness>> {
-        self.harnesses.lock().await.active(project_id)
+        let authority = self.project_authority(project_id).await?;
+        let _gate = self.harness_transition_gate.lock().await;
+        authority
+            .harness
+            .lock()
+            .await
+            .as_ref()
+            .and_then(ProjectHarnessState::active)
+            .cloned()
+    }
+
+    async fn project_authority(&self, project_id: ProjectId) -> Option<Arc<ProjectAuthority>> {
+        self.projects
+            .lock()
+            .await
+            .projects
+            .get(&project_id)
+            .cloned()
+    }
+
+    async fn intern_project_authority(&self, project_id: ProjectId) -> Arc<ProjectAuthority> {
+        let mut index = self.projects.lock().await;
+        if let Some(authority) = index.projects.get(&project_id) {
+            return authority.clone();
+        }
+        index
+            .unpublished_locks
+            .retain(|_, lock| lock.strong_count() > 0);
+        let lifecycle = index
+            .unpublished_locks
+            .remove(&project_id)
+            .and_then(|lock| Weak::upgrade(&lock))
+            .unwrap_or_else(|| Arc::new(Mutex::new(())));
+        let authority = Arc::new(ProjectAuthority::new(project_id, lifecycle));
+        index.projects.insert(project_id, authority.clone());
+        authority
     }
 
     async fn abort_admitted_operation(
@@ -888,11 +917,11 @@ impl RegistryShared {
     ) -> Self {
         let thread_metadata = Arc::new(ThreadMetadataService::new(store.clone(), hub.clone()));
         Self {
-            harnesses: Arc::new(Mutex::new(Harnesses::default())),
+            projects: Arc::new(Mutex::new(ProjectIndex::default())),
+            harness_transition_gate: Arc::new(Mutex::new(HarnessTransitionGate::default())),
             threads: Arc::new(Mutex::new(HashMap::new())),
             background_tasks: Arc::new(RegistryTaskTracker::default()),
             subagent_materialization_queues: Arc::new(Mutex::new(HashMap::new())),
-            project_lifecycle_locks: Arc::new(Mutex::new(HashMap::new())),
             thread_owner_locks: Arc::new(Mutex::new(HashMap::new())),
             hub,
             runtime,
@@ -1020,12 +1049,45 @@ impl HarnessRegistry {
         self.shared.thread_metadata.clone()
     }
 
+    pub(crate) async fn project_model_catalog(
+        &self,
+        project: &ProjectConfig,
+    ) -> Option<Vec<ModelDescriptor>> {
+        self.shared
+            .intern_project_authority(project.id)
+            .await
+            .model_catalog
+            .read()
+            .await
+            .clone()
+    }
+
+    pub(crate) async fn replace_project_model_catalog(
+        &self,
+        project: &ProjectConfig,
+        models: Vec<ModelDescriptor>,
+    ) {
+        *self
+            .shared
+            .intern_project_authority(project.id)
+            .await
+            .model_catalog
+            .write()
+            .await = Some(models);
+    }
+
+    pub(crate) async fn remove_project_model_catalog(&self, project_id: ProjectId) {
+        if let Some(authority) = self.shared.project_authority(project_id).await {
+            *authority.model_catalog.write().await = None;
+        }
+    }
+
     /// Serialize persisted thread-graph mutations within one project. Child imports may originate
     /// from either an HTTP request or an asynchronously observed harness event, while subtree and
     /// project deletion mutate the same graph. One project-scoped lock makes each find/open/save
     /// or load/preflight/delete sequence atomic with respect to the others.
     pub async fn lock_project_lifecycle(&self, project_id: ProjectId) -> OwnedMutexGuard<()> {
-        lock_project_lifecycle(&self.shared.project_lifecycle_locks, project_id).await
+        lock_project_lifecycle(&self.shared.projects, project_id).await
     }
 
     pub async fn lock_project_lifecycle_with_timeout(
@@ -1047,12 +1109,14 @@ impl HarnessRegistry {
         project: ProjectId,
         config: &ProjectConfig,
     ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
+        let authority = self.shared.intern_project_authority(project).await;
         // Fast path. This lock is a single global one guarding every project's harness and is
         // taken on ordinary per-event work, so the usual answer — "already running" — must not
         // wait behind anything slower than a map lookup.
         {
-            let harnesses = self.shared.harnesses.lock().await;
-            if let Some(harness) = harness_slot(&harnesses, project)? {
+            let gate = self.shared.harness_transition_gate.lock().await;
+            let slot = authority.harness.lock().await;
+            if let Some(harness) = harness_slot(&gate, &slot, project)? {
                 return Ok(harness);
             }
         }
@@ -1067,8 +1131,9 @@ impl HarnessRegistry {
         // I/O on every path that does not.
         let bootstrap = self.known_thread_bindings(project).await?;
 
-        let mut harnesses = self.shared.harnesses.lock().await;
-        if let Some(harness) = harness_slot(&harnesses, project)? {
+        let gate = self.shared.harness_transition_gate.lock().await;
+        let mut slot = authority.harness.lock().await;
+        if let Some(harness) = harness_slot(&gate, &slot, project)? {
             return Ok(harness);
         }
         let binding_count = bootstrap.known_threads.len();
@@ -1076,9 +1141,7 @@ impl HarnessRegistry {
         debug!(project_id = %project, bindings = binding_count,
             "created harness with durable thread bindings installed");
 
-        harnesses
-            .by_project
-            .insert(project, ProjectHarnessState::Active(h.clone()));
+        *slot = Some(ProjectHarnessState::Active(h.clone()));
         Ok(h)
     }
 
@@ -1922,8 +1985,24 @@ impl HarnessRegistry {
     /// aggregate error is returned.
     pub async fn shutdown(&self) -> Result<(), HarnessError> {
         let harnesses = {
-            let mut harnesses = self.shared.harnesses.lock().await;
-            harnesses.begin_shutdown()
+            let mut gate = self.shared.harness_transition_gate.lock().await;
+            gate.shutting_down = true;
+            let authorities = self
+                .shared
+                .projects
+                .lock()
+                .await
+                .projects
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut harnesses = HashMap::new();
+            for authority in authorities {
+                if let Some(state) = authority.harness.lock().await.take() {
+                    harnesses.insert(authority.project_id, state.into_harness());
+                }
+            }
+            harnesses
         };
         if harnesses.is_empty() {
             debug!("harness registry shutdown found no active harnesses");
@@ -2017,18 +2096,30 @@ impl HarnessRegistry {
                 thread_ids.insert(thread_id);
             }
         }
-        let harness = {
-            let mut harnesses = self.shared.harnesses.lock().await;
-            harnesses.begin_delete(project_id)?
+        let authority = self.shared.project_authority(project_id).await;
+        let harness = if let Some(authority) = authority.as_ref() {
+            let _gate = self.shared.harness_transition_gate.lock().await;
+            let mut slot = authority.harness.lock().await;
+            ProjectAuthority::begin_delete(&mut slot, project_id)?
+        } else {
+            None
         };
         if let Some(harness) = harness {
             if let Err(error) = harness.shutdown().await {
-                let mut harnesses = self.shared.harnesses.lock().await;
-                harnesses.rollback_delete(project_id, harness);
+                let gate = self.shared.harness_transition_gate.lock().await;
+                if !gate.shutting_down
+                    && let Some(authority) = authority.as_ref()
+                {
+                    let mut slot = authority.harness.lock().await;
+                    ProjectAuthority::rollback_delete(&mut slot, harness);
+                }
                 return Err(error);
             }
-            let mut harnesses = self.shared.harnesses.lock().await;
-            harnesses.finish_delete(project_id, &harness);
+            let _gate = self.shared.harness_transition_gate.lock().await;
+            if let Some(authority) = authority.as_ref() {
+                let mut slot = authority.harness.lock().await;
+                ProjectAuthority::finish_delete(&mut slot, &harness);
+            }
         }
 
         for thread_id in &thread_ids {
@@ -2044,18 +2135,30 @@ impl HarnessRegistry {
 }
 
 async fn lock_project_lifecycle(
-    locks: &ProjectLifecycleLocks,
+    projects: &Arc<Mutex<ProjectIndex>>,
     project_id: ProjectId,
 ) -> OwnedMutexGuard<()> {
     let lock = {
-        let mut locks = locks.lock().await;
-        locks.retain(|_, lock| lock.strong_count() > 0);
-        match locks.get(&project_id).and_then(Weak::upgrade) {
-            Some(lock) => lock,
-            None => {
-                let lock = Arc::new(Mutex::new(()));
-                locks.insert(project_id, Arc::downgrade(&lock));
-                lock
+        let mut index = projects.lock().await;
+        if let Some(authority) = index.projects.get(&project_id) {
+            authority.lifecycle.clone()
+        } else {
+            index
+                .unpublished_locks
+                .retain(|_, lock| lock.strong_count() > 0);
+            match index
+                .unpublished_locks
+                .get(&project_id)
+                .and_then(Weak::upgrade)
+            {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(Mutex::new(()));
+                    index
+                        .unpublished_locks
+                        .insert(project_id, Arc::downgrade(&lock));
+                    lock
+                }
             }
         }
     };
@@ -2318,8 +2421,7 @@ async fn materialize_subagent_thread(
     info: SubagentActivityInfo,
     shared: Arc<RegistryShared>,
 ) -> Result<Option<ThreadId>, HarnessError> {
-    let _lifecycle_guard =
-        lock_project_lifecycle(&shared.project_lifecycle_locks, project_id).await;
+    let _lifecycle_guard = lock_project_lifecycle(&shared.projects, project_id).await;
     let Some(project_config) = shared
         .store
         .load_project(project_id)
@@ -4524,9 +4626,9 @@ async fn persist_turn(
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Weak};
 
     use chrono::Utc;
     use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalRequest};
@@ -4536,7 +4638,7 @@ mod tests {
     use giskard_core::item::{
         CommandExecutionStart, Item, ItemDelta, ItemKind, ItemPayload, ItemStart,
     };
-    use giskard_core::model::ModelRef;
+    use giskard_core::model::{ModelDescriptor, ModelRef};
     use giskard_core::server_request::ServerRequest;
     use giskard_core::token::{TokenLedger, TokenUsage};
     use giskard_core::turn::{
@@ -4550,7 +4652,7 @@ mod tests {
     use giskard_persist::PersistStore;
     use giskard_persist::store::{ProjectConfig, ThreadFile};
     use giskard_proto::{ServerMessage, WireAgentEvent};
-    use tokio::sync::{broadcast, mpsc};
+    use tokio::sync::{Notify, broadcast, mpsc};
     use tokio::task::JoinHandle;
 
     use super::{
@@ -4921,6 +5023,7 @@ mod tests {
 
     struct BindingOrderFactory {
         harness: Arc<BindingOrderHarness>,
+        calls: Arc<AtomicUsize>,
     }
 
     #[async_trait::async_trait]
@@ -4930,6 +5033,7 @@ mod tests {
             _config: &ProjectConfig,
             bootstrap: giskard_harness::HarnessBootstrap,
         ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             // Held open so a second caller is certainly inside construction. The harness must not
             // become reachable until its complete bootstrap has been installed.
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -4938,6 +5042,64 @@ mod tests {
                 .store(bootstrap.known_threads.len().max(1), Ordering::SeqCst);
             Ok(self.harness.clone())
         }
+    }
+
+    struct SerializedFactory {
+        calls: Arc<AtomicUsize>,
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::HarnessFactory for SerializedFactory {
+        async fn create(
+            &self,
+            _config: &ProjectConfig,
+            _bootstrap: giskard_harness::HarnessBootstrap,
+        ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(Arc::new(ShutdownHarness {
+                calls: Arc::new(AtomicUsize::new(0)),
+                fail: false,
+            }))
+        }
+    }
+
+    struct BlockingFactory {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+        harness: Arc<ShutdownHarness>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::HarnessFactory for BlockingFactory {
+        async fn create(
+            &self,
+            _config: &ProjectConfig,
+            _bootstrap: giskard_harness::HarnessBootstrap,
+        ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(self.harness.clone())
+        }
+    }
+
+    async fn create_test_project(store: &PersistStore, name: &str) -> (ProjectId, ProjectConfig) {
+        let project_id = ProjectId::new();
+        store
+            .create_project(project_id, name, "/tmp/test")
+            .await
+            .unwrap();
+        let config = store
+            .load_project(project_id)
+            .await
+            .unwrap()
+            .expect("the project was just created");
+        (project_id, config)
     }
 
     /// The bindings only prevent a second identity if they are in place before anything can open a
@@ -4956,9 +5118,11 @@ mod tests {
             bound: Arc::new(AtomicUsize::new(0)),
             opened_before_bound: Arc::new(AtomicUsize::new(0)),
         });
+        let factory_calls = Arc::new(AtomicUsize::new(0));
         let registry = Arc::new(super::HarnessRegistry::new(
             Arc::new(BindingOrderFactory {
                 harness: harness.clone(),
+                calls: factory_calls.clone(),
             }),
             Arc::new(Hub::new()),
             store.clone(),
@@ -5011,6 +5175,85 @@ mod tests {
             0,
             "no thread may be opened on a harness that has not been given its bindings"
         );
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn different_project_harness_creation_remains_globally_serialized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (first_id, first) = create_test_project(&store, "first").await;
+        let (second_id, second) = create_test_project(&store, "second").await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let registry = Arc::new(super::HarnessRegistry::new(
+            Arc::new(SerializedFactory {
+                calls: calls.clone(),
+                active: active.clone(),
+                max_active: max_active.clone(),
+            }),
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store),
+        ));
+
+        let first_call = {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.get_or_create_harness(first_id, &first).await })
+        };
+        let second_call = {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.get_or_create_harness(second_id, &second).await })
+        };
+        first_call.await.unwrap().unwrap();
+        second_call.await.unwrap().unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+        assert!(registry.shared.active_harness(first_id).await.is_some());
+        assert!(registry.shared.active_harness(second_id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn harness_creation_cannot_publish_after_shutdown_fence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project_id, config) = create_test_project(&store, "project").await;
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let harness = Arc::new(ShutdownHarness {
+            calls: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+        });
+        let registry = Arc::new(super::HarnessRegistry::new(
+            Arc::new(BlockingFactory {
+                started: started.clone(),
+                release: release.clone(),
+                harness: harness.clone(),
+            }),
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store),
+        ));
+
+        let creating = {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.get_or_create_harness(project_id, &config).await })
+        };
+        started.notified().await;
+        let shutting_down = {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.shutdown().await })
+        };
+        tokio::task::yield_now().await;
+        release.notify_one();
+
+        creating.await.unwrap().unwrap();
+        shutting_down.await.unwrap().unwrap();
+        let authority = registry.shared.project_authority(project_id).await.unwrap();
+        assert!(authority.harness.lock().await.is_none());
+        assert_eq!(harness.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -5070,14 +5313,13 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("bound more than once"));
+        let authority = registry
+            .shared
+            .project_authority(project_id)
+            .await
+            .expect("verified project has an authority shell");
         assert!(
-            !registry
-                .shared
-                .harnesses
-                .lock()
-                .await
-                .by_project
-                .contains_key(&project_id),
+            authority.harness.lock().await.is_none(),
             "a conflicting bootstrap must not publish any harness state"
         );
     }
@@ -5095,23 +5337,24 @@ mod tests {
         );
         let successful_calls = Arc::new(AtomicUsize::new(0));
         let failing_calls = Arc::new(AtomicUsize::new(0));
-        {
-            let mut harnesses = registry.shared.harnesses.lock().await;
-            harnesses.by_project.insert(
-                ProjectId::new(),
-                ProjectHarnessState::Active(Arc::new(ShutdownHarness {
-                    calls: successful_calls.clone(),
-                    fail: false,
-                })),
-            );
-            harnesses.by_project.insert(
-                ProjectId::new(),
-                ProjectHarnessState::Active(Arc::new(ShutdownHarness {
-                    calls: failing_calls.clone(),
-                    fail: true,
-                })),
-            );
-        }
+        let successful = registry
+            .shared
+            .intern_project_authority(ProjectId::new())
+            .await;
+        *successful.harness.lock().await =
+            Some(ProjectHarnessState::Active(Arc::new(ShutdownHarness {
+                calls: successful_calls.clone(),
+                fail: false,
+            })));
+        let failing = registry
+            .shared
+            .intern_project_authority(ProjectId::new())
+            .await;
+        *failing.harness.lock().await =
+            Some(ProjectHarnessState::Active(Arc::new(ShutdownHarness {
+                calls: failing_calls.clone(),
+                fail: true,
+            })));
 
         let error = registry.shutdown().await.unwrap_err();
         assert!(error.to_string().contains("injected shutdown failure"));
@@ -5121,7 +5364,14 @@ mod tests {
         registry.shutdown().await.unwrap();
         assert_eq!(successful_calls.load(Ordering::SeqCst), 1);
         assert_eq!(failing_calls.load(Ordering::SeqCst), 1);
-        assert!(registry.shared.harnesses.lock().await.shutting_down);
+        assert!(
+            registry
+                .shared
+                .harness_transition_gate
+                .lock()
+                .await
+                .shutting_down
+        );
     }
 
     #[tokio::test]
@@ -5206,13 +5456,8 @@ mod tests {
             calls: Arc::new(AtomicUsize::new(0)),
             fail: false,
         });
-        registry
-            .shared
-            .harnesses
-            .lock()
-            .await
-            .by_project
-            .insert(project_id, ProjectHarnessState::Deleting(harness));
+        let authority = registry.shared.intern_project_authority(project_id).await;
+        *authority.harness.lock().await = Some(ProjectHarnessState::Deleting(harness));
         let config: ProjectConfig = serde_json::from_value(serde_json::json!({
             "version": 1,
             "id": project_id,
@@ -5228,6 +5473,139 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("being deleted"));
+    }
+
+    #[tokio::test]
+    async fn failed_project_deletion_restores_the_same_active_harness() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let registry = super::HarnessRegistry::new(
+            Arc::new(UnusedHarnessFactory),
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store),
+        );
+        let project_id = ProjectId::new();
+        let harness: Arc<dyn AgentHarness> = Arc::new(ShutdownHarness {
+            calls: Arc::new(AtomicUsize::new(0)),
+            fail: true,
+        });
+        let authority = registry.shared.intern_project_authority(project_id).await;
+        *authority.harness.lock().await = Some(ProjectHarnessState::Active(harness.clone()));
+
+        let error = registry.delete_project(project_id).await.unwrap_err();
+        assert!(error.to_string().contains("injected shutdown failure"));
+        let restored = authority
+            .harness
+            .lock()
+            .await
+            .as_ref()
+            .and_then(ProjectHarnessState::active)
+            .cloned()
+            .expect("failed deletion restores an active harness");
+        assert!(Arc::ptr_eq(&restored, &harness));
+    }
+
+    #[tokio::test]
+    async fn authority_catalog_preserves_absence_replace_and_removal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let registry = super::HarnessRegistry::new(
+            Arc::new(UnusedHarnessFactory),
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store.clone()),
+        );
+        let (project_id, config) = create_test_project(&store, "project").await;
+        assert!(registry.project_model_catalog(&config).await.is_none());
+
+        let first = vec![ModelDescriptor::conservative("provider", "first")];
+        registry
+            .replace_project_model_catalog(&config, first.clone())
+            .await;
+        assert_eq!(registry.project_model_catalog(&config).await, Some(first));
+
+        let second = vec![ModelDescriptor::conservative("provider", "second")];
+        registry
+            .replace_project_model_catalog(&config, second.clone())
+            .await;
+        assert_eq!(registry.project_model_catalog(&config).await, Some(second));
+
+        registry.remove_project_model_catalog(project_id).await;
+        assert!(registry.project_model_catalog(&config).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn project_authority_adopts_the_contended_lifecycle_mutex() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let registry = super::HarnessRegistry::new(
+            Arc::new(UnusedHarnessFactory),
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store),
+        );
+        let project_id = ProjectId::new();
+        let guard = registry.lock_project_lifecycle(project_id).await;
+        let interned_lock = registry
+            .shared
+            .projects
+            .lock()
+            .await
+            .unpublished_locks
+            .get(&project_id)
+            .and_then(Weak::upgrade)
+            .expect("held lifecycle lock remains interned");
+
+        let authority = registry.shared.intern_project_authority(project_id).await;
+        assert!(Arc::ptr_eq(&authority.lifecycle, &interned_lock));
+        assert!(
+            !registry
+                .shared
+                .projects
+                .lock()
+                .await
+                .unpublished_locks
+                .contains_key(&project_id)
+        );
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn arbitrary_project_lookup_and_lock_do_not_intern_authority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let registry = super::HarnessRegistry::new(
+            Arc::new(UnusedHarnessFactory),
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store),
+        );
+        let project_id = ProjectId::new();
+
+        assert!(
+            registry
+                .shared
+                .project_authority(project_id)
+                .await
+                .is_none()
+        );
+        let guard = registry.lock_project_lifecycle(project_id).await;
+        assert!(
+            registry
+                .shared
+                .project_authority(project_id)
+                .await
+                .is_none()
+        );
+        drop(guard);
+        assert!(
+            registry
+                .shared
+                .project_authority(project_id)
+                .await
+                .is_none()
+        );
     }
 
     #[test]
