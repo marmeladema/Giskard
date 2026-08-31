@@ -99,7 +99,19 @@ enum ReplacementKey {
 
 #[derive(Default)]
 struct PendingReplacements {
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Preserve per-connection delivery order for latest-by-authority replacements.
+    // Source of truth: The messages map below owns the pending replacement payloads.
+    // Structural reason: This queue spans subscribed entities but owns only delivery state.
+    // Synchronization: ReplacementMailbox::pending protects the queue and payload map together.
+    // Invalidation/removal: Pop removes each key after delivery; connection teardown drops all.
     order: VecDeque<ReplacementKey>,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Coalesce pending replacement messages by thread or root projection identity.
+    // Source of truth: This is only the latest pending delivery, not authoritative entity state.
+    // Structural reason: A connection-owned replacement lane necessarily spans its subscriptions.
+    // Synchronization: ReplacementMailbox::pending serializes coalescing and ordered removal.
+    // Invalidation/removal: Pop removes delivered values; connection teardown drops the mailbox.
     messages: HashMap<ReplacementKey, ServerMessage>,
 }
 

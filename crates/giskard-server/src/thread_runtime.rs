@@ -32,6 +32,12 @@ use giskard_proto::{
 };
 
 pub struct ThreadRuntimeRegistry {
+    // ENTITY-AUTHORITY-MIGRATION: milestone 3
+    // Role: Own the process-local runtime entry for each observed thread.
+    // Source of truth: Entry presence and contents define the current runtime authority state.
+    // Structural reason: This is the baseline thread-keyed runtime owner being consolidated.
+    // Synchronization: The outer mutex protects membership; each entry has its own mutex.
+    // Invalidation/removal: Full thread retirement removes entries; milestone 3 relocates the slot.
     entries: Arc<Mutex<HashMap<ThreadId, Arc<Mutex<ThreadRuntimeEntry>>>>>,
     overview: Arc<Mutex<OverviewState>>,
     max_command_output_bytes: usize,
@@ -154,6 +160,12 @@ pub(crate) enum RuntimeDiffLookup {
 #[derive(Default)]
 struct OverviewState {
     revision: u64,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Hold the cross-thread runtime summary sent to browser connections.
+    // Source of truth: Runtime entries remain authoritative; this is a derived projection.
+    // Structural reason: One revisioned replacement snapshot necessarily spans many threads.
+    // Synchronization: The enclosing overview mutex protects revision and summaries together.
+    // Invalidation/removal: Runtime summary transitions replace or remove the matching projection.
     summaries: HashMap<ThreadId, ThreadRuntimeSummary>,
 }
 

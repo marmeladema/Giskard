@@ -504,13 +504,31 @@ pub struct PersistStore {
     data_dir: PathBuf,
     config: Mutex<Option<Config>>,
     project_index_lock: Mutex<()>,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Serialize persistence transactions that rewrite one thread's files.
+    // Source of truth: Durable files remain authoritative; weak locks provide transaction ordering.
+    // Structural reason: This lower persistence crate cannot depend on server authority types.
+    // Synchronization: The map mutex protects weak-lock interning and dead-entry pruning.
+    // Invalidation/removal: Dead weak entries are pruned when locks are next requested.
     /// Per-thread-id write locks so read-modify-write of a thread file is single-writer (§5.4).
     thread_locks: Mutex<HashMap<ThreadId, Weak<Mutex<()>>>>,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Cache parsed durable histories by their project and thread storage identity.
+    // Source of truth: JSONL files and their metadata remain authoritative.
+    // Structural reason: This lower persistence cache spans callers and cannot use server authority.
+    // Synchronization: The RwLock protects cache lookup, installation, and invalidation.
+    // Invalidation/removal: File changes, mutations, and project deletion invalidate matching keys.
     /// Parsed JSONL history cache, keyed by `(project, thread)`.
     ///
     /// The JSONL remains authoritative. This per-process cache only avoids reparsing unchanged
     /// histories when the user switches between already-opened threads.
     history_cache: RwLock<HashMap<(ProjectId, ThreadId), Arc<HistoryCacheEntry>>>,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Remember failed per-thread legacy migration decisions for this store process.
+    // Source of truth: The durable layout determines migratability; this only suppresses retries.
+    // Structural reason: Migration belongs to the lower persistence crate and spans server owners.
+    // Synchronization: The RwLock protects membership checks and insertion.
+    // Invalidation/removal: The cache is process-scoped and disappears when PersistStore is dropped.
     /// Threads whose migration to the current layout was attempted and could not proceed.
     ///
     /// Without this, a thread with an unparseable format 1 history re-reads and re-parses that

@@ -153,7 +153,19 @@ fn live_turn_user_input(ctx: &TurnContext) -> Option<UserInput> {
         .map(UserInput::text)
 }
 
+// ENTITY-AUTHORITY-MIGRATION: milestone 1
+// Role: Intern project lifecycle locks before durable project existence is verified.
+// Source of truth: The weak entry points to the mutex used by current project lifecycle callers.
+// Structural reason: Callers must lock an ID before a verified project authority can exist.
+// Synchronization: The map mutex protects lookup, weak-entry pruning, and insertion.
+// Invalidation/removal: Dead weak entries are pruned; milestone 1 makes publication adopt the lock.
 type ProjectLifecycleLocks = Arc<Mutex<HashMap<ProjectId, Weak<Mutex<()>>>>>;
+// ENTITY-AUTHORITY-MIGRATION: milestone 2
+// Role: Intern event-owner locks before a thread coordinator is published.
+// Source of truth: The weak entry points to the mutex used by current owner installers.
+// Structural reason: Owner serialization begins before a verified thread authority is available.
+// Synchronization: The map mutex protects lookup, weak-entry pruning, and insertion.
+// Invalidation/removal: Dead weak entries are pruned; milestone 2 makes publication adopt the lock.
 type ThreadOwnerLocks = Arc<Mutex<HashMap<ThreadId, Weak<Mutex<()>>>>>;
 const HARNESS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const BACKGROUND_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -674,6 +686,12 @@ pub struct HarnessRegistry {
 #[derive(Default)]
 struct Harnesses {
     shutting_down: bool,
+    // ENTITY-AUTHORITY-MIGRATION: milestone 1
+    // Role: Own the process-local harness slot for every loaded project.
+    // Source of truth: Each value is the current active or deleting harness state.
+    // Structural reason: This is the baseline project-keyed owner being consolidated.
+    // Synchronization: The enclosing Harnesses mutex is the global transition barrier.
+    // Invalidation/removal: Project deletion or shutdown removes entries; milestone 1 relocates them.
     by_project: HashMap<ProjectId, ProjectHarnessState>,
 }
 
@@ -755,10 +773,22 @@ impl ProjectHarnessState {
 
 struct RegistryShared {
     harnesses: Arc<Mutex<Harnesses>>,
+    // ENTITY-AUTHORITY-MIGRATION: milestone 2
+    // Role: Own every loaded thread coordinator binding.
+    // Source of truth: Map presence defines whether the thread has a loaded coordinator.
+    // Structural reason: This is the baseline thread-keyed owner being consolidated.
+    // Synchronization: The map mutex protects coordinator lookup and conditional replacement.
+    // Invalidation/removal: Owner failure, retirement, or deletion removes entries in current code.
     threads: Arc<Mutex<HashMap<ThreadId, ThreadBinding>>>,
     background_tasks: Arc<RegistryTaskTracker>,
     /// Per-parent FIFO serializes relationship materialization. It does not order child lifecycle:
     /// only the child's native event owner may mutate that state.
+    // ENTITY-AUTHORITY-MIGRATION: milestone 4
+    // Role: Own the per-parent materialization FIFO and mark whether its worker is running.
+    // Source of truth: Entry presence and queue order drive the existing worker protocol.
+    // Structural reason: This baseline parent-thread owner is consolidated after runtime ownership.
+    // Synchronization: The map mutex protects enqueue, worker election, dequeue, and removal.
+    // Invalidation/removal: The worker removes an empty queue; milestone 4 moves it to its authority.
     subagent_materialization_queues:
         Arc<Mutex<HashMap<ThreadId, VecDeque<SubagentMaterializationJob>>>>,
     project_lifecycle_locks: ProjectLifecycleLocks,

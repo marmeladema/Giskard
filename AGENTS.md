@@ -110,6 +110,19 @@ Cargo workspace with 8 crates under `crates/`:
 - IDs are ULIDs.
 - Comments are welcome when they explain intent, invariants, protocol contracts, or non-obvious
   failure handling. Avoid comments that only restate the code.
+- `RegistryShared` is the designated process-local entity authority root. Once introduced,
+  `RegistryShared::projects` and `RegistryShared::threads` are the only strong process-local owner
+  maps for project and thread identity. Before their removal milestones, only collections marked
+  `ENTITY-AUTHORITY-MIGRATION` are permitted as baseline migration owners.
+- Entity-local state belongs on its authority or an authority-owned component. Do not add a peer
+  owning map keyed directly or indirectly by project or thread identity.
+- Each root authority owner map must have an adjacent `ENTITY-AUTHORITY-OWNER` comment naming the
+  entity whose process-local identity it owns. Every permanent keyed exception must have an
+  adjacent `ENTITY-AUTHORITY-EXCEPTION` comment. Every temporary baseline owner must have an
+  adjacent `ENTITY-AUTHORITY-MIGRATION` comment naming its approved removal milestone; new code
+  must not add migration exceptions.
+- Convenience, reduced plumbing, speculative performance, and compatibility are not valid reasons
+  for a keyed authority exception.
 - Do not use `unwrap`, `expect`, `panic!`, `todo!`, or `unreachable!` in runtime paths unless the
   condition is proven infallible in local context. Prefer returning typed errors, logging, or
   surfacing a structured browser error. Test-only assertions may use panics normally.

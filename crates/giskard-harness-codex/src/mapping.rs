@@ -70,35 +70,125 @@ type MappingResult<T> = Result<T, UnknownNativeThread>;
 /// reused for every subsequent response, delta, or completion in that turn's item lifecycle.
 pub struct CodexMapper {
     workspace_root: PathBuf,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Translate between native Codex thread IDs and Giskard thread IDs.
+    // Source of truth: Provider protocol bindings establish the bijective route claims.
+    // Structural reason: The lower harness adapter must route native protocol identities.
+    // Synchronization: The single Codex background task owns and mutates the mapper.
+    // Invalidation/removal: The mappings live for one harness process and drop on shutdown.
     thread_ids: HashMap<String, ThreadId>,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Provide the reverse Giskard-to-native thread route for harness commands.
+    // Source of truth: This is the reverse half of the mapper's bijective route claims.
+    // Structural reason: The adapter cannot depend on server authority types.
+    // Synchronization: The single Codex background task owns and mutates the mapper.
+    // Invalidation/removal: The mappings live for one harness process and drop on shutdown.
     native_ids: HashMap<ThreadId, String>,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Version authoritative claims for native-thread routing identities.
+    // Source of truth: Successful native route claims advance the stored epoch.
+    // Structural reason: Route epochs implement the provider adapter's protocol contract.
+    // Synchronization: The single Codex background task owns and mutates the mapper.
+    // Invalidation/removal: Epochs live for one harness process and drop on shutdown.
     route_epochs: HashMap<String, u64>,
     next_route_epoch: u64,
     /// Native parentage the provider attested through its own routing: child native id → parent
     /// native id. See [`CodexMapper::track_native_parentage`].
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Retain provider-attested native parent-to-child routing relationships.
+    // Source of truth: Codex subagent protocol events establish these relationships.
+    // Structural reason: Native relationships must be resolved before server identity translation.
+    // Synchronization: The single Codex background task owns and mutates the mapper.
+    // Invalidation/removal: Relationships live for one harness process and drop on shutdown.
     native_parents: HashMap<String, String>,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Translate provider turn IDs within their owning thread to Giskard turn IDs.
+    // Source of truth: Native turn acknowledgements and events establish each translation.
+    // Structural reason: Provider protocol routing belongs in the lower harness adapter.
+    // Synchronization: The single Codex background task owns and mutates the mapper.
+    // Invalidation/removal: Entries live for one harness process and drop with the mapper.
     turn_ids: HashMap<NativeTurnKey, TurnId>,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Translate provider item IDs within their thread and turn to Giskard item IDs.
+    // Source of truth: First observation mints the stable Giskard item identity.
+    // Structural reason: Provider item routing belongs in the lower harness adapter.
+    // Synchronization: The single Codex background task owns and mutates the mapper.
+    // Invalidation/removal: Entries live for one harness process and drop with the mapper.
     item_ids: HashMap<NativeItemKey, ItemId>,
     /// Latest per-turn token usage, keyed by owning thread and native turn id. Codex reports usage
     /// via a separate `thread/tokenUsage/updated` notification (not on `turn/completed`), so we
     /// cache the most recent value per turn and attach it when the turn completes (spec §10.1).
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Correlate out-of-band Codex usage notifications with their owning native turn.
+    // Source of truth: The latest provider notification supplies the cached usage value.
+    // Structural reason: Codex delivers usage separately from turn completion.
+    // Synchronization: The single Codex background task owns and mutates the mapper.
+    // Invalidation/removal: Turn completion consumes the value; shutdown drops remaining entries.
     turn_usage: HashMap<NativeTurnKey, TokenUsage>,
     /// Last effective context window emitted for each turn. Codex repeats the same window on every
     /// token-usage notification, so this suppresses redundant persistence and browser updates.
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Deduplicate effective context-window notifications per native turn.
+    // Source of truth: The latest valid Codex usage notification supplies the value.
+    // Structural reason: Notification correlation belongs to the provider adapter.
+    // Synchronization: The single Codex background task owns and mutates the mapper.
+    // Invalidation/removal: Turn completion clears the entry; shutdown drops remaining entries.
     turn_context_windows: HashMap<NativeTurnKey, u32>,
     /// Model selected for each acknowledged native turn. Context-window notifications do not carry
     /// a model id, so the value must be bound when `turn/start` returns.
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Attribute native-turn context notifications to the acknowledged model.
+    // Source of truth: The Codex turn-start response supplies the selected model.
+    // Structural reason: Codex context notifications omit model identity.
+    // Synchronization: The single Codex background task owns and mutates the mapper.
+    // Invalidation/removal: Turn completion clears the entry; shutdown drops remaining entries.
     turn_models: HashMap<NativeTurnKey, ModelRef>,
     /// Turns whose context window could not be attributed to a model, deduplicating warnings.
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Deduplicate missing-model warnings by native thread and turn identity.
+    // Source of truth: Warning emission inserts the corresponding native turn key.
+    // Structural reason: This is provider-protocol diagnostic state, not thread ownership.
+    // Synchronization: The single Codex background task owns and mutates the mapper.
+    // Invalidation/removal: Turn cleanup removes entries; shutdown drops remaining entries.
     missing_context_model_turns: HashSet<NativeTurnKey>,
     /// Turns for which an invalid context window was already logged. A later valid value is still
     /// accepted, but repeated malformed usage notifications do not flood service logs.
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Deduplicate invalid-context warnings by native thread and turn identity.
+    // Source of truth: Warning emission inserts the corresponding native turn key.
+    // Structural reason: This is provider-protocol diagnostic state, not thread ownership.
+    // Synchronization: The single Codex background task owns and mutates the mapper.
+    // Invalidation/removal: Turn cleanup removes entries; shutdown drops remaining entries.
     invalid_context_window_turns: HashSet<NativeTurnKey>,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Route thread-scoped Codex events to the currently active native turn.
+    // Source of truth: Codex turn start and terminal events update this adapter state.
+    // Structural reason: Active native-turn translation belongs to the provider adapter.
+    // Synchronization: The single Codex background task owns and mutates the mapper.
+    // Invalidation/removal: Terminal events remove entries; shutdown drops remaining entries.
     active_turns: HashMap<ThreadId, String>,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Correlate running command items with their owning thread and native turn.
+    // Source of truth: Codex command lifecycle events establish and clear correlations.
+    // Structural reason: Command protocol routing belongs to the lower harness adapter.
+    // Synchronization: The single Codex background task owns and mutates the mapper.
+    // Invalidation/removal: Command completion removes entries; shutdown drops remaining entries.
     running_command_turns: HashMap<(ThreadId, String), String>,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Track running command items by native thread, turn, and item identity.
+    // Source of truth: Codex command lifecycle events establish and clear membership.
+    // Structural reason: Command protocol routing belongs to the lower harness adapter.
+    // Synchronization: The single Codex background task owns and mutates the mapper.
+    // Invalidation/removal: Command completion removes entries; shutdown drops remaining entries.
     running_commands: HashSet<NativeItemKey>,
     /// File-change items arrive before approval requests, whose payloads only identify the item.
     /// Retain their structured changes so the approval card can name what it will modify.
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Correlate file-change previews with later native approval requests.
+    // Source of truth: Codex file-change items provide the structured preview.
+    // Structural reason: Codex approval payloads omit details held by earlier item events.
+    // Synchronization: The single Codex background task owns and mutates the mapper.
+    // Invalidation/removal: Approval handling consumes entries; shutdown drops remaining entries.
     file_change_previews: HashMap<NativeItemKey, Vec<FileChangeEntry>>,
     pending_approval_responses: HashMap<ApprovalId, PendingApprovalResponse>,
     pending_server_requests: HashMap<ServerRequestId, PendingServerRequest>,

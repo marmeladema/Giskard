@@ -17,6 +17,12 @@ type SubList = Vec<(ClientId, Arc<ClientDelivery>)>;
 
 pub struct Hub {
     clients: Mutex<HashMap<ClientId, Arc<ClientDelivery>>>,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Route thread-scoped server messages to subscribed browser connections.
+    // Source of truth: Client subscription actions define this delivery membership only.
+    // Structural reason: Delivery routing spans authorities and is not entity-local state.
+    // Synchronization: The subs mutex protects subscription lookup, addition, and removal.
+    // Invalidation/removal: Unsubscribe and client removal delete the corresponding routes.
     subs: Mutex<HashMap<ThreadId, SubList>>,
     next_id: AtomicUsize,
 }

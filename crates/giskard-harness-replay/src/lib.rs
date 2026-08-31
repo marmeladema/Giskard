@@ -83,6 +83,12 @@ struct PreloadedFixture {
 /// A harness that replays recorded events deterministically.
 pub struct ReplayHarness {
     capabilities: HarnessCapabilities,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Route deterministic replay events to harness threads opened by the server.
+    // Source of truth: Replay harness open/resume operations establish each thread state.
+    // Structural reason: This non-test-gated harness adapter cannot depend on server authorities.
+    // Synchronization: The mutex protects linear lookup, insertion, and removal.
+    // Invalidation/removal: Thread close removes state; dropping the harness removes all entries.
     threads: Mutex<Vec<(ThreadId, ThreadState)>>,
     fixtures: Mutex<HashMap<String, PreloadedFixture>>,
     /// Catalog returned by `list_models` (empty unless set via [`ReplayHarness::with_models`]),
