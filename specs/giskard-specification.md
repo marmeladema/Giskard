@@ -2533,6 +2533,20 @@ yet, so there is no catalog to choose from (§8.3).
 
 ### 7.1 Thread lifecycle
 
+- `RegistryShared` owns the sole strong process-local thread map. Each stable `ThreadAuthority`
+  records its verified thread and project IDs and the adopted event-owner mutex, with independently
+  synchronized optional coordinator, runtime, and parent-materialization components. Project
+  authorities do not contain thread authorities; process ownership does not mirror durable project
+  containment.
+- A thread authority shell is process-local identity, not evidence that the durable thread exists,
+  that a coordinator is installed, or that runtime state is present. Its first verified project
+  association is immutable. Once interned, the shell remains while coordinator retirement, runtime
+  cleanup, and materialization completion clear their respective optional components.
+- Event-owner locking may precede verified thread association. The root therefore retains weak
+  unpublished owner-lock entries; publishing a verified authority adopts that exact mutex and
+  removes its weak entry atomically under the thread-index membership lock. The optional
+  materialization FIFO remains present while its one per-parent worker is active, including while
+  that worker is processing a dequeued job.
 - **Draft new thread:** user starts a new thread in a project; the browser opens an unpersisted
   draft immediately, with mode and permission preset defaulted synchronously and the composer
   editable. The model is resolved asynchronously (LT6/LT7): until it lands the draft has no model
