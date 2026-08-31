@@ -10,45 +10,12 @@ use std::collections::{HashMap, HashSet};
 use indexmap::IndexMap;
 
 use serde::Deserialize;
-use tokio::sync::RwLock;
 use tracing::warn;
 
-use giskard_core::ids::ProjectId;
 use giskard_core::model::{ModelDescriptor, ModelRef};
 use giskard_harness::{HarnessProvider, ProviderAuth};
 use giskard_persist::Config;
 use giskard_proto::ModelListingWarning;
-
-/// Last successfully composed model list for each project.
-///
-/// The browser and model-mutation routes must resolve against the same descriptors: otherwise a
-/// catalog-only reasoning effort can be displayed by the picker and then discarded when a turn is
-/// created. The project endpoint refreshes this store; mutation routes load it on demand when the
-/// browser has not fetched the catalog yet.
-#[derive(Default)]
-pub struct ProjectModelCatalogStore {
-    // ENTITY-AUTHORITY-MIGRATION: milestone 1
-    // Role: Own the last composed model catalog for each project.
-    // Source of truth: Absence or the stored descriptor vector controls catalog reuse.
-    // Structural reason: This is the baseline project-keyed catalog owner being consolidated.
-    // Synchronization: One RwLock protects lookup, replacement, and removal for all projects.
-    // Invalidation/removal: Project deletion removes its entry; milestone 1 relocates the slot.
-    catalogs: RwLock<HashMap<ProjectId, Vec<ModelDescriptor>>>,
-}
-
-impl ProjectModelCatalogStore {
-    pub async fn get(&self, project_id: ProjectId) -> Option<Vec<ModelDescriptor>> {
-        self.catalogs.read().await.get(&project_id).cloned()
-    }
-
-    pub async fn replace(&self, project_id: ProjectId, models: Vec<ModelDescriptor>) {
-        self.catalogs.write().await.insert(project_id, models);
-    }
-
-    pub async fn remove(&self, project_id: ProjectId) {
-        self.catalogs.write().await.remove(&project_id);
-    }
-}
 
 /// Build a `ModelDescriptor` from a typed config entry, if the provider + model are declared.
 fn from_config(config: &Config, provider: &str, model: &str) -> Option<ModelDescriptor> {
