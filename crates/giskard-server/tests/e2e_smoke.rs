@@ -5856,8 +5856,9 @@ async fn parent_deletion_cascades_to_all_descendants_leaf_first() {
     harness.wait_for_subscribers(child_id, 1).await;
     let child_handle = state
         .registry
-        .get_thread_handle(child_id)
+        .loaded_thread_binding(child_id)
         .await
+        .map(|binding| binding.handle().clone())
         .expect("materialized child should remain open");
     // Native work the provider drives on its own child, reproduced by calling the harness
     // directly: the child is read-only through Giskard and reports no model of its own.
@@ -5915,7 +5916,11 @@ async fn parent_deletion_cascades_to_all_descendants_leaf_first() {
                 .is_none()
         );
         assert_eq!(
-            state.registry.get_project_for_thread(deleted_id).await,
+            state
+                .registry
+                .loaded_thread_binding(deleted_id)
+                .await
+                .map(|binding| binding.project_id()),
             None
         );
     }
@@ -5982,8 +5987,9 @@ async fn parent_deletion_rejects_active_descendant_before_deleting_anything() {
     }
     let child_handle = state
         .registry
-        .get_thread_handle(child_id)
+        .loaded_thread_binding(child_id)
         .await
+        .map(|binding| binding.handle().clone())
         .expect("imported child should remain open");
     // Provider-driven native work on the read-only child; its own model is unreported, so the
     // caller names one.
@@ -6079,7 +6085,11 @@ async fn thread_delete_removes_native_and_persisted_thread() {
     let cookie = login_cookie(&client, &base).await;
     let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
     assert_eq!(
-        state.registry.get_project_for_thread(thread_id).await,
+        state
+            .registry
+            .loaded_thread_binding(thread_id)
+            .await
+            .map(|binding| binding.project_id()),
         Some(project_id)
     );
 
@@ -6100,7 +6110,13 @@ async fn thread_delete_removes_native_and_persisted_thread() {
             .unwrap()
             .is_none()
     );
-    assert_eq!(state.registry.get_project_for_thread(thread_id).await, None);
+    assert!(
+        state
+            .registry
+            .loaded_thread_binding(thread_id)
+            .await
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -6150,7 +6166,11 @@ async fn project_remove_shuts_down_harness_and_removes_giskard_data_only() {
         .parse()
         .unwrap();
     assert_eq!(
-        state.registry.get_project_for_thread(thread_id).await,
+        state
+            .registry
+            .loaded_thread_binding(thread_id)
+            .await
+            .map(|binding| binding.project_id()),
         Some(project_id)
     );
 
@@ -6162,7 +6182,13 @@ async fn project_remove_shuts_down_harness_and_removes_giskard_data_only() {
         .unwrap();
     assert_eq!(resp.status(), 204);
     assert_eq!(harness.shutdown_calls(), 1);
-    assert_eq!(state.registry.get_project_for_thread(thread_id).await, None);
+    assert!(
+        state
+            .registry
+            .loaded_thread_binding(thread_id)
+            .await
+            .is_none()
+    );
     assert!(
         state
             .store
@@ -6861,7 +6887,7 @@ async fn subscribe_reopens_persisted_thread() {
         )
         .await
         .unwrap();
-    assert_eq!(state.registry.get_project_for_thread(tid).await, None);
+    assert!(state.registry.loaded_thread_binding(tid).await.is_none());
 
     use tokio_tungstenite::tungstenite::http::Request;
     let ws_request = Request::builder()
@@ -6910,7 +6936,14 @@ async fn subscribe_reopens_persisted_thread() {
     assert!(got_thread_state, "subscribe should return ThreadState");
     let persisted = state.store.load_thread(pid, tid).await.unwrap().unwrap();
     assert_eq!(persisted.context_window, 258_400);
-    assert_eq!(state.registry.get_project_for_thread(tid).await, Some(pid));
+    assert_eq!(
+        state
+            .registry
+            .loaded_thread_binding(tid)
+            .await
+            .map(|binding| binding.project_id()),
+        Some(pid)
+    );
 }
 
 #[tokio::test]
@@ -6997,7 +7030,7 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
         )
         .await
         .unwrap();
-    assert_eq!(state.registry.get_project_for_thread(tid).await, None);
+    assert!(state.registry.loaded_thread_binding(tid).await.is_none());
 
     let resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
@@ -7009,7 +7042,14 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["thread_id"].as_str().unwrap(), tid.to_string());
-    assert_eq!(state.registry.get_project_for_thread(tid).await, Some(pid));
+    assert_eq!(
+        state
+            .registry
+            .loaded_thread_binding(tid)
+            .await
+            .map(|binding| binding.project_id()),
+        Some(pid)
+    );
 
     use tokio_tungstenite::tungstenite::http::Request;
     let ws_request = Request::builder()
