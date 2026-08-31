@@ -145,12 +145,6 @@ async fn actor(store: Arc<PersistStore>, mut rx: mpsc::Receiver<LedgerMsg>) {
             DailyTokenLedger::default()
         }
     };
-    // ENTITY-AUTHORITY-EXCEPTION:
-    // Role: Aggregate token usage per project for durable ledger flushes.
-    // Source of truth: Persisted ledger files are durable; this actor-confined state folds updates.
-    // Structural reason: A single persistence actor batches cross-project accounting writes.
-    // Synchronization: The actor owns the map and processes messages serially without a lock.
-    // Invalidation/removal: Shutdown flushes pending state and then drops the actor-owned map.
     let mut projects: HashMap<ProjectId, DailyTokenLedger> = HashMap::new();
 
     while let Some(message) = rx.recv().await {
