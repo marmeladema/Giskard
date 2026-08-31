@@ -1928,8 +1928,8 @@ impl HarnessRegistry {
         let (result, receiver) = tokio::sync::oneshot::channel();
         enqueue_subagent_materialization(
             parent_thread_id,
+            project_id,
             SubagentMaterializationJob {
-                project_id,
                 spawned_by_turn_id,
                 item_id,
                 origin: "explicit_open",
@@ -2440,7 +2440,6 @@ struct SubagentActivityInfo {
 type SubagentMaterializationResult = Result<Option<ThreadId>, HarnessError>;
 
 struct SubagentMaterializationJob {
-    project_id: ProjectId,
     spawned_by_turn_id: TurnId,
     item_id: ItemId,
     origin: &'static str,
@@ -2879,6 +2878,7 @@ async fn materialize_subagent_thread(
 
 async fn enqueue_subagent_materialization(
     parent_thread_id: ThreadId,
+    project_id: ProjectId,
     mut job: SubagentMaterializationJob,
     shared: Arc<RegistryShared>,
 ) {
@@ -2886,7 +2886,7 @@ async fn enqueue_subagent_materialization(
         match shared.background_tasks.register() {
             Some(permit) => Some(permit),
             None => {
-                reject_materialization_during_shutdown(parent_thread_id, &mut job);
+                reject_materialization_during_shutdown(parent_thread_id, project_id, &mut job);
                 return;
             }
         }
@@ -2894,13 +2894,13 @@ async fn enqueue_subagent_materialization(
         None
     };
     let authority = match shared
-        .intern_thread_authority(parent_thread_id, job.project_id)
+        .intern_thread_authority(parent_thread_id, project_id)
         .await
     {
         Ok(authority) => authority,
         Err(error) => {
             warn!(
-                project_id = %job.project_id,
+                %project_id,
                 %parent_thread_id,
                 turn_id = %job.spawned_by_turn_id,
                 item_id = %job.item_id,
@@ -2924,7 +2924,7 @@ async fn enqueue_subagent_materialization(
             match shared.background_tasks.register() {
                 Some(permit) => Some(permit),
                 None => {
-                    reject_materialization_during_shutdown(parent_thread_id, &mut job);
+                    reject_materialization_during_shutdown(parent_thread_id, project_id, &mut job);
                     return;
                 }
             }
@@ -2942,10 +2942,11 @@ async fn enqueue_subagent_materialization(
 
 fn reject_materialization_during_shutdown(
     parent_thread_id: ThreadId,
+    project_id: ProjectId,
     job: &mut SubagentMaterializationJob,
 ) {
     warn!(
-        project_id = %job.project_id,
+        %project_id,
         %parent_thread_id,
         turn_id = %job.spawned_by_turn_id,
         item_id = %job.item_id,
@@ -2965,6 +2966,7 @@ async fn run_subagent_materialization_queue(
     shared: Arc<RegistryShared>,
 ) {
     let parent_thread_id = authority.thread_id;
+    let project_id = authority.project_id;
     loop {
         let job = {
             let mut queue = authority.materialization.lock().await;
@@ -2979,7 +2981,7 @@ async fn run_subagent_materialization_queue(
         };
         let result = materialize_subagent_thread(
             parent_thread_id,
-            job.project_id,
+            project_id,
             job.spawned_by_turn_id,
             job.info,
             shared.clone(),
@@ -2988,7 +2990,7 @@ async fn run_subagent_materialization_queue(
         match &result {
             Ok(Some(subagent_thread_id)) => {
                 info!(
-                    project_id = %job.project_id,
+                    %project_id,
                     %parent_thread_id,
                     %subagent_thread_id,
                     turn = %job.spawned_by_turn_id,
@@ -3000,7 +3002,7 @@ async fn run_subagent_materialization_queue(
             Ok(None) => {}
             Err(error) => {
                 warn!(
-                    project_id = %job.project_id,
+                    %project_id,
                     %parent_thread_id,
                     turn = %job.spawned_by_turn_id,
                     item_id = %job.item_id,
@@ -3697,8 +3699,8 @@ async fn forward_events(
                         if let Some(info) = subagent_start_info(item) {
                             enqueue_subagent_materialization(
                                 thread_id,
+                                project_id,
                                 SubagentMaterializationJob {
-                                    project_id,
                                     spawned_by_turn_id: *turn,
                                     item_id: item.id,
                                     origin: "item_started",
@@ -3714,8 +3716,8 @@ async fn forward_events(
                         if let Some(info) = subagent_activity_info(item) {
                             enqueue_subagent_materialization(
                                 thread_id,
+                                project_id,
                                 SubagentMaterializationJob {
-                                    project_id,
                                     spawned_by_turn_id: *turn,
                                     item_id: item.id,
                                     origin: "item_completed",
@@ -5716,11 +5718,12 @@ mod tests {
             .await
             .unwrap();
         let parent_thread_id = ThreadId::new();
+        let project_id = ProjectId::new();
         let (result, receiver) = tokio::sync::oneshot::channel();
         super::enqueue_subagent_materialization(
             parent_thread_id,
+            project_id,
             super::SubagentMaterializationJob {
-                project_id: ProjectId::new(),
                 spawned_by_turn_id: TurnId::new(),
                 item_id: ItemId::new(),
                 origin: "test",
@@ -5746,7 +5749,6 @@ mod tests {
     }
 
     fn materialization_job(
-        project_id: ProjectId,
         item_id: ItemId,
     ) -> (
         super::SubagentMaterializationJob,
@@ -5755,7 +5757,6 @@ mod tests {
         let (result, receiver) = tokio::sync::oneshot::channel();
         (
             super::SubagentMaterializationJob {
-                project_id,
                 spawned_by_turn_id: TurnId::new(),
                 item_id,
                 origin: "test",
@@ -5787,13 +5788,16 @@ mod tests {
         let first_item = ItemId::new();
         let second_item = ItemId::new();
         let other_item = ItemId::new();
-        let (first, first_result) = materialization_job(project_id, first_item);
-        let (second, second_result) = materialization_job(project_id, second_item);
-        let (other, other_result) = materialization_job(project_id, other_item);
+        let (first, first_result) = materialization_job(first_item);
+        let (second, second_result) = materialization_job(second_item);
+        let (other, other_result) = materialization_job(other_item);
 
-        super::enqueue_subagent_materialization(first_parent, first, shared.clone()).await;
-        super::enqueue_subagent_materialization(first_parent, second, shared.clone()).await;
-        super::enqueue_subagent_materialization(second_parent, other, shared.clone()).await;
+        super::enqueue_subagent_materialization(first_parent, project_id, first, shared.clone())
+            .await;
+        super::enqueue_subagent_materialization(first_parent, project_id, second, shared.clone())
+            .await;
+        super::enqueue_subagent_materialization(second_parent, project_id, other, shared.clone())
+            .await;
         tokio::task::yield_now().await;
 
         let first_authority = shared.thread_authority(first_parent).await.unwrap();
@@ -5852,10 +5856,16 @@ mod tests {
         ));
         *authority.coordinator.lock().await = Some(coordinator);
         let lifecycle = super::lock_project_lifecycle(&shared.projects, project_id).await;
-        let (first, first_result) = materialization_job(project_id, ItemId::new());
-        let (second, second_result) = materialization_job(project_id, ItemId::new());
+        let (first, first_result) = materialization_job(ItemId::new());
+        let (second, second_result) = materialization_job(ItemId::new());
 
-        super::enqueue_subagent_materialization(parent_thread_id, first, shared.clone()).await;
+        super::enqueue_subagent_materialization(
+            parent_thread_id,
+            project_id,
+            first,
+            shared.clone(),
+        )
+        .await;
         while authority
             .materialization
             .lock()
@@ -5866,7 +5876,13 @@ mod tests {
             tokio::task::yield_now().await;
         }
         *authority.coordinator.lock().await = None;
-        super::enqueue_subagent_materialization(parent_thread_id, second, shared.clone()).await;
+        super::enqueue_subagent_materialization(
+            parent_thread_id,
+            project_id,
+            second,
+            shared.clone(),
+        )
+        .await;
 
         let retained = shared.thread_authority(parent_thread_id).await.unwrap();
         assert!(Arc::ptr_eq(&authority, &retained));
