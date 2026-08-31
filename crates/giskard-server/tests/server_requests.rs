@@ -1,6 +1,8 @@
 //! Regression coverage for Codex-style server-initiated browser requests.
 
 mod common;
+#[path = "common/event_channel.rs"]
+mod event_channel;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,21 +19,24 @@ use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+    AgentEventStream, AgentHarness, ClaimedNativeRoute, HarnessCapabilities, HarnessSignalStream,
+    OpenThreadOptions, ThreadHandle,
 };
 use giskard_persist::store::ProjectConfig;
 use giskard_proto::{ClientMessage, LiveTurnSnapshot, ServerMessage, WireAgentEvent};
 use giskard_server::{AppState, HarnessFactory, build_app};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 
 use common::fake_native_model;
+use event_channel::{BoundedEventRoute, TestRouteContract};
 
 type TestWs =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 struct ServerRequestHarness {
-    tx: broadcast::Sender<AgentEvent>,
+    route_contract: TestRouteContract,
+    tx: BoundedEventRoute,
     active: Mutex<Option<(ThreadId, TurnId)>>,
     responses: Mutex<Vec<(ServerRequestId, ServerRequestResponse)>>,
     fail_next_response: Mutex<Option<HarnessError>>,
@@ -44,9 +49,9 @@ struct ServerRequestHarness {
 
 impl ServerRequestHarness {
     fn new() -> Self {
-        let (tx, _) = broadcast::channel(64);
         Self {
-            tx,
+            route_contract: TestRouteContract::new(),
+            tx: BoundedEventRoute::new(64),
             active: Mutex::new(None),
             responses: Mutex::new(Vec::new()),
             fail_next_response: Mutex::new(None),
@@ -105,17 +110,40 @@ impl AgentHarness for ServerRequestHarness {
         Ok(vec![])
     }
 
+    fn take_harness_signals(&self) -> Result<HarnessSignalStream, HarnessError> {
+        self.route_contract.take_harness_signals()
+    }
+
+    async fn claim_native_route(
+        &self,
+        harness_thread_id: String,
+        suggested_thread_id: ThreadId,
+    ) -> Result<ClaimedNativeRoute, HarnessError> {
+        self.route_contract
+            .claim_native_route(harness_thread_id, suggested_thread_id)
+    }
+
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
         let thread = opts.thread.unwrap_or_default();
-        Ok(ThreadHandle {
-            resumed_model: opts
-                .initial_model
-                .clone()
-                .or_else(|| Some(fake_native_model())),
-            ..ThreadHandle::opened(
-                thread,
+        let resumed_model = opts
+            .initial_model
+            .clone()
+            .or_else(|| Some(fake_native_model()));
+        let route = self
+            .route_contract
+            .activate_primary(
                 opts.resume
                     .unwrap_or_else(|| "server_request_harness".into()),
+                thread,
+                opts.identity_generation,
+                resumed_model.clone(),
+            )
+            .await?;
+        Ok(ThreadHandle {
+            resumed_model,
+            ..ThreadHandle::opened(
+                route.thread_id,
+                route.harness_thread_id,
                 opts.workspace_root.clone(),
             )
         })
@@ -129,32 +157,44 @@ impl AgentHarness for ServerRequestHarness {
     ) -> Result<TurnId, HarnessError> {
         let turn = TurnId::new();
         *self.active.lock().await = Some((thread.thread, turn));
-        let _ = self.tx.send(AgentEvent::TurnStarted {
-            thread: thread.thread,
-            turn,
-        });
-        let _ = self.tx.send(AgentEvent::ServerRequestReceived {
-            thread: thread.thread,
-            turn: Some(turn),
-            request: ServerRequest {
-                id: ServerRequestId("srv_1".into()),
-                method: "item/tool/requestUserInput".into(),
-                params: serde_json::json!({
-                    "questions": [{
-                        "id": "confirm",
-                        "header": "Confirm",
-                        "question": "Continue?",
-                        "options": [{ "label": "Yes", "description": "Continue" }],
-                    }]
-                }),
-                received_at: Utc::now(),
-            },
-        });
+        let _ = self
+            .tx
+            .send(AgentEvent::TurnStarted {
+                thread: thread.thread,
+                turn,
+            })
+            .await;
+        let _ = self
+            .tx
+            .send(AgentEvent::ServerRequestReceived {
+                thread: thread.thread,
+                turn: Some(turn),
+                request: ServerRequest {
+                    id: ServerRequestId("srv_1".into()),
+                    method: "item/tool/requestUserInput".into(),
+                    params: serde_json::json!({
+                        "questions": [{
+                            "id": "confirm",
+                            "header": "Confirm",
+                            "question": "Continue?",
+                            "options": [{ "label": "Yes", "description": "Continue" }],
+                        }]
+                    }),
+                    received_at: Utc::now(),
+                },
+            })
+            .await;
         Ok(turn)
     }
 
-    fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-        AgentEventStream::new(self.tx.subscribe())
+    fn claim_event_receiver(
+        &self,
+        _route: &ClaimedNativeRoute,
+    ) -> Result<AgentEventStream, HarnessError> {
+        Ok(self
+            .tx
+            .take_stream()
+            .expect("server-request event receiver should be claimed once"))
     }
 
     async fn respond_approval(
@@ -184,20 +224,26 @@ impl AgentHarness for ServerRequestHarness {
             return Ok(());
         }
         let (thread, turn) = self.active.lock().await.take().unwrap_or_default();
-        let _ = self.tx.send(AgentEvent::ServerRequestResolved {
-            thread,
-            turn: Some(turn),
-            request_id: req,
-        });
-        let _ = self.tx.send(AgentEvent::TurnCompleted {
-            thread,
-            turn,
-            usage: TokenUsage::default(),
-            status: TurnStatus {
-                kind: TurnStatusKind::Completed,
-                message: None,
-            },
-        });
+        let _ = self
+            .tx
+            .send(AgentEvent::ServerRequestResolved {
+                thread,
+                turn: Some(turn),
+                request_id: req,
+            })
+            .await;
+        let _ = self
+            .tx
+            .send(AgentEvent::TurnCompleted {
+                thread,
+                turn,
+                usage: TokenUsage::default(),
+                status: TurnStatus {
+                    kind: TurnStatusKind::Completed,
+                    message: None,
+                },
+            })
+            .await;
         Ok(())
     }
 

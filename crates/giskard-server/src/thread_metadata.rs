@@ -122,27 +122,31 @@ impl ThreadMetadataService {
         self.store.create_thread(project_id, thread).await
     }
 
-    /// Classify a hidden native identity exactly once. The revision and kind checks execute under
-    /// the store's per-thread lock, so racing parent claims cannot both commit.
-    pub async fn classify_orphan(
+    /// Persist classification of a hidden native identity without publishing it.
+    ///
+    /// The revision and kind checks execute under the store's per-thread lock, so racing parent
+    /// claims cannot both commit. Publication belongs to the caller's larger transition and must
+    /// happen only after its event owner has converged to the same classification.
+    pub async fn persist_orphan_classification(
         &self,
         project_id: ProjectId,
         thread_id: ThreadId,
         expected_revision: u64,
         classification: OrphanClassification,
     ) -> Result<ThreadMutation, PersistError> {
-        self.mutate(project_id, thread_id, move |thread| {
-            if thread.revision != expected_revision || thread.kind != ThreadKind::Orphan {
-                return;
-            }
-            thread.kind = ThreadKind::Subagent;
-            thread.parent_thread_id = Some(classification.parent_thread_id);
-            thread.spawned_by_turn_id = Some(classification.spawned_by_turn_id);
-            thread.title = classification.title.clone();
-            thread.mode = classification.mode;
-            thread.permission_preset = classification.permission_preset;
-        })
-        .await
+        self.store
+            .update_thread(project_id, thread_id, move |thread| {
+                if thread.revision != expected_revision || thread.kind != ThreadKind::Orphan {
+                    return;
+                }
+                thread.kind = ThreadKind::Subagent;
+                thread.parent_thread_id = Some(classification.parent_thread_id);
+                thread.spawned_by_turn_id = Some(classification.spawned_by_turn_id);
+                thread.title = classification.title.clone();
+                thread.mode = classification.mode;
+                thread.permission_preset = classification.permission_preset;
+            })
+            .await
     }
 
     /// Publish a creation only after its surrounding native/worktree setup has committed.
@@ -438,13 +442,18 @@ mod tests {
 
         assert!(matches!(
             service
-                .classify_orphan(project_id, thread_id, orphan.revision + 1, classify(parent),)
+                .persist_orphan_classification(
+                    project_id,
+                    thread_id,
+                    orphan.revision + 1,
+                    classify(parent),
+                )
                 .await
                 .unwrap(),
             ThreadMutation::Unchanged { .. }
         ));
         let changed = service
-            .classify_orphan(project_id, thread_id, orphan.revision, classify(parent))
+            .persist_orphan_classification(project_id, thread_id, orphan.revision, classify(parent))
             .await
             .unwrap();
         assert!(matches!(changed, ThreadMutation::Changed { .. }));
@@ -459,7 +468,7 @@ mod tests {
 
         assert!(matches!(
             service
-                .classify_orphan(
+                .persist_orphan_classification(
                     project_id,
                     thread_id,
                     classified.revision,

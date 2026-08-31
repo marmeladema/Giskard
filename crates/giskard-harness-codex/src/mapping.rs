@@ -72,8 +72,6 @@ pub struct CodexMapper {
     workspace_root: PathBuf,
     thread_ids: HashMap<String, ThreadId>,
     native_ids: HashMap<ThreadId, String>,
-    route_epochs: HashMap<String, u64>,
-    next_route_epoch: u64,
     /// Native parentage the provider attested through its own routing: child native id → parent
     /// native id. See [`CodexMapper::track_native_parentage`].
     native_parents: HashMap<String, String>,
@@ -102,6 +100,7 @@ pub struct CodexMapper {
     file_change_previews: HashMap<NativeItemKey, Vec<FileChangeEntry>>,
     pending_approval_responses: HashMap<ApprovalId, PendingApprovalResponse>,
     pending_server_requests: HashMap<ServerRequestId, PendingServerRequest>,
+    next_response_attempt: u64,
 }
 
 impl CodexMapper {
@@ -110,8 +109,6 @@ impl CodexMapper {
             workspace_root,
             thread_ids: HashMap::new(),
             native_ids: HashMap::new(),
-            route_epochs: HashMap::new(),
-            next_route_epoch: 0,
             native_parents: HashMap::new(),
             turn_ids: HashMap::new(),
             item_ids: HashMap::new(),
@@ -126,15 +123,13 @@ impl CodexMapper {
             file_change_previews: HashMap::new(),
             pending_approval_responses: HashMap::new(),
             pending_server_requests: HashMap::new(),
+            next_response_attempt: 0,
         }
     }
 
+    #[cfg(test)]
     pub fn has_running_commands(&self) -> bool {
         !self.running_commands.is_empty()
-    }
-
-    pub fn has_active_turns(&self) -> bool {
-        !self.active_turns.is_empty()
     }
 
     pub fn running_command_fallback_thread(&self) -> Option<ThreadId> {
@@ -219,7 +214,7 @@ impl CodexMapper {
         &mut self,
         harness_thread_id: String,
         thread: ThreadId,
-    ) -> Result<u64, HarnessError> {
+    ) -> Result<(), HarnessError> {
         let harness_thread_id = harness_thread_id.trim().to_owned();
         if harness_thread_id.is_empty() {
             return Err(HarnessError::Protocol(
@@ -232,30 +227,16 @@ impl CodexMapper {
                     "native thread {harness_thread_id} is already bound to {existing}, not {thread}"
                 )));
             }
-            return self
-                .route_epochs
-                .get(&harness_thread_id)
-                .copied()
-                .ok_or_else(|| {
-                    HarnessError::Protocol(format!(
-                        "native thread {harness_thread_id} has no route epoch"
-                    ))
-                });
+            return Ok(());
         }
         if let Some(existing) = self.native_ids.get(&thread) {
             return Err(HarnessError::Protocol(format!(
                 "thread {thread} is already bound to native thread {existing}, not {harness_thread_id}"
             )));
         }
-        self.next_route_epoch = self
-            .next_route_epoch
-            .checked_add(1)
-            .ok_or_else(|| HarnessError::Protocol("native route epoch space exhausted".into()))?;
-        let epoch = self.next_route_epoch;
         self.thread_ids.insert(harness_thread_id.clone(), thread);
-        self.native_ids.insert(thread, harness_thread_id.clone());
-        self.route_epochs.insert(harness_thread_id, epoch);
-        Ok(epoch)
+        self.native_ids.insert(thread, harness_thread_id);
+        Ok(())
     }
 
     /// Record the native parentage a sub-agent link item attests.
@@ -963,6 +944,7 @@ impl CodexMapper {
                         thread,
                         turn,
                         kind: PendingApprovalResponseKind::Decision,
+                        attempt: None,
                     },
                 );
                 Some(AgentEvent::ApprovalRequested {
@@ -1025,6 +1007,7 @@ impl CodexMapper {
                         thread,
                         turn,
                         kind: PendingApprovalResponseKind::Decision,
+                        attempt: None,
                     },
                 );
                 Some(AgentEvent::ApprovalRequested {
@@ -1065,6 +1048,7 @@ impl CodexMapper {
                         kind: PendingApprovalResponseKind::Permissions {
                             permissions: permissions.clone(),
                         },
+                        attempt: None,
                     },
                 );
                 Some(AgentEvent::ApprovalRequested {
@@ -1108,6 +1092,7 @@ impl CodexMapper {
                         thread,
                         turn,
                         kind: PendingApprovalResponseKind::LegacyReviewDecision,
+                        attempt: None,
                     },
                 );
                 Some(AgentEvent::ApprovalRequested {
@@ -1152,6 +1137,7 @@ impl CodexMapper {
                         thread,
                         turn,
                         kind: PendingApprovalResponseKind::LegacyReviewDecision,
+                        attempt: None,
                     },
                 );
                 Some(AgentEvent::ApprovalRequested {
@@ -1257,43 +1243,55 @@ impl CodexMapper {
         })
     }
 
-    pub fn map_approval_response(
+    pub fn prepare_approval_response(
         &mut self,
         id: &ApprovalId,
         decision: &ApprovalDecision,
-    ) -> Result<ApprovalResponse, String> {
-        match self.pending_approval_responses.remove(id) {
-            Some(PendingApprovalResponse {
+    ) -> Result<ApprovalResponseAttempt, String> {
+        let attempt = self.allocate_response_attempt()?;
+        let pending = self
+            .pending_approval_responses
+            .get_mut(id)
+            .ok_or_else(|| format!("no pending approval for id {id}"))?;
+        if pending.attempt.is_some() {
+            return Err(format!("approval {id} already has a response in progress"));
+        }
+        pending.attempt = Some(attempt);
+        let response = match pending.clone() {
+            PendingApprovalResponse {
                 request_id,
                 thread,
                 turn,
                 kind: PendingApprovalResponseKind::Permissions { permissions },
-            }) => Ok(ApprovalResponse::from_parts(
+                ..
+            } => ApprovalResponse::from_parts(
                 request_id,
                 ApprovalResponseOwner { thread, turn },
                 map_permissions_approval_decision(decision, permissions),
-            )),
-            Some(PendingApprovalResponse {
+            ),
+            PendingApprovalResponse {
                 request_id,
                 thread,
                 turn,
                 kind: PendingApprovalResponseKind::LegacyReviewDecision,
-            }) => Ok(ApprovalResponse::from_parts(
+                ..
+            } => ApprovalResponse::from_parts(
                 request_id,
                 ApprovalResponseOwner { thread, turn },
                 map_legacy_review_decision(decision),
-            )),
-            Some(PendingApprovalResponse {
+            ),
+            PendingApprovalResponse {
                 request_id,
                 thread,
                 turn,
                 kind: PendingApprovalResponseKind::Decision,
-            }) => Ok(ApprovalResponse::from_parts(
+                ..
+            } => ApprovalResponse::from_parts(
                 request_id,
                 ApprovalResponseOwner { thread, turn },
                 ApprovalResponseBody::Result(map_approval_decision(decision)),
-            )),
-            Some(PendingApprovalResponse {
+            ),
+            PendingApprovalResponse {
                 request_id,
                 thread,
                 turn,
@@ -1302,15 +1300,82 @@ impl CodexMapper {
                         transport,
                         question_id,
                     },
-            }) => Ok(ApprovalResponse::from_parts(
+                ..
+            } => ApprovalResponse::from_parts(
                 request_id,
                 ApprovalResponseOwner { thread, turn },
                 map_mcp_tool_approval_decision(decision, &transport, question_id.as_deref()),
-            )),
-            None => Err(format!("no pending approval for id {id}")),
+            ),
+        };
+        Ok(ApprovalResponseAttempt {
+            response,
+            token: ApprovalResponseToken {
+                id: id.clone(),
+                attempt,
+            },
+        })
+    }
+
+    pub fn commit_approval_response(&mut self, token: &ApprovalResponseToken) -> bool {
+        if self
+            .pending_approval_responses
+            .get(&token.id)
+            .is_some_and(|pending| pending.attempt == Some(token.attempt))
+        {
+            self.pending_approval_responses.remove(&token.id);
+            true
+        } else {
+            false
         }
     }
 
+    pub fn rollback_approval_response(&mut self, token: &ApprovalResponseToken) -> bool {
+        let Some(pending) = self.pending_approval_responses.get_mut(&token.id) else {
+            return false;
+        };
+        if pending.attempt != Some(token.attempt) {
+            return false;
+        }
+        pending.attempt = None;
+        true
+    }
+
+    #[cfg(test)]
+    pub fn map_approval_response(
+        &mut self,
+        id: &ApprovalId,
+        decision: &ApprovalDecision,
+    ) -> Result<ApprovalResponse, String> {
+        let attempt = self.prepare_approval_response(id, decision)?;
+        self.commit_approval_response(&attempt.token);
+        Ok(attempt.response)
+    }
+
+    pub fn prepare_server_request_response(
+        &mut self,
+        id: &ServerRequestId,
+    ) -> Result<ServerRequestResponseAttempt, String> {
+        let attempt = self.allocate_response_attempt()?;
+        let pending = self
+            .pending_server_requests
+            .get_mut(id)
+            .ok_or_else(|| format!("no pending server request for id {id}"))?;
+        if pending.attempt.is_some() {
+            return Err(format!(
+                "server request {id} already has a response in progress"
+            ));
+        }
+        pending.attempt = Some(attempt);
+        Ok(ServerRequestResponseAttempt {
+            pending: pending.clone(),
+            token: ServerRequestResponseToken {
+                id: id.clone(),
+                attempt,
+            },
+        })
+    }
+
+    #[cfg(test)]
     pub fn pending_server_request(
         &self,
         id: &ServerRequestId,
@@ -1335,6 +1400,39 @@ impl CodexMapper {
             .collect()
     }
 
+    pub fn commit_server_request_response(&mut self, token: &ServerRequestResponseToken) -> bool {
+        if self
+            .pending_server_requests
+            .get(&token.id)
+            .is_some_and(|pending| pending.attempt == Some(token.attempt))
+        {
+            self.pending_server_requests.remove(&token.id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn rollback_server_request_response(&mut self, token: &ServerRequestResponseToken) -> bool {
+        let Some(pending) = self.pending_server_requests.get_mut(&token.id) else {
+            return false;
+        };
+        if pending.attempt != Some(token.attempt) {
+            return false;
+        }
+        pending.attempt = None;
+        true
+    }
+
+    fn allocate_response_attempt(&mut self) -> Result<u64, String> {
+        self.next_response_attempt = self
+            .next_response_attempt
+            .checked_add(1)
+            .ok_or_else(|| "Codex response-attempt token space exhausted".to_owned())?;
+        Ok(self.next_response_attempt)
+    }
+
+    #[cfg(test)]
     pub fn resolve_server_request(&mut self, id: &ServerRequestId) {
         self.pending_server_requests.remove(id);
     }
@@ -1363,6 +1461,7 @@ impl CodexMapper {
                     transport,
                     question_id: detected.question_id.clone(),
                 },
+                attempt: None,
             },
         );
         Some(AgentEvent::ApprovalRequested {
@@ -1400,6 +1499,7 @@ impl CodexMapper {
                 request_id: id,
                 thread,
                 turn,
+                attempt: None,
             },
         );
         Ok(Some(AgentEvent::ServerRequestReceived {
@@ -1476,6 +1576,19 @@ pub struct PendingServerRequest {
     pub request_id: RequestId,
     pub thread: ThreadId,
     pub turn: Option<TurnId>,
+    attempt: Option<u64>,
+}
+
+#[derive(Debug)]
+pub struct ServerRequestResponseAttempt {
+    pub pending: PendingServerRequest,
+    pub token: ServerRequestResponseToken,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServerRequestResponseToken {
+    id: ServerRequestId,
+    attempt: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1499,13 +1612,16 @@ pub enum ApprovalResponse {
     },
 }
 
+#[derive(Clone)]
 struct PendingApprovalResponse {
     request_id: RequestId,
     thread: ThreadId,
     turn: TurnId,
     kind: PendingApprovalResponseKind,
+    attempt: Option<u64>,
 }
 
+#[derive(Clone)]
 enum PendingApprovalResponseKind {
     Decision,
     Permissions {
@@ -1524,6 +1640,18 @@ enum PendingApprovalResponseKind {
         /// answer map by this id.
         question_id: Option<String>,
     },
+}
+
+#[derive(Debug)]
+pub struct ApprovalResponseAttempt {
+    pub response: ApprovalResponse,
+    pub token: ApprovalResponseToken,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApprovalResponseToken {
+    id: ApprovalId,
+    attempt: u64,
 }
 
 /// How Codex transported the MCP tool approval prompt.
@@ -3306,22 +3434,18 @@ mod tests {
     }
 
     #[test]
-    fn native_route_claims_are_idempotent_and_bijective() {
+    fn native_identity_claims_are_idempotent_and_bijective() {
         let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
         let first = ThreadId::new();
         let second = ThreadId::new();
 
-        let epoch = mapper.claim_thread("native-a".into(), first).unwrap();
-        assert_eq!(
-            mapper.claim_thread("native-a".into(), first).unwrap(),
-            epoch
-        );
+        mapper.claim_thread("native-a".into(), first).unwrap();
+        mapper.claim_thread("native-a".into(), first).unwrap();
         assert!(mapper.claim_thread("native-a".into(), second).is_err());
         assert!(mapper.claim_thread("native-b".into(), first).is_err());
         assert!(mapper.claim_thread("   ".into(), second).is_err());
 
-        let second_epoch = mapper.claim_thread("native-b".into(), second).unwrap();
-        assert!(second_epoch > epoch);
+        mapper.claim_thread("native-b".into(), second).unwrap();
     }
 
     #[test]
@@ -4746,6 +4870,44 @@ mod tests {
     }
 
     #[test]
+    fn stale_approval_rollback_cannot_reopen_committed_attempt() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let thread = ThreadId::new();
+        mapper.register_thread("thread1".into(), thread);
+        let request = CodexServerRequest::PermissionsRequestApproval(
+            serde_json::from_value(serde_json::json!({
+                "cwd": "/tmp",
+                "itemId": "item1",
+                "permissions": { "network": { "enabled": true } },
+                "threadId": "thread1",
+                "turnId": "turn1",
+                "startedAtMs": 1
+            }))
+            .unwrap(),
+        );
+        mapper.map_server_request(
+            &RequestId::String("approval_attempt".into()),
+            &request,
+            thread,
+        );
+        let id = ApprovalId("approval_attempt".into());
+        let first = mapper
+            .prepare_approval_response(&id, &ApprovalDecision::Accept)
+            .unwrap();
+        assert!(mapper.rollback_approval_response(&first.token));
+        let second = mapper
+            .prepare_approval_response(&id, &ApprovalDecision::Accept)
+            .unwrap();
+        assert!(mapper.commit_approval_response(&second.token));
+        assert!(!mapper.rollback_approval_response(&first.token));
+        assert!(
+            mapper
+                .prepare_approval_response(&id, &ApprovalDecision::Accept)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn dynamic_tool_call_maps_to_pending_server_request() {
         let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
         let fallback = ThreadId::new();
@@ -4793,6 +4955,32 @@ mod tests {
                 .pending_server_request(&ServerRequestId("42".into()))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn stale_server_request_rollback_cannot_reopen_committed_attempt() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let thread = ThreadId::new();
+        mapper.register_thread("thread1".into(), thread);
+        let request = CodexServerRequest::ItemToolCall(
+            serde_json::from_value(serde_json::json!({
+                "threadId": "thread1",
+                "turnId": "turn1",
+                "callId": "call1",
+                "namespace": "test",
+                "tool": "ask",
+                "arguments": {}
+            }))
+            .unwrap(),
+        );
+        mapper.map_server_request(&RequestId::Integer(77), &request, thread);
+        let id = ServerRequestId("77".into());
+        let first = mapper.prepare_server_request_response(&id).unwrap();
+        assert!(mapper.rollback_server_request_response(&first.token));
+        let second = mapper.prepare_server_request_response(&id).unwrap();
+        assert!(mapper.commit_server_request_response(&second.token));
+        assert!(!mapper.rollback_server_request_response(&first.token));
+        assert!(mapper.prepare_server_request_response(&id).is_err());
     }
 
     #[test]

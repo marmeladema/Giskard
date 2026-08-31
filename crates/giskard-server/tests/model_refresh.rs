@@ -40,7 +40,7 @@ impl HarnessFactory for DiffFactory {
     async fn create(
         &self,
         _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
+        bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
         let harness = ReplayHarness::from_fixture(self.fixture.clone());
         let harness = if self.providers.is_empty() {
@@ -61,7 +61,7 @@ impl HarnessFactory for DiffFactory {
         } else {
             harness.with_models(self.harness_models.clone())
         };
-        Ok(Arc::new(harness))
+        Ok(Arc::new(harness.with_bootstrap(bootstrap)?))
     }
 }
 

@@ -45,12 +45,13 @@ impl HarnessFactory for CatalogFactory {
     async fn create(
         &self,
         _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
+        bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
         Ok(Arc::new(
             ReplayHarness::new()
                 .with_models(self.models.clone())
-                .with_providers(self.providers.clone()),
+                .with_providers(self.providers.clone())
+                .with_bootstrap(bootstrap)?,
         ))
     }
 }
@@ -65,12 +66,13 @@ impl HarnessFactory for FailingCatalogFactory {
     async fn create(
         &self,
         _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
+        bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
         Ok(Arc::new(
             ReplayHarness::new()
                 .with_failing_models("model/list boom")
-                .with_providers(self.providers.clone()),
+                .with_providers(self.providers.clone())
+                .with_bootstrap(bootstrap)?,
         ))
     }
 }

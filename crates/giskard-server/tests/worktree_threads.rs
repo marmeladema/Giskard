@@ -5,6 +5,8 @@
 //! be after a restart. Everything here therefore records the workspace root the harness was handed.
 
 mod common;
+#[path = "common/event_channel.rs"]
+mod event_channel;
 
 use std::path::Path;
 use std::process::Command;
@@ -20,13 +22,15 @@ use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+    AgentEventStream, AgentHarness, ClaimedNativeRoute, HarnessCapabilities, HarnessSignalStream,
+    OpenThreadOptions, ThreadHandle,
 };
 use giskard_persist::store::{ProjectConfig, ThreadGitWorkspace};
 use giskard_server::{AppState, HarnessFactory, build_app};
 use tokio::sync::Mutex;
 
 use common::fake_native_model;
+use event_channel::{BoundedEventRoute, TestRouteContract, closed_event_stream};
 
 /// Saving a plan writes a file into the workspace and then offers it back as a link. For an
 /// isolated thread that has to be the worktree: writing to the project's checkout would put the
@@ -234,12 +238,13 @@ async fn an_unknown_git_strategy_is_refused_and_an_absent_one_is_an_ordinary_thr
 /// feature: the cwd the agent works in.
 #[derive(Default)]
 struct RecordingHarness {
+    route_contract: TestRouteContract,
     opened_workspace_roots: Mutex<Vec<String>>,
-    /// A `std` mutex, not a `tokio` one: `subscribe` is a synchronous trait method, and with an
+    /// A `std` mutex, not a `tokio` one: receiver claim is a synchronous trait method, and with an
     /// async mutex it could only `try_lock` — handing back a stream over a dropped sender whenever
     /// the map happened to be held. Every event for that thread would then vanish and the test would
     /// fail on an unexplained timeout. Nothing holds this guard across an await.
-    threads: std::sync::Mutex<Vec<(ThreadId, tokio::sync::broadcast::Sender<AgentEvent>)>>,
+    threads: std::sync::Mutex<Vec<(ThreadId, BoundedEventRoute)>>,
     /// When set, the next turn reports having spawned a sub-agent with this native id, which is what
     /// drives the registry to materialize a linked thread the way Codex does.
     spawns_subagent: Mutex<Option<String>>,
@@ -261,22 +266,47 @@ impl AgentHarness for RecordingHarness {
         Ok(Vec::new())
     }
 
+    fn take_harness_signals(&self) -> Result<HarnessSignalStream, HarnessError> {
+        self.route_contract.take_harness_signals()
+    }
+
+    async fn claim_native_route(
+        &self,
+        harness_thread_id: String,
+        suggested_thread_id: ThreadId,
+    ) -> Result<ClaimedNativeRoute, HarnessError> {
+        self.route_contract
+            .claim_native_route(harness_thread_id, suggested_thread_id)
+    }
+
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
         self.opened_workspace_roots
             .lock()
             .await
             .push(opts.workspace_root.to_string_lossy().into_owned());
         let thread = opts.thread.unwrap_or_default();
-        let (tx, _) = tokio::sync::broadcast::channel(16);
-        self.threads.lock().unwrap().push((thread, tx));
-        Ok(ThreadHandle {
-            resumed_model: opts
-                .initial_model
-                .clone()
-                .or_else(|| Some(fake_native_model())),
-            ..ThreadHandle::opened(
-                thread,
+        self.threads
+            .lock()
+            .expect("recording harness thread-route lock poisoned")
+            .push((thread, BoundedEventRoute::new(16)));
+        let resumed_model = opts
+            .initial_model
+            .clone()
+            .or_else(|| Some(fake_native_model()));
+        let route = self
+            .route_contract
+            .activate_primary(
                 opts.resume.unwrap_or_else(|| format!("native-{thread}")),
+                thread,
+                opts.identity_generation,
+                resumed_model.clone(),
+            )
+            .await?;
+        Ok(ThreadHandle {
+            resumed_model,
+            ..ThreadHandle::opened(
+                route.thread_id,
+                route.harness_thread_id,
                 opts.workspace_root.clone(),
             )
         })
@@ -294,8 +324,10 @@ impl AgentHarness for RecordingHarness {
             .lock()
             .await
             .push(workspace_root.to_string_lossy().into_owned());
-        let (tx, _) = tokio::sync::broadcast::channel(16);
-        self.threads.lock().unwrap().push((thread, tx));
+        self.threads
+            .lock()
+            .expect("recording harness thread-route lock poisoned")
+            .push((thread, BoundedEventRoute::new(16)));
         Ok(ThreadHandle::opened(
             thread,
             harness_thread_id,
@@ -317,82 +349,93 @@ impl AgentHarness for RecordingHarness {
         let sender = self
             .threads
             .lock()
-            .unwrap()
+            .expect("recording harness thread-route lock poisoned")
             .iter()
             .find(|(id, _)| *id == thread.thread)
-            .map(|(_, tx)| tx.clone());
+            .map(|(_, events)| events.clone());
         if let Some(tx) = sender {
-            let _ = tx.send(AgentEvent::TurnStarted {
-                thread: thread.thread,
-                turn,
-            });
-            if let Some(text) = self.agent_says.lock().await.clone() {
-                let _ = tx.send(AgentEvent::ItemCompleted {
+            let _ = tx
+                .send(AgentEvent::TurnStarted {
                     thread: thread.thread,
                     turn,
-                    item: Item {
-                        id: ItemId::new(),
-                        harness_item_id: format!("say_{turn}"),
-                        payload: ItemPayload::AgentMessage { text },
-                        created_at: chrono::Utc::now(),
-                    },
-                });
+                })
+                .await;
+            if let Some(text) = self.agent_says.lock().await.clone() {
+                let _ = tx
+                    .send(AgentEvent::ItemCompleted {
+                        thread: thread.thread,
+                        turn,
+                        item: Item {
+                            id: ItemId::new(),
+                            harness_item_id: format!("say_{turn}"),
+                            payload: ItemPayload::AgentMessage { text },
+                            created_at: chrono::Utc::now(),
+                        },
+                    })
+                    .await;
             }
             if let Some(child) = self.spawns_subagent.lock().await.take() {
-                let _ = tx.send(AgentEvent::ItemCompleted {
+                let _ = tx
+                    .send(AgentEvent::ItemCompleted {
+                        thread: thread.thread,
+                        turn,
+                        item: Item {
+                            id: ItemId::new(),
+                            harness_item_id: format!("spawn_{turn}"),
+                            payload: ItemPayload::ToolCall {
+                                name: "spawn_subagent".into(),
+                                input: serde_json::json!({}),
+                                output: None,
+                                server: None,
+                                status: Some("completed".into()),
+                                metadata: None,
+                                subagent: Some(SubagentLink {
+                                    harness_thread_id: child,
+                                    path: Some("reviewer".into()),
+                                    initial_prompt: Some("review the change".into()),
+                                    action: SubagentAction::Spawned,
+                                    // Pending, not completed: a child that is still running is the one
+                                    // the monitor attaches to, which is the route being covered.
+                                    status: Some(giskard_core::item::SubagentStatus::Pending),
+                                    message: None,
+                                }),
+                                error: None,
+                            },
+                            created_at: chrono::Utc::now(),
+                        },
+                    })
+                    .await;
+            }
+            let _ = tx
+                .send(AgentEvent::TurnCompleted {
                     thread: thread.thread,
                     turn,
-                    item: Item {
-                        id: ItemId::new(),
-                        harness_item_id: format!("spawn_{turn}"),
-                        payload: ItemPayload::ToolCall {
-                            name: "spawn_subagent".into(),
-                            input: serde_json::json!({}),
-                            output: None,
-                            server: None,
-                            status: Some("completed".into()),
-                            metadata: None,
-                            subagent: Some(SubagentLink {
-                                harness_thread_id: child,
-                                path: Some("reviewer".into()),
-                                initial_prompt: Some("review the change".into()),
-                                action: SubagentAction::Spawned,
-                                // Pending, not completed: a child that is still running is the one
-                                // the monitor attaches to, which is the route being covered.
-                                status: Some(giskard_core::item::SubagentStatus::Pending),
-                                message: None,
-                            }),
-                            error: None,
-                        },
-                        created_at: chrono::Utc::now(),
+                    usage: TokenUsage::new(0, 0),
+                    status: TurnStatus {
+                        kind: TurnStatusKind::Completed,
+                        message: None,
                     },
-                });
-            }
-            let _ = tx.send(AgentEvent::TurnCompleted {
-                thread: thread.thread,
-                turn,
-                usage: TokenUsage::new(0, 0),
-                status: TurnStatus {
-                    kind: TurnStatusKind::Completed,
-                    message: None,
-                },
-            });
+                })
+                .await;
         }
         Ok(turn)
     }
 
-    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Some((_, tx)) = self
+    fn claim_event_receiver(
+        &self,
+        route: &ClaimedNativeRoute,
+    ) -> Result<AgentEventStream, HarnessError> {
+        if let Some(stream) = self
             .threads
             .lock()
-            .unwrap()
+            .expect("recording harness thread-route lock poisoned")
             .iter()
-            .find(|(id, _)| *id == thread.thread)
+            .find(|(id, _)| *id == route.thread_id)
+            .and_then(|(_, events)| events.take_stream())
         {
-            return AgentEventStream::new(tx.subscribe());
+            return Ok(stream);
         }
-        let (_, rx) = tokio::sync::broadcast::channel(1);
-        AgentEventStream::new(rx)
+        Ok(closed_event_stream())
     }
 
     async fn respond_approval(
@@ -418,7 +461,7 @@ impl AgentHarness for RecordingHarness {
     async fn delete_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
         self.threads
             .lock()
-            .unwrap()
+            .expect("recording harness thread-route lock poisoned")
             .retain(|(id, _)| *id != thread.thread);
         Ok(())
     }

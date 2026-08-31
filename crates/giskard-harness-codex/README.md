@@ -9,6 +9,68 @@ owned identifier semantics and invariants. This document describes how the
 Codex adapter satisfies them, including the scope and lifetime of Codex-native
 identifiers.
 
+## Event transport and activation
+
+The adapter owns one non-cloneable receiver for every app-server stdout frame. Cloneable RPC
+handles contain only bounded write lanes and response correlations, so a caller cannot acquire a
+second stdout reader by construction. Initialization rejects a production frame that arrives
+before the handshake response instead of waiting on an owner that cannot exist yet. After
+initialization, the inbound consumer starts before `config/read`, so configuration responses cannot
+deadlock behind a gated production frame.
+
+Normal requests and provider replies use independent workers. Approval and server-request replies
+therefore reach the reserved bounded control writer even while a normal RPC is in flight or event
+delivery is backpressured. Interrupts have their own bounded correlation permits, are submitted on
+that same control writer, and await their response outside the urgent dispatcher; a held interrupt
+response cannot block a later provider reply, and a timed-out interrupt releases its correlation
+permit. Command termination has the same urgent, reserved, detached submission. Numeric process
+ids try the background-terminal endpoint first and fall back to `command/exec` when Codex reports
+no match or an error. Other lifecycle controls remain ordered with normal commands.
+
+Response correlations have an explicit lifetime. Ordinary RPCs are caller-bound: cancellation or
+timeout removes the pending entry and restores bounded capacity, so a late response is merely
+diagnostic. Identity and protocol-state hooks are retained: they survive a browser waiter timing
+out, run on the late response, and release capacity only after committing that state. Provider
+rejections are typed separately from transport and protocol failures. A late retained identity
+error reports definitive startup failure after its waiter is gone; an error consumed by the active
+waiter disarms that report so an intentional fresh-thread fallback remains authoritative. Provider
+approval and server-request responses separately use mapper attempt tokens; a failed write rolls
+the exact attempt back for retry, while removal commits only after the writer acknowledges a
+successful write and flush. Stale rollbacks cannot reopen a newer attempt.
+
+Fresh Primary creation and unknown-thread import attach a method-specific hook to the
+`thread/start` or `thread/resume` correlation. The reader claims the returned native identity and
+holds both the RPC result and the next stdout frame while the registry persists the complete
+Primary binding, claims its route receiver, and installs the live owner. Dropping the browser
+waiter does not drop this hook or turn the returned identity into an orphan.
+
+Each native thread route owns one bounded `mpsc` sender and one non-cloneable receiver. The first
+thread-scoped notification or server request for an unknown or dormant route is retained while the
+adapter requests activation from the registry. The registry persists a hidden orphan when needed,
+claims the receiver, installs the long-lived owner, and acknowledges only after that coordinator is
+live. The adapter then delivers the retained frame. This inspection applies to every thread-scoped
+frame, including `thread/started`; `thread/status/changed` is a discovery signal but is not assumed
+to precede other traffic. A full route backpressures the sole stdout reader instead of overwriting
+an unread event. Each decoded production frame carries a one-use delivery acknowledgement, so the
+reader retains at most that frame and cannot correlate a later response before the earlier frame
+has reached its owned route.
+
+The route epoch is the event-owner generation. Before consuming its receiver, the registry
+atomically publishes an `Installing` coordinator for that epoch; competing installers wait for the
+same coordinator to become `Live` or `Failed` instead of taking another receiver. Native cold opens
+use a separate cancellation-safe singleflight keyed by the durable thread, so concurrent callers
+share one provider request. Harness-signal activation bypasses that provider flight and can install
+the owner while the open response is pending, which lets the stdout reader acknowledge an earlier
+notification without deadlocking behind that response.
+
+Shutdown establishes one absolute budget before best-effort active-state cleanup. Cleanup uses an
+earlier deadline that reserves the transport's final forced-kill/reap window; transport shutdown
+still receives the original deadline. Upload cleanup, incomplete-turn delivery, writer flush/stdin
+close, natural child exit, forced kill, and reap all consume that same total budget. Queue
+saturation or a held child lock therefore cannot extend shutdown by stacking per-step timeouts. Poisoning of the mapper,
+native route table, or exclusive signal receiver is a fatal typed transport error; these
+authoritative structures are never recovered from poisoned memory.
+
 ## Identifier model
 
 Giskard-owned identifiers are durable application identities. Codex-native
@@ -322,11 +384,15 @@ raw attachment bytes from persisted history and the parsed in-memory history
 cache.
 
 Harness shutdown is completion-based: every caller waits until the single worker has cleaned active
-turn uploads and closed the Codex transport. Transport shutdown is bounded; on timeout the adapter
-drops the transport and then reports the worker complete. Concurrent and repeated shutdown calls
-share that same completion and do not start another teardown. Initiation uses a dedicated
-idempotent signal rather than the bounded command queues, so cancelling the initiating caller does
-not cancel worker teardown.
+turn uploads and closed the Codex transport. Transport shutdown first stops request admission and
+gives the writer a bounded interval to drain accepted messages and close stdin. If that succeeds,
+it gives the child a second bounded interval to exit naturally. Failure to close stdin or exit in
+time falls back to killing and waiting through a handle independent of write-queue capacity.
+Concurrent and repeated shutdown calls share that same completion and do not start another
+teardown. Initiation uses a dedicated idempotent signal rather than the bounded command queues, so
+cancelling the initiating caller does not cancel worker teardown. The child is also configured with
+a last-owner kill-on-drop guard before it starts, covering constructor and initialization failures
+that occur before the worker can own explicit shutdown.
 
 ## Permission presets
 
@@ -488,7 +554,10 @@ omits both keys when it is `None`:
 - **Starting** a fresh thread requires one (`fresh_model`); there is no existing
   thread whose model Codex could report. The resume-failed recovery path that
   starts a replacement therefore returns the resume error instead when no model
-  was named.
+  was named. With a model, it starts a replacement only after a typed provider
+  rejection. A timeout, transport failure, or malformed response is ambiguous
+  and returns without starting a second native thread; a retained late response
+  still completes or definitively fails the original identity operation.
 
 `thread/resume` also reports `reasoningEffort`, and a reported effort wins over a
 requested one — an imported thread must show the effort it is actually running,

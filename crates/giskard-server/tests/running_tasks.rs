@@ -1,7 +1,10 @@
 //! End-to-end coverage: a running tool/MCP call surfaces in the `RunningTasks` snapshot through the
-//! real server path (registry forward → broadcast → WebSocket), the same way commands do (TK1).
+//! real server path (registry forward → bounded route → WebSocket), the same way commands do
+//! (TK1).
 
 mod common;
+#[path = "common/event_channel.rs"]
+mod event_channel;
 
 use std::sync::Arc;
 
@@ -16,28 +19,31 @@ use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+    AgentEventStream, AgentHarness, ClaimedNativeRoute, HarnessCapabilities, HarnessSignalStream,
+    OpenThreadOptions, ThreadHandle,
 };
 use giskard_persist::store::ProjectConfig;
 use giskard_proto::{ClientMessage, ServerMessage, TaskKind};
 use giskard_server::{AppState, HarnessFactory, build_app};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 
 use common::fake_native_model;
+use event_channel::{BoundedEventRoute, TestRouteContract, closed_event_stream};
 
 /// Harness that, on `start_turn`, emits `TurnStarted` + an in-progress tool `ItemStarted` and
 /// leaves the turn open (the tool blocks the turn), so the server keeps a running tool task.
 struct ToolHarness {
-    tx: broadcast::Sender<AgentEvent>,
+    route_contract: TestRouteContract,
+    tx: BoundedEventRoute,
     active_turn: Mutex<Option<TurnId>>,
 }
 
 impl ToolHarness {
     fn new() -> Self {
-        let (tx, _) = broadcast::channel(64);
         Self {
-            tx,
+            route_contract: TestRouteContract::new(),
+            tx: BoundedEventRoute::new(64),
             active_turn: Mutex::new(None),
         }
     }
@@ -67,16 +73,39 @@ impl AgentHarness for ToolHarness {
         Ok(vec![])
     }
 
+    fn take_harness_signals(&self) -> Result<HarnessSignalStream, HarnessError> {
+        self.route_contract.take_harness_signals()
+    }
+
+    async fn claim_native_route(
+        &self,
+        harness_thread_id: String,
+        suggested_thread_id: ThreadId,
+    ) -> Result<ClaimedNativeRoute, HarnessError> {
+        self.route_contract
+            .claim_native_route(harness_thread_id, suggested_thread_id)
+    }
+
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
         let thread = opts.thread.unwrap_or_default();
-        Ok(ThreadHandle {
-            resumed_model: opts
-                .initial_model
-                .clone()
-                .or_else(|| Some(fake_native_model())),
-            ..ThreadHandle::opened(
-                thread,
+        let resumed_model = opts
+            .initial_model
+            .clone()
+            .or_else(|| Some(fake_native_model()));
+        let route = self
+            .route_contract
+            .activate_primary(
                 opts.resume.unwrap_or_else(|| "tool_harness".into()),
+                thread,
+                opts.identity_generation,
+                resumed_model.clone(),
+            )
+            .await?;
+        Ok(ThreadHandle {
+            resumed_model,
+            ..ThreadHandle::opened(
+                route.thread_id,
+                route.harness_thread_id,
                 opts.workspace_root.clone(),
             )
         })
@@ -91,31 +120,40 @@ impl AgentHarness for ToolHarness {
         let turn = TurnId::new();
         let tid = thread.thread;
         *self.active_turn.lock().await = Some(turn);
-        let _ = self.tx.send(AgentEvent::TurnStarted { thread: tid, turn });
-        let _ = self.tx.send(AgentEvent::ItemStarted {
-            thread: tid,
-            turn,
-            item: ItemStart {
-                id: ItemId::new(),
-                harness_item_id: "tool1".into(),
-                kind: ItemKind::ToolCall,
-                command: None,
-                tool: Some(ToolCallStart {
-                    name: "search".into(),
-                    input: serde_json::json!({ "q": "cats" }),
-                    server: Some("wiki".into()),
-                    status: Some("in_progress".into()),
-                    metadata: None,
-                    subagent: None,
-                    started_at_ms: Some(1_785_000_000_000),
-                }),
-            },
-        });
+        let _ = self
+            .tx
+            .send(AgentEvent::TurnStarted { thread: tid, turn })
+            .await;
+        let _ = self
+            .tx
+            .send(AgentEvent::ItemStarted {
+                thread: tid,
+                turn,
+                item: ItemStart {
+                    id: ItemId::new(),
+                    harness_item_id: "tool1".into(),
+                    kind: ItemKind::ToolCall,
+                    command: None,
+                    tool: Some(ToolCallStart {
+                        name: "search".into(),
+                        input: serde_json::json!({ "q": "cats" }),
+                        server: Some("wiki".into()),
+                        status: Some("in_progress".into()),
+                        metadata: None,
+                        subagent: None,
+                        started_at_ms: Some(1_785_000_000_000),
+                    }),
+                },
+            })
+            .await;
         Ok(turn)
     }
 
-    fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-        AgentEventStream::new(self.tx.subscribe())
+    fn claim_event_receiver(
+        &self,
+        _route: &ClaimedNativeRoute,
+    ) -> Result<AgentEventStream, HarnessError> {
+        Ok(self.tx.take_stream().unwrap_or_else(closed_event_stream))
     }
 
     async fn respond_approval(
@@ -142,15 +180,18 @@ impl AgentHarness for ToolHarness {
             .await
             .take()
             .unwrap_or_else(TurnId::new);
-        let _ = self.tx.send(AgentEvent::TurnCompleted {
-            thread: thread.thread,
-            turn,
-            usage: giskard_core::token::TokenUsage::default(),
-            status: TurnStatus {
-                kind: TurnStatusKind::Interrupted,
-                message: None,
-            },
-        });
+        let _ = self
+            .tx
+            .send(AgentEvent::TurnCompleted {
+                thread: thread.thread,
+                turn,
+                usage: giskard_core::token::TokenUsage::default(),
+                status: TurnStatus {
+                    kind: TurnStatusKind::Interrupted,
+                    message: None,
+                },
+            })
+            .await;
         Ok(())
     }
 

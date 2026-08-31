@@ -4,7 +4,7 @@ use giskard_core::error::PersistError;
 use giskard_core::ids::{ProjectId, ThreadId};
 use giskard_core::thread::ThreadKind;
 use giskard_persist::PersistStore;
-use giskard_persist::store::{ThreadFile, ThreadGitWorkspace};
+use giskard_persist::store::{ProjectConfig, ThreadFile, ThreadGitWorkspace};
 use tracing::warn;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +97,27 @@ pub(crate) async fn inherited_git_workspace(
         next = parent.parent_thread_id;
     }
     Ok(None)
+}
+
+/// Resolve the one workspace root used for every operation on a durable thread.
+///
+/// Keeping this beside [`inherited_git_workspace`] makes the ownership-chain walk authoritative
+/// for HTTP file operations, explicit harness opens, and notification-driven activation alike.
+pub(crate) async fn thread_workspace_root(
+    store: &PersistStore,
+    project: &ProjectConfig,
+    thread: &ThreadFile,
+) -> Result<String, PersistError> {
+    Ok(inherited_git_workspace(store, project.id, thread)
+        .await?
+        .map(|workspace| workspace.workspace_root().to_string())
+        .unwrap_or_else(|| {
+            project
+                .workspace_root
+                .as_deref()
+                .unwrap_or(&project.dir)
+                .to_owned()
+        }))
 }
 
 pub(crate) fn classify_existing_link(
@@ -364,6 +385,55 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_workspace_root_uses_inheritance_then_the_project_fallback() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = PersistStore::new(dir.path().to_path_buf());
+        let project_id = ProjectId::new();
+        store
+            .create_project(project_id, "workspace roots", "/project/checkout")
+            .await
+            .unwrap();
+        let mut project = store.load_project(project_id).await.unwrap().unwrap();
+
+        let root_id = ThreadId::new();
+        let child_id = ThreadId::new();
+        let ordinary_id = ThreadId::new();
+        let mut root = thread(root_id, ThreadKind::Primary, None);
+        root.project_id = project_id;
+        root.git_workspace = Some(worktree("/worktrees/root"));
+        let mut child = thread(child_id, ThreadKind::Subagent, Some(root_id));
+        child.project_id = project_id;
+        let mut ordinary = thread(ordinary_id, ThreadKind::Primary, None);
+        ordinary.project_id = project_id;
+        for thread in [&root, &child, &ordinary] {
+            store.save_thread(project_id, thread).await.unwrap();
+        }
+
+        assert_eq!(
+            thread_workspace_root(&store, &project, &child)
+                .await
+                .unwrap(),
+            "/worktrees/root"
+        );
+
+        project.workspace_root = Some("/project/configured-root".into());
+        assert_eq!(
+            thread_workspace_root(&store, &project, &ordinary)
+                .await
+                .unwrap(),
+            "/project/configured-root"
+        );
+
+        project.workspace_root = None;
+        assert_eq!(
+            thread_workspace_root(&store, &project, &ordinary)
+                .await
+                .unwrap(),
+            "/project/checkout"
         );
     }
 

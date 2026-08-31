@@ -1,4 +1,6 @@
 mod common;
+#[path = "common/event_channel.rs"]
+mod event_channel;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -20,7 +22,8 @@ use giskard_core::token::TokenUsage;
 use giskard_core::turn::{Mode, PermissionPreset, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+    AgentEventStream, AgentHarness, ClaimedNativeRoute, HarnessCapabilities, HarnessSignalStream,
+    OpenThreadOptions, ThreadHandle, ThreadUpdate,
 };
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 use giskard_persist::store::ProjectConfig;
@@ -34,6 +37,7 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::prelude::*;
 
 use common::fake_native_model;
+use event_channel::{BoundedEventRoute, TestRouteContract, closed_event_stream};
 
 #[derive(Clone, Debug)]
 struct CapturedRegistryEvent {
@@ -131,9 +135,11 @@ impl HarnessFactory for TestFactory {
     async fn create(
         &self,
         _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
+        bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
-        Ok(Arc::new(ReplayHarness::from_fixture(self.fixture.clone())))
+        Ok(Arc::new(
+            ReplayHarness::from_fixture(self.fixture.clone()).with_bootstrap(bootstrap)?,
+        ))
     }
 }
 
@@ -160,7 +166,9 @@ impl HarnessFactory for NoMcpFactory {
         _config: &ProjectConfig,
         _bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
-        Ok(Arc::new(NoMcpHarness))
+        Ok(Arc::new(NoMcpHarness {
+            route_contract: TestRouteContract::new(),
+        }))
     }
 }
 
@@ -230,23 +238,41 @@ impl HarnessFactory for CountingOpenFactory {
     }
 }
 
-struct NoMcpHarness;
+struct NoMcpHarness {
+    route_contract: TestRouteContract,
+}
+
+type TestEventRoutes = tokio::sync::Mutex<HashMap<ThreadId, BoundedEventRoute>>;
+
+fn take_event_stream(routes: &TestEventRoutes, thread_id: ThreadId) -> AgentEventStream {
+    if let Ok(routes) = routes.try_lock()
+        && let Some(stream) = routes
+            .get(&thread_id)
+            .and_then(BoundedEventRoute::take_stream)
+    {
+        return stream;
+    }
+    closed_event_stream()
+}
 
 #[derive(Default)]
 struct UnsupportedCompactionHarness {
-    threads: tokio::sync::Mutex<HashMap<ThreadId, tokio::sync::broadcast::Sender<AgentEvent>>>,
+    route_contract: TestRouteContract,
+    threads: TestEventRoutes,
 }
 
 #[derive(Default)]
 struct SlowCompactionHarness {
-    threads: tokio::sync::Mutex<HashMap<ThreadId, tokio::sync::broadcast::Sender<AgentEvent>>>,
+    route_contract: TestRouteContract,
+    threads: TestEventRoutes,
     compact_calls: AtomicUsize,
     hold_compaction: AtomicBool,
     release_compaction: AtomicBool,
 }
 
 struct SlowStartHarness {
-    threads: tokio::sync::Mutex<HashMap<ThreadId, tokio::sync::broadcast::Sender<AgentEvent>>>,
+    route_contract: TestRouteContract,
+    threads: TestEventRoutes,
     start_calls: AtomicUsize,
     hold_first_start: AtomicBool,
     release_first_start: AtomicBool,
@@ -254,7 +280,8 @@ struct SlowStartHarness {
 
 #[derive(Default)]
 struct ActivityHarness {
-    threads: tokio::sync::Mutex<HashMap<ThreadId, tokio::sync::broadcast::Sender<AgentEvent>>>,
+    route_contract: TestRouteContract,
+    threads: TestEventRoutes,
     resumed_native_ids: tokio::sync::Mutex<Vec<String>>,
     claims: tokio::sync::Mutex<Vec<(String, ThreadId)>>,
     hold_native_child_open: AtomicBool,
@@ -269,15 +296,21 @@ struct ActivityHarness {
 
 #[derive(Default)]
 struct CountingOpenHarness {
-    threads: tokio::sync::Mutex<HashMap<ThreadId, tokio::sync::broadcast::Sender<AgentEvent>>>,
+    route_contract: TestRouteContract,
+    threads: TestEventRoutes,
     open_calls: AtomicUsize,
     claim_calls: AtomicUsize,
     start_calls: AtomicUsize,
     delete_calls: AtomicUsize,
     shutdown_calls: AtomicUsize,
+    status_before_open_response: AtomicBool,
+    hold_open_response: AtomicBool,
+    open_entered: AtomicBool,
+    release_open_response: AtomicBool,
     /// What each `open_thread` requested — `None` when the caller left the model to the
     /// harness, which is how an imported thread keeps the model it was already on.
     opened_models: tokio::sync::Mutex<Vec<Option<ModelRef>>>,
+    open_result_model: tokio::sync::Mutex<Option<ModelRef>>,
     started_models: tokio::sync::Mutex<Vec<Option<ModelRef>>>,
     started_inputs: tokio::sync::Mutex<Vec<String>>,
     start_error: tokio::sync::Mutex<Option<HarnessError>>,
@@ -310,6 +343,7 @@ impl SlowCompactionHarness {
 impl SlowStartHarness {
     fn new() -> Self {
         Self {
+            route_contract: TestRouteContract::new(),
             threads: tokio::sync::Mutex::new(HashMap::new()),
             start_calls: AtomicUsize::new(0),
             hold_first_start: AtomicBool::new(true),
@@ -412,15 +446,17 @@ impl ActivityHarness {
         let Some(sender) = self.threads.lock().await.get(&thread).cloned() else {
             return Err(HarnessError::ThreadNotFound(thread));
         };
-        let _ = sender.send(AgentEvent::TurnCompleted {
-            thread,
-            turn,
-            usage: TokenUsage::default(),
-            status: TurnStatus {
-                kind: TurnStatusKind::Completed,
-                message: None,
-            },
-        });
+        let _ = sender
+            .send(AgentEvent::TurnCompleted {
+                thread,
+                turn,
+                usage: TokenUsage::default(),
+                status: TurnStatus {
+                    kind: TurnStatusKind::Completed,
+                    message: None,
+                },
+            })
+            .await;
         Ok(())
     }
 
@@ -447,7 +483,7 @@ impl ActivityHarness {
                 .lock()
                 .await
                 .get(&thread)
-                .map(tokio::sync::broadcast::Sender::receiver_count)
+                .map(BoundedEventRoute::receiver_count)
                 .unwrap_or_default();
             if count == expected {
                 return;
@@ -478,19 +514,23 @@ impl ActivityHarness {
             },
             created_at: chrono::Utc::now(),
         };
-        let _ = sender.send(AgentEvent::TurnStarted { thread, turn });
+        let _ = sender.send(AgentEvent::TurnStarted { thread, turn }).await;
         tokio::task::yield_now().await;
-        let _ = sender.send(AgentEvent::ItemCompleted { thread, turn, item });
+        let _ = sender
+            .send(AgentEvent::ItemCompleted { thread, turn, item })
+            .await;
         tokio::task::yield_now().await;
-        let _ = sender.send(AgentEvent::TurnCompleted {
-            thread,
-            turn,
-            usage: TokenUsage::default(),
-            status: TurnStatus {
-                kind: TurnStatusKind::Completed,
-                message: None,
-            },
-        });
+        let _ = sender
+            .send(AgentEvent::TurnCompleted {
+                thread,
+                turn,
+                usage: TokenUsage::default(),
+                status: TurnStatus {
+                    kind: TurnStatusKind::Completed,
+                    message: None,
+                },
+            })
+            .await;
         Ok(turn)
     }
 
@@ -524,19 +564,23 @@ impl ActivityHarness {
             },
             created_at: chrono::Utc::now(),
         };
-        let _ = sender.send(AgentEvent::TurnStarted { thread, turn });
+        let _ = sender.send(AgentEvent::TurnStarted { thread, turn }).await;
         tokio::task::yield_now().await;
-        let _ = sender.send(AgentEvent::ItemCompleted { thread, turn, item });
+        let _ = sender
+            .send(AgentEvent::ItemCompleted { thread, turn, item })
+            .await;
         tokio::task::yield_now().await;
-        let _ = sender.send(AgentEvent::TurnCompleted {
-            thread,
-            turn,
-            usage: TokenUsage::default(),
-            status: TurnStatus {
-                kind: TurnStatusKind::Completed,
-                message: None,
-            },
-        });
+        let _ = sender
+            .send(AgentEvent::TurnCompleted {
+                thread,
+                turn,
+                usage: TokenUsage::default(),
+                status: TurnStatus {
+                    kind: TurnStatusKind::Completed,
+                    message: None,
+                },
+            })
+            .await;
         Ok(turn)
     }
 
@@ -557,9 +601,11 @@ impl ActivityHarness {
             },
             created_at: chrono::Utc::now(),
         };
-        let _ = sender.send(AgentEvent::TurnStarted { thread, turn });
+        let _ = sender.send(AgentEvent::TurnStarted { thread, turn }).await;
         tokio::task::yield_now().await;
-        let _ = sender.send(AgentEvent::ItemCompleted { thread, turn, item });
+        let _ = sender
+            .send(AgentEvent::ItemCompleted { thread, turn, item })
+            .await;
         Ok(turn)
     }
 
@@ -573,25 +619,27 @@ impl ActivityHarness {
         };
         let turn = TurnId::new();
         let item_id = ItemId::new();
-        let _ = sender.send(AgentEvent::TurnStarted { thread, turn });
+        let _ = sender.send(AgentEvent::TurnStarted { thread, turn }).await;
         tokio::task::yield_now().await;
-        let _ = sender.send(AgentEvent::ItemStarted {
-            thread,
-            turn,
-            item: ItemStart {
-                id: item_id,
-                harness_item_id: format!("external_command_{turn}"),
-                kind: ItemKind::CommandExecution,
-                command: Some(CommandExecutionStart {
-                    command: command.to_string(),
-                    cwd: "/tmp/subagent-command".into(),
-                    status: Some("in_progress".into()),
-                    process_id: Some(format!("process_{turn}")),
-                    started_at_ms: None,
-                }),
-                tool: None,
-            },
-        });
+        let _ = sender
+            .send(AgentEvent::ItemStarted {
+                thread,
+                turn,
+                item: ItemStart {
+                    id: item_id,
+                    harness_item_id: format!("external_command_{turn}"),
+                    kind: ItemKind::CommandExecution,
+                    command: Some(CommandExecutionStart {
+                        command: command.to_string(),
+                        cwd: "/tmp/subagent-command".into(),
+                        status: Some("in_progress".into()),
+                        process_id: Some(format!("process_{turn}")),
+                        started_at_ms: None,
+                    }),
+                    tool: None,
+                },
+            })
+            .await;
         Ok((turn, item_id))
     }
 
@@ -605,27 +653,29 @@ impl ActivityHarness {
         let Some(sender) = self.threads.lock().await.get(&thread).cloned() else {
             return Err(HarnessError::ThreadNotFound(thread));
         };
-        let _ = sender.send(AgentEvent::ItemCompleted {
-            thread,
-            turn,
-            item: Item {
-                id: item_id,
-                harness_item_id: format!("external_command_{turn}"),
-                payload: ItemPayload::CommandExecution {
-                    command: command.to_string(),
-                    cwd: "/tmp/subagent-command".into(),
-                    output: String::new(),
-                    output_truncated: false,
-                    output_original_bytes: None,
-                    output_original_lines: None,
-                    exit_code: Some(0),
-                    status: Some("completed".into()),
-                    process_id: Some(format!("process_{turn}")),
-                    duration_ms: Some(30_000),
+        let _ = sender
+            .send(AgentEvent::ItemCompleted {
+                thread,
+                turn,
+                item: Item {
+                    id: item_id,
+                    harness_item_id: format!("external_command_{turn}"),
+                    payload: ItemPayload::CommandExecution {
+                        command: command.to_string(),
+                        cwd: "/tmp/subagent-command".into(),
+                        output: String::new(),
+                        output_truncated: false,
+                        output_original_bytes: None,
+                        output_original_lines: None,
+                        exit_code: Some(0),
+                        status: Some("completed".into()),
+                        process_id: Some(format!("process_{turn}")),
+                        duration_ms: Some(30_000),
+                    },
+                    created_at: chrono::Utc::now(),
                 },
-                created_at: chrono::Utc::now(),
-            },
-        });
+            })
+            .await;
         Ok(())
     }
 }
@@ -653,6 +703,29 @@ impl CountingOpenHarness {
 
     fn shutdown_calls(&self) -> usize {
         self.shutdown_calls.load(Ordering::SeqCst)
+    }
+
+    fn send_status_before_open_response(&self) {
+        self.status_before_open_response
+            .store(true, Ordering::SeqCst);
+    }
+
+    fn hold_open_response(&self) {
+        self.hold_open_response.store(true, Ordering::SeqCst);
+    }
+
+    async fn wait_for_open(&self) {
+        while !self.open_entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn release_open_response(&self) {
+        self.release_open_response.store(true, Ordering::SeqCst);
+    }
+
+    async fn set_open_result_model(&self, model: ModelRef) {
+        *self.open_result_model.lock().await = Some(model);
     }
 
     async fn started_models(&self) -> Vec<Option<ModelRef>> {
@@ -692,18 +765,41 @@ impl AgentHarness for UnsupportedCompactionHarness {
         Ok(Vec::new())
     }
 
+    fn take_harness_signals(&self) -> Result<HarnessSignalStream, HarnessError> {
+        self.route_contract.take_harness_signals()
+    }
+
+    async fn claim_native_route(
+        &self,
+        harness_thread_id: String,
+        suggested_thread_id: ThreadId,
+    ) -> Result<ClaimedNativeRoute, HarnessError> {
+        self.route_contract
+            .claim_native_route(harness_thread_id, suggested_thread_id)
+    }
+
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
         let thread = opts.thread.unwrap_or_default();
-        let (tx, _) = tokio::sync::broadcast::channel(16);
+        let tx = BoundedEventRoute::new(16);
         self.threads.lock().await.insert(thread, tx);
-        Ok(ThreadHandle {
-            resumed_model: opts
-                .initial_model
-                .clone()
-                .or_else(|| Some(fake_native_model())),
-            ..ThreadHandle::opened(
-                thread,
+        let resumed_model = opts
+            .initial_model
+            .clone()
+            .or_else(|| Some(fake_native_model()));
+        let route = self
+            .route_contract
+            .activate_primary(
                 opts.resume.unwrap_or_else(|| format!("test_{thread}")),
+                thread,
+                opts.identity_generation,
+                resumed_model.clone(),
+            )
+            .await?;
+        Ok(ThreadHandle {
+            resumed_model,
+            ..ThreadHandle::opened(
+                route.thread_id,
+                route.harness_thread_id,
                 opts.workspace_root.clone(),
             )
         })
@@ -720,14 +816,11 @@ impl AgentHarness for UnsupportedCompactionHarness {
         ))
     }
 
-    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Ok(threads) = self.threads.try_lock()
-            && let Some(sender) = threads.get(&thread.thread)
-        {
-            return AgentEventStream::new(sender.subscribe());
-        }
-        let (_, rx) = tokio::sync::broadcast::channel(1);
-        AgentEventStream::new(rx)
+    fn claim_event_receiver(
+        &self,
+        route: &ClaimedNativeRoute,
+    ) -> Result<AgentEventStream, HarnessError> {
+        Ok(take_event_stream(&self.threads, route.thread_id))
     }
 
     async fn respond_approval(
@@ -785,18 +878,41 @@ impl AgentHarness for SlowCompactionHarness {
         Ok(Vec::new())
     }
 
+    fn take_harness_signals(&self) -> Result<HarnessSignalStream, HarnessError> {
+        self.route_contract.take_harness_signals()
+    }
+
+    async fn claim_native_route(
+        &self,
+        harness_thread_id: String,
+        suggested_thread_id: ThreadId,
+    ) -> Result<ClaimedNativeRoute, HarnessError> {
+        self.route_contract
+            .claim_native_route(harness_thread_id, suggested_thread_id)
+    }
+
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
         let thread = opts.thread.unwrap_or_default();
-        let (tx, _) = tokio::sync::broadcast::channel(32);
+        let tx = BoundedEventRoute::new(32);
         self.threads.lock().await.insert(thread, tx);
-        Ok(ThreadHandle {
-            resumed_model: opts
-                .initial_model
-                .clone()
-                .or_else(|| Some(fake_native_model())),
-            ..ThreadHandle::opened(
-                thread,
+        let resumed_model = opts
+            .initial_model
+            .clone()
+            .or_else(|| Some(fake_native_model()));
+        let route = self
+            .route_contract
+            .activate_primary(
                 opts.resume.unwrap_or_else(|| format!("test_{thread}")),
+                thread,
+                opts.identity_generation,
+                resumed_model.clone(),
+            )
+            .await?;
+        Ok(ThreadHandle {
+            resumed_model,
+            ..ThreadHandle::opened(
+                route.thread_id,
+                route.harness_thread_id,
                 opts.workspace_root.clone(),
             )
         })
@@ -822,38 +938,41 @@ impl AgentHarness for SlowCompactionHarness {
                 },
                 created_at: chrono::Utc::now(),
             };
-            let _ = sender.send(AgentEvent::TurnStarted {
-                thread: thread_id,
-                turn,
-            });
+            let _ = sender
+                .send(AgentEvent::TurnStarted {
+                    thread: thread_id,
+                    turn,
+                })
+                .await;
             tokio::task::yield_now().await;
-            let _ = sender.send(AgentEvent::ItemCompleted {
-                thread: thread_id,
-                turn,
-                item,
-            });
+            let _ = sender
+                .send(AgentEvent::ItemCompleted {
+                    thread: thread_id,
+                    turn,
+                    item,
+                })
+                .await;
             tokio::task::yield_now().await;
-            let _ = sender.send(AgentEvent::TurnCompleted {
-                thread: thread_id,
-                turn,
-                usage: TokenUsage::default(),
-                status: TurnStatus {
-                    kind: TurnStatusKind::Completed,
-                    message: None,
-                },
-            });
+            let _ = sender
+                .send(AgentEvent::TurnCompleted {
+                    thread: thread_id,
+                    turn,
+                    usage: TokenUsage::default(),
+                    status: TurnStatus {
+                        kind: TurnStatusKind::Completed,
+                        message: None,
+                    },
+                })
+                .await;
         });
         Ok(turn)
     }
 
-    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Ok(threads) = self.threads.try_lock()
-            && let Some(sender) = threads.get(&thread.thread)
-        {
-            return AgentEventStream::new(sender.subscribe());
-        }
-        let (_, rx) = tokio::sync::broadcast::channel(1);
-        AgentEventStream::new(rx)
+    fn claim_event_receiver(
+        &self,
+        route: &ClaimedNativeRoute,
+    ) -> Result<AgentEventStream, HarnessError> {
+        Ok(take_event_stream(&self.threads, route.thread_id))
     }
 
     async fn respond_approval(
@@ -889,36 +1008,42 @@ impl AgentHarness for SlowCompactionHarness {
         let thread_id = thread.thread;
         tokio::spawn(async move {
             let turn = TurnId::new();
-            let _ = sender.send(AgentEvent::TurnStarted {
-                thread: thread_id,
-                turn,
-            });
+            let _ = sender
+                .send(AgentEvent::TurnStarted {
+                    thread: thread_id,
+                    turn,
+                })
+                .await;
             tokio::task::yield_now().await;
-            let _ = sender.send(AgentEvent::ItemCompleted {
-                thread: thread_id,
-                turn,
-                item: Item {
-                    id: ItemId::new(),
-                    harness_item_id: format!("compact_{turn}"),
-                    payload: ItemPayload::Activity {
-                        title: "Context compacted".into(),
-                        detail: None,
-                        metadata: None,
-                        subagent: None,
+            let _ = sender
+                .send(AgentEvent::ItemCompleted {
+                    thread: thread_id,
+                    turn,
+                    item: Item {
+                        id: ItemId::new(),
+                        harness_item_id: format!("compact_{turn}"),
+                        payload: ItemPayload::Activity {
+                            title: "Context compacted".into(),
+                            detail: None,
+                            metadata: None,
+                            subagent: None,
+                        },
+                        created_at: chrono::Utc::now(),
                     },
-                    created_at: chrono::Utc::now(),
-                },
-            });
+                })
+                .await;
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            let _ = sender.send(AgentEvent::TurnCompleted {
-                thread: thread_id,
-                turn,
-                usage: TokenUsage::default(),
-                status: TurnStatus {
-                    kind: TurnStatusKind::Completed,
-                    message: None,
-                },
-            });
+            let _ = sender
+                .send(AgentEvent::TurnCompleted {
+                    thread: thread_id,
+                    turn,
+                    usage: TokenUsage::default(),
+                    status: TurnStatus {
+                        kind: TurnStatusKind::Completed,
+                        message: None,
+                    },
+                })
+                .await;
         });
         Ok(())
     }
@@ -952,6 +1077,19 @@ impl AgentHarness for ActivityHarness {
         Ok(Vec::new())
     }
 
+    fn take_harness_signals(&self) -> Result<HarnessSignalStream, HarnessError> {
+        self.route_contract.take_harness_signals()
+    }
+
+    async fn claim_native_route(
+        &self,
+        harness_thread_id: String,
+        suggested_thread_id: ThreadId,
+    ) -> Result<ClaimedNativeRoute, HarnessError> {
+        self.route_contract
+            .claim_native_route(harness_thread_id, suggested_thread_id)
+    }
+
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
         if let Some(native_thread_id) = opts.resume.as_ref() {
             self.resumed_native_ids
@@ -970,19 +1108,33 @@ impl AgentHarness for ActivityHarness {
             }
         }
         let thread = opts.thread.unwrap_or_default();
-        let (tx, _) = tokio::sync::broadcast::channel(32);
+        let tx = BoundedEventRoute::new(32);
         self.threads.lock().await.insert(thread, tx);
         let harness_thread_id = opts.resume.unwrap_or_else(|| format!("test_{thread}"));
         let agent_name = (harness_thread_id == "native-collab-child").then(|| "James".to_string());
         let parent_harness_thread_id = attested_native_parent(&harness_thread_id);
+        let resumed_model = opts
+            .initial_model
+            .clone()
+            .or_else(|| Some(fake_native_model()));
+        let route = self
+            .route_contract
+            .activate_primary(
+                harness_thread_id,
+                thread,
+                opts.identity_generation,
+                resumed_model.clone(),
+            )
+            .await?;
         Ok(ThreadHandle {
-            resumed_model: opts
-                .initial_model
-                .clone()
-                .or_else(|| Some(fake_native_model())),
+            resumed_model,
             agent_name,
             parent_harness_thread_id,
-            ..ThreadHandle::opened(thread, harness_thread_id, opts.workspace_root.clone())
+            ..ThreadHandle::opened(
+                route.thread_id,
+                route.harness_thread_id,
+                opts.workspace_root.clone(),
+            )
         })
     }
 
@@ -1007,10 +1159,9 @@ impl AgentHarness for ActivityHarness {
             .await
             .push((harness_thread_id.clone(), thread));
         let mut threads = self.threads.lock().await;
-        threads.entry(thread).or_insert_with(|| {
-            let (sender, _) = tokio::sync::broadcast::channel(32);
-            sender
-        });
+        threads
+            .entry(thread)
+            .or_insert_with(|| BoundedEventRoute::new(32));
         // Mirrors the Codex adapter: a claim reports the parentage this harness lifetime already
         // attested through its own events, and nothing a resume would have to ask for.
         let parent_harness_thread_id = attested_native_parent(&harness_thread_id);
@@ -1032,10 +1183,12 @@ impl AgentHarness for ActivityHarness {
         let thread_id = thread.thread;
         let turn = TurnId::new();
         let text = input.as_text().unwrap_or_default().to_string();
-        let _ = sender.send(AgentEvent::TurnStarted {
-            thread: thread_id,
-            turn,
-        });
+        let _ = sender
+            .send(AgentEvent::TurnStarted {
+                thread: thread_id,
+                turn,
+            })
+            .await;
 
         if text.contains("approval") {
             let approval_id = ApprovalId(format!("approval_{thread_id}"));
@@ -1043,72 +1196,78 @@ impl AgentHarness for ActivityHarness {
                 .lock()
                 .await
                 .insert(approval_id.clone(), (thread_id, turn));
-            let _ = sender.send(AgentEvent::ApprovalRequested {
-                thread: thread_id,
-                turn,
-                request: ApprovalRequest {
-                    id: approval_id,
-                    kind: ApprovalKind::CommandExecution {
-                        command: "cargo test".into(),
-                        cwd: "/tmp".into(),
+            let _ = sender
+                .send(AgentEvent::ApprovalRequested {
+                    thread: thread_id,
+                    turn,
+                    request: ApprovalRequest {
+                        id: approval_id,
+                        kind: ApprovalKind::CommandExecution {
+                            command: "cargo test".into(),
+                            cwd: "/tmp".into(),
+                        },
+                        reason: Some("inactive approval".into()),
+                        metadata: Vec::new(),
+                        available: vec![ApprovalDecision::Accept, ApprovalDecision::Decline],
                     },
-                    reason: Some("inactive approval".into()),
-                    metadata: Vec::new(),
-                    available: vec![ApprovalDecision::Accept, ApprovalDecision::Decline],
-                },
-            });
+                })
+                .await;
         } else if text.contains("server request") {
             let request_id = ServerRequestId(format!("server_request_{thread_id}"));
             self.pending_server_requests
                 .lock()
                 .await
                 .insert(request_id.clone(), (thread_id, turn));
-            let _ = sender.send(AgentEvent::ServerRequestReceived {
-                thread: thread_id,
-                turn: Some(turn),
-                request: ServerRequest {
-                    id: request_id,
-                    method: "item/tool/requestUserInput".into(),
-                    params: serde_json::json!({
-                        "questions": [{
-                            "id": "confirm",
-                            "header": "Confirm",
-                            "question": "Continue?",
-                            "options": [{ "label": "Yes", "description": "Continue" }],
-                        }]
-                    }),
-                    received_at: chrono::Utc::now(),
-                },
-            });
+            let _ = sender
+                .send(AgentEvent::ServerRequestReceived {
+                    thread: thread_id,
+                    turn: Some(turn),
+                    request: ServerRequest {
+                        id: request_id,
+                        method: "item/tool/requestUserInput".into(),
+                        params: serde_json::json!({
+                            "questions": [{
+                                "id": "confirm",
+                                "header": "Confirm",
+                                "question": "Continue?",
+                                "options": [{ "label": "Yes", "description": "Continue" }],
+                            }]
+                        }),
+                        received_at: chrono::Utc::now(),
+                    },
+                })
+                .await;
         } else if text.contains("subagent terminal fallback") {
             let item_id = ItemId::new();
             let harness_item_id = format!("subagent_terminal_{turn}");
-            let _ = sender.send(AgentEvent::ItemStarted {
-                thread: thread_id,
-                turn,
-                item: ItemStart {
-                    id: item_id,
-                    harness_item_id: harness_item_id.clone(),
-                    kind: ItemKind::ToolCall,
-                    command: None,
-                    tool: Some(ToolCallStart {
-                        name: "spawn_subagent".into(),
-                        input: serde_json::json!({ "prompt": "recover completed work" }),
-                        server: Some("test-harness".into()),
-                        status: Some("in_progress".into()),
-                        metadata: None,
-                        subagent: Some(SubagentLink {
-                            harness_thread_id: "native-terminal-child".into(),
-                            path: Some("terminal-reviewer".into()),
-                            initial_prompt: Some("recover completed work".into()),
-                            action: SubagentAction::Spawned,
-                            status: Some(giskard_core::item::SubagentStatus::Pending),
-                            message: None,
+            let _ = sender
+                .send(AgentEvent::ItemStarted {
+                    thread: thread_id,
+                    turn,
+                    item: ItemStart {
+                        id: item_id,
+                        harness_item_id: harness_item_id.clone(),
+                        kind: ItemKind::ToolCall,
+                        command: None,
+                        tool: Some(ToolCallStart {
+                            name: "spawn_subagent".into(),
+                            input: serde_json::json!({ "prompt": "recover completed work" }),
+                            server: Some("test-harness".into()),
+                            status: Some("in_progress".into()),
+                            metadata: None,
+                            subagent: Some(SubagentLink {
+                                harness_thread_id: "native-terminal-child".into(),
+                                path: Some("terminal-reviewer".into()),
+                                initial_prompt: Some("recover completed work".into()),
+                                action: SubagentAction::Spawned,
+                                status: Some(giskard_core::item::SubagentStatus::Pending),
+                                message: None,
+                            }),
+                            started_at_ms: Some(1_785_000_000_000),
                         }),
-                        started_at_ms: Some(1_785_000_000_000),
-                    }),
-                },
-            });
+                    },
+                })
+                .await;
             let item = Item {
                 id: item_id,
                 harness_item_id,
@@ -1131,11 +1290,13 @@ impl AgentHarness for ActivityHarness {
                 },
                 created_at: chrono::Utc::now(),
             };
-            let _ = sender.send(AgentEvent::ItemCompleted {
-                thread: thread_id,
-                turn,
-                item,
-            });
+            let _ = sender
+                .send(AgentEvent::ItemCompleted {
+                    thread: thread_id,
+                    turn,
+                    item,
+                })
+                .await;
             self.complete_turn(thread_id, turn).await?;
         } else if text.contains("subagent interrupted") {
             let item = Item {
@@ -1156,11 +1317,13 @@ impl AgentHarness for ActivityHarness {
                 },
                 created_at: chrono::Utc::now(),
             };
-            let _ = sender.send(AgentEvent::ItemCompleted {
-                thread: thread_id,
-                turn,
-                item,
-            });
+            let _ = sender
+                .send(AgentEvent::ItemCompleted {
+                    thread: thread_id,
+                    turn,
+                    item,
+                })
+                .await;
             self.complete_turn(thread_id, turn).await?;
         } else if text.contains("plain activity") {
             let item = Item {
@@ -1174,11 +1337,13 @@ impl AgentHarness for ActivityHarness {
                 },
                 created_at: chrono::Utc::now(),
             };
-            let _ = sender.send(AgentEvent::ItemCompleted {
-                thread: thread_id,
-                turn,
-                item,
-            });
+            let _ = sender
+                .send(AgentEvent::ItemCompleted {
+                    thread: thread_id,
+                    turn,
+                    item,
+                })
+                .await;
         } else if text.contains("foreign subagent activity") {
             let item = Item {
                 id: ItemId::new(),
@@ -1198,11 +1363,13 @@ impl AgentHarness for ActivityHarness {
                 },
                 created_at: chrono::Utc::now(),
             };
-            let _ = sender.send(AgentEvent::ItemCompleted {
-                thread: thread_id,
-                turn,
-                item,
-            });
+            let _ = sender
+                .send(AgentEvent::ItemCompleted {
+                    thread: thread_id,
+                    turn,
+                    item,
+                })
+                .await;
         } else if text.contains("subagent activity") {
             let item = Item {
                 id: ItemId::new(),
@@ -1222,11 +1389,13 @@ impl AgentHarness for ActivityHarness {
                 },
                 created_at: chrono::Utc::now(),
             };
-            let _ = sender.send(AgentEvent::ItemCompleted {
-                thread: thread_id,
-                turn,
-                item,
-            });
+            let _ = sender
+                .send(AgentEvent::ItemCompleted {
+                    thread: thread_id,
+                    turn,
+                    item,
+                })
+                .await;
         } else if text.contains("subagent delayed metadata") {
             let item = Item {
                 id: ItemId::new(),
@@ -1246,14 +1415,47 @@ impl AgentHarness for ActivityHarness {
                 },
                 created_at: chrono::Utc::now(),
             };
-            let _ = sender.send(AgentEvent::ItemCompleted {
-                thread: thread_id,
-                turn,
-                item,
-            });
+            let _ = sender
+                .send(AgentEvent::ItemCompleted {
+                    thread: thread_id,
+                    turn,
+                    item,
+                })
+                .await;
             tokio::spawn(async move {
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                let _ = sender.send(AgentEvent::ItemStarted {
+                let _ = sender
+                    .send(AgentEvent::ItemStarted {
+                        thread: thread_id,
+                        turn,
+                        item: ItemStart {
+                            id: ItemId::new(),
+                            harness_item_id: format!("collab_spawn_{turn}"),
+                            kind: ItemKind::ToolCall,
+                            command: None,
+                            tool: Some(ToolCallStart {
+                                name: "spawn_subagent".into(),
+                                input: serde_json::json!({ "prompt": "delayed investigate" }),
+                                server: Some("test-harness".into()),
+                                status: Some("in_progress".into()),
+                                metadata: None,
+                                subagent: Some(SubagentLink {
+                                    harness_thread_id: "native-collab-child".into(),
+                                    path: Some("explorer".into()),
+                                    initial_prompt: Some("delayed investigate".into()),
+                                    action: SubagentAction::Spawned,
+                                    status: None,
+                                    message: None,
+                                }),
+                                started_at_ms: Some(1_785_000_000_000),
+                            }),
+                        },
+                    })
+                    .await;
+            });
+        } else if text.contains("collab spawn input fallback") {
+            let _ = sender
+                .send(AgentEvent::ItemStarted {
                     thread: thread_id,
                     turn,
                     item: ItemStart {
@@ -1263,14 +1465,14 @@ impl AgentHarness for ActivityHarness {
                         command: None,
                         tool: Some(ToolCallStart {
                             name: "spawn_subagent".into(),
-                            input: serde_json::json!({ "prompt": "delayed investigate" }),
+                            input: serde_json::json!({ "message": "fallback investigate" }),
                             server: Some("test-harness".into()),
                             status: Some("in_progress".into()),
                             metadata: None,
                             subagent: Some(SubagentLink {
                                 harness_thread_id: "native-collab-child".into(),
                                 path: Some("explorer".into()),
-                                initial_prompt: Some("delayed investigate".into()),
+                                initial_prompt: None,
                                 action: SubagentAction::Spawned,
                                 status: None,
                                 message: None,
@@ -1278,89 +1480,66 @@ impl AgentHarness for ActivityHarness {
                             started_at_ms: Some(1_785_000_000_000),
                         }),
                     },
-                });
-            });
-        } else if text.contains("collab spawn input fallback") {
-            let _ = sender.send(AgentEvent::ItemStarted {
-                thread: thread_id,
-                turn,
-                item: ItemStart {
-                    id: ItemId::new(),
-                    harness_item_id: format!("collab_spawn_{turn}"),
-                    kind: ItemKind::ToolCall,
-                    command: None,
-                    tool: Some(ToolCallStart {
-                        name: "spawn_subagent".into(),
-                        input: serde_json::json!({ "message": "fallback investigate" }),
-                        server: Some("test-harness".into()),
-                        status: Some("in_progress".into()),
-                        metadata: None,
-                        subagent: Some(SubagentLink {
-                            harness_thread_id: "native-collab-child".into(),
-                            path: Some("explorer".into()),
-                            initial_prompt: None,
-                            action: SubagentAction::Spawned,
-                            status: None,
-                            message: None,
-                        }),
-                        started_at_ms: Some(1_785_000_000_000),
-                    }),
-                },
-            });
+                })
+                .await;
         } else if text.contains("nested collab spawn") {
-            let _ = sender.send(AgentEvent::ItemStarted {
-                thread: thread_id,
-                turn,
-                item: ItemStart {
-                    id: ItemId::new(),
-                    harness_item_id: format!("nested_collab_spawn_{turn}"),
-                    kind: ItemKind::ToolCall,
-                    command: None,
-                    tool: Some(ToolCallStart {
-                        name: "spawn_subagent".into(),
-                        input: serde_json::json!({ "prompt": "nested investigate" }),
-                        server: Some("test-harness".into()),
-                        status: Some("in_progress".into()),
-                        metadata: None,
-                        subagent: Some(SubagentLink {
-                            harness_thread_id: "native-grandchild".into(),
-                            path: Some("nested-explorer".into()),
-                            initial_prompt: Some("nested investigate".into()),
-                            action: SubagentAction::Spawned,
-                            status: None,
-                            message: None,
+            let _ = sender
+                .send(AgentEvent::ItemStarted {
+                    thread: thread_id,
+                    turn,
+                    item: ItemStart {
+                        id: ItemId::new(),
+                        harness_item_id: format!("nested_collab_spawn_{turn}"),
+                        kind: ItemKind::ToolCall,
+                        command: None,
+                        tool: Some(ToolCallStart {
+                            name: "spawn_subagent".into(),
+                            input: serde_json::json!({ "prompt": "nested investigate" }),
+                            server: Some("test-harness".into()),
+                            status: Some("in_progress".into()),
+                            metadata: None,
+                            subagent: Some(SubagentLink {
+                                harness_thread_id: "native-grandchild".into(),
+                                path: Some("nested-explorer".into()),
+                                initial_prompt: Some("nested investigate".into()),
+                                action: SubagentAction::Spawned,
+                                status: None,
+                                message: None,
+                            }),
+                            started_at_ms: Some(1_785_000_000_000),
                         }),
-                        started_at_ms: Some(1_785_000_000_000),
-                    }),
-                },
-            });
+                    },
+                })
+                .await;
         } else if text.contains("collab spawn") {
-            let _ = sender.send(AgentEvent::ItemStarted {
-                thread: thread_id,
-                turn,
-                item: ItemStart {
-                    id: ItemId::new(),
-                    harness_item_id: format!("collab_spawn_{turn}"),
-                    kind: ItemKind::ToolCall,
-                    command: None,
-                    tool: Some(ToolCallStart {
-                        name: "spawn_subagent".into(),
-                        input: serde_json::json!({ "prompt": "investigate" }),
-                        server: Some("test-harness".into()),
-                        status: Some("in_progress".into()),
-                        metadata: None,
-                        subagent: Some(SubagentLink {
-                            harness_thread_id: "native-collab-child".into(),
-                            path: Some("explorer".into()),
-                            initial_prompt: Some("investigate".into()),
-                            action: SubagentAction::Spawned,
-                            status: None,
-                            message: None,
+            let _ = sender
+                .send(AgentEvent::ItemStarted {
+                    thread: thread_id,
+                    turn,
+                    item: ItemStart {
+                        id: ItemId::new(),
+                        harness_item_id: format!("collab_spawn_{turn}"),
+                        kind: ItemKind::ToolCall,
+                        command: None,
+                        tool: Some(ToolCallStart {
+                            name: "spawn_subagent".into(),
+                            input: serde_json::json!({ "prompt": "investigate" }),
+                            server: Some("test-harness".into()),
+                            status: Some("in_progress".into()),
+                            metadata: None,
+                            subagent: Some(SubagentLink {
+                                harness_thread_id: "native-collab-child".into(),
+                                path: Some("explorer".into()),
+                                initial_prompt: Some("investigate".into()),
+                                action: SubagentAction::Spawned,
+                                status: None,
+                                message: None,
+                            }),
+                            started_at_ms: Some(1_785_000_000_000),
                         }),
-                        started_at_ms: Some(1_785_000_000_000),
-                    }),
-                },
-            });
+                    },
+                })
+                .await;
         } else if text.contains("reverse parent activity") {
             let item = Item {
                 id: ItemId::new(),
@@ -1380,11 +1559,13 @@ impl AgentHarness for ActivityHarness {
                 },
                 created_at: chrono::Utc::now(),
             };
-            let _ = sender.send(AgentEvent::ItemCompleted {
-                thread: thread_id,
-                turn,
-                item,
-            });
+            let _ = sender
+                .send(AgentEvent::ItemCompleted {
+                    thread: thread_id,
+                    turn,
+                    item,
+                })
+                .await;
             self.complete_turn(thread_id, turn).await?;
         } else {
             self.complete_turn(thread_id, turn).await?;
@@ -1393,14 +1574,11 @@ impl AgentHarness for ActivityHarness {
         Ok(turn)
     }
 
-    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Ok(threads) = self.threads.try_lock()
-            && let Some(sender) = threads.get(&thread.thread)
-        {
-            return AgentEventStream::new(sender.subscribe());
-        }
-        let (_, rx) = tokio::sync::broadcast::channel(1);
-        AgentEventStream::new(rx)
+    fn claim_event_receiver(
+        &self,
+        route: &ClaimedNativeRoute,
+    ) -> Result<AgentEventStream, HarnessError> {
+        Ok(take_event_stream(&self.threads, route.thread_id))
     }
 
     async fn respond_approval(
@@ -1479,18 +1657,41 @@ impl AgentHarness for SlowStartHarness {
         Ok(Vec::new())
     }
 
+    fn take_harness_signals(&self) -> Result<HarnessSignalStream, HarnessError> {
+        self.route_contract.take_harness_signals()
+    }
+
+    async fn claim_native_route(
+        &self,
+        harness_thread_id: String,
+        suggested_thread_id: ThreadId,
+    ) -> Result<ClaimedNativeRoute, HarnessError> {
+        self.route_contract
+            .claim_native_route(harness_thread_id, suggested_thread_id)
+    }
+
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
         let thread = opts.thread.unwrap_or_default();
-        let (tx, _) = tokio::sync::broadcast::channel(32);
+        let tx = BoundedEventRoute::new(32);
         self.threads.lock().await.insert(thread, tx);
-        Ok(ThreadHandle {
-            resumed_model: opts
-                .initial_model
-                .clone()
-                .or_else(|| Some(fake_native_model())),
-            ..ThreadHandle::opened(
-                thread,
+        let resumed_model = opts
+            .initial_model
+            .clone()
+            .or_else(|| Some(fake_native_model()));
+        let route = self
+            .route_contract
+            .activate_primary(
                 opts.resume.unwrap_or_else(|| format!("test_{thread}")),
+                thread,
+                opts.identity_generation,
+                resumed_model.clone(),
+            )
+            .await?;
+        Ok(ThreadHandle {
+            resumed_model,
+            ..ThreadHandle::opened(
+                route.thread_id,
+                route.harness_thread_id,
                 opts.workspace_root.clone(),
             )
         })
@@ -1523,37 +1724,40 @@ impl AgentHarness for SlowStartHarness {
             },
             created_at: chrono::Utc::now(),
         };
-        let _ = sender.send(AgentEvent::TurnStarted {
-            thread: thread_id,
-            turn,
-        });
+        let _ = sender
+            .send(AgentEvent::TurnStarted {
+                thread: thread_id,
+                turn,
+            })
+            .await;
         tokio::task::yield_now().await;
-        let _ = sender.send(AgentEvent::ItemCompleted {
-            thread: thread_id,
-            turn,
-            item,
-        });
+        let _ = sender
+            .send(AgentEvent::ItemCompleted {
+                thread: thread_id,
+                turn,
+                item,
+            })
+            .await;
         tokio::task::yield_now().await;
-        let _ = sender.send(AgentEvent::TurnCompleted {
-            thread: thread_id,
-            turn,
-            usage: TokenUsage::default(),
-            status: TurnStatus {
-                kind: TurnStatusKind::Completed,
-                message: None,
-            },
-        });
+        let _ = sender
+            .send(AgentEvent::TurnCompleted {
+                thread: thread_id,
+                turn,
+                usage: TokenUsage::default(),
+                status: TurnStatus {
+                    kind: TurnStatusKind::Completed,
+                    message: None,
+                },
+            })
+            .await;
         Ok(turn)
     }
 
-    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Ok(threads) = self.threads.try_lock()
-            && let Some(sender) = threads.get(&thread.thread)
-        {
-            return AgentEventStream::new(sender.subscribe());
-        }
-        let (_, rx) = tokio::sync::broadcast::channel(1);
-        AgentEventStream::new(rx)
+    fn claim_event_receiver(
+        &self,
+        route: &ClaimedNativeRoute,
+    ) -> Result<AgentEventStream, HarnessError> {
+        Ok(take_event_stream(&self.threads, route.thread_id))
     }
 
     async fn respond_approval(
@@ -1609,24 +1813,75 @@ impl AgentHarness for CountingOpenHarness {
         Ok(Vec::new())
     }
 
+    fn take_harness_signals(&self) -> Result<HarnessSignalStream, HarnessError> {
+        self.route_contract.take_harness_signals()
+    }
+
+    async fn claim_native_route(
+        &self,
+        harness_thread_id: String,
+        suggested_thread_id: ThreadId,
+    ) -> Result<ClaimedNativeRoute, HarnessError> {
+        self.route_contract
+            .claim_native_route(harness_thread_id, suggested_thread_id)
+    }
+
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
         let open_call = self.open_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        self.open_entered.store(true, Ordering::SeqCst);
+        while self.hold_open_response.load(Ordering::SeqCst)
+            && !self.release_open_response.load(Ordering::SeqCst)
+        {
+            tokio::task::yield_now().await;
+        }
         let thread = opts.thread.unwrap_or_default();
         self.opened_models
             .lock()
             .await
             .push(opts.initial_model.clone());
-        let (tx, _) = tokio::sync::broadcast::channel(16);
+        let tx = BoundedEventRoute::new(16);
         self.threads.lock().await.insert(thread, tx);
-        Ok(ThreadHandle {
-            resumed_model: opts
-                .initial_model
-                .clone()
-                .or_else(|| Some(fake_native_model())),
-            ..ThreadHandle::opened(
-                thread,
+        let resumed_model = self
+            .open_result_model
+            .lock()
+            .await
+            .clone()
+            .or_else(|| opts.initial_model.clone())
+            .or_else(|| Some(fake_native_model()));
+        let route = self
+            .route_contract
+            .activate_primary(
                 opts.resume
                     .unwrap_or_else(|| format!("count_{thread}_{open_call}")),
+                thread,
+                opts.identity_generation,
+                resumed_model.clone(),
+            )
+            .await?;
+        if self.status_before_open_response.load(Ordering::SeqCst) {
+            self.route_contract
+                .activate_notification(route.clone(), "thread/status/changed")
+                .await?;
+            opts.updates
+                .send(ThreadUpdate::ContextWindowRestored {
+                    model: resumed_model.clone().ok_or_else(|| {
+                        HarnessError::Protocol(
+                            "notification-first test open must report a model".into(),
+                        )
+                    })?,
+                    context_window: 196_000,
+                })
+                .map_err(|error| {
+                    HarnessError::Protocol(format!(
+                        "notification-first test update was not retained: {error:?}"
+                    ))
+                })?;
+        }
+        Ok(ThreadHandle {
+            resumed_model,
+            ..ThreadHandle::opened(
+                route.thread_id,
+                route.harness_thread_id,
                 opts.workspace_root.clone(),
             )
         })
@@ -1639,7 +1894,7 @@ impl AgentHarness for CountingOpenHarness {
         workspace_root: PathBuf,
     ) -> Result<ThreadHandle, HarnessError> {
         self.claim_calls.fetch_add(1, Ordering::SeqCst);
-        let (tx, _) = tokio::sync::broadcast::channel(16);
+        let tx = BoundedEventRoute::new(16);
         self.threads.lock().await.insert(thread, tx);
         Ok(ThreadHandle::opened(
             thread,
@@ -1671,21 +1926,20 @@ impl AgentHarness for CountingOpenHarness {
             threads.get(&thread.thread).cloned()
         }
         .ok_or(HarnessError::ThreadNotFound(thread.thread))?;
-        let _ = sender.send(AgentEvent::TurnStarted {
-            thread: thread.thread,
-            turn,
-        });
+        let _ = sender
+            .send(AgentEvent::TurnStarted {
+                thread: thread.thread,
+                turn,
+            })
+            .await;
         Ok(turn)
     }
 
-    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Ok(threads) = self.threads.try_lock()
-            && let Some(sender) = threads.get(&thread.thread)
-        {
-            return AgentEventStream::new(sender.subscribe());
-        }
-        let (_, rx) = tokio::sync::broadcast::channel(1);
-        AgentEventStream::new(rx)
+    fn claim_event_receiver(
+        &self,
+        route: &ClaimedNativeRoute,
+    ) -> Result<AgentEventStream, HarnessError> {
+        Ok(take_event_stream(&self.threads, route.thread_id))
     }
 
     async fn respond_approval(
@@ -1744,6 +1998,19 @@ impl AgentHarness for NoMcpHarness {
         Ok(Vec::new())
     }
 
+    fn take_harness_signals(&self) -> Result<HarnessSignalStream, HarnessError> {
+        self.route_contract.take_harness_signals()
+    }
+
+    async fn claim_native_route(
+        &self,
+        harness_thread_id: String,
+        suggested_thread_id: ThreadId,
+    ) -> Result<ClaimedNativeRoute, HarnessError> {
+        self.route_contract
+            .claim_native_route(harness_thread_id, suggested_thread_id)
+    }
+
     async fn open_thread(&self, _opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
         Err(HarnessError::Unsupported(
             "thread opening is not supported by this harness".into(),
@@ -1761,9 +2028,11 @@ impl AgentHarness for NoMcpHarness {
         ))
     }
 
-    fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-        let (_tx, rx) = tokio::sync::broadcast::channel(1);
-        AgentEventStream::new(rx)
+    fn claim_event_receiver(
+        &self,
+        _route: &ClaimedNativeRoute,
+    ) -> Result<AgentEventStream, HarnessError> {
+        Ok(closed_event_stream())
     }
 
     async fn respond_approval(
@@ -7485,9 +7754,9 @@ async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
 
 #[tokio::test]
 async fn failed_turn_is_persisted_with_error_message() {
-    let tid = ThreadId::new();
+    let fixture_thread = ThreadId::new();
     let turn = TurnId::new();
-    let fixture = failed_turn_fixture(tid, turn);
+    let fixture = failed_turn_fixture(fixture_thread, turn);
     let (_tmp, state, port) =
         start_server_with_fixture_and_extra_config_on_available_port(fixture, "").await;
     let base = format!("http://127.0.0.1:{port}");
@@ -7545,7 +7814,9 @@ async fn failed_turn_is_persisted_with_error_message() {
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(thread_id, tid.to_string());
+    // M3 allocates the Primary identity before the harness opens it. Replay remaps fixture events
+    // from their recorded thread id to this server-owned durable id.
+    let tid: ThreadId = thread_id.parse().unwrap();
 
     use tokio_tungstenite::tungstenite::http::Request;
     let ws_request = Request::builder()
@@ -7632,9 +7903,9 @@ async fn failed_turn_is_persisted_with_error_message() {
 /// completes normally.
 #[tokio::test]
 async fn notice_event_is_delivered_to_client() {
-    let tid = ThreadId::new();
+    let fixture_thread = ThreadId::new();
     let turn = TurnId::new();
-    let fixture = notice_fixture(tid, turn);
+    let fixture = notice_fixture(fixture_thread, turn);
     let (_tmp, _state, port) =
         start_server_with_fixture_and_extra_config_on_available_port(fixture, "").await;
     let base = format!("http://127.0.0.1:{port}");
@@ -7684,6 +7955,11 @@ async fn notice_event_is_delivered_to_client() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+    let tid: ThreadId = resp.json::<serde_json::Value>().await.unwrap()["thread_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
 
     use tokio_tungstenite::tungstenite::http::Request;
     let ws_request = Request::builder()
@@ -7710,6 +7986,11 @@ async fn notice_event_is_delivered_to_client() {
     ))
     .await
     .unwrap();
+
+    // `ThreadState` is the subscription readiness acknowledgement. Wait for it before starting
+    // the replay turn so its live-only, turnless notice cannot race the hub registration.
+    let _ = wait_for_thread_state(&mut ws, tid).await;
+
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::SendInput {
             thread_id: tid,
@@ -7983,6 +8264,120 @@ async fn open_thread_normalization_reuses_live_handle() {
 }
 
 #[tokio::test]
+async fn status_before_resume_response_activates_without_deadlock() {
+    let harness = Arc::new(CountingOpenHarness::default());
+    harness.send_status_before_open_response();
+    let resumed_model = ModelRef {
+        provider: "reported".into(),
+        model: "new-model".into(),
+        reasoning_effort: None,
+    };
+    harness.set_open_result_model(resumed_model.clone()).await;
+    let (_tmp, state, _port) = start_custom_server_with_extra_config_on_available_port(
+        Arc::new(CountingOpenFactory {
+            harness: harness.clone(),
+        }),
+        "",
+    )
+    .await;
+    let project_id = ProjectId::new();
+    state
+        .store
+        .create_project(project_id, "test-project", "/tmp/test")
+        .await
+        .unwrap();
+    let config = state.store.load_project(project_id).await.unwrap().unwrap();
+    let thread_id = ThreadId::new();
+    let model = fake_native_model();
+    let now = chrono::Utc::now();
+    state
+        .store
+        .save_thread(
+            project_id,
+            &giskard_persist::store::ThreadFile {
+                revision: 0,
+                version: giskard_persist::store::THREAD_METADATA_VERSION,
+                id: thread_id,
+                project_id,
+                title: "Notification-first thread".into(),
+                harness_thread_id: "native-thread".into(),
+                parent_thread_id: None,
+                spawned_by_turn_id: None,
+                kind: giskard_core::ThreadKind::Primary,
+                mode: giskard_core::turn::TurnMode::Known(Mode::Build),
+                current_model: giskard_core::turn::TurnModel::Known(model.clone()),
+                context_window: 128_000,
+                model_context_windows: Default::default(),
+                permission_preset: PermissionPreset::AskFirst,
+                model_efforts: Default::default(),
+                tokens: Default::default(),
+                created_at: now,
+                updated_at: now,
+                archived: false,
+                git_workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let handle = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state.registry.open_thread(
+            &config,
+            "/tmp/test",
+            Some(thread_id),
+            Some("native-thread".into()),
+            Some(model),
+        ),
+    )
+    .await
+    .expect("status activation must not wait behind the provider response")
+    .unwrap();
+
+    assert_eq!(handle.thread, thread_id);
+    assert_eq!(handle.harness_thread_id, "native-thread");
+    assert_eq!(handle.resumed_model, Some(resumed_model.clone()));
+    assert_eq!(
+        state.registry.get_thread_native_model(thread_id).await,
+        Some(resumed_model.clone()),
+        "the provider result must refresh the binding installed by notification activation"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let thread = state
+                .store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if thread
+                .model_context_windows
+                .get(&resumed_model.provider)
+                .and_then(|models| models.get(&resumed_model.model))
+                == Some(&196_000)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the provider open's metadata stream must survive notification activation");
+    assert_eq!(harness.open_calls(), 1);
+    assert_eq!(harness.claim_calls(), 0);
+    assert_eq!(
+        harness
+            .threads
+            .lock()
+            .await
+            .get(&thread_id)
+            .map(BoundedEventRoute::receiver_count),
+        Some(1),
+        "notification activation must claim exactly one event receiver"
+    );
+}
+
+#[tokio::test]
 async fn concurrent_cold_opens_install_one_native_owner() {
     let harness = Arc::new(CountingOpenHarness::default());
     let (_tmp, state, _port) = start_custom_server_with_extra_config_on_available_port(
@@ -8024,6 +8419,64 @@ async fn concurrent_cold_opens_install_one_native_owner() {
         1,
         "the cold-open lock must cover the native open, not only owner publication"
     );
+}
+
+#[tokio::test]
+async fn cancelled_cold_open_waiter_does_not_start_a_second_native_open() {
+    let harness = Arc::new(CountingOpenHarness::default());
+    harness.hold_open_response();
+    let (_tmp, state, _port) = start_custom_server_with_extra_config_on_available_port(
+        Arc::new(CountingOpenFactory {
+            harness: harness.clone(),
+        }),
+        "",
+    )
+    .await;
+    let project_id = ProjectId::new();
+    state
+        .store
+        .create_project(project_id, "test-project", "/tmp/test")
+        .await
+        .unwrap();
+    let config = state.store.load_project(project_id).await.unwrap().unwrap();
+    let thread_id = ThreadId::new();
+    let model = fake_native_model();
+
+    let mut first = Box::pin(state.registry.open_thread(
+        &config,
+        "/tmp/test",
+        Some(thread_id),
+        Some("native-thread".into()),
+        Some(model.clone()),
+    ));
+    assert!(matches!(
+        futures::poll!(&mut first),
+        std::task::Poll::Pending
+    ));
+    harness.wait_for_open().await;
+    drop(first);
+
+    let second = state.registry.open_thread(
+        &config,
+        "/tmp/test",
+        Some(thread_id),
+        Some("native-thread".into()),
+        Some(model),
+    );
+    tokio::pin!(second);
+    assert!(matches!(
+        futures::poll!(&mut second),
+        std::task::Poll::Pending
+    ));
+    assert_eq!(harness.open_calls(), 1);
+
+    harness.release_open_response();
+    let handle = tokio::time::timeout(std::time::Duration::from_secs(2), second)
+        .await
+        .expect("the surviving waiter must receive the shared open result")
+        .unwrap();
+    assert_eq!(handle.thread, thread_id);
+    assert_eq!(harness.open_calls(), 1);
 }
 
 #[tokio::test]

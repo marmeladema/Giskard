@@ -433,6 +433,7 @@ impl From<HarnessError> for WireHarnessError {
             HarnessError::Unauthenticated => "harness_unauthenticated",
             HarnessError::Transport(_) => "harness_transport_error",
             HarnessError::Protocol(_) => "harness_protocol_error",
+            HarnessError::ProviderRejected { .. } => "harness_provider_rejected",
             HarnessError::Overloaded => "harness_overloaded",
             HarnessError::Unsupported(_) => "harness_unsupported",
             HarnessError::ThreadNotFound(_) => "thread_not_open",

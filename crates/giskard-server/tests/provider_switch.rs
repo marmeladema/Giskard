@@ -4,9 +4,12 @@
 //! rejected with `thread_provider_switch_ignored` and persists nothing.
 
 mod common;
+#[path = "common/event_channel.rs"]
+mod event_channel;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
@@ -17,14 +20,16 @@ use giskard_core::model::{ModelDescriptor, ModelRef};
 use giskard_core::token::{TokenLedger, TokenUsage};
 use giskard_core::turn::{Mode, PermissionPreset, Turn, TurnStatus, TurnStatusKind};
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+    AgentEventStream, AgentHarness, ClaimedNativeRoute, HarnessCapabilities, HarnessSignalStream,
+    OpenThreadOptions, ThreadHandle,
 };
 use giskard_persist::store::{ProjectConfig, ThreadFile, ThreadGitWorkspace, ThreadWorktree};
 use giskard_proto::ClientMessage;
 use giskard_server::{AppState, HarnessFactory, build_app};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, mpsc};
 
 use common::fake_native_model;
+use event_channel::TestRouteContract;
 
 const DEAD_PROVIDER: &str = "cloudflare-litellm";
 const NEW_PROVIDER: &str = "opencodex";
@@ -33,9 +38,11 @@ const NEW_PROVIDER: &str = "opencodex";
 /// reports an effective model — either an echo of the request, or `report_provider` to simulate
 /// Codex ignoring the override (the loaded-thread rejoin behavior the verification must catch).
 struct SwitchHarness {
+    route_contract: TestRouteContract,
     report_provider: Option<String>,
     opened_workspace_roots: Arc<Mutex<Vec<String>>>,
-    events: broadcast::Sender<giskard_core::event::AgentEvent>,
+    _events: mpsc::Sender<giskard_core::event::AgentEvent>,
+    event_receiver: Arc<StdMutex<Option<mpsc::Receiver<giskard_core::event::AgentEvent>>>>,
 }
 
 #[async_trait::async_trait]
@@ -46,6 +53,19 @@ impl AgentHarness for SwitchHarness {
 
     async fn list_models(&self) -> Result<Vec<ModelDescriptor>, HarnessError> {
         Ok(Vec::new())
+    }
+
+    fn take_harness_signals(&self) -> Result<HarnessSignalStream, HarnessError> {
+        self.route_contract.take_harness_signals()
+    }
+
+    async fn claim_native_route(
+        &self,
+        harness_thread_id: String,
+        suggested_thread_id: ThreadId,
+    ) -> Result<ClaimedNativeRoute, HarnessError> {
+        self.route_contract
+            .claim_native_route(harness_thread_id, suggested_thread_id)
     }
 
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
@@ -67,11 +87,20 @@ impl AgentHarness for SwitchHarness {
             effective.provider = provider.clone();
         }
         let thread = opts.thread.unwrap_or_default();
+        let route = self
+            .route_contract
+            .activate_primary(
+                opts.resume.unwrap_or_else(|| "fresh".into()),
+                thread,
+                opts.identity_generation,
+                Some(effective.clone()),
+            )
+            .await?;
         Ok(ThreadHandle {
             resumed_model: Some(effective),
             ..ThreadHandle::opened(
-                thread,
-                opts.resume.unwrap_or_else(|| "fresh".into()),
+                route.thread_id,
+                route.harness_thread_id,
                 opts.workspace_root.clone(),
             )
         })
@@ -86,8 +115,17 @@ impl AgentHarness for SwitchHarness {
         Err(HarnessError::Unsupported("no turns in this test".into()))
     }
 
-    fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-        AgentEventStream::new(self.events.subscribe())
+    fn claim_event_receiver(
+        &self,
+        _route: &ClaimedNativeRoute,
+    ) -> Result<AgentEventStream, HarnessError> {
+        Ok(AgentEventStream::new(
+            self.event_receiver
+                .lock()
+                .expect("provider-switch event receiver lock poisoned")
+                .take()
+                .expect("provider-switch event receiver should be claimed once"),
+        ))
     }
 
     async fn respond_approval(
@@ -120,7 +158,8 @@ impl AgentHarness for SwitchHarness {
 struct SwitchFactory {
     report_provider: Option<String>,
     opened_workspace_roots: Arc<Mutex<Vec<String>>>,
-    events: broadcast::Sender<giskard_core::event::AgentEvent>,
+    events: mpsc::Sender<giskard_core::event::AgentEvent>,
+    event_receiver: Arc<StdMutex<Option<mpsc::Receiver<giskard_core::event::AgentEvent>>>>,
 }
 
 #[async_trait::async_trait]
@@ -131,9 +170,11 @@ impl HarnessFactory for SwitchFactory {
         _bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
         Ok(Arc::new(SwitchHarness {
+            route_contract: TestRouteContract::new(),
             report_provider: self.report_provider.clone(),
             opened_workspace_roots: self.opened_workspace_roots.clone(),
-            events: self.events.clone(),
+            _events: self.events.clone(),
+            event_receiver: self.event_receiver.clone(),
         }))
     }
 }
@@ -310,13 +351,14 @@ model_listing = false
         .unwrap();
 
     let opened_workspace_roots = Arc::new(Mutex::new(Vec::new()));
-    let (events, _) = broadcast::channel(8);
+    let (events, event_receiver) = mpsc::channel(8);
     let state = AppState::new(
         store,
         Arc::new(SwitchFactory {
             report_provider,
             opened_workspace_roots: opened_workspace_roots.clone(),
             events,
+            event_receiver: Arc::new(StdMutex::new(Some(event_receiver))),
         }),
         (0..32u8).collect(),
     );

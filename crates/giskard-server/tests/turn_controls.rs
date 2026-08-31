@@ -28,19 +28,19 @@ impl HarnessFactory for TestFactory {
     async fn create(
         &self,
         _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
+        bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
         // The thread is imported by native id, so the model it starts on is the harness's to
         // report. This test's config only offers `cloudflare-litellm`, and it goes on to select a
         // different model on that same provider.
         Ok(Arc::new(
-            ReplayHarness::from_fixture(self.fixture.clone()).with_imported_model(
-                giskard_core::model::ModelRef {
+            ReplayHarness::from_fixture(self.fixture.clone())
+                .with_imported_model(giskard_core::model::ModelRef {
                     provider: "cloudflare-litellm".into(),
                     model: "gpt-5.5".into(),
                     reasoning_effort: None,
-                },
-            ),
+                })
+                .with_bootstrap(bootstrap)?,
         ))
     }
 }

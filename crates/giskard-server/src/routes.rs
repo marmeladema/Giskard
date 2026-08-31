@@ -46,8 +46,7 @@ use crate::auth::{
     get_session_token_from_header, sign_token, verify_token,
 };
 use crate::thread_graph::{
-    descendant_deletion_order, graph_issue, inherited_git_workspace, load_thread_graph,
-    should_refresh_subagent_title,
+    descendant_deletion_order, graph_issue, load_thread_graph, should_refresh_subagent_title,
 };
 
 const HARNESS_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -846,9 +845,33 @@ async fn open_thread(
     // harness knows it. Naming one here would not express a preference — Codex treats
     // `model`/`modelProvider` on resume as an override and stops applying the thread's own
     // persisted model — so it would silently move an existing conversation onto another model.
+    let catalog = project_model_catalog(&state, &project_config, &app_config).await;
+    let imported_thread_id = ThreadId::new();
     let handle = state
         .registry
-        .open_thread(&project_config, project_ws_root, None, Some(resume), None)
+        .open_thread_with_primary_identity(
+            &project_config,
+            Some(resume),
+            crate::registry::PrimaryIdentityDraft {
+                thread_id: imported_thread_id,
+                project_id,
+                title: "New thread".into(),
+                mode: Mode::Build,
+                requested_model: None,
+                model_context_windows: catalog
+                    .iter()
+                    .map(|descriptor| {
+                        (
+                            format!("{}/{}", descriptor.provider, descriptor.model),
+                            descriptor.context_window,
+                        )
+                    })
+                    .collect(),
+                permission_preset: PermissionPreset::AskFirst,
+                git_workspace: None,
+                workspace_root: project_ws_root.to_owned(),
+            },
+        )
         .await
         // Not `Internal`: the usual reason is that this thread's provider is no longer in the
         // harness's config, which is a conflict with the current state of the world and fixable by
@@ -864,43 +887,24 @@ async fn open_thread(
                 .into(),
         )
     })?;
-    let catalog = project_model_catalog(&state, &project_config, &app_config).await;
-    let descriptor =
-        crate::models::resolve_catalog_descriptor(&catalog, &app_config, &current_model);
-    let context_window = descriptor.context_window;
-    let now = Utc::now();
-    let title = "New thread".to_owned();
-    let thread_file = ThreadFile {
-        revision: 0,
-        version: giskard_persist::store::THREAD_METADATA_VERSION,
-        id: handle.thread,
-        project_id,
-        title,
-        harness_thread_id: handle.harness_thread_id.clone(),
-        parent_thread_id: None,
-        spawned_by_turn_id: None,
-        kind: ThreadKind::Primary,
-        mode: TurnMode::Known(Mode::Build),
-        current_model: TurnModel::Known(current_model.clone()),
-        context_window,
-        model_context_windows: std::collections::HashMap::new(),
-        permission_preset: PermissionPreset::AskFirst,
-        model_efforts: std::collections::HashMap::new(),
-        tokens: giskard_core::token::TokenLedger::default(),
-        created_at: now,
-        updated_at: now,
-        archived: false,
-        git_workspace: None,
-    };
     let thread_file = state
-        .thread_metadata
-        .create(project_id, thread_file)
-        .await?;
-    state
-        .thread_metadata
-        .publish_created(project_id, &thread_file)
-        .await;
-
+        .store
+        .load_thread(project_id, handle.thread)
+        .await?
+        .ok_or_else(|| {
+            ApiError::Internal(format!(
+                "imported Primary thread {} was not durable after identity acknowledgement",
+                handle.thread
+            ))
+        })?;
+    if thread_file.kind != ThreadKind::Primary
+        || thread_file.current_model != TurnModel::Known(current_model)
+    {
+        return Err(ApiError::Internal(format!(
+            "imported Primary thread {} has conflicting durable identity metadata",
+            handle.thread
+        )));
+    }
     let warning = handle.warning.as_ref().map(|warning| {
         warning_info(
             warning.code.clone(),
@@ -1026,21 +1030,35 @@ async fn start_thread_with_message(
         .as_ref()
         .map(|w| w.workspace_root())
         .unwrap_or(project_ws_root);
+    let title = if text.is_empty() {
+        thread_title_from_attachments(&req.attachments)
+    } else {
+        thread_title_from_first_prompt(&text)
+    };
 
     let handle = match state
         .registry
-        .open_thread(
+        .open_thread_with_primary_identity(
             &project_config,
-            ws_root,
-            Some(thread_id),
             None,
-            Some(model_ref.clone()),
+            crate::registry::PrimaryIdentityDraft {
+                thread_id,
+                project_id,
+                title: title.clone(),
+                mode: req.mode,
+                requested_model: Some(model_ref.clone()),
+                model_context_windows: [(model_ref.key(), model_descriptor.context_window)]
+                    .into_iter()
+                    .collect(),
+                permission_preset: req.permission_preset,
+                git_workspace: worktree.clone().map(ThreadGitWorkspace::Worktree),
+                workspace_root: ws_root.to_owned(),
+            },
         )
         .await
     {
         Ok(handle) => handle,
         Err(error) => {
-            remove_worktree_after_start_failure(worktree.as_ref(), thread_id, "open_thread").await;
             return Err(harness_api_error(error));
         }
     };
@@ -1064,51 +1082,15 @@ async fn start_thread_with_message(
         return Err(ApiError::Internal(detail));
     }
 
-    let now = Utc::now();
-    let title = if text.is_empty() {
-        thread_title_from_attachments(&req.attachments)
-    } else {
-        thread_title_from_first_prompt(&text)
-    };
-    let thread_file = ThreadFile {
-        revision: 0,
-        version: giskard_persist::store::THREAD_METADATA_VERSION,
-        id: thread_id,
-        project_id,
-        title: title.clone(),
-        harness_thread_id: handle.harness_thread_id.clone(),
-        parent_thread_id: None,
-        spawned_by_turn_id: None,
-        kind: ThreadKind::Primary,
-        mode: TurnMode::Known(req.mode),
-        current_model: TurnModel::Known(model_ref.clone()),
-        context_window: model_descriptor.context_window,
-        model_context_windows: std::collections::HashMap::new(),
-        permission_preset: req.permission_preset,
-        model_efforts: std::collections::HashMap::new(),
-        tokens: giskard_core::token::TokenLedger::default(),
-        created_at: now,
-        updated_at: now,
-        archived: false,
-        git_workspace: worktree.clone().map(ThreadGitWorkspace::Worktree),
-    };
-
-    let thread_file = match state.thread_metadata.create(project_id, thread_file).await {
-        Ok(thread_file) => thread_file,
-        Err(error) => {
-            cleanup_new_thread_after_start_failure(
-                &state,
-                &project_config,
-                thread_id,
-                handle.harness_thread_id.clone(),
-                false,
-                "save_thread",
-            )
-            .await;
-            remove_worktree_after_start_failure(worktree.as_ref(), thread_id, "save_thread").await;
-            return Err(ApiError::Internal(error.to_string()));
-        }
-    };
+    let _thread_file = state
+        .store
+        .load_thread(project_id, thread_id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::Internal(format!(
+                "new Primary thread {thread_id} was not durable after identity acknowledgement"
+            ))
+        })?;
 
     let overrides = TurnOverrides {
         model: Some(model_ref.clone()),
@@ -1150,11 +1132,6 @@ async fn start_thread_with_message(
             "start_thread",
         )
     });
-
-    state
-        .thread_metadata
-        .publish_created(project_id, &thread_file)
-        .await;
 
     Ok(Json(StartThreadResponse {
         thread_id,
@@ -1737,10 +1714,9 @@ async fn thread_workspace_root(
     project: &ProjectConfig,
     thread: &ThreadFile,
 ) -> Result<String, ApiError> {
-    Ok(inherited_git_workspace(&state.store, project.id, thread)
-        .await?
-        .map(|workspace| workspace.workspace_root().to_string())
-        .unwrap_or_else(|| project_workspace_root(project).to_string()))
+    crate::thread_graph::thread_workspace_root(&state.store, project, thread)
+        .await
+        .map_err(ApiError::from)
 }
 
 /// The project's own workspace, which is what a draft reads before any thread exists.
@@ -2113,6 +2089,11 @@ async fn delete_thread(
             }
         }
     }
+    let mut native_deletion = state
+        .registry
+        .begin_native_deletion(project_id, &deletion_order)
+        .await
+        .map_err(harness_api_error)?;
     let descendant_count = deletion_order.len().saturating_sub(1);
     info!(
         %project_id,
@@ -2198,6 +2179,9 @@ async fn delete_thread(
             );
             return Err(error.into());
         }
+        native_deletion
+            .mark_deleted(*candidate)
+            .map_err(harness_api_error)?;
 
         info!(
             %project_id,
@@ -4102,6 +4086,10 @@ impl WsError {
             }
             HarnessError::Transport(_) => ("harness_transport_error", "Codex transport failed."),
             HarnessError::Protocol(_) => ("harness_protocol_error", "Codex protocol error."),
+            HarnessError::ProviderRejected { .. } => (
+                "harness_provider_rejected",
+                "Codex rejected the requested operation.",
+            ),
             HarnessError::Overloaded => ("harness_overloaded", "Codex is overloaded."),
             HarnessError::Unsupported(_) => (
                 "harness_unsupported",

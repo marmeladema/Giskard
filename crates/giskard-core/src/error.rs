@@ -17,6 +17,8 @@ pub enum HarnessError {
     Transport(String),
     #[error("protocol error: {0}")]
     Protocol(String),
+    #[error("JSON-RPC error ({code}): {message}")]
+    ProviderRejected { code: i64, message: String },
     #[error("harness overloaded after retries exhausted")]
     Overloaded,
     #[error("capability not offered: {0}")]

@@ -2064,6 +2064,7 @@ pub enum HarnessError {
     Unauthenticated,          // harness reports missing/invalid credentials
     Transport(String),        // I/O / framing / connection error
     Protocol(String),         // unexpected/unparseable protocol message
+    ProviderRejected { code: i64, message: String }, // typed JSON-RPC error response
     Overloaded,               // JSON-RPC -32001 after retries exhausted
     Unsupported(String),      // capability not offered by this harness
     ThreadNotFound(ThreadId),

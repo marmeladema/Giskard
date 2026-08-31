@@ -114,6 +114,7 @@ async fn open_thread_one_turn_assert_state() {
             thread: None,
             workspace_root: "/tmp/test".into(),
             resume: Some("th_test_001".into()),
+            identity_generation: None,
             updates: giskard_harness::thread_update_channel().0,
             initial_model: Some(ModelRef {
                 provider: "openai".into(),
@@ -127,8 +128,14 @@ async fn open_thread_one_turn_assert_state() {
     assert_eq!(handle.thread, expected_thread);
     assert_eq!(handle.harness_thread_id, "th_test_001");
 
-    // Subscribe before starting turn
-    let mut stream = harness.subscribe(&handle);
+    // Claim the route and its event receiver before starting the turn.
+    let route = harness
+        .claim_native_route(handle.harness_thread_id.clone(), handle.thread)
+        .await
+        .expect("replay route should be claimable");
+    let mut stream = harness
+        .claim_event_receiver(&route)
+        .expect("replay event receiver should be claimable");
 
     // Start turn
     let _turn_id = harness
@@ -151,20 +158,14 @@ async fn open_thread_one_turn_assert_state() {
     // Collect events until TurnCompleted
     let mut events = Vec::new();
     let mut final_usage = None;
-    loop {
-        match stream.recv().await {
-            Ok(event) => {
-                if let AgentEvent::TurnCompleted { usage, .. } = &event {
-                    final_usage = Some(*usage);
-                }
-                let is_done = matches!(event, AgentEvent::TurnCompleted { .. });
-                events.push(event);
-                if is_done {
-                    break;
-                }
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+    while let Some(event) = stream.recv().await {
+        if let AgentEvent::TurnCompleted { usage, .. } = &event {
+            final_usage = Some(*usage);
+        }
+        let is_done = matches!(event, AgentEvent::TurnCompleted { .. });
+        events.push(event);
+        if is_done {
+            break;
         }
     }
 
@@ -250,6 +251,7 @@ async fn replay_persisted_state_roundtrip() {
             thread: None,
             workspace_root: "/tmp/test".into(),
             resume: Some("th_test_001".into()),
+            identity_generation: None,
             updates: giskard_harness::thread_update_channel().0,
             initial_model: Some(ModelRef {
                 provider: "openai".into(),
@@ -260,7 +262,13 @@ async fn replay_persisted_state_roundtrip() {
         .await
         .unwrap();
 
-    let mut stream = harness.subscribe(&handle);
+    let route = harness
+        .claim_native_route(handle.harness_thread_id.clone(), handle.thread)
+        .await
+        .expect("replay route should be claimable");
+    let mut stream = harness
+        .claim_event_receiver(&route)
+        .expect("replay event receiver should be claimable");
     let _ = harness
         .start_turn(
             &handle,
@@ -278,12 +286,12 @@ async fn replay_persisted_state_roundtrip() {
     let mut usage = TokenUsage::default();
     loop {
         match stream.recv().await {
-            Ok(AgentEvent::TurnCompleted { usage: u, .. }) => {
+            Some(AgentEvent::TurnCompleted { usage: u, .. }) => {
                 usage = u;
                 break;
             }
-            Ok(_) => continue,
-            Err(_) => break,
+            Some(_) => continue,
+            None => break,
         }
     }
 

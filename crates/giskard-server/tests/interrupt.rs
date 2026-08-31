@@ -2,6 +2,8 @@
 //! protocol.
 
 mod common;
+#[path = "common/event_channel.rs"]
+mod event_channel;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,15 +23,17 @@ use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+    AgentEventStream, AgentHarness, ClaimedNativeRoute, HarnessCapabilities, HarnessSignalStream,
+    OpenThreadOptions, ThreadHandle,
 };
 use giskard_persist::store::ProjectConfig;
 use giskard_proto::{ClientMessage, ErrorInfo, RunningTask, ServerMessage, WireAgentEvent};
 use giskard_server::{AppState, HarnessFactory, build_app};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 
 use common::fake_native_model;
+use event_channel::{BoundedEventRoute, TestRouteContract};
 
 type TestWs =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -44,7 +48,8 @@ enum TerminateBehavior {
 }
 
 struct InterruptHarness {
-    tx: broadcast::Sender<AgentEvent>,
+    route_contract: TestRouteContract,
+    tx: BoundedEventRoute,
     active: Mutex<Option<(ThreadId, TurnId)>>,
     command: Mutex<Option<(ThreadId, TurnId, ItemId)>>,
     interrupted: Mutex<Vec<ThreadId>>,
@@ -55,9 +60,9 @@ struct InterruptHarness {
 
 impl InterruptHarness {
     fn new() -> Self {
-        let (tx, _) = broadcast::channel(64);
         Self {
-            tx,
+            route_contract: TestRouteContract::new(),
+            tx: BoundedEventRoute::new(64),
             active: Mutex::new(None),
             command: Mutex::new(None),
             interrupted: Mutex::new(Vec::new()),
@@ -113,27 +118,30 @@ impl InterruptHarness {
         let Some((thread, turn, item_id)) = *self.command.lock().await else {
             panic!("command did not start");
         };
-        let _ = self.tx.send(AgentEvent::ItemCompleted {
-            thread,
-            turn,
-            item: Item {
-                id: item_id,
-                harness_item_id: "cmd1".into(),
-                payload: ItemPayload::CommandExecution {
-                    command: "sleep 60".into(),
-                    cwd: "/tmp/project".into(),
-                    output: "started\nfinished".into(),
-                    output_truncated: false,
-                    output_original_bytes: None,
-                    output_original_lines: None,
-                    exit_code: Some(0),
-                    status: Some("completed".into()),
-                    process_id: Some("proc_1".into()),
-                    duration_ms: Some(60_000),
+        let _ = self
+            .tx
+            .send(AgentEvent::ItemCompleted {
+                thread,
+                turn,
+                item: Item {
+                    id: item_id,
+                    harness_item_id: "cmd1".into(),
+                    payload: ItemPayload::CommandExecution {
+                        command: "sleep 60".into(),
+                        cwd: "/tmp/project".into(),
+                        output: "started\nfinished".into(),
+                        output_truncated: false,
+                        output_original_bytes: None,
+                        output_original_lines: None,
+                        exit_code: Some(0),
+                        status: Some("completed".into()),
+                        process_id: Some("proc_1".into()),
+                        duration_ms: Some(60_000),
+                    },
+                    created_at: Utc::now(),
                 },
-                created_at: Utc::now(),
-            },
-        });
+            })
+            .await;
     }
 }
 
@@ -161,16 +169,39 @@ impl AgentHarness for InterruptHarness {
         Ok(vec![])
     }
 
+    fn take_harness_signals(&self) -> Result<HarnessSignalStream, HarnessError> {
+        self.route_contract.take_harness_signals()
+    }
+
+    async fn claim_native_route(
+        &self,
+        harness_thread_id: String,
+        suggested_thread_id: ThreadId,
+    ) -> Result<ClaimedNativeRoute, HarnessError> {
+        self.route_contract
+            .claim_native_route(harness_thread_id, suggested_thread_id)
+    }
+
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
         let thread = opts.thread.unwrap_or_default();
-        Ok(ThreadHandle {
-            resumed_model: opts
-                .initial_model
-                .clone()
-                .or_else(|| Some(fake_native_model())),
-            ..ThreadHandle::opened(
-                thread,
+        let resumed_model = opts
+            .initial_model
+            .clone()
+            .or_else(|| Some(fake_native_model()));
+        let route = self
+            .route_contract
+            .activate_primary(
                 opts.resume.unwrap_or_else(|| "interrupt_harness".into()),
+                thread,
+                opts.identity_generation,
+                resumed_model.clone(),
+            )
+            .await?;
+        Ok(ThreadHandle {
+            resumed_model,
+            ..ThreadHandle::opened(
+                route.thread_id,
+                route.harness_thread_id,
                 opts.workspace_root.clone(),
             )
         })
@@ -184,42 +215,57 @@ impl AgentHarness for InterruptHarness {
     ) -> Result<TurnId, HarnessError> {
         let turn = TurnId::new();
         *self.active.lock().await = Some((thread.thread, turn));
-        let _ = self.tx.send(AgentEvent::TurnStarted {
-            thread: thread.thread,
-            turn,
-        });
+        let _ = self
+            .tx
+            .send(AgentEvent::TurnStarted {
+                thread: thread.thread,
+                turn,
+            })
+            .await;
         let command_item = ItemId::new();
         *self.command.lock().await = Some((thread.thread, turn, command_item));
-        let _ = self.tx.send(AgentEvent::ItemStarted {
-            thread: thread.thread,
-            turn,
-            item: ItemStart {
-                id: command_item,
-                harness_item_id: "cmd1".into(),
-                kind: ItemKind::CommandExecution,
-                command: Some(CommandExecutionStart {
-                    command: "sleep 60".into(),
-                    cwd: "/tmp/project".into(),
-                    status: Some("in_progress".into()),
-                    process_id: Some("proc_1".into()),
-                    started_at_ms: Some(Utc::now().timestamp_millis()),
-                }),
-                tool: None,
-            },
-        });
-        let _ = self.tx.send(AgentEvent::ItemDelta {
-            thread: thread.thread,
-            turn,
-            item_id: command_item,
-            delta: ItemDelta::CommandOutput {
-                chunk: "started".into(),
-            },
-        });
+        let _ = self
+            .tx
+            .send(AgentEvent::ItemStarted {
+                thread: thread.thread,
+                turn,
+                item: ItemStart {
+                    id: command_item,
+                    harness_item_id: "cmd1".into(),
+                    kind: ItemKind::CommandExecution,
+                    command: Some(CommandExecutionStart {
+                        command: "sleep 60".into(),
+                        cwd: "/tmp/project".into(),
+                        status: Some("in_progress".into()),
+                        process_id: Some("proc_1".into()),
+                        started_at_ms: Some(Utc::now().timestamp_millis()),
+                    }),
+                    tool: None,
+                },
+            })
+            .await;
+        let _ = self
+            .tx
+            .send(AgentEvent::ItemDelta {
+                thread: thread.thread,
+                turn,
+                item_id: command_item,
+                delta: ItemDelta::CommandOutput {
+                    chunk: "started".into(),
+                },
+            })
+            .await;
         Ok(turn)
     }
 
-    fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-        AgentEventStream::new(self.tx.subscribe())
+    fn claim_event_receiver(
+        &self,
+        _route: &ClaimedNativeRoute,
+    ) -> Result<AgentEventStream, HarnessError> {
+        Ok(self
+            .tx
+            .take_stream()
+            .expect("interrupt event receiver should be claimed once"))
     }
 
     async fn respond_approval(
@@ -250,15 +296,18 @@ impl AgentHarness for InterruptHarness {
             .take()
             .map(|(_, turn)| turn)
             .unwrap_or_default();
-        let _ = self.tx.send(AgentEvent::TurnCompleted {
-            thread: thread.thread,
-            turn,
-            usage: TokenUsage::default(),
-            status: TurnStatus {
-                kind: TurnStatusKind::Interrupted,
-                message: Some("Interrupted by user.".into()),
-            },
-        });
+        let _ = self
+            .tx
+            .send(AgentEvent::TurnCompleted {
+                thread: thread.thread,
+                turn,
+                usage: TokenUsage::default(),
+                status: TurnStatus {
+                    kind: TurnStatusKind::Interrupted,
+                    message: Some("Interrupted by user.".into()),
+                },
+            })
+            .await;
         Ok(())
     }
 

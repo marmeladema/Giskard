@@ -2,6 +2,9 @@
 //! still load **read-only**: the persisted history is served and a non-fatal `thread_read_only`
 //! warning is surfaced, instead of the whole subscribe failing with a JSON-RPC/harness error.
 
+#[path = "common/event_channel.rs"]
+mod event_channel;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -17,6 +20,8 @@ use giskard_persist::store::{ProjectConfig, ThreadFile};
 use giskard_proto::ClientMessage;
 use giskard_server::{AppState, HarnessFactory, build_app};
 
+use event_channel::TestRouteContract;
+
 /// Always fails to create a harness — simulating a thread whose provider has been removed from
 /// config, so the agent app-server can no longer be started/resumed for it.
 struct FailingFactory;
@@ -31,6 +36,7 @@ struct AttachFailsFactory {
 }
 
 struct AttachFails {
+    route_contract: TestRouteContract,
     inner: ReplayHarness,
 }
 
@@ -43,6 +49,19 @@ impl giskard_harness::AgentHarness for AttachFails {
         &self,
     ) -> Result<Vec<giskard_core::model::ModelDescriptor>, giskard_core::HarnessError> {
         self.inner.list_models().await
+    }
+    fn take_harness_signals(
+        &self,
+    ) -> Result<giskard_harness::HarnessSignalStream, giskard_core::HarnessError> {
+        self.route_contract.take_harness_signals()
+    }
+    async fn claim_native_route(
+        &self,
+        harness_thread_id: String,
+        suggested_thread_id: ThreadId,
+    ) -> Result<giskard_harness::ClaimedNativeRoute, giskard_core::HarnessError> {
+        self.route_contract
+            .claim_native_route(harness_thread_id, suggested_thread_id)
     }
     async fn list_providers(
         &self,
@@ -57,11 +76,11 @@ impl giskard_harness::AgentHarness for AttachFails {
             "unknown provider: cloudflare-litellm".into(),
         ))
     }
-    fn subscribe(
+    fn claim_event_receiver(
         &self,
-        thread: &giskard_harness::ThreadHandle,
-    ) -> giskard_harness::AgentEventStream {
-        self.inner.subscribe(thread)
+        route: &giskard_harness::ClaimedNativeRoute,
+    ) -> Result<giskard_harness::AgentEventStream, giskard_core::HarnessError> {
+        self.inner.claim_event_receiver(route)
     }
     async fn interrupt(
         &self,
@@ -101,7 +120,7 @@ impl HarnessFactory for AttachFailsFactory {
     async fn create(
         &self,
         _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
+        bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn giskard_harness::AgentHarness>, giskard_core::HarnessError> {
         let inner = if self.advertises_provider_listing {
             ReplayHarness::new().with_providers(self.providers.clone())
@@ -109,7 +128,10 @@ impl HarnessFactory for AttachFailsFactory {
             // Capability off, yet `list_providers` still returns `Ok(vec![])`.
             ReplayHarness::new()
         };
-        Ok(Arc::new(AttachFails { inner }))
+        Ok(Arc::new(AttachFails {
+            route_contract: TestRouteContract::new(),
+            inner: inner.with_bootstrap(bootstrap)?,
+        }))
     }
 }
 

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
 use giskard_core::approval::ApprovalDecision;
@@ -303,6 +303,9 @@ pub struct OpenThreadOptions {
     /// would silently move an existing conversation onto a different model. Starting a fresh
     /// thread, and reopening one Giskard already tracks, both pass `Some`.
     pub initial_model: Option<ModelRef>,
+    /// Registry-owned generation for a Primary identity response that must be held until the
+    /// durable binding and long-lived owner are ready.
+    pub identity_generation: Option<u64>,
     /// Bounded, non-blocking destination for metadata discovered after open returns.
     pub updates: ThreadUpdateSink,
 }
@@ -357,6 +360,90 @@ pub struct KnownThreadBinding {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HarnessBootstrap {
     pub known_threads: Vec<KnownThreadBinding>,
+}
+
+/// One authoritative native route for a harness process lifetime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedNativeRoute {
+    pub thread_id: ThreadId,
+    pub harness_thread_id: String,
+    pub route_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadActivationCause {
+    Notification {
+        method: String,
+    },
+    ServerRequest {
+        method: String,
+    },
+    IdentityResponse {
+        method: String,
+        generation: u64,
+        reported_model: Option<ModelRef>,
+    },
+}
+
+/// The registry owns this one-use acknowledgement. Success means the route's receiver has been
+/// claimed and its long-lived coordinator is Live; the adapter retains the triggering frame until
+/// then.
+#[derive(Debug)]
+pub struct ThreadActivationAck(Option<oneshot::Sender<Result<(), HarnessError>>>);
+
+impl ThreadActivationAck {
+    pub fn acknowledge(mut self, result: Result<(), HarnessError>) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(result);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ThreadActivation {
+    pub route: ClaimedNativeRoute,
+    pub cause: ThreadActivationCause,
+    pub readiness: ThreadActivationAck,
+}
+
+pub enum HarnessSignal {
+    Activate(ThreadActivation),
+    PrimaryIdentityFailed {
+        thread_id: ThreadId,
+        generation: u64,
+        error: String,
+    },
+}
+
+pub struct HarnessSignalStream(mpsc::Receiver<HarnessSignal>);
+
+impl HarnessSignalStream {
+    pub fn new(receiver: mpsc::Receiver<HarnessSignal>) -> Self {
+        Self(receiver)
+    }
+
+    pub async fn recv(&mut self) -> Option<HarnessSignal> {
+        self.0.recv().await
+    }
+}
+
+/// Build an activation and the private readiness receiver retained by the adapter.
+pub fn thread_activation(
+    route: ClaimedNativeRoute,
+    cause: ThreadActivationCause,
+) -> (
+    ThreadActivation,
+    oneshot::Receiver<Result<(), HarnessError>>,
+) {
+    let (sender, receiver) = oneshot::channel();
+    (
+        ThreadActivation {
+            route,
+            cause,
+            readiness: ThreadActivationAck(Some(sender)),
+        },
+        receiver,
+    )
 }
 
 /// Handle to an opened thread.
@@ -420,35 +507,26 @@ pub struct HarnessNotice {
     pub detail: Option<String>,
 }
 
-/// A typed wrapper around a `broadcast::Receiver<AgentEvent>`.
+/// A bounded, exclusive event receiver for one native route epoch.
 pub struct AgentEventStream {
-    rx: broadcast::Receiver<AgentEvent>,
+    rx: mpsc::Receiver<AgentEvent>,
 }
 
 impl AgentEventStream {
-    pub fn new(rx: broadcast::Receiver<AgentEvent>) -> Self {
-        Self { rx }
-    }
-
-    /// Returns the underlying receiver.
-    pub fn into_inner(self) -> broadcast::Receiver<AgentEvent> {
-        self.rx
+    pub fn new(receiver: mpsc::Receiver<AgentEvent>) -> Self {
+        Self { rx: receiver }
     }
 
     /// Recv next event (awaits).
-    pub async fn recv(&mut self) -> Result<AgentEvent, broadcast::error::RecvError> {
+    pub async fn recv(&mut self) -> Option<AgentEvent> {
         self.rx.recv().await
     }
 
     /// Convert to a `BoxStream` for ergonomic use with `futures`.
     pub fn into_stream(self) -> BoxStream<'static, AgentEvent> {
         use futures::StreamExt;
-        let rx = self.rx;
-        futures::stream::unfold(rx, |mut rx| async move {
-            match rx.recv().await {
-                Ok(event) => Some((event, rx)),
-                Err(_) => None,
-            }
+        futures::stream::unfold(self, |mut stream| async move {
+            stream.recv().await.map(|event| (event, stream))
         })
         .boxed()
     }
@@ -510,20 +588,43 @@ pub trait AgentHarness: Send + Sync {
     /// Bind a harness-native thread identity without starting or resuming native work.
     ///
     /// This is used when an already-running agent reports a child thread. The returned handle is
-    /// immediately subscribable, but the operation must not issue a provider RPC or make the
-    /// read-only child user-operable. Repeating the same pair is idempotent; either side already
-    /// bound to a different identity is a protocol error.
+    /// immediately available for an exclusive receiver claim, but the operation must not issue a
+    /// provider RPC or make the read-only child user-operable. `suggested_thread_id` supplies the
+    /// local identity only for a native id's first claim. An existing native route is authoritative
+    /// and is returned unchanged even when it has a different local identity; an unknown native id
+    /// whose suggested local identity is already bound elsewhere is a protocol error. Claims never
+    /// rekey an existing route.
     async fn claim_native_thread(
         &self,
-        thread: ThreadId,
+        suggested_thread_id: ThreadId,
         harness_thread_id: String,
         workspace_root: PathBuf,
     ) -> Result<ThreadHandle, HarnessError> {
-        let _ = (thread, harness_thread_id, workspace_root);
+        let _ = (suggested_thread_id, harness_thread_id, workspace_root);
         Err(HarnessError::Unsupported(
             "native thread identity claims are not supported by this harness".into(),
         ))
     }
+
+    /// Take the one bounded stream of harness-level activation signals.
+    fn take_harness_signals(&self) -> Result<HarnessSignalStream, HarnessError>;
+
+    /// Atomically claim or look up the authoritative route for a native thread id.
+    ///
+    /// `suggested_thread_id` is used only when the native id has no route. Once claimed, the native
+    /// route remains authoritative and a later lookup returns it unchanged rather than rekeying it
+    /// to a different suggestion.
+    async fn claim_native_route(
+        &self,
+        harness_thread_id: String,
+        suggested_thread_id: ThreadId,
+    ) -> Result<ClaimedNativeRoute, HarnessError>;
+
+    /// Claim the one non-cloneable event receiver for a native route epoch.
+    fn claim_event_receiver(
+        &self,
+        route: &ClaimedNativeRoute,
+    ) -> Result<AgentEventStream, HarnessError>;
 
     /// Start a turn: send user input, applying per-turn overrides.
     async fn start_turn(
@@ -532,9 +633,6 @@ pub trait AgentHarness: Send + Sync {
         input: UserInput,
         overrides: TurnOverrides,
     ) -> Result<TurnId, HarnessError>;
-
-    /// Subscribe to the stream of neutral events for a thread.
-    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream;
 
     /// Respond to a pending approval request.
     async fn respond_approval(

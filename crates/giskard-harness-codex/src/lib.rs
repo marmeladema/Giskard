@@ -1,6 +1,7 @@
 //! Codex CLI harness adapter (spec §4.6).
 //!
-//! Wraps `codex-codes::AsyncClient` and implements the `AgentHarness` trait.
+//! Uses `codex-codes` protocol types with a single-reader, bounded JSON-RPC transport and
+//! implements the `AgentHarness` trait.
 //! All Codex-specific types are confined to this crate and mapped to
 //! `giskard-core` types at the boundary.
 //!
@@ -9,11 +10,14 @@
 
 mod log_fields;
 mod mapping;
+mod transport;
 
 use crate::log_fields::display_opt;
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, Weak};
 use std::time::{Duration, Instant};
 
@@ -21,7 +25,7 @@ use async_trait::async_trait;
 use rand::RngCore;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 
 use giskard_core::approval::ApprovalDecision;
@@ -39,14 +43,16 @@ use giskard_core::token::TokenUsage;
 use giskard_core::turn::{PermissionPreset, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::{AttachmentKind, UserAttachment, UserInput};
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessBootstrap, HarnessCapabilities, HarnessNotice,
-    HarnessProvider, OpenThreadOptions, ProviderAuth, ProviderAuthCommand, ThreadHandle,
-    ThreadUpdate,
+    AgentEventStream, AgentHarness, ClaimedNativeRoute, HarnessBootstrap, HarnessCapabilities,
+    HarnessNotice, HarnessProvider, HarnessSignal, HarnessSignalStream, OpenThreadOptions,
+    ProviderAuth, ProviderAuthCommand, ThreadActivationCause, ThreadHandle, ThreadUpdate,
+    thread_activation,
 };
 
 use mapping::CodexMapper;
 
-const BROADCAST_CAPACITY: usize = 256;
+const ROUTE_CAPACITY: usize = 256;
+const HARNESS_SIGNAL_CAPACITY: usize = 64;
 const TURN_FIRST_EVENT_WARN_AFTER: Duration = Duration::from_secs(15);
 #[cfg(not(test))]
 const CODEX_JSON_RPC_TIMEOUT: Duration = Duration::from_secs(10);
@@ -71,7 +77,6 @@ struct PendingContextRestore {
 
 struct OpenThreadOutcome {
     handle: ThreadHandle,
-    resume_replay_model: Option<ModelRef>,
 }
 
 #[derive(Debug, Serialize)]
@@ -295,10 +300,25 @@ enum ControlCommand {
 struct WorkerReceivers {
     commands: mpsc::Receiver<QueuedHarnessCommand>,
     controls: mpsc::Receiver<QueuedControlCommand>,
+    urgent_controls: mpsc::Receiver<QueuedControlCommand>,
     shutdown: watch::Receiver<bool>,
 }
 
-type SenderMap = Arc<StdMutex<HashMap<ThreadId, broadcast::Sender<AgentEvent>>>>;
+struct NativeRouteEntry {
+    route: ClaimedNativeRoute,
+    event_tx: mpsc::Sender<AgentEvent>,
+    receiver: Option<mpsc::Receiver<AgentEvent>>,
+    ready: bool,
+}
+
+#[derive(Default)]
+struct NativeRoutes {
+    by_native: HashMap<String, NativeRouteEntry>,
+    native_by_thread: HashMap<ThreadId, String>,
+    next_route_epoch: u64,
+}
+
+type RouteMap = Arc<StdMutex<NativeRoutes>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerQueueKind {
@@ -347,7 +367,7 @@ struct WorkerQueueSnapshot {
 struct WorkerQueueState {
     next_id: u64,
     pending: HashMap<u64, WorkerQueueToken>,
-    active: Option<WorkerQueueToken>,
+    active: HashMap<u64, WorkerQueueToken>,
     closed: bool,
 }
 
@@ -362,7 +382,7 @@ impl WorkerQueueWatchdog {
             state: StdMutex::new(WorkerQueueState {
                 next_id: 1,
                 pending: HashMap::new(),
-                active: None,
+                active: HashMap::new(),
                 closed: false,
             }),
         }
@@ -396,14 +416,12 @@ impl WorkerQueueWatchdog {
     fn mark_started(&self, token: WorkerQueueToken) {
         let mut state = self.lock_state();
         state.pending.remove(&token.id);
-        state.active = Some(token);
+        state.active.insert(token.id, token);
     }
 
     fn mark_finished(&self, token: WorkerQueueToken) {
         let mut state = self.lock_state();
-        if state.active.is_some_and(|active| active.id == token.id) {
-            state.active = None;
-        }
+        state.active.remove(&token.id);
     }
 
     fn close(&self) {
@@ -427,7 +445,12 @@ impl WorkerQueueWatchdog {
         }
 
         WorkerQueueSnapshot {
-            active: state.active.map(|token| snapshot_queue_token(token, now)),
+            active: state
+                .active
+                .values()
+                .copied()
+                .min_by_key(|token| token.enqueued_at)
+                .map(|token| snapshot_queue_token(token, now)),
             oldest_pending: oldest_pending.map(|token| snapshot_queue_token(token, now)),
             command_pending,
             control_pending,
@@ -632,9 +655,23 @@ trait CodexTransport: Send {
         params: serde_json::Value,
     ) -> Result<serde_json::Value, HarnessError>;
 
-    async fn next_message(
+    async fn request_json_with_hook(
         &mut self,
-    ) -> Result<Option<codex_codes::ServerMessage>, CodexStreamError>;
+        method: &str,
+        params: serde_json::Value,
+        hook: transport::SuccessResponseHook,
+        _lifetime: transport::CorrelationLifetime,
+        _abandoned_error_hook: Option<transport::AbandonedErrorHook>,
+    ) -> Result<serde_json::Value, HarnessError> {
+        let response = self.request_json(method, params).await?;
+        hook(response).await
+    }
+
+    async fn submit_control_request_json(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<PendingCodexResponse, HarnessError>;
 
     async fn respond_json(
         &mut self,
@@ -649,9 +686,19 @@ trait CodexTransport: Send {
         message: &str,
     ) -> Result<(), HarnessError>;
 
-    async fn shutdown_transport(self) -> Result<(), HarnessError>
+    async fn shutdown_transport(self, deadline: tokio::time::Instant) -> Result<(), HarnessError>
     where
         Self: Sized;
+}
+
+type PendingCodexResponse =
+    Pin<Box<dyn Future<Output = Result<serde_json::Value, HarnessError>> + Send>>;
+
+#[async_trait]
+trait CodexFrameReceiver: Send {
+    async fn next_message(
+        &mut self,
+    ) -> Result<Option<transport::ProductionFrame>, CodexStreamError>;
 }
 
 #[derive(Debug)]
@@ -676,55 +723,36 @@ fn bounded_utf8_preview(value: &str, max_bytes: usize) -> String {
     value[..end].to_owned()
 }
 
-fn classify_codex_stream_error(error: codex_codes::Error) -> CodexStreamError {
-    match error {
-        codex_codes::Error::Deserialization(parse_error)
-            if parse_error.method.is_none()
-                && parse_error.raw_json.is_none()
-                && !parse_error.raw_line.trim_start().starts_with('{') =>
-        {
-            CodexStreamError::NonJsonStdout {
-                raw_preview: bounded_utf8_preview(
-                    &parse_error.raw_line,
-                    NON_JSON_STDOUT_PREVIEW_BYTES,
-                ),
-                raw_bytes: parse_error.raw_line.len(),
-                parse_error: parse_error.error_message,
-            }
-        }
-        codex_codes::Error::Deserialization(parse_error) => {
-            let raw_preview =
-                bounded_utf8_preview(&parse_error.raw_line, NON_JSON_STDOUT_PREVIEW_BYTES);
-            let method = parse_error.method.as_deref().unwrap_or("unknown");
-            CodexStreamError::Fatal(HarnessError::Transport(format!(
-                "Codex JSON-RPC deserialization error for method {method}: {} \
-                 (raw_bytes: {}, raw_preview: {raw_preview:?})",
-                parse_error.error_message,
-                parse_error.raw_line.len(),
-            )))
-        }
-        error => CodexStreamError::Fatal(HarnessError::Transport(error.to_string())),
-    }
-}
-
 #[async_trait]
-impl CodexTransport for codex_codes::AsyncClient {
+impl CodexTransport for transport::DispatchClient {
     async fn request_json(
         &mut self,
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, HarnessError> {
-        self.request(method, &params)
-            .await
-            .map_err(|e| HarnessError::Transport(e.to_string()))
+        self.request(method, params).await
     }
 
-    async fn next_message(
+    async fn request_json_with_hook(
         &mut self,
-    ) -> Result<Option<codex_codes::ServerMessage>, CodexStreamError> {
-        self.next_message()
+        method: &str,
+        params: serde_json::Value,
+        hook: transport::SuccessResponseHook,
+        lifetime: transport::CorrelationLifetime,
+        abandoned_error_hook: Option<transport::AbandonedErrorHook>,
+    ) -> Result<serde_json::Value, HarnessError> {
+        self.request_with_hook(method, params, hook, lifetime, abandoned_error_hook)
             .await
-            .map_err(classify_codex_stream_error)
+    }
+
+    async fn submit_control_request_json(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<PendingCodexResponse, HarnessError> {
+        let response = self.submit_control_request(method, params)?;
+        let method = method.to_owned();
+        Ok(Box::pin(async move { response.receive(&method).await }))
     }
 
     async fn respond_json(
@@ -732,9 +760,7 @@ impl CodexTransport for codex_codes::AsyncClient {
         id: codex_codes::jsonrpc::RequestId,
         value: serde_json::Value,
     ) -> Result<(), HarnessError> {
-        self.respond(id, &value)
-            .await
-            .map_err(|e| HarnessError::Transport(e.to_string()))
+        self.respond(id, value).await
     }
 
     async fn respond_error_json(
@@ -743,15 +769,20 @@ impl CodexTransport for codex_codes::AsyncClient {
         code: i64,
         message: &str,
     ) -> Result<(), HarnessError> {
-        self.respond_error(id, code, message)
-            .await
-            .map_err(|e| HarnessError::Transport(e.to_string()))
+        self.respond_error(id, code, message).await
     }
 
-    async fn shutdown_transport(self) -> Result<(), HarnessError> {
-        self.shutdown()
-            .await
-            .map_err(|e| HarnessError::Transport(e.to_string()))
+    async fn shutdown_transport(self, deadline: tokio::time::Instant) -> Result<(), HarnessError> {
+        self.shutdown(deadline).await
+    }
+}
+
+#[async_trait]
+impl CodexFrameReceiver for transport::ProductionFrameReceiver {
+    async fn next_message(
+        &mut self,
+    ) -> Result<Option<transport::ProductionFrame>, CodexStreamError> {
+        transport::ProductionFrameReceiver::next_message(self).await
     }
 }
 
@@ -778,6 +809,39 @@ where
                 );
                 HarnessError::Timeout(format!("Codex JSON-RPC request {method} timed out"))
             })??;
+    serde_json::from_value(response).map_err(|e| HarnessError::Protocol(e.to_string()))
+}
+
+async fn codex_request_with_hook<P, R>(
+    client: &mut dyn CodexTransport,
+    context: CodexOperationContext<'_>,
+    method: &str,
+    params: &P,
+    hook: transport::SuccessResponseHook,
+    lifetime: transport::CorrelationLifetime,
+    abandoned_error_hook: Option<transport::AbandonedErrorHook>,
+) -> Result<R, HarnessError>
+where
+    P: Serialize + Sync,
+    R: DeserializeOwned,
+{
+    let params = serde_json::to_value(params).map_err(|e| HarnessError::Protocol(e.to_string()))?;
+    let started = Instant::now();
+    let response = tokio::time::timeout(
+        CODEX_JSON_RPC_TIMEOUT,
+        client.request_json_with_hook(method, params, hook, lifetime, abandoned_error_hook),
+    )
+    .await
+    .map_err(|_| {
+        context.log_timeout(
+            Some(method),
+            started.elapsed(),
+            "Codex JSON-RPC request or identity activation timed out",
+        );
+        HarnessError::Timeout(format!(
+            "Codex JSON-RPC request or identity activation {method} timed out"
+        ))
+    })??;
     serde_json::from_value(response).map_err(|e| HarnessError::Protocol(e.to_string()))
 }
 
@@ -838,7 +902,9 @@ pub struct CodexHarness {
     client_version: Option<String>,
     cmd_tx: mpsc::Sender<QueuedHarnessCommand>,
     control_tx: mpsc::Sender<QueuedControlCommand>,
-    senders: SenderMap,
+    urgent_control_tx: mpsc::Sender<QueuedControlCommand>,
+    routes: RouteMap,
+    signals: StdMutex<Option<mpsc::Receiver<HarnessSignal>>>,
     worker_queue: Arc<WorkerQueueWatchdog>,
     shutdown_tx: watch::Sender<bool>,
     worker_done: watch::Receiver<bool>,
@@ -855,13 +921,13 @@ impl CodexHarness {
         bootstrap: HarnessBootstrap,
     ) -> Result<Arc<Self>, HarnessError> {
         let workspace_root = normalize_workspace_root(workspace_root)?;
-        let (mut client, client_version) =
+        let (client, frames, client_version) =
             start_codex_client(codex_codes::AppServerBuilder::new()).await?;
-        let writable_roots = configured_workspace_write_roots(&mut client, &workspace_root).await;
         Self::spawn_harness(
             client,
+            frames,
             workspace_root,
-            writable_roots,
+            None,
             client_version,
             bootstrap,
         )
@@ -873,36 +939,40 @@ impl CodexHarness {
     ) -> Result<Arc<Self>, HarnessError> {
         let workspace_root = normalize_workspace_root(workspace_root)?;
         let builder = codex_codes::cli::AppServerBuilder::new().command(codex_path);
-        let (mut client, client_version) = start_codex_client(builder).await?;
-        let writable_roots = configured_workspace_write_roots(&mut client, &workspace_root).await;
+        let (client, frames, client_version) = start_codex_client(builder).await?;
         Self::spawn_harness(
             client,
+            frames,
             workspace_root,
-            writable_roots,
+            None,
             client_version,
             HarnessBootstrap::default(),
         )
     }
 
-    fn spawn_harness<C>(
+    fn spawn_harness<C, R>(
         client: C,
+        frames: R,
         workspace_root: PathBuf,
-        writable_roots: Vec<PathBuf>,
+        writable_roots: Option<Vec<PathBuf>>,
         client_version: Option<String>,
         bootstrap: HarnessBootstrap,
     ) -> Result<Arc<Self>, HarnessError>
     where
-        C: CodexTransport + 'static,
+        C: CodexTransport + Clone + 'static,
+        R: CodexFrameReceiver + 'static,
     {
         let mut mapper = CodexMapper::new(workspace_root.clone());
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (control_tx, control_rx) = mpsc::channel(64);
-        let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
+        let (urgent_control_tx, urgent_control_rx) = mpsc::channel(64);
+        let routes: RouteMap = Arc::new(StdMutex::new(NativeRoutes::default()));
         for binding in bootstrap.known_threads {
-            mapper.claim_thread(binding.harness_thread_id, binding.thread_id)?;
-            let (sender, _) = broadcast::channel(BROADCAST_CAPACITY);
-            ensure_thread_sender(&senders, binding.thread_id, sender);
+            let native_id = binding.harness_thread_id;
+            let route = claim_native_route(&routes, &native_id, binding.thread_id)?;
+            mapper.claim_thread(native_id, route.thread_id)?;
         }
+        let (signal_tx, signal_rx) = mpsc::channel(HARNESS_SIGNAL_CAPACITY);
         let worker_queue = Arc::new(WorkerQueueWatchdog::new());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (worker_done_tx, worker_done) = watch::channel(false);
@@ -912,7 +982,9 @@ impl CodexHarness {
             client_version,
             cmd_tx,
             control_tx,
-            senders: senders.clone(),
+            urgent_control_tx,
+            routes: routes.clone(),
+            signals: StdMutex::new(Some(signal_rx)),
             worker_queue: worker_queue.clone(),
             shutdown_tx,
             worker_done,
@@ -937,12 +1009,15 @@ impl CodexHarness {
         tokio::spawn(async move {
             background_task(
                 client,
+                frames,
                 WorkerReceivers {
                     commands: cmd_rx,
                     controls: control_rx,
+                    urgent_controls: urgent_control_rx,
                     shutdown: shutdown_rx,
                 },
-                senders,
+                routes,
+                signal_tx,
                 worker_queue,
                 workspace_root,
                 writable_roots,
@@ -993,8 +1068,14 @@ impl CodexHarness {
         let token = self
             .worker_queue
             .enqueue(WorkerQueueKind::Control, action, None, thread_id);
-        self.control_tx
-            .send(QueuedControlCommand { token, command })
+        let tx = match &command {
+            ControlCommand::RespondApproval { .. }
+            | ControlCommand::RespondServerRequest { .. }
+            | ControlCommand::Interrupt { .. }
+            | ControlCommand::TerminateCommand { .. } => &self.urgent_control_tx,
+            _ => &self.control_tx,
+        };
+        tx.send(QueuedControlCommand { token, command })
             .await
             .map_err(|_| {
                 self.worker_queue.cancel(token);
@@ -1019,14 +1100,50 @@ fn normalize_workspace_root(workspace_root: PathBuf) -> Result<PathBuf, HarnessE
 
 async fn start_codex_client(
     builder: codex_codes::AppServerBuilder,
-) -> Result<(codex_codes::AsyncClient, Option<String>), HarnessError> {
-    let mut client = codex_codes::AsyncClient::spawn(builder)
-        .await
-        .map_err(|e| HarnessError::Spawn(e.to_string()))?;
-    let response = client
-        .initialize(&build_initialize_params())
-        .await
-        .map_err(|e| HarnessError::Spawn(e.to_string()))?;
+) -> Result<
+    (
+        transport::DispatchClient,
+        transport::ProductionFrameReceiver,
+        Option<String>,
+    ),
+    HarnessError,
+> {
+    let (client, mut frames) = transport::DispatchClient::spawn(builder).await?;
+    let params = serde_json::to_value(build_initialize_params())
+        .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+    let initialize_client = client.clone();
+    let initialize = initialize_client.request(codex_codes::protocol::methods::INITIALIZE, params);
+    tokio::pin!(initialize);
+    let value = tokio::select! {
+        biased;
+        result = &mut initialize => {
+            result.map_err(|error| HarnessError::Spawn(error.to_string()))?
+        }
+        frame = frames.next_message() => {
+            let error = match frame {
+                Ok(Some(frame)) => {
+                    let (_, acknowledgement) = frame.into_parts();
+                    let error = HarnessError::Protocol(
+                        "Codex emitted a production frame before initialize completed".into(),
+                    );
+                    acknowledgement.acknowledge(Err(error.clone()));
+                    error
+                }
+                Ok(None) => HarnessError::Transport(
+                    "Codex stdout closed before initialize completed".into(),
+                ),
+                Err(CodexStreamError::NonJsonStdout { parse_error, .. }) => {
+                    HarnessError::Transport(format!(
+                        "Codex wrote non-JSON stdout before initialize completed: {parse_error}"
+                    ))
+                }
+                Err(CodexStreamError::Fatal(error)) => error,
+            };
+            return Err(HarnessError::Spawn(error.to_string()));
+        }
+    };
+    let response: codex_codes::InitializeResponse =
+        serde_json::from_value(value).map_err(|error| HarnessError::Spawn(error.to_string()))?;
     let version = codex_version_from_user_agent(&response.user_agent);
     match version.as_deref() {
         Some(version) => warn_if_codex_is_newer_than_tested(version),
@@ -1037,7 +1154,7 @@ async fn start_codex_client(
              /models discovery will not identify a client version"
         ),
     }
-    Ok((client, version))
+    Ok((client, frames, version))
 }
 
 /// Warn when the running Codex CLI is newer than the release the `codex-codes` bindings were last
@@ -1301,6 +1418,53 @@ impl AgentHarness for CodexHarness {
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
     }
 
+    fn take_harness_signals(&self) -> Result<HarnessSignalStream, HarnessError> {
+        let mut signals = self.signals.lock().map_err(|_| {
+            HarnessError::Transport("Codex harness signal lock was poisoned".into())
+        })?;
+        signals
+            .take()
+            .map(HarnessSignalStream::new)
+            .ok_or_else(|| HarnessError::Protocol("harness signal stream was already taken".into()))
+    }
+
+    async fn claim_native_route(
+        &self,
+        harness_thread_id: String,
+        suggested_thread_id: ThreadId,
+    ) -> Result<ClaimedNativeRoute, HarnessError> {
+        self.claim_native_thread(
+            suggested_thread_id,
+            harness_thread_id.clone(),
+            PathBuf::new(),
+        )
+        .await?;
+        route_for_native(&self.routes, &harness_thread_id)?.ok_or_else(|| {
+            HarnessError::Protocol(format!(
+                "native thread {harness_thread_id} was claimed without a route"
+            ))
+        })
+    }
+
+    fn claim_event_receiver(
+        &self,
+        route: &ClaimedNativeRoute,
+    ) -> Result<AgentEventStream, HarnessError> {
+        let mut routes = lock_routes(&self.routes)?;
+        let entry = routes
+            .by_native
+            .get_mut(&route.harness_thread_id)
+            .filter(|entry| entry.route == *route)
+            .ok_or_else(|| HarnessError::Protocol("stale or unknown native route".into()))?;
+        let receiver = entry.receiver.take().ok_or_else(|| {
+            HarnessError::Protocol(format!(
+                "native route {} event receiver was already claimed",
+                route.harness_thread_id
+            ))
+        })?;
+        Ok(AgentEventStream::new(receiver))
+    }
+
     async fn start_turn(
         &self,
         thread: &ThreadHandle,
@@ -1320,14 +1484,6 @@ impl AgentHarness for CodexHarness {
         .await?;
         rx.await
             .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
-    }
-
-    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Some(sender) = sender_for_thread(&self.senders, thread.thread) {
-            return AgentEventStream::new(sender.subscribe());
-        }
-        let (_, rx) = broadcast::channel(1);
-        AgentEventStream::new(rx)
     }
 
     async fn respond_approval(
@@ -1477,234 +1633,594 @@ impl AgentHarness for CodexHarness {
     }
 }
 
-async fn background_task<C>(
+#[allow(clippy::too_many_arguments)]
+async fn background_task<C, R>(
     mut client: C,
+    frames: R,
     receivers: WorkerReceivers,
-    senders: SenderMap,
+    routes: RouteMap,
+    signal_tx: mpsc::Sender<HarnessSignal>,
     worker_queue: Arc<WorkerQueueWatchdog>,
     workspace_root: PathBuf,
-    writable_roots: Vec<PathBuf>,
-    mut mapper: CodexMapper,
+    configured_writable_roots: Option<Vec<PathBuf>>,
+    mapper: CodexMapper,
 ) where
-    C: CodexTransport,
+    C: CodexTransport + Clone + 'static,
+    R: CodexFrameReceiver + 'static,
 {
     let WorkerReceivers {
-        mut commands,
-        mut controls,
+        commands,
+        controls,
+        urgent_controls,
         mut shutdown,
     } = receivers;
-    let mut pending_compactions: HashMap<ThreadId, PendingCompaction> = HashMap::new();
-    let mut pending_context_restores: HashMap<String, PendingContextRestore> = HashMap::new();
-    let mut active_turns: ActiveTurns = HashMap::new();
-    let mut first_event_warn_tick = tokio::time::interval(Duration::from_secs(1));
+    let state = Arc::new(StdMutex::new(BackgroundState {
+        mapper,
+        pending_compactions: HashMap::new(),
+        pending_context_restores: HashMap::new(),
+        active_turns: HashMap::new(),
+    }));
+    let inbound = run_inbound_dispatch(
+        client.clone(),
+        frames,
+        state.clone(),
+        routes.clone(),
+        signal_tx.clone(),
+        workspace_root.clone(),
+    );
+    tokio::pin!(inbound);
 
-    loop {
-        tokio::select! {
-            biased;
-            _ = wait_for_shutdown_request(&mut shutdown) => {
-                cleanup_all_active_turn_uploads(&mut client, &mut active_turns).await;
-                shutdown_codex_transport(client, &workspace_root).await;
-                break;
-            }
-            msg = client.next_message(), if should_poll_codex_messages(&mapper, &active_turns, &pending_compactions) || !pending_context_restores.is_empty() => {
-                match msg {
-                    Ok(Some(msg)) => {
-                        observe_pending_context_restore(&mut pending_context_restores, &msg);
-                        match handle_background_server_message(
-                                &mut client,
-                                &mut mapper,
-                                &senders,
-                                &mut pending_compactions,
-                                &mut active_turns,
-                                msg,
-                            )
-                            .await
-                        {
-                            StreamOutcome::TurnEnded => {}
-                            StreamOutcome::CompactionCompleted { thread, elapsed_ms } => {
-                                info!(
-                                    %thread,
-                                    elapsed_ms,
-                                    pending_compactions = pending_compactions.len(),
-                                    "Codex context compaction completion observed"
-                                );
-                            }
-                            StreamOutcome::Shutdown => {
-                                cleanup_all_active_turn_uploads(&mut client, &mut active_turns).await;
-                                shutdown_codex_transport(client, &workspace_root).await;
-                                break;
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        cleanup_all_active_turn_uploads(&mut client, &mut active_turns).await;
-                        emit_incomplete_active_turns(
-                            &senders,
-                            &mut mapper,
-                            &mut active_turns,
-                            "Codex stream ended before turn completion",
-                        )
-                        .await;
-                        if !pending_compactions.is_empty() {
-                            warn!(
-                                action = "read_codex_stream",
-                                workspace_root = %workspace_root.display(),
-                                pending_compactions = pending_compactions.len(),
-                                pending_compaction_states = ?pending_compaction_states(&pending_compactions),
-                                "Codex message stream ended with pending context compactions"
-                            );
-                        }
-                        break;
-                    }
-                    Err(CodexStreamError::NonJsonStdout {
-                        parse_error,
-                        raw_preview,
-                        raw_bytes,
-                    }) => {
-                        warn!(
-                            active_turns = active_turns.len(),
-                            pending_compactions = pending_compactions.len(),
-                            pending_compaction_states = ?pending_compaction_states(&pending_compactions),
-                            workspace_root = %workspace_root.display(),
-                            error = %parse_error,
-                            raw_bytes,
-                            raw_preview = ?raw_preview,
-                            "Ignoring non-JSON line from Codex app-server stdout"
-                        );
-                    }
-                    Err(CodexStreamError::Fatal(e)) => {
-                        let message = e.to_string();
-                        if active_turns.is_empty() {
-                            warn!(
-                                action = "read_codex_stream",
-                                error = %message,
-                                pending_compactions = pending_compactions.len(),
-                                pending_compaction_states = ?pending_compaction_states(&pending_compactions),
-                                workspace_root = %workspace_root.display(),
-                                "Codex idle stream failed while background work was running"
-                            );
-                        } else {
-                            warn!(
-                                action = "read_codex_stream",
-                                error = %message,
-                                active_turns = active_turns.len(),
-                                active_turn_states = ?active_turn_states(&active_turns),
-                                pending_compactions = pending_compactions.len(),
-                                pending_compaction_states = ?pending_compaction_states(&pending_compactions),
-                                workspace_root = %workspace_root.display(),
-                                "Codex stream failed before all active turns completed"
-                            );
-                            cleanup_all_active_turn_uploads(&mut client, &mut active_turns).await;
-                            emit_incomplete_active_turns(
-                                &senders,
-                                &mut mapper,
-                                &mut active_turns,
-                                format!("Codex stream failed before turn completion: {message}"),
-                            )
-                            .await;
-                        }
-                        break;
-                    }
-                }
-            }
-            queued = commands.recv() => {
-                let queued = match queued {
-                    Some(queued) => queued,
-                    None => {
-                        cleanup_all_active_turn_uploads(&mut client, &mut active_turns).await;
-                        break;
-                    }
-                };
-                worker_queue.mark_started(queued.token);
-
-                match queued.command {
-                    HarnessCommand::OpenThread { opts, response } => {
-                        let result =
-                            handle_open_thread(&mut client, &mut mapper, &opts, &senders).await;
-                        match result {
-                            Ok(outcome) => {
-                                let handle = outcome.handle;
-                                if let Some(model) = outcome.resume_replay_model {
-                                    let replaced = pending_context_restores.insert(handle.harness_thread_id.clone(), PendingContextRestore {
-                                        thread: handle.thread,
-                                        model,
-                                        sink: opts.updates.clone(),
-                                    });
-                                    if let Some(replaced) = replaced {
-                                        warn!(thread_id = %handle.thread,
-                                            replaced_thread_id = %replaced.thread,
-                                            harness_thread_id = %handle.harness_thread_id,
-                                            "replaced an overlapping pending context restore");
-                                    }
-                                }
-                                let _ = response.send(Ok(handle));
-                            }
-                            Err(error) => { let _ = response.send(Err(error)); }
-                        }
-                    }
-                    HarnessCommand::StartTurn {
-                        thread,
-                        input,
-                        overrides,
-                        response,
-                    } => {
-                        match handle_start_turn(
-                            &mut client,
-                            &mut mapper,
-                            &thread,
-                            &input,
-                            &overrides,
-                            &writable_roots,
-                        )
-                        .await
-                        {
-                            Ok(started) => {
-                                let _ = response.send(Ok(started.turn));
-                                active_turns.insert(
-                                    thread.thread,
-                                    ActiveTurn::new(*thread, started.turn)
-                                        .with_upload_dir(started.upload_dir),
-                                );
-                            }
-                            Err(error) => {
-                                let _ = response.send(Err(error));
-                            }
-                        }
-                    }
-                }
-                worker_queue.mark_finished(queued.token);
-            }
-            queued = controls.recv() => {
-                let Some(queued) = queued else {
-                    cleanup_all_active_turn_uploads(&mut client, &mut active_turns).await;
-                    break;
-                };
-                worker_queue.mark_started(queued.token);
-                let token = queued.token;
-                let outcome =
-                    handle_control_command(
+    // `config/read` may have ordinary production frames ahead of its response. Start the sole
+    // production consumer first so the ACK barrier can activate and deliver those frames instead
+    // of deadlocking harness construction.
+    let writable_roots = match configured_writable_roots {
+        Some(roots) => roots,
+        None => {
+            let mut config_client = client.clone();
+            let read_roots = configured_workspace_write_roots(&mut config_client, &workspace_root);
+            tokio::pin!(read_roots);
+            let roots = tokio::select! {
+                biased;
+                _ = wait_for_shutdown_request(&mut shutdown) => None,
+                message = &mut inbound => {
+                    let (cleanup_deadline, deadline) = codex_shutdown_deadlines();
+                    finish_background_state(
                         &mut client,
-                        &mut mapper,
-                        &senders,
-                        &mut pending_compactions,
-                        &mut pending_context_restores,
-                        &active_turns,
-                        Some(queued.command),
+                        &state,
+                        &routes,
+                        message,
+                        cleanup_deadline,
                     )
                     .await;
-                worker_queue.mark_finished(token);
-                if matches!(outcome, StreamOutcome::Shutdown) {
-                    cleanup_all_active_turn_uploads(&mut client, &mut active_turns).await;
-                    shutdown_codex_transport(client, &workspace_root).await;
-                    break;
+                    shutdown_codex_transport(client, &workspace_root, deadline).await;
+                    worker_queue.close();
+                    return;
+                }
+                roots = &mut read_roots => Some(roots),
+            };
+            let Some(roots) = roots else {
+                let (cleanup_deadline, deadline) = codex_shutdown_deadlines();
+                finish_background_state(&mut client, &state, &routes, None, cleanup_deadline).await;
+                shutdown_codex_transport(client, &workspace_root, deadline).await;
+                worker_queue.close();
+                return;
+            };
+            roots
+        }
+    };
+
+    let command_worker = run_command_worker(
+        client.clone(),
+        commands,
+        controls,
+        state.clone(),
+        routes.clone(),
+        signal_tx.clone(),
+        worker_queue.clone(),
+        writable_roots,
+    );
+    let urgent_control_worker = run_urgent_control_worker(
+        client.clone(),
+        urgent_controls,
+        state.clone(),
+        routes.clone(),
+        worker_queue.clone(),
+    );
+    let first_event_watchdog = run_first_event_watchdog(state.clone());
+    tokio::pin!(command_worker);
+    tokio::pin!(urgent_control_worker);
+    tokio::pin!(first_event_watchdog);
+
+    let incomplete_message = tokio::select! {
+        biased;
+        _ = wait_for_shutdown_request(&mut shutdown) => None,
+        message = &mut inbound => message,
+        () = &mut command_worker => None,
+        () = &mut urgent_control_worker => None,
+        () = &mut first_event_watchdog => None,
+    };
+
+    let (cleanup_deadline, deadline) = codex_shutdown_deadlines();
+    finish_background_state(
+        &mut client,
+        &state,
+        &routes,
+        incomplete_message,
+        cleanup_deadline,
+    )
+    .await;
+    shutdown_codex_transport(client, &workspace_root, deadline).await;
+    worker_queue.close();
+}
+
+fn codex_shutdown_deadlines() -> (tokio::time::Instant, tokio::time::Instant) {
+    let started = tokio::time::Instant::now();
+    let deadline = started + CODEX_SHUTDOWN_TIMEOUT;
+    let cleanup_deadline = deadline
+        .checked_sub(transport::FORCED_KILL_REAP_RESERVE)
+        .unwrap_or(started);
+    (cleanup_deadline, deadline)
+}
+
+struct BackgroundState {
+    mapper: CodexMapper,
+    pending_compactions: HashMap<ThreadId, PendingCompaction>,
+    pending_context_restores: HashMap<String, PendingContextRestore>,
+    active_turns: ActiveTurns,
+}
+
+type SharedBackgroundState = Arc<StdMutex<BackgroundState>>;
+
+fn lock_background_state(
+    state: &SharedBackgroundState,
+) -> Result<StdMutexGuard<'_, BackgroundState>, HarnessError> {
+    state
+        .lock()
+        .map_err(|_| HarnessError::Transport("Codex background-state lock was poisoned".into()))
+}
+
+async fn run_inbound_dispatch<C, R>(
+    mut client: C,
+    mut frames: R,
+    state: SharedBackgroundState,
+    routes: RouteMap,
+    signal_tx: mpsc::Sender<HarnessSignal>,
+    workspace_root: PathBuf,
+) -> Option<String>
+where
+    C: CodexTransport + Clone + 'static,
+    R: CodexFrameReceiver,
+{
+    macro_rules! lock_state_or_stop {
+        () => {
+            match lock_background_state(&state) {
+                Ok(state) => state,
+                Err(error) => return Some(error.to_string()),
+            }
+        };
+    }
+    loop {
+        match frames.next_message().await {
+            Ok(Some(frame)) => {
+                let (message, acknowledgement) = frame.into_parts();
+                {
+                    let mut state = lock_state_or_stop!();
+                    observe_pending_context_restore(&mut state.pending_context_restores, &message);
+                }
+                match handle_background_server_message(
+                    &mut client,
+                    &state,
+                    &routes,
+                    &signal_tx,
+                    message,
+                )
+                .await
+                {
+                    Ok(StreamOutcome::TurnEnded) => acknowledgement.acknowledge(Ok(())),
+                    Ok(StreamOutcome::CompactionCompleted { thread, elapsed_ms }) => {
+                        acknowledgement.acknowledge(Ok(()));
+                        let pending_compactions = lock_state_or_stop!().pending_compactions.len();
+                        info!(
+                            %thread,
+                            elapsed_ms,
+                            pending_compactions,
+                            "Codex context compaction completion observed"
+                        );
+                    }
+                    Err(error) => {
+                        acknowledgement.acknowledge(Err(error.clone()));
+                        return Some(format!(
+                            "Codex stream failed before turn completion: {error}"
+                        ));
+                    }
                 }
             }
-            _ = first_event_warn_tick.tick(), if !active_turns.is_empty() => {
-                warn_slow_first_events(&mut active_turns);
+            Ok(None) => {
+                let state = lock_state_or_stop!();
+                if !state.pending_compactions.is_empty() {
+                    warn!(
+                        action = "read_codex_stream",
+                        workspace_root = %workspace_root.display(),
+                        pending_compactions = state.pending_compactions.len(),
+                        pending_compaction_states = ?pending_compaction_states(&state.pending_compactions),
+                        "Codex message stream ended with pending context compactions"
+                    );
+                }
+                return Some("Codex stream ended before turn completion".into());
+            }
+            Err(CodexStreamError::NonJsonStdout {
+                parse_error,
+                raw_preview,
+                raw_bytes,
+            }) => {
+                let state = lock_state_or_stop!();
+                warn!(
+                    active_turns = state.active_turns.len(),
+                    pending_compactions = state.pending_compactions.len(),
+                    pending_compaction_states = ?pending_compaction_states(&state.pending_compactions),
+                    workspace_root = %workspace_root.display(),
+                    error = %parse_error,
+                    raw_bytes,
+                    raw_preview = ?raw_preview,
+                    "Ignoring non-JSON line from Codex app-server stdout"
+                );
+            }
+            Err(CodexStreamError::Fatal(error)) => {
+                let message = error.to_string();
+                let state = lock_state_or_stop!();
+                if state.active_turns.is_empty() {
+                    warn!(
+                        action = "read_codex_stream",
+                        error = %message,
+                        pending_compactions = state.pending_compactions.len(),
+                        pending_compaction_states = ?pending_compaction_states(&state.pending_compactions),
+                        workspace_root = %workspace_root.display(),
+                        "Codex idle stream failed while background work was running"
+                    );
+                } else {
+                    warn!(
+                        action = "read_codex_stream",
+                        error = %message,
+                        active_turns = state.active_turns.len(),
+                        active_turn_states = ?active_turn_states(&state.active_turns),
+                        pending_compactions = state.pending_compactions.len(),
+                        pending_compaction_states = ?pending_compaction_states(&state.pending_compactions),
+                        workspace_root = %workspace_root.display(),
+                        "Codex stream failed before all active turns completed"
+                    );
+                }
+                return Some(format!(
+                    "Codex stream failed before turn completion: {message}"
+                ));
             }
         }
     }
-    worker_queue.close();
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_command_worker<C>(
+    mut client: C,
+    mut commands: mpsc::Receiver<QueuedHarnessCommand>,
+    mut controls: mpsc::Receiver<QueuedControlCommand>,
+    state: SharedBackgroundState,
+    routes: RouteMap,
+    signal_tx: mpsc::Sender<HarnessSignal>,
+    worker_queue: Arc<WorkerQueueWatchdog>,
+    writable_roots: Vec<PathBuf>,
+) where
+    C: CodexTransport + Clone,
+{
+    loop {
+        tokio::select! {
+            biased;
+            queued = controls.recv() => {
+                let Some(queued) = queued else { break };
+                worker_queue.mark_started(queued.token);
+                let token = queued.token;
+                if handle_control_command(&mut client, &state, &routes, queued.command)
+                    .await
+                    .is_err()
+                {
+                    worker_queue.mark_finished(token);
+                    break;
+                }
+                worker_queue.mark_finished(token);
+            }
+            queued = commands.recv() => {
+                let Some(queued) = queued else { break };
+                worker_queue.mark_started(queued.token);
+                handle_harness_command(
+                    &mut client,
+                    &state,
+                    &routes,
+                    &signal_tx,
+                    &writable_roots,
+                    queued.command,
+                )
+                .await;
+                worker_queue.mark_finished(queued.token);
+            }
+        }
+    }
+}
+
+async fn run_urgent_control_worker<C>(
+    mut client: C,
+    mut controls: mpsc::Receiver<QueuedControlCommand>,
+    state: SharedBackgroundState,
+    routes: RouteMap,
+    worker_queue: Arc<WorkerQueueWatchdog>,
+) where
+    C: CodexTransport + Clone + 'static,
+{
+    while let Some(queued) = controls.recv().await {
+        worker_queue.mark_started(queued.token);
+        let token = queued.token;
+        match queued.command {
+            ControlCommand::Interrupt { thread, response } => {
+                let native_turn_id = match lock_background_state(&state) {
+                    Ok(state) => state
+                        .mapper
+                        .active_native_turn_for_thread(thread.thread)
+                        .map(str::to_owned),
+                    Err(error) => {
+                        let _ = response.send(Err(error));
+                        worker_queue.mark_finished(token);
+                        break;
+                    }
+                };
+                let Some(native_turn_id) = native_turn_id else {
+                    let _ = response.send(Err(HarnessError::Unsupported(
+                        "no active Codex turn to interrupt".into(),
+                    )));
+                    worker_queue.mark_finished(token);
+                    continue;
+                };
+                let pending =
+                    submit_interrupt_turn(&mut client, &thread.harness_thread_id, &native_turn_id)
+                        .await;
+                let pending = match pending {
+                    Ok(pending) => pending,
+                    Err(error) => {
+                        let _ = response.send(Err(error));
+                        worker_queue.mark_finished(token);
+                        continue;
+                    }
+                };
+
+                let mut completion_client = client.clone();
+                let completion_state = state.clone();
+                let completion_routes = routes.clone();
+                let completion_queue = worker_queue.clone();
+                tokio::spawn(async move {
+                    let result = timeout_codex_control(
+                        "interrupt",
+                        Some(&thread),
+                        None,
+                        Some(&native_turn_id),
+                        await_interrupt_response(
+                            pending,
+                            CodexOperationContext::for_thread("interrupt", &thread)
+                                .with_native_turn_id(&native_turn_id),
+                        ),
+                    )
+                    .await;
+                    if result.is_ok() {
+                        reject_pending_requests_for_interrupted_thread_ordered(
+                            &mut completion_client,
+                            &completion_state,
+                            &completion_routes,
+                            thread.thread,
+                        )
+                        .await;
+                    }
+                    let _ = response.send(result);
+                    completion_queue.mark_finished(token);
+                });
+            }
+            ControlCommand::TerminateCommand {
+                thread,
+                process_id,
+                response,
+            } => {
+                let native_turn_id = {
+                    let state = match lock_background_state(&state) {
+                        Ok(state) => state,
+                        Err(error) => {
+                            let _ = response.send(Err(error));
+                            worker_queue.mark_finished(token);
+                            break;
+                        }
+                    };
+                    state
+                        .mapper
+                        .native_turn_for_process(thread.thread, &process_id)
+                        .or_else(|| state.mapper.active_native_turn_for_thread(thread.thread))
+                        .map(str::to_owned)
+                };
+                let initial = submit_terminate_command(&mut client, &thread, &process_id).await;
+                let initial = match initial {
+                    Ok(initial) => initial,
+                    Err(error) => {
+                        let _ = response.send(Err(error));
+                        worker_queue.mark_finished(token);
+                        continue;
+                    }
+                };
+                let mut completion_client = client.clone();
+                let completion_queue = worker_queue.clone();
+                tokio::spawn(async move {
+                    let result = complete_submitted_termination(
+                        &mut completion_client,
+                        &thread,
+                        &process_id,
+                        initial,
+                    )
+                    .await;
+                    if let Err(error) = &result {
+                        warn!(
+                            thread_id = %thread.thread,
+                            harness_thread_id = %thread.harness_thread_id,
+                            native_turn_id = display_opt(native_turn_id.as_deref()),
+                            process_id,
+                            %error,
+                            "Codex command termination failed"
+                        );
+                    }
+                    let _ = response.send(result);
+                    completion_queue.mark_finished(token);
+                });
+            }
+            command => {
+                if handle_control_command(&mut client, &state, &routes, command)
+                    .await
+                    .is_err()
+                {
+                    worker_queue.mark_finished(token);
+                    break;
+                }
+                worker_queue.mark_finished(token);
+            }
+        }
+    }
+}
+
+async fn run_first_event_watchdog(state: SharedBackgroundState) {
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tick.tick().await;
+        let Ok(mut state) = lock_background_state(&state) else {
+            return;
+        };
+        if !state.active_turns.is_empty() {
+            warn_slow_first_events(&mut state.active_turns);
+        }
+    }
+}
+
+async fn finish_background_state(
+    client: &mut dyn CodexTransport,
+    state: &SharedBackgroundState,
+    routes: &RouteMap,
+    incomplete_message: Option<String>,
+    deadline: tokio::time::Instant,
+) {
+    let active = {
+        let mut state = match lock_background_state(state) {
+            Ok(state) => state,
+            Err(error) => {
+                warn!(%error, "could not finalize poisoned Codex background state");
+                return;
+            }
+        };
+        let active_turns = std::mem::take(&mut state.active_turns);
+        active_turns
+            .into_iter()
+            .map(|(thread_id, mut active)| {
+                state.mapper.clear_active_turn(thread_id);
+                let upload_dir = active.upload_dir.take();
+                (active.thread, active.active_turn, upload_dir)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for (thread, _, upload_dir) in &active {
+        if tokio::time::timeout_at(
+            deadline,
+            cleanup_codex_upload_dir(client, thread, upload_dir.as_ref()),
+        )
+        .await
+        .is_err()
+        {
+            warn!(
+                thread_id = %thread.thread,
+                harness_thread_id = %thread.harness_thread_id,
+                "shutdown deadline reached while cleaning Codex upload directories"
+            );
+            break;
+        }
+    }
+    if let Some(message) = incomplete_message {
+        for (thread, turn, _) in active {
+            if tokio::time::timeout_at(
+                deadline,
+                emit_incomplete_turn(routes, thread.thread, turn, message.clone()),
+            )
+            .await
+            .is_err()
+            {
+                warn!(
+                    thread_id = %thread.thread,
+                    harness_thread_id = %thread.harness_thread_id,
+                    "shutdown deadline reached while finalizing an incomplete Codex turn"
+                );
+                break;
+            }
+        }
+    }
+}
+
+async fn handle_harness_command(
+    client: &mut dyn CodexTransport,
+    state: &SharedBackgroundState,
+    routes: &RouteMap,
+    signal_tx: &mpsc::Sender<HarnessSignal>,
+    writable_roots: &[PathBuf],
+    command: HarnessCommand,
+) {
+    match command {
+        HarnessCommand::OpenThread { opts, response } => {
+            let result = handle_open_thread(client, state, &opts, routes, signal_tx).await;
+            if let (Some(generation), Err(error)) = (opts.identity_generation, &result)
+                && !matches!(error, HarnessError::Timeout(_))
+            {
+                warn!(
+                    action = "primary_identity_failed",
+                    project_id = %opts.project,
+                    thread_id = display_opt(opts.thread),
+                    generation,
+                    %error,
+                    "Codex Primary identity operation failed definitively"
+                );
+                if let Some(thread_id) = opts.thread
+                    && signal_tx
+                        .send(HarnessSignal::PrimaryIdentityFailed {
+                            thread_id,
+                            generation,
+                            error: error.to_string(),
+                        })
+                        .await
+                        .is_err()
+                {
+                    warn!(
+                        action = "primary_identity_failed",
+                        project_id = %opts.project,
+                        %thread_id,
+                        generation,
+                        "could not publish definitive Primary identity failure because the harness signal stream closed"
+                    );
+                }
+            }
+            let _ = response.send(result.map(|outcome| outcome.handle));
+        }
+        HarnessCommand::StartTurn {
+            thread,
+            input,
+            overrides,
+            response,
+        } => {
+            let result = handle_start_turn_ordered(
+                client,
+                state,
+                &thread,
+                &input,
+                &overrides,
+                writable_roots,
+            )
+            .await;
+            let _ = response.send(result.map(|started| started.turn));
+        }
+    }
 }
 
 async fn wait_for_shutdown_request(shutdown: &mut watch::Receiver<bool>) {
@@ -1715,13 +2231,16 @@ async fn wait_for_shutdown_request(shutdown: &mut watch::Receiver<bool>) {
     let _ = shutdown.changed().await;
 }
 
-async fn shutdown_codex_transport<C>(client: C, workspace_root: &std::path::Path)
-where
+async fn shutdown_codex_transport<C>(
+    client: C,
+    workspace_root: &std::path::Path,
+    deadline: tokio::time::Instant,
+) where
     C: CodexTransport,
 {
     let started = Instant::now();
-    match tokio::time::timeout(CODEX_SHUTDOWN_TIMEOUT, client.shutdown_transport()).await {
-        Ok(Ok(())) => {
+    match client.shutdown_transport(deadline).await {
+        Ok(()) => {
             info!(
                 action = "shutdown_codex_transport",
                 workspace_root = %workspace_root.display(),
@@ -1729,22 +2248,13 @@ where
                 "Codex transport shutdown completed"
             );
         }
-        Ok(Err(error)) => {
+        Err(error) => {
             warn!(
                 action = "shutdown_codex_transport",
                 workspace_root = %workspace_root.display(),
                 error = %error,
                 elapsed_ms = started.elapsed().as_millis(),
                 "Codex transport shutdown failed"
-            );
-        }
-        Err(_) => {
-            warn!(
-                action = "shutdown_codex_transport",
-                workspace_root = %workspace_root.display(),
-                elapsed_ms = started.elapsed().as_millis(),
-                timeout_ms = CODEX_SHUTDOWN_TIMEOUT.as_millis(),
-                "Codex transport shutdown timed out; dropping transport"
             );
         }
     }
@@ -1809,18 +2319,8 @@ fn active_turn_states(active_turns: &ActiveTurns) -> Vec<String> {
 
 struct StartedTurn {
     turn: TurnId,
+    #[allow(dead_code)]
     upload_dir: Option<PathBuf>,
-}
-
-fn should_poll_codex_messages(
-    mapper: &CodexMapper,
-    active_turns: &ActiveTurns,
-    pending_compactions: &HashMap<ThreadId, PendingCompaction>,
-) -> bool {
-    !active_turns.is_empty()
-        || mapper.has_active_turns()
-        || mapper.has_running_commands()
-        || !pending_compactions.is_empty()
 }
 
 fn fallback_thread(mapper: &CodexMapper, active_turns: &ActiveTurns) -> ThreadId {
@@ -1864,20 +2364,55 @@ fn completed_current_active_turn(
     (*turn == active.acknowledged_turn).then_some((*thread, *turn))
 }
 
-async fn handle_background_server_message(
-    client: &mut dyn CodexTransport,
-    mapper: &mut CodexMapper,
-    senders: &SenderMap,
-    pending_compactions: &mut HashMap<ThreadId, PendingCompaction>,
-    active_turns: &mut ActiveTurns,
+async fn handle_background_server_message<C>(
+    client: &mut C,
+    state: &SharedBackgroundState,
+    routes: &RouteMap,
+    signal_tx: &mpsc::Sender<HarnessSignal>,
     msg: codex_codes::ServerMessage,
-) -> StreamOutcome {
-    let fallback_thread = fallback_thread(mapper, active_turns);
+) -> Result<StreamOutcome, HarnessError>
+where
+    C: CodexTransport + Clone + 'static,
+{
     match msg {
         codex_codes::ServerMessage::Notification(notif) => {
-            if let Some(event) = mapper.map_notification(&notif, fallback_thread) {
+            let native_thread_id = notification_native_thread_id(&notif);
+            if let Some(native_thread_id) = native_thread_id.as_deref()
+                && !native_thread_id.trim().is_empty()
+            {
+                let cause = ThreadActivationCause::Notification {
+                    method: notif.method().to_owned(),
+                };
+                ensure_frame_route_ready(state, routes, signal_tx, native_thread_id, cause)
+                    .await
+                    .inspect_err(|error| {
+                        warn!(
+                            harness_thread_id = native_thread_id,
+                            method = notif.method(),
+                            %error,
+                            "failed to activate native route before notification delivery"
+                        );
+                    })?;
+            }
+
+            let mapped = {
+                let mut state = lock_background_state(state)?;
+                let fallback_thread = fallback_thread(&state.mapper, &state.active_turns);
+                let event = state.mapper.map_notification(&notif, fallback_thread);
+                let Some(event) = event else {
+                    if let Some(message) = mapping::fatal_turn_error(&notif) {
+                        warn!(
+                            action = "map_fatal_notification",
+                            method = notif.method(),
+                            fallback_thread = %fallback_thread,
+                            error = %message,
+                            "dropping fatal Codex error notification that could not be mapped to a known thread"
+                        );
+                    }
+                    return Ok(StreamOutcome::TurnEnded);
+                };
                 let thread = event_thread(&event);
-                if let Some(active) = active_turns.get_mut(&thread) {
+                if let Some(active) = state.active_turns.get_mut(&thread) {
                     active.mark_server_message();
                     if let AgentEvent::TurnStarted { turn, .. } = &event
                         && *turn == active.acknowledged_turn
@@ -1886,21 +2421,22 @@ async fn handle_background_server_message(
                     }
                 }
                 let completed_compaction =
-                    observe_pending_compaction(pending_compactions, thread, &event);
+                    observe_pending_compaction(&mut state.pending_compactions, thread, &event);
                 let completed_active_turn =
-                    completed_current_active_turn(active_turns, &event).map(|(_, turn)| turn);
-                if active_turns.contains_key(&thread)
+                    completed_current_active_turn(&state.active_turns, &event)
+                        .map(|(_, turn)| turn);
+                if state.active_turns.contains_key(&thread)
                     && matches!(&event, AgentEvent::TurnCompleted { .. })
                     && completed_active_turn.is_none()
                 {
                     debug!(
                         %thread,
-                        acknowledged_turn = display_opt(active_turns.get(&thread).map(|active| active.acknowledged_turn)),
+                        acknowledged_turn = display_opt(state.active_turns.get(&thread).map(|active| active.acknowledged_turn)),
                         event_turn = display_opt(agent_event_turn(&event)),
                         "ignoring Codex turn completion for a non-current turn"
                     );
                 }
-                let fatal_completion = active_turns.get(&thread).and_then(|active| {
+                let fatal_completion = state.active_turns.get(&thread).and_then(|active| {
                     active
                         .event_is_current_turn(&event)
                         .then(|| {
@@ -1909,212 +2445,353 @@ async fn handle_background_server_message(
                         })
                         .flatten()
                 });
-                let _ = broadcast_event(senders, thread, || event).await;
-                if let Some(turn) = completed_active_turn {
-                    cleanup_active_turn_upload(client, active_turns, thread).await;
-                    active_turns.remove(&thread);
-                    mapper.clear_active_turn(thread);
-                    debug!(
-                        %thread,
-                        %turn,
-                        remaining_active_turns = active_turns.len(),
-                        "Codex turn completion observed"
-                    );
-                } else if let Some((turn, message)) = fatal_completion
-                    && emit_fatal_turn_completion(senders, thread, turn, message).await
-                {
-                    cleanup_active_turn_upload(client, active_turns, thread).await;
-                    active_turns.remove(&thread);
-                    mapper.clear_active_turn(thread);
-                }
-                if let Some(elapsed_ms) = completed_compaction {
-                    return StreamOutcome::CompactionCompleted { thread, elapsed_ms };
-                }
-            } else if let Some(message) = mapping::fatal_turn_error(&notif) {
-                let (harness_thread_id, native_turn_id) = match &notif {
-                    codex_codes::messages::Notification::Error(error) => {
-                        (Some(error.thread_id.as_str()), Some(error.turn_id.as_str()))
-                    }
-                    _ => (None, notif.turn_id()),
+                (
+                    event,
+                    thread,
+                    completed_compaction,
+                    completed_active_turn,
+                    fatal_completion,
+                )
+            };
+            let (event, thread, completed_compaction, completed_active_turn, fatal_completion) =
+                mapped;
+            route_event(routes, thread, event).await?;
+
+            let mut cleanup = None;
+            if let Some(turn) = completed_active_turn {
+                let remaining_active_turns = {
+                    let mut state = lock_background_state(state)?;
+                    cleanup = state
+                        .active_turns
+                        .remove(&thread)
+                        .map(|active| (active.thread, active.upload_dir));
+                    state.mapper.clear_active_turn(thread);
+                    state.active_turns.len()
                 };
-                warn!(
-                    action = "map_fatal_notification",
-                    method = notif.method(),
-                    harness_thread_id,
-                    native_turn_id,
-                    fallback_thread = %fallback_thread,
-                    error = %message,
-                    "dropping fatal Codex error notification that could not be mapped to a known thread"
+                debug!(
+                    %thread,
+                    %turn,
+                    remaining_active_turns,
+                    "Codex turn completion observed"
                 );
+            } else if let Some((turn, message)) = fatal_completion
+                && emit_fatal_turn_completion(routes, thread, turn, message).await
+            {
+                let mut state = lock_background_state(state)?;
+                cleanup = state
+                    .active_turns
+                    .remove(&thread)
+                    .map(|active| (active.thread, active.upload_dir));
+                state.mapper.clear_active_turn(thread);
             }
-            StreamOutcome::TurnEnded
+            if let Some((thread, upload_dir)) = cleanup {
+                let mut cleanup_client = client.clone();
+                tokio::spawn(async move {
+                    cleanup_codex_upload_dir(&mut cleanup_client, &thread, upload_dir.as_ref())
+                        .await;
+                });
+            }
+            Ok(
+                completed_compaction.map_or(StreamOutcome::TurnEnded, |elapsed_ms| {
+                    StreamOutcome::CompactionCompleted { thread, elapsed_ms }
+                }),
+            )
         }
         codex_codes::ServerMessage::Request { id, request } => {
-            let Some(event) = mapper.map_server_request(&id, &request, fallback_thread) else {
-                respond_unroutable_server_request(client, &id, &request).await;
-                return StreamOutcome::TurnEnded;
+            let (native_thread_id, _) = server_request_native_scope(&request);
+            if let Some(native_thread_id) = native_thread_id.as_deref()
+                && !native_thread_id.trim().is_empty()
+            {
+                let cause = ThreadActivationCause::ServerRequest {
+                    method: request.method().to_owned(),
+                };
+                ensure_frame_route_ready(state, routes, signal_tx, native_thread_id, cause)
+                    .await
+                    .inspect_err(|error| {
+                        warn!(
+                            harness_thread_id = native_thread_id,
+                            method = request.method(),
+                            request_id = %id,
+                            %error,
+                            "failed to activate native route before server-request delivery"
+                        );
+                    })?;
+            }
+            let event = {
+                let mut state = lock_background_state(state)?;
+                let fallback_thread = fallback_thread(&state.mapper, &state.active_turns);
+                state
+                    .mapper
+                    .map_server_request(&id, &request, fallback_thread)
+            };
+            let Some(event) = event else {
+                let mut response_client = client.clone();
+                tokio::spawn(async move {
+                    respond_unroutable_server_request(&mut response_client, &id, &request).await;
+                });
+                return Ok(StreamOutcome::TurnEnded);
             };
             let thread = event_thread(&event);
-            if let Some(active) = active_turns.get_mut(&thread) {
-                active.mark_server_message();
+            {
+                let mut state = lock_background_state(state)?;
+                if let Some(active) = state.active_turns.get_mut(&thread) {
+                    active.mark_server_message();
+                }
             }
-            let _ = broadcast_event(senders, thread, || event).await;
-            StreamOutcome::TurnEnded
+            route_event(routes, thread, event).await?;
+            Ok(StreamOutcome::TurnEnded)
         }
     }
 }
 
+async fn ensure_frame_route_ready(
+    state: &SharedBackgroundState,
+    routes: &RouteMap,
+    signal_tx: &mpsc::Sender<HarnessSignal>,
+    native_thread_id: &str,
+    cause: ThreadActivationCause,
+) -> Result<ClaimedNativeRoute, HarnessError> {
+    let native_thread_id = native_thread_id.trim();
+    let suggested_thread_id = lock_background_state(state)?
+        .mapper
+        .thread_for_native(native_thread_id)
+        .unwrap_or_default();
+    let route = claim_mapped_route(state, routes, native_thread_id, suggested_thread_id)?;
+    activate_route(routes, signal_tx, &route, cause).await?;
+    Ok(route)
+}
+
+fn claim_mapped_route(
+    state: &SharedBackgroundState,
+    routes: &RouteMap,
+    native_thread_id: &str,
+    suggested_thread_id: ThreadId,
+) -> Result<ClaimedNativeRoute, HarnessError> {
+    let route = claim_native_route(routes, native_thread_id, suggested_thread_id)?;
+    lock_background_state(state)?
+        .mapper
+        .claim_thread(native_thread_id.to_owned(), route.thread_id)?;
+    Ok(route)
+}
+
+async fn activate_primary_identity_response(
+    routes: &RouteMap,
+    signal_tx: &mpsc::Sender<HarnessSignal>,
+    intended_thread_id: ThreadId,
+    native_thread_id: String,
+    generation: u64,
+    method: &'static str,
+    reported_model: Option<ModelRef>,
+) -> Result<(), HarnessError> {
+    let route = claim_native_route(routes, &native_thread_id, intended_thread_id)?;
+    if route.thread_id != intended_thread_id {
+        return Err(HarnessError::Protocol(format!(
+            "native thread {native_thread_id} is already bound to {}, not intended Primary {intended_thread_id}",
+            route.thread_id
+        )));
+    }
+    let cause = ThreadActivationCause::IdentityResponse {
+        method: method.to_owned(),
+        generation,
+        reported_model,
+    };
+    activate_route(routes, signal_tx, &route, cause).await
+}
+
+fn primary_identity_failure_hook(
+    signal_tx: mpsc::Sender<HarnessSignal>,
+    thread_id: ThreadId,
+    generation: u64,
+    method: &'static str,
+) -> transport::AbandonedErrorHook {
+    Box::new(move |error| {
+        Box::pin(async move {
+            warn!(
+                action = "primary_identity_failed",
+                %thread_id,
+                generation,
+                method,
+                %error,
+                "abandoned Codex Primary identity operation failed definitively"
+            );
+            if signal_tx
+                .send(HarnessSignal::PrimaryIdentityFailed {
+                    thread_id,
+                    generation,
+                    error: error.to_string(),
+                })
+                .await
+                .is_err()
+            {
+                warn!(
+                    action = "primary_identity_failed",
+                    %thread_id,
+                    generation,
+                    method,
+                    "could not publish definitive Primary identity failure because the harness signal stream closed"
+                );
+            }
+        })
+    })
+}
+
+async fn activate_route(
+    routes: &RouteMap,
+    signal_tx: &mpsc::Sender<HarnessSignal>,
+    route: &ClaimedNativeRoute,
+    cause: ThreadActivationCause,
+) -> Result<(), HarnessError> {
+    if lock_routes(routes)?
+        .by_native
+        .get(&route.harness_thread_id)
+        .is_some_and(|entry| entry.ready)
+    {
+        return Ok(());
+    }
+
+    let (activation, readiness) = thread_activation(route.clone(), cause);
+    signal_tx
+        .send(HarnessSignal::Activate(activation))
+        .await
+        .map_err(|_| HarnessError::Transport("harness signal receiver closed".into()))?;
+    readiness.await.map_err(|_| {
+        HarnessError::Transport("thread activation acknowledgement dropped".into())
+    })??;
+    let mut routes = lock_routes(routes)?;
+    let entry = routes
+        .by_native
+        .get_mut(&route.harness_thread_id)
+        .filter(|entry| entry.route == *route)
+        .ok_or_else(|| HarnessError::Protocol("stale or unknown native route".into()))?;
+    if entry.receiver.is_some() {
+        return Err(HarnessError::Protocol(format!(
+            "native route {} was acknowledged before its receiver was claimed",
+            route.harness_thread_id
+        )));
+    }
+    entry.ready = true;
+    Ok(())
+}
+
 async fn handle_control_command(
     client: &mut dyn CodexTransport,
-    mapper: &mut CodexMapper,
-    senders: &SenderMap,
-    pending_compactions: &mut HashMap<ThreadId, PendingCompaction>,
-    pending_context_restores: &mut HashMap<String, PendingContextRestore>,
-    active_turns: &ActiveTurns,
-    control: Option<ControlCommand>,
-) -> StreamOutcome {
+    state: &SharedBackgroundState,
+    routes: &RouteMap,
+    control: ControlCommand,
+) -> Result<StreamOutcome, HarnessError> {
     match control {
-        Some(ControlCommand::ClaimNativeThread {
+        ControlCommand::ClaimNativeThread {
             thread,
             harness_thread_id,
             workspace_root,
             response,
-        }) => {
-            let result = mapper
-                .claim_thread(harness_thread_id.clone(), thread)
-                .map(|_| {
-                    let (sender, _) = broadcast::channel(BROADCAST_CAPACITY);
-                    ensure_thread_sender(senders, thread, sender);
-                    // A claim answers with the identity facts this harness lifetime already
-                    // attested through its own events. It must not resume the thread to learn
-                    // more: the native model stays unreported until an event names it.
-                    let parent_harness_thread_id = mapper.native_parent(&harness_thread_id);
-                    ThreadHandle {
-                        parent_harness_thread_id,
-                        ..ThreadHandle::opened(thread, harness_thread_id, workspace_root)
-                    }
+        } => {
+            let route = match claim_native_route(routes, &harness_thread_id, thread) {
+                Ok(route) => route,
+                Err(error) => {
+                    let _ = response.send(Err(error.clone()));
+                    return Err(error);
+                }
+            };
+            let mut state = match lock_background_state(state) {
+                Ok(state) => state,
+                Err(error) => {
+                    let _ = response.send(Err(error.clone()));
+                    return Err(error);
+                }
+            };
+            let result = state
+                .mapper
+                .claim_thread(harness_thread_id.clone(), route.thread_id)
+                .map(|()| ThreadHandle {
+                    parent_harness_thread_id: state.mapper.native_parent(&harness_thread_id),
+                    ..ThreadHandle::opened(route.thread_id, harness_thread_id, workspace_root)
                 });
             let _ = response.send(result);
-            StreamOutcome::TurnEnded
         }
-        Some(ControlCommand::RespondApproval {
+        ControlCommand::RespondApproval {
             id,
             decision,
             response,
-        }) => {
-            let result = handle_respond_approval(client, mapper, &id, &decision).await;
+        } => {
+            let result = handle_respond_approval_ordered(client, state, &id, &decision).await;
             let _ = response.send(result);
-            StreamOutcome::TurnEnded
         }
-        Some(ControlCommand::RespondServerRequest {
+        ControlCommand::RespondServerRequest {
             id,
             response_payload,
             response,
-        }) => {
+        } => {
             let result =
-                handle_respond_server_request(client, mapper, senders, &id, response_payload).await;
+                handle_respond_server_request_ordered(client, state, routes, &id, response_payload)
+                    .await;
             let _ = response.send(result);
-            StreamOutcome::TurnEnded
         }
-        Some(ControlCommand::Interrupt { thread, response }) => {
-            let native_turn_id = mapper
-                .active_native_turn_for_thread(thread.thread)
-                .map(str::to_owned);
-            let result = timeout_codex_control(
-                "interrupt",
-                Some(&thread),
-                None,
-                native_turn_id.as_deref(),
-                handle_interrupt(client, mapper, &thread),
-            )
-            .await;
-            if result.is_ok() {
-                reject_pending_requests_for_interrupted_thread(
-                    client,
-                    mapper,
-                    senders,
-                    thread.thread,
-                )
-                .await;
-            }
-            let _ = response.send(result);
-            StreamOutcome::TurnEnded
+        ControlCommand::Interrupt { thread, response } => {
+            warn!(
+                thread_id = %thread.thread,
+                harness_thread_id = %thread.harness_thread_id,
+                action = "interrupt",
+                "interrupt reached the non-urgent Codex control dispatcher"
+            );
+            let _ = response.send(Err(HarnessError::Protocol(
+                "interrupt was routed to the non-urgent Codex control dispatcher".into(),
+            )));
         }
-        Some(ControlCommand::TerminateCommand {
+        ControlCommand::TerminateCommand {
             thread,
             process_id,
             response,
-        }) => {
-            let native_turn_id = mapper
-                .native_turn_for_process(thread.thread, &process_id)
-                .or_else(|| mapper.active_native_turn_for_thread(thread.thread))
-                .map(str::to_owned);
-            let result = timeout_codex_control(
-                "terminate_command",
-                Some(&thread),
-                Some(&process_id),
-                native_turn_id.as_deref(),
-                handle_terminate_command(client, &thread, &process_id),
-            )
-            .await;
-            let _ = response.send(result);
-            StreamOutcome::TurnEnded
-        }
-        Some(ControlCommand::CompactThread { thread, response }) => {
-            if active_turns.contains_key(&thread.thread) {
-                let _ = response.send(Err(HarnessError::Unsupported(
-                    "context compaction is not available during an active turn".into(),
-                )));
-                return StreamOutcome::TurnEnded;
-            }
-            let started = Instant::now();
-            info!(
-                thread = %thread.thread,
+        } => {
+            warn!(
+                thread_id = %thread.thread,
                 harness_thread_id = %thread.harness_thread_id,
-                pending_compactions = pending_compactions.len(),
-                "requesting Codex context compaction"
+                process_id,
+                action = "terminate_command",
+                "command termination reached the non-urgent Codex control dispatcher"
             );
-            let result = handle_compact_thread(client, &thread).await;
-            match &result {
-                Ok(()) => {
-                    pending_compactions.insert(thread.thread, PendingCompaction::new(started));
-                    info!(
-                        thread = %thread.thread,
-                        harness_thread_id = %thread.harness_thread_id,
-                        ack_elapsed_ms = started.elapsed().as_millis(),
-                        pending_compactions = pending_compactions.len(),
-                        "Codex accepted context compaction request"
-                    );
-                }
-                Err(error) => {
-                    warn!(
-                        action = "compact_thread",
-                        thread_id = %thread.thread,
-                        harness_thread_id = %thread.harness_thread_id,
-                        error = %error,
-                        elapsed_ms = started.elapsed().as_millis(),
-                        "Codex context compaction request failed"
-                    );
-                }
-            }
-            let _ = response.send(result);
-            StreamOutcome::TurnEnded
+            let _ = response.send(Err(HarnessError::Protocol(
+                "command termination was routed to the non-urgent Codex control dispatcher".into(),
+            )));
         }
-        Some(ControlCommand::SetThreadName {
+        ControlCommand::CompactThread { thread, response } => {
+            let active = match lock_background_state(state) {
+                Ok(state) => state.active_turns.contains_key(&thread.thread),
+                Err(error) => {
+                    let _ = response.send(Err(error.clone()));
+                    return Err(error);
+                }
+            };
+            let result = if active {
+                Err(HarnessError::Unsupported(
+                    "context compaction is not available during an active turn".into(),
+                ))
+            } else {
+                handle_compact_thread_ordered(client, state, &thread).await
+            };
+            let _ = response.send(result);
+        }
+        ControlCommand::SetThreadName {
             thread,
             name,
             response,
-        }) => {
+        } => {
             let result = handle_set_thread_name(client, &thread, &name).await;
             let _ = response.send(result);
-            StreamOutcome::TurnEnded
         }
-        Some(ControlCommand::SetThreadArchived {
+        ControlCommand::SetThreadArchived {
             thread,
             archived,
             response,
-        }) => {
-            let result = if active_turns.contains_key(&thread.thread) {
+        } => {
+            let active = match lock_background_state(state) {
+                Ok(state) => state.active_turns.contains_key(&thread.thread),
+                Err(error) => {
+                    let _ = response.send(Err(error.clone()));
+                    return Err(error);
+                }
+            };
+            let result = if active {
                 Err(HarnessError::Unsupported(
                     "thread archiving is not available during an active turn".into(),
                 ))
@@ -2122,10 +2799,16 @@ async fn handle_control_command(
                 handle_set_thread_archived(client, &thread, archived).await
             };
             let _ = response.send(result);
-            StreamOutcome::TurnEnded
         }
-        Some(ControlCommand::DeleteThread { thread, response }) => {
-            let result = if active_turns.contains_key(&thread.thread) {
+        ControlCommand::DeleteThread { thread, response } => {
+            let active = match lock_background_state(state) {
+                Ok(state) => state.active_turns.contains_key(&thread.thread),
+                Err(error) => {
+                    let _ = response.send(Err(error.clone()));
+                    return Err(error);
+                }
+            };
+            let result = if active {
                 Err(HarnessError::Unsupported(
                     "thread deletion is not available during an active turn".into(),
                 ))
@@ -2133,13 +2816,23 @@ async fn handle_control_command(
                 handle_delete_thread(client, &thread).await
             };
             if result.is_ok() {
-                lock_senders(senders).remove(&thread.thread);
-                pending_context_restores.remove(&thread.harness_thread_id);
+                if let Err(error) = remove_native_route(routes, thread.thread) {
+                    let _ = response.send(Err(error.clone()));
+                    return Err(error);
+                }
+                match lock_background_state(state) {
+                    Ok(mut state) => state
+                        .pending_context_restores
+                        .remove(&thread.harness_thread_id),
+                    Err(error) => {
+                        let _ = response.send(Err(error.clone()));
+                        return Err(error);
+                    }
+                };
             }
             let _ = response.send(result);
-            StreamOutcome::TurnEnded
         }
-        Some(ControlCommand::ListMcpServers { response }) => {
+        ControlCommand::ListMcpServers { response } => {
             let result = timeout_codex_control(
                 "list_mcp_servers",
                 None,
@@ -2149,9 +2842,8 @@ async fn handle_control_command(
             )
             .await;
             let _ = response.send(result);
-            StreamOutcome::TurnEnded
         }
-        Some(ControlCommand::ReloadMcpServers { response }) => {
+        ControlCommand::ReloadMcpServers { response } => {
             let result = timeout_codex_control(
                 "reload_mcp_servers",
                 None,
@@ -2161,9 +2853,8 @@ async fn handle_control_command(
             )
             .await;
             let _ = response.send(result);
-            StreamOutcome::TurnEnded
         }
-        Some(ControlCommand::StartMcpOauthLogin { name, response }) => {
+        ControlCommand::StartMcpOauthLogin { name, response } => {
             let result = timeout_codex_control(
                 "start_mcp_oauth_login",
                 None,
@@ -2173,9 +2864,8 @@ async fn handle_control_command(
             )
             .await;
             let _ = response.send(result);
-            StreamOutcome::TurnEnded
         }
-        Some(ControlCommand::ListProviders { cwd, response }) => {
+        ControlCommand::ListProviders { cwd, response } => {
             let result = timeout_codex_control(
                 "list_providers",
                 None,
@@ -2185,9 +2875,8 @@ async fn handle_control_command(
             )
             .await;
             let _ = response.send(result);
-            StreamOutcome::TurnEnded
         }
-        Some(ControlCommand::ListModels { cwd, response }) => {
+        ControlCommand::ListModels { cwd, response } => {
             let result = timeout_codex_control(
                 "list_models",
                 None,
@@ -2197,10 +2886,9 @@ async fn handle_control_command(
             )
             .await;
             let _ = response.send(result);
-            StreamOutcome::TurnEnded
         }
-        None => StreamOutcome::Shutdown,
     }
+    Ok(StreamOutcome::TurnEnded)
 }
 
 async fn timeout_codex_control<T>(
@@ -2231,7 +2919,6 @@ async fn timeout_codex_control<T>(
 enum StreamOutcome {
     TurnEnded,
     CompactionCompleted { thread: ThreadId, elapsed_ms: u128 },
-    Shutdown,
 }
 
 #[derive(Debug)]
@@ -2347,23 +3034,26 @@ fn is_context_compaction_activity(item: &giskard_core::item::Item) -> bool {
 
 async fn handle_open_thread(
     client: &mut dyn CodexTransport,
-    mapper: &mut CodexMapper,
+    state: &SharedBackgroundState,
     opts: &OpenThreadOptions,
-    senders: &SenderMap,
+    routes: &RouteMap,
+    signal_tx: &mpsc::Sender<HarnessSignal>,
 ) -> Result<OpenThreadOutcome, HarnessError> {
     let cwd = opts.workspace_root.to_string_lossy().to_string();
     // An explicit id wins — the caller knows this thread's durable identity. Otherwise, if the
     // native thread being resumed is already bound, reuse that binding rather than inventing an
     // id: a caller passing `None` is saying it has no opinion, not that this is a new thread, and
     // minting here would give one thread two identities for everything downstream to reconcile.
-    let thread_id = opts
-        .thread
-        .or_else(|| {
-            opts.resume
-                .as_deref()
-                .and_then(|native| mapper.thread_for_native(native))
-        })
-        .unwrap_or_default();
+    let thread_id = if let Some(thread) = opts.thread {
+        thread
+    } else if let Some(native) = opts.resume.as_deref() {
+        lock_background_state(state)?
+            .mapper
+            .thread_for_native(native)
+            .unwrap_or_default()
+    } else {
+        ThreadId::default()
+    };
 
     // Track whether resume-by-id failed and we fell back to a fresh native thread (C5), so we can
     // warn the caller that agent context was lost while keeping the Giskard-side history.
@@ -2375,10 +3065,16 @@ async fn handle_open_thread(
             .with_harness_thread_id(resume_id);
         match resume_thread(
             client,
+            state,
             context,
             resume_id,
             &cwd,
             opts.initial_model.as_ref(),
+            thread_id,
+            opts.identity_generation,
+            routes,
+            signal_tx,
+            opts.updates.clone(),
         )
         .await
         {
@@ -2386,7 +3082,7 @@ async fn handle_open_thread(
             // Recovery needs a model to start on, and importing a thread by native id supplies
             // none — the model was the resumed thread's to report. Nothing sensible to start.
             Err(error) if opts.initial_model.is_none() => return Err(error),
-            Err(e) => {
+            Err(e @ HarnessError::ProviderRejected { .. }) => {
                 // C5: Codex thread store purged/rotated. Start fresh instead of hard-failing.
                 resume_warning = Some(HarnessNotice {
                     code: "codex_resume_failed".into(),
@@ -2400,40 +3096,69 @@ async fn handle_open_thread(
                     opts.project,
                 )
                 .with_thread_id(thread_id);
-                start_thread(client, context, &cwd, &fresh_model(opts)?).await?
+                start_thread(
+                    client,
+                    state,
+                    context,
+                    &cwd,
+                    &fresh_model(opts)?,
+                    thread_id,
+                    opts.identity_generation,
+                    routes,
+                    signal_tx,
+                )
+                .await?
             }
+            Err(error) => return Err(error),
         }
     } else {
         let context = CodexOperationContext::for_project("thread_start", opts.project)
             .with_thread_id(thread_id);
-        start_thread(client, context, &cwd, &fresh_model(opts)?).await?
+        start_thread(
+            client,
+            state,
+            context,
+            &cwd,
+            &fresh_model(opts)?,
+            thread_id,
+            opts.identity_generation,
+            routes,
+            signal_tx,
+        )
+        .await?
     };
 
-    // B4: bind the (possibly re-established) native id to the durable ThreadId.
-    mapper.claim_thread(opened.harness_thread_id.clone(), thread_id)?;
-
-    let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
-    ensure_thread_sender(senders, thread_id, tx);
-
-    let _ = broadcast_event(senders, thread_id, || AgentEvent::ThreadOpened {
-        thread: thread_id,
-        harness_thread_id: opened.harness_thread_id.clone(),
-    })
-    .await;
+    let route = claim_mapped_route(state, routes, &opened.harness_thread_id, thread_id)?;
+    if route.thread_id != thread_id {
+        return Err(HarnessError::Protocol(format!(
+            "native thread {} is already bound to {}, not intended Primary {thread_id}",
+            opened.harness_thread_id, route.thread_id
+        )));
+    }
+    route_event(
+        routes,
+        thread_id,
+        AgentEvent::ThreadOpened {
+            thread: thread_id,
+            harness_thread_id: opened.harness_thread_id.clone(),
+        },
+    )
+    .await?;
 
     if let Some(warning) = &resume_warning {
         let message = warning.message.clone();
-        let _ = broadcast_event(senders, thread_id, || AgentEvent::Error {
-            thread: thread_id,
-            turn: None,
-            error: HarnessError::Transport(message),
-        })
-        .await;
+        route_event(
+            routes,
+            thread_id,
+            AgentEvent::Error {
+                thread: thread_id,
+                turn: None,
+                error: HarnessError::Transport(message),
+            },
+        )
+        .await?;
     }
 
-    let resume_replay_model = (opts.resume.is_some() && resume_warning.is_none())
-        .then(|| opened.model.clone())
-        .flatten();
     Ok(OpenThreadOutcome {
         handle: ThreadHandle {
             warning: resume_warning,
@@ -2446,7 +3171,6 @@ async fn handle_open_thread(
                 opts.workspace_root.clone(),
             )
         },
-        resume_replay_model,
     })
 }
 
@@ -2529,7 +3253,8 @@ fn effective_model(
     context: CodexOperationContext<'_>,
     reported_harness_thread_id: &str,
 ) -> Option<giskard_core::model::ModelRef> {
-    if model.is_empty() || model_provider.is_empty() {
+    let effective = identity_response_model(model, model_provider, reported_effort, requested);
+    if effective.is_none() {
         // An import has no requested model to fall back on, so this is the difference between a
         // thread whose model Codex declined to report and one Giskard dropped on the floor. The
         // caller turns it into a refusal; without this the refusal has no cause attached.
@@ -2543,22 +3268,40 @@ fn effective_model(
             harness_thread_id = reported_harness_thread_id,
             "Codex reported no effective model for the opened thread"
         );
+    }
+    effective
+}
+
+fn identity_response_model(
+    model: &str,
+    model_provider: &str,
+    reported_effort: Option<giskard_core::model::Effort>,
+    requested: Option<&giskard_core::model::ModelRef>,
+) -> Option<giskard_core::model::ModelRef> {
+    if model.is_empty() || model_provider.is_empty() {
         return None;
     }
     Some(giskard_core::model::ModelRef {
-        provider: model_provider.to_string(),
-        model: model.to_string(),
+        provider: model_provider.to_owned(),
+        model: model.to_owned(),
         reasoning_effort: reported_effort
-            .or_else(|| requested.and_then(|r| r.reasoning_effort.clone())),
+            .or_else(|| requested.and_then(|model| model.reasoning_effort.clone())),
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn resume_thread(
     client: &mut dyn CodexTransport,
+    state: &SharedBackgroundState,
     context: CodexOperationContext<'_>,
     resume_id: &str,
     cwd: &str,
     model: Option<&giskard_core::model::ModelRef>,
+    intended_thread_id: ThreadId,
+    identity_generation: Option<u64>,
+    routes: &RouteMap,
+    signal_tx: &mpsc::Sender<HarnessSignal>,
+    updates: giskard_harness::ThreadUpdateSink,
 ) -> Result<OpenedNativeThread, HarnessError> {
     // `model`/`modelProvider` are overrides, not preferences: Codex stops applying the thread's
     // own persisted model the moment either is present (`merge_persisted_resume_metadata` returns
@@ -2571,11 +3314,76 @@ async fn resume_thread(
         model_provider: model.map(|model| model.provider.clone()),
         ..Default::default()
     };
-    let resp: codex_codes::ThreadResumeResponse = codex_request(
+    let hook = {
+        let routes = routes.clone();
+        let signal_tx = signal_tx.clone();
+        let state = state.clone();
+        let requested_model = model.cloned();
+        Box::new(move |value: serde_json::Value| {
+            Box::pin(async move {
+                let response: codex_codes::ThreadResumeResponse =
+                    serde_json::from_value(value.clone())
+                        .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+                let reported_model = identity_response_model(
+                    &response.model,
+                    &response.model_provider,
+                    response
+                        .reasoning_effort
+                        .as_ref()
+                        .map(|effort| giskard_core::model::Effort::new(effort.0.clone())),
+                    requested_model.as_ref(),
+                );
+                if let Some(generation) = identity_generation {
+                    activate_primary_identity_response(
+                        &routes,
+                        &signal_tx,
+                        intended_thread_id,
+                        response.thread.id.clone(),
+                        generation,
+                        codex_codes::protocol::methods::THREAD_RESUME,
+                        reported_model.clone(),
+                    )
+                    .await?;
+                }
+                claim_mapped_route(&state, &routes, &response.thread.id, intended_thread_id)?;
+                let mut state = lock_background_state(&state)?;
+                if let Some(model) = reported_model {
+                    let replaced = state.pending_context_restores.insert(
+                        response.thread.id.clone(),
+                        PendingContextRestore {
+                            thread: intended_thread_id,
+                            model,
+                            sink: updates,
+                        },
+                    );
+                    if let Some(replaced) = replaced {
+                        warn!(
+                            thread_id = %intended_thread_id,
+                            replaced_thread_id = %replaced.thread,
+                            harness_thread_id = %response.thread.id,
+                            "replaced an overlapping pending context restore"
+                        );
+                    }
+                }
+                Ok(value)
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
+        }) as transport::SuccessResponseHook
+    };
+    let resp: codex_codes::ThreadResumeResponse = codex_request_with_hook(
         client,
         context,
         codex_codes::protocol::methods::THREAD_RESUME,
         &params,
+        hook,
+        transport::CorrelationLifetime::Retained,
+        identity_generation.map(|generation| {
+            primary_identity_failure_hook(
+                signal_tx.clone(),
+                intended_thread_id,
+                generation,
+                codex_codes::protocol::methods::THREAD_RESUME,
+            )
+        }),
     )
     .await?;
     let resumed = effective_model(
@@ -2614,11 +3422,17 @@ fn fresh_model(opts: &OpenThreadOptions) -> Result<giskard_core::model::ModelRef
         .ok_or_else(|| HarnessError::Protocol("starting a new thread requires a model".into()))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_thread(
     client: &mut dyn CodexTransport,
+    state: &SharedBackgroundState,
     context: CodexOperationContext<'_>,
     cwd: &str,
     initial_model: &giskard_core::model::ModelRef,
+    intended_thread_id: ThreadId,
+    identity_generation: Option<u64>,
+    routes: &RouteMap,
+    signal_tx: &mpsc::Sender<HarnessSignal>,
 ) -> Result<OpenedNativeThread, HarnessError> {
     let params = codex_codes::ThreadStartParams {
         cwd: Some(cwd.to_owned()),
@@ -2626,11 +3440,54 @@ async fn start_thread(
         model_provider: Some(initial_model.provider.clone()),
         ..Default::default()
     };
-    let resp: codex_codes::ThreadStartResponse = codex_request(
+    let hook = {
+        let routes = routes.clone();
+        let signal_tx = signal_tx.clone();
+        let state = state.clone();
+        let requested_model = initial_model.clone();
+        Box::new(move |value: serde_json::Value| {
+            Box::pin(async move {
+                let response: codex_codes::ThreadStartResponse =
+                    serde_json::from_value(value.clone())
+                        .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+                let reported_model = identity_response_model(
+                    &response.model,
+                    &response.model_provider,
+                    None,
+                    Some(&requested_model),
+                );
+                if let Some(generation) = identity_generation {
+                    activate_primary_identity_response(
+                        &routes,
+                        &signal_tx,
+                        intended_thread_id,
+                        response.thread.id.clone(),
+                        generation,
+                        codex_codes::protocol::methods::THREAD_START,
+                        reported_model,
+                    )
+                    .await?;
+                }
+                claim_mapped_route(&state, &routes, &response.thread.id, intended_thread_id)?;
+                Ok(value)
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
+        }) as transport::SuccessResponseHook
+    };
+    let resp: codex_codes::ThreadStartResponse = codex_request_with_hook(
         client,
         context,
         codex_codes::protocol::methods::THREAD_START,
         &params,
+        hook,
+        transport::CorrelationLifetime::Retained,
+        identity_generation.map(|generation| {
+            primary_identity_failure_hook(
+                signal_tx.clone(),
+                intended_thread_id,
+                generation,
+                codex_codes::protocol::methods::THREAD_START,
+            )
+        }),
     )
     .await?;
     let started = effective_model(
@@ -2659,6 +3516,7 @@ async fn start_thread(
     })
 }
 
+#[cfg(test)]
 async fn handle_start_turn(
     client: &mut dyn CodexTransport,
     mapper: &mut CodexMapper,
@@ -2707,6 +3565,84 @@ async fn handle_start_turn(
             ))
         }
     }
+}
+
+async fn handle_start_turn_ordered(
+    client: &mut dyn CodexTransport,
+    state: &SharedBackgroundState,
+    thread: &ThreadHandle,
+    input: &UserInput,
+    overrides: &TurnOverrides,
+    writable_roots: &[PathBuf],
+) -> Result<StartedTurn, HarnessError> {
+    let prepared = prepare_user_input_for_codex_uploads(client, thread, input).await?;
+    let params = match build_turn_start_params(thread, &prepared.input, overrides, writable_roots) {
+        Ok(params) => params,
+        Err(error) => {
+            cleanup_codex_upload_dir(client, thread, prepared.upload_dir.as_ref()).await;
+            return Err(error);
+        }
+    };
+    let state_for_hook = state.clone();
+    let thread_for_hook = thread.clone();
+    let model_for_hook = overrides.model.clone();
+    let upload_dir_for_hook = prepared.upload_dir.clone();
+    let hook: transport::SuccessResponseHook = Box::new(move |value| {
+        Box::pin(async move {
+            let response: codex_codes::TurnStartResponse = serde_json::from_value(value.clone())
+                .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+            let mut state = lock_background_state(&state_for_hook)?;
+            let turn = if let Some(model) = model_for_hook {
+                state.mapper.register_active_turn_with_model(
+                    thread_for_hook.thread,
+                    &response.turn.id,
+                    model,
+                )
+            } else {
+                state
+                    .mapper
+                    .register_active_turn(thread_for_hook.thread, &response.turn.id)
+            }
+            .ok_or_else(|| {
+                HarnessError::Protocol("turn/start response did not include a turn id".into())
+            })?;
+            state.active_turns.insert(
+                thread_for_hook.thread,
+                ActiveTurn::new(thread_for_hook, turn).with_upload_dir(upload_dir_for_hook),
+            );
+            Ok(value)
+        })
+    });
+    let _response: codex_codes::TurnStartResponse = match codex_request_with_hook(
+        client,
+        CodexOperationContext::for_thread("turn_start", thread),
+        codex_codes::protocol::methods::TURN_START,
+        &params,
+        hook,
+        transport::CorrelationLifetime::Retained,
+        None,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            cleanup_codex_upload_dir(client, thread, prepared.upload_dir.as_ref()).await;
+            return Err(error);
+        }
+    };
+    let turn = lock_background_state(state)?
+        .active_turns
+        .get(&thread.thread)
+        .map(|active| active.acknowledged_turn)
+        .ok_or_else(|| {
+            HarnessError::Protocol(
+                "turn/start hook completed without registering the active turn".into(),
+            )
+        })?;
+    Ok(StartedTurn {
+        turn,
+        upload_dir: prepared.upload_dir,
+    })
 }
 
 struct PreparedUserInput {
@@ -2800,6 +3736,7 @@ async fn prepare_user_input_for_codex_uploads(
     })
 }
 
+#[cfg(test)]
 async fn cleanup_active_turn_upload(
     client: &mut dyn CodexTransport,
     active_turns: &mut ActiveTurns,
@@ -2812,6 +3749,7 @@ async fn cleanup_active_turn_upload(
     cleanup_codex_upload_dir(client, &active.thread, upload_dir.as_ref()).await;
 }
 
+#[cfg(test)]
 async fn cleanup_all_active_turn_uploads(
     client: &mut dyn CodexTransport,
     active_turns: &mut ActiveTurns,
@@ -2964,38 +3902,134 @@ fn runtime_workspace_roots(
     roots
 }
 
-async fn broadcast_event<F: FnOnce() -> AgentEvent>(senders: &SenderMap, thread: ThreadId, f: F) {
-    let sender = sender_for_thread(senders, thread);
-    if let Some(sender) = sender {
-        let _ = sender.send(f());
-    }
-}
-
-fn lock_senders(
-    senders: &SenderMap,
-) -> StdMutexGuard<'_, HashMap<ThreadId, broadcast::Sender<AgentEvent>>> {
-    match senders.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            warn!("Codex sender map lock was poisoned; recovering sender state");
-            poisoned.into_inner()
-        }
-    }
-}
-
-fn sender_for_thread(
-    senders: &SenderMap,
+async fn route_event(
+    routes: &RouteMap,
     thread: ThreadId,
-) -> Option<broadcast::Sender<AgentEvent>> {
-    lock_senders(senders).get(&thread).cloned()
+    event: AgentEvent,
+) -> Result<(), HarnessError> {
+    let event_tx = event_sender_for_thread(routes, thread)?.ok_or_else(|| {
+        HarnessError::Protocol(format!("no native event route exists for thread {thread}"))
+    })?;
+    event_tx.send(event).await.map_err(|_| {
+        HarnessError::Transport(format!("native event route for thread {thread} is closed"))
+    })
 }
 
-fn ensure_thread_sender(
-    senders: &SenderMap,
+fn lock_routes(routes: &RouteMap) -> Result<StdMutexGuard<'_, NativeRoutes>, HarnessError> {
+    routes
+        .lock()
+        .map_err(|_| HarnessError::Transport("Codex route map lock was poisoned".into()))
+}
+
+fn event_sender_for_thread(
+    routes: &RouteMap,
     thread: ThreadId,
-    sender: broadcast::Sender<AgentEvent>,
-) {
-    lock_senders(senders).entry(thread).or_insert(sender);
+) -> Result<Option<mpsc::Sender<AgentEvent>>, HarnessError> {
+    let routes = lock_routes(routes)?;
+    let Some(native) = routes.native_by_thread.get(&thread) else {
+        return Ok(None);
+    };
+    Ok(routes
+        .by_native
+        .get(native)
+        .map(|entry| entry.event_tx.clone()))
+}
+
+fn route_for_native(
+    routes: &RouteMap,
+    native_thread_id: &str,
+) -> Result<Option<ClaimedNativeRoute>, HarnessError> {
+    Ok(lock_routes(routes)?
+        .by_native
+        .get(native_thread_id)
+        .map(|entry| entry.route.clone()))
+}
+
+fn remove_native_route(routes: &RouteMap, thread_id: ThreadId) -> Result<(), HarnessError> {
+    let mut routes = lock_routes(routes)?;
+    if let Some(native_id) = routes.native_by_thread.remove(&thread_id) {
+        routes.by_native.remove(&native_id);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn install_native_route(routes: &RouteMap, route: ClaimedNativeRoute) -> Result<(), HarnessError> {
+    let mut routes = lock_routes(routes)?;
+    if let Some(existing) = routes.by_native.get(&route.harness_thread_id) {
+        return (existing.route == route).then_some(()).ok_or_else(|| {
+            HarnessError::Protocol(format!(
+                "native route {} conflicts with its existing route",
+                route.harness_thread_id
+            ))
+        });
+    }
+    if let Some(existing) = routes.native_by_thread.get(&route.thread_id) {
+        return Err(HarnessError::Protocol(format!(
+            "thread {} already has native route {existing}",
+            route.thread_id
+        )));
+    }
+    let (event_tx, receiver) = mpsc::channel(ROUTE_CAPACITY);
+    routes.next_route_epoch = routes.next_route_epoch.max(route.route_epoch);
+    routes
+        .native_by_thread
+        .insert(route.thread_id, route.harness_thread_id.clone());
+    routes.by_native.insert(
+        route.harness_thread_id.clone(),
+        NativeRouteEntry {
+            route,
+            event_tx,
+            receiver: Some(receiver),
+            ready: false,
+        },
+    );
+    Ok(())
+}
+
+fn claim_native_route(
+    routes: &RouteMap,
+    harness_thread_id: &str,
+    suggested_thread_id: ThreadId,
+) -> Result<ClaimedNativeRoute, HarnessError> {
+    let harness_thread_id = harness_thread_id.trim();
+    if harness_thread_id.is_empty() {
+        return Err(HarnessError::Protocol(
+            "cannot claim an empty native thread id".into(),
+        ));
+    }
+    let mut routes = lock_routes(routes)?;
+    if let Some(existing) = routes.by_native.get(harness_thread_id) {
+        return Ok(existing.route.clone());
+    }
+    if let Some(existing) = routes.native_by_thread.get(&suggested_thread_id) {
+        return Err(HarnessError::Protocol(format!(
+            "thread {suggested_thread_id} is already bound to native route {existing}"
+        )));
+    }
+    routes.next_route_epoch = routes
+        .next_route_epoch
+        .checked_add(1)
+        .ok_or_else(|| HarnessError::Protocol("native route epoch space exhausted".into()))?;
+    let route = ClaimedNativeRoute {
+        thread_id: suggested_thread_id,
+        harness_thread_id: harness_thread_id.to_owned(),
+        route_epoch: routes.next_route_epoch,
+    };
+    let (event_tx, receiver) = mpsc::channel(ROUTE_CAPACITY);
+    routes
+        .native_by_thread
+        .insert(route.thread_id, route.harness_thread_id.clone());
+    routes.by_native.insert(
+        route.harness_thread_id.clone(),
+        NativeRouteEntry {
+            route: route.clone(),
+            event_tx,
+            receiver: Some(receiver),
+            ready: false,
+        },
+    );
+    Ok(route)
 }
 
 async fn respond_unroutable_server_request(
@@ -3056,19 +4090,61 @@ fn server_request_native_scope(
             (Some(params.conversation_id.0.clone()), None)
         }
         ServerRequest::Unknown { params, .. } => {
-            let string_at = |key: &str| {
-                params
-                    .as_ref()
-                    .and_then(|value| value.get(key))
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToOwned::to_owned)
-            };
-            (string_at("threadId"), string_at("turnId"))
+            let params = params.as_ref();
+            (
+                params.and_then(native_thread_id_from_value),
+                params.and_then(|value| string_field(value, &["turnId", "turn_id"])),
+            )
         }
-        ServerRequest::McpServerElicitationRequest(_)
-        | ServerRequest::ChatgptAuthTokensRefresh(_)
-        | ServerRequest::AttestationGenerate(_) => (None, None),
+        ServerRequest::McpServerElicitationRequest(params) => {
+            let value = serde_json::to_value(params).ok();
+            (
+                value.as_ref().and_then(native_thread_id_from_value),
+                value
+                    .as_ref()
+                    .and_then(|value| string_field_or_meta(value, &["turnId", "turn_id"])),
+            )
+        }
+        ServerRequest::ChatgptAuthTokensRefresh(_) | ServerRequest::AttestationGenerate(_) => {
+            (None, None)
+        }
     }
+}
+
+fn notification_native_thread_id(
+    notification: &codex_codes::messages::Notification,
+) -> Option<String> {
+    let envelope = serde_json::to_value(notification).ok()?;
+    let params = envelope.get("params").unwrap_or(&envelope);
+    native_thread_id_from_value(params)
+}
+
+fn native_thread_id_from_value(value: &serde_json::Value) -> Option<String> {
+    string_field(
+        value,
+        &["threadId", "thread_id", "conversationId", "conversation_id"],
+    )
+    .or_else(|| {
+        let thread = value.get("thread")?;
+        thread
+            .as_str()
+            .and_then(trimmed_non_empty)
+            .map(ToOwned::to_owned)
+            .or_else(|| string_field(thread, &["id", "threadId", "thread_id"]))
+    })
+    .or_else(|| value.get("_meta").and_then(native_thread_id_from_value))
+}
+
+fn string_field(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(key).and_then(serde_json::Value::as_str))
+        .and_then(trimmed_non_empty)
+        .map(ToOwned::to_owned)
+}
+
+fn string_field_or_meta(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    string_field(value, keys)
+        .or_else(|| value.get("_meta").and_then(|meta| string_field(meta, keys)))
 }
 
 fn event_thread(event: &AgentEvent) -> ThreadId {
@@ -3089,79 +4165,50 @@ fn event_thread(event: &AgentEvent) -> ThreadId {
     }
 }
 
-#[cfg(test)]
-fn event_belongs_to_stream(stream_thread: ThreadId, event: &AgentEvent) -> bool {
-    event_thread(event) == stream_thread
-}
-
-#[cfg(test)]
-fn event_belongs_to_current_turn(
-    stream_thread: ThreadId,
-    current_turn: TurnId,
-    event: &AgentEvent,
-) -> bool {
-    event_belongs_to_stream(stream_thread, event)
-        && agent_event_turn(event).is_none_or(|turn| turn == current_turn)
-}
-
-#[cfg(test)]
-fn event_completes_stream(
-    stream_thread: ThreadId,
-    current_turn: TurnId,
-    event: &AgentEvent,
-) -> bool {
-    event_belongs_to_stream(stream_thread, event)
-        && matches!(event, AgentEvent::TurnCompleted { turn, .. } if *turn == current_turn)
-}
-
 async fn emit_incomplete_turn(
-    senders: &SenderMap,
+    routes: &RouteMap,
     thread: ThreadId,
     turn: Option<TurnId>,
     message: impl Into<String>,
 ) {
     let message = message.into();
     if let Some(turn) = turn {
-        let _ = broadcast_event(senders, thread, || AgentEvent::TurnCompleted {
+        if let Err(error) = route_event(
+            routes,
             thread,
-            turn,
-            usage: TokenUsage::default(),
-            status: TurnStatus {
-                kind: TurnStatusKind::Failed,
-                message: Some(message),
+            AgentEvent::TurnCompleted {
+                thread,
+                turn,
+                usage: TokenUsage::default(),
+                status: TurnStatus {
+                    kind: TurnStatusKind::Failed,
+                    message: Some(message),
+                },
             },
-        })
-        .await;
+        )
+        .await
+        {
+            warn!(%thread, %error, "failed to route incomplete turn completion during teardown");
+        }
     } else {
-        let _ = broadcast_event(senders, thread, || AgentEvent::Error {
+        if let Err(error) = route_event(
+            routes,
             thread,
-            turn: None,
-            error: HarnessError::Transport(message),
-        })
-        .await;
+            AgentEvent::Error {
+                thread,
+                turn: None,
+                error: HarnessError::Transport(message),
+            },
+        )
+        .await
+        {
+            warn!(%thread, %error, "failed to route incomplete stream error during teardown");
+        }
     }
-}
-
-async fn emit_incomplete_active_turns(
-    senders: &SenderMap,
-    mapper: &mut CodexMapper,
-    active_turns: &mut ActiveTurns,
-    message: impl Into<String>,
-) {
-    let message = message.into();
-    let turns: Vec<(ThreadId, Option<TurnId>)> = active_turns
-        .iter()
-        .map(|(thread, active)| (*thread, active.active_turn))
-        .collect();
-    for (thread, turn) in turns {
-        emit_incomplete_turn(senders, thread, turn, message.clone()).await;
-        mapper.clear_active_turn(thread);
-    }
-    active_turns.clear();
 }
 
 async fn emit_fatal_turn_completion(
-    senders: &SenderMap,
+    routes: &RouteMap,
     thread: ThreadId,
     turn: Option<TurnId>,
     message: impl Into<String>,
@@ -3182,29 +4229,39 @@ async fn emit_fatal_turn_completion(
         error = %message,
         "synthesizing failed turn completion from fatal Codex error notification"
     );
-    let _ = broadcast_event(senders, thread, || AgentEvent::TurnCompleted {
+    if let Err(error) = route_event(
+        routes,
         thread,
-        turn,
-        usage: TokenUsage::default(),
-        status: TurnStatus {
-            kind: TurnStatusKind::Failed,
-            message: Some(message),
+        AgentEvent::TurnCompleted {
+            thread,
+            turn,
+            usage: TokenUsage::default(),
+            status: TurnStatus {
+                kind: TurnStatusKind::Failed,
+                message: Some(message),
+            },
         },
-    })
-    .await;
+    )
+    .await
+    {
+        warn!(%thread, %turn, %error, "failed to route fatal turn completion");
+        return false;
+    }
     true
 }
 
-async fn handle_respond_approval(
+async fn handle_respond_approval_ordered(
     client: &mut dyn CodexTransport,
-    mapper: &mut CodexMapper,
+    state: &SharedBackgroundState,
     id: &ApprovalId,
     decision: &ApprovalDecision,
 ) -> Result<(), HarnessError> {
-    match mapper
-        .map_approval_response(id, decision)
-        .map_err(HarnessError::Protocol)?
-    {
+    let attempt = lock_background_state(state)?
+        .mapper
+        .prepare_approval_response(id, decision)
+        .map_err(HarnessError::Protocol)?;
+    let mapping::ApprovalResponseAttempt { response, token } = attempt;
+    let result = match response {
         mapping::ApprovalResponse::Result {
             request_id,
             owner,
@@ -3239,192 +4296,243 @@ async fn handle_respond_approval(
             )
             .await
         }
+    };
+    let mut state = lock_background_state(state)?;
+    if result.is_ok() {
+        state.mapper.commit_approval_response(&token);
+    } else {
+        state.mapper.rollback_approval_response(&token);
     }
+    result
 }
 
-async fn handle_respond_server_request(
+async fn handle_respond_server_request_ordered(
     client: &mut dyn CodexTransport,
-    mapper: &mut CodexMapper,
-    senders: &SenderMap,
+    state: &SharedBackgroundState,
+    routes: &RouteMap,
     id: &ServerRequestId,
     response: ServerRequestResponse,
 ) -> Result<(), HarnessError> {
-    let pending = mapper
-        .pending_server_request(id)
-        .map_err(HarnessError::Protocol)?;
+    let attempt = {
+        let mut state = lock_background_state(state)?;
+        state
+            .mapper
+            .prepare_server_request_response(id)
+            .map_err(HarnessError::Protocol)?
+    };
+    let mapping::ServerRequestResponseAttempt { pending, token } = attempt;
     let request_id = pending.request_id.clone();
     let context = CodexOperationContext::new("respond_server_request")
         .with_thread_id(pending.thread)
         .with_request_id(&request_id);
-    match response {
+    let write_result = match response {
         ServerRequestResponse::Result { value } => {
-            codex_respond_json(client, context, request_id.clone(), value).await?
+            codex_respond_json(client, context, request_id.clone(), value).await
         }
         ServerRequestResponse::Error { code, message } => {
-            codex_respond_error_json(client, context, request_id.clone(), code, &message).await?
+            codex_respond_error_json(client, context, request_id.clone(), code, &message).await
+        }
+    };
+    {
+        let mut state = lock_background_state(state)?;
+        if write_result.is_ok() {
+            state.mapper.commit_server_request_response(&token);
+        } else {
+            state.mapper.rollback_server_request_response(&token);
         }
     }
-    mapper.resolve_server_request(id);
+    write_result?;
     let thread = pending.thread;
     let turn = pending.turn;
     let request_id = id.clone();
-    let _ = broadcast_event(senders, thread, || AgentEvent::ServerRequestResolved {
+    route_event(
+        routes,
         thread,
-        turn,
-        request_id,
-    })
-    .await;
+        AgentEvent::ServerRequestResolved {
+            thread,
+            turn,
+            request_id,
+        },
+    )
+    .await?;
     Ok(())
 }
 
-async fn reject_pending_requests_for_interrupted_thread(
+async fn reject_pending_requests_for_interrupted_thread_ordered(
     client: &mut dyn CodexTransport,
-    mapper: &mut CodexMapper,
-    senders: &SenderMap,
+    state: &SharedBackgroundState,
+    routes: &RouteMap,
     thread: ThreadId,
 ) {
-    let approval_ids = mapper.pending_approval_ids_for_thread(thread);
-    let server_request_ids = mapper.pending_server_request_ids_for_thread(thread);
-
-    if approval_ids.is_empty() && server_request_ids.is_empty() {
-        debug!(
-            %thread,
-            "interrupt accepted with no pending Codex approval/server request to reject"
-        );
-        return;
-    }
-
+    let (approval_ids, server_request_ids) = {
+        let state = match lock_background_state(state) {
+            Ok(state) => state,
+            Err(error) => {
+                warn!(%thread, %error, "could not reject requests from poisoned Codex mapper state");
+                return;
+            }
+        };
+        (
+            state.mapper.pending_approval_ids_for_thread(thread),
+            state.mapper.pending_server_request_ids_for_thread(thread),
+        )
+    };
     for approval_id in approval_ids {
         if let Err(error) =
-            handle_respond_approval(client, mapper, &approval_id, &ApprovalDecision::Cancel).await
+            handle_respond_approval_ordered(client, state, &approval_id, &ApprovalDecision::Cancel)
+                .await
         {
-            warn!(
-                %thread,
-                request_id = %approval_id,
-                %error,
-                "failed to cancel pending approval after interrupt"
-            );
+            warn!(%thread, request_id = %approval_id, %error, "failed to cancel pending approval after interrupt");
         }
     }
-
     for server_request_id in server_request_ids {
         let response = ServerRequestResponse::Error {
             code: -32000,
             message: "Turn interrupted before this server request was answered.".into(),
         };
-        if let Err(error) =
-            handle_respond_server_request(client, mapper, senders, &server_request_id, response)
-                .await
+        if let Err(error) = handle_respond_server_request_ordered(
+            client,
+            state,
+            routes,
+            &server_request_id,
+            response,
+        )
+        .await
         {
-            warn!(
-                %thread,
-                request_id = %server_request_id,
-                %error,
-                "failed to reject pending server request after interrupt"
-            );
+            warn!(%thread, request_id = %server_request_id, %error, "failed to reject pending server request after interrupt");
         }
     }
 }
 
-async fn handle_interrupt(
-    client: &mut dyn CodexTransport,
-    mapper: &CodexMapper,
-    thread: &ThreadHandle,
-) -> Result<(), HarnessError> {
-    let native_turn_id = mapper
-        .active_native_turn_for_thread(thread.thread)
-        .ok_or_else(|| HarnessError::Unsupported("no active Codex turn to interrupt".into()))?;
-    handle_interrupt_turn(
-        client,
-        CodexOperationContext::for_thread("interrupt", thread).with_native_turn_id(native_turn_id),
-        &thread.harness_thread_id,
-        native_turn_id,
-    )
-    .await
+enum PendingTermination {
+    BackgroundTerminal(PendingCodexResponse),
+    CommandExec(PendingCodexResponse),
 }
 
-async fn handle_terminate_command(
+async fn submit_terminate_command(
     client: &mut dyn CodexTransport,
     thread: &ThreadHandle,
     process_id: &str,
-) -> Result<(), HarnessError> {
+) -> Result<PendingTermination, HarnessError> {
     if process_id.parse::<i32>().is_ok() {
-        match handle_terminate_background_terminal(client, thread, process_id).await {
-            Ok(true) => return Ok(()),
-            Ok(false) => {
-                debug!(
+        return submit_terminate_background_terminal(client, thread, process_id)
+            .await
+            .map(PendingTermination::BackgroundTerminal);
+    }
+    submit_terminate_command_exec(client, process_id)
+        .await
+        .map(PendingTermination::CommandExec)
+}
+
+async fn complete_submitted_termination(
+    client: &mut dyn CodexTransport,
+    thread: &ThreadHandle,
+    process_id: &str,
+    initial: PendingTermination,
+) -> Result<(), HarnessError> {
+    match initial {
+        PendingTermination::CommandExec(pending) => {
+            let _: codex_codes::CommandExecTerminateResponse = await_reserved_control_response(
+                pending,
+                CodexOperationContext::for_thread("terminate_command_exec", thread)
+                    .with_process_id(process_id),
+                codex_codes::protocol::methods::COMMAND_EXEC_TERMINATE,
+            )
+            .await?;
+            Ok(())
+        }
+        PendingTermination::BackgroundTerminal(pending) => {
+            let response: Result<ThreadBackgroundTerminalsTerminateResponse, HarnessError> =
+                await_reserved_control_response(
+                    pending,
+                    CodexOperationContext::for_thread("terminate_background_terminal", thread)
+                        .with_process_id(process_id),
+                    THREAD_BACKGROUND_TERMINALS_TERMINATE,
+                )
+                .await;
+            match response {
+                Ok(response) if response.terminated => return Ok(()),
+                Ok(_) => debug!(
                     thread_id = %thread.thread,
                     harness_thread_id = %thread.harness_thread_id,
                     process_id,
                     "Codex did not find a background terminal for command process"
-                );
-            }
-            Err(error) => {
-                debug!(
+                ),
+                Err(error) => debug!(
                     thread_id = %thread.thread,
                     harness_thread_id = %thread.harness_thread_id,
                     process_id,
-                    error = %error,
+                    %error,
                     "Codex background-terminal termination failed; trying command/exec"
-                );
+                ),
             }
+            let pending = submit_terminate_command_exec(client, process_id).await?;
+            let _: codex_codes::CommandExecTerminateResponse = await_reserved_control_response(
+                pending,
+                CodexOperationContext::for_thread("terminate_command_exec", thread)
+                    .with_process_id(process_id),
+                codex_codes::protocol::methods::COMMAND_EXEC_TERMINATE,
+            )
+            .await?;
+            Ok(())
         }
     }
-
-    handle_terminate_command_exec(client, thread, process_id).await
 }
 
-async fn handle_terminate_background_terminal(
+async fn submit_terminate_background_terminal(
     client: &mut dyn CodexTransport,
     thread: &ThreadHandle,
     process_id: &str,
-) -> Result<bool, HarnessError> {
+) -> Result<PendingCodexResponse, HarnessError> {
     let params = ThreadBackgroundTerminalsTerminateParams {
         thread_id: thread.harness_thread_id.clone(),
         process_id: process_id.to_owned(),
     };
-    let response: ThreadBackgroundTerminalsTerminateResponse = codex_request(
-        client,
-        CodexOperationContext::for_thread("terminate_background_terminal", thread)
-            .with_process_id(process_id),
-        THREAD_BACKGROUND_TERMINALS_TERMINATE,
-        &params,
-    )
-    .await?;
-    Ok(response.terminated)
+    submit_reserved_control_request(client, THREAD_BACKGROUND_TERMINALS_TERMINATE, &params).await
 }
 
-async fn handle_terminate_command_exec(
+async fn submit_terminate_command_exec(
     client: &mut dyn CodexTransport,
-    thread: &ThreadHandle,
     process_id: &str,
-) -> Result<(), HarnessError> {
+) -> Result<PendingCodexResponse, HarnessError> {
     let params = codex_codes::CommandExecTerminateParams {
         process_id: process_id.to_owned(),
     };
-    let _: codex_codes::CommandExecTerminateResponse = codex_request(
+    submit_reserved_control_request(
         client,
-        CodexOperationContext::for_thread("terminate_command_exec", thread)
-            .with_process_id(process_id),
         codex_codes::protocol::methods::COMMAND_EXEC_TERMINATE,
         &params,
     )
-    .await?;
-    Ok(())
+    .await
 }
 
-async fn handle_compact_thread(
+async fn handle_compact_thread_ordered(
     client: &mut dyn CodexTransport,
+    state: &SharedBackgroundState,
     thread: &ThreadHandle,
 ) -> Result<(), HarnessError> {
+    let started = Instant::now();
     let params = codex_codes::ThreadCompactStartParams {
         thread_id: thread.harness_thread_id.clone(),
     };
-    let _: codex_codes::ThreadCompactStartResponse = codex_request(
+    let state_for_hook = state.clone();
+    let thread_id = thread.thread;
+    let hook: transport::SuccessResponseHook = Box::new(move |value| {
+        Box::pin(async move {
+            lock_background_state(&state_for_hook)?
+                .pending_compactions
+                .insert(thread_id, PendingCompaction::new(started));
+            Ok(value)
+        })
+    });
+    let _: codex_codes::ThreadCompactStartResponse = codex_request_with_hook(
         client,
         CodexOperationContext::for_thread("compact_thread", thread),
         codex_codes::protocol::methods::THREAD_COMPACT_START,
         &params,
+        hook,
+        transport::CorrelationLifetime::Retained,
+        None,
     )
     .await?;
     Ok(())
@@ -3806,10 +4914,14 @@ async fn handle_delete_thread(
 fn codex_reports_missing_rollout(error: &HarnessError, harness_thread_id: &str) -> bool {
     // This is intentionally coupled to the pinned Codex/codex-codes protocol chain: Codex emits
     // `InvalidRequest("no rollout found for thread id …")`, app-server preserves it as JSON-RPC
-    // -32600, and codex-codes formats that response with this prefix. Keep the match fail-closed if
-    // any layer changes; a different "thread not found" error must remain visible to the caller.
-    const PREFIX: &str = "JSON-RPC error (-32600): no rollout found for thread id ";
-    let HarnessError::Transport(message) = error else {
+    // -32600. Keep the match fail-closed if any layer changes; a different "thread not found"
+    // error must remain visible to the caller.
+    const PREFIX: &str = "no rollout found for thread id ";
+    let HarnessError::ProviderRejected {
+        code: -32600,
+        message,
+    } = error
+    else {
         return false;
     };
     message
@@ -3817,23 +4929,59 @@ fn codex_reports_missing_rollout(error: &HarnessError, harness_thread_id: &str) 
         .is_some_and(|missing_id| missing_id == harness_thread_id)
 }
 
-async fn handle_interrupt_turn(
+async fn submit_interrupt_turn(
     client: &mut dyn CodexTransport,
-    context: CodexOperationContext<'_>,
     native_thread_id: &str,
     native_turn_id: &str,
-) -> Result<(), HarnessError> {
+) -> Result<PendingCodexResponse, HarnessError> {
     let params = codex_codes::TurnInterruptParams {
         thread_id: native_thread_id.to_owned(),
         turn_id: native_turn_id.to_owned(),
     };
-    let _: codex_codes::TurnInterruptResponse = codex_request(
+    submit_reserved_control_request(
         client,
-        context,
         codex_codes::protocol::methods::TURN_INTERRUPT,
         &params,
     )
-    .await?;
+    .await
+}
+
+async fn submit_reserved_control_request<P: Serialize + Sync>(
+    client: &mut dyn CodexTransport,
+    method: &str,
+    params: &P,
+) -> Result<PendingCodexResponse, HarnessError> {
+    let params =
+        serde_json::to_value(params).map_err(|error| HarnessError::Protocol(error.to_string()))?;
+    client.submit_control_request_json(method, params).await
+}
+
+async fn await_reserved_control_response<R: DeserializeOwned>(
+    pending: PendingCodexResponse,
+    context: CodexOperationContext<'_>,
+    method: &str,
+) -> Result<R, HarnessError> {
+    let started = Instant::now();
+    let response = tokio::time::timeout(CODEX_JSON_RPC_TIMEOUT, pending)
+        .await
+        .map_err(|_| {
+            context.log_timeout(
+                Some(method),
+                started.elapsed(),
+                "Codex reserved control response timed out",
+            );
+            HarnessError::Timeout(format!("Codex JSON-RPC request {method} timed out"))
+        })??;
+    serde_json::from_value(response).map_err(|error| HarnessError::Protocol(error.to_string()))
+}
+
+async fn await_interrupt_response(
+    pending: PendingCodexResponse,
+    context: CodexOperationContext<'_>,
+) -> Result<(), HarnessError> {
+    let method = codex_codes::protocol::methods::TURN_INTERRUPT;
+    let _: codex_codes::TurnInterruptResponse =
+        await_reserved_control_response(pending, context, method).await?;
     Ok(())
 }
 
@@ -3847,6 +4995,45 @@ mod tests {
     use giskard_core::turn::{Mode, PermissionPreset};
     use serde_json::{Value, json};
     use std::collections::HashSet;
+
+    fn test_routes(thread: ThreadId) -> (RouteMap, mpsc::Receiver<AgentEvent>) {
+        let routes = Arc::new(StdMutex::new(NativeRoutes::default()));
+        install_native_route(
+            &routes,
+            ClaimedNativeRoute {
+                thread_id: thread,
+                harness_thread_id: format!("native-{thread}"),
+                route_epoch: 1,
+            },
+        )
+        .unwrap();
+        let receiver = {
+            let mut routes_guard = lock_routes(&routes).expect("test route lock should be healthy");
+            routes_guard
+                .by_native
+                .get_mut(&format!("native-{thread}"))
+                .and_then(|entry| entry.receiver.take())
+                .unwrap()
+        };
+        (routes, receiver)
+    }
+
+    #[test]
+    fn event_routes_own_authoritative_monotonic_epochs() {
+        let routes = Arc::new(StdMutex::new(NativeRoutes::default()));
+        let first_thread = ThreadId::new();
+        let second_thread = ThreadId::new();
+        let first = claim_native_route(&routes, "native-first", first_thread)
+            .expect("first native route should be claimable");
+        let repeated = claim_native_route(&routes, "native-first", ThreadId::new())
+            .expect("an existing native route should remain authoritative");
+        let second = claim_native_route(&routes, "native-second", second_thread)
+            .expect("second native route should be claimable");
+
+        assert_eq!(repeated, first);
+        assert!(second.route_epoch > first.route_epoch);
+        assert!(claim_native_route(&routes, "native-conflict", first_thread).is_err());
+    }
     use tokio::sync::Mutex;
     use tokio::time::timeout;
 
@@ -3908,6 +5095,64 @@ mod tests {
         assert!(states[0].contains(&format!("acknowledged_turn={turn}")));
     }
 
+    #[tokio::test]
+    async fn poisoned_signal_receiver_lock_returns_typed_error() {
+        let (harness, _controller) = spawn_fake_harness();
+        let poisoning_harness = harness.clone();
+        let poisoning = std::thread::spawn(move || {
+            let _guard = poisoning_harness
+                .signals
+                .lock()
+                .expect("fresh signal lock should be available");
+            panic!("poison signal receiver lock");
+        });
+        assert!(poisoning.join().is_err());
+        assert!(matches!(
+            harness.take_harness_signals(),
+            Err(HarnessError::Transport(message)) if message.contains("signal lock was poisoned")
+        ));
+    }
+
+    #[tokio::test]
+    async fn poisoned_route_lock_returns_typed_error_without_claiming() {
+        let (harness, _controller) = spawn_fake_harness();
+        let routes = harness.routes.clone();
+        let poisoning = std::thread::spawn(move || {
+            let _guard = routes.lock().expect("fresh route lock should be available");
+            panic!("poison route lock");
+        });
+        assert!(poisoning.join().is_err());
+        assert!(matches!(
+            harness
+                .claim_native_route("native-poisoned".into(), ThreadId::new())
+                .await,
+            Err(HarnessError::Transport(message)) if message.contains("route map lock was poisoned")
+        ));
+    }
+
+    #[test]
+    fn poisoned_mapper_state_lock_returns_typed_error() {
+        let state = Arc::new(StdMutex::new(BackgroundState {
+            mapper: CodexMapper::new(PathBuf::from("/tmp")),
+            pending_compactions: HashMap::new(),
+            pending_context_restores: HashMap::new(),
+            active_turns: HashMap::new(),
+        }));
+        let state_to_poison = state.clone();
+        let poisoning = std::thread::spawn(move || {
+            let _guard = state_to_poison
+                .lock()
+                .expect("fresh mapper-state lock should be available");
+            panic!("poison mapper-state lock");
+        });
+        assert!(poisoning.join().is_err());
+        assert!(matches!(
+            lock_background_state(&state),
+            Err(HarnessError::Transport(message))
+                if message.contains("background-state lock was poisoned")
+        ));
+    }
+
     #[test]
     fn unknown_server_request_diagnostics_extract_only_native_scope() {
         let request = codex_codes::messages::ServerRequest::Unknown {
@@ -3922,6 +5167,70 @@ mod tests {
         assert_eq!(
             server_request_native_scope(&request),
             (Some("native-thread-7".into()), Some("native-turn-9".into()))
+        );
+    }
+
+    #[test]
+    fn unknown_server_request_scope_accepts_all_protocol_spellings() {
+        for (key, native_id) in [
+            ("threadId", "camel-thread"),
+            ("thread_id", "snake-thread"),
+            ("conversationId", "camel-conversation"),
+            ("conversation_id", "snake-conversation"),
+        ] {
+            let request = codex_codes::messages::ServerRequest::Unknown {
+                method: "future/request".into(),
+                params: Some(json!({ (key): native_id, "turn_id": "native-turn" })),
+            };
+            assert_eq!(
+                server_request_native_scope(&request),
+                (Some(native_id.into()), Some("native-turn".into()))
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_elicitation_scope_uses_meta_thread_and_turn() {
+        let request = codex_codes::messages::ServerRequest::McpServerElicitationRequest(
+            serde_json::from_value(json!({
+                "mode": "form",
+                "_meta": { "threadId": "native-mcp", "turn_id": "native-turn" },
+                "message": "Need input",
+                "requestedSchema": { "type": "object" }
+            }))
+            .unwrap(),
+        );
+
+        assert_eq!(
+            server_request_native_scope(&request),
+            (Some("native-mcp".into()), Some("native-turn".into()))
+        );
+    }
+
+    #[test]
+    fn thread_started_scope_uses_nested_thread_identity() {
+        let notification = codex_codes::messages::Notification::from_envelope(
+            codex_codes::protocol::methods::THREAD_STARTED,
+            Some(json!({ "thread": { "id": "native-started" } })),
+        )
+        .expect("minimal thread/started notification should decode");
+
+        assert_eq!(
+            notification_native_thread_id(&notification).as_deref(),
+            Some("native-started")
+        );
+    }
+
+    #[test]
+    fn unknown_notification_scope_accepts_meta_and_snake_case() {
+        let notification = codex_codes::messages::Notification::Unknown {
+            method: "future/notification".into(),
+            params: Some(json!({ "_meta": { "thread_id": "native-meta" } })),
+        };
+
+        assert_eq!(
+            notification_native_thread_id(&notification).as_deref(),
+            Some("native-meta")
         );
     }
 
@@ -3959,6 +5268,7 @@ mod tests {
         command_exec_terminate_error: Option<String>,
         thread_delete_error: Option<String>,
         thread_resume_missing_rollout_failures: usize,
+        thread_resume_error: Option<HarnessError>,
         model_list_error: Option<String>,
         config_read_error: Option<String>,
         /// `model_provider` in the `config/read` payload; `None` omits the key, as a config that
@@ -3973,10 +5283,15 @@ mod tests {
         response_errors: Vec<FakeResponseError>,
         started_turns: Vec<FakeStartedTurn>,
         shutdowns: usize,
+        shutdown_remaining: Option<Duration>,
     }
 
+    #[derive(Clone)]
     struct FakeCodexTransport {
         state: Arc<Mutex<FakeCodexState>>,
+    }
+
+    struct FakeCodexFrameReceiver {
         events_rx: mpsc::Receiver<Result<codex_codes::ServerMessage, CodexStreamError>>,
     }
 
@@ -4021,6 +5336,10 @@ mod tests {
             self.state.lock().await.shutdowns
         }
 
+        async fn shutdown_remaining(&self) -> Option<Duration> {
+            self.state.lock().await.shutdown_remaining
+        }
+
         async fn hang_method(&self, method: &'static str) {
             self.state.lock().await.hang_methods.insert(method.into());
         }
@@ -4048,6 +5367,10 @@ mod tests {
                 .thread_resume_missing_rollout_failures = failures;
         }
 
+        async fn fail_next_thread_resume(&self, error: HarnessError) {
+            self.state.lock().await.thread_resume_error = Some(error);
+        }
+
         async fn fail_model_list(&self, message: &str) {
             self.state.lock().await.model_list_error = Some(message.into());
         }
@@ -4064,6 +5387,10 @@ mod tests {
             self.state.lock().await.hang_response_json = true;
         }
 
+        async fn resume_json_responses(&self) {
+            self.state.lock().await.hang_response_json = false;
+        }
+
         async fn hang_shutdown(&self) {
             self.state.lock().await.hang_shutdown = true;
         }
@@ -4077,14 +5404,18 @@ mod tests {
         }
     }
 
-    fn fake_codex() -> (FakeCodexTransport, FakeCodexController) {
+    fn fake_codex() -> (
+        FakeCodexTransport,
+        FakeCodexFrameReceiver,
+        FakeCodexController,
+    ) {
         let (events_tx, events_rx) = mpsc::channel(32);
         let state = Arc::new(Mutex::new(FakeCodexState::default()));
         (
             FakeCodexTransport {
                 state: state.clone(),
-                events_rx,
             },
+            FakeCodexFrameReceiver { events_rx },
             FakeCodexController { state, events_tx },
         )
     }
@@ -4121,12 +5452,16 @@ mod tests {
                             .as_str()
                             .filter(|id| !id.is_empty())
                             .unwrap_or("native-resumed");
-                        if state.thread_resume_missing_rollout_failures > 0 {
+                        if let Some(error) = state.thread_resume_error.take() {
+                            Err(error)
+                        } else if state.thread_resume_missing_rollout_failures > 0 {
                             state.thread_resume_missing_rollout_failures -= 1;
-                            Err(HarnessError::Transport(format!(
-                                "JSON-RPC error (-32600): no rollout found for thread id \
-                                 {native_thread_id}"
-                            )))
+                            Err(HarnessError::ProviderRejected {
+                                code: -32600,
+                                message: format!(
+                                    "no rollout found for thread id {native_thread_id}"
+                                ),
+                            })
                         } else {
                             let mut response = thread_open_response(
                                 // An import sends no override, and Codex then answers with the
@@ -4168,7 +5503,10 @@ mod tests {
                     | codex_codes::protocol::methods::TURN_INTERRUPT => Ok(json!({})),
                     codex_codes::protocol::methods::THREAD_DELETE => {
                         if let Some(message) = state.thread_delete_error.clone() {
-                            Err(HarnessError::Transport(message))
+                            Err(HarnessError::ProviderRejected {
+                                code: -32600,
+                                message,
+                            })
                         } else {
                             Ok(json!({}))
                         }
@@ -4294,10 +5632,37 @@ mod tests {
             }
         }
 
-        async fn next_message(
+        async fn submit_control_request_json(
             &mut self,
-        ) -> Result<Option<codex_codes::ServerMessage>, CodexStreamError> {
-            self.events_rx.recv().await.transpose()
+            method: &str,
+            params: Value,
+        ) -> Result<PendingCodexResponse, HarnessError> {
+            let mut state = self.state.lock().await;
+            state.requests.push(FakeRequest {
+                method: method.to_owned(),
+                params,
+            });
+            if state.hang_methods.contains(method) {
+                return Ok(Box::pin(std::future::pending()));
+            }
+            let response = match method {
+                codex_codes::protocol::methods::TURN_INTERRUPT => Ok(json!({})),
+                THREAD_BACKGROUND_TERMINALS_TERMINATE => Ok(json!({
+                    "terminated": state.background_terminal_terminate_result.unwrap_or(true)
+                })),
+                codex_codes::protocol::methods::COMMAND_EXEC_TERMINATE => {
+                    state.command_exec_terminate_error.clone().map_or_else(
+                        || Ok(json!({})),
+                        |message| Err(HarnessError::Transport(message)),
+                    )
+                }
+                _ => {
+                    return Err(HarnessError::Unsupported(format!(
+                        "fake Codex transport has no control request for {method}"
+                    )));
+                }
+            };
+            Ok(Box::pin(async move { response }))
         }
 
         async fn respond_json(
@@ -4333,18 +5698,40 @@ mod tests {
             Ok(())
         }
 
-        async fn shutdown_transport(self) -> Result<(), HarnessError> {
+        async fn shutdown_transport(
+            self,
+            deadline: tokio::time::Instant,
+        ) -> Result<(), HarnessError> {
             let mut state = self.state.lock().await;
             state.shutdowns += 1;
+            state.shutdown_remaining =
+                Some(deadline.saturating_duration_since(tokio::time::Instant::now()));
             if state.hang_shutdown {
                 drop(state);
-                std::future::pending().await
+                return tokio::time::timeout_at(deadline, std::future::pending())
+                    .await
+                    .map_err(|_| HarnessError::Timeout("fake shutdown timed out".into()));
             } else if state.block_shutdown {
                 let release = state.shutdown_release.clone();
                 drop(state);
-                release.notified().await;
+                tokio::time::timeout_at(deadline, release.notified())
+                    .await
+                    .map_err(|_| HarnessError::Timeout("fake shutdown timed out".into()))?;
             }
             Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl CodexFrameReceiver for FakeCodexFrameReceiver {
+        async fn next_message(
+            &mut self,
+        ) -> Result<Option<transport::ProductionFrame>, CodexStreamError> {
+            self.events_rx
+                .recv()
+                .await
+                .transpose()
+                .map(|message| message.map(transport::ProductionFrame::ungated))
         }
     }
 
@@ -4372,6 +5759,7 @@ mod tests {
             workspace_root: PathBuf::from("/tmp"),
             resume: resume.map(str::to_owned),
             initial_model: Some(test_model(None)),
+            identity_generation: None,
             updates,
         }
     }
@@ -4387,16 +5775,38 @@ mod tests {
     fn spawn_fake_harness_with_bootstrap(
         bootstrap: HarnessBootstrap,
     ) -> (Arc<CodexHarness>, FakeCodexController) {
-        let (transport, controller) = fake_codex();
+        let (transport, frames, controller) = fake_codex();
         let harness = CodexHarness::spawn_harness(
             transport,
+            frames,
             PathBuf::from("/tmp"),
-            Vec::new(),
+            Some(Vec::new()),
             Some("1.2.3".into()),
             bootstrap,
         )
         .expect("fake harness should spawn");
         (harness, controller)
+    }
+
+    async fn claim_event_stream(harness: &CodexHarness, thread: &ThreadHandle) -> AgentEventStream {
+        let route = harness
+            .claim_native_route(thread.harness_thread_id.clone(), thread.thread)
+            .await
+            .expect("test thread route should be claimable");
+        harness
+            .claim_event_receiver(&route)
+            .expect("test thread event receiver should be claimable")
+    }
+
+    fn acknowledge_test_activations(harness: &CodexHarness) {
+        let mut signals = harness
+            .take_harness_signals()
+            .expect("test activation signal stream should be available");
+        let _activation_owner = tokio::spawn(async move {
+            while let Some(HarnessSignal::Activate(activation)) = signals.recv().await {
+                activation.readiness.acknowledge(Ok(()));
+            }
+        });
     }
 
     /// A sub-agent Giskard persisted in an earlier run already has a `ThreadId` — the one its
@@ -4455,8 +5865,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_status_change_waits_for_exclusive_owner_activation() {
+        let (harness, controller) = spawn_fake_harness();
+        let mut signals = harness.take_harness_signals().unwrap();
+        assert!(harness.take_harness_signals().is_err());
+
+        controller
+            .send_server_message(codex_codes::ServerMessage::Notification(
+                codex_codes::Notification::ThreadStatusChanged(
+                    codex_codes::ThreadStatusChangedNotification {
+                        status: codex_codes::ThreadStatus::Idle,
+                        thread_id: "native-unknown-status".into(),
+                    },
+                ),
+            ))
+            .await;
+
+        let activation = timeout(Duration::from_secs(1), signals.recv())
+            .await
+            .expect("status change should request activation")
+            .expect("signal stream should remain open");
+        let HarnessSignal::Activate(activation) = activation else {
+            panic!("expected activation signal");
+        };
+        assert_eq!(activation.route.harness_thread_id, "native-unknown-status");
+        let route = activation.route.clone();
+        let _events = harness.claim_event_receiver(&route).unwrap();
+        assert!(harness.claim_event_receiver(&route).is_err());
+        activation.readiness.acknowledge(Ok(()));
+    }
+
+    #[tokio::test]
+    async fn primary_identity_response_waits_for_receiver_and_owner_acknowledgement() {
+        let (harness, _controller) = spawn_fake_harness();
+        let mut signals = harness.take_harness_signals().unwrap();
+        let intended_thread = ThreadId::new();
+        let mut opts = open_opts(Some(intended_thread), None);
+        opts.identity_generation = Some(41);
+        let opening_harness = harness.clone();
+        let mut opening = tokio::spawn(async move { opening_harness.open_thread(opts).await });
+
+        let signal = timeout(Duration::from_secs(1), signals.recv())
+            .await
+            .expect("thread/start response should request Primary activation")
+            .expect("signal stream should remain open");
+        let HarnessSignal::Activate(activation) = signal else {
+            panic!("expected activation signal");
+        };
+        assert_eq!(activation.route.thread_id, intended_thread);
+        assert!(matches!(
+            &activation.cause,
+            ThreadActivationCause::IdentityResponse {
+                method,
+                generation: 41,
+                reported_model: Some(model),
+            } if method == codex_codes::protocol::methods::THREAD_START
+                && model == &test_model(None)
+        ));
+        assert!(
+            timeout(Duration::from_millis(10), &mut opening)
+                .await
+                .is_err(),
+            "open_thread must remain held before owner readiness"
+        );
+
+        let route = activation.route.clone();
+        let _events = harness.claim_event_receiver(&route).unwrap();
+        assert!(
+            !lock_routes(&harness.routes)
+                .expect("test route lock should be healthy")
+                .by_native
+                .get(&route.harness_thread_id)
+                .unwrap()
+                .ready,
+            "claiming the receiver does not establish a Live owner"
+        );
+        activation.readiness.acknowledge(Ok(()));
+        let handle = timeout(Duration::from_secs(1), opening)
+            .await
+            .expect("owner acknowledgement should release open_thread")
+            .unwrap()
+            .unwrap();
+        assert_eq!(handle.thread, intended_thread);
+        assert_eq!(handle.harness_thread_id, route.harness_thread_id);
+        assert!(
+            lock_routes(&harness.routes)
+                .expect("test route lock should be healthy")
+                .by_native
+                .get(&route.harness_thread_id)
+                .unwrap()
+                .ready,
+            "successful activation acknowledgement establishes route readiness"
+        );
+    }
+
+    #[tokio::test]
     async fn start_turn_maps_image_attachment_to_codex_data_url() {
-        let (mut transport, controller) = fake_codex();
+        let (mut transport, _frames, controller) = fake_codex();
         let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
         let thread = test_thread();
         let input = UserInput::text_with_attachments(
@@ -4498,7 +6003,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_turn_uploads_and_removes_file_attachment() {
-        let (mut transport, controller) = fake_codex();
+        let (mut transport, _frames, controller) = fake_codex();
         let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
         let thread = test_thread();
         let input = UserInput::text_with_attachments(
@@ -4560,7 +6065,7 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_all_active_turn_uploads_removes_every_directory() {
-        let (mut transport, controller) = fake_codex();
+        let (mut transport, _frames, controller) = fake_codex();
         let first = test_thread();
         let second = test_thread();
         let mut active_turns = ActiveTurns::new();
@@ -4684,134 +6189,6 @@ mod tests {
     }
 
     #[test]
-    fn bare_non_json_stream_error_is_recoverable() {
-        let serde_error = serde_json::from_str::<Value>("not JSON").unwrap_err();
-        let parse_error = codex_codes::ParseError::from_line("not JSON", serde_error);
-
-        assert!(matches!(
-            classify_codex_stream_error(codex_codes::Error::Deserialization(parse_error)),
-            CodexStreamError::NonJsonStdout { .. }
-        ));
-    }
-
-    #[test]
-    fn non_json_stdout_preview_is_bounded_on_a_utf8_boundary() {
-        let raw = format!("{}é", "x".repeat(NON_JSON_STDOUT_PREVIEW_BYTES - 1));
-        let serde_error = serde_json::from_str::<Value>(&raw).unwrap_err();
-        let parse_error = codex_codes::ParseError::from_line(&raw, serde_error);
-
-        let CodexStreamError::NonJsonStdout {
-            raw_preview,
-            raw_bytes,
-            ..
-        } = classify_codex_stream_error(codex_codes::Error::Deserialization(parse_error))
-        else {
-            panic!("expected recoverable non-JSON stdout");
-        };
-        assert_eq!(raw_preview.len(), NON_JSON_STDOUT_PREVIEW_BYTES - 1);
-        assert_eq!(raw_bytes, raw.len());
-    }
-
-    #[test]
-    fn parseable_json_stream_error_remains_fatal() {
-        let raw = r#"{"unexpected":true}"#;
-        let serde_error = serde_json::from_str::<i32>(raw).unwrap_err();
-        let parse_error = codex_codes::ParseError::from_line(raw, serde_error);
-
-        assert!(matches!(
-            classify_codex_stream_error(codex_codes::Error::Deserialization(parse_error)),
-            CodexStreamError::Fatal(HarnessError::Transport(_))
-        ));
-    }
-
-    #[test]
-    fn truncated_json_rpc_object_remains_fatal() {
-        let raw = r#"{"method":"turn/completed""#;
-        let serde_error = serde_json::from_str::<Value>(raw).unwrap_err();
-        let parse_error = codex_codes::ParseError::from_line(raw, serde_error);
-
-        assert!(matches!(
-            classify_codex_stream_error(codex_codes::Error::Deserialization(parse_error)),
-            CodexStreamError::Fatal(HarnessError::Transport(_))
-        ));
-    }
-
-    #[test]
-    fn typed_json_rpc_decode_error_remains_fatal() {
-        let serde_error = serde_json::from_value::<i32>(json!({"unexpected": true})).unwrap_err();
-        let parse_error = codex_codes::ParseError::from_envelope(
-            "turn/completed",
-            Some(json!({"unexpected": true})),
-            serde_error,
-        );
-
-        assert!(matches!(
-            classify_codex_stream_error(codex_codes::Error::Deserialization(parse_error)),
-            CodexStreamError::Fatal(HarnessError::Transport(_))
-        ));
-    }
-
-    #[test]
-    fn foreign_turn_completion_does_not_end_live_stream() {
-        let stream_thread = ThreadId::new();
-        let foreign_thread = ThreadId::new();
-        let turn = TurnId::new();
-        let current_turn = TurnId::new();
-        let event = completed_event(foreign_thread, turn);
-
-        assert!(!event_belongs_to_stream(stream_thread, &event));
-        assert!(!event_belongs_to_current_turn(
-            stream_thread,
-            current_turn,
-            &event
-        ));
-        assert!(!event_completes_stream(stream_thread, current_turn, &event));
-        assert!(event_completes_stream(foreign_thread, turn, &event));
-    }
-
-    #[test]
-    fn same_thread_stale_turn_completion_does_not_end_live_stream() {
-        let thread = ThreadId::new();
-        let current_turn = TurnId::new();
-        let previous_turn = TurnId::new();
-        let event = completed_event(thread, previous_turn);
-
-        assert!(event_belongs_to_stream(thread, &event));
-        assert!(!event_belongs_to_current_turn(thread, current_turn, &event));
-        assert!(!event_completes_stream(thread, current_turn, &event));
-        assert!(event_completes_stream(thread, previous_turn, &event));
-    }
-
-    #[test]
-    fn same_thread_stale_turn_error_is_not_current_turn() {
-        let thread = ThreadId::new();
-        let current_turn = TurnId::new();
-        let previous_turn = TurnId::new();
-        let stale_error = AgentEvent::Error {
-            thread,
-            turn: Some(previous_turn),
-            error: HarnessError::Protocol("previous failure".into()),
-        };
-
-        assert!(!event_belongs_to_current_turn(
-            thread,
-            current_turn,
-            &stale_error
-        ));
-
-        let turnless_error = AgentEvent::Error {
-            thread,
-            turn: None,
-            error: HarnessError::Protocol("unscoped failure".into()),
-        };
-        assert!(event_belongs_to_current_turn(
-            thread,
-            current_turn,
-            &turnless_error
-        ));
-    }
-
-    #[test]
     fn active_turn_table_completes_only_matching_thread_and_turn() {
         let first_thread = test_thread();
         let second_thread = ThreadHandle::opened(
@@ -4855,20 +6232,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn codex_messages_are_polled_while_any_turn_is_active() {
-        let mapper = CodexMapper::new(PathBuf::from("/tmp"));
-        let mut active_turns = ActiveTurns::new();
-        let thread = test_thread();
-        active_turns.insert(thread.thread, ActiveTurn::new(thread, TurnId::new()));
-
-        assert!(should_poll_codex_messages(
-            &mapper,
-            &active_turns,
-            &HashMap::new()
-        ));
-    }
-
     #[tokio::test]
     async fn codex_worker_opens_new_thread_while_turn_is_active() {
         let (harness, controller) = spawn_fake_harness();
@@ -4905,6 +6268,7 @@ mod tests {
     #[tokio::test]
     async fn codex_worker_ignores_non_json_stdout_during_an_active_turn() {
         let (harness, controller) = spawn_fake_harness();
+        acknowledge_test_activations(&harness);
         let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
         harness
             .start_turn(
@@ -4915,7 +6279,7 @@ mod tests {
             .await
             .unwrap();
         let native_turn = controller.started_turns().await[0].native_turn_id.clone();
-        let mut stream = harness.subscribe(&thread);
+        let mut stream = claim_event_stream(&harness, &thread).await;
 
         controller
             .send_stream_error(CodexStreamError::NonJsonStdout {
@@ -4962,7 +6326,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fatal_stream_error_closes_worker_with_only_pending_compaction() {
+    async fn fatal_stream_error_closes_worker_while_idle() {
         let (harness, controller) = spawn_fake_harness();
         let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
         controller
@@ -4971,7 +6335,6 @@ mod tests {
             )))
             .await;
 
-        harness.compact_thread(&thread).await.unwrap();
         timeout(Duration::from_secs(1), async {
             while !harness.worker_queue.is_closed() {
                 tokio::task::yield_now().await;
@@ -4979,6 +6342,8 @@ mod tests {
         })
         .await
         .expect("fatal stream error must close the worker");
+
+        assert!(harness.compact_thread(&thread).await.is_err());
 
         assert!(matches!(
             harness.list_models().await,
@@ -5053,6 +6418,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consumed_resume_rejection_does_not_fail_successful_primary_fallback() {
+        let (harness, controller) = spawn_fake_harness();
+        controller.fail_thread_resume_missing_rollout(1).await;
+        let mut signals = harness
+            .take_harness_signals()
+            .expect("signal stream should be available");
+        let thread_id = ThreadId::new();
+        let mut opts = open_opts(Some(thread_id), Some("native-missing"));
+        opts.identity_generation = Some(7);
+        let opening_harness = harness.clone();
+        let opening = tokio::spawn(async move { opening_harness.open_thread(opts).await });
+
+        let activation = signals
+            .recv()
+            .await
+            .expect("fallback identity should request activation");
+        let HarnessSignal::Activate(activation) = activation else {
+            panic!("consumed resume rejection must not publish identity failure");
+        };
+        assert_eq!(activation.route.thread_id, thread_id);
+        assert!(matches!(
+            &activation.cause,
+            ThreadActivationCause::IdentityResponse {
+                method,
+                generation: 7,
+                ..
+            } if method == codex_codes::protocol::methods::THREAD_START
+        ));
+        let _events = harness
+            .claim_event_receiver(&activation.route)
+            .expect("activation owner should claim the exclusive event receiver");
+        activation.readiness.acknowledge(Ok(()));
+
+        let opened = opening.await.unwrap().unwrap();
+        assert_eq!(opened.thread, thread_id);
+        assert_eq!(opened.harness_thread_id, "native-thread-1");
+        harness.shutdown().await.unwrap();
+        while let Some(signal) = signals.recv().await {
+            assert!(
+                !matches!(signal, HarnessSignal::PrimaryIdentityFailed { .. }),
+                "successful fresh-thread fallback must not be failed by the consumed resume rejection"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_resume_does_not_start_fresh_thread_after_ambiguous_failure() {
+        for error in [
+            HarnessError::Timeout("thread/resume timed out".into()),
+            HarnessError::Transport("connection closed before thread/resume response".into()),
+            HarnessError::Protocol("thread/resume response was malformed".into()),
+        ] {
+            let (harness, controller) = spawn_fake_harness();
+            controller.fail_next_thread_resume(error.clone()).await;
+
+            let result = harness
+                .open_thread(open_opts(None, Some("native-ambiguous")))
+                .await;
+            assert_eq!(
+                result
+                    .expect_err("ambiguous resume failure must surface")
+                    .to_string(),
+                error.to_string()
+            );
+
+            let requests = controller.requests().await;
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(
+                        |request| request.method == codex_codes::protocol::methods::THREAD_RESUME
+                    )
+                    .count(),
+                1
+            );
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.method == codex_codes::protocol::methods::THREAD_START)
+                    .count(),
+                0,
+                "ambiguous resume failure must not start a second native thread"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn codex_worker_starts_other_thread_turn_while_first_turn_is_active() {
         let (harness, controller) = spawn_fake_harness();
         let first = harness.open_thread(open_opts(None, None)).await.unwrap();
@@ -5089,13 +6541,14 @@ mod tests {
     #[tokio::test]
     async fn codex_worker_pending_server_request_does_not_block_other_thread_start() {
         let (harness, controller) = spawn_fake_harness();
+        acknowledge_test_activations(&harness);
         let first = harness.open_thread(open_opts(None, None)).await.unwrap();
         let first_turn = harness
             .start_turn(&first, UserInput::text("ask later"), build_turn_overrides())
             .await
             .unwrap();
         let first_native_turn = controller.started_turns().await[0].native_turn_id.clone();
-        let mut first_stream = harness.subscribe(&first);
+        let mut first_stream = claim_event_stream(&harness, &first).await;
 
         controller
             .send_server_message(generic_user_input_request(
@@ -5104,6 +6557,7 @@ mod tests {
                 &first_native_turn,
             ))
             .await;
+
         let event = recv_matching_event(&mut first_stream, "server request", |event| {
             matches!(
                 event,
@@ -5136,6 +6590,7 @@ mod tests {
     #[tokio::test]
     async fn codex_worker_routes_server_request_response_while_other_thread_is_active() {
         let (harness, controller) = spawn_fake_harness();
+        acknowledge_test_activations(&harness);
         let first = harness.open_thread(open_opts(None, None)).await.unwrap();
         let second = harness.open_thread(open_opts(None, None)).await.unwrap();
         harness
@@ -5155,7 +6610,7 @@ mod tests {
             .await
             .unwrap();
         let first_native_turn = controller.started_turns().await[0].native_turn_id.clone();
-        let mut first_stream = harness.subscribe(&first);
+        let mut first_stream = claim_event_stream(&harness, &first).await;
         controller
             .send_server_message(generic_user_input_request(
                 "server_req",
@@ -5262,6 +6717,7 @@ mod tests {
                 workspace_root: PathBuf::from("/tmp"),
                 resume: Some("native-existing".into()),
                 initial_model: None,
+                identity_generation: None,
                 updates: giskard_harness::thread_update_channel().0,
             }),
         )
@@ -5306,6 +6762,7 @@ mod tests {
                 workspace_root: PathBuf::from("/tmp"),
                 resume: Some("native-existing".into()),
                 initial_model: Some(test_model(None)),
+                identity_generation: None,
                 updates,
             })
             .await
@@ -5561,7 +7018,7 @@ mod tests {
         let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
         controller
             .fail_thread_delete(&format!(
-                "JSON-RPC error (-32600): no rollout found for thread id {}",
+                "no rollout found for thread id {}",
                 thread.harness_thread_id
             ))
             .await;
@@ -5582,9 +7039,7 @@ mod tests {
         let (harness, controller) = spawn_fake_harness();
         let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
         controller
-            .fail_thread_delete(
-                "JSON-RPC error (-32600): no rollout found for thread id different-thread",
-            )
+            .fail_thread_delete("no rollout found for thread id different-thread")
             .await;
 
         let error = timeout(Duration::from_secs(1), harness.delete_thread(&thread))
@@ -5593,7 +7048,8 @@ mod tests {
             .expect_err("a nonmatching missing-rollout error must remain fatal");
         assert!(matches!(
             error,
-            HarnessError::Transport(message) if message.ends_with("different-thread")
+            HarnessError::ProviderRejected { code: -32600, message }
+                if message.ends_with("different-thread")
         ));
     }
 
@@ -5645,6 +7101,7 @@ mod tests {
     #[tokio::test]
     async fn codex_worker_routes_approval_response_while_other_thread_is_active() {
         let (harness, controller) = spawn_fake_harness();
+        acknowledge_test_activations(&harness);
         let first = harness.open_thread(open_opts(None, None)).await.unwrap();
         let second = harness.open_thread(open_opts(None, None)).await.unwrap();
         harness
@@ -5664,7 +7121,7 @@ mod tests {
             .await
             .unwrap();
         let first_native_turn = controller.started_turns().await[0].native_turn_id.clone();
-        let mut first_stream = harness.subscribe(&first);
+        let mut first_stream = claim_event_stream(&harness, &first).await;
         controller
             .send_server_message(command_approval_request(
                 "approval_req",
@@ -5701,6 +7158,7 @@ mod tests {
     #[tokio::test]
     async fn codex_worker_interrupt_rejects_only_interrupted_thread_requests() {
         let (harness, controller) = spawn_fake_harness();
+        acknowledge_test_activations(&harness);
         let first = harness.open_thread(open_opts(None, None)).await.unwrap();
         let second = harness.open_thread(open_opts(None, None)).await.unwrap();
         harness
@@ -5722,8 +7180,8 @@ mod tests {
         let started = controller.started_turns().await;
         let first_native_turn = started[0].native_turn_id.clone();
         let second_native_turn = started[1].native_turn_id.clone();
-        let mut first_stream = harness.subscribe(&first);
-        let mut second_stream = harness.subscribe(&second);
+        let mut first_stream = claim_event_stream(&harness, &first).await;
+        let mut second_stream = claim_event_stream(&harness, &second).await;
 
         controller
             .send_server_message(generic_user_input_request(
@@ -5842,6 +7300,195 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn held_interrupt_response_does_not_block_approval_reply() {
+        let (harness, controller) = spawn_fake_harness();
+        acknowledge_test_activations(&harness);
+        let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
+        harness
+            .start_turn(
+                &thread,
+                UserInput::text("needs approval"),
+                build_turn_overrides(),
+            )
+            .await
+            .unwrap();
+        let native_turn = controller.started_turns().await[0].native_turn_id.clone();
+        let mut stream = claim_event_stream(&harness, &thread).await;
+        controller
+            .send_server_message(command_approval_request(
+                "approval-during-interrupt",
+                &thread.harness_thread_id,
+                &native_turn,
+            ))
+            .await;
+        recv_matching_event(&mut stream, "approval request", |event| {
+            matches!(
+                event,
+                AgentEvent::ApprovalRequested { request, .. }
+                    if request.id == ApprovalId("approval-during-interrupt".into())
+            )
+        })
+        .await;
+        controller
+            .hang_method(codex_codes::protocol::methods::TURN_INTERRUPT)
+            .await;
+
+        let interrupt_harness = harness.clone();
+        let interrupt_thread = thread.clone();
+        let interrupt =
+            tokio::spawn(async move { interrupt_harness.interrupt(&interrupt_thread).await });
+        timeout(Duration::from_secs(1), async {
+            while !controller
+                .requests()
+                .await
+                .iter()
+                .any(|request| request.method == codex_codes::protocol::methods::TURN_INTERRUPT)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("interrupt must be submitted before its response is available");
+        assert!(!interrupt.is_finished());
+
+        timeout(
+            Duration::from_secs(1),
+            harness.respond_approval(
+                ApprovalId("approval-during-interrupt".into()),
+                ApprovalDecision::Accept,
+            ),
+        )
+        .await
+        .expect("approval reply must bypass the held interrupt response")
+        .unwrap();
+        assert!(controller.responses().await.iter().any(|response| {
+            response.id
+                == codex_codes::jsonrpc::RequestId::String("approval-during-interrupt".into())
+                && response.value == json!({"decision": "accept"})
+        }));
+
+        let error = timeout(Duration::from_secs(1), interrupt)
+            .await
+            .expect("held interrupt should retain its bounded timeout")
+            .expect("interrupt task should not panic")
+            .expect_err("held interrupt response should time out");
+        assert!(matches!(error, HarnessError::Timeout(_)));
+    }
+
+    #[tokio::test]
+    async fn held_termination_response_does_not_block_approval_reply() {
+        let (harness, controller) = spawn_fake_harness();
+        acknowledge_test_activations(&harness);
+        let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
+        harness
+            .start_turn(
+                &thread,
+                UserInput::text("needs approval"),
+                build_turn_overrides(),
+            )
+            .await
+            .unwrap();
+        let native_turn = controller.started_turns().await[0].native_turn_id.clone();
+        let mut stream = claim_event_stream(&harness, &thread).await;
+        controller
+            .send_server_message(command_approval_request(
+                "approval-during-termination",
+                &thread.harness_thread_id,
+                &native_turn,
+            ))
+            .await;
+        recv_matching_event(&mut stream, "approval request", |event| {
+            matches!(event, AgentEvent::ApprovalRequested { request, .. }
+                if request.id == ApprovalId("approval-during-termination".into()))
+        })
+        .await;
+        controller
+            .hang_method(THREAD_BACKGROUND_TERMINALS_TERMINATE)
+            .await;
+
+        let terminating_harness = harness.clone();
+        let terminating_thread = thread.clone();
+        let termination = tokio::spawn(async move {
+            terminating_harness
+                .terminate_command(&terminating_thread, "123")
+                .await
+        });
+        timeout(Duration::from_secs(1), async {
+            while !controller
+                .requests()
+                .await
+                .iter()
+                .any(|request| request.method == THREAD_BACKGROUND_TERMINALS_TERMINATE)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("termination must be submitted before its response is available");
+
+        harness
+            .respond_approval(
+                ApprovalId("approval-during-termination".into()),
+                ApprovalDecision::Accept,
+            )
+            .await
+            .expect("approval reply must bypass the held termination response");
+        assert!(controller.responses().await.iter().any(|response| {
+            response.id
+                == codex_codes::jsonrpc::RequestId::String("approval-during-termination".into())
+        }));
+        termination
+            .await
+            .expect("termination task should not panic")
+            .expect("command/exec fallback should complete termination");
+    }
+
+    #[tokio::test]
+    async fn termination_write_bypasses_blocked_normal_rpc() {
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
+        controller
+            .hang_method(codex_codes::protocol::methods::TURN_START)
+            .await;
+        let turn_harness = harness.clone();
+        let turn_thread = thread.clone();
+        let starting = tokio::spawn(async move {
+            turn_harness
+                .start_turn(
+                    &turn_thread,
+                    UserInput::text("blocked"),
+                    build_turn_overrides(),
+                )
+                .await
+        });
+        timeout(Duration::from_secs(1), async {
+            while !controller
+                .requests()
+                .await
+                .iter()
+                .any(|request| request.method == codex_codes::protocol::methods::TURN_START)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("normal turn request should be in flight");
+
+        harness
+            .terminate_command(&thread, "session-urgent")
+            .await
+            .expect("termination should use the urgent reserved transport");
+        assert!(controller.requests().await.iter().any(|request| {
+            request.method == codex_codes::protocol::methods::COMMAND_EXEC_TERMINATE
+                && request.params["processId"] == "session-urgent"
+        }));
+        assert!(matches!(
+            starting.await.unwrap(),
+            Err(HarnessError::Timeout(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn codex_worker_recovers_after_hung_turn_start_request() {
         let (harness, controller) = spawn_fake_harness();
         let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
@@ -5875,6 +7522,7 @@ mod tests {
     #[tokio::test]
     async fn codex_worker_recovers_after_hung_approval_response() {
         let (harness, controller) = spawn_fake_harness();
+        acknowledge_test_activations(&harness);
         let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
         harness
             .start_turn(
@@ -5885,7 +7533,7 @@ mod tests {
             .await
             .unwrap();
         let native_turn = controller.started_turns().await[0].native_turn_id.clone();
-        let mut stream = harness.subscribe(&thread);
+        let mut stream = claim_event_stream(&harness, &thread).await;
 
         controller
             .send_server_message(command_approval_request(
@@ -5913,6 +7561,27 @@ mod tests {
         .expect_err("hung approval response should return a timeout");
         assert!(matches!(err, HarnessError::Timeout(_)));
 
+        controller.resume_json_responses().await;
+        timeout(
+            Duration::from_secs(1),
+            harness.respond_approval(ApprovalId("approval_req".into()), ApprovalDecision::Accept),
+        )
+        .await
+        .expect("approval retry should complete")
+        .expect("approval retry should reuse the pending native request");
+        let matching = controller
+            .responses()
+            .await
+            .into_iter()
+            .filter(|response| {
+                response.id == codex_codes::jsonrpc::RequestId::String("approval_req".into())
+            })
+            .count();
+        assert_eq!(
+            matching, 1,
+            "the native approval must be answered exactly once"
+        );
+
         timeout(
             Duration::from_secs(1),
             harness.open_thread(open_opts(None, None)),
@@ -5920,6 +7589,117 @@ mod tests {
         .await
         .expect("worker must keep processing commands after a hung approval response")
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_server_response_write_can_retry_same_native_request() {
+        let (harness, controller) = spawn_fake_harness();
+        acknowledge_test_activations(&harness);
+        let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
+        harness
+            .start_turn(
+                &thread,
+                UserInput::text("needs input"),
+                build_turn_overrides(),
+            )
+            .await
+            .unwrap();
+        let native_turn = controller.started_turns().await[0].native_turn_id.clone();
+        let mut stream = claim_event_stream(&harness, &thread).await;
+        controller
+            .send_server_message(generic_user_input_request(
+                "server_retry",
+                &thread.harness_thread_id,
+                &native_turn,
+            ))
+            .await;
+        recv_matching_event(&mut stream, "server request", |event| {
+            matches!(event, AgentEvent::ServerRequestReceived { request, .. }
+                if request.id == ServerRequestId("server_retry".into()))
+        })
+        .await;
+
+        controller.hang_json_responses().await;
+        let first = harness
+            .respond_server_request(
+                ServerRequestId("server_retry".into()),
+                ServerRequestResponse::result(json!({"answer": 1})),
+            )
+            .await;
+        assert!(matches!(first, Err(HarnessError::Timeout(_))));
+
+        controller.resume_json_responses().await;
+        harness
+            .respond_server_request(
+                ServerRequestId("server_retry".into()),
+                ServerRequestResponse::result(json!({"answer": 2})),
+            )
+            .await
+            .expect("server response retry should reuse the pending native request");
+        let matching = controller
+            .responses()
+            .await
+            .into_iter()
+            .filter(|response| {
+                response.id == codex_codes::jsonrpc::RequestId::String("server_retry".into())
+            })
+            .count();
+        assert_eq!(
+            matching, 1,
+            "the native server request must be answered once"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_cleanups_leave_forced_kill_reap_reserve_for_transport() {
+        let (mut client, _frames, controller) = fake_codex();
+        controller
+            .hang_method(codex_codes::protocol::methods::FS_REMOVE)
+            .await;
+        let mut active_turns = HashMap::new();
+        for index in 0..32 {
+            let thread = ThreadHandle::opened(
+                ThreadId::new(),
+                format!("native-shutdown-{index}"),
+                PathBuf::from("/tmp/test-workspace"),
+            );
+            active_turns.insert(
+                thread.thread,
+                ActiveTurn::new(thread, TurnId::new())
+                    .with_upload_dir(Some(PathBuf::from(format!("/tmp/codex-upload-{index}")))),
+            );
+        }
+        let state = Arc::new(StdMutex::new(BackgroundState {
+            mapper: CodexMapper::new(PathBuf::from("/tmp/test-workspace")),
+            pending_compactions: HashMap::new(),
+            pending_context_restores: HashMap::new(),
+            active_turns,
+        }));
+        let routes = Arc::new(StdMutex::new(NativeRoutes::default()));
+        let (cleanup_deadline, deadline) = codex_shutdown_deadlines();
+        assert_eq!(
+            deadline.duration_since(cleanup_deadline),
+            transport::FORCED_KILL_REAP_RESERVE
+        );
+
+        finish_background_state(&mut client, &state, &routes, None, cleanup_deadline).await;
+        shutdown_codex_transport(
+            client,
+            std::path::Path::new("/tmp/test-workspace"),
+            deadline,
+        )
+        .await;
+
+        let remaining = controller
+            .shutdown_remaining()
+            .await
+            .expect("transport shutdown should record its remaining deadline");
+        assert!(
+            !remaining.is_zero(),
+            "cleanup must leave time for the transport to issue kill and reap"
+        );
+        assert!(remaining <= transport::FORCED_KILL_REAP_RESERVE);
+        assert_eq!(controller.shutdowns().await, 1);
     }
 
     #[tokio::test]
@@ -5997,27 +7777,194 @@ mod tests {
         assert_eq!(controller.shutdowns().await, 1);
     }
 
-    #[test]
-    fn opening_thread_preserves_existing_sender() {
+    #[tokio::test]
+    async fn opening_thread_preserves_existing_sender() {
         let thread = ThreadId::new();
-        let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
-        let (first_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
-        let mut first_rx = first_tx.subscribe();
-        ensure_thread_sender(&senders, thread, first_tx);
-
-        let (replacement_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
-        ensure_thread_sender(&senders, thread, replacement_tx);
+        let (routes, mut first_rx) = test_routes(thread);
+        let route = route_for_native(&routes, &format!("native-{thread}"))
+            .unwrap()
+            .unwrap();
+        install_native_route(&routes, route).unwrap();
 
         let turn = TurnId::new();
-        sender_for_thread(&senders, thread)
+        event_sender_for_thread(&routes, thread)
+            .unwrap()
             .expect("sender exists")
             .send(AgentEvent::TurnStarted { thread, turn })
+            .await
             .unwrap();
         assert!(matches!(
-            first_rx.try_recv(),
-            Ok(AgentEvent::TurnStarted { thread: got_thread, turn: got_turn })
+            first_rx.recv().await,
+            Some(AgentEvent::TurnStarted { thread: got_thread, turn: got_turn })
                 if got_thread == thread && got_turn == turn
         ));
+    }
+
+    #[tokio::test]
+    async fn bounded_native_route_backpressures_without_overwriting_events() {
+        let thread = ThreadId::new();
+        let (routes, mut receiver) = test_routes(thread);
+        let sender = event_sender_for_thread(&routes, thread).unwrap().unwrap();
+        for sequence in 0..ROUTE_CAPACITY {
+            sender
+                .try_send(AgentEvent::Notice {
+                    thread,
+                    turn: None,
+                    message: sequence.to_string(),
+                })
+                .unwrap();
+        }
+        assert!(matches!(
+            sender.try_send(AgentEvent::Notice {
+                thread,
+                turn: None,
+                message: "full".into(),
+            }),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+
+        for expected in 0..ROUTE_CAPACITY {
+            let AgentEvent::Notice { message, .. } = receiver.recv().await.unwrap() else {
+                panic!("expected notice");
+            };
+            assert_eq!(message, expected.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn full_route_does_not_block_public_control_response_write() {
+        let (harness, controller) = spawn_fake_harness();
+        acknowledge_test_activations(&harness);
+        let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
+        harness
+            .start_turn(
+                &thread,
+                UserInput::text("keep the native turn active"),
+                build_turn_overrides(),
+            )
+            .await
+            .unwrap();
+        let native_turn = controller.started_turns().await[0].native_turn_id.clone();
+        let mut stream = claim_event_stream(&harness, &thread).await;
+        let _ = stream
+            .recv()
+            .await
+            .expect("thread-opened event should exist");
+
+        let sender = event_sender_for_thread(&harness.routes, thread.thread)
+            .unwrap()
+            .unwrap();
+        for sequence in 0..ROUTE_CAPACITY {
+            sender
+                .try_send(AgentEvent::Notice {
+                    thread: thread.thread,
+                    turn: None,
+                    message: format!("filler-{sequence}"),
+                })
+                .unwrap();
+        }
+        controller
+            .send_server_message(generic_user_input_request(
+                "blocked-request",
+                &thread.harness_thread_id,
+                &native_turn,
+            ))
+            .await;
+
+        controller
+            .hang_method(codex_codes::protocol::methods::TURN_INTERRUPT)
+            .await;
+        let interrupt_harness = harness.clone();
+        let interrupt_thread = thread.clone();
+        let interrupt =
+            tokio::spawn(async move { interrupt_harness.interrupt(&interrupt_thread).await });
+        timeout(Duration::from_secs(1), async {
+            while !controller
+                .requests()
+                .await
+                .iter()
+                .any(|request| request.method == codex_codes::protocol::methods::TURN_INTERRUPT)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("interrupt write must not wait for route capacity");
+        assert!(matches!(
+            sender.try_send(AgentEvent::Notice {
+                thread: thread.thread,
+                turn: None,
+                message: "full-after-interrupt".into(),
+            }),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+
+        controller
+            .hang_method(codex_codes::protocol::methods::THREAD_START)
+            .await;
+        let opening_harness = harness.clone();
+        let blocked_normal_rpc =
+            tokio::spawn(async move { opening_harness.open_thread(open_opts(None, None)).await });
+        timeout(Duration::from_secs(1), async {
+            while controller
+                .requests()
+                .await
+                .iter()
+                .filter(|request| request.method == codex_codes::protocol::methods::THREAD_START)
+                .count()
+                < 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("normal RPC should be in flight before the urgent response");
+
+        let responding_harness = harness.clone();
+        let response_task = tokio::spawn(async move {
+            loop {
+                match responding_harness
+                    .respond_server_request(
+                        ServerRequestId("blocked-request".into()),
+                        ServerRequestResponse::result(json!({"answer": "accepted"})),
+                    )
+                    .await
+                {
+                    Ok(()) => return Ok(()),
+                    Err(HarnessError::Protocol(message))
+                        if message.contains("no pending server request") =>
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        });
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if controller.responses().await.iter().any(|response| {
+                    response.id == codex_codes::jsonrpc::RequestId::String("blocked-request".into())
+                        && response.value == json!({"answer": "accepted"})
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("control write must not wait for route capacity");
+        assert!(matches!(
+            sender.try_send(AgentEvent::Notice {
+                thread: thread.thread,
+                turn: None,
+                message: "still-full".into(),
+            }),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        interrupt.abort();
+        response_task.abort();
+        blocked_normal_rpc.abort();
     }
 
     #[test]
@@ -6065,11 +8012,9 @@ mod tests {
     #[tokio::test]
     async fn incomplete_stream_without_turn_emits_error_event() {
         let thread = ThreadId::new();
-        let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
-        let (tx, mut rx) = broadcast::channel(BROADCAST_CAPACITY);
-        ensure_thread_sender(&senders, thread, tx);
+        let (routes, mut rx) = test_routes(thread);
 
-        emit_incomplete_turn(&senders, thread, None, "stream ended").await;
+        emit_incomplete_turn(&routes, thread, None, "stream ended").await;
 
         let event = rx.recv().await.unwrap();
         match event {
@@ -6089,11 +8034,9 @@ mod tests {
     async fn incomplete_stream_with_turn_emits_failed_completion() {
         let thread = ThreadId::new();
         let turn = TurnId::new();
-        let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
-        let (tx, mut rx) = broadcast::channel(BROADCAST_CAPACITY);
-        ensure_thread_sender(&senders, thread, tx);
+        let (routes, mut rx) = test_routes(thread);
 
-        emit_incomplete_turn(&senders, thread, Some(turn), "stream failed").await;
+        emit_incomplete_turn(&routes, thread, Some(turn), "stream failed").await;
 
         let event = rx.recv().await.unwrap();
         match event {
@@ -6116,11 +8059,9 @@ mod tests {
     async fn fatal_error_with_turn_emits_failed_completion() {
         let thread = ThreadId::new();
         let turn = TurnId::new();
-        let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
-        let (tx, mut rx) = broadcast::channel(BROADCAST_CAPACITY);
-        ensure_thread_sender(&senders, thread, tx);
+        let (routes, mut rx) = test_routes(thread);
 
-        assert!(emit_fatal_turn_completion(&senders, thread, Some(turn), "quota exceeded").await);
+        assert!(emit_fatal_turn_completion(&routes, thread, Some(turn), "quota exceeded").await);
 
         let event = rx.recv().await.unwrap();
         match event {
@@ -6142,15 +8083,13 @@ mod tests {
     #[tokio::test]
     async fn fatal_error_without_turn_does_not_synthesize_completion() {
         let thread = ThreadId::new();
-        let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
-        let (tx, mut rx) = broadcast::channel(BROADCAST_CAPACITY);
-        ensure_thread_sender(&senders, thread, tx);
+        let (routes, mut rx) = test_routes(thread);
 
-        assert!(!emit_fatal_turn_completion(&senders, thread, None, "quota exceeded").await);
+        assert!(!emit_fatal_turn_completion(&routes, thread, None, "quota exceeded").await);
 
         assert!(matches!(
             rx.try_recv(),
-            Err(broadcast::error::TryRecvError::Empty)
+            Err(mpsc::error::TryRecvError::Empty)
         ));
     }
 
@@ -6309,6 +8248,50 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn initialization_failure_kills_and_reaps_spawned_codex() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let test_dir =
+            std::env::temp_dir().join(format!("giskard-codex-init-failure-{}", ThreadId::new()));
+        std::fs::create_dir_all(&test_dir).expect("create startup-failure test directory");
+        let script = test_dir.join("fake-codex");
+        let pid_file = test_dir.join("pid");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$GISKARD_TEST_PID_FILE\"\nprintf '%s\\n' 'not-json'\nexec sleep 60\n",
+        )
+        .expect("write fake Codex executable");
+        let mut permissions = std::fs::metadata(&script)
+            .expect("read fake Codex permissions")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions)
+            .expect("make fake Codex executable runnable");
+
+        let result = start_codex_client(
+            codex_codes::AppServerBuilder::new()
+                .command(&script)
+                .env("GISKARD_TEST_PID_FILE", &pid_file),
+        )
+        .await;
+        assert!(matches!(result, Err(HarnessError::Spawn(_))));
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("fake Codex should record its pid")
+            .trim()
+            .to_owned();
+        let proc_entry = PathBuf::from(format!("/proc/{pid}"));
+        timeout(Duration::from_secs(1), async {
+            while proc_entry.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("last transport owner should kill and reap failed startup child");
+        std::fs::remove_dir_all(test_dir).expect("remove startup-failure test directory");
+    }
+
     #[test]
     fn initialize_params_enable_experimental_app_server_api() {
         let params = serde_json::to_value(build_initialize_params()).unwrap();
@@ -6328,7 +8311,7 @@ mod tests {
 
     #[tokio::test]
     async fn config_read_resolves_extra_workspace_write_roots_for_project_cwd() {
-        let (mut transport, controller) = fake_codex();
+        let (mut transport, _frames, controller) = fake_codex();
         let workspace = PathBuf::from("/tmp/project");
 
         let roots = configured_workspace_write_roots(&mut transport, &workspace).await;
@@ -6343,7 +8326,7 @@ mod tests {
 
     #[tokio::test]
     async fn config_read_failure_omits_configured_extra_workspace_roots() {
-        let (mut transport, controller) = fake_codex();
+        let (mut transport, _frames, controller) = fake_codex();
         controller.fail_config_read("unsupported method").await;
 
         let roots =

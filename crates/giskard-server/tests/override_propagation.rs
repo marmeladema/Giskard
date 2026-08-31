@@ -5,6 +5,8 @@
 //! must reach the harness (§9). A capturing harness records every `TurnOverrides` it is handed.
 
 mod common;
+#[path = "common/event_channel.rs"]
+mod event_channel;
 
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -20,20 +22,22 @@ use giskard_core::token::TokenUsage;
 use giskard_core::turn::{Mode, PermissionPreset, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+    AgentEventStream, AgentHarness, ClaimedNativeRoute, HarnessCapabilities, HarnessSignalStream,
+    OpenThreadOptions, ThreadHandle,
 };
 use giskard_persist::store::ProjectConfig;
 use giskard_proto::ClientMessage;
 use giskard_server::{AppState, HarnessFactory, build_app};
 use tokio::sync::Mutex as TokioMutex;
-use tokio::sync::broadcast;
 
 use common::fake_native_model;
+use event_channel::{BoundedEventRoute, TestRouteContract, closed_event_stream};
 
 /// Harness that records the overrides passed to `start_turn` and emits a trivial completed turn.
 struct CapturingHarness {
+    route_contract: TestRouteContract,
     captured: Arc<TokioMutex<Vec<TurnOverrides>>>,
-    tx: broadcast::Sender<AgentEvent>,
+    tx: BoundedEventRoute,
     thread_id: StdMutex<Option<ThreadId>>,
     /// What each `open_thread` asked for. `None` means the caller left the model to the harness.
     requested_models: Arc<StdMutex<Vec<Option<ModelRef>>>>,
@@ -44,10 +48,10 @@ impl CapturingHarness {
         captured: Arc<TokioMutex<Vec<TurnOverrides>>>,
         requested_models: Arc<StdMutex<Vec<Option<ModelRef>>>>,
     ) -> Self {
-        let (tx, _) = broadcast::channel(64);
         Self {
+            route_contract: TestRouteContract::new(),
             captured,
-            tx,
+            tx: BoundedEventRoute::new(64),
             requested_models,
             thread_id: StdMutex::new(None),
         }
@@ -78,21 +82,47 @@ impl AgentHarness for CapturingHarness {
         Ok(vec![])
     }
 
+    fn take_harness_signals(&self) -> Result<HarnessSignalStream, HarnessError> {
+        self.route_contract.take_harness_signals()
+    }
+
+    async fn claim_native_route(
+        &self,
+        harness_thread_id: String,
+        suggested_thread_id: ThreadId,
+    ) -> Result<ClaimedNativeRoute, HarnessError> {
+        self.route_contract
+            .claim_native_route(harness_thread_id, suggested_thread_id)
+    }
+
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
         let tid = opts.thread.unwrap_or_default();
-        *self.thread_id.lock().unwrap() = Some(tid);
+        *self
+            .thread_id
+            .lock()
+            .expect("capturing harness thread lock poisoned") = Some(tid);
         self.requested_models
             .lock()
-            .unwrap()
+            .expect("capturing harness requested-model lock poisoned")
             .push(opts.initial_model.clone());
-        Ok(ThreadHandle {
-            resumed_model: opts
-                .initial_model
-                .clone()
-                .or_else(|| Some(fake_native_model())),
-            ..ThreadHandle::opened(
-                tid,
+        let resumed_model = opts
+            .initial_model
+            .clone()
+            .or_else(|| Some(fake_native_model()));
+        let route = self
+            .route_contract
+            .activate_primary(
                 opts.resume.unwrap_or_else(|| "cap".into()),
+                tid,
+                opts.identity_generation,
+                resumed_model.clone(),
+            )
+            .await?;
+        Ok(ThreadHandle {
+            resumed_model,
+            ..ThreadHandle::opened(
+                route.thread_id,
+                route.harness_thread_id,
                 opts.workspace_root.clone(),
             )
         })
@@ -108,21 +138,30 @@ impl AgentHarness for CapturingHarness {
         let tid = thread.thread;
         let turn = TurnId::new();
         // Drive a minimal turn so the server-side forwarder completes and persists.
-        let _ = self.tx.send(AgentEvent::TurnStarted { thread: tid, turn });
-        let _ = self.tx.send(AgentEvent::TurnCompleted {
-            thread: tid,
-            turn,
-            usage: TokenUsage::default(),
-            status: TurnStatus {
-                kind: TurnStatusKind::Completed,
-                message: None,
-            },
-        });
+        let _ = self
+            .tx
+            .send(AgentEvent::TurnStarted { thread: tid, turn })
+            .await;
+        let _ = self
+            .tx
+            .send(AgentEvent::TurnCompleted {
+                thread: tid,
+                turn,
+                usage: TokenUsage::default(),
+                status: TurnStatus {
+                    kind: TurnStatusKind::Completed,
+                    message: None,
+                },
+            })
+            .await;
         Ok(turn)
     }
 
-    fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-        AgentEventStream::new(self.tx.subscribe())
+    fn claim_event_receiver(
+        &self,
+        _route: &ClaimedNativeRoute,
+    ) -> Result<AgentEventStream, HarnessError> {
+        Ok(self.tx.take_stream().unwrap_or_else(closed_event_stream))
     }
 
     async fn respond_approval(

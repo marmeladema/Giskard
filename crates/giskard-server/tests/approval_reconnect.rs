@@ -7,6 +7,8 @@
 //! and assert the snapshot reports it as answered (not pending).
 
 mod common;
+#[path = "common/event_channel.rs"]
+mod event_channel;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -20,15 +22,17 @@ use giskard_core::model::ModelDescriptor;
 use giskard_core::turn::TurnOverrides;
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+    AgentEventStream, AgentHarness, ClaimedNativeRoute, HarnessCapabilities, HarnessSignalStream,
+    OpenThreadOptions, ThreadHandle,
 };
 use giskard_persist::store::ProjectConfig;
 use giskard_proto::{ClientMessage, ServerMessage, WireAgentEvent};
 use giskard_server::{AppState, HarnessFactory, build_app};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 
 use common::fake_native_model;
+use event_channel::{BoundedEventRoute, TestRouteContract};
 
 type TestWs =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -39,7 +43,8 @@ const SERVER_REQUEST_ID: &str = "req_reconnect_1";
 /// A harness that raises a single approval and keeps the turn in-flight forever (never sends
 /// `TurnCompleted`), so the live buffer is still present when the reconnect snapshot is taken.
 struct ApprovalHarness {
-    tx: broadcast::Sender<AgentEvent>,
+    route_contract: TestRouteContract,
+    tx: BoundedEventRoute,
     active: Mutex<Option<(ThreadId, TurnId)>>,
     answered: Mutex<Vec<(ApprovalId, ApprovalDecision)>>,
     hang_next_approval: Mutex<bool>,
@@ -47,9 +52,9 @@ struct ApprovalHarness {
 
 impl ApprovalHarness {
     fn new() -> Self {
-        let (tx, _) = broadcast::channel(64);
         Self {
-            tx,
+            route_contract: TestRouteContract::new(),
+            tx: BoundedEventRoute::new(64),
             active: Mutex::new(None),
             answered: Mutex::new(Vec::new()),
             hang_next_approval: Mutex::new(false),
@@ -85,16 +90,39 @@ impl AgentHarness for ApprovalHarness {
         Ok(vec![])
     }
 
+    fn take_harness_signals(&self) -> Result<HarnessSignalStream, HarnessError> {
+        self.route_contract.take_harness_signals()
+    }
+
+    async fn claim_native_route(
+        &self,
+        harness_thread_id: String,
+        suggested_thread_id: ThreadId,
+    ) -> Result<ClaimedNativeRoute, HarnessError> {
+        self.route_contract
+            .claim_native_route(harness_thread_id, suggested_thread_id)
+    }
+
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
         let thread = opts.thread.unwrap_or_default();
-        Ok(ThreadHandle {
-            resumed_model: opts
-                .initial_model
-                .clone()
-                .or_else(|| Some(fake_native_model())),
-            ..ThreadHandle::opened(
-                thread,
+        let resumed_model = opts
+            .initial_model
+            .clone()
+            .or_else(|| Some(fake_native_model()));
+        let route = self
+            .route_contract
+            .activate_primary(
                 opts.resume.unwrap_or_else(|| "approval_harness".into()),
+                thread,
+                opts.identity_generation,
+                resumed_model.clone(),
+            )
+            .await?;
+        Ok(ThreadHandle {
+            resumed_model,
+            ..ThreadHandle::opened(
+                route.thread_id,
+                route.harness_thread_id,
                 opts.workspace_root.clone(),
             )
         })
@@ -108,41 +136,56 @@ impl AgentHarness for ApprovalHarness {
     ) -> Result<TurnId, HarnessError> {
         let turn = TurnId::new();
         *self.active.lock().await = Some((thread.thread, turn));
-        let _ = self.tx.send(AgentEvent::TurnStarted {
-            thread: thread.thread,
-            turn,
-        });
-        let _ = self.tx.send(AgentEvent::ApprovalRequested {
-            thread: thread.thread,
-            turn,
-            request: ApprovalRequest {
-                id: ApprovalId(APPROVAL_ID.into()),
-                kind: ApprovalKind::CommandExecution {
-                    command: "rm -rf ./build".into(),
-                    cwd: "/tmp/project".into(),
+        let _ = self
+            .tx
+            .send(AgentEvent::TurnStarted {
+                thread: thread.thread,
+                turn,
+            })
+            .await;
+        let _ = self
+            .tx
+            .send(AgentEvent::ApprovalRequested {
+                thread: thread.thread,
+                turn,
+                request: ApprovalRequest {
+                    id: ApprovalId(APPROVAL_ID.into()),
+                    kind: ApprovalKind::CommandExecution {
+                        command: "rm -rf ./build".into(),
+                        cwd: "/tmp/project".into(),
+                    },
+                    reason: Some("Remove the build directory?".into()),
+                    metadata: vec![],
+                    available: vec![ApprovalDecision::Accept, ApprovalDecision::Decline],
                 },
-                reason: Some("Remove the build directory?".into()),
-                metadata: vec![],
-                available: vec![ApprovalDecision::Accept, ApprovalDecision::Decline],
-            },
-        });
+            })
+            .await;
         // A non-approval server request blocks the turn the same way an approval does, and is just
         // as invisible to a browser that was not connected, so the connect replay carries both.
-        let _ = self.tx.send(AgentEvent::ServerRequestReceived {
-            thread: thread.thread,
-            turn: Some(turn),
-            request: giskard_core::server_request::ServerRequest {
-                id: giskard_core::ids::ServerRequestId(SERVER_REQUEST_ID.into()),
-                method: "requestUserInput".into(),
-                params: serde_json::json!({ "question": "Which branch?" }),
-                received_at: chrono::Utc::now(),
-            },
-        });
+        let _ = self
+            .tx
+            .send(AgentEvent::ServerRequestReceived {
+                thread: thread.thread,
+                turn: Some(turn),
+                request: giskard_core::server_request::ServerRequest {
+                    id: giskard_core::ids::ServerRequestId(SERVER_REQUEST_ID.into()),
+                    method: "requestUserInput".into(),
+                    params: serde_json::json!({ "question": "Which branch?" }),
+                    received_at: chrono::Utc::now(),
+                },
+            })
+            .await;
         Ok(turn)
     }
 
-    fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-        AgentEventStream::new(self.tx.subscribe())
+    fn claim_event_receiver(
+        &self,
+        _route: &ClaimedNativeRoute,
+    ) -> Result<AgentEventStream, HarnessError> {
+        Ok(self
+            .tx
+            .take_stream()
+            .expect("approval harness event receiver can only be claimed once"))
     }
 
     async fn respond_approval(
@@ -167,11 +210,14 @@ impl AgentHarness for ApprovalHarness {
         // Mirror a real harness: answering the request resolves it, which is what clears it from the
         // live buffer. Without this it would stay outstanding and keep being replayed.
         if let Some((thread, turn)) = *self.active.lock().await {
-            let _ = self.tx.send(AgentEvent::ServerRequestResolved {
-                thread,
-                turn: Some(turn),
-                request_id: req,
-            });
+            let _ = self
+                .tx
+                .send(AgentEvent::ServerRequestResolved {
+                    thread,
+                    turn: Some(turn),
+                    request_id: req,
+                })
+                .await;
         }
         Ok(())
     }
