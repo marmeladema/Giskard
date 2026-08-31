@@ -569,13 +569,35 @@ async fn websocket_terminate_running_command_marks_terminating_until_terminal_ev
 
     app.harness.wait_until_terminated().await;
     wait_for_terminating_command(&mut ws).await;
-    let snapshot = app.state.runtime.tasks_snapshot(thread_id).1;
+    let snapshot = app
+        .state
+        .runtime
+        .tasks_snapshot(
+            &app.state
+                .registry
+                .thread_authority(thread_id)
+                .await
+                .unwrap(),
+        )
+        .1;
     assert_eq!(snapshot.len(), 1);
     assert!(snapshot[0].terminating);
 
     app.harness.complete_command().await;
     wait_for_completed_command_after_interrupted_turn(&mut ws).await;
-    assert!(app.state.runtime.tasks_snapshot(thread_id).1.is_empty());
+    assert!(
+        app.state
+            .runtime
+            .tasks_snapshot(
+                &app.state
+                    .registry
+                    .thread_authority(thread_id)
+                    .await
+                    .unwrap()
+            )
+            .1
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -686,7 +708,19 @@ async fn no_active_for_after_turn_command_clears_stale_snapshot(behavior: Termin
         .await
         .unwrap();
     wait_for_interrupted_turn(&mut ws).await;
-    assert!(app.state.runtime.tasks_snapshot(thread_id).1[0].after_turn);
+    assert!(
+        app.state
+            .runtime
+            .tasks_snapshot(
+                &app.state
+                    .registry
+                    .thread_authority(thread_id)
+                    .await
+                    .unwrap()
+            )
+            .1[0]
+            .after_turn
+    );
 
     ws.send(ws_text(&ClientMessage::TerminateCommand {
         thread_id,
@@ -703,7 +737,19 @@ async fn no_active_for_after_turn_command_clears_stale_snapshot(behavior: Termin
     assert!(warning.detail.as_deref().is_some_and(|detail| {
         detail.contains("may still be running in the harness environment")
     }));
-    assert!(app.state.runtime.tasks_snapshot(thread_id).1.is_empty());
+    assert!(
+        app.state
+            .runtime
+            .tasks_snapshot(
+                &app.state
+                    .registry
+                    .thread_authority(thread_id)
+                    .await
+                    .unwrap()
+            )
+            .1
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -756,7 +802,17 @@ async fn terminate_failure_preserves_snapshot(behavior: TerminateBehavior, expec
     let error = wait_for_error(&mut ws, "terminate_command", expected_code).await;
     assert_eq!(error.thread_id, Some(thread_id));
     assert_eq!(error.process_id.as_deref(), Some("proc_1"));
-    let snapshot = app.state.runtime.tasks_snapshot(thread_id).1;
+    let snapshot = app
+        .state
+        .runtime
+        .tasks_snapshot(
+            &app.state
+                .registry
+                .thread_authority(thread_id)
+                .await
+                .unwrap(),
+        )
+        .1;
     assert_eq!(snapshot.len(), 1);
     assert_eq!(snapshot[0].process_id.as_deref(), Some("proc_1"));
     assert!(!snapshot[0].terminating);

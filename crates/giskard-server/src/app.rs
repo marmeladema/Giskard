@@ -11,7 +11,7 @@ use crate::ledger::{self, LedgerHandle};
 use crate::registry::{HarnessFactory, HarnessRegistry};
 use crate::routes::{http_request_context_middleware, protected_routes, public_routes};
 use crate::thread_metadata::ThreadMetadataService;
-use crate::thread_runtime::ThreadRuntimeRegistry;
+use crate::thread_runtime::ThreadRuntimeSupport;
 use crate::throttle::LoginThrottle;
 
 #[derive(Clone)]
@@ -51,7 +51,7 @@ pub struct AppState {
     pub hub: Arc<Hub>,
     pub thread_metadata: Arc<ThreadMetadataService>,
     pub registry: Arc<HarnessRegistry>,
-    pub runtime: Arc<ThreadRuntimeRegistry>,
+    pub runtime: Arc<ThreadRuntimeSupport>,
     pub highlighter: Arc<Highlighter>,
     /// Single-writer token-ledger actor handle (§5.4).
     pub ledger: LedgerHandle,
@@ -83,7 +83,7 @@ impl AppState {
         retention_config: Option<&giskard_persist::config::RetentionConfig>,
     ) -> Self {
         let hub = Arc::new(Hub::new());
-        let runtime = Arc::new(ThreadRuntimeRegistry::with_max_command_output_bytes(
+        let runtime = Arc::new(ThreadRuntimeSupport::with_max_command_output_bytes(
             retention_config.map_or(
                 giskard_persist::config::RetentionConfig::DEFAULT_MAX_COMMAND_OUTPUT_BYTES,
                 |retention| retention.max_command_output_bytes,

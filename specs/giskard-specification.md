@@ -148,9 +148,10 @@
   revisioned browser projection.
 
 **Changelog (1.68 → 1.69), process-local thread runtime authority:**
-- **RT1:** `ThreadRuntimeRegistry` is the sole server-facing authority for active-turn ownership,
-  reconnect projection, running tasks, outstanding/resolved requests, and the cross-thread runtime
-  overview. Client-visible agent events enter through one apply operation and receive one
+- **RT1:** The thread-owned runtime component is the sole server-facing authority for active-turn
+  ownership, reconnect projection, running tasks, and outstanding/resolved requests; the root
+  runtime overview projection remains the cross-thread derived authority. Client-visible agent
+  events enter through one apply operation and receive one
   process-local sequence; metadata-only/internal events do not consume that sequence or reach the
   transcript stream.
 - **RT2:** Approval and server-request responses carry `thread_id` and atomically claim a pending
@@ -3478,11 +3479,11 @@ than claiming that the current transitional stores already provide those clocks.
 | Persisted thread metadata | thread metadata service | durable thread revision | revisioned replacement |
 | Project thread catalog | persisted thread files | each row's thread revision | invalidation + HTTP replacement |
 | Completed transcript | history JSONL | ordered `TurnId` | bootstrap/page |
-| Active transcript | thread runtime registry | process-local event sequence | ordered journal |
-| Active-turn ownership | thread runtime registry | runtime transition order | bootstrap/runtime replacement |
-| Running tasks | thread runtime registry | process-local task revision | revisioned replacement |
-| Requests | thread runtime registry | request state transition | ordered + runtime replacement |
-| Cross-thread runtime overview | thread runtime registry | process-local overview revision | revisioned replacement |
+| Active transcript | thread-owned runtime component | process-local event sequence | ordered journal |
+| Active-turn ownership | thread-owned runtime component | runtime transition order | bootstrap/runtime replacement |
+| Running tasks | thread-owned runtime component | process-local task revision | revisioned replacement |
+| Requests | thread-owned runtime component | request state transition | ordered + runtime replacement |
+| Cross-thread runtime overview | root runtime overview projection | process-local overview revision | revisioned replacement |
 | Direct action result | action handler | domain identity | direct control response |
 | Background notice | notice authority | notice identity/revision | revisioned replacement |
 

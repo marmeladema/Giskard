@@ -464,16 +464,20 @@ session_days = 30
     .await
     .unwrap();
 
-    // The socket reports the read-only attach warning; completed history is independent HTTP.
+    // The socket reports the read-only attach warning and still bootstraps persisted history.
     let mut read_only_warning: Option<serde_json::Value> = None;
+    let mut history_delta: Option<serde_json::Value> = None;
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-    while tokio::time::Instant::now() < deadline && read_only_warning.is_none() {
+    while tokio::time::Instant::now() < deadline
+        && (read_only_warning.is_none() || history_delta.is_none())
+    {
         match tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
                 let v: serde_json::Value = serde_json::from_str(&t).unwrap();
                 // `ServerMessage::Error` flattens `ErrorInfo`, so its fields sit at the top level.
                 match v["type"].as_str() {
                     Some("error") if v["code"] == "thread_read_only" => read_only_warning = Some(v),
+                    Some("history_delta") => history_delta = Some(v),
                     _ => {}
                 }
             }
@@ -482,7 +486,13 @@ session_days = 30
         }
     }
 
-    // The persisted history is served despite the harness being unable to attach.
+    let history_delta =
+        history_delta.expect("read-only subscribe must bootstrap persisted history over WebSocket");
+    assert_eq!(history_delta["thread_id"], tid.to_string());
+    assert_eq!(history_delta["turns"].as_array().unwrap().len(), 2);
+    assert_eq!(history_delta["reset"], true);
+
+    // The persisted history also remains available through pagination.
     let page: serde_json::Value = client
         .get(format!("{base}/api/projects/{pid}/threads/{tid}/history"))
         .header("cookie", &cookie)
