@@ -329,7 +329,13 @@ async fn running_tool_call_surfaces_in_running_tasks_snapshot() {
             serde_json::from_str::<ServerMessage>(&text).unwrap()
             && tasks.iter().all(|task| task.item_id != tool_item_id)
         {
-            assert!(state.runtime.tasks_snapshot(thread_id).1.is_empty());
+            assert!(
+                state
+                    .runtime
+                    .tasks_snapshot(&state.registry.thread_authority(thread_id).await.unwrap())
+                    .1
+                    .is_empty()
+            );
             return;
         }
     }

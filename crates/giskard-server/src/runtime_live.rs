@@ -331,7 +331,7 @@ impl LiveTurnState {
     /// Every thread currently waiting on the user, across all in-flight turns.
     ///
     /// Legacy test projection retained to verify that every unanswered request is reconstructed.
-    /// Production cross-thread state comes from `ThreadRuntimeRegistry`'s replacement overview.
+    /// Production cross-thread state comes from the root runtime overview projection.
     #[cfg(test)]
     pub fn pending_attention(&self) -> Vec<PendingAttention> {
         self.thread_id

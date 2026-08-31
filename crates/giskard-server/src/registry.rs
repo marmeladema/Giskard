@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -46,7 +46,7 @@ use crate::thread_graph::{
 use crate::thread_metadata::ThreadMetadataService;
 use crate::thread_runtime::{
     AppliedRuntimeEvent, RequestResolution, RequestTransition, RestorePermit, RuntimeRequestId,
-    ThreadRuntimeRegistry, ThreadTurnLease, TurnReservation,
+    ThreadRuntimeEntry, ThreadRuntimeSupport, ThreadTurnLease, TurnReservation,
 };
 
 #[async_trait]
@@ -312,20 +312,22 @@ struct ThreadCoordinator {
 
 type ThreadBinding = Arc<ThreadCoordinator>;
 
-struct ThreadAuthority {
-    thread_id: ThreadId,
+pub struct ThreadAuthority {
+    pub(crate) thread_id: ThreadId,
     project_id: ProjectId,
     owner: Arc<Mutex<()>>,
     coordinator: Mutex<Option<ThreadBinding>>,
+    pub(crate) runtime: StdMutex<Option<Arc<StdMutex<ThreadRuntimeEntry>>>>,
 }
 
 impl ThreadAuthority {
-    fn new(thread_id: ThreadId, project_id: ProjectId, owner: Arc<Mutex<()>>) -> Self {
+    pub(crate) fn new(thread_id: ThreadId, project_id: ProjectId, owner: Arc<Mutex<()>>) -> Self {
         Self {
             thread_id,
             project_id,
             owner,
             coordinator: Mutex::new(None),
+            runtime: StdMutex::new(None),
         }
     }
 }
@@ -827,7 +829,7 @@ struct RegistryShared {
     subagent_materialization_queues:
         Arc<Mutex<HashMap<ThreadId, VecDeque<SubagentMaterializationJob>>>>,
     hub: Arc<Hub>,
-    runtime: Arc<ThreadRuntimeRegistry>,
+    runtime: Arc<ThreadRuntimeSupport>,
     store: Arc<PersistStore>,
     thread_metadata: Arc<ThreadMetadataService>,
     ledger: LedgerHandle,
@@ -969,6 +971,7 @@ impl RegistryShared {
 
     async fn admit_operation(
         &self,
+        authority: &Arc<ThreadAuthority>,
         coordinator: &ThreadCoordinator,
         project_id: ProjectId,
         handle: &ThreadHandle,
@@ -976,7 +979,7 @@ impl RegistryShared {
     ) -> Result<CoordinatorToken, HarnessError> {
         let turn_gate = match self
             .runtime
-            .reserve_turn(handle.thread, turn_reservation(project_id, handle, context))
+            .reserve_turn(authority, turn_reservation(project_id, handle, context))
         {
             Ok(turn_gate) => turn_gate,
             Err(error) => return Err(error),
@@ -999,12 +1002,12 @@ impl RegistryShared {
 
     #[cfg(test)]
     fn new(hub: Arc<Hub>, store: Arc<PersistStore>, ledger: LedgerHandle) -> Self {
-        Self::new_with_runtime(hub, Arc::new(ThreadRuntimeRegistry::new()), store, ledger)
+        Self::new_with_runtime(hub, Arc::new(ThreadRuntimeSupport::new()), store, ledger)
     }
 
     fn new_with_runtime(
         hub: Arc<Hub>,
-        runtime: Arc<ThreadRuntimeRegistry>,
+        runtime: Arc<ThreadRuntimeSupport>,
         store: Arc<PersistStore>,
         ledger: LedgerHandle,
     ) -> Self {
@@ -1025,8 +1028,9 @@ impl RegistryShared {
 }
 
 #[cfg(test)]
-fn prepare_thread_updates(
+async fn prepare_thread_updates(
     shared: &RegistryShared,
+    project_id: ProjectId,
     thread_id: ThreadId,
 ) -> (
     giskard_harness::ThreadUpdateSink,
@@ -1034,7 +1038,11 @@ fn prepare_thread_updates(
     RestorePermit,
 ) {
     let (sink, stream) = thread_update_channel();
-    let permit = shared.runtime.restoration_permit(thread_id);
+    let authority = shared
+        .intern_thread_authority(thread_id, project_id)
+        .await
+        .expect("test thread authority must be valid");
+    let permit = shared.runtime.restoration_permit(&authority);
     (sink, stream, permit)
 }
 
@@ -1089,6 +1097,21 @@ fn spawn_thread_update_forwarder(
 }
 
 impl HarnessRegistry {
+    pub async fn thread_authority(&self, thread_id: ThreadId) -> Option<Arc<ThreadAuthority>> {
+        self.shared.thread_authority(thread_id).await
+    }
+
+    pub(crate) async fn verified_thread_authority(
+        &self,
+        project_id: ProjectId,
+        thread_id: ThreadId,
+    ) -> Result<Arc<ThreadAuthority>, HarnessError> {
+        self.shared
+            .intern_thread_authority(thread_id, project_id)
+            .await
+            .map_err(|error| HarnessError::Protocol(error.to_string()))
+    }
+
     pub async fn ensure_thread_writable(
         &self,
         project_id: ProjectId,
@@ -1125,7 +1148,7 @@ impl HarnessRegistry {
     pub fn new_with_runtime(
         factory: Arc<dyn HarnessFactory>,
         hub: Arc<Hub>,
-        runtime: Arc<ThreadRuntimeRegistry>,
+        runtime: Arc<ThreadRuntimeSupport>,
         store: Arc<PersistStore>,
         ledger: LedgerHandle,
     ) -> Self {
@@ -1351,8 +1374,18 @@ impl HarnessRegistry {
         }
         let harness = self.get_or_create_harness(config.id, config).await?;
         let (updates, update_stream) = thread_update_channel();
-        let restore_permit =
-            thread.map(|thread_id| self.shared.runtime.restoration_permit(thread_id));
+        let authority = match thread {
+            Some(thread_id) => Some(
+                self.shared
+                    .intern_thread_authority(thread_id, config.id)
+                    .await
+                    .map_err(|error| HarnessError::Protocol(error.to_string()))?,
+            ),
+            None => None,
+        };
+        let restore_permit = authority
+            .as_ref()
+            .map(|authority| self.shared.runtime.restoration_permit(authority));
 
         let handle = harness
             .open_thread(OpenThreadOptions {
@@ -1367,8 +1400,16 @@ impl HarnessRegistry {
         // A known thread can begin another lifecycle while its harness open is in flight, so its
         // permit was captured above. A newly imported thread is not exposed until after this
         // function returns, making the harness-returned identity safe to capture here.
+        let authority = match authority {
+            Some(authority) => authority,
+            None => self
+                .shared
+                .intern_thread_authority(handle.thread, config.id)
+                .await
+                .map_err(|error| HarnessError::Protocol(error.to_string()))?,
+        };
         let restore_permit =
-            restore_permit.unwrap_or_else(|| self.shared.runtime.restoration_permit(handle.thread));
+            restore_permit.unwrap_or_else(|| self.shared.runtime.restoration_permit(&authority));
 
         // Bind the model the harness reports as effective when it says so — Codex can ignore
         // resume overrides for a loaded thread, and the binding must reflect reality, not the
@@ -1459,9 +1500,14 @@ impl HarnessRegistry {
             kind: TurnContextKind::User,
         };
         let request_started = Instant::now();
+        let authority = self
+            .shared
+            .thread_authority(thread_id)
+            .await
+            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
         let operation = self
             .shared
-            .admit_operation(&coordinator, project_id, &handle, &ctx)
+            .admit_operation(&authority, &coordinator, project_id, &handle, &ctx)
             .await?;
         let Some(task_permit) = self.shared.background_tasks.register() else {
             self.shared
@@ -1531,6 +1577,11 @@ impl HarnessRegistry {
         request_id: ApprovalId,
         decision: ApprovalDecision,
     ) -> Result<ThreadId, HarnessError> {
+        let authority = self
+            .shared
+            .thread_authority(thread_id)
+            .await
+            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
         let project_id = self
             .get_project_for_thread(thread_id)
             .await
@@ -1545,7 +1596,7 @@ impl HarnessRegistry {
         let (claim, transition) = self
             .shared
             .runtime
-            .claim_request(thread_id, RuntimeRequestId::Approval(request_id.clone()))?;
+            .claim_request(&authority, RuntimeRequestId::Approval(request_id.clone()))?;
         self.publish_request_transition(thread_id, transition).await;
 
         if let Err(error) = harness
@@ -1571,7 +1622,7 @@ impl HarnessRegistry {
         // rather than re-prompting (spec §13.6).
         self.shared
             .runtime
-            .resolve_live_approval(thread_id, request_id.clone(), decision);
+            .resolve_live_approval(&authority, request_id.clone(), decision);
         debug!(
             %thread_id,
             request_id = %request_id.0,
@@ -1589,6 +1640,11 @@ impl HarnessRegistry {
         request_id: ServerRequestId,
         response: ServerRequestResponse,
     ) -> Result<ThreadId, HarnessError> {
+        let authority = self
+            .shared
+            .thread_authority(thread_id)
+            .await
+            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
         let project_id = self
             .get_project_for_thread(thread_id)
             .await
@@ -1603,7 +1659,7 @@ impl HarnessRegistry {
         let (claim, transition) = self
             .shared
             .runtime
-            .claim_request(thread_id, RuntimeRequestId::Server(request_id.clone()))?;
+            .claim_request(&authority, RuntimeRequestId::Server(request_id.clone()))?;
         self.publish_request_transition(thread_id, transition).await;
 
         if let Err(error) = harness
@@ -1630,7 +1686,7 @@ impl HarnessRegistry {
         // would re-prompt and re-answering routes a stale id to the harness (spec §13.6).
         self.shared
             .runtime
-            .resolve_live_server_request(thread_id, request_id.clone());
+            .resolve_live_server_request(&authority, request_id.clone());
         debug!(
             %thread_id,
             request_id = %request_id.0,
@@ -1641,7 +1697,10 @@ impl HarnessRegistry {
     }
 
     async fn publish_request_state(&self, thread_id: ThreadId, request_id: &RuntimeRequestId) {
-        let Some(request) = self.shared.runtime.request_state(thread_id, request_id) else {
+        let Some(authority) = self.shared.thread_authority(thread_id).await else {
+            return;
+        };
+        let Some(request) = self.shared.runtime.request_state(&authority, request_id) else {
             return;
         };
         self.shared
@@ -1764,7 +1823,17 @@ impl HarnessRegistry {
         };
         let operation = self
             .shared
-            .admit_operation(&coordinator, project_id, &handle, &ctx)
+            .admit_operation(
+                &self
+                    .shared
+                    .thread_authority(thread_id)
+                    .await
+                    .ok_or(HarnessError::ThreadNotFound(thread_id))?,
+                &coordinator,
+                project_id,
+                &handle,
+                &ctx,
+            )
             .await?;
         let Some(task_permit) = self.shared.background_tasks.register() else {
             self.shared
@@ -2022,7 +2091,10 @@ impl HarnessRegistry {
     }
 
     pub async fn thread_has_active_turn(&self, thread_id: ThreadId) -> bool {
-        self.shared.runtime.has_active_turn(thread_id)
+        let Some(authority) = self.shared.thread_authority(thread_id).await else {
+            return false;
+        };
+        self.shared.runtime.has_active_turn(&authority)
     }
 
     pub async fn forget_thread(&self, thread_id: ThreadId) {
@@ -2046,7 +2118,7 @@ impl HarnessRegistry {
         }
 
         let _owner_guard = lock_thread_owner(&self.shared.threads, thread_id).await;
-        if let (Some(authority), Some(coordinator)) = (authority, coordinator) {
+        if let (Some(authority), Some(coordinator)) = (authority.as_ref(), coordinator) {
             let mut slot = authority.coordinator.lock().await;
             if slot
                 .as_ref()
@@ -2060,10 +2132,11 @@ impl HarnessRegistry {
     }
 
     pub async fn retire_thread(&self, thread_id: ThreadId) {
+        let authority = self.shared.thread_authority(thread_id).await;
         self.forget_thread(thread_id).await;
-        self.shared
-            .runtime
-            .forget_threads(&HashSet::from([thread_id]));
+        if let Some(authority) = authority {
+            self.shared.runtime.forget_threads(&[authority]);
+        }
         publish_runtime_overview(&self.shared).await;
     }
 
@@ -2205,12 +2278,14 @@ impl HarnessRegistry {
             }
         }
 
+        let mut thread_authorities = Vec::new();
         for thread_id in &thread_ids {
+            if let Some(authority) = self.shared.thread_authority(*thread_id).await {
+                thread_authorities.push(authority);
+            }
             self.forget_thread(*thread_id).await;
         }
-        let removed_thread_ids = thread_ids;
-
-        self.shared.runtime.forget_threads(&removed_thread_ids);
+        self.shared.runtime.forget_threads(&thread_authorities);
         publish_runtime_overview(&self.shared).await;
 
         Ok(())
@@ -2389,12 +2464,11 @@ async fn resolve_subagent_link_info(
         return Err(HarnessError::ThreadNotFound(parent_thread_id));
     }
 
-    for event in shared
-        .runtime
-        .live_item_events(parent_thread_id, item_id)
-        .into_iter()
-        .rev()
-    {
+    let live_events = match shared.thread_authority(parent_thread_id).await {
+        Some(authority) => shared.runtime.live_item_events(&authority, item_id),
+        None => Vec::new(),
+    };
+    for event in live_events.into_iter().rev() {
         match event {
             AgentEvent::ItemCompleted { turn, item, .. } => {
                 if let Some(info) = subagent_activity_info(&item) {
@@ -3033,7 +3107,14 @@ fn launch_event_forwarder(
         let _permit = permit;
         let cancellation_probe = cancel.clone();
         let thread_id = coordinator.binding().await.handle.thread;
-        let exit_reason = forward_events(shared.clone(), coordinator.clone(), stream, cancel).await;
+        let exit_reason = forward_events(
+            shared.clone(),
+            authority.clone(),
+            coordinator.clone(),
+            stream,
+            cancel,
+        )
+        .await;
         let cancelled = *cancellation_probe.borrow();
         if !cancelled && exit_reason != ForwarderExitReason::PersistenceBlocked {
             coordinator.owner_finished(false).await;
@@ -3124,6 +3205,7 @@ async fn install_event_owner_locked(
 
 async fn forward_events(
     shared: Arc<RegistryShared>,
+    authority: Arc<ThreadAuthority>,
     coordinator: Arc<ThreadCoordinator>,
     mut stream: giskard_harness::AgentEventStream,
     mut cancel: watch::Receiver<bool>,
@@ -3161,7 +3243,7 @@ async fn forward_events(
     let runtime = shared.runtime.clone();
     // Establish the authority once. Per-event permits must only observe this entry, never recreate
     // it after retirement.
-    drop(runtime.restoration_permit(thread_id));
+    drop(runtime.restoration_permit(&authority));
     let store = shared.store.clone();
     let mut turn_id: Option<TurnId> = None;
     let mut owned_turn: Option<TurnId> = None;
@@ -3267,7 +3349,7 @@ async fn forward_events(
                     ctx = claim.context;
                     if claim.external {
                         match runtime.reserve_turn(
-                            thread_id,
+                            &authority,
                             turn_reservation(project_id, &binding.handle, &ctx),
                         ) {
                             Ok(mut lease) => {
@@ -3314,7 +3396,7 @@ async fn forward_events(
                 );
                 let (event, prepared_item_output, preparation_permit) =
                     if is_completed_addressable_output {
-                        let Some(permit) = runtime.event_application_permit(thread_id) else {
+                        let Some(permit) = runtime.event_application_permit(&authority) else {
                             break ForwarderExitReason::RuntimeAuthorityReplaced;
                         };
                         let preparation_diagnostics = completed_item_diagnostics(&event);
@@ -3347,8 +3429,10 @@ async fn forward_events(
                     && seen_turn_ids.contains(&turn)
                 {
                     let command_state_changed = if is_terminal_command_completion(&event) {
-                        let before =
-                            terminating_command_before_terminal_completion(&runtime, &event).await;
+                        let before = terminating_command_before_terminal_completion(
+                            &runtime, &authority, &event,
+                        )
+                        .await;
                         let applied = match preparation_permit.as_ref() {
                             Some(permit) => match shared.runtime.apply_prepared_event_if_current(
                                 permit,
@@ -3360,7 +3444,7 @@ async fn forward_events(
                                 None => break ForwarderExitReason::RuntimeAuthorityReplaced,
                             },
                             None => shared.runtime.apply_prepared_event(
-                                thread_id,
+                                &authority,
                                 &event,
                                 false,
                                 prepared_item_output,
@@ -3369,7 +3453,7 @@ async fn forward_events(
                         if let AgentEvent::ItemCompleted { turn, item, .. } = &event {
                             shared
                                 .runtime
-                                .remove_command_output(thread_id, *turn, item.id);
+                                .remove_command_output(&authority, *turn, item.id);
                             warn!(
                                 %project_id,
                                 %thread_id,
@@ -3415,7 +3499,9 @@ async fn forward_events(
                     if let AgentEvent::ItemCompleted { turn, item, .. } = &event
                         && let ItemPayload::ToolCall { name, server, .. } = &item.payload
                     {
-                        shared.runtime.remove_tool_output(thread_id, *turn, item.id);
+                        shared
+                            .runtime
+                            .remove_tool_output(&authority, *turn, item.id);
                         if completed_tool_has_terminal_output(item) {
                             warn!(
                                 %project_id,
@@ -3433,7 +3519,7 @@ async fn forward_events(
                 }
 
                 if owned_turn.is_none() && event_turn.is_none() {
-                    let applied = shared.runtime.apply_event(thread_id, &event, false);
+                    let applied = shared.runtime.apply_event(&authority, &event, false);
                     debug!(
                         %thread_id,
                         event_sequence = display_opt(applied.sequence),
@@ -3495,7 +3581,7 @@ async fn forward_events(
                 // Only admitted events may mutate lazy diff storage. Extract bodies after the
                 // wrong-turn and already-persisted-turn exits, but before reconnect state,
                 // persistence assembly, or browser projection can observe the event.
-                let event = runtime.capture_event_diffs(thread_id, event);
+                let event = runtime.capture_event_diffs(&authority, event);
 
                 if let AgentEvent::ContextWindowUpdated {
                     turn,
@@ -3644,8 +3730,11 @@ async fn forward_events(
                 // start arrives, otherwise a reload in that window loses the already-visible item.
                 let mut append_to_live_buffer = true;
                 if let Some(buffer_turn) = event_turn
-                    && let Err(existing_turn) =
-                        runtime.ensure_live_turn(thread_id, buffer_turn, live_turn_user_input(&ctx))
+                    && let Err(existing_turn) = runtime.ensure_live_turn(
+                        &authority,
+                        buffer_turn,
+                        live_turn_user_input(&ctx),
+                    )
                 {
                     if matches!(event, AgentEvent::TurnStarted { .. }) {
                         warn!(
@@ -3656,7 +3745,7 @@ async fn forward_events(
                             "replacing a stale live buffer when a new turn started"
                         );
                         runtime.replace_live_turn(
-                            thread_id,
+                            &authority,
                             buffer_turn,
                             live_turn_user_input(&ctx),
                         );
@@ -3684,7 +3773,7 @@ async fn forward_events(
                             None => break ForwarderExitReason::RuntimeAuthorityReplaced,
                         },
                         None => shared.runtime.apply_prepared_event(
-                            thread_id,
+                            &authority,
                             &event,
                             append_to_live_buffer,
                             prepared_item_output,
@@ -3730,6 +3819,7 @@ async fn forward_events(
                             .await;
                     }
                     let Some(tid) = complete_forwarded_turn(
+                        &authority,
                         thread_id,
                         project_id,
                         completed_turn,
@@ -3749,7 +3839,7 @@ async fn forward_events(
                         break ForwarderExitReason::PersistenceBlocked;
                     };
                     hub.broadcast_event(thread_id, event).await;
-                    if runtime.has_running_for_turn(thread_id, tid) {
+                    if runtime.has_running_for_turn(&authority, tid) {
                         info!(
                             %project_id,
                             %thread_id,
@@ -3785,7 +3875,7 @@ async fn forward_events(
                     turn_gate = coordinator.take_native_turn_gate(token, turn).await;
                 }
                 if ctx.kind == TurnContextKind::ManualCompaction {
-                    let live_buffer_active = runtime.live_is_active(thread_id);
+                    let live_buffer_active = runtime.live_is_active(&authority);
                     warn!(
                         %project_id,
                         %thread_id,
@@ -3803,7 +3893,7 @@ async fn forward_events(
                     debug!(%thread_id, ?e, "event stream ended");
                 }
                 if let Some(incomplete_turn) = turn_id.or(owned_turn) {
-                    let live_buffer_active = runtime.live_is_active(thread_id);
+                    let live_buffer_active = runtime.live_is_active(&authority);
                     let turn_gate_held =
                         turn_gate.as_ref().is_some_and(|lease| !lease.is_released());
                     let status = TurnStatus {
@@ -3838,6 +3928,7 @@ async fn forward_events(
                         status: status.clone(),
                     };
                     let Some(_) = complete_forwarded_turn(
+                        &authority,
                         thread_id,
                         project_id,
                         incomplete_turn,
@@ -3943,6 +4034,7 @@ async fn forward_events(
 
 #[allow(clippy::too_many_arguments)]
 async fn complete_forwarded_turn(
+    authority: &Arc<ThreadAuthority>,
     thread_id: ThreadId,
     project_id: ProjectId,
     completed_turn: TurnId,
@@ -3986,7 +4078,7 @@ async fn complete_forwarded_turn(
         started_at,
         completed_at: Some(Utc::now()),
     };
-    let captured_diffs = shared.runtime.captured_diff_records(thread_id, tid);
+    let captured_diffs = shared.runtime.captured_diff_records(authority, tid);
     let persist_outcome = persist_turn(
         &shared.thread_metadata,
         &shared.ledger,
@@ -4020,7 +4112,7 @@ async fn complete_forwarded_turn(
             Some(turn_gate) => turn_gate.commit_after_persistence(&completion_event),
             None => shared
                 .runtime
-                .settle_completed_turn(thread_id, &completion_event, None),
+                .settle_completed_turn(authority, &completion_event, None),
         };
         publish_applied_runtime_effects(&shared.hub, thread_id, applied).await;
     } else {
@@ -4033,7 +4125,7 @@ async fn complete_forwarded_turn(
                 turn_gate.retain_after_persistence_failure(&completion_event, turn, error)
             }
             None => shared.runtime.settle_completed_turn(
-                thread_id,
+                authority,
                 &completion_event,
                 Some((turn, error)),
             ),
@@ -4293,10 +4385,11 @@ fn log_ignored_seen_turn_running_task_start(project_id: ProjectId, event: &Agent
 }
 
 async fn terminating_command_before_terminal_completion(
-    runtime: &ThreadRuntimeRegistry,
+    runtime: &ThreadRuntimeSupport,
+    authority: &Arc<ThreadAuthority>,
     event: &AgentEvent,
 ) -> Option<RunningTask> {
-    let AgentEvent::ItemCompleted { thread, turn, item } = event else {
+    let AgentEvent::ItemCompleted { turn, item, .. } = event else {
         return None;
     };
     let ItemPayload::CommandExecution { status, .. } = &item.payload else {
@@ -4310,7 +4403,7 @@ async fn terminating_command_before_terminal_completion(
         return None;
     }
 
-    let command = runtime.task_by_item(*thread, *turn, item.id)?;
+    let command = runtime.task_by_item(authority, *turn, item.id)?;
     command.terminating.then_some(command)
 }
 
@@ -4722,9 +4815,8 @@ async fn persist_turn(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Weak};
 
     use chrono::Utc;
@@ -4763,7 +4855,7 @@ mod tests {
     use crate::hub::Hub;
     use crate::ledger;
     use crate::test_logs::CapturedLogWriter;
-    use crate::thread_runtime::ThreadRuntimeRegistry;
+    use crate::thread_runtime::ThreadRuntimeSupport;
 
     fn capture_logs(log: impl FnOnce()) -> String {
         let output = Arc::new(StdMutex::new(Vec::new()));
@@ -5057,6 +5149,8 @@ mod tests {
     struct BindingOrderHarness {
         bound: Arc<AtomicUsize>,
         opened_before_bound: Arc<AtomicUsize>,
+        authority_probe: StdMutex<Option<Weak<super::RegistryShared>>>,
+        observed_runtime_before_return: AtomicBool,
     }
 
     #[async_trait::async_trait]
@@ -5071,10 +5165,20 @@ mod tests {
 
         async fn open_thread(
             &self,
-            _opts: giskard_harness::OpenThreadOptions,
+            opts: giskard_harness::OpenThreadOptions,
         ) -> Result<ThreadHandle, HarnessError> {
             if self.bound.load(Ordering::SeqCst) == 0 {
                 self.opened_before_bound.fetch_add(1, Ordering::SeqCst);
+            }
+            let shared = self.authority_probe.lock().unwrap().clone();
+            if let (Some(shared), Some(thread_id)) =
+                (shared.and_then(|weak| weak.upgrade()), opts.thread)
+                && let Some(authority) = shared.thread_authority(thread_id).await
+                && authority.runtime.lock().unwrap().is_some()
+                && authority.coordinator.lock().await.is_none()
+            {
+                self.observed_runtime_before_return
+                    .store(true, Ordering::SeqCst);
             }
             Err(HarnessError::Protocol("not needed by this test".into()))
         }
@@ -5214,6 +5318,8 @@ mod tests {
         let harness = Arc::new(BindingOrderHarness {
             bound: Arc::new(AtomicUsize::new(0)),
             opened_before_bound: Arc::new(AtomicUsize::new(0)),
+            authority_probe: StdMutex::new(None),
+            observed_runtime_before_return: AtomicBool::new(false),
         });
         let factory_calls = Arc::new(AtomicUsize::new(0));
         let registry = Arc::new(super::HarnessRegistry::new(
@@ -5273,6 +5379,58 @@ mod tests {
             "no thread may be opened on a harness that has not been given its bindings"
         );
         assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn first_message_runtime_exists_before_native_open_returns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (_project_id, config) = create_test_project(&store, "first-message").await;
+        let harness = Arc::new(BindingOrderHarness {
+            bound: Arc::new(AtomicUsize::new(1)),
+            opened_before_bound: Arc::new(AtomicUsize::new(0)),
+            authority_probe: StdMutex::new(None),
+            observed_runtime_before_return: AtomicBool::new(false),
+        });
+        let registry = super::HarnessRegistry::new(
+            Arc::new(BindingOrderFactory {
+                harness: harness.clone(),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store),
+        );
+        *harness.authority_probe.lock().unwrap() = Some(Arc::downgrade(&registry.shared));
+        let thread_id = ThreadId::new();
+
+        let result = registry
+            .open_thread(&config, "/tmp/test", Some(thread_id), None, None)
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            harness
+                .observed_runtime_before_return
+                .load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_entry_does_not_require_a_coordinator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let shared =
+            super::RegistryShared::new(Arc::new(Hub::new()), store.clone(), ledger::spawn(store));
+        let authority = shared
+            .intern_thread_authority(ThreadId::new(), ProjectId::new())
+            .await
+            .unwrap();
+
+        let _permit = shared.runtime.restoration_permit(&authority);
+
+        assert!(authority.runtime.lock().unwrap().is_some());
+        assert!(authority.coordinator.lock().await.is_none());
     }
 
     #[tokio::test]
@@ -5743,6 +5901,14 @@ mod tests {
         authority
     }
 
+    fn test_authority(binding: &super::BindingData) -> Arc<super::ThreadAuthority> {
+        Arc::new(super::ThreadAuthority::new(
+            binding.handle.thread,
+            binding.project,
+            Arc::new(tokio::sync::Mutex::new(())),
+        ))
+    }
+
     fn test_turn_context() -> TurnContext {
         TurnContext {
             user_input: UserInput::text("test"),
@@ -5758,13 +5924,14 @@ mod tests {
 
     async fn prepare_test_operation(
         coordinator: &super::ThreadCoordinator,
-        runtime: &ThreadRuntimeRegistry,
+        runtime: &ThreadRuntimeSupport,
         context: TurnContext,
     ) -> super::CoordinatorToken {
         let binding = coordinator.binding().await;
+        let authority = test_authority(&binding);
         let lease = runtime
             .reserve_turn(
-                binding.handle.thread,
+                &authority,
                 turn_reservation(binding.project, &binding.handle, &context),
             )
             .unwrap();
@@ -5777,12 +5944,13 @@ mod tests {
     #[tokio::test]
     async fn subagent_coordinator_rejects_prepared_operations() {
         let coordinator = test_coordinator(super::ClassificationPhase::Subagent);
-        let runtime = ThreadRuntimeRegistry::new();
+        let runtime = ThreadRuntimeSupport::new();
         let binding = coordinator.binding().await;
+        let authority = test_authority(&binding);
         let context = test_turn_context();
         let lease = runtime
             .reserve_turn(
-                binding.handle.thread,
+                &authority,
                 turn_reservation(binding.project, &binding.handle, &context),
             )
             .unwrap();
@@ -5805,13 +5973,19 @@ mod tests {
         let coordinator = Arc::new(test_coordinator(super::ClassificationPhase::Primary));
         let binding = coordinator.binding().await;
         let thread_id = binding.handle.thread;
+        let authority = shared
+            .intern_thread_authority(thread_id, binding.project)
+            .await
+            .unwrap();
         let state_guard = coordinator.state.lock().await;
         let task_shared = shared.clone();
         let task_coordinator = coordinator.clone();
+        let task_authority = authority.clone();
         let context = test_turn_context();
         let task = tokio::spawn(async move {
             task_shared
                 .admit_operation(
+                    &task_authority,
                     &task_coordinator,
                     binding.project,
                     &binding.handle,
@@ -5820,14 +5994,14 @@ mod tests {
                 .await
         });
 
-        while !shared.runtime.has_active_turn(thread_id) {
+        while !shared.runtime.has_active_turn(&authority) {
             tokio::task::yield_now().await;
         }
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         drop(state_guard);
 
-        assert!(!shared.runtime.has_active_turn(thread_id));
+        assert!(!shared.runtime.has_active_turn(&authority));
         assert!(coordinator.state.lock().await.operation.is_none());
     }
 
@@ -6161,7 +6335,7 @@ mod tests {
             .activate_owner(super::EventOwnerControl { cancel, completed })
             .await
             .unwrap();
-        let runtime = ThreadRuntimeRegistry::new();
+        let runtime = ThreadRuntimeSupport::new();
         let stale = prepare_test_operation(&coordinator, &runtime, test_turn_context()).await;
         let mut stale_lease = coordinator.abort_operation(stale).await.unwrap();
         let _ = stale_lease.release();
@@ -6177,7 +6351,8 @@ mod tests {
     async fn stale_operation_acknowledgement_cannot_acknowledge_a_later_lease() {
         let coordinator = test_coordinator(super::ClassificationPhase::Primary);
         let binding = coordinator.binding().await;
-        let runtime = ThreadRuntimeRegistry::new();
+        let authority = test_authority(&binding);
+        let runtime = ThreadRuntimeSupport::new();
         let context = test_turn_context();
         let (cancel, _) = tokio::sync::watch::channel(false);
         let (_, completed) = tokio::sync::watch::channel(false);
@@ -6188,7 +6363,7 @@ mod tests {
 
         let stale_lease = runtime
             .reserve_turn(
-                binding.handle.thread,
+                &authority,
                 turn_reservation(binding.project, &binding.handle, &context),
             )
             .unwrap();
@@ -6204,7 +6379,7 @@ mod tests {
 
         let current_lease = runtime
             .reserve_turn(
-                binding.handle.thread,
+                &authority,
                 turn_reservation(binding.project, &binding.handle, &context),
             )
             .unwrap();
@@ -6302,12 +6477,13 @@ mod tests {
             .await
             .unwrap();
         coordinator.owner_finished(false).await;
-        let runtime = ThreadRuntimeRegistry::new();
+        let runtime = ThreadRuntimeSupport::new();
         let binding = coordinator.binding().await;
+        let authority = test_authority(&binding);
         let context = test_turn_context();
         let lease = runtime
             .reserve_turn(
-                binding.handle.thread,
+                &authority,
                 turn_reservation(binding.project, &binding.handle, &context),
             )
             .unwrap();
@@ -6540,7 +6716,7 @@ mod tests {
             store.clone(),
             ledger::spawn(store.clone()),
         ));
-        let (sink, stream, permit) = prepare_thread_updates(&shared, thread_id);
+        let (sink, stream, permit) = prepare_thread_updates(&shared, project_id, thread_id).await;
         let forwarder =
             spawn_thread_update_forwarder(shared.clone(), project_id, thread_id, stream, permit)
                 .unwrap();
@@ -6572,7 +6748,9 @@ mod tests {
             stale_thread.context_window = 128_000;
             stale_thread.model_context_windows.clear();
             store.save_thread(project_id, &stale_thread).await.unwrap();
-            let (sink, stream, permit) = prepare_thread_updates(&shared, stale_thread_id);
+            let (sink, stream, permit) =
+                prepare_thread_updates(&shared, project_id, stale_thread_id).await;
+            let stale_authority = shared.thread_authority(stale_thread_id).await.unwrap();
             if invalidate_with_turn {
                 let handle = ThreadHandle::detached(stale_thread_id, "native-stale".into());
                 let ctx = TurnContext {
@@ -6583,12 +6761,13 @@ mod tests {
                 };
                 let _lease = shared
                     .runtime
-                    .reserve_turn(stale_thread_id, turn_reservation(project_id, &handle, &ctx))
+                    .reserve_turn(
+                        &stale_authority,
+                        turn_reservation(project_id, &handle, &ctx),
+                    )
                     .unwrap();
             } else {
-                shared
-                    .runtime
-                    .forget_threads(&HashSet::from([stale_thread_id]));
+                shared.runtime.forget_threads(&[stale_authority]);
             }
             let forwarder = spawn_thread_update_forwarder(
                 shared.clone(),
@@ -6907,7 +7086,7 @@ mod tests {
         let hub = Arc::new(Hub::new());
         let ledger = ledger::spawn(store.clone());
 
-        let runtime = spawn_forwarder(
+        let (runtime, authority) = spawn_forwarder(
             thread_id,
             project_id,
             AgentEventStream::new(tx.subscribe()),
@@ -6950,7 +7129,7 @@ mod tests {
         }
         wait_for_turn_count(&store, project_id, thread_id, 1).await;
         assert!(matches!(
-            runtime.captured_diff(thread_id, second_turn, &rejected_id),
+            runtime.captured_diff(&authority, second_turn, &rejected_id),
             crate::thread_runtime::RuntimeDiffLookup::Missing
         ));
 
@@ -7041,7 +7220,7 @@ mod tests {
         let (tx, _) = broadcast::channel(64);
         let hub = Arc::new(Hub::new());
         let ledger = ledger::spawn(store.clone());
-        let (handle, runtime, _coordinator) = spawn_forwarder_handle_with_runtime(
+        let (handle, runtime, _coordinator, authority) = spawn_forwarder_handle_with_runtime(
             thread_id,
             project_id,
             AgentEventStream::new(tx.subscribe()),
@@ -7111,7 +7290,7 @@ mod tests {
         .unwrap();
 
         wait_for_turn_count(&store, project_id, thread_id, 1).await;
-        let tasks = runtime.tasks_snapshot(thread_id).1;
+        let tasks = runtime.tasks_snapshot(&authority).1;
         assert_eq!(tasks.len(), 1);
         assert!(tasks[0].after_turn);
         assert!(tasks[0].process_id.is_none());
@@ -7150,14 +7329,14 @@ mod tests {
         .unwrap();
 
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
-        while !runtime.tasks_snapshot(thread_id).1.is_empty() {
+        while !runtime.tasks_snapshot(&authority).1.is_empty() {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "old command completion was not applied while the next turn was active"
             );
             tokio::task::yield_now().await;
         }
-        assert!(runtime.has_active_turn(thread_id));
+        assert!(runtime.has_active_turn(&authority));
 
         tx.send(AgentEvent::TurnCompleted {
             thread: thread_id,
@@ -7182,8 +7361,8 @@ mod tests {
             .expect("forwarder should exit after the event stream closes")
             .unwrap();
 
-        assert!(runtime.tasks_snapshot(thread_id).1.is_empty());
-        assert!(!runtime.has_active_turn(thread_id));
+        assert!(runtime.tasks_snapshot(&authority).1.is_empty());
+        assert!(!runtime.has_active_turn(&authority));
     }
 
     #[tokio::test]
@@ -7234,7 +7413,7 @@ mod tests {
         let (tx, _) = broadcast::channel(64);
         let hub = Arc::new(Hub::new());
         let ledger = ledger::spawn(store.clone());
-        let (handle, runtime, _coordinator) = spawn_forwarder_handle_with_runtime(
+        let (handle, runtime, _coordinator, authority) = spawn_forwarder_handle_with_runtime(
             thread_id,
             project_id,
             AgentEventStream::new(tx.subscribe()),
@@ -7295,11 +7474,11 @@ mod tests {
         assert!(matches!(saved[0].status.kind, TurnStatusKind::Interrupted));
         assert_eq!(saved[0].items.len(), 1);
         assert!(
-            runtime.live_snapshot(thread_id).is_none(),
+            runtime.live_snapshot(&authority).is_none(),
             "synthetic completion should clear live state"
         );
 
-        let tasks = runtime.tasks_snapshot(thread_id).1;
+        let tasks = runtime.tasks_snapshot(&authority).1;
         assert_eq!(tasks.len(), 1);
         assert!(tasks[0].after_turn);
     }
@@ -7323,7 +7502,7 @@ mod tests {
         let (tx, _) = broadcast::channel(8);
         let hub = Arc::new(Hub::new());
         let ledger = ledger::spawn(store.clone());
-        let (handle, runtime, coordinator) = spawn_forwarder_handle_with_runtime(
+        let (handle, runtime, coordinator, authority) = spawn_forwarder_handle_with_runtime(
             thread_id,
             project_id,
             AgentEventStream::new(tx.subscribe()),
@@ -7339,7 +7518,7 @@ mod tests {
             .await
             .expect("forwarder should exit after the event stream closes")
             .unwrap();
-        assert!(!runtime.has_active_turn(thread_id));
+        assert!(!runtime.has_active_turn(&authority));
 
         let replacement_context = TurnContext {
             user_input: UserInput::text("replacement"),
@@ -7442,7 +7621,7 @@ mod tests {
         let hub = Arc::new(Hub::new());
         let ledger = ledger::spawn(store.clone());
 
-        let runtime = spawn_forwarder(
+        let (runtime, authority) = spawn_forwarder(
             thread_id,
             project_id,
             AgentEventStream::new(tx.subscribe()),
@@ -7474,7 +7653,7 @@ mod tests {
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         assert!(
-            runtime.tasks_snapshot(thread_id).1.is_empty(),
+            runtime.tasks_snapshot(&authority).1.is_empty(),
             "historical starts for already-persisted turns must not create stale running tasks"
         );
     }
@@ -7573,7 +7752,7 @@ mod tests {
         assert!(hub.subscribe(thread_id, 1).await);
         let ledger = ledger::spawn(store.clone());
 
-        let runtime = spawn_forwarder(
+        let (runtime, authority) = spawn_forwarder(
             thread_id,
             project_id,
             AgentEventStream::new(tx.subscribe()),
@@ -7584,7 +7763,7 @@ mod tests {
             "next",
         );
 
-        assert!(runtime.tasks_snapshot(thread_id).1.is_empty());
+        assert!(runtime.tasks_snapshot(&authority).1.is_empty());
         tx.send(AgentEvent::ItemCompleted {
             thread: thread_id,
             turn,
@@ -7687,7 +7866,7 @@ mod tests {
         let _replacements = hub.register_client(1, client_tx).await;
         assert!(hub.subscribe(thread_id, 1).await);
 
-        let runtime = spawn_forwarder(
+        let (runtime, authority) = spawn_forwarder(
             thread_id,
             project_id,
             AgentEventStream::new(tx.subscribe()),
@@ -7715,7 +7894,7 @@ mod tests {
             "events for another thread must not be persisted into the target thread"
         );
         assert!(
-            runtime.live_snapshot(thread_id).is_none(),
+            runtime.live_snapshot(&authority).is_none(),
             "events for another thread must not create a live snapshot"
         );
         assert!(
@@ -7780,7 +7959,7 @@ mod tests {
         let _replacements = hub.register_client(1, client_tx).await;
         assert!(hub.subscribe(thread_id, 1).await);
 
-        let runtime = spawn_forwarder(
+        let (runtime, authority) = spawn_forwarder(
             thread_id,
             project_id,
             AgentEventStream::new(tx.subscribe()),
@@ -7863,11 +8042,11 @@ mod tests {
             "foreign events must not be persisted into the target thread"
         );
         assert!(
-            runtime.live_snapshot(thread_id).is_none(),
+            runtime.live_snapshot(&authority).is_none(),
             "foreign events must not create target-thread live state"
         );
         assert!(
-            runtime.tasks_snapshot(thread_id).1.is_empty(),
+            runtime.tasks_snapshot(&authority).1.is_empty(),
             "foreign running commands must not appear in the target-thread task list"
         );
         assert!(
@@ -7931,7 +8110,7 @@ mod tests {
         let _replacements = hub.register_client(1, client_tx).await;
         assert!(hub.subscribe(thread_id, 1).await);
 
-        let runtime = spawn_forwarder(
+        let (runtime, authority) = spawn_forwarder(
             thread_id,
             project_id,
             AgentEventStream::new(tx.subscribe()),
@@ -7990,7 +8169,7 @@ mod tests {
             "turnless request alone must not persist a turn"
         );
         assert!(
-            runtime.live_snapshot(thread_id).is_none(),
+            runtime.live_snapshot(&authority).is_none(),
             "turnless request alone must not create target-thread live turn state"
         );
     }
@@ -8203,7 +8382,7 @@ mod tests {
         let _replacements = hub.register_client(1, client_tx).await;
         assert!(hub.subscribe(thread_id, 1).await);
         let ledger = ledger::spawn(store.clone());
-        let (forwarder, _runtime, coordinator) = spawn_forwarder_handle_with_runtime(
+        let (forwarder, _runtime, coordinator, _authority) = spawn_forwarder_handle_with_runtime(
             thread_id,
             project_id,
             stream,
@@ -8384,12 +8563,12 @@ mod tests {
         ledger: ledger::LedgerHandle,
         model: ModelRef,
         user_input: &str,
-    ) -> Arc<ThreadRuntimeRegistry> {
-        let (handle, runtime, _coordinator) = spawn_forwarder_handle_with_runtime(
+    ) -> (Arc<ThreadRuntimeSupport>, Arc<super::ThreadAuthority>) {
+        let (handle, runtime, _coordinator, authority) = spawn_forwarder_handle_with_runtime(
             thread_id, project_id, stream, hub, store, ledger, model, user_input,
         );
         std::mem::drop(handle);
-        runtime
+        (runtime, authority)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8421,8 +8600,9 @@ mod tests {
         user_input: &str,
     ) -> (
         JoinHandle<()>,
-        Arc<ThreadRuntimeRegistry>,
+        Arc<ThreadRuntimeSupport>,
         Arc<super::ThreadCoordinator>,
+        Arc<super::ThreadAuthority>,
     ) {
         let ctx = TurnContext {
             user_input: UserInput::text(user_input),
@@ -8442,9 +8622,15 @@ mod tests {
             },
             super::ClassificationPhase::Primary,
         ));
+        let authority = Arc::new(super::ThreadAuthority::new(
+            thread_id,
+            project_id,
+            Arc::new(tokio::sync::Mutex::new(())),
+        ));
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let (_completed_tx, completed_rx) = tokio::sync::watch::channel(false);
         let coordinator_for_task = coordinator.clone();
+        let task_authority = authority.clone();
         let handle = tokio::spawn(async move {
             coordinator_for_task
                 .activate_owner(super::EventOwnerControl {
@@ -8456,7 +8642,7 @@ mod tests {
             let lease = shared
                 .runtime
                 .reserve_turn(
-                    thread_id,
+                    &task_authority,
                     turn_reservation(project_id, &native_handle, &ctx),
                 )
                 .unwrap();
@@ -8467,9 +8653,16 @@ mod tests {
                 Ok(_) => {}
                 Err((error, _)) => panic!("forwarder test operation was rejected: {error}"),
             }
-            forward_events(shared, coordinator_for_task, stream, cancel_rx).await;
+            forward_events(
+                shared,
+                task_authority,
+                coordinator_for_task,
+                stream,
+                cancel_rx,
+            )
+            .await;
         });
-        (handle, runtime, coordinator)
+        (handle, runtime, coordinator, authority)
     }
 
     /// Drive an owner over a promptless externally started turn, the way a provider-owned thread
@@ -8500,6 +8693,11 @@ mod tests {
             },
             classification,
         ));
+        let authority = Arc::new(super::ThreadAuthority::new(
+            thread_id,
+            project_id,
+            Arc::new(tokio::sync::Mutex::new(())),
+        ));
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let (_completed_tx, completed_rx) = tokio::sync::watch::channel(false);
         coordinator
@@ -8512,6 +8710,7 @@ mod tests {
         let (tx, rx) = broadcast::channel(16);
         let forwarder = tokio::spawn(forward_events(
             shared,
+            authority,
             coordinator,
             AgentEventStream::new(rx),
             cancel_rx,
