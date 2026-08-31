@@ -27,6 +27,12 @@ use giskard_proto::ModelListingWarning;
 /// browser has not fetched the catalog yet.
 #[derive(Default)]
 pub struct ProjectModelCatalogStore {
+    // ENTITY-AUTHORITY-MIGRATION: milestone 1
+    // Role: Own the last composed model catalog for each project.
+    // Source of truth: Absence or the stored descriptor vector controls catalog reuse.
+    // Structural reason: This is the baseline project-keyed catalog owner being consolidated.
+    // Synchronization: One RwLock protects lookup, replacement, and removal for all projects.
+    // Invalidation/removal: Project deletion removes its entry; milestone 1 relocates the slot.
     catalogs: RwLock<HashMap<ProjectId, Vec<ModelDescriptor>>>,
 }
 

@@ -116,7 +116,19 @@ const RECEIVER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mi
 /// canned agent message, so the browser-visible transcript is fully deterministic.
 struct ScriptedHarness {
     capabilities: HarnessCapabilities,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Route scripted replay events to locally opened harness threads.
+    // Source of truth: Scripted harness open/resume operations establish each sender.
+    // Structural reason: This non-test-gated replay adapter cannot use server authorities.
+    // Synchronization: The mutex protects linear lookup, insertion, and removal.
+    // Invalidation/removal: Thread close removes state; dropping the harness removes all entries.
     threads: tokio::sync::Mutex<Vec<(ThreadId, broadcast::Sender<AgentEvent>)>>,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Translate scripted native thread identifiers to Giskard thread identifiers.
+    // Source of truth: Bootstrap and import claims establish the bijective bindings.
+    // Structural reason: Replay native-ID routing models a provider adapter boundary.
+    // Synchronization: The mutex protects claim validation, lookup, and insertion.
+    // Invalidation/removal: Bindings live for the scripted harness process and drop with it.
     native_bindings: tokio::sync::Mutex<Vec<(String, ThreadId)>>,
     /// Where each in-flight scripted approval was raised, so `respond_approval` can emit its
     /// confirmation item on the right still-open turn (the reload e2e test uses that ack to know the

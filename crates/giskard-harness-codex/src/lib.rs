@@ -298,6 +298,12 @@ struct WorkerReceivers {
     shutdown: watch::Receiver<bool>,
 }
 
+// ENTITY-AUTHORITY-EXCEPTION:
+// Role: Route mapped Codex events to each Giskard thread's harness subscriber.
+// Source of truth: Harness open/resume establishes the sender used by the adapter.
+// Structural reason: Provider delivery routing belongs in the lower harness crate.
+// Synchronization: The standard mutex protects sender lookup, insertion, and removal.
+// Invalidation/removal: Thread close removes a sender; harness shutdown drops the map.
 type SenderMap = Arc<StdMutex<HashMap<ThreadId, broadcast::Sender<AgentEvent>>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1493,8 +1499,26 @@ async fn background_task<C>(
         mut controls,
         mut shutdown,
     } = receivers;
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Correlate prepared compaction commands with their thread-scoped Codex events.
+    // Source of truth: Accepted harness commands insert state consumed by matching events.
+    // Structural reason: Codex protocol operations are coordinated by one adapter task.
+    // Synchronization: The background task owns the map and processes messages serially.
+    // Invalidation/removal: Matching completion consumes entries; shutdown drops remaining state.
     let mut pending_compactions: HashMap<ThreadId, PendingCompaction> = HashMap::new();
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Correlate native context restoration notifications before local routing completes.
+    // Source of truth: Resume results establish the native thread and expected local binding.
+    // Structural reason: The provider notification is keyed only by its native thread identity.
+    // Synchronization: The background task owns the map and processes messages serially.
+    // Invalidation/removal: A matching notification consumes the entry; shutdown drops the rest.
     let mut pending_context_restores: HashMap<String, PendingContextRestore> = HashMap::new();
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Own Codex-specific active-turn protocol state keyed by routed Giskard thread.
+    // Source of truth: Turn commands and Codex lifecycle events update the adapter state.
+    // Structural reason: Provider turn routing and upload cleanup belong in the harness adapter.
+    // Synchronization: The background task owns the map and processes messages serially.
+    // Invalidation/removal: Terminal handling removes entries; shutdown cleans and drops the map.
     let mut active_turns: ActiveTurns = HashMap::new();
     let mut first_event_warn_tick = tokio::time::interval(Duration::from_secs(1));
 
