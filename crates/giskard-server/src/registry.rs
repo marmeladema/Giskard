@@ -40,8 +40,8 @@ use crate::hub::Hub;
 use crate::ledger::LedgerHandle;
 use crate::log_fields::{display_opt, rfc3339, rfc3339_opt};
 use crate::thread_graph::{
-    ExistingLinkDisposition, classify_existing_link, load_thread_graph, parent_chain_is_valid,
-    should_refresh_subagent_title,
+    ExistingLinkDisposition, classify_existing_link, effective_thread_workspace_root,
+    load_thread_graph, parent_chain_is_valid, should_refresh_subagent_title,
 };
 use crate::thread_metadata::ThreadMetadataService;
 use crate::thread_runtime::{
@@ -2225,7 +2225,10 @@ async fn materialize_subagent_thread(
     // workspace. Passing the project's checkout instead would be ignored while the child is live
     // and applied on its next cold resume, moving the thread out of the worktree its own earlier
     // work is in.
-    let workspace_root = subagent_workspace_root(&shared, &project_config, &parent_file).await?;
+    let workspace_root =
+        effective_thread_workspace_root(&shared.store, &project_config, &parent_file)
+            .await
+            .map_err(|error| HarnessError::Protocol(error.to_string()))?;
     let child_thread_id = ThreadId::new();
     let handle = harness
         .claim_native_thread(
@@ -2437,31 +2440,6 @@ async fn run_subagent_materialization_queue(
     }
 }
 
-/// The workspace a sub-agent's harness thread is opened against: the nearest worktree in its
-/// ownership chain, the project's workspace otherwise.
-///
-/// Takes the parent's thread file when the child is not persisted yet, and the child's own once it
-/// is; [`inherited_git_workspace`] answers the same for both.
-async fn subagent_workspace_root(
-    shared: &RegistryShared,
-    project_config: &ProjectConfig,
-    thread: &ThreadFile,
-) -> Result<String, HarnessError> {
-    let worktree =
-        crate::thread_graph::inherited_git_workspace(&shared.store, project_config.id, thread)
-            .await
-            .map_err(|error| HarnessError::Protocol(error.to_string()))?;
-    Ok(worktree
-        .map(|worktree| worktree.workspace_root().to_string())
-        .unwrap_or_else(|| {
-            project_config
-                .workspace_root
-                .as_deref()
-                .unwrap_or(&project_config.dir)
-                .to_owned()
-        }))
-}
-
 async fn ensure_subagent_thread_open(
     project_config: &ProjectConfig,
     thread_file: &ThreadFile,
@@ -2473,7 +2451,10 @@ async fn ensure_subagent_thread_open(
         .ok_or(HarnessError::ThreadNotFound(thread_file.id))?;
     // A sub-agent is provider-owned and read-only. Reattach its durable identity to this harness
     // lifetime without issuing thread/resume or otherwise nudging native work.
-    let workspace_root = subagent_workspace_root(shared, project_config, thread_file).await?;
+    let workspace_root =
+        effective_thread_workspace_root(&shared.store, project_config, thread_file)
+            .await
+            .map_err(|error| HarnessError::Protocol(error.to_string()))?;
     let _owner_guard = lock_thread_owner_after_drain(shared, thread_file.id).await;
     if let Some(coordinator) = shared.coordinator(thread_file.id).await {
         let handle = coordinator
