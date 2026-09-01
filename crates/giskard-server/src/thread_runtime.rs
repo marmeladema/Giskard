@@ -399,14 +399,16 @@ impl ResolvedThreadRuntime {
             .remove_task_by_process(&self.authority, process_id)
     }
 
-    /// Replaces reconnect state for integration setup through the bound authority.
-    pub fn replace_live_turn(&self, turn_id: TurnId, user_input: Option<UserInput>) {
+    /// Integration-test setup that bypasses normal turn orchestration to seed reconnect state.
+    #[doc(hidden)]
+    pub fn replace_live_turn_for_test(&self, turn_id: TurnId, user_input: Option<UserInput>) {
         self.support
             .replace_live_turn(&self.authority, turn_id, user_input);
     }
 
-    /// Applies an event without exposing the runtime implementation's transition result.
-    pub fn apply_event(&self, event: &AgentEvent, append_live: bool) {
+    /// Integration-test setup that bypasses normal event orchestration to seed runtime state.
+    #[doc(hidden)]
+    pub fn apply_event_for_test(&self, event: &AgentEvent, append_live: bool) {
         self.support
             .apply_event(&self.authority, event, append_live);
     }

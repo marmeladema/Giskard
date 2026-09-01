@@ -2510,7 +2510,7 @@ mod tests {
                 created_at: now,
             },
         });
-        runtime.apply_event(&runtime_event, true);
+        runtime.apply_event_for_test(&runtime_event, true);
 
         let loaded = load_command_output(&state, project_id, thread_id, turn_id, item_id)
             .await

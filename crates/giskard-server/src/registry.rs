@@ -1039,7 +1039,7 @@ impl HarnessRegistry {
         self.shared.runtime.current_overview()
     }
 
-    pub async fn ensure_thread_writable(
+    pub(crate) async fn ensure_thread_writable(
         &self,
         project_id: ProjectId,
         thread_id: ThreadId,
@@ -1073,7 +1073,7 @@ impl HarnessRegistry {
     }
 
     /// Constructs the registry-owned runtime support with the configured output limit.
-    pub fn new_with_max_command_output_bytes(
+    pub(crate) fn new_with_max_command_output_bytes(
         factory: Arc<dyn HarnessFactory>,
         hub: Arc<Hub>,
         max_command_output_bytes: usize,
@@ -1128,11 +1128,11 @@ impl HarnessRegistry {
     /// from either an HTTP request or an asynchronously observed harness event, while subtree and
     /// project deletion mutate the same graph. One project-scoped lock makes each find/open/save
     /// or load/preflight/delete sequence atomic with respect to the others.
-    pub async fn lock_project_lifecycle(&self, project_id: ProjectId) -> OwnedMutexGuard<()> {
+    async fn lock_project_lifecycle(&self, project_id: ProjectId) -> OwnedMutexGuard<()> {
         lock_project_lifecycle(&self.shared.projects, project_id).await
     }
 
-    pub async fn lock_project_lifecycle_with_timeout(
+    pub(crate) async fn lock_project_lifecycle_with_timeout(
         &self,
         project_id: ProjectId,
         wait: Duration,

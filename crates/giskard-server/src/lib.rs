@@ -15,7 +15,7 @@ pub mod routes;
 mod runtime_live;
 mod runtime_tasks;
 mod thread_graph;
-pub mod thread_metadata;
+mod thread_metadata;
 pub mod thread_runtime;
 pub mod throttle;
 pub mod tokens;
