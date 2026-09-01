@@ -108,7 +108,7 @@ async fn open_thread_one_turn_assert_state() {
     assert!(caps.live_approvals);
 
     // Open thread
-    let handle = harness
+    let attachment = harness
         .open_thread(OpenThreadOptions {
             project: giskard_core::ProjectId::new(),
             thread: expected_thread,
@@ -123,12 +123,13 @@ async fn open_thread_one_turn_assert_state() {
         })
         .await
         .expect("open_thread failed");
+    let handle = attachment.handle().clone();
 
     assert_eq!(handle.thread, expected_thread);
     assert_eq!(handle.harness_thread_id, "th_test_001");
 
-    // Subscribe before starting turn
-    let mut stream = harness.subscribe(&handle);
+    // Install the one linear event owner before starting the turn.
+    let mut owner = attachment.commit().expect("attachment commit failed");
 
     // Start turn
     let _turn_id = harness
@@ -152,7 +153,7 @@ async fn open_thread_one_turn_assert_state() {
     let mut events = Vec::new();
     let mut final_usage = None;
     loop {
-        match stream.recv().await {
+        match owner.recv().await {
             Ok(event) => {
                 if let AgentEvent::TurnCompleted { usage, .. } = &event {
                     final_usage = Some(*usage);
@@ -244,7 +245,7 @@ async fn replay_persisted_state_roundtrip() {
     let (fixture, thread_id, _turn_id) = make_fixture();
     let harness = Arc::new(ReplayHarness::from_fixture(fixture));
 
-    let handle = harness
+    let attachment = harness
         .open_thread(OpenThreadOptions {
             project: giskard_core::ProjectId::new(),
             thread: thread_id,
@@ -259,8 +260,9 @@ async fn replay_persisted_state_roundtrip() {
         })
         .await
         .unwrap();
+    let handle = attachment.handle().clone();
 
-    let mut stream = harness.subscribe(&handle);
+    let mut owner = attachment.commit().unwrap();
     let _ = harness
         .start_turn(
             &handle,
@@ -277,7 +279,7 @@ async fn replay_persisted_state_roundtrip() {
     // Collect all events
     let mut usage = TokenUsage::default();
     loop {
-        match stream.recv().await {
+        match owner.recv().await {
             Ok(AgentEvent::TurnCompleted { usage: u, .. }) => {
                 usage = u;
                 break;

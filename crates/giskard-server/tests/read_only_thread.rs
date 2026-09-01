@@ -36,6 +36,12 @@ struct AttachFails {
 
 #[async_trait::async_trait]
 impl giskard_harness::AgentHarness for AttachFails {
+    async fn begin_delete_thread<'a>(
+        &'a self,
+        thread: &'a giskard_harness::ThreadHandle,
+    ) -> Result<giskard_harness::ThreadRetirement<'a>, giskard_core::HarnessError> {
+        giskard_harness::unsupported_thread_retirement(thread)
+    }
     fn capabilities(&self) -> giskard_harness::HarnessCapabilities {
         self.inner.capabilities()
     }
@@ -52,16 +58,10 @@ impl giskard_harness::AgentHarness for AttachFails {
     async fn open_thread(
         &self,
         _opts: giskard_harness::OpenThreadOptions,
-    ) -> Result<giskard_harness::ThreadHandle, giskard_core::HarnessError> {
+    ) -> Result<giskard_harness::ThreadAttachment, giskard_core::HarnessError> {
         Err(giskard_core::HarnessError::Spawn(
             "unknown provider: cloudflare-litellm".into(),
         ))
-    }
-    fn subscribe(
-        &self,
-        thread: &giskard_harness::ThreadHandle,
-    ) -> giskard_harness::AgentEventStream {
-        self.inner.subscribe(thread)
     }
     async fn interrupt(
         &self,

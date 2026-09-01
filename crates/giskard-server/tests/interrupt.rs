@@ -2,6 +2,7 @@
 //! protocol.
 
 mod common;
+mod support;
 #[path = "common/thread_fixture.rs"]
 mod thread_fixture;
 
@@ -23,15 +24,16 @@ use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+    AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadAttachment, ThreadHandle,
 };
 use giskard_persist::store::ProjectConfig;
 use giskard_proto::{ClientMessage, ErrorInfo, RunningTask, ServerMessage, WireAgentEvent};
 use giskard_server::{AppState, HarnessFactory, build_app};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 
 use common::fake_native_model;
+use support::TestEventRoute;
 use thread_fixture::persist_primary_thread;
 
 type TestWs =
@@ -47,7 +49,7 @@ enum TerminateBehavior {
 }
 
 struct InterruptHarness {
-    tx: broadcast::Sender<AgentEvent>,
+    route: TestEventRoute,
     active: Mutex<Option<(ThreadId, TurnId)>>,
     command: Mutex<Option<(ThreadId, TurnId, ItemId)>>,
     interrupted: Mutex<Vec<ThreadId>>,
@@ -58,9 +60,8 @@ struct InterruptHarness {
 
 impl InterruptHarness {
     fn new() -> Self {
-        let (tx, _) = broadcast::channel(64);
         Self {
-            tx,
+            route: TestEventRoute::new(64),
             active: Mutex::new(None),
             command: Mutex::new(None),
             interrupted: Mutex::new(Vec::new()),
@@ -116,7 +117,7 @@ impl InterruptHarness {
         let Some((thread, turn, item_id)) = *self.command.lock().await else {
             panic!("command did not start");
         };
-        let _ = self.tx.send(AgentEvent::ItemCompleted {
+        let _ = self.route.send(AgentEvent::ItemCompleted {
             thread,
             turn,
             item: Item {
@@ -142,6 +143,12 @@ impl InterruptHarness {
 
 #[async_trait]
 impl AgentHarness for InterruptHarness {
+    async fn begin_delete_thread<'a>(
+        &'a self,
+        thread: &'a ThreadHandle,
+    ) -> Result<giskard_harness::ThreadRetirement<'a>, HarnessError> {
+        giskard_harness::unsupported_thread_retirement(thread)
+    }
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities {
             live_approvals: true,
@@ -164,9 +171,9 @@ impl AgentHarness for InterruptHarness {
         Ok(vec![])
     }
 
-    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
+    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadAttachment, HarnessError> {
         let thread = opts.thread;
-        Ok(ThreadHandle {
+        self.route.attach(ThreadHandle {
             resumed_model: Some(opts.initial_model.clone()),
             ..ThreadHandle::opened(
                 thread,
@@ -184,13 +191,13 @@ impl AgentHarness for InterruptHarness {
     ) -> Result<TurnId, HarnessError> {
         let turn = TurnId::new();
         *self.active.lock().await = Some((thread.thread, turn));
-        let _ = self.tx.send(AgentEvent::TurnStarted {
+        let _ = self.route.send(AgentEvent::TurnStarted {
             thread: thread.thread,
             turn,
         });
         let command_item = ItemId::new();
         *self.command.lock().await = Some((thread.thread, turn, command_item));
-        let _ = self.tx.send(AgentEvent::ItemStarted {
+        let _ = self.route.send(AgentEvent::ItemStarted {
             thread: thread.thread,
             turn,
             item: ItemStart {
@@ -207,7 +214,7 @@ impl AgentHarness for InterruptHarness {
                 tool: None,
             },
         });
-        let _ = self.tx.send(AgentEvent::ItemDelta {
+        let _ = self.route.send(AgentEvent::ItemDelta {
             thread: thread.thread,
             turn,
             item_id: command_item,
@@ -216,10 +223,6 @@ impl AgentHarness for InterruptHarness {
             },
         });
         Ok(turn)
-    }
-
-    fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-        AgentEventStream::new(self.tx.subscribe())
     }
 
     async fn respond_approval(
@@ -250,7 +253,7 @@ impl AgentHarness for InterruptHarness {
             .take()
             .map(|(_, turn)| turn)
             .unwrap_or_default();
-        let _ = self.tx.send(AgentEvent::TurnCompleted {
+        let _ = self.route.send(AgentEvent::TurnCompleted {
             thread: thread.thread,
             turn,
             usage: TokenUsage::default(),
@@ -286,6 +289,7 @@ impl AgentHarness for InterruptHarness {
     }
 
     async fn shutdown(&self) -> Result<(), HarnessError> {
+        self.route.close();
         Ok(())
     }
 }

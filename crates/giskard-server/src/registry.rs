@@ -25,16 +25,21 @@ use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::text::trimmed_non_empty;
 use giskard_core::thread::ThreadKind;
 use giskard_core::turn::{
-    Mode, Turn, TurnMode, TurnModel, TurnOverrides, TurnStatus, TurnStatusKind,
+    Mode, PermissionPreset, Turn, TurnMode, TurnModel, TurnOverrides, TurnStatus, TurnStatusKind,
 };
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentHarness, HarnessBootstrap, HarnessCapabilities, HarnessProvider, KnownThreadBinding,
-    OpenThreadOptions, ThreadHandle, ThreadUpdate, thread_update_channel,
+    AgentHarness, DiscoveryTicket, HarnessBootstrap, HarnessCapabilities, HarnessProvider,
+    HarnessThreadDiscoveryStream, KnownThreadBinding, OpenThreadOptions, ThreadAttachment,
+    ThreadDeletion, ThreadHandle, ThreadUpdate, thread_update_channel,
 };
 use giskard_persist::PersistStore;
-use giskard_persist::store::{ProjectConfig, ThreadFile, ThreadMutation, TurnCommitOutcome};
-use giskard_proto::{RunningTask, ServerMessage, ThreadRuntimeOverview, WireAgentEvent, WireItem};
+use giskard_persist::store::{
+    ProjectConfig, ThreadFile, ThreadGitWorkspace, ThreadMutation, TurnCommitOutcome,
+};
+use giskard_proto::{
+    GitStrategy, RunningTask, ServerMessage, ThreadRuntimeOverview, WireAgentEvent, WireItem,
+};
 
 use crate::hub::Hub;
 use crate::ledger::LedgerHandle;
@@ -50,18 +55,25 @@ use crate::thread_runtime::{
 };
 
 mod event_forwarder;
+mod owner;
+mod primary;
 mod project;
 mod thread;
 
+#[cfg(test)]
+use event_forwarder::{ForwarderExitReason, ThreadEventForwarder, forwarder_exit_reason_label};
 use event_forwarder::{
-    ForwarderExitReason, ThreadEventForwarder, event_item_id, event_kind, event_turn_id,
-    forwarder_exit_reason_label, log_metadata_only_event_rejection,
+    event_item_id, event_kind, event_turn_id, log_metadata_only_event_rejection,
 };
-use project::{HarnessTransitions, LifecycleLock, ProjectAuthority, WeakLifecycleLock};
+use owner::OwnerInstallation;
+use project::{
+    HarnessTransitions, LifecycleLock, ProjectAuthority, ProjectMaterializationPermit,
+    WeakLifecycleLock,
+};
 pub(crate) use thread::ThreadAuthority;
 use thread::{
     ClassificationPhase, CoordinatorToken, EventOwnerControl, ExternalTurnDefaults, OwnerLock,
-    ThreadBinding, ThreadCoordinator, WeakOwnerLock,
+    OwnerRetirement, PreparedTurnReservation, ThreadBinding, ThreadCoordinator, WeakOwnerLock,
 };
 
 #[async_trait]
@@ -186,6 +198,21 @@ impl RegistryTaskTracker {
             }
         }
     }
+
+    /// Close finite-operation admission and retain shutdown ownership until every admitted
+    /// operation has committed or rolled back. Unlike background workers, these operations have
+    /// bounded provider/persistence awaits of their own; advancing to harness shutdown would tear
+    /// resources out from under rollback and is therefore not a valid timeout recovery.
+    async fn close_and_wait_owned(&self) {
+        self.closed.store(true, Ordering::Release);
+        loop {
+            let completion = self.completion.notified();
+            if self.count.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            completion.await;
+        }
+    }
 }
 
 /// A loaded-thread identity sampled from one coordinator state.
@@ -201,6 +228,25 @@ pub struct LoadedThreadBinding {
     /// the harness named one — callers already treat an unknown native model the same as an
     /// unbound thread.
     native_model: Option<ModelRef>,
+}
+
+#[derive(Clone)]
+pub(crate) struct NewPrimaryThread {
+    pub(crate) title: String,
+    pub(crate) mode: TurnMode,
+    pub(crate) permission_preset: PermissionPreset,
+    pub(crate) context_window: u32,
+    pub(crate) git_workspace: Option<ThreadGitWorkspace>,
+}
+
+#[cfg(test)]
+pub(crate) struct MaterializedPrimaryThread {
+    pub(crate) handle: ThreadHandle,
+}
+
+pub(crate) struct StartedPrimaryThread {
+    pub(crate) handle: ThreadHandle,
+    pub(crate) turn_id: TurnId,
 }
 
 impl LoadedThreadBinding {
@@ -278,11 +324,26 @@ struct RegistryShared {
     harness_transitions: Arc<HarnessTransitions>,
     threads: Arc<Mutex<ThreadIndex>>,
     background_tasks: Arc<RegistryTaskTracker>,
+    primary_operations: Arc<RegistryTaskTracker>,
     hub: Arc<Hub>,
     runtime: Arc<ThreadRuntimeSupport>,
     store: Arc<PersistStore>,
     thread_metadata: Arc<ThreadMetadataService>,
+    #[cfg(test)]
+    discovery_create_fault: std::sync::Mutex<Option<DiscoveryCreateFault>>,
+    #[cfg(test)]
+    primary_create_committed_error: AtomicBool,
+    #[cfg(test)]
+    primary_delete_error: AtomicBool,
     ledger: LedgerHandle,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum DiscoveryCreateFault {
+    CommittedMatching,
+    Absent,
+    CommittedConflicting,
 }
 
 impl RegistryShared {
@@ -386,9 +447,9 @@ impl RegistryShared {
     async fn abort_admitted_operation(
         &self,
         coordinator: &ThreadCoordinator,
-        operation: CoordinatorToken,
+        operation: &PreparedTurnReservation,
     ) {
-        if let Some(mut turn_gate) = coordinator.abort_operation(operation).await
+        if let Some(mut turn_gate) = coordinator.abort_operation(operation.token()).await
             && let Some(overview) = turn_gate.release()
         {
             self.hub.publish_runtime_overview(overview).await;
@@ -402,7 +463,7 @@ impl RegistryShared {
         project_id: ProjectId,
         handle: &ThreadHandle,
         context: &TurnContext,
-    ) -> Result<CoordinatorToken, HarnessError> {
+    ) -> Result<PreparedTurnReservation, HarnessError> {
         let turn_gate = match self
             .runtime
             .reserve_turn(authority, turn_reservation(project_id, handle, context))
@@ -448,12 +509,19 @@ impl RegistryShared {
             harness_transitions: Arc::new(HarnessTransitions::new()),
             threads: Arc::new(Mutex::new(ThreadIndex::default())),
             background_tasks: Arc::new(RegistryTaskTracker::default()),
+            primary_operations: Arc::new(RegistryTaskTracker::default()),
             hub,
             runtime: Arc::new(ThreadRuntimeSupport::with_max_command_output_bytes(
                 max_command_output_bytes,
             )),
             store,
             thread_metadata,
+            #[cfg(test)]
+            discovery_create_fault: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            primary_create_committed_error: AtomicBool::new(false),
+            #[cfg(test)]
+            primary_delete_error: AtomicBool::new(false),
             ledger,
         }
     }
@@ -656,7 +724,7 @@ impl HarnessRegistry {
     /// from either an HTTP request or an asynchronously observed harness event, while subtree and
     /// project deletion mutate the same graph. One project-scoped lock makes each find/open/save
     /// or load/preflight/delete sequence atomic with respect to the others.
-    async fn lock_project_lifecycle(&self, project_id: ProjectId) -> OwnedMutexGuard<()> {
+    async fn lock_project_lifecycle(&self, project_id: ProjectId) -> ProjectMaterializationPermit {
         lock_project_lifecycle(&self.shared.projects, project_id).await
     }
 
@@ -664,7 +732,7 @@ impl HarnessRegistry {
         &self,
         project_id: ProjectId,
         wait: Duration,
-    ) -> Result<OwnedMutexGuard<()>, HarnessError> {
+    ) -> Result<ProjectMaterializationPermit, HarnessError> {
         timeout(wait, self.lock_project_lifecycle(project_id))
             .await
             .map_err(|_| {
@@ -710,6 +778,29 @@ impl HarnessRegistry {
         let h = self.factory.create(config, bootstrap).await?;
         debug!(project_id = %project, bindings = binding_count,
             "created harness with durable thread bindings installed");
+
+        let discovery = match h.take_thread_discovery_stream() {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                let _ = h.shutdown().await;
+                return Err(error);
+            }
+        };
+        if let Some(discovery) = discovery {
+            let Some(permit) = self.shared.background_tasks.register() else {
+                let _ = h.shutdown().await;
+                return Err(HarnessError::Protocol(
+                    "server is shutting down; refusing native thread discovery".into(),
+                ));
+            };
+            launch_thread_discovery_consumer(
+                self.shared.clone(),
+                project,
+                h.clone(),
+                discovery,
+                permit,
+            );
+        }
 
         slot.publish_active(h.clone());
         Ok(h)
@@ -765,13 +856,211 @@ impl HarnessRegistry {
     pub async fn open_thread(
         &self,
         config: &ProjectConfig,
-        workspace_root: &str,
+        _workspace_root: &str,
         thread: ThreadId,
         resume: Option<String>,
         initial_model: ModelRef,
     ) -> Result<ThreadHandle, HarnessError> {
-        self.open_primary_thread(config, workspace_root, thread, resume, initial_model)
+        let permit = self.shared.primary_operations.register().ok_or_else(|| {
+            HarnessError::Protocol("server is shutting down; refusing Primary open".into())
+        })?;
+        let registry = self.clone();
+        let config = config.clone();
+        let (result_tx, result_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let result = async {
+                let permit = registry.lock_project_lifecycle(config.id).await;
+                let current_config = registry
+                    .shared
+                    .store
+                    .load_project(config.id)
+                    .await
+                    .map_err(|error| HarnessError::Protocol(error.to_string()))?
+                    .ok_or_else(|| {
+                        HarnessError::Protocol(format!("project {} disappeared", config.id))
+                    })?;
+                let durable = registry
+                    .shared
+                    .store
+                    .load_thread(config.id, thread)
+                    .await
+                    .map_err(|error| HarnessError::Protocol(error.to_string()))?
+                    .ok_or(HarnessError::ThreadNotFound(thread))?;
+                if durable.kind != ThreadKind::Primary
+                    || resume.as_deref() != Some(durable.harness_thread_id.as_str())
+                {
+                    return Err(HarnessError::Protocol(format!(
+                        "cold Primary open for {thread} did not match its durable native identity"
+                    )));
+                }
+                if let Some(coordinator) = registry.shared.coordinator(thread).await {
+                    return coordinator
+                        .reusable_handle(
+                            config.id,
+                            thread,
+                            Some(&durable.harness_thread_id),
+                            ClassificationPhase::Primary,
+                        )
+                        .await;
+                }
+                let current_workspace = effective_thread_workspace_root(
+                    &registry.shared.store,
+                    &current_config,
+                    &durable,
+                )
+                .await
+                .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+                let app_config = registry
+                    .shared
+                    .store
+                    .load_config()
+                    .await
+                    .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+                let catalog = registry
+                    .project_model_catalog(&current_config)
+                    .await
+                    .unwrap_or_default();
+                let mut current_model =
+                    crate::models::normalize_model_ref(&app_config, &catalog, &initial_model);
+                if !crate::models::resolve_catalog_descriptor(&catalog, &app_config, &current_model)
+                    .supports_reasoning_effort
+                {
+                    current_model.reasoning_effort = None;
+                }
+                registry
+                    .open_primary_thread_locked(
+                        &permit,
+                        &current_config,
+                        &current_workspace,
+                        thread,
+                        resume,
+                        current_model,
+                    )
+                    .await
+            }
+            .await;
+            let _ = result_tx.send(result);
+        });
+        result_rx
             .await
+            .map_err(|_| HarnessError::Transport("Primary open task dropped its result".into()))?
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn materialize_primary_thread(
+        &self,
+        config: &ProjectConfig,
+        workspace_root: &str,
+        thread: ThreadId,
+        initial_model: ModelRef,
+        metadata: NewPrimaryThread,
+    ) -> Result<MaterializedPrimaryThread, HarnessError> {
+        let started = self
+            .create_primary_and_start(
+                config.clone(),
+                workspace_root.to_owned(),
+                thread,
+                initial_model,
+                metadata.clone(),
+                GitStrategy::Shared,
+                UserInput::text("test Primary materialization"),
+                TurnOverrides {
+                    model: None,
+                    mode: metadata.mode.as_known().unwrap_or(Mode::Build),
+                    permission_preset: metadata.permission_preset,
+                },
+            )
+            .await?;
+        Ok(MaterializedPrimaryThread {
+            handle: started.handle,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_primary_and_start(
+        &self,
+        config: ProjectConfig,
+        project_workspace_root: String,
+        thread: ThreadId,
+        initial_model: ModelRef,
+        metadata: NewPrimaryThread,
+        git_strategy: GitStrategy,
+        input: UserInput,
+        overrides: TurnOverrides,
+    ) -> Result<StartedPrimaryThread, HarnessError> {
+        let creation = primary::Unadmitted::new(primary::Request {
+            config,
+            project_workspace_root,
+            thread,
+            initial_model,
+            metadata,
+            git_strategy,
+            input,
+            overrides,
+            #[cfg(test)]
+            phase_gate: None,
+        });
+        let permit = self.shared.primary_operations.register().ok_or_else(|| {
+            HarnessError::Protocol("server is shutting down; refusing Primary creation".into())
+        })?;
+        let registry = self.clone();
+        let (result_tx, result_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let result = creation.run(&registry, permit).await;
+            let _ = result_tx.send(result);
+        });
+        result_rx.await.map_err(|_| {
+            HarnessError::Transport("Primary creation task dropped its result".into())
+        })?
+    }
+
+    #[cfg(test)]
+    async fn create_primary_with_phase_gate(
+        &self,
+        config: ProjectConfig,
+        thread: ThreadId,
+        initial_model: ModelRef,
+        git_strategy: GitStrategy,
+        gate: Arc<primary::PhaseGate>,
+    ) -> Result<StartedPrimaryThread, HarnessError> {
+        let creation = primary::Unadmitted::new(primary::Request {
+            project_workspace_root: config
+                .workspace_root
+                .as_deref()
+                .unwrap_or(&config.dir)
+                .to_owned(),
+            config,
+            thread,
+            initial_model,
+            metadata: NewPrimaryThread {
+                title: "phase-gated Primary".into(),
+                mode: TurnMode::Known(Mode::Build),
+                permission_preset: PermissionPreset::AskFirst,
+                context_window: 0,
+                git_workspace: None,
+            },
+            git_strategy,
+            input: UserInput::text("phase gate"),
+            overrides: TurnOverrides {
+                model: None,
+                mode: Mode::Build,
+                permission_preset: PermissionPreset::AskFirst,
+            },
+            phase_gate: Some(gate),
+        });
+        let operation = self.shared.primary_operations.register().ok_or_else(|| {
+            HarnessError::Protocol("server is shutting down; refusing Primary creation".into())
+        })?;
+        let registry = self.clone();
+        let (result_tx, result_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let result = creation.run(&registry, operation).await;
+            let _ = result_tx.send(result);
+        });
+        result_rx.await.map_err(|_| {
+            HarnessError::Transport("phase-gated Primary task dropped its result".into())
+        })?
     }
 
     /// Attach a persisted provider-owned child without resuming or nudging native work.
@@ -787,15 +1076,25 @@ impl HarnessRegistry {
             )));
         }
         self.get_or_create_harness(config.id, config).await?;
-        ensure_subagent_thread_open(config, thread, &self.shared).await?;
+        let permit = self.lock_project_lifecycle(config.id).await;
+        ensure_subagent_thread_open_locked(
+            &permit,
+            config,
+            thread,
+            &self.shared,
+            SubagentRouteClaim::ExplicitReattach,
+        )
+        .await?;
         self.loaded_thread_binding(thread.id)
             .await
             .map(|binding| binding.handle)
             .ok_or(HarnessError::ThreadNotFound(thread.id))
     }
 
-    async fn open_primary_thread(
+    #[allow(clippy::too_many_arguments)]
+    async fn open_primary_thread_locked(
         &self,
+        lifecycle_permit: &ProjectMaterializationPermit,
         config: &ProjectConfig,
         workspace_root: &str,
         thread: ThreadId,
@@ -808,19 +1107,27 @@ impl HarnessRegistry {
             resume = display_opt(resume.as_deref()),
             "opening harness thread"
         );
-        // Serialize the cold check and native open for an already-known thread. Locking only when
+        // Serialize every project materialization path through coordinator installation. This
+        // deliberately spans the native open/resume: traffic discovery can observe the route
+        // while `open_thread` is outstanding and must wait for its Primary coordinator instead of
+        // creating an orphan. Project/thread deletion accepts this exclusion boundary and may
+        // return Unavailable after its five-second lifecycle-lock wait rather than race partially
+        // published ownership.
+        debug_assert_eq!(lifecycle_permit.project_id(), config.id);
+        // Preserve the global lock order: project lifecycle, then thread owner. Locking only when
         // publishing the owner is too late: two callers could both open the native thread and the
         // losing open may invalidate the stream already owned by the winner.
-        let _owner_guard = lock_thread_owner_after_drain(&self.shared, thread).await;
+        let owner_guard = lock_thread_owner_after_drain(&self.shared, thread).await;
         if let Some(existing) = self.shared.coordinator(thread).await {
-            return existing
+            let handle = existing
                 .reusable_handle(
                     config.id,
                     thread,
                     resume.as_deref(),
                     ClassificationPhase::Primary,
                 )
-                .await;
+                .await?;
+            return Ok(handle);
         }
         let harness = self.get_or_create_harness(config.id, config).await?;
         let (updates, update_stream) = thread_update_channel();
@@ -831,7 +1138,7 @@ impl HarnessRegistry {
             .map_err(|error| HarnessError::Protocol(error.to_string()))?;
         let restore_permit = self.shared.runtime.restoration_permit(&authority);
 
-        let handle = harness
+        let attachment = harness
             .open_thread(OpenThreadOptions {
                 project: config.id,
                 thread,
@@ -841,6 +1148,7 @@ impl HarnessRegistry {
                 updates,
             })
             .await?;
+        let handle = attachment.handle().clone();
         if handle.thread != thread {
             return Err(HarnessError::Protocol(format!(
                 "harness opened thread {} instead of requested thread {thread}",
@@ -855,15 +1163,12 @@ impl HarnessRegistry {
             .resumed_model
             .clone()
             .unwrap_or_else(|| initial_model.clone());
-        let binding = LoadedThreadBinding {
-            project_id: config.id,
-            handle: handle.clone(),
-            native_model: Some(native_model),
-        };
         let owner_installed = install_event_owner_locked(
             &self.shared,
-            &harness,
-            binding,
+            owner_guard,
+            attachment,
+            config.id,
+            Some(native_model),
             ClassificationPhase::Primary,
         )
         .await?;
@@ -938,7 +1243,7 @@ impl HarnessRegistry {
             .await?;
         let Some(task_permit) = self.shared.background_tasks.register() else {
             self.shared
-                .abort_admitted_operation(&coordinator, operation)
+                .abort_admitted_operation(&coordinator, &operation)
                 .await;
             return Err(HarnessError::Protocol(
                 "server is shutting down; refusing to start a turn".into(),
@@ -961,7 +1266,7 @@ impl HarnessRegistry {
                         "harness accepted turn start request"
                     );
                     task_coordinator
-                        .acknowledge_operation_turn(operation, turn_id)
+                        .acknowledge_operation_turn(&operation, turn_id)
                         .await;
                     publish_runtime_overview(&task_shared).await;
                     Ok(turn_id)
@@ -978,7 +1283,7 @@ impl HarnessRegistry {
                         "harness rejected turn start request"
                     );
                     task_shared
-                        .abort_admitted_operation(&task_coordinator, operation)
+                        .abort_admitted_operation(&task_coordinator, &operation)
                         .await;
                     Err(error)
                 }
@@ -986,14 +1291,9 @@ impl HarnessRegistry {
         });
         match task.await {
             Ok(result) => result,
-            Err(error) => {
-                self.shared
-                    .abort_admitted_operation(&coordinator, operation)
-                    .await;
-                Err(HarnessError::Protocol(format!(
-                    "turn start task failed: {error}"
-                )))
-            }
+            Err(error) => Err(HarnessError::Protocol(format!(
+                "turn start task failed: {error}"
+            ))),
         }
     }
 
@@ -1256,7 +1556,7 @@ impl HarnessRegistry {
             .await?;
         let Some(task_permit) = self.shared.background_tasks.register() else {
             self.shared
-                .abort_admitted_operation(&coordinator, operation)
+                .abort_admitted_operation(&coordinator, &operation)
                 .await;
             return Err(HarnessError::Protocol(
                 "server is shutting down; refusing context compaction".into(),
@@ -1268,6 +1568,7 @@ impl HarnessRegistry {
             let _task_permit = task_permit;
             match harness.compact_thread(&handle).await {
                 Ok(()) => {
+                    task_coordinator.retain_accepted_operation(&operation).await;
                     info!(
                         %project_id,
                         %thread_id,
@@ -1279,7 +1580,7 @@ impl HarnessRegistry {
                 }
                 Err(error) => {
                     task_shared
-                        .abort_admitted_operation(&task_coordinator, operation)
+                        .abort_admitted_operation(&task_coordinator, &operation)
                         .await;
                     Err(error)
                 }
@@ -1287,14 +1588,9 @@ impl HarnessRegistry {
         });
         match task.await {
             Ok(result) => result,
-            Err(error) => {
-                self.shared
-                    .abort_admitted_operation(&coordinator, operation)
-                    .await;
-                Err(HarnessError::Protocol(format!(
-                    "context compaction task failed: {error}"
-                )))
-            }
+            Err(error) => Err(HarnessError::Protocol(format!(
+                "context compaction task failed: {error}"
+            ))),
         }
     }
 
@@ -1478,21 +1774,33 @@ impl HarnessRegistry {
         harness.start_mcp_oauth_login(name).await
     }
 
-    pub async fn delete_thread(
+    pub(crate) async fn delete_thread(
         &self,
+        permit: &ProjectMaterializationPermit,
         config: &ProjectConfig,
         thread_id: ThreadId,
         harness_thread_id: String,
     ) -> Result<(), HarnessError> {
+        if permit.project_id() != config.id {
+            return Err(HarnessError::Protocol(format!(
+                "project materialization permit belongs to {}, not {}",
+                permit.project_id(),
+                config.id
+            )));
+        }
         let harness = self.get_or_create_harness(config.id, config).await?;
         let handle = self
             .loaded_thread_binding(thread_id)
             .await
             .map(|binding| binding.handle)
             .unwrap_or_else(|| ThreadHandle::detached(thread_id, harness_thread_id));
-        harness.delete_thread(&handle).await?;
+        let retirement = harness.begin_delete_thread(&handle).await?;
         self.retire_thread(thread_id).await;
-        Ok(())
+        let deletion = retirement.finish().await?;
+        match deletion {
+            ThreadDeletion::Retired => Ok(()),
+            ThreadDeletion::RetiredWithProviderError(error) => Err(error),
+        }
     }
 
     pub async fn thread_has_active_turn(&self, thread_id: ThreadId) -> bool {
@@ -1513,13 +1821,17 @@ impl HarnessRegistry {
             Some(coordinator) => coordinator.begin_retirement().await,
             None => None,
         };
-        if let Some(control) = control.as_ref() {
+        if let Some(OwnerRetirement::Running(control)) = control.as_ref() {
             let _ = control.cancel.send(true);
         }
         drop(owner_guard);
 
-        if let Some(mut control) = control {
-            wait_for_owner_completion(&mut control).await;
+        match control {
+            Some(OwnerRetirement::Running(mut control)) => {
+                wait_for_owner_completion(&mut control).await;
+            }
+            Some(OwnerRetirement::PersistenceBlocked(owner)) => drop(owner),
+            None => {}
         }
 
         let _owner_guard = lock_thread_owner(&self.shared.threads, thread_id).await;
@@ -1545,6 +1857,8 @@ impl HarnessRegistry {
     /// harness failures are isolated: every project receives a shutdown request before an
     /// aggregate error is returned.
     pub async fn shutdown(&self) -> Result<(), HarnessError> {
+        let mut failures = Vec::new();
+        self.shared.primary_operations.close_and_wait_owned().await;
         let harnesses = {
             let mut transitions = self.shared.harness_transitions.lock().await;
             transitions.begin_shutdown();
@@ -1604,11 +1918,12 @@ impl HarnessRegistry {
         )
         .await;
 
-        let mut failures = results
-            .into_iter()
-            .filter_map(|(project_id, result)| result.err().map(|error| (project_id, error)))
-            .map(|(project_id, error)| format!("{project_id}: {error}"))
-            .collect::<Vec<_>>();
+        failures.extend(
+            results
+                .into_iter()
+                .filter_map(|(project_id, result)| result.err().map(|error| (project_id, error)))
+                .map(|(project_id, error)| format!("{project_id}: {error}")),
+        );
         if let Err(error) = self
             .shared
             .background_tasks
@@ -1643,7 +1958,17 @@ impl HarnessRegistry {
         }
     }
 
-    pub async fn delete_project(&self, project_id: ProjectId) -> Result<(), HarnessError> {
+    pub(crate) async fn delete_project(
+        &self,
+        permit: &ProjectMaterializationPermit,
+        project_id: ProjectId,
+    ) -> Result<(), HarnessError> {
+        if permit.project_id() != project_id {
+            return Err(HarnessError::Protocol(format!(
+                "project materialization permit belongs to {}, not {project_id}",
+                permit.project_id()
+            )));
+        }
         let coordinators = self.shared.coordinator_snapshot().await;
         let mut thread_ids = HashSet::new();
         for (thread_id, coordinator) in coordinators {
@@ -1692,7 +2017,7 @@ impl HarnessRegistry {
 async fn lock_project_lifecycle(
     projects: &Arc<Mutex<ProjectIndex>>,
     project_id: ProjectId,
-) -> OwnedMutexGuard<()> {
+) -> ProjectMaterializationPermit {
     let lock = {
         let mut index = projects.lock().await;
         if let Some(authority) = index.projects.get(&project_id) {
@@ -1715,7 +2040,67 @@ async fn lock_project_lifecycle(
             }
         }
     };
-    lock.lock_owned().await
+    ProjectMaterializationPermit::new(project_id, lock.lock_owned().await)
+}
+
+async fn remove_primary_worktree(
+    worktree: Option<&giskard_persist::store::ThreadWorktree>,
+    thread_id: ThreadId,
+    failed_action: &str,
+) -> Result<(), PrimaryWorktreeCleanupError> {
+    let Some(worktree) = worktree else {
+        return Ok(());
+    };
+    if let Err(error) = crate::worktree::remove(worktree, true).await {
+        warn!(
+            %thread_id,
+            branch = %worktree.branch,
+            path = %worktree.path,
+            %failed_action,
+            %error,
+            "could not remove worktree during Primary rollback"
+        );
+        return Err(PrimaryWorktreeCleanupError {
+            stage: "remove checkout",
+            path: worktree.path.clone(),
+            branch: worktree.branch.clone(),
+            source: error.to_string(),
+        });
+    }
+    if let Err(error) = crate::worktree::delete_branch(worktree).await {
+        warn!(
+            %thread_id,
+            branch = %worktree.branch,
+            %failed_action,
+            %error,
+            "could not remove branch during Primary rollback"
+        );
+        return Err(PrimaryWorktreeCleanupError {
+            stage: "delete branch",
+            path: worktree.path.clone(),
+            branch: worktree.branch.clone(),
+            source: error.to_string(),
+        });
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct PrimaryWorktreeCleanupError {
+    stage: &'static str,
+    path: String,
+    branch: String,
+    source: String,
+}
+
+impl fmt::Display for PrimaryWorktreeCleanupError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} failed for checkout {} and branch {}: {}",
+            self.stage, self.path, self.branch, self.source
+        )
+    }
 }
 
 async fn lock_thread_owner(
@@ -1975,7 +2360,8 @@ async fn materialize_subagent_thread(
     info: SubagentActivityInfo,
     shared: Arc<RegistryShared>,
 ) -> Result<Option<ThreadId>, HarnessError> {
-    let _lifecycle_guard = lock_project_lifecycle(&shared.projects, project_id).await;
+    let lifecycle_permit = lock_project_lifecycle(&shared.projects, project_id).await;
+    debug_assert_eq!(lifecycle_permit.project_id(), project_id);
     let Some(project_config) = shared
         .store
         .load_project(project_id)
@@ -2116,8 +2502,14 @@ async fn materialize_subagent_thread(
                 .publish_created(project_id, &existing)
                 .await;
         }
-        let opened_agent_name =
-            ensure_subagent_thread_open(&project_config, &existing, &shared).await?;
+        let opened_agent_name = ensure_subagent_thread_open_locked(
+            &lifecycle_permit,
+            &project_config,
+            &existing,
+            &shared,
+            SubagentRouteClaim::ParentDiscovery,
+        )
+        .await?;
         let refreshed_info = subagent_info_with_agent_name(info.clone(), opened_agent_name);
         let desired_title = subagent_thread_title(&refreshed_info);
         if should_refresh_subagent_title(&existing.title, &desired_title) {
@@ -2166,13 +2558,14 @@ async fn materialize_subagent_thread(
             .await
             .map_err(|error| HarnessError::Protocol(error.to_string()))?;
     let child_thread_id = ThreadId::new();
-    let handle = harness
+    let attachment = harness
         .claim_native_thread(
             child_thread_id,
             info.native_thread_id.clone(),
             workspace_root.into(),
         )
         .await?;
+    let handle = attachment.handle().clone();
     if handle.harness_thread_id != info.native_thread_id {
         return Err(HarnessError::Protocol(format!(
             "linked-thread claim returned native thread {} instead of {}",
@@ -2229,23 +2622,22 @@ async fn materialize_subagent_thread(
     // The bounded channel retains an early replay while the thread is being created. Start the
     // forwarder only after metadata exists, so restoration cannot race creation and be lost.
     let native_model = current_model.as_known().cloned();
-    install_event_owner(
+    let installation = install_event_owner(
         &shared,
-        &harness,
-        LoadedThreadBinding {
-            project_id,
-            handle: handle.clone(),
-            native_model,
-        },
+        attachment,
+        project_id,
+        native_model,
         ClassificationPhase::Subagent,
     )
-    .await?;
-    // The thread and binding are durable even if observation setup below fails. Publish the
-    // creation now so a retry cannot leave the catalog unaware of an already-existing child.
+    .await;
+    // Metadata is already durable even if owner installation failed. Publish exactly once from
+    // the creating attempt so a later existing-Subagent retry cannot leave the catalog unaware of
+    // the child or emit a duplicate creation notification.
     shared
         .thread_metadata
         .publish_created(project_id, &thread_file)
         .await;
+    installation?;
     Ok(Some(handle.thread))
 }
 
@@ -2376,11 +2768,26 @@ async fn run_subagent_materialization_queue(
     }
 }
 
-async fn ensure_subagent_thread_open(
+#[derive(Clone, Copy)]
+enum SubagentRouteClaim {
+    ParentDiscovery,
+    ExplicitReattach,
+}
+
+async fn ensure_subagent_thread_open_locked(
+    permit: &ProjectMaterializationPermit,
     project_config: &ProjectConfig,
     thread_file: &ThreadFile,
     shared: &Arc<RegistryShared>,
+    route_claim: SubagentRouteClaim,
 ) -> Result<Option<String>, HarnessError> {
+    if permit.project_id() != project_config.id {
+        return Err(HarnessError::Protocol(format!(
+            "project materialization permit belongs to {}, not {}",
+            permit.project_id(),
+            project_config.id
+        )));
+    }
     let harness = shared
         .active_harness(project_config.id)
         .await
@@ -2391,7 +2798,7 @@ async fn ensure_subagent_thread_open(
         effective_thread_workspace_root(&shared.store, project_config, thread_file)
             .await
             .map_err(|error| HarnessError::Protocol(error.to_string()))?;
-    let _owner_guard = lock_thread_owner_after_drain(shared, thread_file.id).await;
+    let owner_guard = lock_thread_owner_after_drain(shared, thread_file.id).await;
     if let Some(coordinator) = shared.coordinator(thread_file.id).await {
         let handle = coordinator
             .reusable_handle(
@@ -2403,13 +2810,33 @@ async fn ensure_subagent_thread_open(
             .await?;
         return Ok(handle.agent_name);
     }
-    let handle = harness
-        .claim_native_thread(
-            thread_file.id,
-            thread_file.harness_thread_id.clone(),
-            workspace_root.into(),
-        )
-        .await?;
+    let attachment = match route_claim {
+        SubagentRouteClaim::ParentDiscovery => {
+            harness
+                .claim_native_thread(
+                    thread_file.id,
+                    thread_file.harness_thread_id.clone(),
+                    workspace_root.into(),
+                )
+                .await?
+        }
+        SubagentRouteClaim::ExplicitReattach => {
+            harness
+                .reattach_native_thread(
+                    thread_file.id,
+                    thread_file.harness_thread_id.clone(),
+                    workspace_root.into(),
+                )
+                .await?
+        }
+    };
+    let handle = attachment.handle().clone();
+    if handle.thread != thread_file.id {
+        return Err(HarnessError::Protocol(format!(
+            "linked-thread claim returned thread {} instead of {}",
+            handle.thread, thread_file.id
+        )));
+    }
     if handle.harness_thread_id != thread_file.harness_thread_id {
         return Err(HarnessError::Protocol(format!(
             "linked-thread claim returned native thread {} instead of {}",
@@ -2423,12 +2850,10 @@ async fn ensure_subagent_thread_open(
     let agent_name = handle.agent_name.clone();
     install_event_owner_locked(
         shared,
-        &harness,
-        LoadedThreadBinding {
-            project_id: project_config.id,
-            handle,
-            native_model,
-        },
+        owner_guard,
+        attachment,
+        project_config.id,
+        native_model,
         ClassificationPhase::Subagent,
     )
     .await?;
@@ -2482,11 +2907,12 @@ async fn broadcast_event_with_user_input(
     .await;
 }
 
+#[cfg(test)]
 fn launch_event_forwarder(
     shared: Arc<RegistryShared>,
     authority: Arc<ThreadAuthority>,
     coordinator: Arc<ThreadCoordinator>,
-    stream: giskard_harness::AgentEventStream,
+    owner: giskard_harness::ThreadEventOwner,
     cancel: watch::Receiver<bool>,
     completed: watch::Sender<bool>,
     permit: RegistryTaskPermit,
@@ -2498,14 +2924,24 @@ fn launch_event_forwarder(
             shared.clone(),
             authority.clone(),
             coordinator.clone(),
-            stream,
+            owner,
             cancel,
         )
         .await;
         let thread_id = forwarder.thread_id();
-        let exit_reason = forwarder.run().await;
+        let (exit_reason, owner) = forwarder.run().await;
         let cancelled = *cancellation_probe.borrow();
-        if !cancelled && exit_reason != ForwarderExitReason::PersistenceBlocked {
+        if exit_reason == ForwarderExitReason::PersistenceBlocked {
+            if let Err((error, owner)) = coordinator.retain_persistence_blocked_owner(owner).await {
+                warn!(
+                    %thread_id,
+                    %error,
+                    "could not retain persistence-blocked native event owner"
+                );
+                drop(owner);
+            }
+        } else if !cancelled {
+            drop(owner);
             coordinator.owner_finished(false).await;
             if authority.clear_coordinator_if(&coordinator).await {
                 warn!(
@@ -2515,83 +2951,318 @@ fn launch_event_forwarder(
                 );
             }
         } else {
+            drop(owner);
             coordinator.owner_finished(cancelled).await;
         }
         let _ = completed.send(true);
     });
 }
 
+fn launch_thread_discovery_consumer(
+    shared: Arc<RegistryShared>,
+    project_id: ProjectId,
+    harness: Arc<dyn AgentHarness>,
+    mut discoveries: HarnessThreadDiscoveryStream,
+    permit: RegistryTaskPermit,
+) {
+    tokio::spawn(async move {
+        let _permit = permit;
+        while let Some(discovery) = discoveries.recv().await {
+            let thread_id = discovery.thread_id();
+            let harness_thread_id = discovery.harness_thread_id().to_owned();
+            let result = ensure_discovered_thread_owner(
+                project_id,
+                discovery,
+                harness.clone(),
+                shared.clone(),
+            )
+            .await;
+            if let Err(error) = &result {
+                warn!(
+                    %project_id,
+                    %thread_id,
+                    %harness_thread_id,
+                    action = "materialize_discovered_thread",
+                    %error,
+                    "failed to establish an owner for a discovered native thread"
+                );
+            }
+        }
+        if shared.active_harness(project_id).await.is_some() {
+            error!(
+                %project_id,
+                action = "consume_native_thread_discovery",
+                "native thread discovery stream closed while the harness remained active"
+            );
+            let retired = if let Some(authority) = shared.project_authority(project_id).await {
+                let mut transitions = shared.harness_transitions.lock().await;
+                let mut slot = transitions.project(&authority).await;
+                if slot
+                    .active()
+                    .is_some_and(|active| Arc::ptr_eq(&active, &harness))
+                {
+                    let retired = slot.begin_delete().ok().flatten();
+                    if let Some(retired) = retired.as_ref() {
+                        slot.finish_delete(retired);
+                    }
+                    retired
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(retired) = retired
+                && let Err(error) = retired.shutdown().await
+            {
+                warn!(
+                    %project_id,
+                    %error,
+                    "failed to shut down harness after discovery consumer closure"
+                );
+            }
+        }
+    });
+}
+
+async fn ensure_discovered_thread_owner(
+    project_id: ProjectId,
+    discovery: DiscoveryTicket,
+    harness: Arc<dyn AgentHarness>,
+    shared: Arc<RegistryShared>,
+) -> Result<ThreadBinding, HarnessError> {
+    let discovered_thread = discovery.thread_id();
+    let discovered_native = discovery.harness_thread_id().to_owned();
+    let lifecycle_permit = lock_project_lifecycle(&shared.projects, project_id).await;
+    debug_assert_eq!(lifecycle_permit.project_id(), project_id);
+
+    let project = shared
+        .store
+        .load_project(project_id)
+        .await
+        .map_err(|error| HarnessError::Protocol(error.to_string()))?
+        .ok_or_else(|| HarnessError::Protocol(format!("project {project_id} disappeared")))?;
+    let graph = load_thread_graph(&shared.store, project_id)
+        .await
+        .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+    if let Some(conflict) = graph.values().find(|thread| {
+        thread.harness_thread_id == discovered_native && thread.id != discovered_thread
+    }) {
+        return Err(HarnessError::Protocol(format!(
+            "native thread {} is durably owned by thread {} instead of discovered thread {}",
+            discovered_native, conflict.id, discovered_thread
+        )));
+    }
+
+    let existing = graph.get(&discovered_thread).cloned();
+    if let Some(thread) = existing.as_ref()
+        && thread.harness_thread_id != discovered_native
+    {
+        return Err(HarnessError::Protocol(format!(
+            "discovered thread {} is durably bound to native thread {} instead of {}",
+            discovered_thread, thread.harness_thread_id, discovered_native
+        )));
+    }
+
+    if let Some(coordinator) = shared.coordinator(discovered_thread).await {
+        let thread = existing.as_ref().ok_or_else(|| {
+            HarnessError::Protocol(format!(
+                "discovered thread {} has a coordinator before durable metadata",
+                discovered_thread
+            ))
+        })?;
+        coordinator
+            .reusable_handle(
+                project_id,
+                discovered_thread,
+                Some(&discovered_native),
+                ClassificationPhase::from(thread.kind),
+            )
+            .await?;
+        return Ok(coordinator);
+    }
+
+    let workspace_root = match existing.as_ref() {
+        Some(thread) => effective_thread_workspace_root(&shared.store, &project, thread)
+            .await
+            .map_err(|error| HarnessError::Protocol(error.to_string()))?,
+        None => project
+            .workspace_root
+            .as_deref()
+            .unwrap_or(&project.dir)
+            .to_owned(),
+    };
+    let attachment = harness
+        .claim_discovered_thread(discovery, workspace_root.into())
+        .await?;
+    let handle = attachment.handle().clone();
+    if handle.thread != discovered_thread || handle.harness_thread_id != discovered_native {
+        return Err(HarnessError::Protocol(format!(
+            "discovered route claim returned thread {} / native {} instead of {} / {}",
+            handle.thread, handle.harness_thread_id, discovered_thread, discovered_native
+        )));
+    }
+
+    let (thread, created) = match existing {
+        Some(thread) => (thread, false),
+        None => {
+            let now = Utc::now();
+            let candidate = ThreadFile {
+                revision: 0,
+                version: giskard_persist::store::THREAD_METADATA_VERSION,
+                id: discovered_thread,
+                project_id,
+                title: "Unclassified native thread".into(),
+                harness_thread_id: discovered_native,
+                parent_thread_id: None,
+                spawned_by_turn_id: None,
+                kind: ThreadKind::Orphan,
+                mode: TurnMode::Unknown,
+                current_model: TurnModel::Unknown,
+                context_window: 0,
+                model_context_windows: HashMap::new(),
+                permission_preset: PermissionPreset::AskFirst,
+                model_efforts: HashMap::new(),
+                tokens: giskard_core::token::TokenLedger::default(),
+                created_at: now,
+                updated_at: now,
+                archived: false,
+                git_workspace: None,
+            };
+            let thread = match create_discovery_metadata(&shared, project_id, candidate.clone())
+                .await
+            {
+                Ok(thread) => thread,
+                Err(create_error) => {
+                    // An atomic rename may have committed even when its caller observed an error.
+                    // Reload before deciding that the attachment should be restored and retried.
+                    match shared
+                        .store
+                        .load_thread(project_id, discovered_thread)
+                        .await
+                    {
+                        Ok(Some(thread))
+                            if thread.project_id == candidate.project_id
+                                && thread.id == candidate.id
+                                && thread.harness_thread_id == candidate.harness_thread_id
+                                && thread.kind == candidate.kind =>
+                        {
+                            thread
+                        }
+                        Ok(Some(thread)) => {
+                            return Err(HarnessError::Protocol(format!(
+                                "discovery metadata create for {discovered_thread} failed ({create_error}); reload found conflicting native {} / kind {:?}",
+                                thread.harness_thread_id, thread.kind
+                            )));
+                        }
+                        Ok(None) => {
+                            return Err(HarnessError::Protocol(create_error.to_string()));
+                        }
+                        Err(reload_error) => {
+                            return Err(HarnessError::Protocol(format!(
+                                "discovery metadata create for {discovered_thread} failed ({create_error}); reload also failed: {reload_error}"
+                            )));
+                        }
+                    }
+                }
+            };
+            (thread, true)
+        }
+    };
+    let native_model = handle
+        .resumed_model
+        .clone()
+        .or_else(|| thread.current_model.as_known().cloned());
+    let installation = install_event_owner(
+        &shared,
+        attachment,
+        project_id,
+        native_model,
+        ClassificationPhase::from(thread.kind),
+    )
+    .await;
+    if created {
+        shared
+            .thread_metadata
+            .publish_created(project_id, &thread)
+            .await;
+    }
+    installation?;
+    let coordinator = shared.coordinator(discovered_thread).await.ok_or_else(|| {
+        HarnessError::Protocol(format!(
+            "discovered thread {} owner disappeared during installation",
+            discovered_thread
+        ))
+    })?;
+    Ok(coordinator)
+}
+
+async fn create_discovery_metadata(
+    shared: &RegistryShared,
+    project_id: ProjectId,
+    candidate: ThreadFile,
+) -> Result<ThreadFile, giskard_core::PersistError> {
+    #[cfg(test)]
+    let discovery_create_fault = { shared.discovery_create_fault.lock().unwrap().take() };
+    #[cfg(test)]
+    if let Some(fault) = discovery_create_fault {
+        let injected =
+            giskard_core::PersistError::Io("injected uncertain discovery metadata create".into());
+        match fault {
+            DiscoveryCreateFault::CommittedMatching => {
+                shared.thread_metadata.create(project_id, candidate).await?;
+                return Err(injected);
+            }
+            DiscoveryCreateFault::Absent => return Err(injected),
+            DiscoveryCreateFault::CommittedConflicting => {
+                let mut conflicting = candidate;
+                conflicting.harness_thread_id = "conflicting-native".into();
+                shared.store.save_thread(project_id, &conflicting).await?;
+                return Err(injected);
+            }
+        }
+    }
+    shared.thread_metadata.create(project_id, candidate).await
+}
+
 async fn install_event_owner(
     shared: &Arc<RegistryShared>,
-    harness: &Arc<dyn AgentHarness>,
-    binding: LoadedThreadBinding,
+    attachment: ThreadAttachment,
+    project_id: ProjectId,
+    native_model: Option<ModelRef>,
     classification: ClassificationPhase,
 ) -> Result<bool, HarnessError> {
-    let thread_id = binding.handle.thread;
-    let _owner_guard = lock_thread_owner_after_drain(shared, thread_id).await;
-    install_event_owner_locked(shared, harness, binding, classification).await
+    let thread_id = attachment.handle().thread;
+    let owner_guard = lock_thread_owner_after_drain(shared, thread_id).await;
+    install_event_owner_locked(
+        shared,
+        owner_guard,
+        attachment,
+        project_id,
+        native_model,
+        classification,
+    )
+    .await
 }
 
 async fn install_event_owner_locked(
     shared: &Arc<RegistryShared>,
-    harness: &Arc<dyn AgentHarness>,
-    binding: LoadedThreadBinding,
+    owner_guard: OwnedMutexGuard<()>,
+    attachment: ThreadAttachment,
+    project_id: ProjectId,
+    native_model: Option<ModelRef>,
     classification: ClassificationPhase,
 ) -> Result<bool, HarnessError> {
-    let thread_id = binding.handle.thread;
-    let project_id = binding.project_id;
-    let authority = shared
-        .intern_thread_authority(thread_id, project_id)
-        .await
-        .map_err(|error| HarnessError::Protocol(error.to_string()))?;
-    let existing = authority.coordinator().await;
-    if let Some(existing) = existing {
-        existing
-            .reusable_handle(
-                project_id,
-                thread_id,
-                Some(&binding.handle.harness_thread_id),
-                classification,
-            )
-            .await?;
-        debug!(%project_id, %thread_id, "reused existing long-lived native event owner");
-        return Ok(false);
-    }
-
-    let stream = harness.subscribe(&binding.handle);
-    let Some(permit) = shared.background_tasks.register() else {
-        return Err(HarnessError::Protocol(
-            "server is shutting down; refusing to install event owner".into(),
-        ));
-    };
-    let coordinator = Arc::new(ThreadCoordinator::new(binding, classification));
-    let (cancel_tx, cancel_rx) = watch::channel(false);
-    let (completed_tx, completed_rx) = watch::channel(false);
-    coordinator
-        .activate_owner(EventOwnerControl {
-            cancel: cancel_tx,
-            completed: completed_rx,
-        })
-        .await?;
-    if authority
-        .install_coordinator_if_empty(coordinator.clone())
-        .await
-        .is_err()
-    {
-        return Err(HarnessError::Protocol(format!(
-            "thread {thread_id} event owner installation conflicted with an existing coordinator"
-        )));
-    }
-    launch_event_forwarder(
-        shared.clone(),
-        authority,
-        coordinator.clone(),
-        stream,
-        cancel_rx,
-        completed_tx,
-        permit,
-    );
-    debug!(%project_id, %thread_id, "installed long-lived native event owner");
+    OwnerInstallation::prepare(
+        shared,
+        owner_guard,
+        attachment,
+        project_id,
+        native_model,
+        classification,
+    )
+    .await?
+    .commit()?;
     Ok(true)
 }
 
@@ -2607,20 +3278,24 @@ impl HarnessThreadId {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
     use std::sync::{Arc, Weak};
 
     use chrono::Utc;
     use giskard_core::approval::ApprovalDecision;
     use giskard_core::error::HarnessError;
+    use giskard_core::event::AgentEvent;
     use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
     use giskard_core::model::{ModelDescriptor, ModelRef};
+    use giskard_core::thread::ThreadKind;
     use giskard_core::token::TokenLedger;
     use giskard_core::turn::{Mode, PermissionPreset, TurnMode, TurnModel};
     use giskard_core::user_input::UserInput;
     use giskard_harness::{
-        AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+        AgentEventStream, AgentHarness, DiscoveryTicket, HarnessCapabilities,
+        HarnessThreadDiscoveryStream, OpenThreadOptions, ThreadAttachment, ThreadHandle,
     };
     use giskard_persist::PersistStore;
     use giskard_persist::store::{ProjectConfig, ThreadFile};
@@ -2638,21 +3313,150 @@ mod tests {
         fail: bool,
     }
 
+    #[derive(Clone)]
+    struct TestRoute {
+        receiver: Arc<StdMutex<Option<AgentEventStream>>>,
+    }
+
+    impl TestRoute {
+        fn new(receiver: broadcast::Receiver<AgentEvent>) -> Self {
+            Self {
+                receiver: Arc::new(StdMutex::new(Some(AgentEventStream::new(receiver)))),
+            }
+        }
+
+        fn attachment(&self, handle: ThreadHandle) -> Result<ThreadAttachment, HarnessError> {
+            let stream = self.receiver.lock().unwrap().take().ok_or_else(|| {
+                HarnessError::Protocol("test route receiver is already attached".into())
+            })?;
+            let attachment_return = self.receiver.clone();
+            let owner_return = self.receiver.clone();
+            Ok(ThreadAttachment::from_route(
+                handle,
+                stream,
+                move || {
+                    Ok(move |stream: AgentEventStream| {
+                        *owner_return.lock().unwrap() = Some(stream);
+                    })
+                },
+                move |stream| {
+                    *attachment_return.lock().unwrap() = Some(stream);
+                },
+            ))
+        }
+
+        fn ticket(&self, handle: ThreadHandle) -> DiscoveryTicket {
+            let thread_id = handle.thread;
+            let native_id = handle.harness_thread_id.clone();
+            let route = self.clone();
+            DiscoveryTicket::from_route(
+                thread_id,
+                native_id,
+                move |_| route.attachment(handle),
+                || {},
+            )
+        }
+    }
+
+    struct DiscoveryOwnerHarness {
+        route: TestRoute,
+        subscriptions: AtomicUsize,
+        routes: StdMutex<HashMap<String, ThreadId>>,
+        discovery_tx: StdMutex<Option<tokio::sync::mpsc::Sender<DiscoveryTicket>>>,
+        discovery_rx: StdMutex<Option<tokio::sync::mpsc::Receiver<DiscoveryTicket>>>,
+    }
+
     #[async_trait::async_trait]
-    impl AgentHarness for ShutdownHarness {
+    impl AgentHarness for DiscoveryOwnerHarness {
+        async fn begin_delete_thread<'a>(
+            &'a self,
+            thread: &'a ThreadHandle,
+        ) -> Result<giskard_harness::ThreadRetirement<'a>, HarnessError> {
+            giskard_harness::unsupported_thread_retirement(thread)
+        }
         fn capabilities(&self) -> HarnessCapabilities {
             HarnessCapabilities::default()
         }
 
-        async fn list_models(&self) -> Result<Vec<giskard_core::ModelDescriptor>, HarnessError> {
+        fn take_thread_discovery_stream(
+            &self,
+        ) -> Result<Option<HarnessThreadDiscoveryStream>, HarnessError> {
+            Ok(self
+                .discovery_rx
+                .lock()
+                .unwrap()
+                .take()
+                .map(HarnessThreadDiscoveryStream::new))
+        }
+
+        async fn list_models(&self) -> Result<Vec<ModelDescriptor>, HarnessError> {
             Ok(Vec::new())
         }
 
         async fn open_thread(
             &self,
             _opts: OpenThreadOptions,
-        ) -> Result<ThreadHandle, HarnessError> {
+        ) -> Result<ThreadAttachment, HarnessError> {
             Err(HarnessError::Unsupported("unused".into()))
+        }
+
+        async fn claim_native_thread(
+            &self,
+            thread: ThreadId,
+            harness_thread_id: String,
+            workspace_root: std::path::PathBuf,
+        ) -> Result<ThreadAttachment, HarnessError> {
+            if self.routes.lock().unwrap().contains_key("__tombstoned__") {
+                return Err(HarnessError::Protocol(
+                    "parent discovery cannot reactivate tombstoned route".into(),
+                ));
+            }
+            if self.routes.lock().unwrap().contains_key("__busy__") {
+                return Err(HarnessError::Protocol(
+                    "active route has no compatible coordinator".into(),
+                ));
+            }
+            let thread = *self
+                .routes
+                .lock()
+                .unwrap()
+                .entry(harness_thread_id.clone())
+                .or_insert(thread);
+            self.subscriptions.fetch_add(1, Ordering::SeqCst);
+            self.route.attachment(ThreadHandle::opened(
+                thread,
+                harness_thread_id,
+                workspace_root,
+            ))
+        }
+
+        async fn reattach_native_thread(
+            &self,
+            thread: ThreadId,
+            harness_thread_id: String,
+            workspace_root: std::path::PathBuf,
+        ) -> Result<ThreadAttachment, HarnessError> {
+            let thread = {
+                let mut routes = self.routes.lock().unwrap();
+                let authoritative = routes.get(&harness_thread_id).copied().unwrap_or(thread);
+                routes.insert("__reattached__".into(), authoritative);
+                authoritative
+            };
+            self.subscriptions.fetch_add(1, Ordering::SeqCst);
+            self.route.attachment(ThreadHandle::opened(
+                thread,
+                harness_thread_id,
+                workspace_root,
+            ))
+        }
+
+        async fn claim_discovered_thread(
+            &self,
+            ticket: DiscoveryTicket,
+            workspace_root: std::path::PathBuf,
+        ) -> Result<ThreadAttachment, HarnessError> {
+            self.subscriptions.fetch_add(1, Ordering::SeqCst);
+            ticket.claim(workspace_root)
         }
 
         async fn start_turn(
@@ -2664,9 +3468,241 @@ mod tests {
             Err(HarnessError::Unsupported("unused".into()))
         }
 
-        fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-            let (_, receiver) = broadcast::channel(1);
-            AgentEventStream::new(receiver)
+        async fn respond_approval(
+            &self,
+            _req: ApprovalId,
+            _decision: ApprovalDecision,
+        ) -> Result<(), HarnessError> {
+            Ok(())
+        }
+
+        async fn respond_server_request(
+            &self,
+            _req: ServerRequestId,
+            _response: giskard_core::server_request::ServerRequestResponse,
+        ) -> Result<(), HarnessError> {
+            Ok(())
+        }
+
+        async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
+            Ok(())
+        }
+
+        async fn shutdown(&self) -> Result<(), HarnessError> {
+            self.discovery_tx.lock().unwrap().take();
+            Ok(())
+        }
+    }
+
+    struct DiscoveryOwnerFactory {
+        harness: Arc<DiscoveryOwnerHarness>,
+    }
+
+    fn discovery_ticket(
+        harness: &DiscoveryOwnerHarness,
+        thread_id: ThreadId,
+        native_id: &str,
+    ) -> DiscoveryTicket {
+        harness.route.ticket(ThreadHandle::opened(
+            thread_id,
+            native_id.into(),
+            "/tmp".into(),
+        ))
+    }
+
+    #[async_trait::async_trait]
+    impl super::HarnessFactory for DiscoveryOwnerFactory {
+        async fn create(
+            &self,
+            _config: &ProjectConfig,
+            _bootstrap: giskard_harness::HarnessBootstrap,
+        ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
+            Ok(self.harness.clone())
+        }
+    }
+
+    struct BlockingPrimaryHarness {
+        open_started: Notify,
+        open_release: Notify,
+        turn_started: Notify,
+        turn_release: Notify,
+        turn_completed: Notify,
+        start_success: AtomicBool,
+        shutdown_started: AtomicBool,
+        delete_mode: AtomicU8,
+        sabotage_worktree_removal: AtomicBool,
+        cleanup_started: Notify,
+        cleanup_release: Notify,
+        block_cleanup: AtomicBool,
+        sender: StdMutex<Option<broadcast::Sender<AgentEvent>>>,
+        route: TestRoute,
+        claims: AtomicUsize,
+        subscriptions: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentHarness for BlockingPrimaryHarness {
+        fn capabilities(&self) -> HarnessCapabilities {
+            HarnessCapabilities::default()
+        }
+
+        async fn list_models(&self) -> Result<Vec<ModelDescriptor>, HarnessError> {
+            Ok(Vec::new())
+        }
+
+        async fn open_thread(
+            &self,
+            opts: OpenThreadOptions,
+        ) -> Result<ThreadAttachment, HarnessError> {
+            self.open_started.notify_one();
+            self.open_release.notified().await;
+            self.subscriptions.fetch_add(1, Ordering::SeqCst);
+            self.route.attachment(ThreadHandle::opened(
+                opts.thread,
+                "native-primary".into(),
+                opts.workspace_root,
+            ))
+        }
+
+        async fn claim_native_thread(
+            &self,
+            _thread: ThreadId,
+            _harness_thread_id: String,
+            _workspace_root: std::path::PathBuf,
+        ) -> Result<ThreadAttachment, HarnessError> {
+            self.claims.fetch_add(1, Ordering::SeqCst);
+            Err(HarnessError::Protocol(
+                "discovery must reuse the Primary coordinator".into(),
+            ))
+        }
+
+        async fn start_turn(
+            &self,
+            thread: &ThreadHandle,
+            _input: UserInput,
+            _overrides: giskard_core::turn::TurnOverrides,
+        ) -> Result<TurnId, HarnessError> {
+            self.turn_started.notify_one();
+            self.turn_release.notified().await;
+            self.turn_completed.notify_one();
+            #[cfg(unix)]
+            if self.sabotage_worktree_removal.load(Ordering::SeqCst)
+                && let Some(parent) = std::path::Path::new(&thread.workspace_root).parent()
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o555))
+                    .map_err(|error| HarnessError::Transport(error.to_string()))?;
+            }
+            if self.start_success.load(Ordering::SeqCst) {
+                Ok(TurnId::new())
+            } else {
+                Err(HarnessError::Unsupported("unused".into()))
+            }
+        }
+
+        async fn respond_approval(
+            &self,
+            _req: ApprovalId,
+            _decision: ApprovalDecision,
+        ) -> Result<(), HarnessError> {
+            Ok(())
+        }
+
+        async fn respond_server_request(
+            &self,
+            _req: ServerRequestId,
+            _response: giskard_core::server_request::ServerRequestResponse,
+        ) -> Result<(), HarnessError> {
+            Ok(())
+        }
+
+        async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
+            Ok(())
+        }
+
+        async fn begin_delete_thread<'a>(
+            &'a self,
+            _thread: &'a ThreadHandle,
+        ) -> Result<giskard_harness::ThreadRetirement<'a>, HarnessError> {
+            let mode = self.delete_mode.load(Ordering::SeqCst);
+            if mode == 2 {
+                return Err(HarnessError::Protocol(
+                    "injected pre-invalidation rejection".into(),
+                ));
+            }
+            Ok(giskard_harness::ThreadRetirement::new(Box::pin(
+                async move {
+                    self.cleanup_started.notify_one();
+                    if self.block_cleanup.load(Ordering::SeqCst) {
+                        self.cleanup_release.notified().await;
+                    }
+                    if mode == 3 {
+                        Err(HarnessError::Transport(
+                            "injected provider cleanup future failure".into(),
+                        ))
+                    } else if mode == 1 {
+                        Ok(giskard_harness::ThreadDeletion::RetiredWithProviderError(
+                            HarnessError::Transport("injected provider cleanup failure".into()),
+                        ))
+                    } else {
+                        Ok(giskard_harness::ThreadDeletion::Retired)
+                    }
+                },
+            )))
+        }
+
+        async fn shutdown(&self) -> Result<(), HarnessError> {
+            self.shutdown_started.store(true, Ordering::SeqCst);
+            self.sender.lock().unwrap().take();
+            Ok(())
+        }
+    }
+
+    struct BlockingPrimaryFactory {
+        harness: Arc<BlockingPrimaryHarness>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::HarnessFactory for BlockingPrimaryFactory {
+        async fn create(
+            &self,
+            _config: &ProjectConfig,
+            _bootstrap: giskard_harness::HarnessBootstrap,
+        ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
+            Ok(self.harness.clone())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentHarness for ShutdownHarness {
+        async fn begin_delete_thread<'a>(
+            &'a self,
+            thread: &'a ThreadHandle,
+        ) -> Result<giskard_harness::ThreadRetirement<'a>, HarnessError> {
+            giskard_harness::unsupported_thread_retirement(thread)
+        }
+        fn capabilities(&self) -> HarnessCapabilities {
+            HarnessCapabilities::default()
+        }
+
+        async fn list_models(&self) -> Result<Vec<giskard_core::ModelDescriptor>, HarnessError> {
+            Ok(Vec::new())
+        }
+
+        async fn open_thread(
+            &self,
+            _opts: OpenThreadOptions,
+        ) -> Result<ThreadAttachment, HarnessError> {
+            Err(HarnessError::Unsupported("unused".into()))
+        }
+
+        async fn start_turn(
+            &self,
+            _thread: &ThreadHandle,
+            _input: UserInput,
+            _overrides: giskard_core::turn::TurnOverrides,
+        ) -> Result<TurnId, HarnessError> {
+            Err(HarnessError::Unsupported("unused".into()))
         }
 
         async fn respond_approval(
@@ -2723,6 +3759,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AgentHarness for BindingOrderHarness {
+        async fn begin_delete_thread<'a>(
+            &'a self,
+            thread: &'a ThreadHandle,
+        ) -> Result<giskard_harness::ThreadRetirement<'a>, HarnessError> {
+            giskard_harness::unsupported_thread_retirement(thread)
+        }
         fn capabilities(&self) -> HarnessCapabilities {
             HarnessCapabilities::default()
         }
@@ -2734,7 +3776,7 @@ mod tests {
         async fn open_thread(
             &self,
             opts: giskard_harness::OpenThreadOptions,
-        ) -> Result<ThreadHandle, HarnessError> {
+        ) -> Result<ThreadAttachment, HarnessError> {
             if self.bound.load(Ordering::SeqCst) == 0 {
                 self.opened_before_bound.fetch_add(1, Ordering::SeqCst);
             }
@@ -2757,11 +3799,6 @@ mod tests {
             _overrides: giskard_core::turn::TurnOverrides,
         ) -> Result<TurnId, HarnessError> {
             Err(HarnessError::Protocol("not needed by this test".into()))
-        }
-
-        fn subscribe(&self, _thread: &ThreadHandle) -> giskard_harness::AgentEventStream {
-            let (_, rx) = tokio::sync::broadcast::channel(1);
-            giskard_harness::AgentEventStream::new(rx)
         }
 
         async fn respond_approval(
@@ -2870,6 +3907,2256 @@ mod tests {
         (project_id, config)
     }
 
+    fn durable_thread(
+        project_id: ProjectId,
+        thread_id: ThreadId,
+        native_id: &str,
+        kind: giskard_core::thread::ThreadKind,
+    ) -> ThreadFile {
+        let now = Utc::now();
+        ThreadFile {
+            revision: 0,
+            version: giskard_persist::store::THREAD_METADATA_VERSION,
+            id: thread_id,
+            project_id,
+            title: "durable".into(),
+            harness_thread_id: native_id.into(),
+            parent_thread_id: None,
+            spawned_by_turn_id: None,
+            kind,
+            mode: TurnMode::Unknown,
+            current_model: TurnModel::Unknown,
+            context_window: 0,
+            model_context_windows: HashMap::new(),
+            permission_preset: PermissionPreset::AskFirst,
+            model_efforts: HashMap::new(),
+            tokens: TokenLedger::default(),
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            git_workspace: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_route_attachment_drop_restores_the_exact_buffered_receiver() {
+        let thread_id = ThreadId::new();
+        let handle = ThreadHandle::opened(thread_id, "native-linear".into(), "/tmp".into());
+        let (sender, receiver) = broadcast::channel(4);
+        let route = TestRoute::new(receiver);
+        let attachment = route.attachment(handle.clone()).unwrap();
+        let turn = TurnId::new();
+        sender
+            .send(AgentEvent::TurnStarted {
+                thread: thread_id,
+                turn,
+            })
+            .unwrap();
+
+        drop(attachment);
+        let mut owner = route.attachment(handle).unwrap().commit().unwrap();
+        assert!(matches!(
+            owner.recv().await.unwrap(),
+            AgentEvent::TurnStarted { thread, turn: got }
+                if thread == thread_id && got == turn
+        ));
+    }
+
+    #[test]
+    fn dropped_test_discovery_ticket_leaves_route_claimable() {
+        let thread_id = ThreadId::new();
+        let handle = ThreadHandle::opened(thread_id, "native-linear".into(), "/tmp".into());
+        let (_sender, receiver) = broadcast::channel(1);
+        let route = TestRoute::new(receiver);
+
+        drop(route.ticket(handle.clone()));
+        let attachment = route
+            .ticket(handle)
+            .claim(std::path::PathBuf::from("/tmp"))
+            .unwrap();
+        assert_eq!(attachment.handle().thread, thread_id);
+    }
+
+    #[tokio::test]
+    async fn discovery_creates_one_orphan_publishes_catalog_and_installs_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project_id, _) = create_test_project(&store, "discovery").await;
+        let hub = Arc::new(Hub::new());
+        let (client_tx, mut client_rx) = tokio::sync::mpsc::channel(8);
+        let replacements = hub.register_client(hub.next_client_id(), client_tx).await;
+        let shared = Arc::new(super::RegistryShared::new(
+            hub,
+            store.clone(),
+            ledger::spawn(store.clone()),
+        ));
+        let (sender, receiver) = broadcast::channel(4);
+        let harness = Arc::new(DiscoveryOwnerHarness {
+            route: TestRoute::new(receiver),
+            subscriptions: AtomicUsize::new(0),
+            routes: StdMutex::new(HashMap::new()),
+            discovery_tx: StdMutex::new(None),
+            discovery_rx: StdMutex::new(None),
+        });
+        let thread_id = ThreadId::new();
+        let turn_id = TurnId::new();
+        sender
+            .send(AgentEvent::TurnStarted {
+                thread: thread_id,
+                turn: turn_id,
+            })
+            .unwrap();
+        sender
+            .send(AgentEvent::TurnCompleted {
+                thread: thread_id,
+                turn: turn_id,
+                usage: giskard_core::token::TokenUsage::default(),
+                status: giskard_core::turn::TurnStatus {
+                    kind: giskard_core::turn::TurnStatusKind::Completed,
+                    message: None,
+                },
+            })
+            .unwrap();
+
+        super::ensure_discovered_thread_owner(
+            project_id,
+            discovery_ticket(&harness, thread_id, "native-discovered"),
+            harness.clone(),
+            shared.clone(),
+        )
+        .await
+        .unwrap();
+
+        let thread = store
+            .load_thread(project_id, thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(thread.kind, giskard_core::thread::ThreadKind::Orphan);
+        assert_eq!(thread.title, "Unclassified native thread");
+        assert_eq!(thread.mode, TurnMode::Unknown);
+        assert_eq!(thread.current_model, TurnModel::Unknown);
+        assert_eq!(thread.permission_preset, PermissionPreset::AskFirst);
+        assert!(thread.parent_thread_id.is_none());
+        assert!(thread.git_workspace.is_none());
+        assert_eq!(harness.subscriptions.load(Ordering::SeqCst), 1);
+        assert!(shared.coordinator(thread_id).await.is_some());
+        while store
+            .load_turn_records(project_id, thread_id)
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            tokio::task::yield_now().await;
+        }
+        assert!(matches!(
+            replacements.recv().await,
+            giskard_proto::ServerMessage::ThreadCatalogChanged
+        ));
+        assert!(
+            client_rx.try_recv().is_err(),
+            "catalog invalidation must use the replacement lane"
+        );
+
+        drop(sender);
+        while shared.coordinator(thread_id).await.is_some() {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn uncertain_discovery_fixture(
+        name: &str,
+    ) -> (
+        tempfile::TempDir,
+        Arc<PersistStore>,
+        ProjectId,
+        Arc<super::RegistryShared>,
+        Arc<DiscoveryOwnerHarness>,
+        broadcast::Sender<AgentEvent>,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project_id, _) = create_test_project(&store, name).await;
+        let (sender, receiver) = broadcast::channel(4);
+        let harness = Arc::new(DiscoveryOwnerHarness {
+            route: TestRoute::new(receiver),
+            subscriptions: AtomicUsize::new(0),
+            routes: StdMutex::new(HashMap::new()),
+            discovery_tx: StdMutex::new(None),
+            discovery_rx: StdMutex::new(None),
+        });
+        let shared = Arc::new(super::RegistryShared::new(
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store.clone()),
+        ));
+        (tmp, store, project_id, shared, harness, sender)
+    }
+
+    #[tokio::test]
+    async fn uncertain_discovery_create_with_matching_reload_continues_installation() {
+        let (_tmp, store, project_id, shared, harness, _sender) =
+            uncertain_discovery_fixture("uncertain-matching").await;
+        let thread_id = ThreadId::new();
+        *shared.discovery_create_fault.lock().unwrap() =
+            Some(super::DiscoveryCreateFault::CommittedMatching);
+
+        super::ensure_discovered_thread_owner(
+            project_id,
+            discovery_ticket(&harness, thread_id, "native-matching"),
+            harness,
+            shared.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .harness_thread_id,
+            "native-matching"
+        );
+        assert!(shared.coordinator(thread_id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn uncertain_discovery_create_with_absent_reload_restores_and_retries() {
+        let (_tmp, store, project_id, shared, harness, _sender) =
+            uncertain_discovery_fixture("uncertain-absent").await;
+        let thread_id = ThreadId::new();
+        *shared.discovery_create_fault.lock().unwrap() = Some(super::DiscoveryCreateFault::Absent);
+
+        assert!(
+            super::ensure_discovered_thread_owner(
+                project_id,
+                discovery_ticket(&harness, thread_id, "native-absent"),
+                harness.clone(),
+                shared.clone(),
+            )
+            .await
+            .is_err()
+        );
+        assert!(harness.route.receiver.lock().unwrap().is_some());
+        assert!(
+            store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        super::ensure_discovered_thread_owner(
+            project_id,
+            discovery_ticket(&harness, thread_id, "native-absent"),
+            harness,
+            shared.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(shared.coordinator(thread_id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn uncertain_discovery_create_with_conflicting_reload_reports_corruption() {
+        let (_tmp, _store, project_id, shared, harness, _sender) =
+            uncertain_discovery_fixture("uncertain-conflict").await;
+        let thread_id = ThreadId::new();
+        *shared.discovery_create_fault.lock().unwrap() =
+            Some(super::DiscoveryCreateFault::CommittedConflicting);
+
+        let result = super::ensure_discovered_thread_owner(
+            project_id,
+            discovery_ticket(&harness, thread_id, "native-expected"),
+            harness.clone(),
+            shared,
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("conflicting reload must fail discovery materialization")
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("reload found conflicting native")
+        );
+        assert!(harness.route.receiver.lock().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn owner_install_admission_failure_publishes_durable_orphan_and_allows_retry() {
+        let (_tmp, store, project_id, shared, harness, _sender) =
+            uncertain_discovery_fixture("owner-install-retry").await;
+        let (client_tx, _client_rx) = tokio::sync::mpsc::channel(4);
+        let replacements = shared
+            .hub
+            .register_client(shared.hub.next_client_id(), client_tx)
+            .await;
+        let thread_id = ThreadId::new();
+        shared
+            .background_tasks
+            .closed
+            .store(true, Ordering::Release);
+
+        assert!(
+            super::ensure_discovered_thread_owner(
+                project_id,
+                discovery_ticket(&harness, thread_id, "native-install-retry"),
+                harness.clone(),
+                shared.clone(),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(matches!(
+            replacements.recv().await,
+            giskard_proto::ServerMessage::ThreadCatalogChanged
+        ));
+        assert!(
+            harness.route.receiver.lock().unwrap().is_some(),
+            "failed installation must restore the exact attachment receiver"
+        );
+        assert!(shared.coordinator(thread_id).await.is_none());
+
+        // This test-only reopening models a later ordinary discovery attempt after the injected
+        // admission failure; production shutdown never reopens a closed tracker.
+        shared
+            .background_tasks
+            .closed
+            .store(false, Ordering::Release);
+        super::ensure_discovered_thread_owner(
+            project_id,
+            discovery_ticket(&harness, thread_id, "native-install-retry"),
+            harness,
+            shared.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(shared.coordinator(thread_id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn discovery_reattaches_dormant_primary_and_subagent_without_new_records() {
+        for kind in [
+            giskard_core::thread::ThreadKind::Primary,
+            giskard_core::thread::ThreadKind::Subagent,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+            let (project_id, _) = create_test_project(&store, "reattach").await;
+            let thread_id = ThreadId::new();
+            store
+                .save_thread(
+                    project_id,
+                    &durable_thread(project_id, thread_id, "native-dormant", kind),
+                )
+                .await
+                .unwrap();
+            let shared = Arc::new(super::RegistryShared::new(
+                Arc::new(Hub::new()),
+                store.clone(),
+                ledger::spawn(store.clone()),
+            ));
+            let (sender, receiver) = broadcast::channel(4);
+            let harness = Arc::new(DiscoveryOwnerHarness {
+                route: TestRoute::new(receiver),
+                subscriptions: AtomicUsize::new(0),
+                routes: StdMutex::new(HashMap::new()),
+                discovery_tx: StdMutex::new(None),
+                discovery_rx: StdMutex::new(None),
+            });
+
+            super::ensure_discovered_thread_owner(
+                project_id,
+                discovery_ticket(&harness, thread_id, "native-dormant"),
+                harness.clone(),
+                shared.clone(),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                store
+                    .load_thread(project_id, thread_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .kind,
+                kind
+            );
+            assert_eq!(harness.subscriptions.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                super::load_thread_graph(&store, project_id)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            drop(sender);
+            while shared.coordinator(thread_id).await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_rejects_installing_coordinator_without_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project_id, _) = create_test_project(&store, "explicit-race").await;
+        let shared = Arc::new(super::RegistryShared::new(
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store.clone()),
+        ));
+        let thread_id = ThreadId::new();
+        let authority = shared
+            .intern_thread_authority(thread_id, project_id)
+            .await
+            .unwrap();
+        let installing = Arc::new(super::ThreadCoordinator::new(
+            super::LoadedThreadBinding {
+                project_id,
+                handle: ThreadHandle::opened(thread_id, "native-explicit".into(), "/tmp".into()),
+                native_model: None,
+            },
+            super::ClassificationPhase::Primary,
+        ));
+        assert!(
+            authority
+                .install_coordinator_if_empty(installing.clone())
+                .await
+                .is_ok()
+        );
+        let (_, receiver) = broadcast::channel(1);
+        let harness = Arc::new(DiscoveryOwnerHarness {
+            route: TestRoute::new(receiver),
+            subscriptions: AtomicUsize::new(0),
+            routes: StdMutex::new(HashMap::new()),
+            discovery_tx: StdMutex::new(None),
+            discovery_rx: StdMutex::new(None),
+        });
+
+        let error = super::ensure_discovered_thread_owner(
+            project_id,
+            discovery_ticket(&harness, thread_id, "native-explicit"),
+            harness.clone(),
+            shared.clone(),
+        )
+        .await
+        .err()
+        .unwrap();
+
+        assert!(error.to_string().contains("before durable metadata"));
+        assert!(
+            store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(harness.subscriptions.load(Ordering::SeqCst), 0);
+
+        assert!(authority.clear_coordinator_if(&installing).await);
+        super::ensure_discovered_thread_owner(
+            project_id,
+            discovery_ticket(&harness, thread_id, "native-explicit"),
+            harness.clone(),
+            shared.clone(),
+        )
+        .await
+        .expect("a later discovery must retry after the pre-claim failure");
+        assert_eq!(harness.subscriptions.load(Ordering::SeqCst), 1);
+        assert!(shared.coordinator(thread_id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn dormant_subagent_rejects_a_claim_for_another_thread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project_id, config) = create_test_project(&store, "subagent-claim-mismatch").await;
+        let thread_id = ThreadId::new();
+        let returned_thread_id = ThreadId::new();
+        let thread = durable_thread(
+            project_id,
+            thread_id,
+            "native-subagent",
+            giskard_core::thread::ThreadKind::Subagent,
+        );
+        let shared = Arc::new(super::RegistryShared::new(
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store),
+        ));
+        let (_, receiver) = broadcast::channel(1);
+        let harness = Arc::new(DiscoveryOwnerHarness {
+            route: TestRoute::new(receiver),
+            subscriptions: AtomicUsize::new(0),
+            routes: StdMutex::new(HashMap::from([(
+                "native-subagent".into(),
+                returned_thread_id,
+            )])),
+            discovery_tx: StdMutex::new(None),
+            discovery_rx: StdMutex::new(None),
+        });
+        let authority = shared.intern_project_authority(project_id).await;
+        {
+            let mut transitions = shared.harness_transitions.lock().await;
+            transitions
+                .project(&authority)
+                .await
+                .publish_active(harness.clone());
+        }
+
+        let permit = super::lock_project_lifecycle(&shared.projects, project_id).await;
+        let error = super::ensure_subagent_thread_open_locked(
+            &permit,
+            &config,
+            &thread,
+            &shared,
+            super::SubagentRouteClaim::ExplicitReattach,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains(&returned_thread_id.to_string()));
+        assert!(error.to_string().contains(&thread_id.to_string()));
+        assert_eq!(harness.subscriptions.load(Ordering::SeqCst), 1);
+        assert!(harness.route.receiver.lock().unwrap().is_some());
+        assert!(shared.coordinator(thread_id).await.is_none());
+        assert!(shared.coordinator(returned_thread_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn parent_materialization_cannot_reactivate_a_tombstoned_subagent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project_id, _) = create_test_project(&store, "parent-tombstone").await;
+        let parent_id = ThreadId::new();
+        let child_id = ThreadId::new();
+        let spawning_turn = TurnId::new();
+        store
+            .save_thread(
+                project_id,
+                &durable_thread(
+                    project_id,
+                    parent_id,
+                    "native-parent",
+                    giskard_core::thread::ThreadKind::Primary,
+                ),
+            )
+            .await
+            .unwrap();
+        let mut child = durable_thread(
+            project_id,
+            child_id,
+            "native-child",
+            giskard_core::thread::ThreadKind::Subagent,
+        );
+        child.parent_thread_id = Some(parent_id);
+        child.spawned_by_turn_id = Some(spawning_turn);
+        store.save_thread(project_id, &child).await.unwrap();
+
+        let shared = Arc::new(super::RegistryShared::new(
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store.clone()),
+        ));
+        let (_, receiver) = broadcast::channel(1);
+        let harness = Arc::new(DiscoveryOwnerHarness {
+            route: TestRoute::new(receiver),
+            subscriptions: AtomicUsize::new(0),
+            routes: StdMutex::new(HashMap::from([
+                ("native-child".into(), child_id),
+                ("__tombstoned__".into(), child_id),
+            ])),
+            discovery_tx: StdMutex::new(None),
+            discovery_rx: StdMutex::new(None),
+        });
+        let authority = shared.intern_project_authority(project_id).await;
+        {
+            let mut transitions = shared.harness_transitions.lock().await;
+            transitions
+                .project(&authority)
+                .await
+                .publish_active(harness.clone());
+        }
+
+        let error = super::materialize_subagent_thread(
+            parent_id,
+            project_id,
+            spawning_turn,
+            super::SubagentActivityInfo {
+                native_thread_id: "native-child".into(),
+                agent_name: None,
+                agent_path: None,
+                title: None,
+            },
+            shared.clone(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("cannot reactivate"));
+        assert!(
+            !harness
+                .routes
+                .lock()
+                .unwrap()
+                .contains_key("__reattached__")
+        );
+        assert_eq!(harness.subscriptions.load(Ordering::SeqCst), 0);
+        assert!(shared.coordinator(child_id).await.is_none());
+        assert_eq!(
+            store
+                .load_thread(project_id, child_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .kind,
+            giskard_core::thread::ThreadKind::Subagent
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_materialization_rejects_active_route_without_compatible_coordinator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project_id, _) = create_test_project(&store, "parent-active-without-owner").await;
+        let parent_id = ThreadId::new();
+        let child_id = ThreadId::new();
+        store
+            .save_thread(
+                project_id,
+                &durable_thread(
+                    project_id,
+                    parent_id,
+                    "native-parent",
+                    giskard_core::thread::ThreadKind::Primary,
+                ),
+            )
+            .await
+            .unwrap();
+        let mut child = durable_thread(
+            project_id,
+            child_id,
+            "native-child",
+            giskard_core::thread::ThreadKind::Subagent,
+        );
+        child.parent_thread_id = Some(parent_id);
+        child.spawned_by_turn_id = Some(TurnId::new());
+        store.save_thread(project_id, &child).await.unwrap();
+        let shared = Arc::new(super::RegistryShared::new(
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store.clone()),
+        ));
+        let (_, receiver) = broadcast::channel(1);
+        let harness = Arc::new(DiscoveryOwnerHarness {
+            route: TestRoute::new(receiver),
+            subscriptions: AtomicUsize::new(0),
+            routes: StdMutex::new(HashMap::from([
+                ("native-child".into(), child_id),
+                ("__busy__".into(), child_id),
+            ])),
+            discovery_tx: StdMutex::new(None),
+            discovery_rx: StdMutex::new(None),
+        });
+        let authority = shared.intern_project_authority(project_id).await;
+        {
+            let mut transitions = shared.harness_transitions.lock().await;
+            transitions
+                .project(&authority)
+                .await
+                .publish_active(harness.clone());
+        }
+
+        let error = super::materialize_subagent_thread(
+            parent_id,
+            project_id,
+            child.spawned_by_turn_id.unwrap(),
+            super::SubagentActivityInfo {
+                native_thread_id: "native-child".into(),
+                agent_name: None,
+                agent_path: None,
+                title: Some("child".into()),
+            },
+            shared.clone(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("no compatible coordinator"));
+        assert!(shared.coordinator(child_id).await.is_none());
+        assert_eq!(harness.subscriptions.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            store.load_thread(project_id, child_id).await.unwrap(),
+            Some(child)
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_owner_install_failure_publishes_durable_child_once_and_retries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project_id, _) = create_test_project(&store, "parent-install-retry").await;
+        let parent_id = ThreadId::new();
+        store
+            .save_thread(
+                project_id,
+                &durable_thread(
+                    project_id,
+                    parent_id,
+                    "native-parent",
+                    giskard_core::thread::ThreadKind::Primary,
+                ),
+            )
+            .await
+            .unwrap();
+        let shared = Arc::new(super::RegistryShared::new(
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store.clone()),
+        ));
+        let (client_tx, _client_rx) = tokio::sync::mpsc::channel(4);
+        let replacements = shared
+            .hub
+            .register_client(shared.hub.next_client_id(), client_tx)
+            .await;
+        let (_sender, receiver) = broadcast::channel(4);
+        let harness = Arc::new(DiscoveryOwnerHarness {
+            route: TestRoute::new(receiver),
+            subscriptions: AtomicUsize::new(0),
+            routes: StdMutex::new(HashMap::new()),
+            discovery_tx: StdMutex::new(None),
+            discovery_rx: StdMutex::new(None),
+        });
+        let authority = shared.intern_project_authority(project_id).await;
+        {
+            let mut transitions = shared.harness_transitions.lock().await;
+            transitions
+                .project(&authority)
+                .await
+                .publish_active(harness.clone());
+        }
+        let spawning_turn = TurnId::new();
+        let info = super::SubagentActivityInfo {
+            native_thread_id: "native-child".into(),
+            agent_name: None,
+            agent_path: None,
+            title: Some("child".into()),
+        };
+        shared
+            .background_tasks
+            .closed
+            .store(true, Ordering::Release);
+
+        assert!(
+            super::materialize_subagent_thread(
+                parent_id,
+                project_id,
+                spawning_turn,
+                info.clone(),
+                shared.clone(),
+            )
+            .await
+            .is_err()
+        );
+        let child = super::load_thread_graph(&store, project_id)
+            .await
+            .unwrap()
+            .into_values()
+            .find(|thread| thread.harness_thread_id == "native-child")
+            .expect("failed installation must retain durable Subagent metadata");
+        assert_eq!(child.kind, giskard_core::thread::ThreadKind::Subagent);
+        assert!(matches!(
+            replacements.recv().await,
+            giskard_proto::ServerMessage::ThreadCatalogChanged
+        ));
+        assert!(harness.route.receiver.lock().unwrap().is_some());
+        assert!(shared.coordinator(child.id).await.is_none());
+
+        // Test-only reopening models a later parent activity after the injected admission failure.
+        shared
+            .background_tasks
+            .closed
+            .store(false, Ordering::Release);
+        assert_eq!(
+            super::materialize_subagent_thread(
+                parent_id,
+                project_id,
+                spawning_turn,
+                info,
+                shared.clone(),
+            )
+            .await
+            .unwrap(),
+            Some(child.id)
+        );
+        assert!(shared.coordinator(child.id).await.is_some());
+        assert_eq!(harness.subscriptions.load(Ordering::SeqCst), 2);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), replacements.recv())
+                .await
+                .is_err(),
+            "retrying an already-published child must not publish creation twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_open_excludes_discovery_through_owner_installation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project_id, config) = create_test_project(&store, "primary-discovery-race").await;
+        let (sender, receiver) = broadcast::channel(4);
+        let harness = Arc::new(BlockingPrimaryHarness {
+            open_started: Notify::new(),
+            open_release: Notify::new(),
+            turn_started: Notify::new(),
+            turn_release: Notify::new(),
+            turn_completed: Notify::new(),
+            start_success: AtomicBool::new(true),
+            shutdown_started: AtomicBool::new(false),
+            delete_mode: AtomicU8::new(0),
+            sabotage_worktree_removal: AtomicBool::new(false),
+            cleanup_started: Notify::new(),
+            cleanup_release: Notify::new(),
+            block_cleanup: AtomicBool::new(false),
+            sender: StdMutex::new(Some(sender)),
+            route: TestRoute::new(receiver),
+            claims: AtomicUsize::new(0),
+            subscriptions: AtomicUsize::new(0),
+        });
+        let registry = Arc::new(super::HarnessRegistry::new(
+            Arc::new(BlockingPrimaryFactory {
+                harness: harness.clone(),
+            }),
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store.clone()),
+        ));
+        let thread_id = ThreadId::new();
+        let opening = {
+            let registry = registry.clone();
+            let config = config.clone();
+            tokio::spawn(async move {
+                registry
+                    .materialize_primary_thread(
+                        &config,
+                        "/tmp/test",
+                        thread_id,
+                        ModelRef {
+                            provider: "test".into(),
+                            model: "test-model".into(),
+                            reasoning_effort: None,
+                        },
+                        super::NewPrimaryThread {
+                            title: "Primary".into(),
+                            mode: TurnMode::Known(Mode::Build),
+                            permission_preset: PermissionPreset::AskFirst,
+                            context_window: 0,
+                            git_workspace: None,
+                        },
+                    )
+                    .await
+            })
+        };
+        harness.open_started.notified().await;
+
+        let lifecycle_error = registry
+            .lock_project_lifecycle_with_timeout(project_id, std::time::Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(lifecycle_error, HarnessError::Timeout(_)));
+        let discovery_started = Arc::new(Notify::new());
+        let discovery = harness.route.ticket(ThreadHandle::opened(
+            thread_id,
+            "native-primary".into(),
+            "/tmp".into(),
+        ));
+        let discovering = {
+            let harness: Arc<dyn AgentHarness> = harness.clone();
+            let shared = registry.shared.clone();
+            let discovery_started = discovery_started.clone();
+            tokio::spawn(async move {
+                discovery_started.notify_one();
+                super::ensure_discovered_thread_owner(project_id, discovery, harness, shared).await
+            })
+        };
+        discovery_started.notified().await;
+        tokio::task::yield_now().await;
+        assert!(
+            !discovering.is_finished(),
+            "traffic discovery passed Primary materialization"
+        );
+
+        harness.open_release.notify_one();
+        harness.turn_started.notified().await;
+        harness.turn_release.notify_one();
+        let materialized = opening.await.unwrap().unwrap();
+        discovering.await.unwrap().unwrap();
+
+        let handle = materialized.handle;
+        assert_eq!(handle.thread, thread_id);
+        let coordinator = registry.shared.coordinator(thread_id).await.unwrap();
+        coordinator
+            .reusable_handle(
+                project_id,
+                thread_id,
+                Some("native-primary"),
+                super::ClassificationPhase::Primary,
+            )
+            .await
+            .unwrap();
+        assert_eq!(harness.claims.load(Ordering::SeqCst), 0);
+        assert_eq!(harness.subscriptions.load(Ordering::SeqCst), 1);
+        let persisted = store
+            .load_thread(project_id, thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.kind, super::ThreadKind::Primary);
+
+        registry.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_delete_failure_reopen_installs_a_new_coordinator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project_id, config) = create_test_project(&store, "delete-failure-reopen").await;
+        let (sender, receiver) = broadcast::channel(4);
+        let harness = Arc::new(BlockingPrimaryHarness {
+            open_started: Notify::new(),
+            open_release: Notify::new(),
+            turn_started: Notify::new(),
+            turn_release: Notify::new(),
+            turn_completed: Notify::new(),
+            start_success: AtomicBool::new(true),
+            shutdown_started: AtomicBool::new(false),
+            delete_mode: AtomicU8::new(0),
+            sabotage_worktree_removal: AtomicBool::new(false),
+            cleanup_started: Notify::new(),
+            cleanup_release: Notify::new(),
+            block_cleanup: AtomicBool::new(false),
+            sender: StdMutex::new(Some(sender)),
+            route: TestRoute::new(receiver),
+            claims: AtomicUsize::new(0),
+            subscriptions: AtomicUsize::new(0),
+        });
+        let registry = Arc::new(super::HarnessRegistry::new(
+            Arc::new(BlockingPrimaryFactory {
+                harness: harness.clone(),
+            }),
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store),
+        ));
+        let thread_id = ThreadId::new();
+        let model = ModelRef {
+            provider: "test".into(),
+            model: "test-model".into(),
+            reasoning_effort: None,
+        };
+        let initial_open = {
+            let harness = harness.clone();
+            tokio::spawn(async move {
+                harness.open_started.notified().await;
+                harness.open_release.notify_one();
+                harness.turn_release.notify_one();
+            })
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            registry.materialize_primary_thread(
+                &config,
+                "/tmp/test",
+                thread_id,
+                model.clone(),
+                super::NewPrimaryThread {
+                    title: "Primary".into(),
+                    mode: TurnMode::Known(Mode::Build),
+                    permission_preset: PermissionPreset::AskFirst,
+                    context_window: 0,
+                    git_workspace: None,
+                },
+            ),
+        )
+        .await
+        .expect("initial Primary materialization timed out")
+        .unwrap();
+        initial_open.await.unwrap();
+        let original = registry.shared.coordinator(thread_id).await.unwrap();
+
+        harness.delete_mode.store(1, Ordering::SeqCst);
+        let permit = registry.lock_project_lifecycle(project_id).await;
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            registry.delete_thread(&permit, &config, thread_id, "native-primary".into()),
+        )
+        .await
+        .expect("provider-failed deletion timed out")
+        .unwrap_err();
+        drop(permit);
+        assert!(error.to_string().contains("provider cleanup failure"));
+        assert!(registry.shared.coordinator(thread_id).await.is_none());
+
+        harness.delete_mode.store(0, Ordering::SeqCst);
+        let reopened_open = {
+            let harness = harness.clone();
+            tokio::spawn(async move {
+                harness.open_started.notified().await;
+                harness.open_release.notify_one();
+            })
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            registry.open_thread(
+                &config,
+                "/tmp/test",
+                thread_id,
+                Some("native-primary".into()),
+                model,
+            ),
+        )
+        .await
+        .expect("exact reopen timed out")
+        .unwrap();
+        reopened_open.await.unwrap();
+        let reopened = registry.shared.coordinator(thread_id).await.unwrap();
+        assert!(!Arc::ptr_eq(&original, &reopened));
+        assert_eq!(harness.subscriptions.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_primary_caller_does_not_cancel_creation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project_id, config) = create_test_project(&store, "cancelled-primary").await;
+        let (sender, receiver) = broadcast::channel(4);
+        let harness = Arc::new(BlockingPrimaryHarness {
+            open_started: Notify::new(),
+            open_release: Notify::new(),
+            turn_started: Notify::new(),
+            turn_release: Notify::new(),
+            turn_completed: Notify::new(),
+            start_success: AtomicBool::new(true),
+            shutdown_started: AtomicBool::new(false),
+            delete_mode: AtomicU8::new(0),
+            sabotage_worktree_removal: AtomicBool::new(false),
+            cleanup_started: Notify::new(),
+            cleanup_release: Notify::new(),
+            block_cleanup: AtomicBool::new(false),
+            sender: StdMutex::new(Some(sender)),
+            route: TestRoute::new(receiver),
+            claims: AtomicUsize::new(0),
+            subscriptions: AtomicUsize::new(0),
+        });
+        let registry = Arc::new(super::HarnessRegistry::new(
+            Arc::new(BlockingPrimaryFactory {
+                harness: harness.clone(),
+            }),
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store.clone()),
+        ));
+        let thread_id = ThreadId::new();
+        let held_permit = registry.lock_project_lifecycle(project_id).await;
+        let caller = {
+            let registry = registry.clone();
+            let config = config.clone();
+            tokio::spawn(async move {
+                registry
+                    .create_primary_and_start(
+                        config,
+                        "/tmp/test".into(),
+                        thread_id,
+                        ModelRef {
+                            provider: "test".into(),
+                            model: "test-model".into(),
+                            reasoning_effort: None,
+                        },
+                        super::NewPrimaryThread {
+                            title: "Primary".into(),
+                            mode: TurnMode::Known(Mode::Build),
+                            permission_preset: PermissionPreset::AskFirst,
+                            context_window: 0,
+                            git_workspace: None,
+                        },
+                        giskard_proto::GitStrategy::Shared,
+                        UserInput::text("continue after cancellation"),
+                        giskard_core::turn::TurnOverrides {
+                            model: None,
+                            mode: Mode::Build,
+                            permission_preset: PermissionPreset::AskFirst,
+                        },
+                    )
+                    .await
+            })
+        };
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(1),
+                harness.open_started.notified()
+            )
+            .await
+            .is_err(),
+            "Primary provider I/O began while its project permit was unavailable"
+        );
+        drop(held_permit);
+        harness.open_started.notified().await;
+        harness.open_release.notify_one();
+        harness.turn_started.notified().await;
+        assert!(
+            registry.shared.coordinator(thread_id).await.is_some(),
+            "native response did not install the exact Primary owner before turn admission"
+        );
+
+        caller.abort();
+        match caller.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("aborted Primary caller unexpectedly completed"),
+        }
+        let mut shutdown = {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.shutdown().await })
+        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown completed while an admitted Primary was awaiting turn acceptance"
+        );
+        assert!(
+            !harness.shutdown_started.load(Ordering::SeqCst),
+            "harness shutdown overtook an admitted Primary operation"
+        );
+        harness.turn_release.notify_one();
+        harness.turn_completed.notified().await;
+        shutdown.await.unwrap().unwrap();
+        assert!(harness.shutdown_started.load(Ordering::SeqCst));
+        let durable = store
+            .load_thread(project_id, thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.kind, super::ThreadKind::Primary);
+        assert_eq!(durable.harness_thread_id, "native-primary");
+    }
+
+    #[tokio::test]
+    async fn dropped_final_result_receiver_at_every_primary_phase_still_publishes() {
+        use super::primary::{Phase, PhaseGate};
+
+        for phase in [
+            Phase::WaitingForPermit,
+            Phase::WorkspaceCreation,
+            Phase::NativeCommandAdmission,
+            Phase::NativeResponse,
+            Phase::MetadataRename,
+            Phase::OwnerInstallation,
+            Phase::TurnPreparation,
+            Phase::StartTurn,
+            Phase::TurnAccepted,
+            Phase::Publication,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+            let (project_id, config) = if phase == Phase::WorkspaceCreation {
+                let repo = tmp.path().join("repo");
+                std::fs::create_dir_all(&repo).unwrap();
+                for args in [
+                    &["init", "-q", "-b", "main"][..],
+                    &["config", "user.email", "t@example.invalid"][..],
+                    &["config", "user.name", "T"][..],
+                    &["commit", "-q", "--allow-empty", "-m", "initial"][..],
+                ] {
+                    assert!(
+                        std::process::Command::new("git")
+                            .current_dir(&repo)
+                            .args(args)
+                            .status()
+                            .unwrap()
+                            .success()
+                    );
+                }
+                let project_id = ProjectId::new();
+                store
+                    .create_project(project_id, "phase-cancellation", &repo.to_string_lossy())
+                    .await
+                    .unwrap();
+                (
+                    project_id,
+                    store.load_project(project_id).await.unwrap().unwrap(),
+                )
+            } else {
+                create_test_project(&store, "phase-cancellation").await
+            };
+            let (sender, receiver) = broadcast::channel(4);
+            let harness = Arc::new(BlockingPrimaryHarness {
+                open_started: Notify::new(),
+                open_release: Notify::new(),
+                turn_started: Notify::new(),
+                turn_release: Notify::new(),
+                turn_completed: Notify::new(),
+                start_success: AtomicBool::new(true),
+                shutdown_started: AtomicBool::new(false),
+                delete_mode: AtomicU8::new(0),
+                sabotage_worktree_removal: AtomicBool::new(false),
+                cleanup_started: Notify::new(),
+                cleanup_release: Notify::new(),
+                block_cleanup: AtomicBool::new(false),
+                sender: StdMutex::new(Some(sender)),
+                route: TestRoute::new(receiver),
+                claims: AtomicUsize::new(0),
+                subscriptions: AtomicUsize::new(0),
+            });
+            let registry = Arc::new(super::HarnessRegistry::new(
+                Arc::new(BlockingPrimaryFactory {
+                    harness: harness.clone(),
+                }),
+                Arc::new(Hub::new()),
+                store.clone(),
+                ledger::spawn(store.clone()),
+            ));
+            if phase != Phase::NativeCommandAdmission {
+                harness.open_release.notify_one();
+            }
+            if phase != Phase::StartTurn {
+                harness.turn_release.notify_one();
+            }
+            if phase == Phase::MetadataRename {
+                registry
+                    .shared
+                    .primary_create_committed_error
+                    .store(true, Ordering::SeqCst);
+            }
+            let thread_id = ThreadId::new();
+            let gate = PhaseGate::new(phase);
+            let worktree_gate = if phase == Phase::WorkspaceCreation {
+                Some(crate::worktree::gate_create(
+                    crate::worktree::worktree_path(
+                        store.data_dir(),
+                        &project_id.to_string(),
+                        thread_id,
+                    ),
+                ))
+            } else {
+                None
+            };
+            let held_permit = if phase == Phase::WaitingForPermit {
+                Some(registry.lock_project_lifecycle(project_id).await)
+            } else {
+                None
+            };
+            let caller = {
+                let registry = registry.clone();
+                let gate = gate.clone();
+                tokio::spawn(async move {
+                    registry
+                        .create_primary_with_phase_gate(
+                            config,
+                            thread_id,
+                            ModelRef {
+                                provider: "test".into(),
+                                model: "test-model".into(),
+                                reasoning_effort: None,
+                            },
+                            if phase == Phase::WorkspaceCreation {
+                                giskard_proto::GitStrategy::Worktree
+                            } else {
+                                giskard_proto::GitStrategy::Shared
+                            },
+                            gate,
+                        )
+                        .await
+                })
+            };
+            if let Some(worktree_gate) = worktree_gate.as_ref() {
+                worktree_gate.wait_arrived().await;
+            } else {
+                gate.wait_arrived().await;
+            }
+            if phase == Phase::NativeCommandAdmission {
+                gate.release();
+                harness.open_started.notified().await;
+            } else if phase == Phase::StartTurn {
+                gate.release();
+                harness.turn_started.notified().await;
+            } else if phase == Phase::WaitingForPermit {
+                gate.release();
+                assert!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(1),
+                        harness.open_started.notified(),
+                    )
+                    .await
+                    .is_err(),
+                    "Primary provider I/O began while the project permit was held"
+                );
+            } else if worktree_gate.is_some() {
+                gate.release();
+            }
+            caller.abort();
+            match caller.await {
+                Err(error) => assert!(error.is_cancelled(), "phase {phase:?}"),
+                Ok(_) => panic!("phase {phase:?} caller unexpectedly completed"),
+            }
+            if phase == Phase::NativeCommandAdmission {
+                harness.open_release.notify_one();
+            } else if phase == Phase::StartTurn {
+                harness.turn_release.notify_one();
+            } else if let Some(worktree_gate) = worktree_gate {
+                worktree_gate.release();
+            } else if phase != Phase::WaitingForPermit {
+                gate.release();
+            }
+            drop(held_permit);
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if let Some(coordinator) = registry.shared.coordinator(thread_id).await
+                        && coordinator
+                            .reusable_handle(
+                                project_id,
+                                thread_id,
+                                None,
+                                super::ClassificationPhase::Primary,
+                            )
+                            .await
+                            .is_ok()
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("phase {phase:?} did not publish a Live Primary owner"));
+            registry.shutdown().await.unwrap();
+            let durable = store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("phase {phase:?} did not publish its Primary"));
+            assert_eq!(durable.kind, ThreadKind::Primary, "phase {phase:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_metadata_create_error_reloads_and_publishes_primary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project_id, config) = create_test_project(&store, "committed-metadata-error").await;
+        let (sender, receiver) = broadcast::channel(4);
+        let harness = Arc::new(BlockingPrimaryHarness {
+            open_started: Notify::new(),
+            open_release: Notify::new(),
+            turn_started: Notify::new(),
+            turn_release: Notify::new(),
+            turn_completed: Notify::new(),
+            start_success: AtomicBool::new(true),
+            shutdown_started: AtomicBool::new(false),
+            delete_mode: AtomicU8::new(0),
+            sabotage_worktree_removal: AtomicBool::new(false),
+            cleanup_started: Notify::new(),
+            cleanup_release: Notify::new(),
+            block_cleanup: AtomicBool::new(false),
+            sender: StdMutex::new(Some(sender)),
+            route: TestRoute::new(receiver),
+            claims: AtomicUsize::new(0),
+            subscriptions: AtomicUsize::new(0),
+        });
+        harness.open_release.notify_one();
+        harness.turn_release.notify_one();
+        let registry = super::HarnessRegistry::new(
+            Arc::new(BlockingPrimaryFactory { harness }),
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store.clone()),
+        );
+        registry
+            .shared
+            .primary_create_committed_error
+            .store(true, Ordering::SeqCst);
+        let thread_id = ThreadId::new();
+
+        registry
+            .create_primary_and_start(
+                config,
+                "/tmp/test".into(),
+                thread_id,
+                ModelRef {
+                    provider: "test".into(),
+                    model: "test-model".into(),
+                    reasoning_effort: None,
+                },
+                super::NewPrimaryThread {
+                    title: "Primary".into(),
+                    mode: TurnMode::Known(Mode::Build),
+                    permission_preset: PermissionPreset::AskFirst,
+                    context_window: 0,
+                    git_workspace: None,
+                },
+                giskard_proto::GitStrategy::Shared,
+                UserInput::text("recover committed metadata"),
+                giskard_core::turn::TurnOverrides {
+                    model: None,
+                    mode: Mode::Build,
+                    permission_preset: PermissionPreset::AskFirst,
+                },
+            )
+            .await
+            .unwrap();
+
+        let durable = store
+            .load_thread(project_id, thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.kind, ThreadKind::Primary);
+        assert_eq!(durable.harness_thread_id, "native-primary");
+    }
+
+    #[tokio::test]
+    async fn dropped_cold_reopen_receiver_cannot_strand_the_attachment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project_id, config) = create_test_project(&store, "cancelled-cold-reopen").await;
+        let thread_id = ThreadId::new();
+        let mut durable =
+            durable_thread(project_id, thread_id, "native-primary", ThreadKind::Primary);
+        let model = ModelRef {
+            provider: "test".into(),
+            model: "test-model".into(),
+            reasoning_effort: None,
+        };
+        durable.current_model = TurnModel::Known(model.clone());
+        store.save_thread(project_id, &durable).await.unwrap();
+        let (sender, receiver) = broadcast::channel(4);
+        let harness = Arc::new(BlockingPrimaryHarness {
+            open_started: Notify::new(),
+            open_release: Notify::new(),
+            turn_started: Notify::new(),
+            turn_release: Notify::new(),
+            turn_completed: Notify::new(),
+            start_success: AtomicBool::new(true),
+            shutdown_started: AtomicBool::new(false),
+            delete_mode: AtomicU8::new(0),
+            sabotage_worktree_removal: AtomicBool::new(false),
+            cleanup_started: Notify::new(),
+            cleanup_release: Notify::new(),
+            block_cleanup: AtomicBool::new(false),
+            sender: StdMutex::new(Some(sender)),
+            route: TestRoute::new(receiver),
+            claims: AtomicUsize::new(0),
+            subscriptions: AtomicUsize::new(0),
+        });
+        let registry = Arc::new(super::HarnessRegistry::new(
+            Arc::new(BlockingPrimaryFactory {
+                harness: harness.clone(),
+            }),
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store),
+        ));
+        let caller = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                registry
+                    .open_thread(
+                        &config,
+                        "/ignored",
+                        thread_id,
+                        Some("native-primary".into()),
+                        model,
+                    )
+                    .await
+            })
+        };
+        harness.open_started.notified().await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        harness.open_release.notify_one();
+        registry.shutdown().await.unwrap();
+        assert_eq!(harness.subscriptions.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(not(unix))]
+    async fn failed_primary_rollback_fixture(
+        delete_mode: u8,
+        metadata_delete_error: bool,
+    ) -> (Arc<PersistStore>, ProjectId, ThreadId, HarnessError) {
+        let tmp = tempfile::tempdir().unwrap().keep();
+        let store = Arc::new(PersistStore::new(tmp));
+        let (project_id, config) = create_test_project(&store, "failed-primary").await;
+        let (sender, receiver) = broadcast::channel(4);
+        let harness = Arc::new(BlockingPrimaryHarness {
+            open_started: Notify::new(),
+            open_release: Notify::new(),
+            turn_started: Notify::new(),
+            turn_release: Notify::new(),
+            turn_completed: Notify::new(),
+            start_success: AtomicBool::new(false),
+            shutdown_started: AtomicBool::new(false),
+            delete_mode: AtomicU8::new(delete_mode),
+            sabotage_worktree_removal: AtomicBool::new(false),
+            cleanup_started: Notify::new(),
+            cleanup_release: Notify::new(),
+            block_cleanup: AtomicBool::new(false),
+            sender: StdMutex::new(Some(sender)),
+            route: TestRoute::new(receiver),
+            claims: AtomicUsize::new(0),
+            subscriptions: AtomicUsize::new(0),
+        });
+        harness.open_release.notify_one();
+        harness.turn_release.notify_one();
+        let registry = super::HarnessRegistry::new(
+            Arc::new(BlockingPrimaryFactory { harness }),
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store.clone()),
+        );
+        registry
+            .shared
+            .primary_delete_error
+            .store(metadata_delete_error, Ordering::SeqCst);
+        let thread_id = ThreadId::new();
+        let error = registry
+            .create_primary_and_start(
+                config,
+                "/tmp/test".into(),
+                thread_id,
+                ModelRef {
+                    provider: "test".into(),
+                    model: "test-model".into(),
+                    reasoning_effort: None,
+                },
+                super::NewPrimaryThread {
+                    title: "failed Primary".into(),
+                    mode: TurnMode::Known(Mode::Build),
+                    permission_preset: PermissionPreset::AskFirst,
+                    context_window: 0,
+                    git_workspace: None,
+                },
+                giskard_proto::GitStrategy::Shared,
+                UserInput::text("fail turn"),
+                giskard_core::turn::TurnOverrides {
+                    model: None,
+                    mode: Mode::Build,
+                    permission_preset: PermissionPreset::AskFirst,
+                },
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("failed Primary unexpectedly succeeded"));
+        (store, project_id, thread_id, error)
+    }
+
+    #[cfg(unix)]
+    async fn failed_primary_worktree_fixture(
+        delete_mode: u8,
+        metadata_delete_error: bool,
+        sabotage_removal: bool,
+        authority_conflict: bool,
+    ) -> (
+        Arc<PersistStore>,
+        ProjectId,
+        ThreadId,
+        std::path::PathBuf,
+        String,
+        std::path::PathBuf,
+        HarnessError,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap().keep();
+        let repo = tmp.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.email", "t@example.invalid"][..],
+            &["config", "user.name", "T"][..],
+            &["commit", "-q", "--allow-empty", "-m", "initial"][..],
+        ] {
+            let output = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+        }
+        let store = Arc::new(PersistStore::new(tmp.join("data")));
+        let project_id = ProjectId::new();
+        store
+            .create_project(
+                project_id,
+                "failed-worktree-primary",
+                &repo.to_string_lossy(),
+            )
+            .await
+            .unwrap();
+        let config = store.load_project(project_id).await.unwrap().unwrap();
+        let (sender, receiver) = broadcast::channel(4);
+        let harness = Arc::new(BlockingPrimaryHarness {
+            open_started: Notify::new(),
+            open_release: Notify::new(),
+            turn_started: Notify::new(),
+            turn_release: Notify::new(),
+            turn_completed: Notify::new(),
+            start_success: AtomicBool::new(false),
+            shutdown_started: AtomicBool::new(false),
+            delete_mode: AtomicU8::new(delete_mode),
+            sabotage_worktree_removal: AtomicBool::new(sabotage_removal),
+            cleanup_started: Notify::new(),
+            cleanup_release: Notify::new(),
+            block_cleanup: AtomicBool::new(false),
+            sender: StdMutex::new(Some(sender)),
+            route: TestRoute::new(receiver),
+            claims: AtomicUsize::new(0),
+            subscriptions: AtomicUsize::new(0),
+        });
+        harness.open_release.notify_one();
+        harness.turn_release.notify_one();
+        let registry = super::HarnessRegistry::new(
+            Arc::new(BlockingPrimaryFactory { harness }),
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store.clone()),
+        );
+        registry
+            .shared
+            .primary_delete_error
+            .store(metadata_delete_error, Ordering::SeqCst);
+        let thread_id = ThreadId::new();
+        let worktree_path =
+            crate::worktree::worktree_path(store.data_dir(), &project_id.to_string(), thread_id);
+        let branch = crate::worktree::branch_name(thread_id);
+        if authority_conflict {
+            registry
+                .shared
+                .intern_thread_authority(thread_id, ProjectId::new())
+                .await
+                .unwrap();
+        }
+        let result = registry
+            .create_primary_and_start(
+                config,
+                repo.to_string_lossy().into_owned(),
+                thread_id,
+                ModelRef {
+                    provider: "test".into(),
+                    model: "test-model".into(),
+                    reasoning_effort: None,
+                },
+                super::NewPrimaryThread {
+                    title: "failed worktree Primary".into(),
+                    mode: TurnMode::Known(Mode::Build),
+                    permission_preset: PermissionPreset::AskFirst,
+                    context_window: 0,
+                    git_workspace: None,
+                },
+                giskard_proto::GitStrategy::Worktree,
+                UserInput::text("fail turn"),
+                giskard_core::turn::TurnOverrides {
+                    model: None,
+                    mode: Mode::Build,
+                    permission_preset: PermissionPreset::AskFirst,
+                },
+            )
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("failed worktree Primary unexpectedly succeeded"),
+        };
+        if let Some(parent) = worktree_path.parent() {
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        (
+            store,
+            project_id,
+            thread_id,
+            worktree_path,
+            branch,
+            repo,
+            error,
+        )
+    }
+
+    #[tokio::test]
+    async fn metadata_delete_failure_preserves_visible_primary() {
+        #[cfg(unix)]
+        let (store, project_id, thread_id, worktree_path, _branch, _repo, error) =
+            failed_primary_worktree_fixture(0, true, false, false).await;
+        #[cfg(not(unix))]
+        let (store, project_id, thread_id, error) = failed_primary_rollback_fixture(0, true).await;
+        assert!(error.to_string().contains("metadata rollback failed"));
+        assert!(
+            store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        #[cfg(unix)]
+        assert!(
+            worktree_path.is_dir(),
+            "durable recovery worktree was removed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worktree_removal_failure_reports_retained_checkout_and_branch() {
+        let (store, project_id, thread_id, worktree_path, branch, _repo, error) =
+            failed_primary_worktree_fixture(0, false, true, false).await;
+        let message = error.to_string();
+        assert!(
+            message.contains("orphan checkout"),
+            "unexpected rollback error: {message}"
+        );
+        assert!(message.contains(&worktree_path.to_string_lossy().to_string()));
+        assert!(message.contains(&branch));
+        assert!(
+            worktree_path.is_dir(),
+            "failed removal did not retain checkout"
+        );
+        assert!(
+            store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "metadata was recreated after worktree-only cleanup failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn authority_intern_failure_rolls_back_primary_worktree_and_branch() {
+        let (_store, _project_id, _thread_id, worktree_path, branch, repo, error) =
+            failed_primary_worktree_fixture(0, false, false, true).await;
+        assert!(
+            error
+                .to_string()
+                .contains("already associated with project"),
+            "unexpected authority error: {error}"
+        );
+        assert!(!worktree_path.exists(), "authority failure leaked worktree");
+        let branches = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(["branch", "--list", &branch])
+            .output()
+            .unwrap();
+        assert!(branches.status.success());
+        assert!(
+            String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
+            "authority failure leaked branch {branch}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_cleanup_failure_preserves_visible_degraded_primary() {
+        #[cfg(unix)]
+        let (store, project_id, thread_id, worktree_path, _branch, _repo, error) =
+            failed_primary_worktree_fixture(1, false, false, false).await;
+        #[cfg(not(unix))]
+        let (store, project_id, thread_id, error) = failed_primary_rollback_fixture(1, false).await;
+        assert!(error.to_string().contains("provider cleanup failed"));
+        assert!(
+            store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        #[cfg(unix)]
+        assert!(
+            worktree_path.is_dir(),
+            "provider failure removed recovery worktree"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_cleanup_future_error_preserves_metadata_and_worktree() {
+        let (store, project_id, thread_id, worktree_path, _branch, _repo, error) =
+            failed_primary_worktree_fixture(3, false, false, false).await;
+        assert!(error.to_string().contains("cleanup future failure"));
+        assert!(
+            store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(worktree_path.is_dir());
+    }
+
+    #[tokio::test]
+    async fn primary_rollback_retires_owner_before_provider_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project_id, config) = create_test_project(&store, "retirement-order").await;
+        let (sender, receiver) = broadcast::channel(4);
+        let harness = Arc::new(BlockingPrimaryHarness {
+            open_started: Notify::new(),
+            open_release: Notify::new(),
+            turn_started: Notify::new(),
+            turn_release: Notify::new(),
+            turn_completed: Notify::new(),
+            start_success: AtomicBool::new(false),
+            shutdown_started: AtomicBool::new(false),
+            delete_mode: AtomicU8::new(0),
+            sabotage_worktree_removal: AtomicBool::new(false),
+            cleanup_started: Notify::new(),
+            cleanup_release: Notify::new(),
+            block_cleanup: AtomicBool::new(true),
+            sender: StdMutex::new(Some(sender)),
+            route: TestRoute::new(receiver),
+            claims: AtomicUsize::new(0),
+            subscriptions: AtomicUsize::new(0),
+        });
+        harness.open_release.notify_one();
+        harness.turn_release.notify_one();
+        let registry = Arc::new(super::HarnessRegistry::new(
+            Arc::new(BlockingPrimaryFactory {
+                harness: harness.clone(),
+            }),
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store.clone()),
+        ));
+        let thread_id = ThreadId::new();
+        let creating = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                registry
+                    .create_primary_and_start(
+                        config,
+                        "/tmp/test".into(),
+                        thread_id,
+                        ModelRef {
+                            provider: "test".into(),
+                            model: "test-model".into(),
+                            reasoning_effort: None,
+                        },
+                        super::NewPrimaryThread {
+                            title: "failed Primary".into(),
+                            mode: TurnMode::Known(Mode::Build),
+                            permission_preset: PermissionPreset::AskFirst,
+                            context_window: 0,
+                            git_workspace: None,
+                        },
+                        giskard_proto::GitStrategy::Shared,
+                        UserInput::text("fail turn"),
+                        giskard_core::turn::TurnOverrides {
+                            model: None,
+                            mode: Mode::Build,
+                            permission_preset: PermissionPreset::AskFirst,
+                        },
+                    )
+                    .await
+            })
+        };
+
+        harness.cleanup_started.notified().await;
+        assert!(
+            registry.shared.coordinator(thread_id).await.is_none(),
+            "provider cleanup began before the exact coordinator was retired"
+        );
+        assert!(
+            store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "metadata rollback overtook provider cleanup"
+        );
+        harness.cleanup_release.notify_one();
+        assert!(creating.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn registry_shutdown_closes_and_joins_discovery_consumer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project_id, config) = create_test_project(&store, "shutdown-discovery").await;
+        let (_events_tx, events_rx) = broadcast::channel(1);
+        let (discovery_tx, discovery_rx) = tokio::sync::mpsc::channel(1);
+        let harness = Arc::new(DiscoveryOwnerHarness {
+            route: TestRoute::new(events_rx),
+            subscriptions: AtomicUsize::new(0),
+            routes: StdMutex::new(HashMap::new()),
+            discovery_tx: StdMutex::new(Some(discovery_tx)),
+            discovery_rx: StdMutex::new(Some(discovery_rx)),
+        });
+        let registry = super::HarnessRegistry::new(
+            Arc::new(DiscoveryOwnerFactory {
+                harness: harness.clone(),
+            }),
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store),
+        );
+
+        registry
+            .get_or_create_harness(project_id, &config)
+            .await
+            .unwrap();
+        registry.shutdown().await.unwrap();
+
+        assert!(harness.discovery_tx.lock().unwrap().is_none());
+        assert!(registry.shared.active_harness(project_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn unexpected_discovery_consumer_closure_retires_matching_published_harness() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project_id, config) = create_test_project(&store, "closed-discovery").await;
+        let (_events_tx, events_rx) = broadcast::channel(1);
+        let (discovery_tx, discovery_rx) = tokio::sync::mpsc::channel(1);
+        let harness = Arc::new(DiscoveryOwnerHarness {
+            route: TestRoute::new(events_rx),
+            subscriptions: AtomicUsize::new(0),
+            routes: StdMutex::new(HashMap::new()),
+            discovery_tx: StdMutex::new(Some(discovery_tx)),
+            discovery_rx: StdMutex::new(Some(discovery_rx)),
+        });
+        let registry = super::HarnessRegistry::new(
+            Arc::new(DiscoveryOwnerFactory {
+                harness: harness.clone(),
+            }),
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store),
+        );
+        let published = registry
+            .get_or_create_harness(project_id, &config)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &published,
+            &(harness.clone() as Arc<dyn AgentHarness>)
+        ));
+
+        drop(harness.discovery_tx.lock().unwrap().take());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while registry.shared.active_harness(project_id).await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("consumer closure must retire the matching published harness");
+
+        registry.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovery_rejects_conflicting_durable_native_ownership() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project_id, _) = create_test_project(&store, "conflict").await;
+        let owner = ThreadId::new();
+        store
+            .save_thread(
+                project_id,
+                &durable_thread(
+                    project_id,
+                    owner,
+                    "native-conflict",
+                    giskard_core::thread::ThreadKind::Primary,
+                ),
+            )
+            .await
+            .unwrap();
+        let shared = Arc::new(super::RegistryShared::new(
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store),
+        ));
+        let (_, receiver) = broadcast::channel(1);
+        let harness = Arc::new(DiscoveryOwnerHarness {
+            route: TestRoute::new(receiver),
+            subscriptions: AtomicUsize::new(0),
+            routes: StdMutex::new(HashMap::new()),
+            discovery_tx: StdMutex::new(None),
+            discovery_rx: StdMutex::new(None),
+        });
+
+        let discovered = ThreadId::new();
+        let error = super::ensure_discovered_thread_owner(
+            project_id,
+            discovery_ticket(&harness, discovered, "native-conflict"),
+            harness.clone(),
+            shared,
+        )
+        .await
+        .err()
+        .unwrap();
+
+        assert!(error.to_string().contains(&owner.to_string()));
+        assert_eq!(harness.subscriptions.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn status_first_then_parent_materialization_preserves_route_and_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project_id, _) = create_test_project(&store, "status-first").await;
+        let parent_id = ThreadId::new();
+        store
+            .save_thread(
+                project_id,
+                &durable_thread(
+                    project_id,
+                    parent_id,
+                    "native-parent",
+                    giskard_core::thread::ThreadKind::Primary,
+                ),
+            )
+            .await
+            .unwrap();
+        let shared = Arc::new(super::RegistryShared::new(
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store.clone()),
+        ));
+        let (sender, receiver) = broadcast::channel(4);
+        let child_id = ThreadId::new();
+        let harness = Arc::new(DiscoveryOwnerHarness {
+            route: TestRoute::new(receiver),
+            subscriptions: AtomicUsize::new(0),
+            routes: StdMutex::new(HashMap::from([("native-child".into(), child_id)])),
+            discovery_tx: StdMutex::new(None),
+            discovery_rx: StdMutex::new(None),
+        });
+        let authority = shared.intern_project_authority(project_id).await;
+        {
+            let mut transitions = shared.harness_transitions.lock().await;
+            transitions
+                .project(&authority)
+                .await
+                .publish_active(harness.clone());
+        }
+        super::ensure_discovered_thread_owner(
+            project_id,
+            discovery_ticket(&harness, child_id, "native-child"),
+            harness.clone(),
+            shared.clone(),
+        )
+        .await
+        .unwrap();
+        let original = shared.coordinator(child_id).await.unwrap();
+
+        let materialized = super::materialize_subagent_thread(
+            parent_id,
+            project_id,
+            TurnId::new(),
+            super::SubagentActivityInfo {
+                native_thread_id: "native-child".into(),
+                agent_name: None,
+                agent_path: None,
+                title: Some("child".into()),
+            },
+            shared.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(materialized, Some(child_id));
+        assert_eq!(
+            store
+                .load_thread(project_id, child_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .kind,
+            giskard_core::thread::ThreadKind::Subagent
+        );
+        assert!(Arc::ptr_eq(
+            &original,
+            &shared.coordinator(child_id).await.unwrap()
+        ));
+        assert_eq!(harness.subscriptions.load(Ordering::SeqCst), 1);
+        drop(sender);
+    }
+
+    #[tokio::test]
+    async fn parent_first_then_discovery_keeps_one_subagent_and_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project_id, _) = create_test_project(&store, "parent-first").await;
+        let parent_id = ThreadId::new();
+        store
+            .save_thread(
+                project_id,
+                &durable_thread(
+                    project_id,
+                    parent_id,
+                    "native-parent",
+                    giskard_core::thread::ThreadKind::Primary,
+                ),
+            )
+            .await
+            .unwrap();
+        let shared = Arc::new(super::RegistryShared::new(
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store.clone()),
+        ));
+        let (sender, receiver) = broadcast::channel(4);
+        let harness = Arc::new(DiscoveryOwnerHarness {
+            route: TestRoute::new(receiver),
+            subscriptions: AtomicUsize::new(0),
+            routes: StdMutex::new(HashMap::new()),
+            discovery_tx: StdMutex::new(None),
+            discovery_rx: StdMutex::new(None),
+        });
+        let authority = shared.intern_project_authority(project_id).await;
+        {
+            let mut transitions = shared.harness_transitions.lock().await;
+            transitions
+                .project(&authority)
+                .await
+                .publish_active(harness.clone());
+        }
+        let child_id = super::materialize_subagent_thread(
+            parent_id,
+            project_id,
+            TurnId::new(),
+            super::SubagentActivityInfo {
+                native_thread_id: "native-child".into(),
+                agent_name: None,
+                agent_path: None,
+                title: Some("child".into()),
+            },
+            shared.clone(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let original = shared.coordinator(child_id).await.unwrap();
+
+        super::ensure_discovered_thread_owner(
+            project_id,
+            discovery_ticket(&harness, child_id, "native-child"),
+            harness.clone(),
+            shared.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            super::load_thread_graph(&store, project_id)
+                .await
+                .unwrap()
+                .values()
+                .filter(|thread| thread.kind == giskard_core::thread::ThreadKind::Subagent)
+                .count(),
+            1
+        );
+        assert!(Arc::ptr_eq(
+            &original,
+            &shared.coordinator(child_id).await.unwrap()
+        ));
+        assert_eq!(harness.subscriptions.load(Ordering::SeqCst), 1);
+        drop(sender);
+    }
+
+    #[tokio::test]
+    async fn concurrent_parent_and_discovery_converge_on_one_durable_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project_id, _) = create_test_project(&store, "concurrent").await;
+        let parent_id = ThreadId::new();
+        store
+            .save_thread(
+                project_id,
+                &durable_thread(
+                    project_id,
+                    parent_id,
+                    "native-parent",
+                    giskard_core::thread::ThreadKind::Primary,
+                ),
+            )
+            .await
+            .unwrap();
+        let shared = Arc::new(super::RegistryShared::new(
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store.clone()),
+        ));
+        let (sender, receiver) = broadcast::channel(4);
+        let child_id = ThreadId::new();
+        let harness = Arc::new(DiscoveryOwnerHarness {
+            route: TestRoute::new(receiver),
+            subscriptions: AtomicUsize::new(0),
+            routes: StdMutex::new(HashMap::from([("native-child".into(), child_id)])),
+            discovery_tx: StdMutex::new(None),
+            discovery_rx: StdMutex::new(None),
+        });
+        let authority = shared.intern_project_authority(project_id).await;
+        {
+            let mut transitions = shared.harness_transitions.lock().await;
+            transitions
+                .project(&authority)
+                .await
+                .publish_active(harness.clone());
+        }
+        let lifecycle = super::lock_project_lifecycle(&shared.projects, project_id).await;
+        let discovery = discovery_ticket(&harness, child_id, "native-child");
+        let discovering = {
+            let shared = shared.clone();
+            let harness = harness.clone();
+            tokio::spawn(async move {
+                super::ensure_discovered_thread_owner(project_id, discovery, harness, shared).await
+            })
+        };
+        let materializing = {
+            let shared = shared.clone();
+            tokio::spawn(async move {
+                super::materialize_subagent_thread(
+                    parent_id,
+                    project_id,
+                    TurnId::new(),
+                    super::SubagentActivityInfo {
+                        native_thread_id: "native-child".into(),
+                        agent_name: None,
+                        agent_path: None,
+                        title: Some("child".into()),
+                    },
+                    shared,
+                )
+                .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!discovering.is_finished());
+        assert!(!materializing.is_finished());
+        drop(lifecycle);
+
+        discovering.await.unwrap().unwrap();
+        assert_eq!(materializing.await.unwrap().unwrap(), Some(child_id));
+        let graph = super::load_thread_graph(&store, project_id).await.unwrap();
+        assert_eq!(graph.len(), 2);
+        assert_eq!(
+            graph.get(&child_id).unwrap().kind,
+            giskard_core::thread::ThreadKind::Subagent
+        );
+        assert_eq!(harness.subscriptions.load(Ordering::SeqCst), 1);
+        drop(sender);
+    }
+
     /// The bindings only prevent a second identity if they are in place before anything can open a
     /// thread. Publishing the harness first and binding afterwards would let a concurrent caller
     /// take it out of the map in between — so the harness must not be reachable until it is bound.
@@ -2956,7 +6243,20 @@ mod tests {
     async fn first_message_runtime_exists_before_native_open_returns() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
-        let (_project_id, config) = create_test_project(&store, "first-message").await;
+        let (project_id, config) = create_test_project(&store, "first-message").await;
+        let thread_id = ThreadId::new();
+        let mut durable = durable_thread(
+            project_id,
+            thread_id,
+            "native-first-message",
+            ThreadKind::Primary,
+        );
+        durable.current_model = TurnModel::Known(ModelRef {
+            provider: "openai".into(),
+            model: "gpt-test".into(),
+            reasoning_effort: None,
+        });
+        store.save_thread(project_id, &durable).await.unwrap();
         let harness = Arc::new(BindingOrderHarness {
             bound: Arc::new(AtomicUsize::new(1)),
             opened_before_bound: Arc::new(AtomicUsize::new(0)),
@@ -2973,14 +6273,12 @@ mod tests {
             ledger::spawn(store),
         );
         *harness.authority_probe.lock().unwrap() = Some(Arc::downgrade(&registry.shared));
-        let thread_id = ThreadId::new();
-
         let result = registry
             .open_thread(
                 &config,
                 "/tmp/test",
                 thread_id,
-                None,
+                Some("native-first-message".into()),
                 ModelRef {
                     provider: "openai".into(),
                     model: "gpt-test".into(),
@@ -3496,7 +6794,11 @@ mod tests {
                 .publish_active(harness.clone());
         }
 
-        let error = registry.delete_project(project_id).await.unwrap_err();
+        let permit = registry.lock_project_lifecycle(project_id).await;
+        let error = registry
+            .delete_project(&permit, project_id)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("injected shutdown failure"));
         let mut transitions = registry.shared.harness_transitions.lock().await;
         let restored = transitions
@@ -3666,7 +6968,7 @@ mod tests {
         coordinator: &super::ThreadCoordinator,
         runtime: &ThreadRuntimeSupport,
         context: TurnContext,
-    ) -> super::CoordinatorToken {
+    ) -> super::PreparedTurnReservation {
         let binding = coordinator.binding().await;
         let authority = test_authority(&binding);
         let lease = runtime
@@ -3704,12 +7006,22 @@ mod tests {
             .unwrap();
         let authority = install_test_coordinator(&registry.shared, coordinator.clone()).await;
         let permit = registry.shared.background_tasks.register().unwrap();
-        let (events, _) = broadcast::channel(2);
+        let (events, receiver) = broadcast::channel(2);
+        let route = TestRoute::new(receiver);
+        let owner = route
+            .attachment(ThreadHandle::opened(
+                thread_id,
+                "native-test".into(),
+                "/tmp".into(),
+            ))
+            .unwrap()
+            .commit()
+            .unwrap();
         super::launch_event_forwarder(
             registry.shared.clone(),
             authority,
             coordinator,
-            AgentEventStream::new(events.subscribe()),
+            owner,
             cancel_rx,
             completed_tx,
             permit,
@@ -3729,6 +7041,15 @@ mod tests {
             .await
             .expect("forget_thread must not deadlock with a self-exiting owner")
             .unwrap();
+
+        let restored = route
+            .attachment(ThreadHandle::opened(
+                thread_id,
+                "native-test".into(),
+                "/tmp".into(),
+            ))
+            .expect("requested retirement must return the exact route receiver");
+        assert_eq!(restored.handle().thread, thread_id);
     }
 
     #[tokio::test]
@@ -3816,7 +7137,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_forwarder_does_not_clear_a_replacement_coordinator() {
+    async fn tombstoned_owner_stream_exit_clears_only_its_matching_coordinator() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
         let shared = Arc::new(super::RegistryShared::new(
@@ -3849,16 +7170,28 @@ mod tests {
                 .is_ok()
         );
         let permit = shared.background_tasks.register().unwrap();
-        let (events, _) = broadcast::channel(2);
+        let (events, receiver) = broadcast::channel(2);
+        let route = TestRoute::new(receiver);
+        let owner = route
+            .attachment(ThreadHandle::opened(
+                thread_id,
+                "native-test".into(),
+                "/tmp".into(),
+            ))
+            .unwrap()
+            .commit()
+            .unwrap();
         super::launch_event_forwarder(
             shared,
             authority.clone(),
             coordinator,
-            AgentEventStream::new(events.subscribe()),
+            owner,
             cancel_rx,
             completed_tx,
             permit,
         );
+        // Codex tombstoning closes the route sender. Model that boundary directly: the old owner
+        // observes a closed stream after a replacement coordinator has occupied the authority.
         drop(events);
         while !*completed_rx.borrow() {
             completed_rx.changed().await.unwrap();
@@ -3870,6 +7203,7 @@ mod tests {
             .expect("replacement coordinator remains installed");
         assert!(Arc::ptr_eq(&installed, &replacement));
         assert_eq!(authority.thread_id(), thread_id);
+        assert!(route.receiver.lock().unwrap().is_some());
     }
 
     #[tokio::test]

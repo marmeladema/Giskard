@@ -4,6 +4,8 @@
 //! strategy must be opened against the worktree rather than the project's checkout, and must still
 //! be after a restart. Everything here therefore records the workspace root the harness was handed.
 
+mod support;
+
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -18,7 +20,8 @@ use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+    AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadAttachment, ThreadDeletion,
+    ThreadHandle,
 };
 use giskard_persist::store::{ProjectConfig, ThreadGitWorkspace};
 use giskard_server::{AppState, HarnessFactory, build_app};
@@ -231,11 +234,7 @@ async fn an_unknown_git_strategy_is_refused_and_an_absent_one_is_an_ordinary_thr
 #[derive(Default)]
 struct RecordingHarness {
     opened_workspace_roots: Mutex<Vec<String>>,
-    /// A `std` mutex, not a `tokio` one: `subscribe` is a synchronous trait method, and with an
-    /// async mutex it could only `try_lock` — handing back a stream over a dropped sender whenever
-    /// the map happened to be held. Every event for that thread would then vanish and the test would
-    /// fail on an unexplained timeout. Nothing holds this guard across an await.
-    threads: std::sync::Mutex<Vec<(ThreadId, tokio::sync::broadcast::Sender<AgentEvent>)>>,
+    threads: std::sync::Mutex<Vec<(ThreadId, support::TestEventRoute)>>,
     /// When set, the next turn reports having spawned a sub-agent with this native id, which is what
     /// drives the registry to materialize a linked thread the way Codex does.
     spawns_subagent: Mutex<Option<String>>,
@@ -246,6 +245,24 @@ struct RecordingHarness {
 
 #[async_trait::async_trait]
 impl AgentHarness for RecordingHarness {
+    async fn begin_delete_thread<'a>(
+        &'a self,
+        thread: &'a ThreadHandle,
+    ) -> Result<giskard_harness::ThreadRetirement<'a>, HarnessError> {
+        let removed = {
+            let mut threads = self.threads.lock().unwrap();
+            threads
+                .iter()
+                .position(|(id, _)| *id == thread.thread)
+                .map(|index| threads.remove(index).1)
+        };
+        if let Some(route) = removed {
+            route.close();
+        }
+        Ok(giskard_harness::ThreadRetirement::new(Box::pin(async {
+            Ok(ThreadDeletion::Retired)
+        })))
+    }
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities {
             resumable_threads: true,
@@ -257,15 +274,15 @@ impl AgentHarness for RecordingHarness {
         Ok(Vec::new())
     }
 
-    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
+    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadAttachment, HarnessError> {
         self.opened_workspace_roots
             .lock()
             .await
             .push(opts.workspace_root.to_string_lossy().into_owned());
         let thread = opts.thread;
-        let (tx, _) = tokio::sync::broadcast::channel(16);
-        self.threads.lock().unwrap().push((thread, tx));
-        Ok(ThreadHandle {
+        let route = support::TestEventRoute::new(16);
+        self.threads.lock().unwrap().push((thread, route.clone()));
+        route.attach(ThreadHandle {
             resumed_model: Some(opts.initial_model.clone()),
             ..ThreadHandle::opened(
                 thread,
@@ -282,18 +299,28 @@ impl AgentHarness for RecordingHarness {
         thread: ThreadId,
         harness_thread_id: String,
         workspace_root: std::path::PathBuf,
-    ) -> Result<ThreadHandle, HarnessError> {
+    ) -> Result<ThreadAttachment, HarnessError> {
         self.opened_workspace_roots
             .lock()
             .await
             .push(workspace_root.to_string_lossy().into_owned());
-        let (tx, _) = tokio::sync::broadcast::channel(16);
-        self.threads.lock().unwrap().push((thread, tx));
-        Ok(ThreadHandle::opened(
+        let route = support::TestEventRoute::new(16);
+        self.threads.lock().unwrap().push((thread, route.clone()));
+        route.attach(ThreadHandle::opened(
             thread,
             harness_thread_id,
             workspace_root,
         ))
+    }
+
+    async fn reattach_native_thread(
+        &self,
+        thread: ThreadId,
+        harness_thread_id: String,
+        workspace_root: std::path::PathBuf,
+    ) -> Result<ThreadAttachment, HarnessError> {
+        self.claim_native_thread(thread, harness_thread_id, workspace_root)
+            .await
     }
 
     async fn start_turn(
@@ -374,20 +401,6 @@ impl AgentHarness for RecordingHarness {
         Ok(turn)
     }
 
-    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Some((_, tx)) = self
-            .threads
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(id, _)| *id == thread.thread)
-        {
-            return AgentEventStream::new(tx.subscribe());
-        }
-        let (_, rx) = tokio::sync::broadcast::channel(1);
-        AgentEventStream::new(rx)
-    }
-
     async fn respond_approval(
         &self,
         _req: ApprovalId,
@@ -408,15 +421,10 @@ impl AgentHarness for RecordingHarness {
         Ok(())
     }
 
-    async fn delete_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
-        self.threads
-            .lock()
-            .unwrap()
-            .retain(|(id, _)| *id != thread.thread);
-        Ok(())
-    }
-
     async fn shutdown(&self) -> Result<(), HarnessError> {
+        for (_, route) in self.threads.lock().unwrap().drain(..) {
+            route.close();
+        }
         Ok(())
     }
 }

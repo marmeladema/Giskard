@@ -54,6 +54,20 @@ retains explicit `unknown` model/mode values rather than parent-derived guesses.
 classification is an expected-revision `orphan -> subagent` update on that same ID once parent
 evidence arrives.
 
+Codex traffic can establish that identity before a parent event names the relationship. A live
+status or thread-start frame, or another supported thread-scoped frame as a safety net, creates a
+retained delivery route and asks the registry to install an owner. The registry persists the hidden
+orphan before consuming its first retained event. After acquiring the shared project
+materialization permit, the registry consumes the non-cloneable discovery ticket into a
+`ThreadAttachment`; failure or cancellation returns the exact retained receiver. Successful owner
+installation consumes that attachment into a `ThreadEventOwner` held by the forwarder or a
+persistence-blocked coordinator. Discovery, Primary creation, parent materialization, and deletion
+share the permit: status-first classifies the same orphan later, parent-first reuses the
+existing sub-agent, and an interleaving converges on the adapter's authoritative ID without a
+second channel or durable record. Deletion tombstones the route; traffic cannot resurrect it.
+Creating durable orphan metadata emits the ordinary catalog invalidation so authoritative clients
+refetch, but the catalog's visibility filter still omits the hidden orphan until classification.
+
 ## Supported Codex spawning events
 
 The Codex adapter maps both known protocols into the same harness-neutral sub-agent link:
@@ -74,16 +88,16 @@ the fields exposed through the adapter protocol.
 
 ## Long-lived native event ownership
 
-Opening or materializing a child installs one coordinator and one long-lived subscriber for that
+Opening or materializing a child installs one coordinator and one long-lived event owner for that
 native thread. The same owner processes every native turn until the binding is explicitly retired;
-parent activity does not start a second subscriber, hand ownership between tasks, or stop the owner
+parent activity does not create a second receiver, hand ownership between tasks, or stop the owner
 after a timeout.
 
 Owner retirement changes the slot from `Live` to `Draining` while holding the per-thread owner
 lock, requests cancellation, then releases the lock before waiting for task completion. Cold opens
 that encounter `Draining` also release the lock and wait before retrying. Consequently no task ever
-waits for another task while holding the owner lock, and a replacement subscriber cannot overlap
-the draining generation.
+waits for another task while holding the owner lock. A replacement owner can start only after the
+previous `ThreadEventOwner` has returned its exact receiver to the route authority.
 
 The first event carrying a previously unseen native turn ID atomically claims that turn before any
 live-buffer, browser, or persistence mutation. `TurnStarted` may arrive later. On completion the

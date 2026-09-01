@@ -6,7 +6,9 @@
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use tokio::sync::{Mutex, broadcast};
@@ -25,7 +27,7 @@ use giskard_core::turn::{TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
     AgentEventStream, AgentHarness, HarnessCapabilities, HarnessProvider, OpenThreadOptions,
-    ThreadHandle,
+    ThreadAttachment, ThreadDeletion, ThreadHandle,
 };
 
 /// A recorded fixture: an ordered list of `AgentEvent`s to replay.
@@ -72,8 +74,20 @@ impl ReplayFixture {
 }
 
 struct ThreadState {
-    sender: broadcast::Sender<AgentEvent>,
+    harness_thread_id: String,
+    activation: u64,
+    sender: Option<broadcast::Sender<AgentEvent>>,
+    receiver: Option<AgentEventStream>,
+    phase: RoutePhase,
     pending: Vec<AgentEvent>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RoutePhase {
+    Idle,
+    Attaching,
+    Owned,
+    Tombstoned,
 }
 
 struct PreloadedFixture {
@@ -104,8 +118,14 @@ pub struct ReplayHarness {
     // Source of truth: Replay harness open/resume operations establish each thread state.
     // Structural reason: This non-test-gated harness adapter cannot depend on server authorities.
     // Synchronization: The mutex protects linear lookup, insertion, and removal.
-    // Invalidation/removal: Thread close removes state; dropping the harness removes all entries.
-    threads: Mutex<Vec<(ThreadId, ThreadState)>>,
+    // Invalidation/removal: Delete tombstones delivery; harness drop removes all entries.
+    threads: Arc<StdMutex<Vec<(ThreadId, ThreadState)>>>,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Own preloaded replay fixtures until one matching native identity consumes them.
+    // Source of truth: Replay fixture construction and explicit resume selection.
+    // Structural reason: Fixture identity is harness-native and has no server authority owner.
+    // Synchronization: The mutex serializes lookup and one-time fixture removal.
+    // Invalidation/removal: Successful resume consumes an entry; harness drop removes the rest.
     fixtures: Mutex<HashMap<ReplayNativeThreadId, PreloadedFixture>>,
     /// Catalog returned by `list_models` (empty unless set via [`ReplayHarness::with_models`]),
     /// standing in for a real harness's model catalog (e.g. Codex `model/list`).
@@ -122,6 +142,7 @@ pub struct ReplayHarness {
     /// default: a harness that cannot say must not have one invented for it.
     client_version: Option<String>,
     shutdown_called: AtomicBool,
+    next_activation: AtomicU64,
 }
 
 impl ReplayHarness {
@@ -147,7 +168,7 @@ impl ReplayHarness {
                 mcp_oauth_login: false,
                 context_compaction: true,
             },
-            threads: Mutex::new(Vec::new()),
+            threads: Arc::new(StdMutex::new(Vec::new())),
             fixtures: Mutex::new(fixtures),
             models: Vec::new(),
             models_error: None,
@@ -155,6 +176,7 @@ impl ReplayHarness {
             providers_error: None,
             client_version: None,
             shutdown_called: AtomicBool::new(false),
+            next_activation: AtomicU64::new(1),
         }
     }
 
@@ -221,6 +243,207 @@ impl ReplayHarness {
         );
         Self::with_fixtures(fixtures)
     }
+
+    fn route_lock(
+        routes: &Arc<StdMutex<Vec<(ThreadId, ThreadState)>>>,
+    ) -> Result<std::sync::MutexGuard<'_, Vec<(ThreadId, ThreadState)>>, HarnessError> {
+        match routes.lock() {
+            Ok(routes) => Ok(routes),
+            Err(poisoned) => {
+                Self::close_poisoned_routes(poisoned);
+                Err(HarnessError::Transport(
+                    "replay route authority lock poisoned; authority closed".into(),
+                ))
+            }
+        }
+    }
+
+    /// A capability drop cannot report an error. Close all delivery state while preserving the
+    /// poisoned mutex so the next fallible harness operation surfaces the fatal authority error.
+    fn close_poisoned_routes(
+        poisoned: std::sync::PoisonError<std::sync::MutexGuard<'_, Vec<(ThreadId, ThreadState)>>>,
+    ) {
+        poisoned.into_inner().clear();
+    }
+
+    fn attachment(
+        &self,
+        handle: ThreadHandle,
+        stream: AgentEventStream,
+        activation: u64,
+    ) -> ThreadAttachment {
+        let routes_for_commit = Arc::downgrade(&self.threads);
+        let routes_for_attachment_drop = Arc::downgrade(&self.threads);
+        let thread_id = handle.thread;
+        ThreadAttachment::from_route(
+            handle,
+            stream,
+            move || {
+                let Some(route_authority) = routes_for_commit.upgrade() else {
+                    return Err(HarnessError::Protocol(
+                        "replay harness route authority closed".into(),
+                    ));
+                };
+                let mut routes = match ReplayHarness::route_lock(&route_authority) {
+                    Ok(routes) => routes,
+                    Err(error) => return Err(error),
+                };
+                let Some((_, state)) = routes.iter_mut().find(|(id, state)| {
+                    *id == thread_id
+                        && state.activation == activation
+                        && state.phase == RoutePhase::Attaching
+                }) else {
+                    return Err(HarnessError::Protocol(format!(
+                        "replay thread {thread_id} attachment is stale"
+                    )));
+                };
+                state.phase = RoutePhase::Owned;
+                drop(routes);
+
+                let routes_for_owner_drop = Arc::downgrade(&route_authority);
+                Ok(Box::new(move |stream| {
+                    let Some(routes) = routes_for_owner_drop.upgrade() else {
+                        return;
+                    };
+                    let mut routes = match routes.lock() {
+                        Ok(routes) => routes,
+                        Err(poisoned) => {
+                            ReplayHarness::close_poisoned_routes(poisoned);
+                            return;
+                        }
+                    };
+                    if let Some((_, state)) = routes.iter_mut().find(|(id, state)| {
+                        *id == thread_id
+                            && state.activation == activation
+                            && state.phase == RoutePhase::Owned
+                    }) {
+                        state.receiver = Some(stream);
+                        state.phase = RoutePhase::Idle;
+                    }
+                })
+                    as Box<dyn FnOnce(AgentEventStream) + Send>)
+            },
+            move |stream| {
+                let Some(routes) = routes_for_attachment_drop.upgrade() else {
+                    return;
+                };
+                let mut routes = match routes.lock() {
+                    Ok(routes) => routes,
+                    Err(poisoned) => {
+                        ReplayHarness::close_poisoned_routes(poisoned);
+                        return;
+                    }
+                };
+                if let Some((_, state)) = routes.iter_mut().find(|(id, state)| {
+                    *id == thread_id
+                        && state.activation == activation
+                        && state.phase == RoutePhase::Attaching
+                }) {
+                    state.receiver = Some(stream);
+                    state.phase = RoutePhase::Idle;
+                }
+            },
+        )
+    }
+
+    fn claim_route(
+        &self,
+        thread: ThreadId,
+        harness_thread_id: String,
+        workspace_root: PathBuf,
+        reactivate_tombstone: bool,
+    ) -> Result<ThreadAttachment, HarnessError> {
+        if self.shutdown_called.load(Ordering::SeqCst) {
+            return Err(HarnessError::Transport(
+                "replay harness is shut down".into(),
+            ));
+        }
+        let mut routes = Self::route_lock(&self.threads)?;
+        if let Some((_, state)) = routes.iter().find(|(bound_thread, state)| {
+            *bound_thread == thread && state.harness_thread_id != harness_thread_id
+        }) {
+            return Err(HarnessError::Protocol(format!(
+                "replay thread {thread} is already bound to native thread {}",
+                state.harness_thread_id
+            )));
+        }
+        let authoritative_thread = routes
+            .iter()
+            .find(|(_, state)| state.harness_thread_id == harness_thread_id)
+            .map(|(bound_thread, state)| (*bound_thread, state.phase));
+        let thread = match authoritative_thread {
+            Some((bound_thread, RoutePhase::Tombstoned)) if bound_thread != thread => {
+                return Err(HarnessError::Protocol(format!(
+                    "native replay thread {harness_thread_id} is tombstoned for {bound_thread}, not {thread}"
+                )));
+            }
+            Some((bound_thread, _)) => bound_thread,
+            None => thread,
+        };
+
+        let (handle, stream, activation) =
+            if let Some((_, state)) = routes.iter_mut().find(|(id, _)| *id == thread) {
+                match state.phase {
+                    RoutePhase::Idle => {
+                        let Some(stream) = state.receiver.take() else {
+                            return Err(HarnessError::Protocol(format!(
+                                "idle replay thread {thread} lost its retained receiver"
+                            )));
+                        };
+                        state.phase = RoutePhase::Attaching;
+                        (
+                            ThreadHandle::opened(thread, harness_thread_id, workspace_root),
+                            stream,
+                            state.activation,
+                        )
+                    }
+                    RoutePhase::Tombstoned if reactivate_tombstone => {
+                        let activation = self.next_activation.fetch_add(1, Ordering::Relaxed);
+                        let (sender, receiver) = broadcast::channel(256);
+                        state.sender = Some(sender);
+                        state.receiver = None;
+                        state.phase = RoutePhase::Attaching;
+                        state.activation = activation;
+                        (
+                            ThreadHandle::opened(thread, harness_thread_id, workspace_root),
+                            AgentEventStream::new(receiver),
+                            activation,
+                        )
+                    }
+                    RoutePhase::Tombstoned => {
+                        return Err(HarnessError::Protocol(format!(
+                            "replay thread {thread} route is tombstoned"
+                        )));
+                    }
+                    RoutePhase::Attaching | RoutePhase::Owned => {
+                        return Err(HarnessError::Protocol(format!(
+                            "replay thread {thread} already has an event owner"
+                        )));
+                    }
+                }
+            } else {
+                let activation = self.next_activation.fetch_add(1, Ordering::Relaxed);
+                let (sender, receiver) = broadcast::channel(256);
+                routes.push((
+                    thread,
+                    ThreadState {
+                        harness_thread_id: harness_thread_id.clone(),
+                        activation,
+                        sender: Some(sender),
+                        receiver: None,
+                        phase: RoutePhase::Attaching,
+                        pending: Vec::new(),
+                    },
+                ));
+                (
+                    ThreadHandle::opened(thread, harness_thread_id, workspace_root),
+                    AgentEventStream::new(receiver),
+                    activation,
+                )
+            };
+        drop(routes);
+        Ok(self.attachment(handle, stream, activation))
+    }
 }
 
 impl Default for ReplayHarness {
@@ -261,7 +484,12 @@ impl AgentHarness for ReplayHarness {
         Ok(())
     }
 
-    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
+    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadAttachment, HarnessError> {
+        if self.shutdown_called.load(Ordering::SeqCst) {
+            return Err(HarnessError::Transport(
+                "replay harness is shut down".into(),
+            ));
+        }
         let harness_thread_id = opts
             .resume
             .clone()
@@ -281,22 +509,75 @@ impl AgentHarness for ReplayHarness {
             remap_event_thread(event, thread_id);
         }
 
-        let (tx, _) = broadcast::channel(256);
-        let mut threads = self.threads.lock().await;
+        let (tx, rx) = broadcast::channel(256);
+        let activation = self.next_activation.fetch_add(1, Ordering::Relaxed);
+        let mut threads = Self::route_lock(&self.threads)?;
+        if let Some((bound_thread, _)) = threads.iter().find(|(bound_thread, state)| {
+            *bound_thread != thread_id && state.harness_thread_id == harness_thread_id
+        }) {
+            return Err(HarnessError::Protocol(format!(
+                "native replay thread {harness_thread_id} is already bound to {bound_thread}"
+            )));
+        }
+        if let Some((_, state)) = threads.iter().find(|(bound_thread, state)| {
+            *bound_thread == thread_id && state.harness_thread_id != harness_thread_id
+        }) {
+            return Err(HarnessError::Protocol(format!(
+                "replay thread {thread_id} is already bound to native thread {}",
+                state.harness_thread_id
+            )));
+        }
+        if threads.iter().any(|(id, state)| {
+            *id == thread_id && state.phase != RoutePhase::Tombstoned
+                || state.harness_thread_id == harness_thread_id
+                    && state.phase != RoutePhase::Tombstoned
+        }) {
+            return Err(HarnessError::Protocol(format!(
+                "replay route for thread {thread_id} or native thread {harness_thread_id} already exists"
+            )));
+        }
+        threads.retain(|(id, state)| {
+            !(*id == thread_id
+                && state.harness_thread_id == harness_thread_id
+                && state.phase == RoutePhase::Tombstoned)
+        });
         threads.push((
             thread_id,
             ThreadState {
-                sender: tx,
+                harness_thread_id: harness_thread_id.clone(),
+                activation,
+                sender: Some(tx),
+                receiver: None,
+                phase: RoutePhase::Attaching,
                 pending,
             },
         ));
-
-        Ok(ThreadHandle {
+        drop(threads);
+        let handle = ThreadHandle {
             // A deterministic replay applies exactly the requested model, so echo it as
             // effective — this is what lets server tests exercise verified provider switches.
             resumed_model: Some(opts.initial_model.clone()),
             ..ThreadHandle::opened(thread_id, harness_thread_id, opts.workspace_root.clone())
-        })
+        };
+        Ok(self.attachment(handle, AgentEventStream::new(rx), activation))
+    }
+
+    async fn claim_native_thread(
+        &self,
+        thread: ThreadId,
+        harness_thread_id: String,
+        workspace_root: PathBuf,
+    ) -> Result<ThreadAttachment, HarnessError> {
+        self.claim_route(thread, harness_thread_id, workspace_root, false)
+    }
+
+    async fn reattach_native_thread(
+        &self,
+        thread: ThreadId,
+        harness_thread_id: String,
+        workspace_root: PathBuf,
+    ) -> Result<ThreadAttachment, HarnessError> {
+        self.claim_route(thread, harness_thread_id, workspace_root, true)
     }
 
     async fn start_turn(
@@ -308,9 +589,11 @@ impl AgentHarness for ReplayHarness {
         let turn_id = TurnId::new();
 
         // Emit all pending events for this thread into the broadcast channel.
-        let mut threads = self.threads.lock().await;
+        let mut threads = Self::route_lock(&self.threads)?;
         if let Some((_, state)) = threads.iter_mut().find(|(id, _)| *id == thread.thread) {
-            let sender = state.sender.clone();
+            let Some(sender) = state.sender.clone() else {
+                return Err(HarnessError::ThreadNotFound(thread.thread));
+            };
             let events = std::mem::take(&mut state.pending);
             drop(threads);
 
@@ -324,19 +607,6 @@ impl AgentHarness for ReplayHarness {
         }
 
         Ok(turn_id)
-    }
-
-    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        // We need to get the sender synchronously. Use try_lock.
-        let threads = self.threads.try_lock();
-        if let Ok(threads) = threads
-            && let Some((_, state)) = threads.iter().find(|(id, _)| *id == thread.thread)
-        {
-            return AgentEventStream::new(state.sender.subscribe());
-        }
-        // Fallback: create a dummy channel.
-        let (_, rx) = broadcast::channel(1);
-        AgentEventStream::new(rx)
     }
 
     async fn respond_approval(
@@ -360,11 +630,13 @@ impl AgentHarness for ReplayHarness {
     }
 
     async fn compact_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
-        let mut threads = self.threads.lock().await;
+        let mut threads = Self::route_lock(&self.threads)?;
         let Some((_, state)) = threads.iter_mut().find(|(id, _)| *id == thread.thread) else {
             return Err(HarnessError::ThreadNotFound(thread.thread));
         };
-        let sender = state.sender.clone();
+        let Some(sender) = state.sender.clone() else {
+            return Err(HarnessError::ThreadNotFound(thread.thread));
+        };
         let thread_id = thread.thread;
         drop(threads);
 
@@ -421,13 +693,35 @@ impl AgentHarness for ReplayHarness {
         Ok(())
     }
 
-    async fn delete_thread(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
-        Ok(())
+    async fn begin_delete_thread<'a>(
+        &'a self,
+        thread: &'a ThreadHandle,
+    ) -> Result<giskard_harness::ThreadRetirement<'a>, HarnessError> {
+        let mut threads = Self::route_lock(&self.threads)?;
+        let Some((_, state)) = threads.iter_mut().find(|(id, state)| {
+            *id == thread.thread && state.harness_thread_id == thread.harness_thread_id
+        }) else {
+            return Err(HarnessError::ThreadNotFound(thread.thread));
+        };
+        state.sender = None;
+        state.receiver = None;
+        state.pending.clear();
+        state.phase = RoutePhase::Tombstoned;
+        Ok(giskard_harness::ThreadRetirement::new(Box::pin(async {
+            Ok(ThreadDeletion::Retired)
+        })))
     }
 
     async fn shutdown(&self) -> Result<(), HarnessError> {
         if self.shutdown_called.swap(true, Ordering::SeqCst) {
             return Ok(());
+        }
+        let mut threads = Self::route_lock(&self.threads)?;
+        for (_, state) in threads.iter_mut() {
+            state.sender = None;
+            state.receiver = None;
+            state.pending.clear();
+            state.phase = RoutePhase::Tombstoned;
         }
         Ok(())
     }
@@ -461,6 +755,13 @@ mod tests {
     use giskard_core::token::TokenUsage;
     use giskard_core::turn::{Mode, TurnStatus, TurnStatusKind};
     use std::sync::Arc;
+
+    async fn delete_test_thread(
+        harness: &ReplayHarness,
+        handle: &ThreadHandle,
+    ) -> Result<ThreadDeletion, HarnessError> {
+        harness.begin_delete_thread(handle).await?.finish().await
+    }
 
     fn make_simple_fixture() -> ReplayFixture {
         let thread = ThreadId::new();
@@ -531,7 +832,7 @@ mod tests {
 
         let harness = Arc::new(ReplayHarness::from_fixture(fixture));
 
-        let handle = harness
+        let attachment = harness
             .open_thread(giskard_harness::OpenThreadOptions {
                 project: giskard_core::ProjectId::new(),
                 thread: _thread_id,
@@ -546,9 +847,8 @@ mod tests {
             })
             .await
             .unwrap();
-
-        // Subscribe before starting the turn.
-        let mut stream = harness.subscribe(&handle);
+        let handle = attachment.handle().clone();
+        let mut owner = attachment.commit().unwrap();
 
         let _turn_id = harness
             .start_turn(
@@ -565,7 +865,7 @@ mod tests {
 
         // Collect events.
         let mut events = Vec::new();
-        while let Ok(event) = stream.recv().await {
+        while let Ok(event) = owner.recv().await {
             let is_completed = matches!(event, AgentEvent::TurnCompleted { .. });
             events.push(event);
             if is_completed {
@@ -594,7 +894,7 @@ mod tests {
         let requested_thread = ThreadId::new();
         let harness = Arc::new(ReplayHarness::from_fixture(fixture));
 
-        let handle = harness
+        let attachment = harness
             .open_thread(giskard_harness::OpenThreadOptions {
                 project: giskard_core::ProjectId::new(),
                 thread: requested_thread,
@@ -609,9 +909,9 @@ mod tests {
             })
             .await
             .unwrap();
+        let handle = attachment.handle().clone();
         assert_eq!(handle.thread, requested_thread);
-
-        let mut stream = harness.subscribe(&handle);
+        let mut owner = attachment.commit().unwrap();
         harness
             .start_turn(
                 &handle,
@@ -626,7 +926,7 @@ mod tests {
             .unwrap();
 
         let mut events = Vec::new();
-        while let Ok(event) = stream.recv().await {
+        while let Ok(event) = owner.recv().await {
             let is_completed = matches!(event, AgentEvent::TurnCompleted { .. });
             events.push(event);
             if is_completed {
@@ -645,6 +945,231 @@ mod tests {
         let harness = ReplayHarness::new();
         harness.shutdown().await.unwrap();
         harness.shutdown().await.unwrap();
+    }
+
+    fn open_options(thread: ThreadId) -> OpenThreadOptions {
+        OpenThreadOptions {
+            project: giskard_core::ProjectId::new(),
+            thread,
+            workspace_root: "/tmp".into(),
+            resume: None,
+            updates: giskard_harness::thread_update_channel().0,
+            initial_model: ModelRef {
+                provider: "openai".into(),
+                model: "gpt-5.5".into(),
+                reasoning_effort: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_attachment_restores_the_exact_buffered_receiver() {
+        let harness = ReplayHarness::new();
+        let thread = ThreadId::new();
+        let attachment = harness.open_thread(open_options(thread)).await.unwrap();
+        let handle = attachment.handle().clone();
+        let sender = {
+            let routes = ReplayHarness::route_lock(&harness.threads).unwrap();
+            routes
+                .iter()
+                .find(|(id, _)| *id == thread)
+                .and_then(|(_, state)| state.sender.clone())
+                .unwrap()
+        };
+        sender
+            .send(AgentEvent::ThreadOpened {
+                thread,
+                harness_thread_id: handle.harness_thread_id.clone(),
+            })
+            .unwrap();
+
+        drop(attachment);
+        let reattached = harness
+            .claim_native_thread(
+                thread,
+                handle.harness_thread_id.clone(),
+                handle.workspace_root.clone(),
+            )
+            .await
+            .unwrap();
+        let mut owner = reattached.commit().unwrap();
+        assert!(matches!(
+            owner.recv().await.unwrap(),
+            AgentEvent::ThreadOpened { thread: event_thread, .. } if event_thread == thread
+        ));
+    }
+
+    #[tokio::test]
+    async fn repeated_native_claim_converges_when_proposed_thread_is_unbound() {
+        let harness = ReplayHarness::new();
+        let authoritative = ThreadId::new();
+        let first = harness
+            .open_thread(open_options(authoritative))
+            .await
+            .unwrap();
+        let native = first.handle().harness_thread_id.clone();
+        drop(first);
+
+        let converged = harness
+            .claim_native_thread(ThreadId::new(), native.clone(), "/tmp".into())
+            .await
+            .unwrap();
+        assert_eq!(converged.handle().thread, authoritative);
+        assert_eq!(converged.handle().harness_thread_id, native);
+    }
+
+    #[tokio::test]
+    async fn attaching_and_owned_replay_routes_allow_only_one_owner() {
+        let harness = ReplayHarness::new();
+        let thread = ThreadId::new();
+        let attachment = harness.open_thread(open_options(thread)).await.unwrap();
+        let handle = attachment.handle().clone();
+        assert!(
+            harness
+                .claim_native_thread(
+                    ThreadId::new(),
+                    handle.harness_thread_id.clone(),
+                    "/tmp".into(),
+                )
+                .await
+                .is_err()
+        );
+        let owner = attachment.commit().unwrap();
+        assert!(
+            harness
+                .claim_native_thread(
+                    ThreadId::new(),
+                    handle.harness_thread_id.clone(),
+                    "/tmp".into(),
+                )
+                .await
+                .is_err()
+        );
+        drop(owner);
+        assert!(
+            harness
+                .claim_native_thread(ThreadId::new(), handle.harness_thread_id, "/tmp".into())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_open_cannot_rebind_a_tombstoned_native_identity() {
+        let harness = ReplayHarness::new();
+        let original = ThreadId::new();
+        let attachment = harness.open_thread(open_options(original)).await.unwrap();
+        let handle = attachment.handle().clone();
+        delete_test_thread(&harness, &handle).await.unwrap();
+        drop(attachment);
+
+        let mut mismatched = open_options(ThreadId::new());
+        mismatched.resume = Some(handle.harness_thread_id.clone());
+        assert!(harness.open_thread(mismatched).await.is_err());
+
+        let mut exact = open_options(original);
+        exact.resume = Some(handle.harness_thread_id);
+        assert!(harness.open_thread(exact).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_closes_delivery_and_late_owner_drop_cannot_reactivate_it() {
+        let harness = ReplayHarness::new();
+        let thread = ThreadId::new();
+        let attachment = harness.open_thread(open_options(thread)).await.unwrap();
+        let handle = attachment.handle().clone();
+        let mut owner = attachment.commit().unwrap();
+
+        assert!(matches!(
+            delete_test_thread(&harness, &handle).await.unwrap(),
+            ThreadDeletion::Retired
+        ));
+        assert!(matches!(
+            owner.recv().await,
+            Err(broadcast::error::RecvError::Closed)
+        ));
+        drop(owner);
+        let error = harness
+            .claim_native_thread(thread, handle.harness_thread_id, handle.workspace_root)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("tombstoned"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_delivery_and_late_attachment_drop_is_inert() {
+        let harness = ReplayHarness::new();
+        let thread = ThreadId::new();
+        let attachment = harness.open_thread(open_options(thread)).await.unwrap();
+        let handle = attachment.handle().clone();
+
+        harness.shutdown().await.unwrap();
+        drop(attachment);
+        let error = harness
+            .claim_native_thread(thread, handle.harness_thread_id, handle.workspace_root)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("shut down"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn poisoned_route_drop_closes_state_and_next_operation_reports_fatal_error() {
+        let harness = ReplayHarness::new();
+        let thread = ThreadId::new();
+        let attachment = harness.open_thread(open_options(thread)).await.unwrap();
+        let authority = harness.threads.clone();
+        let poisoner = std::thread::spawn(move || {
+            let _guard = authority.lock().unwrap();
+            panic!("poison replay route authority");
+        });
+        assert!(poisoner.join().is_err());
+
+        drop(attachment);
+        {
+            let routes = match harness.threads.lock() {
+                Ok(_) => panic!("replay authority should remain poisoned"),
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            assert!(routes.is_empty());
+        }
+        let error = harness
+            .open_thread(open_options(ThreadId::new()))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HarnessError::Transport(_)), "{error}");
+        assert!(error.to_string().contains("lock poisoned"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn poisoned_route_operation_closes_live_delivery_before_returning_error() {
+        let harness = ReplayHarness::new();
+        let attachment = harness
+            .open_thread(open_options(ThreadId::new()))
+            .await
+            .unwrap();
+        let mut owner = attachment.commit().unwrap();
+        let authority = harness.threads.clone();
+        let poisoner = std::thread::spawn(move || {
+            let _guard = authority.lock().unwrap();
+            panic!("poison replay route authority");
+        });
+        assert!(poisoner.join().is_err());
+
+        let error = harness
+            .open_thread(open_options(ThreadId::new()))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HarnessError::Transport(_)), "{error}");
+        assert!(error.to_string().contains("authority closed"), "{error}");
+        assert!(matches!(
+            owner.recv().await,
+            Err(broadcast::error::RecvError::Closed)
+        ));
+        let routes = match harness.threads.lock() {
+            Ok(_) => panic!("replay authority should remain poisoned"),
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert!(routes.is_empty());
     }
 
     #[tokio::test]

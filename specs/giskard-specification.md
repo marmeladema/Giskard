@@ -11,16 +11,36 @@
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
 **Version:** 1.77
 
+> **Amendment — traffic-driven native route discovery (1.77).** Eligible Codex traffic may claim
+> an unknown non-empty native thread ID before parent evidence arrives. The first claim atomically
+> establishes identity and a broadcast route whose initial receiver is retained until durable
+> metadata and its long-lived owner exist. One `CodexRouteAuthority` owns the native/Giskard
+> bijection, activation or tombstone, sender and retained receiver, and bounded discovery admission.
+> `CodexMapper` retains no native route map. Receiver custody is linear: route-owned receiver →
+> `DiscoveryTicket` → `ThreadAttachment` → `ThreadEventOwner` → forwarder or persistence-blocked
+> coordinator. Capability drops synchronously restore only their exact active route. Parent-driven
+> and traffic-driven claims converge on the same authoritative `ThreadId`. Native deletion
+> tombstones delivery before provider I/O; traffic and parent claims cannot reactivate it, while an
+> authoritative explicit open creates a fresh activation and receiver.
+> `ThreadEventOwner` makes its receiver and synchronous return callback inseparable to safe code.
+> Normal owner exit therefore returns the exact receiver by construction; no synthetic tail
+> subscriber is needed. If the activation was deleted, shut down, or destroyed, the late return is
+> intentionally stale and cannot recreate it.
+
 > **Amendment — durable native identity foundation (1.77).** Harness construction receives a
 > complete, validated `HarnessBootstrap` before the adapter launches ordinary event dispatch; a failed scan,
 > empty native ID, or non-bijective native/local mapping prevents publication. Every first binding
-> is an authoritative, idempotent route claim with one harness-lifetime epoch. Provider-owned child
-> discovery claims a final Giskard ID without `thread/resume` or other native work; conflicting
-> claims fail instead of rekeying. A relationship not yet known is represented durably as hidden,
+> is an authoritative, idempotent route claim in one harness-process authority. Provider-owned child
+> discovery claims a final Giskard ID without `thread/resume` or other native work. A repeated
+> native ID returns its authoritative route even when proposed with another fresh ID; a new native
+> ID proposed for an already-bound Giskard ID fails instead of rekeying. A relationship not yet
+> known is represented durably as hidden,
 > read-only `ThreadKind::Orphan`, whose only transition is a revision-checked
 > `Orphan -> Subagent`. Native model/mode metadata that has not been reported is persisted and sent
 > on the wire as `TurnModel::Unknown` / `TurnMode::Unknown` (`"unknown"`), never as a fabricated
 > provider, model, or default mode. Its usage remains in totals under an unattributed bucket.
+> Durable orphan creation emits the ordinary catalog invalidation, but catalog visibility filtering
+> continues to hide it until classification.
 
 > **Amendment — long-lived native event ownership (1.76).** Every loaded native thread has one
 > coordinator and one long-lived event-stream owner. Starting a turn or compaction records a
@@ -831,13 +851,25 @@ authoritative replacement runtime overview.
   being drained. A `TurnCompleted` only ends the currently drained stream when the completed event
   belongs to that same thread; foreign-thread lifecycle events must not terminate or release another
   thread's forwarder.
-- **WS5:** After at least one native Codex thread id is registered, non-empty unknown native
-  `threadId` values are unroutable. The harness must reject/drop them with an operator-visible warning
-  instead of falling back to the caller's scoped thread. Omitted `threadId` values may still use the
-  scoped fallback for global/threadless notifications and requests.
+- **WS5:** Eligible traffic carrying an unknown non-empty native `threadId` claims one authoritative
+  route and is never relabeled as the caller's scoped fallback. Notifications are classified by an
+  exhaustive borrowed match and claim their typed native ID before one mapping attempt. Server
+  requests likewise establish their eligible native scope before one prepared mapping attempt.
+  Status changes to `NotLoaded`,
+  deletion-only notifications, empty IDs, and unknown protocol methods do not claim routes. Omitted
+  `threadId` values may still use the scoped fallback for global messages. Discovery delivery marks
+  one bounded, non-cloneable ticket for that route. Under the project materialization permit the
+  consumer claims that ticket into an attachment before persistence. Dropping the ticket or
+  attachment restores the exact receiver so later eligible traffic can retry.
 - **WS6:** Reopening an already-open Giskard thread must preserve the existing per-thread harness
-  sender/subscriptions. Metadata normalization while opening a thread may update persisted thread
-  state, but it must not force a second native open or replace the live sender.
+  channel and retained first receiver. Harness subscription is not independently available: owner
+  recovery must return and reclaim that exact receiver through the linear capabilities.
+  Fresh Primary creation holds the project materialization permit through native open, durable
+  Primary metadata creation, and Live owner installation; no bare coordinator is classification
+  evidence. Explicit reopen may reactivate an exact deletion tombstone with a fresh activation and
+  delivery channel, while traffic and parent claims may not.
+  Metadata normalization while opening a thread may update persisted thread state, but it must not
+  force a second native open or replace the live route.
 
 **Changelog (1.31 → 1.32), thread reasoning-effort selector:**
 - **RE1:** The thread header shows an `Effort` selector immediately after the model picker when the
@@ -1509,9 +1541,10 @@ A single Cargo workspace with focused crates. Names are prefixed `giskard-`.
     Codex 0.142.x. Not recommended unless only types are needed and `codex-codes`' `types` feature
     is somehow unsuitable.
 
-  **Decision: use `codex-codes` with the `async-client` feature.** Its API maps directly onto the
-  `AgentHarness` trait; Giskard wraps `next_message()` into a `broadcast::Sender<AgentEvent>` for
-  multi-subscriber support and maps `codex-codes` types to `giskard-core` types at the boundary.
+  **Decision: use `codex-codes` protocol and client support.** Giskard maps its protocol types to
+  `giskard-core` at the boundary. One `CodexRouteAuthority` owns each native/local route and its
+  broadcast sender plus single retained receiver; the receiver is transferred linearly rather than
+  recreated through independent subscriptions.
   If a future Codex CLI version diverges beyond what `codex-codes` tracks, fall back to a minimal
   hand-rolled JSON-RPC client inside `giskard-harness-codex`. **Either way, all Codex/app-server
   types must be confined to `giskard-harness-codex`** (nothing Codex-specific leaks upward) and the
@@ -1660,7 +1693,31 @@ pub trait AgentHarness: Send + Sync {
     async fn open_thread(
         &self,
         opts: OpenThreadOptions,
-    ) -> Result<ThreadHandle, HarnessError>;
+    ) -> Result<ThreadAttachment, HarnessError>;
+
+    /// Claim a provider-owned child without starting native work.
+    async fn claim_native_thread(
+        &self,
+        thread: ThreadId,
+        harness_thread_id: String,
+        workspace_root: PathBuf,
+    ) -> Result<ThreadAttachment, HarnessError>;
+
+    /// Explicitly reattach an exact durable provider thread. This operation is independently
+    /// implemented because, unlike an ordinary claim, it may reactivate an exact tombstone.
+    async fn reattach_native_thread(
+        &self,
+        thread: ThreadId,
+        harness_thread_id: String,
+        workspace_root: PathBuf,
+    ) -> Result<ThreadAttachment, HarnessError>;
+
+    /// Consume one bounded traffic-discovery ticket into its exact retained receiver.
+    async fn claim_discovered_thread(
+        &self,
+        ticket: DiscoveryTicket,
+        workspace_root: PathBuf,
+    ) -> Result<ThreadAttachment, HarnessError>;
 
     /// Start a turn: send user input, applying per-turn overrides (model, mode).
     async fn start_turn(
@@ -1669,10 +1726,6 @@ pub trait AgentHarness: Send + Sync {
         input: UserInput,
         overrides: TurnOverrides,
     ) -> Result<TurnId, HarnessError>;
-
-    /// Subscribe to the stream of neutral events for a thread.
-    /// Implemented as a broadcast/mpsc receiver of `AgentEvent`.
-    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream;
 
     /// Respond to a pending approval request (no-op error if unsupported).
     async fn respond_approval(
@@ -1708,8 +1761,12 @@ pub trait AgentHarness: Send + Sync {
         archived: bool,
     ) -> Result<(), HarnessError>;
 
-    /// Delete a durable thread in the underlying harness.
-    async fn delete_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError>;
+    /// Commit route retirement before returning separately owned provider cleanup work.
+    /// A plain error means retirement did not commit.
+    async fn begin_delete_thread<'a>(
+        &self,
+        thread: &'a ThreadHandle,
+    ) -> Result<ThreadRetirement<'a>, HarnessError>;
 
     /// Cleanly shut down the harness (terminate child process, flush).
     /// Takes `&self` (not `self: Arc<Self>`) so the trait stays object-safe and is
@@ -1718,7 +1775,18 @@ pub trait AgentHarness: Send + Sync {
     /// as no-ops. The child process is also terminated on `Drop` as a safety net.
     async fn shutdown(&self) -> Result<(), HarnessError>;
 }
+
+pub enum ThreadDeletion {
+    Retired,
+    RetiredWithProviderError(HarnessError),
+}
+
+pub struct ThreadRetirement<'a> { /* linear provider-cleanup future */ }
 ```
+
+The registry retires the exact coordinator immediately after `begin_delete_thread` succeeds, then
+awaits `ThreadRetirement::finish`. Thus a slow or failed provider delete cannot leave a reusable
+coordinator for an activation whose route is already tombstoned.
 
 > **Object-safety note.** Every method above is dyn-compatible: `&self` receivers, no
 > generic method params, no `Self`-by-value. The whole application holds harnesses as
@@ -2102,8 +2170,13 @@ including while `PersistenceBlocked`; persisted lookup targets the selected turn
 post-persistence late tool completion remains ignored and is logged until durable late-item
 amendments are implemented.
 
-> `AgentEventStream` is `impl Stream<Item = AgentEvent> + Send` (concretely a wrapper over a
-> `tokio::sync::broadcast::Receiver<AgentEvent>`), supporting multiple subscribers per thread.
+> `AgentEventStream` wraps one `tokio::sync::broadcast::Receiver<AgentEvent>`. The harness route
+> retains that receiver until a `ThreadAttachment` transfers it into the sole `ThreadEventOwner`;
+> it is not available through an independent subscription API.
+> Poisoning of an identity/receiver authority is a fatal harness failure: the implementation closes
+> its route delivery state and surfaces a typed error rather than recovering potentially partial
+> state. A capability-drop callback, which cannot return an error itself, closes the authority and
+> leaves the next fallible harness operation to report that failure.
 
 ### 4.6 Codex mapping (informative)
 
@@ -3681,11 +3754,14 @@ logged at error level with structured fields sufficient to diagnose the harness 
 dumping the full event payload.
 
 **Harness routing invariant (WS4/WS5/WS6):** harness adapters must route every mapped native event by
-the mapped `AgentEvent.thread` before it reaches the server forwarder. If a native message carries a
-non-empty unknown native thread id after native-thread registration has begun, the adapter treats it
-as unroutable and logs/rejects it rather than relabeling it as the current fallback thread. Reopening
-an already-open thread reuses the existing per-thread sender so live subscribers and forwarders are
-not orphaned by metadata refreshes or duplicate open requests.
+the mapped `AgentEvent.thread` before it reaches the server forwarder. If an eligible native message
+carries a non-empty unknown native thread id, the adapter claims and announces one route; it never
+relabels it as the current fallback thread. Notifications use an exhaustive borrowed match to
+classify every typed variant, then claim the directly borrowed native ID before one mapping attempt.
+Server requests establish their eligible native scope before one prepared mapping attempt. Identity
+and delivery are established atomically by `CodexRouteAuthority` before mapping. Reopening or
+rediscovering a thread transfers the retained receiver through a ticket, attachment, and owner so
+duplicate opens or parent/discovery races cannot create a second delivery stream.
 
 **Transcript visibility invariant (E7/E8/E9):** every finalized item payload with user-observable
 meaning is rendered as a transcript row. `FileChange`, `ToolCall`, and `Activity` are visible rows;

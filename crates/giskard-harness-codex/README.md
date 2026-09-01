@@ -18,14 +18,25 @@ receivers, and worker lifecycle. It serves every native thread on that process a
 the Primary/sub-agent hierarchy. Helper futures borrow its protocol state through `&mut self`; no
 independent worker mutates that state.
 
-`CodexTransport` remains the mockable request/read abstraction. `SenderMap` remains shared only
-because synchronous `AgentHarness::subscribe` must read it; `CodexInstance` is its sole runtime
-lifecycle mutator. It also owns route establishment: durable bootstrap, explicit open/resume, and
-provider-owned child claims all use the same primitive. That operation claims identity before
-publishing the broadcast sender, and an idempotent claim preserves the existing sender.
+`CodexTransport` remains the mockable request/read abstraction. `CodexRouteAuthority` is the one
+process-local authority for native/Giskard identity, active delivery or tombstone state, sender and
+retained receiver custody, and discovery admission. Its synchronized transitions are short and
+non-async; no provider I/O or persistence occurs under its lock. `CodexMapper` owns only
+turn/item/request correlation and receives an active route capability before it maps thread-scoped
+traffic. Durable bootstrap, explicit open/resume, provider-owned child claims, and eligible native
+traffic all establish routes through this authority.
+
+Receiver custody is linear: route-owned receiver → `DiscoveryTicket` → `ThreadAttachment` →
+`ThreadEventOwner` → event forwarder or persistence-blocked coordinator. Dropping a ticket,
+attachment, or reusable owner synchronously returns only its exact active route; stale drops after
+replacement, deletion, or shutdown do nothing.
+`ThreadEventOwner` keeps its stream and return callback private and inseparable, so safe code cannot
+lose only the receiver. A synthetic fresh-tail subscriber is therefore unnecessary: ordinary exit
+returns the exact receiver, while route deletion, harness shutdown, or process destruction makes a
+late return intentionally inert.
 When a bootstrapped native resume fails because its rollout disappeared, the instance atomically
-replaces that exact native/Giskard binding with the fresh session identity, advances its route
-epoch, and preserves the delivery sender.
+replaces that exact native/Giskard binding with a fresh activation. A receiver is preserved only
+when it belongs to the exact replaceable unattached route.
 
 ## Identifier model
 
@@ -67,9 +78,8 @@ Codex threadId
 ```
 
 Retained Codex identities use adapter-local newtypes and named composite keys. String identities
-convert back to strings only at harness-neutral, wire, persistence, and logging boundaries; route
-epochs similarly return to their plain numeric representation at the existing harness boundary.
-This keeps the opaque domains distinct without changing their protocol representation.
+convert back to strings only at harness-neutral, wire, persistence, and logging boundaries. This
+keeps the opaque domains distinct without changing their protocol representation.
 
 ### Where the thread mapping comes from
 
@@ -94,24 +104,37 @@ first. Pre-registration removes the second identity rather than reconciling it.
 **On claim or open.** `claim_native_thread` binds a provider-owned child without
 issuing `thread/resume`, starting work, or fabricating model metadata. `open_thread`
 binds the native id it explicitly started or resumed to the authoritative
-`OpenThreadOptions::thread` supplied by Giskard. Live opens never discover or mint a Giskard
-identity from a native id.
+`OpenThreadOptions::thread` supplied by Giskard.
 
-**Never inferred from traffic.** A non-empty native thread id that resolves to
-nothing is a routing failure, reported as such. It is only attributed to the
-caller's fallback thread while the adapter knows of no threads at all — which,
-for a project with persisted threads, stops being true the moment its harness is
-created.
+**Discovered from traffic.** Live `thread/status/changed` and `thread/started` frames are the
+preferred introduction signals. Any other supported thread-scoped notification or server request
+that names an unknown native ID is a safety net. Notifications are classified with an exhaustive
+borrowed match over every typed protocol variant and claim their direct `threadId` before one
+mapping attempt. Server requests establish their eligible native scope before one prepared mapping
+attempt.
+Non-empty native IDs are never assigned to a fallback thread. Repeated claims of one native ID
+converge on its authoritative `ThreadId`, including when parent materialization proposed another
+fresh ID.
 
-Every first binding receives a monotonically allocated route epoch for that
-adapter lifetime. Repeating the same native/local pair is idempotent; binding
-either side to a different identity is a protocol error and never rekeys state.
-These registries belong to one `CodexInstance` and are rebuilt from durable
-bootstrap when its Codex app-server process is respawned. Durable Giskard IDs
+Repeating a native ID returns its authoritative existing route, even when the caller proposed
+another unbound Giskard ID. A new native
+ID proposed for an already-bound Giskard ID is a protocol error and never
+rekeys state.
+The route authority and the `CodexInstance`-owned correlation registries are rebuilt from durable
+bootstrap when the Codex app-server process is respawned. Durable Giskard IDs
 and completed transcript items remain in Giskard persistence; native
-live-process state does not. Deleting a thread removes its delivery sender but preserves its native
-identity claim for the lifetime of that Codex process; an identical later claim recreates the
-sender, while a conflicting identity remains an error.
+live-process state does not. Discovery announcements use a bounded channel and at most one pending
+ticket per route, and pending admission is serviced before further stdout. The consumer takes its
+project materialization permit and consumes the ticket into an attachment before persistence and
+owner installation. Failure or cancellation drops the ticket or attachment and restores the exact
+receiver for later traffic. Deletion leaves a tombstone without delivery. Traffic and parent claims
+cannot reactivate it; an authoritative explicit open can create a fresh activation and receiver.
+Deletion is two-step at the harness boundary: `begin_delete_thread` returns after the actor commits
+the tombstone and purges mapper correlations. The registry retires that activation's event owner
+before awaiting provider cleanup, so provider failure cannot leave the old coordinator reusable.
+Poisoning of the route-authority or exclusive discovery-receiver lock is fatal: the adapter closes
+all route delivery and returns a typed transport failure instead of recovering partial authority
+state.
 
 The turn key includes the Giskard thread because Codex does not expose a
 protocol contract making turn IDs globally unique across threads. The item key

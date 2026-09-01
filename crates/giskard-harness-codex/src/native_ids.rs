@@ -48,35 +48,6 @@ impl Borrow<str> for NativeThreadId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) struct NativeRouteEpoch(u64);
-
-impl NativeRouteEpoch {
-    pub(super) fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    pub(super) fn into_inner(self) -> u64 {
-        self.0
-    }
-
-    pub(super) fn checked_next(self) -> Option<Self> {
-        self.0.checked_add(1).map(Self)
-    }
-}
-
-impl Default for NativeRouteEpoch {
-    fn default() -> Self {
-        Self::new(0)
-    }
-}
-
-impl fmt::Display for NativeRouteEpoch {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct NativeTurnKey {
     pub(super) thread_id: ThreadId,

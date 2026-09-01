@@ -3,6 +3,8 @@
 //! thread under it — but only when the harness *confirms* the switch. An unconfirmed switch is
 //! rejected with `thread_provider_switch_ignored` and persists nothing.
 
+mod support;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -15,12 +17,13 @@ use giskard_core::model::{ModelDescriptor, ModelRef};
 use giskard_core::token::{TokenLedger, TokenUsage};
 use giskard_core::turn::{Mode, PermissionPreset, Turn, TurnStatus, TurnStatusKind};
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+    AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadAttachment, ThreadHandle,
 };
 use giskard_persist::store::{ProjectConfig, ThreadFile, ThreadGitWorkspace, ThreadWorktree};
 use giskard_proto::ClientMessage;
 use giskard_server::{AppState, HarnessFactory, build_app};
-use tokio::sync::{Mutex, broadcast};
+use support::TestEventRoute;
+use tokio::sync::Mutex;
 
 const DEAD_PROVIDER: &str = "cloudflare-litellm";
 const NEW_PROVIDER: &str = "opencodex";
@@ -31,11 +34,17 @@ const NEW_PROVIDER: &str = "opencodex";
 struct SwitchHarness {
     report_provider: Option<String>,
     opened_workspace_roots: Arc<Mutex<Vec<String>>>,
-    events: broadcast::Sender<giskard_core::event::AgentEvent>,
+    route: TestEventRoute,
 }
 
 #[async_trait::async_trait]
 impl AgentHarness for SwitchHarness {
+    async fn begin_delete_thread<'a>(
+        &'a self,
+        thread: &'a ThreadHandle,
+    ) -> Result<giskard_harness::ThreadRetirement<'a>, HarnessError> {
+        giskard_harness::unsupported_thread_retirement(thread)
+    }
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities::default()
     }
@@ -44,7 +53,7 @@ impl AgentHarness for SwitchHarness {
         Ok(Vec::new())
     }
 
-    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
+    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadAttachment, HarnessError> {
         self.opened_workspace_roots
             .lock()
             .await
@@ -62,7 +71,7 @@ impl AgentHarness for SwitchHarness {
             effective.provider = provider.clone();
         }
         let thread = opts.thread;
-        Ok(ThreadHandle {
+        self.route.attach(ThreadHandle {
             resumed_model: Some(effective),
             ..ThreadHandle::opened(
                 thread,
@@ -79,10 +88,6 @@ impl AgentHarness for SwitchHarness {
         _overrides: giskard_core::turn::TurnOverrides,
     ) -> Result<TurnId, HarnessError> {
         Err(HarnessError::Unsupported("no turns in this test".into()))
-    }
-
-    fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-        AgentEventStream::new(self.events.subscribe())
     }
 
     async fn respond_approval(
@@ -108,6 +113,7 @@ impl AgentHarness for SwitchHarness {
     }
 
     async fn shutdown(&self) -> Result<(), HarnessError> {
+        self.route.close();
         Ok(())
     }
 }
@@ -115,7 +121,6 @@ impl AgentHarness for SwitchHarness {
 struct SwitchFactory {
     report_provider: Option<String>,
     opened_workspace_roots: Arc<Mutex<Vec<String>>>,
-    events: broadcast::Sender<giskard_core::event::AgentEvent>,
 }
 
 #[async_trait::async_trait]
@@ -128,7 +133,7 @@ impl HarnessFactory for SwitchFactory {
         Ok(Arc::new(SwitchHarness {
             report_provider: self.report_provider.clone(),
             opened_workspace_roots: self.opened_workspace_roots.clone(),
-            events: self.events.clone(),
+            route: TestEventRoute::new(8),
         }))
     }
 }
@@ -305,13 +310,11 @@ model_listing = false
         .unwrap();
 
     let opened_workspace_roots = Arc::new(Mutex::new(Vec::new()));
-    let (events, _) = broadcast::channel(8);
     let state = AppState::new(
         store,
         Arc::new(SwitchFactory {
             report_provider,
             opened_workspace_roots: opened_workspace_roots.clone(),
-            events,
         }),
         (0..32u8).collect(),
     );

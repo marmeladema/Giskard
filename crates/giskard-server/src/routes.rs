@@ -504,7 +504,7 @@ async fn delete_project(
     }
     state
         .registry
-        .delete_project(id)
+        .delete_project(&_lifecycle_guard, id)
         .await
         .map_err(harness_api_error)?;
     state.registry.remove_project_model_catalog(id).await;
@@ -664,19 +664,10 @@ async fn open_thread(
             "primary thread {thread_id} has no authoritative model"
         )));
     }
-    if let Some(binding) = state.registry.loaded_thread_binding(thread_id).await {
-        let handle = binding.handle();
-        return Ok(Json(OpenThreadResponse {
-            thread_id: handle.thread,
-            harness_thread_id: handle.harness_thread_id.clone(),
-            warning: None,
-        }));
-    }
-
     // A thread with a worktree is opened against that worktree, not the project's checkout — and
-    // a sub-agent against its parent's, which is where the harness ran it. Resolved after the
-    // early return above: an already-attached thread is the common case for this endpoint, and
-    // the lookup walks the ownership chain reading persisted parents to answer.
+    // a sub-agent against its parent's, which is where the harness ran it. The registry validates
+    // any reusable Live owner under the project materialization permit; this route must not accept
+    // an arbitrary coordinator snapshot as proof of a reusable owner.
     let ws_root = effective_workspace_root(&state.store, &project_config, &thread_file).await?;
 
     // Opening an existing thread must not hard-fail when the harness can't attach — most
@@ -838,7 +829,8 @@ async fn start_thread_with_message(
     let project_ws_root = project_config
         .workspace_root
         .as_deref()
-        .unwrap_or(&project_config.dir);
+        .unwrap_or(&project_config.dir)
+        .to_owned();
     let thread_id = ThreadId::new();
     info!(
         %project_id,
@@ -851,148 +843,38 @@ async fn start_thread_with_message(
         "starting new thread from initial user message"
     );
 
-    // The worktree has to exist before the harness opens the thread, because it *is* the cwd the
-    // harness is opened against. A failure here fails the whole request rather than falling back to
-    // the project's checkout: a thread that silently runs unisolated still looks isolated in the UI,
-    // which is the one outcome worse than an error the user can act on.
-    let worktree = match req.git_strategy {
-        GitStrategy::Shared => None,
-        GitStrategy::Worktree => {
-            let path = crate::worktree::worktree_path(
-                state.store.data_dir(),
-                &project_id.to_string(),
-                thread_id,
-            );
-            let branch = crate::worktree::branch_name(thread_id);
-            match crate::worktree::create(Path::new(project_ws_root), &path, &branch).await {
-                Ok(worktree) => {
-                    info!(%project_id, %thread_id, branch, path = %path.display(), "created thread worktree");
-                    Some(worktree)
-                }
-                Err(error) => {
-                    warn!(%project_id, %thread_id, branch, %error, "could not create thread worktree");
-                    return Err(match error {
-                        crate::worktree::WorktreeError::Unavailable(message) => {
-                            ApiError::Unavailable(message)
-                        }
-                        other => ApiError::BadRequest(other.to_string()),
-                    });
-                }
-            }
-        }
-    };
-    let ws_root = worktree
-        .as_ref()
-        .map(|w| w.workspace_root())
-        .unwrap_or(project_ws_root);
-
-    let handle = match state
-        .registry
-        .open_thread(&project_config, ws_root, thread_id, None, model_ref.clone())
-        .await
-    {
-        Ok(handle) => handle,
-        Err(error) => {
-            remove_worktree_after_start_failure(worktree.as_ref(), thread_id, "open_thread").await;
-            return Err(harness_api_error(error));
-        }
-    };
-    if handle.thread != thread_id {
-        cleanup_new_thread_after_start_failure(
-            &state,
-            &project_config,
-            handle.thread,
-            handle.harness_thread_id.clone(),
-            false,
-            "open_thread_mismatch",
-        )
-        .await;
-        remove_worktree_after_start_failure(worktree.as_ref(), thread_id, "open_thread_mismatch")
-            .await;
-        let detail = format!(
-            "harness opened wrong thread: expected {thread_id}, got {}",
-            handle.thread
-        );
-        warn!(%project_id, %thread_id, detail, "new thread open returned mismatched thread id");
-        return Err(ApiError::Internal(detail));
-    }
-
-    let now = Utc::now();
     let title = if text.is_empty() {
         thread_title_from_attachments(&req.attachments)
     } else {
         thread_title_from_first_prompt(&text)
     };
-    let thread_file = ThreadFile {
-        revision: 0,
-        version: giskard_persist::store::THREAD_METADATA_VERSION,
-        id: thread_id,
-        project_id,
-        title: title.clone(),
-        harness_thread_id: handle.harness_thread_id.clone(),
-        parent_thread_id: None,
-        spawned_by_turn_id: None,
-        kind: ThreadKind::Primary,
-        mode: TurnMode::Known(req.mode),
-        current_model: TurnModel::Known(model_ref.clone()),
-        context_window: model_descriptor.context_window,
-        model_context_windows: std::collections::HashMap::new(),
-        permission_preset: req.permission_preset,
-        model_efforts: std::collections::HashMap::new(),
-        tokens: giskard_core::token::TokenLedger::default(),
-        created_at: now,
-        updated_at: now,
-        archived: false,
-        git_workspace: worktree.clone().map(ThreadGitWorkspace::Worktree),
-    };
-
-    let thread_file = match state.thread_metadata.create(project_id, thread_file).await {
-        Ok(thread_file) => thread_file,
-        Err(error) => {
-            cleanup_new_thread_after_start_failure(
-                &state,
-                &project_config,
-                thread_id,
-                handle.harness_thread_id.clone(),
-                false,
-                "save_thread",
-            )
-            .await;
-            remove_worktree_after_start_failure(worktree.as_ref(), thread_id, "save_thread").await;
-            return Err(ApiError::Internal(error.to_string()));
-        }
-    };
-
     let overrides = TurnOverrides {
         model: Some(model_ref.clone()),
         mode: req.mode,
         permission_preset: req.permission_preset,
     };
-    let turn_id = match state
+    let started = state
         .registry
-        .start_turn(
+        .create_primary_and_start(
+            project_config,
+            project_ws_root,
             thread_id,
+            model_ref.clone(),
+            crate::registry::NewPrimaryThread {
+                title: title.clone(),
+                mode: TurnMode::Known(req.mode),
+                permission_preset: req.permission_preset,
+                context_window: model_descriptor.context_window,
+                git_workspace: None,
+            },
+            req.git_strategy,
             UserInput::text_with_attachments(text, req.attachments),
             overrides,
-            model_ref.clone(),
         )
         .await
-    {
-        Ok(turn_id) => turn_id,
-        Err(error) => {
-            cleanup_new_thread_after_start_failure(
-                &state,
-                &project_config,
-                thread_id,
-                handle.harness_thread_id.clone(),
-                true,
-                "start_turn",
-            )
-            .await;
-            remove_worktree_after_start_failure(worktree.as_ref(), thread_id, "start_turn").await;
-            return Err(harness_api_error(error));
-        }
-    };
+        .map_err(harness_api_error)?;
+    let handle = started.handle;
+    let turn_id = started.turn_id;
 
     let warning = handle.warning.as_ref().map(|warning| {
         warning_info(
@@ -1003,11 +885,6 @@ async fn start_thread_with_message(
             "start_thread",
         )
     });
-
-    state
-        .thread_metadata
-        .publish_created(project_id, &thread_file)
-        .await;
 
     Ok(Json(StartThreadResponse {
         thread_id,
@@ -1583,98 +1460,6 @@ fn project_workspace_root(project: &ProjectConfig) -> &str {
     project.workspace_root.as_deref().unwrap_or(&project.dir)
 }
 
-/// Unwind the worktree created for a thread whose startup then failed.
-///
-/// The worktree is created before the harness is opened, so every later failure in that handler
-/// leaves one behind: an empty checkout and a branch belonging to a thread that does not exist.
-/// Forced, because there is nothing in it worth confirming — no turn ever ran.
-async fn remove_worktree_after_start_failure(
-    worktree: Option<&ThreadWorktree>,
-    thread_id: ThreadId,
-    failed_action: &str,
-) {
-    let Some(worktree) = worktree else {
-        return;
-    };
-    match crate::worktree::remove(worktree, /*force*/ true).await {
-        Ok(()) => debug!(
-            %thread_id,
-            branch = %worktree.branch,
-            %failed_action,
-            "removed thread worktree after failed new-thread startup"
-        ),
-        Err(error) => warn!(
-            %thread_id,
-            branch = %worktree.branch,
-            path = %worktree.path,
-            %failed_action,
-            %error,
-            "could not remove thread worktree after failed new-thread startup"
-        ),
-    }
-    // The branch outlives `worktree remove`, and a thread that never started has nothing on it.
-    if let Err(error) = crate::worktree::delete_branch(worktree).await {
-        warn!(
-            %thread_id,
-            branch = %worktree.branch,
-            %failed_action,
-            %error,
-            "could not delete thread branch after failed new-thread startup"
-        );
-    }
-}
-
-async fn cleanup_new_thread_after_start_failure(
-    state: &AppState,
-    project_config: &ProjectConfig,
-    thread_id: ThreadId,
-    harness_thread_id: String,
-    remove_local_thread: bool,
-    failed_action: &str,
-) {
-    match state
-        .registry
-        .delete_thread(project_config, thread_id, harness_thread_id.clone())
-        .await
-    {
-        Ok(()) => {
-            debug!(
-                project_id = %project_config.id,
-                %thread_id,
-                %harness_thread_id,
-                %failed_action,
-                "cleaned up native thread after failed new-thread startup"
-            );
-        }
-        Err(error) => {
-            warn!(
-                project_id = %project_config.id,
-                %thread_id,
-                %harness_thread_id,
-                %failed_action,
-                error = %error,
-                "failed to delete native thread after failed new-thread startup"
-            );
-            state.registry.retire_thread(thread_id).await;
-        }
-    }
-
-    if remove_local_thread
-        && let Err(error) = state
-            .store
-            .delete_thread(project_config.id, thread_id)
-            .await
-    {
-        warn!(
-            project_id = %project_config.id,
-            %thread_id,
-            %failed_action,
-            error = %error,
-            "failed to delete local thread after failed new-thread startup"
-        );
-    }
-}
-
 fn thread_summary(tf: &ThreadFile, workspace_root: String) -> ThreadSummary {
     ThreadSummary {
         id: tf.id,
@@ -1865,7 +1650,7 @@ async fn delete_thread(
     AxumPath((project_id, thread_id)): AxumPath<(ProjectId, ThreadId)>,
     Query(q): Query<DeleteThreadQuery>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    let _lifecycle_guard = state
+    let lifecycle_permit = state
         .registry
         .lock_project_lifecycle_with_timeout(project_id, PROJECT_LIFECYCLE_LOCK_TIMEOUT)
         .await
@@ -1976,6 +1761,7 @@ async fn delete_thread(
         if let Err(error) = state
             .registry
             .delete_thread(
+                &lifecycle_permit,
                 &project_config,
                 *candidate,
                 thread_file.harness_thread_id.clone(),
@@ -2096,8 +1882,10 @@ mod tests {
     use std::sync::Arc;
 
     use giskard_core::event::AgentEvent;
+    use giskard_core::ids::TurnId;
     use giskard_core::item::{Item, ItemPayload};
     use giskard_harness::AgentHarness;
+    use giskard_persist::PersistStore;
     use giskard_persist::store::ProjectConfig;
 
     use super::*;
@@ -2114,6 +1902,43 @@ mod tests {
         ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
             Err(giskard_core::HarnessError::Spawn("unused in test".into()))
         }
+    }
+
+    #[tokio::test]
+    async fn active_turn_delete_preflight_preserves_runtime_before_harness_lookup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let state = AppState::new(store, Arc::new(FailingFactory), vec![7; 32]);
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let runtime = state
+            .registry
+            .verified_thread_runtime(project_id, thread_id)
+            .await
+            .unwrap();
+        runtime.replace_live_turn_for_test(TurnId::new(), Some(UserInput::text("active")));
+
+        let error = reject_thread_mutation_if_live(&state, thread_id)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ApiError::Conflict(_)));
+        assert!(
+            state
+                .registry
+                .thread_runtime(thread_id)
+                .await
+                .unwrap()
+                .live_is_active(),
+            "preflight rejection must leave the thread runtime reusable"
+        );
+        assert!(
+            state
+                .registry
+                .loaded_thread_binding(thread_id)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]

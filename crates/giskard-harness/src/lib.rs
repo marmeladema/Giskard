@@ -1,6 +1,8 @@
 //! The `AgentHarness` abstraction — the keystone of the harness-agnostic design (spec §4).
 
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -352,6 +354,273 @@ pub struct HarnessBootstrap {
     pub known_threads: Vec<KnownThreadBinding>,
 }
 
+/// The bounded stream of linear discovery claims produced by a harness process.
+pub struct HarnessThreadDiscoveryStream {
+    receiver: mpsc::Receiver<DiscoveryTicket>,
+}
+
+impl HarnessThreadDiscoveryStream {
+    pub fn new(receiver: mpsc::Receiver<DiscoveryTicket>) -> Self {
+        Self { receiver }
+    }
+
+    pub async fn recv(&mut self) -> Option<DiscoveryTicket> {
+        self.receiver.recv().await
+    }
+}
+
+type DiscoveryClaim =
+    Box<dyn FnOnce(PathBuf) -> Result<ThreadAttachment, HarnessError> + Send + 'static>;
+type TicketDefer = Box<dyn FnOnce() -> Result<(), HarnessError> + Send + 'static>;
+type TicketDrop = Box<dyn FnOnce() + Send + 'static>;
+type AttachmentCommit = Box<dyn FnOnce() -> Result<OwnerDrop, HarnessError> + Send + 'static>;
+type AttachmentDrop = Box<dyn FnOnce(AgentEventStream) + Send + 'static>;
+type OwnerDrop = Box<dyn FnOnce(AgentEventStream) + Send + 'static>;
+
+/// A route-owned, linear claim admitted through the bounded discovery stream.
+///
+/// A ticket is intentionally neither `Clone` nor independently constructible from identity.
+/// Dropping it invokes the route authority's synchronous return path, making only that exact
+/// queued claim discoverable again. Claiming consumes it and atomically obtains the retained event
+/// receiver as a [`ThreadAttachment`].
+#[must_use = "dropping a discovery ticket returns its exact route to discovery eligibility"]
+pub struct DiscoveryTicket {
+    thread_id: ThreadId,
+    harness_thread_id: String,
+    claim: Option<DiscoveryClaim>,
+    defer: Option<TicketDefer>,
+    on_drop: Option<TicketDrop>,
+}
+
+impl std::fmt::Debug for DiscoveryTicket {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DiscoveryTicket")
+            .field("thread_id", &self.thread_id)
+            .field("harness_thread_id", &self.harness_thread_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DiscoveryTicket {
+    /// Construct a ticket whose callbacks perform exact, synchronous route transitions.
+    ///
+    /// This is intended for harness route authorities. `claim` must validate and commit the whole
+    /// queued-to-attaching transition before returning. `on_drop` must be stale-safe.
+    pub fn from_route<C, D>(
+        thread_id: ThreadId,
+        harness_thread_id: String,
+        claim: C,
+        on_drop: D,
+    ) -> Self
+    where
+        C: FnOnce(PathBuf) -> Result<ThreadAttachment, HarnessError> + Send + 'static,
+        D: FnOnce() + Send + 'static,
+    {
+        Self {
+            thread_id,
+            harness_thread_id,
+            claim: Some(Box::new(claim)),
+            defer: None,
+            on_drop: Some(Box::new(on_drop)),
+        }
+    }
+
+    /// Construct a route ticket that can atomically become the route-owned pending admission.
+    pub fn from_route_with_defer<C, F, D>(
+        thread_id: ThreadId,
+        harness_thread_id: String,
+        claim: C,
+        defer: F,
+        on_drop: D,
+    ) -> Self
+    where
+        C: FnOnce(PathBuf) -> Result<ThreadAttachment, HarnessError> + Send + 'static,
+        F: FnOnce() -> Result<(), HarnessError> + Send + 'static,
+        D: FnOnce() + Send + 'static,
+    {
+        Self {
+            thread_id,
+            harness_thread_id,
+            claim: Some(Box::new(claim)),
+            defer: Some(Box::new(defer)),
+            on_drop: Some(Box::new(on_drop)),
+        }
+    }
+
+    pub fn thread_id(&self) -> ThreadId {
+        self.thread_id
+    }
+
+    pub fn harness_thread_id(&self) -> &str {
+        &self.harness_thread_id
+    }
+
+    /// Atomically claim the route's retained receiver.
+    pub fn claim(mut self, workspace_root: PathBuf) -> Result<ThreadAttachment, HarnessError> {
+        let claim = self.claim.take().ok_or_else(|| {
+            HarnessError::Protocol("discovery ticket was already consumed".into())
+        })?;
+        let result = claim(workspace_root);
+        if result.is_ok() {
+            self.on_drop = None;
+        }
+        result
+    }
+
+    /// Return this exact rejected bounded admission to its route as one pending marker.
+    pub fn defer(mut self) -> Result<(), HarnessError> {
+        let defer = self.defer.take().ok_or_else(|| {
+            HarnessError::Unsupported("this discovery ticket cannot be deferred".into())
+        })?;
+        let result = defer();
+        if result.is_ok() {
+            self.claim = None;
+            self.on_drop = None;
+        }
+        result
+    }
+}
+
+impl Drop for DiscoveryTicket {
+    fn drop(&mut self) {
+        if let Some(on_drop) = self.on_drop.take() {
+            on_drop();
+        }
+    }
+}
+
+/// A claimed native route whose exact event receiver is awaiting owner installation.
+///
+/// Dropping an uncommitted attachment synchronously returns the receiver to the route authority.
+/// Committing it produces the only value that may drive a long-lived event forwarder.
+#[must_use = "an attachment must be installed or dropped to return its retained receiver"]
+pub struct ThreadAttachment {
+    handle: ThreadHandle,
+    stream: Option<AgentEventStream>,
+    commit: Option<AttachmentCommit>,
+    on_drop: Option<AttachmentDrop>,
+}
+
+impl std::fmt::Debug for ThreadAttachment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ThreadAttachment")
+            .field("handle", &self.handle)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ThreadAttachment {
+    /// Construct an attachment backed by one exact route slot.
+    ///
+    /// `commit` must atomically change that slot from attaching to owned and return only the
+    /// receiver-release action for the resulting owner. The owner identity and receiver always
+    /// come from this attachment and cannot be substituted by the callback. On failure this value's
+    /// drop path restores the retained stream. Both callbacks must ignore stale route capabilities
+    /// after replacement, deletion, or shutdown.
+    pub fn from_route<C, R, D>(
+        handle: ThreadHandle,
+        stream: AgentEventStream,
+        commit: C,
+        on_drop: D,
+    ) -> Self
+    where
+        C: FnOnce() -> Result<R, HarnessError> + Send + 'static,
+        R: FnOnce(AgentEventStream) + Send + 'static,
+        D: FnOnce(AgentEventStream) + Send + 'static,
+    {
+        Self {
+            handle,
+            stream: Some(stream),
+            commit: Some(Box::new(move || {
+                commit().map(|release| Box::new(release) as OwnerDrop)
+            })),
+            on_drop: Some(Box::new(on_drop)),
+        }
+    }
+
+    pub fn handle(&self) -> &ThreadHandle {
+        &self.handle
+    }
+
+    pub fn commit(mut self) -> Result<ThreadEventOwner, HarnessError> {
+        let stream = self.stream.take().ok_or_else(|| {
+            HarnessError::Protocol("thread attachment stream was already consumed".into())
+        })?;
+        let commit = self.commit.take().ok_or_else(|| {
+            HarnessError::Protocol("thread attachment was already committed".into())
+        })?;
+        match commit() {
+            Ok(on_drop) => {
+                self.on_drop = None;
+                Ok(ThreadEventOwner {
+                    handle: self.handle.clone(),
+                    stream: Some(stream),
+                    on_drop: Some(on_drop),
+                })
+            }
+            Err(error) => {
+                self.stream = Some(stream);
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Drop for ThreadAttachment {
+    fn drop(&mut self) {
+        if let (Some(stream), Some(on_drop)) = (self.stream.take(), self.on_drop.take()) {
+            on_drop(stream);
+        }
+    }
+}
+
+/// The linear event-route owner transferred to a forwarder or persistence-blocked coordinator.
+///
+/// Dropping it synchronously offers the exact receiver back to its route authority. That callback
+/// is required to be stale-safe when deletion or shutdown has already closed the activation.
+#[must_use = "the event owner must remain held for the lifetime of its forwarder"]
+pub struct ThreadEventOwner {
+    handle: ThreadHandle,
+    // Deliberately private with no consuming accessor: safe code cannot separate the stream from
+    // its return callback. Forwarder failure, cancellation, and unwind therefore drop this pair
+    // together and return the exact receiver; a fresh-tail recovery path would only mask an
+    // unsafe leak or forced process destruction, neither of which can be recovered in-process.
+    stream: Option<AgentEventStream>,
+    on_drop: Option<OwnerDrop>,
+}
+
+impl std::fmt::Debug for ThreadEventOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ThreadEventOwner")
+            .field("handle", &self.handle)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ThreadEventOwner {
+    pub fn handle(&self) -> &ThreadHandle {
+        &self.handle
+    }
+
+    pub async fn recv(&mut self) -> Result<AgentEvent, broadcast::error::RecvError> {
+        match self.stream.as_mut() {
+            Some(stream) => stream.recv().await,
+            None => Err(broadcast::error::RecvError::Closed),
+        }
+    }
+}
+
+impl Drop for ThreadEventOwner {
+    fn drop(&mut self) {
+        if let (Some(stream), Some(on_drop)) = (self.stream.take(), self.on_drop.take()) {
+            on_drop(stream);
+        }
+    }
+}
+
 /// Handle to an opened thread.
 #[derive(Debug, Clone)]
 pub struct ThreadHandle {
@@ -476,6 +745,16 @@ pub trait AgentHarness: Send + Sync {
         None
     }
 
+    /// Takes the optional bounded stream of provider-owned routes discovered from live traffic.
+    /// A supporting harness returns it at most once for each harness process. Each received ticket
+    /// is a linear claim: its drop path returns the exact route to discovery eligibility, while a
+    /// successful claim transfers the retained receiver into a [`ThreadAttachment`].
+    fn take_thread_discovery_stream(
+        &self,
+    ) -> Result<Option<HarnessThreadDiscoveryStream>, HarnessError> {
+        Ok(None)
+    }
+
     /// List configured MCP servers and their visible tools/resources.
     async fn list_mcp_servers(&self) -> Result<Vec<McpServerStatus>, HarnessError> {
         Err(HarnessError::Unsupported(
@@ -498,23 +777,53 @@ pub trait AgentHarness: Send + Sync {
     }
 
     /// Open (or resume) a thread.
-    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError>;
+    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadAttachment, HarnessError>;
 
     /// Bind a harness-native thread identity without starting or resuming native work.
     ///
-    /// This is used when an already-running agent reports a child thread. The returned handle is
-    /// immediately subscribable, but the operation must not issue a provider RPC or make the
-    /// read-only child user-operable. Repeating the same pair is idempotent; either side already
-    /// bound to a different identity is a protocol error.
+    /// This is used when an already-running agent reports a child thread. The returned attachment
+    /// owns the route's retained receiver, but the operation must not issue a provider RPC or make
+    /// the read-only child user-operable. Repeating a native identity returns its authoritative
+    /// existing thread even when the caller proposed another fresh ID. A new native identity
+    /// proposed for an already-bound Giskard thread remains a protocol error.
     async fn claim_native_thread(
         &self,
         thread: ThreadId,
         harness_thread_id: String,
         workspace_root: PathBuf,
-    ) -> Result<ThreadHandle, HarnessError> {
+    ) -> Result<ThreadAttachment, HarnessError> {
         let _ = (thread, harness_thread_id, workspace_root);
         Err(HarnessError::Unsupported(
             "native thread identity claims are not supported by this harness".into(),
+        ))
+    }
+
+    /// Reattach a durable provider-owned thread after an explicit user/server reopen.
+    /// Unlike parent discovery, this operation may reactivate an exact deletion tombstone. It has
+    /// no compatibility delegation because an ordinary claim must never reactivate a tombstone.
+    async fn reattach_native_thread(
+        &self,
+        thread: ThreadId,
+        harness_thread_id: String,
+        workspace_root: PathBuf,
+    ) -> Result<ThreadAttachment, HarnessError> {
+        let _ = (thread, harness_thread_id, workspace_root);
+        Err(HarnessError::Unsupported(
+            "native thread reattachment is not supported by this harness".into(),
+        ))
+    }
+
+    /// Consume one traffic-discovery ticket after taking the project materialization permit.
+    /// Implementations must not issue provider work; the ticket already names an active route.
+    async fn claim_discovered_thread(
+        &self,
+        ticket: DiscoveryTicket,
+        workspace_root: PathBuf,
+    ) -> Result<ThreadAttachment, HarnessError> {
+        let _ = workspace_root;
+        drop(ticket);
+        Err(HarnessError::Unsupported(
+            "native thread discovery claims are not supported by this harness".into(),
         ))
     }
 
@@ -525,9 +834,6 @@ pub trait AgentHarness: Send + Sync {
         input: UserInput,
         overrides: TurnOverrides,
     ) -> Result<TurnId, HarnessError>;
-
-    /// Subscribe to the stream of neutral events for a thread.
-    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream;
 
     /// Respond to a pending approval request.
     async fn respond_approval(
@@ -586,13 +892,11 @@ pub trait AgentHarness: Send + Sync {
         )))
     }
 
-    /// Delete a durable thread in the underlying harness, when supported.
-    async fn delete_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
-        Err(HarnessError::Unsupported(format!(
-            "deleting thread {} is not supported",
-            thread.harness_thread_id
-        )))
-    }
+    /// Commit local route retirement and return separately owned provider cleanup work.
+    async fn begin_delete_thread<'a>(
+        &'a self,
+        thread: &'a ThreadHandle,
+    ) -> Result<ThreadRetirement<'a>, HarnessError>;
 
     /// Cleanly shut down the harness.
     ///
@@ -601,9 +905,48 @@ pub trait AgentHarness: Send + Sync {
     async fn shutdown(&self) -> Result<(), HarnessError>;
 }
 
+/// Result of a native deletion after its local route-invalidation commit point.
+///
+/// `Err(HarnessError)` means deletion was rejected before route invalidation. Either enum variant
+/// means the activation is permanently tombstoned and the registry must retire its matching event
+/// owner before continuing or propagating the provider failure.
+#[derive(Debug)]
+pub enum ThreadDeletion {
+    Retired,
+    RetiredWithProviderError(HarnessError),
+}
+
+#[must_use]
+pub struct ThreadRetirement<'a> {
+    cleanup: Pin<Box<dyn Future<Output = Result<ThreadDeletion, HarnessError>> + Send + 'a>>,
+}
+
+impl<'a> ThreadRetirement<'a> {
+    pub fn new(
+        cleanup: Pin<Box<dyn Future<Output = Result<ThreadDeletion, HarnessError>> + Send + 'a>>,
+    ) -> Self {
+        Self { cleanup }
+    }
+
+    pub async fn finish(self) -> Result<ThreadDeletion, HarnessError> {
+        self.cleanup.await
+    }
+}
+
+pub fn unsupported_thread_retirement(
+    thread: &ThreadHandle,
+) -> Result<ThreadRetirement<'static>, HarnessError> {
+    Err(HarnessError::Unsupported(format!(
+        "deleting thread {} is not supported",
+        thread.harness_thread_id
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc as std_mpsc};
 
     fn command_provider(args: &[&str], timeout: Duration) -> HarnessProvider {
         HarnessProvider {
@@ -804,5 +1147,150 @@ mod tests {
             auth: None,
         };
         assert_eq!(provider.resolve_api_key().await.unwrap(), None);
+    }
+
+    fn test_handle() -> ThreadHandle {
+        ThreadHandle::opened(
+            ThreadId::new(),
+            "native-thread".into(),
+            PathBuf::from("/tmp"),
+        )
+    }
+
+    fn test_attachment(
+        on_drop: impl FnOnce(AgentEventStream) + Send + 'static,
+    ) -> ThreadAttachment {
+        let handle = test_handle();
+        let (_events, receiver) = broadcast::channel(4);
+        ThreadAttachment::from_route(
+            handle,
+            AgentEventStream::new(receiver),
+            move || Ok(|_| {}),
+            on_drop,
+        )
+    }
+
+    #[test]
+    fn dropping_discovery_ticket_runs_its_exact_return_path_once() {
+        let returns = Arc::new(AtomicUsize::new(0));
+        let returned = returns.clone();
+        let ticket = DiscoveryTicket::from_route(
+            ThreadId::new(),
+            "native-thread".into(),
+            |_| Ok(test_attachment(|_| {})),
+            move || {
+                returned.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+
+        drop(ticket);
+        assert_eq!(returns.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn claiming_discovery_ticket_disarms_its_return_path() {
+        let returns = Arc::new(AtomicUsize::new(0));
+        let returned = returns.clone();
+        let ticket = DiscoveryTicket::from_route(
+            ThreadId::new(),
+            "native-thread".into(),
+            |_| Ok(test_attachment(|_| {})),
+            move || {
+                returned.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+
+        let attachment = ticket.claim(PathBuf::from("/tmp")).unwrap();
+        assert_eq!(returns.load(Ordering::SeqCst), 0);
+        drop(attachment);
+        assert_eq!(returns.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn deferring_discovery_ticket_runs_exact_defer_path_without_drop_return() {
+        let defers = Arc::new(AtomicUsize::new(0));
+        let returns = Arc::new(AtomicUsize::new(0));
+        let deferred = defers.clone();
+        let returned = returns.clone();
+        let ticket = DiscoveryTicket::from_route_with_defer(
+            ThreadId::new(),
+            "native-thread".into(),
+            |_| Ok(test_attachment(|_| {})),
+            move || {
+                deferred.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            move || {
+                returned.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+
+        ticket.defer().unwrap();
+        assert_eq!(defers.load(Ordering::SeqCst), 1);
+        assert_eq!(returns.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn dropping_attachment_returns_its_retained_receiver() {
+        let (returned_tx, returned_rx) = std_mpsc::channel();
+        let attachment = test_attachment(move |stream| {
+            returned_tx.send(stream).unwrap();
+        });
+
+        drop(attachment);
+        let _same_receiver = returned_rx.try_recv().unwrap();
+        assert!(
+            returned_rx.try_recv().is_err(),
+            "receiver returned more than once"
+        );
+    }
+
+    #[test]
+    fn failed_attachment_commit_still_returns_its_receiver() {
+        let handle = test_handle();
+        let (_events, receiver) = broadcast::channel(4);
+        let (returned_tx, returned_rx) = std_mpsc::channel();
+        let attachment = ThreadAttachment::from_route(
+            handle,
+            AgentEventStream::new(receiver),
+            || -> Result<fn(AgentEventStream), HarnessError> {
+                Err(HarnessError::Protocol("stale attachment".into()))
+            },
+            move |stream| {
+                returned_tx.send(stream).unwrap();
+            },
+        );
+
+        let error = attachment.commit().err().unwrap();
+        assert!(error.to_string().contains("stale attachment"));
+        let _same_receiver = returned_rx.try_recv().unwrap();
+    }
+
+    #[test]
+    fn committed_owner_releases_receiver_only_when_owner_drops() {
+        let handle = test_handle();
+        let expected_handle = handle.clone();
+        let (_events, receiver) = broadcast::channel(4);
+        let (returned_tx, returned_rx) = std_mpsc::channel();
+        let attachment = ThreadAttachment::from_route(
+            handle,
+            AgentEventStream::new(receiver),
+            move || {
+                Ok(move |stream| {
+                    returned_tx.send(stream).unwrap();
+                })
+            },
+            |_| {},
+        );
+
+        let owner = attachment.commit().unwrap();
+        assert_eq!(owner.handle().thread, expected_handle.thread);
+        assert_eq!(
+            owner.handle().harness_thread_id,
+            expected_handle.harness_thread_id
+        );
+        assert!(returned_rx.try_recv().is_err());
+        drop(owner);
+        let _same_receiver = returned_rx.try_recv().unwrap();
     }
 }

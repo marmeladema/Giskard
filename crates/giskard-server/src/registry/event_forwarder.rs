@@ -763,7 +763,7 @@ pub(super) struct ThreadEventForwarder {
     authority: Arc<ThreadAuthority>,
     coordinator: Arc<ThreadCoordinator>,
     binding: LoadedThreadBinding,
-    stream: giskard_harness::AgentEventStream,
+    owner: giskard_harness::ThreadEventOwner,
     cancel: watch::Receiver<bool>,
     idle_context: TurnContext,
     turn: ForwardedTurnState,
@@ -777,7 +777,7 @@ impl ThreadEventForwarder {
         shared: Arc<RegistryShared>,
         authority: Arc<ThreadAuthority>,
         coordinator: Arc<ThreadCoordinator>,
-        stream: giskard_harness::AgentEventStream,
+        owner: giskard_harness::ThreadEventOwner,
         cancel: watch::Receiver<bool>,
     ) -> Self {
         let binding = coordinator.binding().await;
@@ -818,7 +818,7 @@ impl ThreadEventForwarder {
             authority,
             coordinator,
             binding,
-            stream,
+            owner,
             cancel,
             idle_context,
             turn,
@@ -832,7 +832,7 @@ impl ThreadEventForwarder {
         self.binding.handle.thread
     }
 
-    pub(super) async fn run(mut self) -> ForwarderExitReason {
+    pub(super) async fn run(mut self) -> (ForwarderExitReason, giskard_harness::ThreadEventOwner) {
         let exit_reason = loop {
             let recv_result = tokio::select! {
                 changed = self.cancel.changed() => {
@@ -841,7 +841,7 @@ impl ThreadEventForwarder {
                     }
                     continue;
                 }
-                result = self.stream.recv() => result,
+                result = self.owner.recv() => result,
             };
             match recv_result {
                 Ok(event) => match self.handle_event(event).await {
@@ -854,7 +854,8 @@ impl ThreadEventForwarder {
                 },
             }
         };
-        self.finish(exit_reason).await
+        let exit_reason = self.finish(exit_reason).await;
+        (exit_reason, self.owner)
     }
 }
 
@@ -1761,7 +1762,7 @@ mod tests {
     use giskard_core::token::{TokenLedger, TokenUsage};
     use giskard_core::turn::{Mode, PermissionPreset, TurnMode, TurnModel, TurnStatusKind};
     use giskard_core::user_input::UserInput;
-    use giskard_harness::{AgentEventStream, ThreadHandle};
+    use giskard_harness::{AgentEventStream, ThreadAttachment, ThreadEventOwner, ThreadHandle};
     use giskard_persist::PersistStore;
     use giskard_persist::store::ThreadFile;
     use giskard_proto::{ServerMessage, WireAgentEvent};
@@ -1774,6 +1775,12 @@ mod tests {
     use crate::registry::tests::prepare_test_operation;
     use crate::test_logs::CapturedLogWriter;
     use crate::thread_runtime::ThreadRuntimeSupport;
+
+    fn test_event_owner(handle: ThreadHandle, stream: AgentEventStream) -> ThreadEventOwner {
+        ThreadAttachment::from_route(handle, stream, || Ok(|_| {}), |_| {})
+            .commit()
+            .unwrap()
+    }
 
     #[test]
     fn command_completion_success_requires_success_status_and_zero_exit() {
@@ -2747,7 +2754,10 @@ mod tests {
                 shared.clone(),
                 authority,
                 coordinator.clone(),
-                AgentEventStream::new(rx),
+                test_event_owner(
+                    ThreadHandle::detached(thread_id, "native-orphan".into()),
+                    AgentEventStream::new(rx),
+                ),
                 cancel_rx,
             )
             .await
@@ -2803,7 +2813,8 @@ mod tests {
         wait_for_turn_count(&store, project_id, thread_id, 2).await;
         assert_eq!(tx.receiver_count(), 1);
         drop(tx);
-        forwarder.await.unwrap();
+        let (_reason, owner) = forwarder.await.unwrap();
+        drop(owner);
 
         let turns = store.load_all_turns(project_id, thread_id).await.unwrap();
         assert_eq!(turns.len(), 2);
@@ -3173,7 +3184,7 @@ mod tests {
             kind: TurnContextKind::User,
         };
         let replacement = prepare_test_operation(&coordinator, &runtime, replacement_context).await;
-        let _ = coordinator.abort_operation(replacement).await;
+        let _ = coordinator.abort_operation(replacement.token()).await;
     }
 
     #[tokio::test]
@@ -4288,16 +4299,17 @@ mod tests {
                 Ok(_) => {}
                 Err((error, _)) => panic!("forwarder test operation was rejected: {error}"),
             }
-            ThreadEventForwarder::new(
+            let (_reason, owner) = ThreadEventForwarder::new(
                 shared,
                 task_authority,
                 coordinator_for_task,
-                stream,
+                test_event_owner(native_handle, stream),
                 cancel_rx,
             )
             .await
             .run()
             .await;
+            drop(owner);
         });
         (handle, runtime, coordinator, authority)
     }
@@ -4346,7 +4358,10 @@ mod tests {
                 shared,
                 authority,
                 coordinator,
-                AgentEventStream::new(rx),
+                test_event_owner(
+                    ThreadHandle::detached(thread_id, format!("native-{thread_id}")),
+                    AgentEventStream::new(rx),
+                ),
                 cancel_rx,
             )
             .await
@@ -4362,7 +4377,8 @@ mod tests {
             tx.send(event).unwrap();
         }
         drop(tx);
-        forwarder.await.unwrap();
+        let (_reason, owner) = forwarder.await.unwrap();
+        drop(owner);
 
         let turns = store.load_all_turns(project_id, thread_id).await.unwrap();
         turns

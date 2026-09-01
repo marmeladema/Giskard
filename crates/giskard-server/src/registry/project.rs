@@ -10,6 +10,26 @@ use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard, RwLock};
 #[derive(Clone)]
 pub(super) struct LifecycleLock(Arc<Mutex<()>>);
 
+/// Typed admission for one complete project thread-materialization transaction.
+#[derive(Debug)]
+pub(crate) struct ProjectMaterializationPermit {
+    project_id: ProjectId,
+    _guard: OwnedMutexGuard<()>,
+}
+
+impl ProjectMaterializationPermit {
+    pub(super) fn new(project_id: ProjectId, guard: OwnedMutexGuard<()>) -> Self {
+        Self {
+            project_id,
+            _guard: guard,
+        }
+    }
+
+    pub(super) fn project_id(&self) -> ProjectId {
+        self.project_id
+    }
+}
+
 impl LifecycleLock {
     /// Creates a lifecycle lock before an authority or weak interner entry exists.
     pub(super) fn new() -> Self {

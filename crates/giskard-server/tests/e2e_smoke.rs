@@ -1,4 +1,5 @@
 mod common;
+mod support;
 #[path = "common/thread_fixture.rs"]
 mod thread_fixture;
 
@@ -22,7 +23,8 @@ use giskard_core::token::TokenUsage;
 use giskard_core::turn::{Mode, PermissionPreset, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+    AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadAttachment, ThreadDeletion,
+    ThreadHandle,
 };
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 use giskard_persist::store::ProjectConfig;
@@ -36,6 +38,7 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::prelude::*;
 
 use common::fake_native_model;
+use support::TestEventRoute;
 use thread_fixture::persist_primary_thread;
 
 #[derive(Clone, Debug)]
@@ -237,19 +240,19 @@ struct NoMcpHarness;
 
 #[derive(Default)]
 struct UnsupportedCompactionHarness {
-    threads: tokio::sync::Mutex<HashMap<ThreadId, tokio::sync::broadcast::Sender<AgentEvent>>>,
+    threads: tokio::sync::Mutex<HashMap<ThreadId, TestEventRoute>>,
 }
 
 #[derive(Default)]
 struct SlowCompactionHarness {
-    threads: tokio::sync::Mutex<HashMap<ThreadId, tokio::sync::broadcast::Sender<AgentEvent>>>,
+    threads: tokio::sync::Mutex<HashMap<ThreadId, TestEventRoute>>,
     compact_calls: AtomicUsize,
     hold_compaction: AtomicBool,
     release_compaction: AtomicBool,
 }
 
 struct SlowStartHarness {
-    threads: tokio::sync::Mutex<HashMap<ThreadId, tokio::sync::broadcast::Sender<AgentEvent>>>,
+    threads: tokio::sync::Mutex<HashMap<ThreadId, TestEventRoute>>,
     start_calls: AtomicUsize,
     hold_first_start: AtomicBool,
     release_first_start: AtomicBool,
@@ -257,7 +260,7 @@ struct SlowStartHarness {
 
 #[derive(Default)]
 struct ActivityHarness {
-    threads: tokio::sync::Mutex<HashMap<ThreadId, tokio::sync::broadcast::Sender<AgentEvent>>>,
+    threads: tokio::sync::Mutex<HashMap<ThreadId, TestEventRoute>>,
     resumed_native_ids: tokio::sync::Mutex<Vec<String>>,
     claims: tokio::sync::Mutex<Vec<(String, ThreadId)>>,
     hold_native_child_open: AtomicBool,
@@ -272,7 +275,7 @@ struct ActivityHarness {
 
 #[derive(Default)]
 struct CountingOpenHarness {
-    threads: tokio::sync::Mutex<HashMap<ThreadId, tokio::sync::broadcast::Sender<AgentEvent>>>,
+    threads: tokio::sync::Mutex<HashMap<ThreadId, TestEventRoute>>,
     open_calls: AtomicUsize,
     claim_calls: AtomicUsize,
     start_calls: AtomicUsize,
@@ -449,7 +452,7 @@ impl ActivityHarness {
                 .lock()
                 .await
                 .get(&thread)
-                .map(tokio::sync::broadcast::Sender::receiver_count)
+                .map(TestEventRoute::receiver_count)
                 .unwrap_or_default();
             if count == expected {
                 return;
@@ -672,6 +675,12 @@ impl CountingOpenHarness {
 
 #[async_trait::async_trait]
 impl AgentHarness for UnsupportedCompactionHarness {
+    async fn begin_delete_thread<'a>(
+        &'a self,
+        thread: &'a ThreadHandle,
+    ) -> Result<giskard_harness::ThreadRetirement<'a>, HarnessError> {
+        giskard_harness::unsupported_thread_retirement(thread)
+    }
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities {
             live_approvals: false,
@@ -694,11 +703,11 @@ impl AgentHarness for UnsupportedCompactionHarness {
         Ok(Vec::new())
     }
 
-    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
+    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadAttachment, HarnessError> {
         let thread = opts.thread;
-        let (tx, _) = tokio::sync::broadcast::channel(16);
-        self.threads.lock().await.insert(thread, tx);
-        Ok(ThreadHandle {
+        let route = TestEventRoute::new(16);
+        self.threads.lock().await.insert(thread, route.clone());
+        route.attach(ThreadHandle {
             resumed_model: Some(opts.initial_model.clone()),
             ..ThreadHandle::opened(
                 thread,
@@ -717,16 +726,6 @@ impl AgentHarness for UnsupportedCompactionHarness {
         Err(HarnessError::Unsupported(
             "turns are not supported by this harness".into(),
         ))
-    }
-
-    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Ok(threads) = self.threads.try_lock()
-            && let Some(sender) = threads.get(&thread.thread)
-        {
-            return AgentEventStream::new(sender.subscribe());
-        }
-        let (_, rx) = tokio::sync::broadcast::channel(1);
-        AgentEventStream::new(rx)
     }
 
     async fn respond_approval(
@@ -756,12 +755,21 @@ impl AgentHarness for UnsupportedCompactionHarness {
     }
 
     async fn shutdown(&self) -> Result<(), HarnessError> {
+        for (_, route) in self.threads.lock().await.drain() {
+            route.close();
+        }
         Ok(())
     }
 }
 
 #[async_trait::async_trait]
 impl AgentHarness for SlowCompactionHarness {
+    async fn begin_delete_thread<'a>(
+        &'a self,
+        thread: &'a ThreadHandle,
+    ) -> Result<giskard_harness::ThreadRetirement<'a>, HarnessError> {
+        giskard_harness::unsupported_thread_retirement(thread)
+    }
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities {
             live_approvals: false,
@@ -784,11 +792,11 @@ impl AgentHarness for SlowCompactionHarness {
         Ok(Vec::new())
     }
 
-    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
+    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadAttachment, HarnessError> {
         let thread = opts.thread;
-        let (tx, _) = tokio::sync::broadcast::channel(32);
-        self.threads.lock().await.insert(thread, tx);
-        Ok(ThreadHandle {
+        let route = TestEventRoute::new(32);
+        self.threads.lock().await.insert(thread, route.clone());
+        route.attach(ThreadHandle {
             resumed_model: Some(opts.initial_model.clone()),
             ..ThreadHandle::opened(
                 thread,
@@ -840,16 +848,6 @@ impl AgentHarness for SlowCompactionHarness {
             });
         });
         Ok(turn)
-    }
-
-    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Ok(threads) = self.threads.try_lock()
-            && let Some(sender) = threads.get(&thread.thread)
-        {
-            return AgentEventStream::new(sender.subscribe());
-        }
-        let (_, rx) = tokio::sync::broadcast::channel(1);
-        AgentEventStream::new(rx)
     }
 
     async fn respond_approval(
@@ -920,12 +918,30 @@ impl AgentHarness for SlowCompactionHarness {
     }
 
     async fn shutdown(&self) -> Result<(), HarnessError> {
+        for (_, route) in self.threads.lock().await.drain() {
+            route.close();
+        }
         Ok(())
     }
 }
 
 #[async_trait::async_trait]
 impl AgentHarness for ActivityHarness {
+    async fn begin_delete_thread<'a>(
+        &'a self,
+        thread: &'a ThreadHandle,
+    ) -> Result<giskard_harness::ThreadRetirement<'a>, HarnessError> {
+        self.deleted_harness_thread_ids
+            .lock()
+            .await
+            .push(thread.harness_thread_id.clone());
+        if let Some(route) = self.threads.lock().await.remove(&thread.thread) {
+            route.close();
+        }
+        Ok(giskard_harness::ThreadRetirement::new(Box::pin(async {
+            Ok(ThreadDeletion::Retired)
+        })))
+    }
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities {
             live_approvals: true,
@@ -948,7 +964,7 @@ impl AgentHarness for ActivityHarness {
         Ok(Vec::new())
     }
 
-    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
+    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadAttachment, HarnessError> {
         if let Some(native_thread_id) = opts.resume.as_ref() {
             self.resumed_native_ids
                 .lock()
@@ -966,12 +982,12 @@ impl AgentHarness for ActivityHarness {
             }
         }
         let thread = opts.thread;
-        let (tx, _) = tokio::sync::broadcast::channel(32);
-        self.threads.lock().await.insert(thread, tx);
+        let route = TestEventRoute::new(32);
+        self.threads.lock().await.insert(thread, route.clone());
         let harness_thread_id = opts.resume.unwrap_or_else(|| format!("test_{thread}"));
         let agent_name = (harness_thread_id == "native-collab-child").then(|| "James".to_string());
         let parent_harness_thread_id = attested_native_parent(&harness_thread_id);
-        Ok(ThreadHandle {
+        route.attach(ThreadHandle {
             resumed_model: Some(opts.initial_model.clone()),
             agent_name,
             parent_harness_thread_id,
@@ -984,7 +1000,7 @@ impl AgentHarness for ActivityHarness {
         thread: ThreadId,
         harness_thread_id: String,
         workspace_root: std::path::PathBuf,
-    ) -> Result<ThreadHandle, HarnessError> {
+    ) -> Result<ThreadAttachment, HarnessError> {
         if matches!(
             harness_thread_id.as_str(),
             "native-child" | "native-terminal-child"
@@ -999,15 +1015,17 @@ impl AgentHarness for ActivityHarness {
             .lock()
             .await
             .push((harness_thread_id.clone(), thread));
-        let mut threads = self.threads.lock().await;
-        threads.entry(thread).or_insert_with(|| {
-            let (sender, _) = tokio::sync::broadcast::channel(32);
-            sender
-        });
+        let route = self
+            .threads
+            .lock()
+            .await
+            .entry(thread)
+            .or_insert_with(|| TestEventRoute::new(32))
+            .clone();
         // Mirrors the Codex adapter: a claim reports the parentage this harness lifetime already
         // attested through its own events, and nothing a resume would have to ask for.
         let parent_harness_thread_id = attested_native_parent(&harness_thread_id);
-        Ok(ThreadHandle {
+        route.attach(ThreadHandle {
             parent_harness_thread_id,
             ..ThreadHandle::opened(thread, harness_thread_id, workspace_root)
         })
@@ -1386,16 +1404,6 @@ impl AgentHarness for ActivityHarness {
         Ok(turn)
     }
 
-    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Ok(threads) = self.threads.try_lock()
-            && let Some(sender) = threads.get(&thread.thread)
-        {
-            return AgentEventStream::new(sender.subscribe());
-        }
-        let (_, rx) = tokio::sync::broadcast::channel(1);
-        AgentEventStream::new(rx)
-    }
-
     async fn respond_approval(
         &self,
         req: ApprovalId,
@@ -1434,22 +1442,22 @@ impl AgentHarness for ActivityHarness {
         Ok(())
     }
 
-    async fn delete_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
-        self.deleted_harness_thread_ids
-            .lock()
-            .await
-            .push(thread.harness_thread_id.clone());
-        self.threads.lock().await.remove(&thread.thread);
-        Ok(())
-    }
-
     async fn shutdown(&self) -> Result<(), HarnessError> {
+        for (_, route) in self.threads.lock().await.drain() {
+            route.close();
+        }
         Ok(())
     }
 }
 
 #[async_trait::async_trait]
 impl AgentHarness for SlowStartHarness {
+    async fn begin_delete_thread<'a>(
+        &'a self,
+        thread: &'a ThreadHandle,
+    ) -> Result<giskard_harness::ThreadRetirement<'a>, HarnessError> {
+        giskard_harness::unsupported_thread_retirement(thread)
+    }
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities {
             live_approvals: false,
@@ -1472,11 +1480,11 @@ impl AgentHarness for SlowStartHarness {
         Ok(Vec::new())
     }
 
-    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
+    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadAttachment, HarnessError> {
         let thread = opts.thread;
-        let (tx, _) = tokio::sync::broadcast::channel(32);
-        self.threads.lock().await.insert(thread, tx);
-        Ok(ThreadHandle {
+        let route = TestEventRoute::new(32);
+        self.threads.lock().await.insert(thread, route.clone());
+        route.attach(ThreadHandle {
             resumed_model: Some(opts.initial_model.clone()),
             ..ThreadHandle::opened(
                 thread,
@@ -1536,16 +1544,6 @@ impl AgentHarness for SlowStartHarness {
         Ok(turn)
     }
 
-    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Ok(threads) = self.threads.try_lock()
-            && let Some(sender) = threads.get(&thread.thread)
-        {
-            return AgentEventStream::new(sender.subscribe());
-        }
-        let (_, rx) = tokio::sync::broadcast::channel(1);
-        AgentEventStream::new(rx)
-    }
-
     async fn respond_approval(
         &self,
         _req: ApprovalId,
@@ -1571,12 +1569,27 @@ impl AgentHarness for SlowStartHarness {
     }
 
     async fn shutdown(&self) -> Result<(), HarnessError> {
+        for (_, route) in self.threads.lock().await.drain() {
+            route.close();
+        }
         Ok(())
     }
 }
 
 #[async_trait::async_trait]
 impl AgentHarness for CountingOpenHarness {
+    async fn begin_delete_thread<'a>(
+        &'a self,
+        thread: &'a ThreadHandle,
+    ) -> Result<giskard_harness::ThreadRetirement<'a>, HarnessError> {
+        self.delete_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(route) = self.threads.lock().await.remove(&thread.thread) {
+            route.close();
+        }
+        Ok(giskard_harness::ThreadRetirement::new(Box::pin(async {
+            Ok(ThreadDeletion::Retired)
+        })))
+    }
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities {
             live_approvals: false,
@@ -1599,16 +1612,16 @@ impl AgentHarness for CountingOpenHarness {
         Ok(Vec::new())
     }
 
-    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
+    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadAttachment, HarnessError> {
         let open_call = self.open_calls.fetch_add(1, Ordering::SeqCst) + 1;
         let thread = opts.thread;
         self.opened_models
             .lock()
             .await
             .push(opts.initial_model.clone());
-        let (tx, _) = tokio::sync::broadcast::channel(16);
-        self.threads.lock().await.insert(thread, tx);
-        Ok(ThreadHandle {
+        let route = TestEventRoute::new(16);
+        self.threads.lock().await.insert(thread, route.clone());
+        route.attach(ThreadHandle {
             resumed_model: Some(opts.initial_model.clone()),
             ..ThreadHandle::opened(
                 thread,
@@ -1624,15 +1637,25 @@ impl AgentHarness for CountingOpenHarness {
         thread: ThreadId,
         harness_thread_id: String,
         workspace_root: PathBuf,
-    ) -> Result<ThreadHandle, HarnessError> {
+    ) -> Result<ThreadAttachment, HarnessError> {
         self.claim_calls.fetch_add(1, Ordering::SeqCst);
-        let (tx, _) = tokio::sync::broadcast::channel(16);
-        self.threads.lock().await.insert(thread, tx);
-        Ok(ThreadHandle::opened(
+        let route = TestEventRoute::new(16);
+        self.threads.lock().await.insert(thread, route.clone());
+        route.attach(ThreadHandle::opened(
             thread,
             harness_thread_id,
             workspace_root,
         ))
+    }
+
+    async fn reattach_native_thread(
+        &self,
+        thread: ThreadId,
+        harness_thread_id: String,
+        workspace_root: PathBuf,
+    ) -> Result<ThreadAttachment, HarnessError> {
+        self.claim_native_thread(thread, harness_thread_id, workspace_root)
+            .await
     }
 
     async fn start_turn(
@@ -1665,16 +1688,6 @@ impl AgentHarness for CountingOpenHarness {
         Ok(turn)
     }
 
-    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Ok(threads) = self.threads.try_lock()
-            && let Some(sender) = threads.get(&thread.thread)
-        {
-            return AgentEventStream::new(sender.subscribe());
-        }
-        let (_, rx) = tokio::sync::broadcast::channel(1);
-        AgentEventStream::new(rx)
-    }
-
     async fn respond_approval(
         &self,
         _req: ApprovalId,
@@ -1695,20 +1708,23 @@ impl AgentHarness for CountingOpenHarness {
         Ok(())
     }
 
-    async fn delete_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
-        self.delete_calls.fetch_add(1, Ordering::SeqCst);
-        self.threads.lock().await.remove(&thread.thread);
-        Ok(())
-    }
-
     async fn shutdown(&self) -> Result<(), HarnessError> {
         self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
+        for (_, route) in self.threads.lock().await.drain() {
+            route.close();
+        }
         Ok(())
     }
 }
 
 #[async_trait::async_trait]
 impl AgentHarness for NoMcpHarness {
+    async fn begin_delete_thread<'a>(
+        &'a self,
+        thread: &'a ThreadHandle,
+    ) -> Result<giskard_harness::ThreadRetirement<'a>, HarnessError> {
+        giskard_harness::unsupported_thread_retirement(thread)
+    }
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities {
             live_approvals: false,
@@ -1731,7 +1747,10 @@ impl AgentHarness for NoMcpHarness {
         Ok(Vec::new())
     }
 
-    async fn open_thread(&self, _opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
+    async fn open_thread(
+        &self,
+        _opts: OpenThreadOptions,
+    ) -> Result<ThreadAttachment, HarnessError> {
         Err(HarnessError::Unsupported(
             "thread opening is not supported by this harness".into(),
         ))
@@ -1746,11 +1765,6 @@ impl AgentHarness for NoMcpHarness {
         Err(HarnessError::Unsupported(
             "turns are not supported by this harness".into(),
         ))
-    }
-
-    fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-        let (_tx, rx) = tokio::sync::broadcast::channel(1);
-        AgentEventStream::new(rx)
     }
 
     async fn respond_approval(
@@ -8121,6 +8135,36 @@ async fn concurrent_cold_opens_install_one_native_owner() {
     let config = state.store.load_project(project_id).await.unwrap().unwrap();
     let thread_id = ThreadId::new();
     let model = fake_native_model();
+    let now = chrono::Utc::now();
+    state
+        .store
+        .save_thread(
+            project_id,
+            &giskard_persist::store::ThreadFile {
+                revision: 0,
+                version: giskard_persist::store::THREAD_METADATA_VERSION,
+                id: thread_id,
+                project_id,
+                title: "cold Primary".into(),
+                harness_thread_id: "native-thread".into(),
+                parent_thread_id: None,
+                spawned_by_turn_id: None,
+                kind: giskard_core::ThreadKind::Primary,
+                mode: giskard_core::turn::TurnMode::Known(Mode::Build),
+                current_model: giskard_core::turn::TurnModel::Known(model.clone()),
+                context_window: 0,
+                model_context_windows: HashMap::new(),
+                permission_preset: PermissionPreset::AskFirst,
+                model_efforts: Default::default(),
+                tokens: Default::default(),
+                created_at: now,
+                updated_at: now,
+                archived: false,
+                git_workspace: None,
+            },
+        )
+        .await
+        .unwrap();
 
     let first = state.registry.open_thread(
         &config,

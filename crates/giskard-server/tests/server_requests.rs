@@ -1,6 +1,7 @@
 //! Regression coverage for Codex-style server-initiated browser requests.
 
 mod common;
+mod support;
 #[path = "common/thread_fixture.rs"]
 mod thread_fixture;
 
@@ -19,12 +20,12 @@ use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+    AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadAttachment, ThreadHandle,
 };
 use giskard_persist::store::ProjectConfig;
 use giskard_proto::{ClientMessage, LiveTurnSnapshot, ServerMessage, WireAgentEvent};
 use giskard_server::{AppState, HarnessFactory, build_app};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 
 use common::fake_native_model;
@@ -34,7 +35,7 @@ type TestWs =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 struct ServerRequestHarness {
-    tx: broadcast::Sender<AgentEvent>,
+    route: support::TestEventRoute,
     active: Mutex<Option<(ThreadId, TurnId)>>,
     responses: Mutex<Vec<(ServerRequestId, ServerRequestResponse)>>,
     fail_next_response: Mutex<Option<HarnessError>>,
@@ -47,9 +48,8 @@ struct ServerRequestHarness {
 
 impl ServerRequestHarness {
     fn new() -> Self {
-        let (tx, _) = broadcast::channel(64);
         Self {
-            tx,
+            route: support::TestEventRoute::new(64),
             active: Mutex::new(None),
             responses: Mutex::new(Vec::new()),
             fail_next_response: Mutex::new(None),
@@ -86,6 +86,12 @@ impl ServerRequestHarness {
 
 #[async_trait]
 impl AgentHarness for ServerRequestHarness {
+    async fn begin_delete_thread<'a>(
+        &'a self,
+        thread: &'a ThreadHandle,
+    ) -> Result<giskard_harness::ThreadRetirement<'a>, HarnessError> {
+        giskard_harness::unsupported_thread_retirement(thread)
+    }
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities {
             live_approvals: true,
@@ -108,9 +114,9 @@ impl AgentHarness for ServerRequestHarness {
         Ok(vec![])
     }
 
-    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
+    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadAttachment, HarnessError> {
         let thread = opts.thread;
-        Ok(ThreadHandle {
+        self.route.attach(ThreadHandle {
             resumed_model: Some(opts.initial_model.clone()),
             ..ThreadHandle::opened(
                 thread,
@@ -129,11 +135,11 @@ impl AgentHarness for ServerRequestHarness {
     ) -> Result<TurnId, HarnessError> {
         let turn = TurnId::new();
         *self.active.lock().await = Some((thread.thread, turn));
-        let _ = self.tx.send(AgentEvent::TurnStarted {
+        let _ = self.route.send(AgentEvent::TurnStarted {
             thread: thread.thread,
             turn,
         });
-        let _ = self.tx.send(AgentEvent::ServerRequestReceived {
+        let _ = self.route.send(AgentEvent::ServerRequestReceived {
             thread: thread.thread,
             turn: Some(turn),
             request: ServerRequest {
@@ -151,10 +157,6 @@ impl AgentHarness for ServerRequestHarness {
             },
         });
         Ok(turn)
-    }
-
-    fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-        AgentEventStream::new(self.tx.subscribe())
     }
 
     async fn respond_approval(
@@ -184,12 +186,12 @@ impl AgentHarness for ServerRequestHarness {
             return Ok(());
         }
         let (thread, turn) = self.active.lock().await.take().unwrap_or_default();
-        let _ = self.tx.send(AgentEvent::ServerRequestResolved {
+        let _ = self.route.send(AgentEvent::ServerRequestResolved {
             thread,
             turn: Some(turn),
             request_id: req,
         });
-        let _ = self.tx.send(AgentEvent::TurnCompleted {
+        let _ = self.route.send(AgentEvent::TurnCompleted {
             thread,
             turn,
             usage: TokenUsage::default(),
@@ -206,6 +208,7 @@ impl AgentHarness for ServerRequestHarness {
     }
 
     async fn shutdown(&self) -> Result<(), HarnessError> {
+        self.route.close();
         Ok(())
     }
 }

@@ -17,6 +17,40 @@ use giskard_persist::store::ThreadWorktree;
 use tokio::process::Command as TokioCommand;
 use tracing::{debug, warn};
 
+#[cfg(test)]
+static CREATE_GATES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<CreateGate>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+pub(crate) struct CreateGate {
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl CreateGate {
+    pub(crate) async fn wait_arrived(&self) {
+        self.arrived.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn gate_create(path: PathBuf) -> std::sync::Arc<CreateGate> {
+    let gate = std::sync::Arc::new(CreateGate {
+        arrived: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    if let Ok(mut gates) = CREATE_GATES.lock() {
+        gates.insert(path, gate.clone());
+    }
+    gate
+}
+
 /// Read-only queries answer in milliseconds; `worktree add` writes a whole working tree and
 /// `worktree remove` deletes one, so both scale with the repository rather than with the request.
 /// A checkout of a large repository on a cold cache takes far longer than the 3s the status polls
@@ -113,6 +147,17 @@ pub async fn create(
         tokio::fs::create_dir_all(parent).await.map_err(|error| {
             WorktreeError::Unavailable(format!("could not create {}: {error}", parent.display()))
         })?;
+    }
+
+    #[cfg(test)]
+    let create_gate = CREATE_GATES
+        .lock()
+        .ok()
+        .and_then(|mut gates| gates.remove(path));
+    #[cfg(test)]
+    if let Some(gate) = create_gate {
+        gate.arrived.notify_one();
+        gate.release.notified().await;
     }
 
     // A repository with no commits is a supported case, not a failure: Git creates the worktree on

@@ -94,9 +94,21 @@ Cargo workspace with 8 crates under `crates/`:
   transport, mapper, active turns, pending compactions, and pending context restores must remain
   task-owned. Do not share them through `Arc<Mutex<_>>`, `Arc<RwLock<_>>`, or independent
   state-mutating workers; helper futures may borrow this state only through `&mut self`.
-- Every production Codex thread route must be established through the `CodexInstance` route
-  methods; do not claim or replace mapper identity and publish its event sender as separate
-  operations. Resume-fallback replacement must require the exact prior native/Giskard binding.
+- `CodexRouteAuthority` is the sole authority for each Codex process's native/Giskard thread
+  identity, active/tombstoned route state, event sender and retained receiver, and discovery
+  admission. Its short synchronous lock is the deliberate exception to `CodexInstance` task
+  ownership; never perform provider I/O, persistence, channel waits, or task joins under it.
+  `CodexMapper` owns only turn/item/request correlation and must receive an active route capability
+  before mapping thread-scoped traffic. Resume-fallback replacement must require the exact prior
+  native/Giskard binding.
+- Native event ownership is linear: route-owned receiver → `DiscoveryTicket` →
+  `ThreadAttachment` → `ThreadEventOwner` → event forwarder or persistence-blocked coordinator.
+  Do not recreate `AgentHarness::subscribe`, clone these capabilities, or replace their physical
+  custody with cross-crate reconciliation state.
+- When updating `codex-codes`, review `eligible_notification_native_id` against every
+  `Notification` variant. Add direct borrowed extraction for new typed thread-scoped
+  variants so route discovery stays complete without moving high-frequency traffic onto
+  envelope serialization.
 - Atomic writes for all persistence (temp file + fsync + rename).
 - The store's per-thread locks are in-process `Mutex`es and order nothing between binaries. Anything
   that rewrites or deletes store files from outside `giskard-server` must hold the advisory

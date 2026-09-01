@@ -7,6 +7,7 @@
 //! and assert the snapshot reports it as answered (not pending).
 
 mod common;
+mod support;
 #[path = "common/thread_fixture.rs"]
 mod thread_fixture;
 
@@ -22,12 +23,13 @@ use giskard_core::model::ModelDescriptor;
 use giskard_core::turn::TurnOverrides;
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+    AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadAttachment, ThreadHandle,
 };
 use giskard_persist::store::ProjectConfig;
 use giskard_proto::{ClientMessage, ServerMessage, WireAgentEvent};
 use giskard_server::{AppState, HarnessFactory, build_app};
-use tokio::sync::{Mutex, broadcast};
+use support::TestEventRoute;
+use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 
 use common::fake_native_model;
@@ -42,7 +44,7 @@ const SERVER_REQUEST_ID: &str = "req_reconnect_1";
 /// A harness that raises a single approval and keeps the turn in-flight forever (never sends
 /// `TurnCompleted`), so the live buffer is still present when the reconnect snapshot is taken.
 struct ApprovalHarness {
-    tx: broadcast::Sender<AgentEvent>,
+    route: TestEventRoute,
     active: Mutex<Option<(ThreadId, TurnId)>>,
     answered: Mutex<Vec<(ApprovalId, ApprovalDecision)>>,
     hang_next_approval: Mutex<bool>,
@@ -50,9 +52,8 @@ struct ApprovalHarness {
 
 impl ApprovalHarness {
     fn new() -> Self {
-        let (tx, _) = broadcast::channel(64);
         Self {
-            tx,
+            route: TestEventRoute::new(64),
             active: Mutex::new(None),
             answered: Mutex::new(Vec::new()),
             hang_next_approval: Mutex::new(false),
@@ -66,6 +67,12 @@ impl ApprovalHarness {
 
 #[async_trait]
 impl AgentHarness for ApprovalHarness {
+    async fn begin_delete_thread<'a>(
+        &'a self,
+        thread: &'a ThreadHandle,
+    ) -> Result<giskard_harness::ThreadRetirement<'a>, HarnessError> {
+        giskard_harness::unsupported_thread_retirement(thread)
+    }
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities {
             live_approvals: true,
@@ -88,9 +95,9 @@ impl AgentHarness for ApprovalHarness {
         Ok(vec![])
     }
 
-    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
+    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadAttachment, HarnessError> {
         let thread = opts.thread;
-        Ok(ThreadHandle {
+        self.route.attach(ThreadHandle {
             resumed_model: Some(opts.initial_model.clone()),
             ..ThreadHandle::opened(
                 thread,
@@ -108,11 +115,11 @@ impl AgentHarness for ApprovalHarness {
     ) -> Result<TurnId, HarnessError> {
         let turn = TurnId::new();
         *self.active.lock().await = Some((thread.thread, turn));
-        let _ = self.tx.send(AgentEvent::TurnStarted {
+        let _ = self.route.send(AgentEvent::TurnStarted {
             thread: thread.thread,
             turn,
         });
-        let _ = self.tx.send(AgentEvent::ApprovalRequested {
+        let _ = self.route.send(AgentEvent::ApprovalRequested {
             thread: thread.thread,
             turn,
             request: ApprovalRequest {
@@ -128,7 +135,7 @@ impl AgentHarness for ApprovalHarness {
         });
         // A non-approval server request blocks the turn the same way an approval does, and is just
         // as invisible to a browser that was not connected, so the connect replay carries both.
-        let _ = self.tx.send(AgentEvent::ServerRequestReceived {
+        let _ = self.route.send(AgentEvent::ServerRequestReceived {
             thread: thread.thread,
             turn: Some(turn),
             request: giskard_core::server_request::ServerRequest {
@@ -139,10 +146,6 @@ impl AgentHarness for ApprovalHarness {
             },
         });
         Ok(turn)
-    }
-
-    fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-        AgentEventStream::new(self.tx.subscribe())
     }
 
     async fn respond_approval(
@@ -167,7 +170,7 @@ impl AgentHarness for ApprovalHarness {
         // Mirror a real harness: answering the request resolves it, which is what clears it from the
         // live buffer. Without this it would stay outstanding and keep being replayed.
         if let Some((thread, turn)) = *self.active.lock().await {
-            let _ = self.tx.send(AgentEvent::ServerRequestResolved {
+            let _ = self.route.send(AgentEvent::ServerRequestResolved {
                 thread,
                 turn: Some(turn),
                 request_id: req,
@@ -181,6 +184,7 @@ impl AgentHarness for ApprovalHarness {
     }
 
     async fn shutdown(&self) -> Result<(), HarnessError> {
+        self.route.close();
         Ok(())
     }
 }

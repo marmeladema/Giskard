@@ -6,7 +6,7 @@ use giskard_core::ids::{ProjectId, ThreadId, TurnId};
 use giskard_core::thread::ThreadKind;
 use giskard_core::turn::{TurnMode, TurnModel};
 use giskard_core::user_input::UserInput;
-use giskard_harness::ThreadHandle;
+use giskard_harness::{ThreadEventOwner, ThreadHandle};
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, watch};
 
 use super::{
@@ -45,11 +45,23 @@ pub(super) struct EventOwnerControl {
 }
 
 enum OwnerPhase {
+    #[cfg(test)]
     Installing,
     Live(EventOwnerControl),
     Draining(EventOwnerControl),
+    PersistenceBlocked(Box<ThreadEventOwner>),
     Retired,
     Failed(String),
+}
+
+/// Resource returned when retirement starts.
+///
+/// A running forwarder is stopped through its control channel. A persistence-blocked forwarder
+/// has already exited, so retirement takes physical custody of its retained route owner instead;
+/// dropping that value returns the receiver to an active route or becomes inert after tombstoning.
+pub(super) enum OwnerRetirement {
+    Running(EventOwnerControl),
+    PersistenceBlocked(Box<ThreadEventOwner>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,7 +75,25 @@ enum NativeActivity {
 struct PreparedOperation {
     pub(super) token: CoordinatorToken,
     pub(super) context: TurnContext,
-    turn_gate: ThreadTurnLease,
+    reservation: std::sync::Weak<ReservationCell>,
+    accepted_reservation: Option<Arc<ReservationCell>>,
+}
+
+struct ReservationCell {
+    lease: Mutex<Option<ThreadTurnLease>>,
+}
+
+/// Linear ownership of a prepared runtime reservation. The coordinator retains only a weak
+/// correlation handle, so dropping this value releases an unclaimed lease by construction.
+pub(super) struct PreparedTurnReservation {
+    token: CoordinatorToken,
+    cell: Arc<ReservationCell>,
+}
+
+impl PreparedTurnReservation {
+    pub(super) fn token(&self) -> CoordinatorToken {
+        self.token
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,17 +155,44 @@ impl ThreadCoordinatorState {
 }
 
 impl ThreadCoordinator {
+    #[cfg(test)]
     pub(super) fn new(binding: LoadedThreadBinding, classification: ClassificationPhase) -> Self {
+        Self::with_owner(binding, classification, OwnerPhase::Installing)
+    }
+
+    /// Construct the unpublished Live coordinator used by `OwnerInstallation::commit`.
+    ///
+    /// Construction is synchronous so the installer can consume the attachment, publish this
+    /// coordinator, and release its forwarder start gate without an intervening await. The value
+    /// must not be inserted into a thread authority except as part of that atomic commit.
+    pub(super) fn new_live(
+        binding: LoadedThreadBinding,
+        classification: ClassificationPhase,
+        control: EventOwnerControl,
+    ) -> Self {
+        Self::with_owner(binding, classification, OwnerPhase::Live(control))
+    }
+
+    fn with_owner(
+        binding: LoadedThreadBinding,
+        classification: ClassificationPhase,
+        owner: OwnerPhase,
+    ) -> Self {
+        let native_activity = if matches!(owner, OwnerPhase::Live(_)) {
+            NativeActivity::Idle
+        } else {
+            NativeActivity::Unknown
+        };
         Self {
             state: AsyncMutex::new(ThreadCoordinatorState {
                 generation: 1,
                 next_sequence: 0,
                 binding,
                 classification,
-                owner: OwnerPhase::Installing,
+                owner,
                 operation: None,
                 native_turn: None,
-                native_activity: NativeActivity::Unknown,
+                native_activity,
             }),
             changed: Notify::new(),
         }
@@ -160,6 +217,7 @@ impl ThreadCoordinator {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn activate_owner(
         &self,
         control: EventOwnerControl,
@@ -176,11 +234,32 @@ impl ThreadCoordinator {
         Ok(())
     }
 
+    /// Retain physical route ownership after persistence prevents the forwarder from continuing.
+    ///
+    /// The caller receives the owner back on a stale or invalid transition, so no error path can
+    /// accidentally release the only buffered receiver without making that decision explicitly.
+    pub(super) async fn retain_persistence_blocked_owner(
+        &self,
+        owner: ThreadEventOwner,
+    ) -> Result<(), (HarnessError, Box<ThreadEventOwner>)> {
+        let mut state = self.state.lock().await;
+        if !matches!(state.owner, OwnerPhase::Live(_)) {
+            let error = HarnessError::Protocol(format!(
+                "thread {} cannot retain a persistence-blocked owner from its current phase",
+                state.binding.handle.thread
+            ));
+            return Err((error, Box::new(owner)));
+        }
+        state.owner = OwnerPhase::PersistenceBlocked(Box::new(owner));
+        state.native_activity = NativeActivity::Unknown;
+        Ok(())
+    }
+
     pub(super) async fn prepare_operation(
         &self,
         context: TurnContext,
         turn_gate: ThreadTurnLease,
-    ) -> Result<CoordinatorToken, (HarnessError, ThreadTurnLease)> {
+    ) -> Result<PreparedTurnReservation, (HarnessError, ThreadTurnLease)> {
         let mut state = self.state.lock().await;
         if state.classification != ClassificationPhase::Primary {
             return Err((
@@ -194,6 +273,15 @@ impl ThreadCoordinator {
             return Err((
                 HarnessError::Protocol(format!(
                     "thread {} event owner failed: {reason}",
+                    state.binding.handle.thread
+                )),
+                turn_gate,
+            ));
+        }
+        if matches!(state.owner, OwnerPhase::PersistenceBlocked(_)) {
+            return Err((
+                HarnessError::Protocol(format!(
+                    "thread {} event owner is blocked on persistence",
                     state.binding.handle.thread
                 )),
                 turn_gate,
@@ -217,12 +305,16 @@ impl ThreadCoordinator {
             ));
         }
         let token = state.token();
+        let cell = Arc::new(ReservationCell {
+            lease: Mutex::new(Some(turn_gate)),
+        });
         state.operation = Some(PreparedOperation {
             token,
             context,
-            turn_gate,
+            reservation: Arc::downgrade(&cell),
+            accepted_reservation: None,
         });
-        Ok(token)
+        Ok(PreparedTurnReservation { token, cell })
     }
 
     pub(super) async fn abort_operation(&self, token: CoordinatorToken) -> Option<ThreadTurnLease> {
@@ -233,7 +325,13 @@ impl ThreadCoordinator {
         let operation = state.operation.take()?;
         drop(state);
         self.changed.notify_waiters();
-        Some(operation.turn_gate)
+        operation
+            .accepted_reservation
+            .or_else(|| operation.reservation.upgrade())?
+            .lease
+            .lock()
+            .ok()?
+            .take()
     }
 
     /// Clear an operation that never reached a native turn. The event owner calls this when its
@@ -246,7 +344,15 @@ impl ThreadCoordinator {
             drop(state);
             self.changed.notify_waiters();
         }
-        operation.map(|operation| operation.turn_gate)
+        operation.and_then(|operation| {
+            operation
+                .accepted_reservation
+                .or_else(|| operation.reservation.upgrade())?
+                .lease
+                .lock()
+                .ok()?
+                .take()
+        })
     }
 
     pub(super) async fn reusable_handle(
@@ -275,31 +381,55 @@ impl ThreadCoordinator {
                 "thread {} event owner failed: {reason}",
                 thread_id
             ))),
-            OwnerPhase::Installing | OwnerPhase::Draining(_) | OwnerPhase::Retired => Err(
-                HarnessError::Protocol(format!("thread {} event owner is not reusable", thread_id)),
-            ),
+            #[cfg(test)]
+            OwnerPhase::Installing => Err(HarnessError::Protocol(format!(
+                "thread {} event owner is not reusable",
+                thread_id
+            ))),
+            OwnerPhase::Draining(_) | OwnerPhase::PersistenceBlocked(_) | OwnerPhase::Retired => {
+                Err(HarnessError::Protocol(format!(
+                    "thread {} event owner is not reusable",
+                    thread_id
+                )))
+            }
         }
     }
 
     pub(super) async fn acknowledge_operation_turn(
         &self,
-        token: CoordinatorToken,
+        reservation: &PreparedTurnReservation,
         turn_id: TurnId,
     ) {
         let mut state = self.state.lock().await;
         if let Some(operation) = state
             .operation
             .as_mut()
-            .filter(|operation| operation.token == token)
+            .filter(|operation| operation.token == reservation.token)
         {
-            let _ = operation.turn_gate.acknowledge_turn(turn_id);
+            if let Ok(mut lease) = reservation.cell.lease.lock()
+                && let Some(lease) = lease.as_mut()
+            {
+                let _ = lease.acknowledge_turn(turn_id);
+            }
+            operation.accepted_reservation = Some(reservation.cell.clone());
             return;
         }
         if let Some(native_turn) = state.native_turn.as_mut()
-            && native_turn.origin == NativeTurnOrigin::Prepared(token)
+            && native_turn.origin == NativeTurnOrigin::Prepared(reservation.token)
             && let Some(turn_gate) = native_turn.turn_gate.as_mut()
         {
             let _ = turn_gate.acknowledge_turn(turn_id);
+        }
+    }
+
+    pub(super) async fn retain_accepted_operation(&self, reservation: &PreparedTurnReservation) {
+        let mut state = self.state.lock().await;
+        if let Some(operation) = state
+            .operation
+            .as_mut()
+            .filter(|operation| operation.token == reservation.token)
+        {
+            operation.accepted_reservation = Some(reservation.cell.clone());
         }
     }
 
@@ -324,10 +454,14 @@ impl ThreadCoordinator {
         }
 
         let (token, context, turn_gate, origin) = if let Some(operation) = state.operation.take() {
+            let turn_gate = operation
+                .accepted_reservation
+                .or_else(|| operation.reservation.upgrade())
+                .and_then(|cell| cell.lease.lock().ok()?.take());
             (
                 operation.token,
                 operation.context,
-                Some(operation.turn_gate),
+                turn_gate,
                 NativeTurnOrigin::Prepared(operation.token),
             )
         } else {
@@ -437,15 +571,29 @@ impl ThreadCoordinator {
         }
     }
 
-    pub(super) async fn begin_retirement(&self) -> Option<EventOwnerControl> {
+    pub(super) async fn begin_retirement(&self) -> Option<OwnerRetirement> {
         let mut state = self.state.lock().await;
         match &state.owner {
             OwnerPhase::Live(control) | OwnerPhase::Draining(control) => {
                 let control = control.clone();
                 state.owner = OwnerPhase::Draining(control.clone());
-                Some(control)
+                Some(OwnerRetirement::Running(control))
             }
-            OwnerPhase::Installing | OwnerPhase::Retired | OwnerPhase::Failed(_) => None,
+            OwnerPhase::PersistenceBlocked(_) => {
+                let OwnerPhase::PersistenceBlocked(owner) =
+                    std::mem::replace(&mut state.owner, OwnerPhase::Retired)
+                else {
+                    return None;
+                };
+                state.generation = state.generation.wrapping_add(1);
+                state.native_activity = NativeActivity::Unloaded;
+                drop(state);
+                self.changed.notify_waiters();
+                Some(OwnerRetirement::PersistenceBlocked(owner))
+            }
+            #[cfg(test)]
+            OwnerPhase::Installing => None,
+            OwnerPhase::Retired | OwnerPhase::Failed(_) => None,
         }
     }
 
@@ -467,6 +615,8 @@ impl ThreadCoordinator {
             return;
         }
         state.generation = state.generation.wrapping_add(1);
+        // Replacing a persistence-blocked phase drops its physical route owner only after the
+        // coordinator has irrevocably entered retirement.
         state.owner = OwnerPhase::Retired;
         state.native_activity = NativeActivity::Unloaded;
         drop(state);
@@ -555,7 +705,7 @@ impl WeakOwnerLock {
 /// Independently synchronized optional coordinator storage.
 #[derive(Default)]
 struct CoordinatorSlot {
-    current: AsyncMutex<Option<ThreadBinding>>,
+    current: Arc<AsyncMutex<Option<ThreadBinding>>>,
 }
 
 /// Per-parent FIFO storage whose presence also records a running worker.
@@ -613,7 +763,18 @@ impl ThreadAuthority {
         self.coordinator.current.lock().await.clone()
     }
 
+    /// Serializes the no-gap owner installation commit.
+    ///
+    /// Callers acquire this before consuming a linear attachment, then synchronously transfer the
+    /// resulting owner and publish its Live coordinator while the guard remains held.
+    pub(super) async fn coordinator_slot(
+        &self,
+    ) -> tokio::sync::OwnedMutexGuard<Option<ThreadBinding>> {
+        self.coordinator.current.clone().lock_owned().await
+    }
+
     /// Installs only into an empty slot and returns the proposal unchanged on conflict.
+    #[cfg(test)]
     pub(super) async fn install_coordinator_if_empty(
         &self,
         coordinator: ThreadBinding,
@@ -843,7 +1004,10 @@ mod tests {
             tokio::task::yield_now().await;
         }
         task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
+        match task.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("cancelled admission unexpectedly completed"),
+        }
         drop(state_guard);
 
         assert!(!shared.runtime.has_active_turn(&authority));
@@ -861,14 +1025,17 @@ mod tests {
             .unwrap();
         let runtime = ThreadRuntimeSupport::new();
         let stale = prepare_test_operation(&coordinator, &runtime, test_turn_context()).await;
-        let mut stale_lease = coordinator.abort_operation(stale).await.unwrap();
+        let mut stale_lease = coordinator.abort_operation(stale.token()).await.unwrap();
         let _ = stale_lease.release();
         let current = prepare_test_operation(&coordinator, &runtime, test_turn_context()).await;
 
-        let _ = coordinator.abort_operation(stale).await;
+        let _ = coordinator.abort_operation(stale.token()).await;
 
         let state = coordinator.state.lock().await;
-        assert_eq!(state.operation.as_ref().map(|op| op.token), Some(current));
+        assert_eq!(
+            state.operation.as_ref().map(|op| op.token),
+            Some(current.token())
+        );
     }
 
     #[tokio::test]
@@ -963,7 +1130,7 @@ mod tests {
             Ok(operation) => operation,
             Err((error, _)) => panic!("stale test operation was rejected: {error}"),
         };
-        let mut stale_lease = coordinator.abort_operation(stale).await.unwrap();
+        let mut stale_lease = coordinator.abort_operation(stale.token()).await.unwrap();
         let _ = stale_lease.release();
 
         let current_lease = runtime
@@ -981,7 +1148,7 @@ mod tests {
         };
 
         coordinator
-            .acknowledge_operation_turn(stale, TurnId::new())
+            .acknowledge_operation_turn(&stale, TurnId::new())
             .await;
         let summary = runtime
             .current_overview()
@@ -993,7 +1160,7 @@ mod tests {
             summary.turn_state,
             giskard_proto::RuntimeTurnState::Active { turn_id: None }
         ));
-        let mut current_lease = coordinator.abort_operation(current).await.unwrap();
+        let mut current_lease = coordinator.abort_operation(current.token()).await.unwrap();
         let _ = current_lease.release();
     }
 

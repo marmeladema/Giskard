@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use argon2::PasswordHasher;
 use async_trait::async_trait;
@@ -40,7 +40,7 @@ use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
     AgentEventStream, AgentHarness, HarnessBootstrap, HarnessCapabilities, OpenThreadOptions,
-    ThreadHandle,
+    ThreadAttachment, ThreadDeletion, ThreadHandle,
 };
 use giskard_persist::store::ProjectConfig;
 use giskard_server::{AppState, HarnessFactory, build_app};
@@ -112,6 +112,107 @@ const SCRIPTED_REASONING_DETAIL: &str = "Then answering with the deterministic s
 const RECEIVER_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const RECEIVER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
+#[derive(Clone)]
+struct ScriptedRoute {
+    sender: broadcast::Sender<AgentEvent>,
+    state: Arc<StdMutex<ScriptedRouteState>>,
+}
+
+struct ScriptedRouteState {
+    receiver: Option<AgentEventStream>,
+    phase: ScriptedRoutePhase,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScriptedRoutePhase {
+    Idle,
+    Attaching,
+    Owned,
+    Closed,
+}
+
+impl ScriptedRoute {
+    fn new() -> Self {
+        let (sender, receiver) = broadcast::channel(256);
+        Self {
+            sender,
+            state: Arc::new(StdMutex::new(ScriptedRouteState {
+                receiver: Some(AgentEventStream::new(receiver)),
+                phase: ScriptedRoutePhase::Idle,
+            })),
+        }
+    }
+
+    fn attachment(&self, handle: ThreadHandle) -> Result<ThreadAttachment, HarnessError> {
+        let stream = {
+            let mut state = self.state.lock().map_err(|_| {
+                HarnessError::Protocol("scripted route authority lock poisoned".into())
+            })?;
+            if state.phase != ScriptedRoutePhase::Idle {
+                return Err(HarnessError::Protocol(format!(
+                    "scripted thread {} already has an event owner",
+                    handle.thread
+                )));
+            }
+            let stream = state.receiver.take().ok_or_else(|| {
+                HarnessError::Protocol("scripted route lost its retained receiver".into())
+            })?;
+            state.phase = ScriptedRoutePhase::Attaching;
+            stream
+        };
+        let commit_state = self.state.clone();
+        let attachment_drop_state = self.state.clone();
+        Ok(ThreadAttachment::from_route(
+            handle,
+            stream,
+            move || {
+                let mut state = match commit_state.lock() {
+                    Ok(state) => state,
+                    Err(_) => {
+                        return Err(HarnessError::Protocol(
+                            "scripted route authority lock poisoned".into(),
+                        ));
+                    }
+                };
+                if state.phase != ScriptedRoutePhase::Attaching {
+                    return Err(HarnessError::Protocol(
+                        "scripted route attachment is stale".into(),
+                    ));
+                }
+                state.phase = ScriptedRoutePhase::Owned;
+                drop(state);
+                let owner_drop_state = commit_state.clone();
+                Ok(Box::new(move |stream| {
+                    let Ok(mut state) = owner_drop_state.lock() else {
+                        return;
+                    };
+                    if state.phase == ScriptedRoutePhase::Owned {
+                        state.receiver = Some(stream);
+                        state.phase = ScriptedRoutePhase::Idle;
+                    }
+                })
+                    as Box<dyn FnOnce(AgentEventStream) + Send>)
+            },
+            move |stream| {
+                let Ok(mut state) = attachment_drop_state.lock() else {
+                    return;
+                };
+                if state.phase == ScriptedRoutePhase::Attaching {
+                    state.receiver = Some(stream);
+                    state.phase = ScriptedRoutePhase::Idle;
+                }
+            },
+        ))
+    }
+
+    fn close(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.receiver = None;
+            state.phase = ScriptedRoutePhase::Closed;
+        }
+    }
+}
+
 /// A harness that speaks the neutral protocol but has no backend: every turn streams the same
 /// canned agent message, so the browser-visible transcript is fully deterministic.
 struct ScriptedHarness {
@@ -122,7 +223,7 @@ struct ScriptedHarness {
     // Structural reason: This non-test-gated replay adapter cannot use server authorities.
     // Synchronization: The mutex protects linear lookup, insertion, and removal.
     // Invalidation/removal: Thread close removes state; dropping the harness removes all entries.
-    threads: tokio::sync::Mutex<Vec<(ThreadId, broadcast::Sender<AgentEvent>)>>,
+    threads: tokio::sync::Mutex<Vec<(ThreadId, ScriptedRoute)>>,
     // ENTITY-AUTHORITY-EXCEPTION:
     // Role: Translate scripted native thread identifiers to Giskard thread identifiers.
     // Source of truth: Bootstrap and import claims establish the bijective bindings.
@@ -130,6 +231,7 @@ struct ScriptedHarness {
     // Synchronization: The mutex protects claim validation, lookup, and insertion.
     // Invalidation/removal: Bindings live for the scripted harness process and drop with it.
     native_bindings: tokio::sync::Mutex<Vec<(String, ThreadId)>>,
+    tombstones: tokio::sync::Mutex<Vec<ThreadId>>,
     /// Where each in-flight scripted approval was raised, so `respond_approval` can emit its
     /// confirmation item on the right still-open turn (the reload e2e test uses that ack to know the
     /// server has recorded the answer before it reconnects). Keyed by approval id rather than held
@@ -171,6 +273,7 @@ impl ScriptedHarness {
             },
             threads: tokio::sync::Mutex::new(Vec::new()),
             native_bindings: tokio::sync::Mutex::new(native_bindings),
+            tombstones: tokio::sync::Mutex::new(Vec::new()),
             active_approvals: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
     }
@@ -219,7 +322,7 @@ impl ScriptedHarness {
         threads
             .iter()
             .find(|(id, _)| *id == thread)
-            .map(|(_, tx)| tx.clone())
+            .map(|(_, route)| route.sender.clone())
     }
 
     fn subagent_parent(native_thread_id: &str) -> Option<String> {
@@ -238,15 +341,15 @@ impl ScriptedHarness {
         &self,
         thread: ThreadId,
         harness_thread_id: &str,
-    ) -> (Option<String>, bool) {
-        let (new_sender, _) = broadcast::channel(256);
+    ) -> (Option<String>, bool, ScriptedRoute) {
+        let new_route = ScriptedRoute::new();
         let mut threads = self.threads.lock().await;
-        let (sender, is_new) =
+        let (route, is_new) =
             if let Some((_, existing)) = threads.iter().find(|(id, _)| *id == thread) {
                 (existing.clone(), false)
             } else {
-                threads.push((thread, new_sender.clone()));
-                (new_sender, true)
+                threads.push((thread, new_route.clone()));
+                (new_route, true)
             };
         drop(threads);
 
@@ -254,14 +357,22 @@ impl ScriptedHarness {
         let blocks_on_approval = harness_thread_id.starts_with(SCRIPTED_APPROVAL_SUBAGENT_PREFIX);
         if is_new && let Some(parent_id) = parent.clone() {
             if harness_thread_id.starts_with(SCRIPTED_NESTED_SUBAGENT_PREFIX) {
-                Self::spawn_nested_subagent_turn(sender, thread, harness_thread_id.to_owned());
+                Self::spawn_nested_subagent_turn(
+                    route.sender.clone(),
+                    thread,
+                    harness_thread_id.to_owned(),
+                );
             } else if blocks_on_approval {
-                Self::spawn_approval_subagent_turn(sender, thread, self.active_approvals.clone());
+                Self::spawn_approval_subagent_turn(
+                    route.sender.clone(),
+                    thread,
+                    self.active_approvals.clone(),
+                );
             } else {
-                Self::spawn_subagent_turn(sender, thread, parent_id);
+                Self::spawn_subagent_turn(route.sender.clone(), thread, parent_id);
             }
         }
-        (parent, blocks_on_approval)
+        (parent, blocks_on_approval, route)
     }
 
     /// Drive a child turn that blocks on an approval and never completes. The parent's own turn has
@@ -474,8 +585,9 @@ impl AgentHarness for ScriptedHarness {
         }])
     }
 
-    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
+    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadAttachment, HarnessError> {
         let thread = opts.thread;
+        self.tombstones.lock().await.retain(|id| *id != thread);
         let harness_thread_id = opts
             .resume
             .clone()
@@ -486,10 +598,10 @@ impl AgentHarness for ScriptedHarness {
             Self::claim_binding(&mut bindings, harness_thread_id.clone(), thread)?;
         }
 
-        let (parent_harness_thread_id, blocks_on_approval) =
+        let (parent_harness_thread_id, blocks_on_approval, route) =
             self.attach_thread(thread, &harness_thread_id).await;
 
-        Ok(ThreadHandle {
+        route.attachment(ThreadHandle {
             resumed_model: Some(opts.initial_model.clone()),
             agent_name: parent_harness_thread_id.as_ref().map(|_| {
                 if blocks_on_approval {
@@ -508,16 +620,21 @@ impl AgentHarness for ScriptedHarness {
         thread: ThreadId,
         harness_thread_id: String,
         workspace_root: PathBuf,
-    ) -> Result<ThreadHandle, HarnessError> {
+    ) -> Result<ThreadAttachment, HarnessError> {
+        if self.tombstones.lock().await.contains(&thread) {
+            return Err(HarnessError::Protocol(format!(
+                "scripted thread {thread} route is tombstoned"
+            )));
+        }
         {
             let mut bindings = self.native_bindings.lock().await;
             Self::claim_binding(&mut bindings, harness_thread_id.clone(), thread)?;
         }
 
-        let (parent_harness_thread_id, blocks_on_approval) =
+        let (parent_harness_thread_id, blocks_on_approval, route) =
             self.attach_thread(thread, &harness_thread_id).await;
 
-        Ok(ThreadHandle {
+        route.attachment(ThreadHandle {
             agent_name: parent_harness_thread_id.as_ref().map(|_| {
                 if blocks_on_approval {
                     SCRIPTED_APPROVAL_SUBAGENT_AGENT_NAME.to_string()
@@ -528,6 +645,19 @@ impl AgentHarness for ScriptedHarness {
             parent_harness_thread_id,
             ..ThreadHandle::opened(thread, harness_thread_id, workspace_root)
         })
+    }
+
+    async fn reattach_native_thread(
+        &self,
+        thread: ThreadId,
+        harness_thread_id: String,
+        workspace_root: PathBuf,
+    ) -> Result<ThreadAttachment, HarnessError> {
+        // Scripted deletion removes delivery while retaining the native identity. An explicit
+        // durable reopen is the only operation allowed to create the replacement route.
+        self.tombstones.lock().await.retain(|id| *id != thread);
+        self.claim_native_thread(thread, harness_thread_id, workspace_root)
+            .await
     }
 
     async fn start_turn(
@@ -892,16 +1022,6 @@ impl AgentHarness for ScriptedHarness {
         Ok(turn)
     }
 
-    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Ok(threads) = self.threads.try_lock()
-            && let Some((_, tx)) = threads.iter().find(|(id, _)| *id == thread.thread)
-        {
-            return AgentEventStream::new(tx.subscribe());
-        }
-        let (_, rx) = broadcast::channel(1);
-        AgentEventStream::new(rx)
-    }
-
     async fn respond_approval(
         &self,
         req: giskard_core::ids::ApprovalId,
@@ -950,15 +1070,33 @@ impl AgentHarness for ScriptedHarness {
         Ok(())
     }
 
-    async fn delete_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
-        self.threads
-            .lock()
-            .await
-            .retain(|(thread_id, _)| *thread_id != thread.thread);
-        Ok(())
+    async fn begin_delete_thread<'a>(
+        &'a self,
+        thread: &'a ThreadHandle,
+    ) -> Result<giskard_harness::ThreadRetirement<'a>, HarnessError> {
+        let removed = {
+            let mut threads = self.threads.lock().await;
+            threads
+                .iter()
+                .position(|(thread_id, _)| *thread_id == thread.thread)
+                .map(|index| threads.remove(index).1)
+        };
+        if let Some(route) = removed {
+            route.close();
+        }
+        let mut tombstones = self.tombstones.lock().await;
+        if !tombstones.contains(&thread.thread) {
+            tombstones.push(thread.thread);
+        }
+        Ok(giskard_harness::ThreadRetirement::new(Box::pin(async {
+            Ok(ThreadDeletion::Retired)
+        })))
     }
 
     async fn shutdown(&self) -> Result<(), HarnessError> {
+        for (_, route) in self.threads.lock().await.drain(..) {
+            route.close();
+        }
         Ok(())
     }
 }
