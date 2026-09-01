@@ -48,6 +48,11 @@ Codex threadId
     -> originating Codex turnId while the command is known running
 ```
 
+Retained Codex identities use adapter-local newtypes and named composite keys. String identities
+convert back to strings only at harness-neutral, wire, persistence, and logging boundaries; route
+epochs similarly return to their plain numeric representation at the existing harness boundary.
+This keeps the opaque domains distinct without changing their protocol representation.
+
 ### Where the thread mapping comes from
 
 `Codex threadId -> Giskard ThreadId` is populated three ways, and the order

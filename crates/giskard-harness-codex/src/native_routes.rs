@@ -3,11 +3,13 @@ use std::collections::HashMap;
 use giskard_core::error::HarnessError;
 use giskard_core::ids::ThreadId;
 
+use crate::native_ids::{NativeRouteEpoch, NativeThreadId};
+
 /// One authoritative native-to-Giskard thread route for this harness lifetime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct NativeRoute {
     pub(super) thread_id: ThreadId,
-    pub(super) epoch: u64,
+    pub(super) epoch: NativeRouteEpoch,
 }
 
 /// Owns the bijective native-thread routes established for one Codex worker.
@@ -19,22 +21,22 @@ pub(super) struct NativeThreadRoutes {
     // Structural reason: The lower harness adapter must route native protocol identities.
     // Synchronization: The single Codex background task owns and mutates this component.
     // Invalidation/removal: Routes live for one harness process and drop on shutdown.
-    by_native: HashMap<String, NativeRoute>,
+    by_native: HashMap<NativeThreadId, NativeRoute>,
     // ENTITY-AUTHORITY-EXCEPTION:
     // Role: Enforce the reverse Giskard-to-native half of each bijective route claim.
     // Source of truth: The same successful claim that publishes `by_native` publishes this entry.
     // Structural reason: The adapter cannot depend on server authority types.
     // Synchronization: The single Codex background task owns and mutates this component.
     // Invalidation/removal: Routes live for one harness process and drop on shutdown.
-    native_by_thread: HashMap<ThreadId, String>,
+    native_by_thread: HashMap<ThreadId, NativeThreadId>,
     /// Monotonic route epoch allocator scoped to one harness process.
-    next_epoch: u64,
+    next_epoch: NativeRouteEpoch,
 }
 
 /// A non-empty native thread ID that has no established route.
 #[derive(Debug)]
 pub(super) struct UnknownNativeThread {
-    pub(super) native_thread_id: String,
+    pub(super) native_thread_id: NativeThreadId,
 }
 
 impl NativeThreadRoutes {
@@ -44,8 +46,8 @@ impl NativeThreadRoutes {
         native_thread_id: String,
         thread_id: ThreadId,
     ) -> Result<NativeRoute, HarnessError> {
-        let native_thread_id = native_thread_id.trim().to_owned();
-        if native_thread_id.is_empty() {
+        let native_thread_id = NativeThreadId::new(native_thread_id.trim().to_owned());
+        if native_thread_id.as_str().is_empty() {
             return Err(HarnessError::Protocol(
                 "cannot claim an empty native thread id".into(),
             ));
@@ -66,7 +68,7 @@ impl NativeThreadRoutes {
         }
         self.next_epoch = self
             .next_epoch
-            .checked_add(1)
+            .checked_next()
             .ok_or_else(|| HarnessError::Protocol("native route epoch space exhausted".into()))?;
         let route = NativeRoute {
             thread_id,
@@ -99,7 +101,7 @@ impl NativeThreadRoutes {
             return Ok(fallback);
         }
         Err(UnknownNativeThread {
-            native_thread_id: native_thread_id.to_owned(),
+            native_thread_id: NativeThreadId::new(native_thread_id.to_owned()),
         })
     }
 }
