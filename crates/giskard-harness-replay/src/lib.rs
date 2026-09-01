@@ -3,6 +3,7 @@
 //! Reads a recorded fixture (JSONL of `AgentEvent`s) and replays them through the
 //! `AgentHarness` trait with deterministic timing. No real LLM, no network.
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -80,6 +81,22 @@ struct PreloadedFixture {
     events: Vec<AgentEvent>,
 }
 
+/// Replay-owned native thread identity used to consume one matching fixture on resume.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ReplayNativeThreadId(String);
+
+impl ReplayNativeThreadId {
+    fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl Borrow<str> for ReplayNativeThreadId {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A harness that replays recorded events deterministically.
 pub struct ReplayHarness {
     capabilities: HarnessCapabilities,
@@ -90,7 +107,7 @@ pub struct ReplayHarness {
     // Synchronization: The mutex protects linear lookup, insertion, and removal.
     // Invalidation/removal: Thread close removes state; dropping the harness removes all entries.
     threads: Mutex<Vec<(ThreadId, ThreadState)>>,
-    fixtures: Mutex<HashMap<String, PreloadedFixture>>,
+    fixtures: Mutex<HashMap<ReplayNativeThreadId, PreloadedFixture>>,
     /// Catalog returned by `list_models` (empty unless set via [`ReplayHarness::with_models`]),
     /// standing in for a real harness's model catalog (e.g. Codex `model/list`).
     models: Vec<ModelDescriptor>,
@@ -119,7 +136,7 @@ impl ReplayHarness {
         Self::with_fixtures(HashMap::new())
     }
 
-    fn with_fixtures(fixtures: HashMap<String, PreloadedFixture>) -> Self {
+    fn with_fixtures(fixtures: HashMap<ReplayNativeThreadId, PreloadedFixture>) -> Self {
         Self {
             capabilities: HarnessCapabilities {
                 live_approvals: true,
@@ -218,7 +235,7 @@ impl ReplayHarness {
 
         let mut fixtures = HashMap::new();
         fixtures.insert(
-            harness_thread_id,
+            ReplayNativeThreadId::new(harness_thread_id),
             PreloadedFixture {
                 thread_id,
                 events: fixture.events,
@@ -274,7 +291,7 @@ impl AgentHarness for ReplayHarness {
 
         let (thread_id, mut pending) = if let Some(resume) = &opts.resume {
             let mut fixtures = self.fixtures.lock().await;
-            if let Some(fixture) = fixtures.remove(resume) {
+            if let Some(fixture) = fixtures.remove(resume.as_str()) {
                 (opts.thread.unwrap_or(fixture.thread_id), fixture.events)
             } else {
                 (opts.thread.unwrap_or_default(), Vec::new())

@@ -758,7 +758,7 @@ impl HarnessRegistry {
                     thread.id
                 )));
             }
-            if !native_ids.insert(thread.harness_thread_id.clone()) {
+            if !native_ids.insert(HarnessThreadId::new(thread.harness_thread_id.clone())) {
                 return Err(HarnessError::Protocol(format!(
                     "native thread id {} is bound more than once",
                     thread.harness_thread_id
@@ -2693,7 +2693,7 @@ async fn forward_events(
     let mut diffs: Vec<giskard_core::FileDiff> = Vec::new();
     let mut seen_turn_ids = persisted_turn_ids(&store, project_id, thread_id).await;
     let mut seen_notices = HashSet::new();
-    let mut item_ids_by_harness: HashMap<(TurnId, String), ItemId> = HashMap::new();
+    let mut item_ids_by_harness: HashMap<HarnessItemKey, ItemId> = HashMap::new();
     let forwarder_started = Instant::now();
     let mut saw_context_compaction_marker = false;
     let mut stream_error: Option<String> = None;
@@ -3661,12 +3661,48 @@ fn event_item_identity(event: &AgentEvent) -> Option<(TurnId, &str, ItemId)> {
     }
 }
 
+/// Harness-neutral native thread identity used only for bootstrap uniqueness checks.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct HarnessThreadId(String);
+
+impl HarnessThreadId {
+    fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+
+/// Harness-neutral native item identity retained by one thread's event forwarder.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct HarnessItemId(String);
+
+impl HarnessItemId {
+    fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+
+/// Scoped harness item identity; native item IDs need only be unique within a turn.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct HarnessItemKey {
+    turn_id: TurnId,
+    harness_item_id: HarnessItemId,
+}
+
+impl HarnessItemKey {
+    fn new(turn_id: TurnId, harness_item_id: HarnessItemId) -> Self {
+        Self {
+            turn_id,
+            harness_item_id,
+        }
+    }
+}
+
 fn track_item_identity(
-    item_ids_by_harness: &mut HashMap<(TurnId, String), ItemId>,
+    item_ids_by_harness: &mut HashMap<HarnessItemKey, ItemId>,
     event: &AgentEvent,
 ) -> Option<(TurnId, String, ItemId, ItemId)> {
     let (turn, harness_item_id, item_id) = event_item_identity(event)?;
-    let identity_key = (turn, harness_item_id.to_owned());
+    let identity_key = HarnessItemKey::new(turn, HarnessItemId::new(harness_item_id.to_owned()));
     match item_ids_by_harness.get(&identity_key) {
         Some(existing_item_id) if *existing_item_id != item_id => {
             Some((turn, harness_item_id.to_owned(), *existing_item_id, item_id))
