@@ -1505,14 +1505,14 @@ A single Cargo workspace with focused crates. Names are prefixed `giskard-`.
     Codex 0.142.x. Not recommended unless only types are needed and `codex-codes`' `types` feature
     is somehow unsuitable.
 
-  **Decision: use `codex-codes` with the `async-client` feature.** Its API maps directly onto the
-  `AgentHarness` trait; Giskard wraps `next_message()` into a `broadcast::Sender<AgentEvent>` for
-  multi-subscriber support and maps `codex-codes` types to `giskard-core` types at the boundary.
-  If a future Codex CLI version diverges beyond what `codex-codes` tracks, fall back to a minimal
-  hand-rolled JSON-RPC client inside `giskard-harness-codex`. **Either way, all Codex/app-server
-  types must be confined to `giskard-harness-codex`** (nothing Codex-specific leaks upward) and the
-  raw-JSON/unknown-message fallback preserved so protocol drift degrades gracefully rather than
-  panicking.
+  **Decision: use `codex-codes` with the `async-client` feature for its app-server builder and
+  protocol types, with Giskard's split stdio transport owning framing and correlation.** Giskard
+  maps `codex-codes` types to `giskard-core` at the boundary and wraps mapped events in a
+  `broadcast::Sender<AgentEvent>` for multi-subscriber support. If a future Codex CLI version
+  diverges beyond what `codex-codes` tracks, update the confined transport and mapping inside
+  `giskard-harness-codex`. **All Codex/app-server types must remain confined to that crate** and the
+  raw-JSON/unknown-message fallback must be preserved so protocol drift degrades gracefully rather
+  than panicking.
 
 ### 3.4 Data-flow summary
 
@@ -3973,16 +3973,15 @@ Artifacts are version-pinned to the Codex binary that produced them; regenerate 
 > inside `ModelRef.reasoning_effort` (P1: no standalone effort field on `TurnOverrides`).
 > `TurnOverrides.permission_preset` is the thread preset snapshot (P3/AP1: not a per-turn override).
 
-**Client library:** use `codex-codes` (v0.146.4, tested against Codex CLI 0.146.x) with the
-`async-client` feature — its `AsyncClient` API (`spawn`, `initialize`, `thread_start`, generic
-`request`, `next_message`, `respond`, `shutdown`) maps onto the `AgentHarness` trait. The Codex
-`turn/start` call uses the generic `request` path while `codex-codes`' typed `TurnStartParams`
-lags newer fields such as `collaborationMode`. Its built-in schema coverage scorecard validates
-typed structs against `codex app-server generate-json-schema` output and can be wired into the CI
-drift check (§14.4). Fall back to `codex-app-server-sdk` (v0.5.1) or a hand-rolled client only if a
-future Codex CLI version diverges beyond what `codex-codes` tracks. Whichever is chosen, confine all
-Codex types to `giskard-harness-codex` and preserve the raw-JSON fallback for unknown/drifted
-messages.
+**Client library:** use `codex-codes` (v0.150.1, tested against Codex CLI 0.150.x) for the app-server
+builder, protocol types, and typed envelope decoding. Giskard owns the split stdio transport:
+`AsyncClient::request` also reads stdout, so it cannot provide a sole-reader boundary while another
+task independently reduces notifications. The adapter's one stdout reader resolves bounded
+request correlations and forwards typed notifications/server requests; its one bounded writer
+serializes every outgoing JSONL frame. The Codex `turn/start` call continues to use the generic
+request path while `codex-codes`' typed `TurnStartParams` lags newer fields such as
+`collaborationMode`. Whichever transport is used, confine all Codex types to
+`giskard-harness-codex` and preserve the raw-JSON fallback for unknown/drifted messages.
 
 The harness initializes Codex app-server with `capabilities.experimentalApi = true` before starting
 or resuming threads. This is required for the experimental app-server fields/requests Giskard
@@ -4097,11 +4096,10 @@ default already stated in-line:
    (explicit context-used field → last turn's input tokens → cumulative total). Remaining task:
    confirm the exact field name in the pinned Codex JSON schema and record the pick in code +
    README.
-2. **Codex client crate choice** — **resolved: `codex-codes` v0.143.0** with the `async-client`
-   feature (§3.3, App. A). Verified on crates.io against installed Codex CLI 0.142.5; its
-   `AsyncClient` API maps 1:1 to `AgentHarness`, it includes a schema-drift scorecard for CI, and
-   it ships real JSONL test captures. Fallback (`codex-app-server-sdk` v0.5.1 or hand-rolled) only
-   if a future CLI version diverges.
+2. **Codex client crate choice** — **resolved: `codex-codes`** for the app-server builder, protocol
+   types, typed envelope decoding, schema-drift scorecard, and JSONL captures (§3.3, App. A).
+   Giskard owns the split stdio transport because the high-level client's request path reads stdout
+   and cannot enforce the required sole-reader boundary.
 3. **Dioxus fullstack single-crate vs split `giskard-ui`/`giskard-server`** — keep split
    unless tooling friction dictates otherwise; non-WASM crates stay separate regardless (§3.2).
    **Resolved (C1/C2):** `giskard-proto` is the sole crate `giskard-ui` links; it owns `Wire*`

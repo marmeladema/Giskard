@@ -1,6 +1,7 @@
 //! Codex CLI harness adapter (spec §4.6).
 //!
-//! Wraps `codex-codes::AsyncClient` and implements the `AgentHarness` trait.
+//! Uses `codex-codes` protocol types with a Giskard-owned stdio transport and
+//! implements the `AgentHarness` trait.
 //! All Codex-specific types are confined to this crate and mapped to
 //! `giskard-core` types at the boundary.
 //!
@@ -12,10 +13,17 @@ mod log_fields;
 mod mapping;
 mod native_ids;
 mod native_routes;
+mod transport;
 
 use crate::log_fields::display_opt;
 use crate::native_ids::NativeThreadId;
 use instance::CodexInstance;
+use transport::{CodexStreamError, CodexTransport, StdioCodexTransport};
+#[cfg(test)]
+use transport::{
+    NON_JSON_STDOUT_PREVIEW_BYTES, TransportLifecycle, TransportTerminalCause,
+    classify_codex_stream_error,
+};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -630,137 +638,6 @@ impl<'a> CodexOperationContext<'a> {
     }
 }
 
-#[async_trait]
-trait CodexTransport: Send {
-    async fn request_json(
-        &mut self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value, HarnessError>;
-
-    async fn next_message(
-        &mut self,
-    ) -> Result<Option<codex_codes::ServerMessage>, CodexStreamError>;
-
-    async fn respond_json(
-        &mut self,
-        id: codex_codes::jsonrpc::RequestId,
-        value: serde_json::Value,
-    ) -> Result<(), HarnessError>;
-
-    async fn respond_error_json(
-        &mut self,
-        id: codex_codes::jsonrpc::RequestId,
-        code: i64,
-        message: &str,
-    ) -> Result<(), HarnessError>;
-
-    async fn shutdown_transport(self) -> Result<(), HarnessError>
-    where
-        Self: Sized;
-}
-
-#[derive(Debug)]
-enum CodexStreamError {
-    /// A non-JSON line was consumed from app-server stdout. Since JSON-RPC is
-    /// newline-delimited, the next read starts at a fresh frame boundary.
-    NonJsonStdout {
-        parse_error: String,
-        raw_preview: String,
-        raw_bytes: usize,
-    },
-    Fatal(HarnessError),
-}
-
-const NON_JSON_STDOUT_PREVIEW_BYTES: usize = 4 * 1024;
-
-fn bounded_utf8_preview(value: &str, max_bytes: usize) -> String {
-    let mut end = value.len().min(max_bytes);
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    value[..end].to_owned()
-}
-
-fn classify_codex_stream_error(error: codex_codes::Error) -> CodexStreamError {
-    match error {
-        codex_codes::Error::Deserialization(parse_error)
-            if parse_error.method.is_none()
-                && parse_error.raw_json.is_none()
-                && !parse_error.raw_line.trim_start().starts_with('{') =>
-        {
-            CodexStreamError::NonJsonStdout {
-                raw_preview: bounded_utf8_preview(
-                    &parse_error.raw_line,
-                    NON_JSON_STDOUT_PREVIEW_BYTES,
-                ),
-                raw_bytes: parse_error.raw_line.len(),
-                parse_error: parse_error.error_message,
-            }
-        }
-        codex_codes::Error::Deserialization(parse_error) => {
-            let raw_preview =
-                bounded_utf8_preview(&parse_error.raw_line, NON_JSON_STDOUT_PREVIEW_BYTES);
-            let method = parse_error.method.as_deref().unwrap_or("unknown");
-            CodexStreamError::Fatal(HarnessError::Transport(format!(
-                "Codex JSON-RPC deserialization error for method {method}: {} \
-                 (raw_bytes: {}, raw_preview: {raw_preview:?})",
-                parse_error.error_message,
-                parse_error.raw_line.len(),
-            )))
-        }
-        error => CodexStreamError::Fatal(HarnessError::Transport(error.to_string())),
-    }
-}
-
-#[async_trait]
-impl CodexTransport for codex_codes::AsyncClient {
-    async fn request_json(
-        &mut self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value, HarnessError> {
-        self.request(method, &params)
-            .await
-            .map_err(|e| HarnessError::Transport(e.to_string()))
-    }
-
-    async fn next_message(
-        &mut self,
-    ) -> Result<Option<codex_codes::ServerMessage>, CodexStreamError> {
-        self.next_message()
-            .await
-            .map_err(classify_codex_stream_error)
-    }
-
-    async fn respond_json(
-        &mut self,
-        id: codex_codes::jsonrpc::RequestId,
-        value: serde_json::Value,
-    ) -> Result<(), HarnessError> {
-        self.respond(id, &value)
-            .await
-            .map_err(|e| HarnessError::Transport(e.to_string()))
-    }
-
-    async fn respond_error_json(
-        &mut self,
-        id: codex_codes::jsonrpc::RequestId,
-        code: i64,
-        message: &str,
-    ) -> Result<(), HarnessError> {
-        self.respond_error(id, code, message)
-            .await
-            .map_err(|e| HarnessError::Transport(e.to_string()))
-    }
-
-    async fn shutdown_transport(self) -> Result<(), HarnessError> {
-        self.shutdown()
-            .await
-            .map_err(|e| HarnessError::Transport(e.to_string()))
-    }
-}
-
 async fn codex_request<P, R>(
     client: &mut dyn CodexTransport,
     context: CodexOperationContext<'_>,
@@ -868,7 +745,8 @@ impl CodexHarness {
     ) -> Result<Arc<Self>, HarnessError> {
         let workspace_root = normalize_workspace_root(workspace_root)?;
         let (mut client, client_version) =
-            start_codex_client(codex_codes::AppServerBuilder::new()).await?;
+            start_codex_client(codex_codes::AppServerBuilder::new(), workspace_root.clone())
+                .await?;
         let writable_roots = configured_workspace_write_roots(&mut client, &workspace_root).await;
         Self::spawn_harness(
             client,
@@ -885,7 +763,8 @@ impl CodexHarness {
     ) -> Result<Arc<Self>, HarnessError> {
         let workspace_root = normalize_workspace_root(workspace_root)?;
         let builder = codex_codes::cli::AppServerBuilder::new().command(codex_path);
-        let (mut client, client_version) = start_codex_client(builder).await?;
+        let (mut client, client_version) =
+            start_codex_client(builder, workspace_root.clone()).await?;
         let writable_roots = configured_workspace_write_roots(&mut client, &workspace_root).await;
         Self::spawn_harness(
             client,
@@ -1023,14 +902,23 @@ fn normalize_workspace_root(workspace_root: PathBuf) -> Result<PathBuf, HarnessE
 
 async fn start_codex_client(
     builder: codex_codes::AppServerBuilder,
-) -> Result<(codex_codes::AsyncClient, Option<String>), HarnessError> {
-    let mut client = codex_codes::AsyncClient::spawn(builder)
-        .await
-        .map_err(|e| HarnessError::Spawn(e.to_string()))?;
+    workspace_root: PathBuf,
+) -> Result<(StdioCodexTransport, Option<String>), HarnessError> {
+    let mut client = StdioCodexTransport::spawn(builder, workspace_root).await?;
     let response = client
-        .initialize(&build_initialize_params())
+        .request_json(
+            codex_codes::protocol::methods::INITIALIZE,
+            serde_json::to_value(build_initialize_params())
+                .map_err(|error| HarnessError::Spawn(error.to_string()))?,
+        )
         .await
-        .map_err(|e| HarnessError::Spawn(e.to_string()))?;
+        .map_err(|error| HarnessError::Spawn(error.to_string()))?;
+    let response: codex_codes::InitializeResponse =
+        serde_json::from_value(response).map_err(|error| HarnessError::Spawn(error.to_string()))?;
+    client
+        .send_notification_json(codex_codes::protocol::methods::INITIALIZED, None)
+        .await
+        .map_err(|error| HarnessError::Spawn(error.to_string()))?;
     let version = codex_version_from_user_agent(&response.user_agent);
     match version.as_deref() {
         Some(version) => warn_if_codex_is_newer_than_tested(version),
@@ -3338,24 +3226,49 @@ mod tests {
     struct FakeCodexTransport {
         state: Arc<Mutex<FakeCodexState>>,
         events_rx: mpsc::Receiver<Result<codex_codes::ServerMessage, CodexStreamError>>,
+        lifecycle: TransportLifecycle,
     }
+
+    type FakeEventSender = mpsc::Sender<Result<codex_codes::ServerMessage, CodexStreamError>>;
 
     #[derive(Clone)]
     struct FakeCodexController {
         state: Arc<Mutex<FakeCodexState>>,
-        events_tx: mpsc::Sender<Result<codex_codes::ServerMessage, CodexStreamError>>,
+        events_tx: Arc<StdMutex<Option<FakeEventSender>>>,
+        lifecycle: TransportLifecycle,
     }
 
     impl FakeCodexController {
-        async fn send_server_message(&self, msg: codex_codes::ServerMessage) {
+        fn terminate_transport(&self, cause: TransportTerminalCause) {
+            self.lifecycle.begin_stop(cause);
             self.events_tx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            self.lifecycle.finish();
+        }
+
+        async fn send_server_message(&self, msg: codex_codes::ServerMessage) {
+            let sender = self
+                .events_tx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+                .expect("fake Codex event sender should be open");
+            sender
                 .send(Ok(msg))
                 .await
                 .expect("fake Codex event receiver should be open");
         }
 
         async fn send_stream_error(&self, error: CodexStreamError) {
-            self.events_tx
+            let sender = self
+                .events_tx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+                .expect("fake Codex event sender should be open");
+            sender
                 .send(Err(error))
                 .await
                 .expect("fake Codex event receiver should be open");
@@ -3447,13 +3360,20 @@ mod tests {
 
     fn fake_codex() -> (FakeCodexTransport, FakeCodexController) {
         let (events_tx, events_rx) = mpsc::channel(32);
+        let events_tx = Arc::new(StdMutex::new(Some(events_tx)));
         let state = Arc::new(Mutex::new(FakeCodexState::default()));
+        let lifecycle = TransportLifecycle::new(1);
         (
             FakeCodexTransport {
                 state: state.clone(),
                 events_rx,
+                lifecycle: lifecycle.clone(),
             },
-            FakeCodexController { state, events_tx },
+            FakeCodexController {
+                state,
+                events_tx,
+                lifecycle,
+            },
         )
     }
 
@@ -3702,6 +3622,10 @@ mod tests {
                 message: message.to_owned(),
             });
             Ok(())
+        }
+
+        fn terminal(&self) -> transport::TransportTerminalReceiver {
+            self.lifecycle.receiver()
         }
 
         async fn shutdown_transport(self) -> Result<(), HarnessError> {
@@ -4422,6 +4346,25 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn idle_transport_termination_stops_the_codex_instance() {
+        let (harness, controller) = spawn_fake_harness();
+        let mut worker_done = harness.worker_done.clone();
+
+        controller.terminate_transport(TransportTerminalCause::StdoutEof);
+
+        timeout(Duration::from_secs(1), async {
+            while !*worker_done.borrow_and_update() {
+                worker_done
+                    .changed()
+                    .await
+                    .expect("worker completion sender stays open");
+            }
+        })
+        .await
+        .expect("idle instance observes transport termination");
     }
 
     #[tokio::test]

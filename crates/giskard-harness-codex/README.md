@@ -18,11 +18,38 @@ receivers, and worker lifecycle. It serves every native thread on that process a
 the Primary/sub-agent hierarchy. Helper futures borrow its protocol state through `&mut self`; no
 independent worker mutates that state.
 
-`CodexTransport` remains the mockable request/read abstraction. `SenderMap` remains shared only
-because synchronous `AgentHarness::subscribe` must read it; `CodexInstance` is its sole runtime
-lifecycle mutator. It also owns route establishment: durable bootstrap, explicit open/resume, and
-provider-owned child claims all use the same primitive. That operation claims identity before
-publishing the broadcast sender, and an idempotent claim preserves the existing sender.
+`CodexTransport` remains the mockable request/read abstraction. The production
+`StdioCodexTransport` owns the child process and assigns its pipes, framing, and JSON-RPC
+correlations to dedicated tasks: exactly one task reads stdout, one bounded FIFO writer serializes
+every outgoing frame, and an independent task drains stderr. These tasks do not access mapper,
+route, turn, or lifecycle state; `CodexInstance` remains their semantic authority and receives
+decoded notifications and server requests through the transport abstraction.
+
+The incoming notification/server-request inbox is deliberately unbounded during this transition.
+Bounding it while `CodexInstance` still awaits RPCs inline could stop the sole reader before it
+reaches the awaited response. M3 will bound delivery atomically with activation and dispatch
+changes; this transport foundation alone does not satisfy that backpressure requirement. Outgoing
+writes are bounded and never retried automatically. Transport shutdown bypasses writer capacity,
+fails pending operations, and kills the child independently so a saturated writer cannot orphan
+the app-server.
+
+Transport termination is a two-phase lifecycle with one typed, write-once cause. Stdout EOF or
+decoding failure, stdin failure, child exit, and explicit shutdown first publish stopping; the
+first cause wins, admission closes, and the writer/process supervisor cut over immediately.
+Stdout and stderr still drain, the child is reaped, and only then does the supervisor publish
+finalization. `CodexInstance` observes that final fence independently while idle, but drains its
+ordered inbound FIFO first whenever semantic polling is active. Request correlations are
+registered through a bounded channel before their frames can reach the writer, and cancellation
+is an RAII flag rather than another queued reader command. Owned acknowledgement, write, and
+response completions determine their own ordering against stopping, so an earlier success remains
+successful. If stopping interrupts an in-progress write, delivery is ambiguous: stdin is dropped
+and the frame is never retried.
+
+`SenderMap` remains shared only because synchronous `AgentHarness::subscribe` must read it;
+`CodexInstance` is its sole runtime lifecycle mutator. It also owns route establishment: durable
+bootstrap, explicit open/resume, and provider-owned child claims all use the same primitive. That
+operation claims identity before publishing the broadcast sender, and an idempotent claim
+preserves the existing sender.
 When a bootstrapped native resume fails because its rollout disappeared, the instance atomically
 replaces that exact native/Giskard binding with the fresh session identity, advances its route
 epoch, and preserves the delivery sender.
@@ -584,9 +611,10 @@ no longer be answered. Exact native request-ID checks prevent stale completion
 from removing a replacement entry with the same browser-facing ID.
 
 This is adapter-state retry safety, not proof that retrying is wire-safe after a
-timeout. The current transport cannot distinguish no write from a partial frame
-or a completed frame whose flush reported failure; that requires the planned
-non-cancelling writer boundary.
+timeout. The bounded writer reports completion after `write_all` and `flush`,
+but an outer operation timeout can abandon that completion while the writer is
+already running. A write error can also follow a partial frame. Neither case is
+automatically retried.
 
 Current Codex file-change approval requests identify the associated item but do
 not carry its changed paths. With current Codex app-server ordering, the adapter
@@ -604,6 +632,8 @@ target.
   lifecycle tracking.
 - [`src/instance.rs`](src/instance.rs) defines the single-task app-server runtime that owns protocol
   state and reduction for all native threads on that process.
+- [`src/transport.rs`](src/transport.rs) owns the child process, stdio tasks, JSONL framing,
+  bounded write and correlation admission, and the transitional unbounded inbound inbox.
 - [`src/lib.rs`](src/lib.rs) owns the public harness handle, low-level JSON-RPC helpers, timeouts,
   and process termination calls.
 - Mapper tests assert same-lifecycle stability, cross-turn and cross-thread

@@ -91,6 +91,7 @@ where
     C: CodexTransport,
 {
     pub(super) async fn run(mut self) {
+        let mut transport_terminal = self.client.terminal();
         let mut first_event_warn_tick = tokio::time::interval(Duration::from_secs(1));
 
         loop {
@@ -98,10 +99,41 @@ where
                 biased;
                 _ = wait_for_shutdown_request(&mut self.receivers.shutdown) => {
                     cleanup_all_active_turn_uploads(&mut self.client, &mut self.active_turns).await;
-                    shutdown_codex_transport(self.client, &self.workspace_root).await;
-                    self.worker_queue.close();
-                    self.receivers.done.send_replace(true);
-                    return;
+                    break;
+                }
+                cause = transport_terminal.changed(), if !should_poll_codex_messages(&self.mapper, &self.active_turns, &self.pending_compactions) && self.pending_context_restores.is_empty() => {
+                    self.drain_finalized_inbound().await;
+                    let message = cause.to_string();
+                    if self.active_turns.is_empty() {
+                        warn!(
+                            action = "read_codex_stream",
+                            error = %message,
+                            pending_compactions = self.pending_compactions.len(),
+                            pending_compaction_states = ?pending_compaction_states(&self.pending_compactions),
+                            workspace_root = %self.workspace_root.display(),
+                            "Codex transport terminated while idle or background work was running"
+                        );
+                    } else {
+                        warn!(
+                            action = "read_codex_stream",
+                            error = %message,
+                            active_turns = self.active_turns.len(),
+                            active_turn_states = ?active_turn_states(&self.active_turns),
+                            pending_compactions = self.pending_compactions.len(),
+                            pending_compaction_states = ?pending_compaction_states(&self.pending_compactions),
+                            workspace_root = %self.workspace_root.display(),
+                            "Codex transport terminated before all active turns completed"
+                        );
+                        cleanup_all_active_turn_uploads(&mut self.client, &mut self.active_turns).await;
+                        emit_incomplete_active_turns(
+                            &self.senders,
+                            &mut self.mapper,
+                            &mut self.active_turns,
+                            format!("Codex stream failed before turn completion: {message}"),
+                        )
+                        .await;
+                    }
+                    break;
                 }
                 msg = self.client.next_message(), if should_poll_codex_messages(&self.mapper, &self.active_turns, &self.pending_compactions) || !self.pending_context_restores.is_empty() => {
                     match msg {
@@ -218,8 +250,34 @@ where
                 }
             }
         }
+        shutdown_codex_transport(self.client, &self.workspace_root).await;
         self.worker_queue.close();
         self.receivers.done.send_replace(true);
+    }
+
+    async fn drain_finalized_inbound(&mut self) {
+        loop {
+            match self.client.next_message().await {
+                Ok(Some(message)) => {
+                    observe_pending_context_restore(&mut self.pending_context_restores, &message);
+                    let _ = self.handle_server_message(message).await;
+                }
+                Ok(None) | Err(CodexStreamError::Fatal(_)) => return,
+                Err(CodexStreamError::NonJsonStdout {
+                    parse_error,
+                    raw_preview,
+                    raw_bytes,
+                }) => {
+                    warn!(
+                        workspace_root = %self.workspace_root.display(),
+                        error = %parse_error,
+                        raw_bytes,
+                        raw_preview = ?raw_preview,
+                        "Ignoring non-JSON line while draining finalized Codex transport"
+                    );
+                }
+            }
+        }
     }
 
     async fn handle_harness_command(&mut self, queued: QueuedHarnessCommand) {
