@@ -4,7 +4,7 @@ use giskard_core::error::PersistError;
 use giskard_core::ids::{ProjectId, ThreadId};
 use giskard_core::thread::ThreadKind;
 use giskard_persist::PersistStore;
-use giskard_persist::store::{ThreadFile, ThreadGitWorkspace};
+use giskard_persist::store::{ProjectConfig, ThreadFile, ThreadGitWorkspace};
 use tracing::warn;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +97,24 @@ pub(crate) async fn inherited_git_workspace(
         next = parent.parent_thread_id;
     }
     Ok(None)
+}
+
+/// Resolves the one effective workspace policy shared by every loaded-thread caller.
+pub(crate) async fn effective_thread_workspace_root(
+    store: &PersistStore,
+    project: &ProjectConfig,
+    thread: &ThreadFile,
+) -> Result<String, PersistError> {
+    Ok(inherited_git_workspace(store, project.id, thread)
+        .await?
+        .map(|workspace| workspace.workspace_root().to_owned())
+        .unwrap_or_else(|| {
+            project
+                .workspace_root
+                .as_deref()
+                .unwrap_or(&project.dir)
+                .to_owned()
+        }))
 }
 
 pub(crate) fn classify_existing_link(
@@ -364,6 +382,104 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_workspace_uses_configured_root_then_project_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = PersistStore::new(dir.path().to_path_buf());
+        let project_id = ProjectId::new();
+        store
+            .create_project(project_id, "workspace", "/project")
+            .await
+            .unwrap();
+        let mut project = store.load_project(project_id).await.unwrap().unwrap();
+        let thread = thread(ThreadId::new(), ThreadKind::Primary, None);
+
+        project.workspace_root = Some("/configured-workspace".into());
+        assert_eq!(
+            effective_thread_workspace_root(&store, &project, &thread)
+                .await
+                .unwrap(),
+            "/configured-workspace"
+        );
+
+        project.workspace_root = None;
+        assert_eq!(
+            effective_thread_workspace_root(&store, &project, &thread)
+                .await
+                .unwrap(),
+            "/project"
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_workspace_prefers_own_then_inherited_worktree() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = PersistStore::new(dir.path().to_path_buf());
+        let project_id = ProjectId::new();
+        store
+            .create_project(project_id, "workspace", "/project")
+            .await
+            .unwrap();
+        let mut project = store.load_project(project_id).await.unwrap().unwrap();
+        project.workspace_root = Some("/configured-workspace".into());
+
+        let parent_id = ThreadId::new();
+        let mut parent = thread(parent_id, ThreadKind::Primary, None);
+        parent.git_workspace = Some(worktree("/worktrees/parent"));
+        store.save_thread(project_id, &parent).await.unwrap();
+
+        let mut own = thread(ThreadId::new(), ThreadKind::Subagent, Some(parent_id));
+        own.git_workspace = Some(worktree("/worktrees/own"));
+        assert_eq!(
+            effective_thread_workspace_root(&store, &project, &own)
+                .await
+                .unwrap(),
+            "/worktrees/own"
+        );
+
+        own.git_workspace = None;
+        assert_eq!(
+            effective_thread_workspace_root(&store, &project, &own)
+                .await
+                .unwrap(),
+            "/worktrees/parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_workspace_falls_back_for_dangling_and_cyclic_ancestry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = PersistStore::new(dir.path().to_path_buf());
+        let project_id = ProjectId::new();
+        store
+            .create_project(project_id, "workspace", "/project")
+            .await
+            .unwrap();
+        let mut project = store.load_project(project_id).await.unwrap().unwrap();
+        project.workspace_root = Some("/configured-workspace".into());
+
+        let dangling = thread(ThreadId::new(), ThreadKind::Subagent, Some(ThreadId::new()));
+        assert_eq!(
+            effective_thread_workspace_root(&store, &project, &dangling)
+                .await
+                .unwrap(),
+            "/configured-workspace"
+        );
+
+        let first_id = ThreadId::new();
+        let second_id = ThreadId::new();
+        let first = thread(first_id, ThreadKind::Subagent, Some(second_id));
+        let second = thread(second_id, ThreadKind::Subagent, Some(first_id));
+        store.save_thread(project_id, &first).await.unwrap();
+        store.save_thread(project_id, &second).await.unwrap();
+        assert_eq!(
+            effective_thread_workspace_root(&store, &project, &first)
+                .await
+                .unwrap(),
+            "/configured-workspace"
         );
     }
 

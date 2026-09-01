@@ -46,8 +46,8 @@ use crate::auth::{
     get_session_token_from_header, sign_token, verify_token,
 };
 use crate::thread_graph::{
-    descendant_deletion_order, graph_issue, inherited_git_workspace, load_thread_graph,
-    should_refresh_subagent_title,
+    descendant_deletion_order, effective_thread_workspace_root as effective_workspace_root,
+    graph_issue, load_thread_graph, should_refresh_subagent_title,
 };
 
 const HARNESS_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -617,7 +617,7 @@ async fn list_threads(
         if thread.kind == ThreadKind::Orphan {
             continue;
         }
-        let workspace_root = thread_workspace_root(&state, &project, thread).await?;
+        let workspace_root = effective_workspace_root(&state.store, &project, thread).await?;
         threads.push(thread_summary(thread, workspace_root));
     }
     threads.sort_by_key(|t| std::cmp::Reverse(t.updated_at));
@@ -699,7 +699,7 @@ async fn open_thread(
         // a sub-agent against its parent's, which is where the harness ran it. Resolved after the
         // early return above: an already-attached thread is the common case for this endpoint, and
         // the lookup walks the ownership chain reading persisted parents to answer.
-        let ws_root = thread_workspace_root(&state, &project_config, &thread_file).await?;
+        let ws_root = effective_workspace_root(&state.store, &project_config, &thread_file).await?;
 
         // Opening an existing thread must not hard-fail when the harness can't attach — most
         // often because the thread's provider was removed from config. The browser opens a
@@ -815,7 +815,8 @@ async fn open_thread(
             if let Some(binding) = state.registry.loaded_thread_binding(existing.id).await {
                 (binding.handle().clone(), None)
             } else {
-                let ws_root = thread_workspace_root(&state, &project_config, &existing).await?;
+                let ws_root =
+                    effective_workspace_root(&state.store, &project_config, &existing).await?;
                 let handle = if existing.kind == ThreadKind::Subagent {
                     state
                         .registry
@@ -1738,26 +1739,8 @@ async fn workspace_for_query(
         .await?
         .ok_or(ApiError::NotFound)?;
     Ok(PathBuf::from(
-        thread_workspace_root(state, project, &thread).await?,
+        effective_workspace_root(&state.store, project, &thread).await?,
     ))
-}
-
-/// The workspace a thread works in: the nearest Git worktree in its ownership chain, the project's
-/// workspace otherwise.
-///
-/// Every path served for a thread — the harness cwd, file reads, Git status — has to agree on this,
-/// or the browser shows one workspace while the agent edits another. The chain rather than the
-/// thread's own record, because a sub-agent works in its parent's worktree and holds no record of
-/// one itself (see [`inherited_git_workspace`]).
-async fn thread_workspace_root(
-    state: &AppState,
-    project: &ProjectConfig,
-    thread: &ThreadFile,
-) -> Result<String, ApiError> {
-    Ok(inherited_git_workspace(&state.store, project.id, thread)
-        .await?
-        .map(|workspace| workspace.workspace_root().to_string())
-        .unwrap_or_else(|| project_workspace_root(project).to_string()))
 }
 
 /// The project's own workspace, which is what a draft reads before any thread exists.
@@ -1951,7 +1934,7 @@ async fn archive_thread(
         .into_current()
         .ok_or(ApiError::NotFound)?;
 
-    let workspace_root = thread_workspace_root(&state, &project_config, &tf).await?;
+    let workspace_root = effective_workspace_root(&state.store, &project_config, &tf).await?;
     Ok(Json(thread_summary(&tf, workspace_root)))
 }
 
@@ -1977,7 +1960,8 @@ async fn rename_thread(
         .map_err(harness_api_error)?;
     let title = normalize_thread_title(&req.title)?;
     if thread_file.title == title {
-        let workspace_root = thread_workspace_root(&state, &project_config, &thread_file).await?;
+        let workspace_root =
+            effective_workspace_root(&state.store, &project_config, &thread_file).await?;
         return Ok(Json(thread_summary(&thread_file, workspace_root)));
     }
 
@@ -2000,7 +1984,7 @@ async fn rename_thread(
         .into_current()
         .ok_or(ApiError::NotFound)?;
 
-    let workspace_root = thread_workspace_root(&state, &project_config, &tf).await?;
+    let workspace_root = effective_workspace_root(&state.store, &project_config, &tf).await?;
     Ok(Json(thread_summary(&tf, workspace_root)))
 }
 
@@ -3043,7 +3027,7 @@ async fn thread_workspace(
         .await?
         .ok_or(ApiError::NotFound)?;
     Ok(PathBuf::from(
-        thread_workspace_root(state, &project, &thread).await?,
+        effective_workspace_root(&state.store, &project, &thread).await?,
     ))
 }
 
@@ -5711,7 +5695,7 @@ async fn ensure_thread_open(
     // Resume must land in the worktree the thread works in — its own, or its parent's for a
     // sub-agent. Falling back to the project's checkout here would silently un-isolate the thread
     // after a restart, with nothing in the UI to say so.
-    let ws_root = thread_workspace_root(state, &project_config, &persisted_thread)
+    let ws_root = effective_workspace_root(&state.store, &project_config, &persisted_thread)
         .await
         .map_err(|e| {
             WsError::new("workspace_unavailable", ErrorSeverity::Error, e.to_string())
@@ -6158,7 +6142,7 @@ async fn switch_provider_cold(
             .thread(thread_id)
             .action("select_model")
         })?;
-    let ws_root = thread_workspace_root(state, &project_config, &thread_file)
+    let ws_root = effective_workspace_root(&state.store, &project_config, &thread_file)
         .await
         .map_err(|e| {
             WsError::new("workspace_unavailable", ErrorSeverity::Error, e.to_string())
