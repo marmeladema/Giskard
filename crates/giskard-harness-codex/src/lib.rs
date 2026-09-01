@@ -9,9 +9,11 @@
 
 mod log_fields;
 mod mapping;
+mod native_ids;
 mod native_routes;
 
 use crate::log_fields::display_opt;
+use crate::native_ids::NativeThreadId;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1501,7 +1503,8 @@ async fn background_task<C>(
         mut shutdown,
     } = receivers;
     let mut pending_compactions: HashMap<ThreadId, PendingCompaction> = HashMap::new();
-    let mut pending_context_restores: HashMap<String, PendingContextRestore> = HashMap::new();
+    let mut pending_context_restores: HashMap<NativeThreadId, PendingContextRestore> =
+        HashMap::new();
     let mut active_turns: ActiveTurns = HashMap::new();
     let mut first_event_warn_tick = tokio::time::interval(Duration::from_secs(1));
 
@@ -1632,7 +1635,7 @@ async fn background_task<C>(
                             Ok(outcome) => {
                                 let handle = outcome.handle;
                                 if let Some(model) = outcome.resume_replay_model {
-                                    let replaced = pending_context_restores.insert(handle.harness_thread_id.clone(), PendingContextRestore {
+                                    let replaced = pending_context_restores.insert(NativeThreadId::new(handle.harness_thread_id.clone()), PendingContextRestore {
                                         thread: handle.thread,
                                         model,
                                         sink: opts.updates.clone(),
@@ -1976,7 +1979,7 @@ async fn handle_control_command(
     mapper: &mut CodexMapper,
     senders: &SenderMap,
     pending_compactions: &mut HashMap<ThreadId, PendingCompaction>,
-    pending_context_restores: &mut HashMap<String, PendingContextRestore>,
+    pending_context_restores: &mut HashMap<NativeThreadId, PendingContextRestore>,
     active_turns: &ActiveTurns,
     control: Option<ControlCommand>,
 ) -> StreamOutcome {
@@ -2141,7 +2144,7 @@ async fn handle_control_command(
             };
             if result.is_ok() {
                 lock_senders(senders).remove(&thread.thread);
-                pending_context_restores.remove(&thread.harness_thread_id);
+                pending_context_restores.remove(thread.harness_thread_id.as_str());
             }
             let _ = response.send(result);
             StreamOutcome::TurnEnded
@@ -2458,7 +2461,7 @@ async fn handle_open_thread(
 }
 
 fn observe_pending_context_restore(
-    pending: &mut HashMap<String, PendingContextRestore>,
+    pending: &mut HashMap<NativeThreadId, PendingContextRestore>,
     message: &codex_codes::ServerMessage,
 ) {
     let codex_codes::ServerMessage::Notification(
@@ -2467,7 +2470,7 @@ fn observe_pending_context_restore(
     else {
         return;
     };
-    if !pending.contains_key(&notification.thread_id) {
+    if !pending.contains_key(notification.thread_id.as_str()) {
         return;
     }
     if notification.turn_id.is_empty() {
@@ -2493,7 +2496,7 @@ fn observe_pending_context_restore(
             "pending context-window restore rejected a zero context window");
         return;
     }
-    let Some(restore) = pending.remove(&notification.thread_id) else {
+    let Some(restore) = pending.remove(notification.thread_id.as_str()) else {
         return;
     };
     let update = ThreadUpdate::ContextWindowRestored {

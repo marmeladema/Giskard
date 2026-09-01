@@ -33,6 +33,10 @@ use codex_codes::protocol::{
 };
 
 use crate::log_fields::display_opt;
+use crate::native_ids::{
+    NativeItemId, NativeItemKey, NativeProcessId, NativeProcessKey, NativeThreadId, NativeTurnId,
+    NativeTurnKey,
+};
 use crate::native_routes::{NativeThreadRoutes, UnknownNativeThread};
 
 // ---- MCP tool-call approval detection (spec §9.2) ----
@@ -54,9 +58,6 @@ const MCP_TOOL_APPROVAL_LABEL_ACCEPT: &str = "Allow";
 const MCP_TOOL_APPROVAL_LABEL_ACCEPT_FOR_SESSION: &str = "Allow for this session";
 const MCP_TOOL_APPROVAL_LABEL_CANCEL: &str = "Cancel";
 
-type NativeItemKey = (ThreadId, TurnId, String);
-type NativeTurnKey = (ThreadId, String);
-
 type MappingResult<T> = Result<T, UnknownNativeThread>;
 
 /// Maps Codex app-server messages onto `giskard-core` events, owning the id-translation registries
@@ -75,7 +76,7 @@ pub struct CodexMapper {
     // Structural reason: Native relationships must be resolved before server identity translation.
     // Synchronization: The single Codex background task owns and mutates the mapper.
     // Invalidation/removal: Relationships live for one harness process and drop on shutdown.
-    native_parents: HashMap<String, String>,
+    native_parents: HashMap<NativeThreadId, NativeThreadId>,
     // ENTITY-AUTHORITY-EXCEPTION:
     // Role: Translate provider turn IDs within their owning thread to Giskard turn IDs.
     // Source of truth: Native turn acknowledgements and events establish each translation.
@@ -141,14 +142,14 @@ pub struct CodexMapper {
     // Structural reason: Active native-turn translation belongs to the provider adapter.
     // Synchronization: The single Codex background task owns and mutates the mapper.
     // Invalidation/removal: Terminal events remove entries; shutdown drops remaining entries.
-    active_turns: HashMap<ThreadId, String>,
+    active_turns: HashMap<ThreadId, NativeTurnId>,
     // ENTITY-AUTHORITY-EXCEPTION:
     // Role: Correlate running command items with their owning thread and native turn.
     // Source of truth: Codex command lifecycle events establish and clear correlations.
     // Structural reason: Command protocol routing belongs to the lower harness adapter.
     // Synchronization: The single Codex background task owns and mutates the mapper.
     // Invalidation/removal: Command completion removes entries; shutdown drops remaining entries.
-    running_command_turns: HashMap<(ThreadId, String), String>,
+    running_command_turns: HashMap<NativeProcessKey, NativeTurnId>,
     // ENTITY-AUTHORITY-EXCEPTION:
     // Role: Track running command items by native thread, turn, and item identity.
     // Source of truth: Codex command lifecycle events establish and clear membership.
@@ -200,28 +201,25 @@ impl CodexMapper {
     }
 
     pub fn running_command_fallback_thread(&self) -> Option<ThreadId> {
-        self.running_commands
-            .iter()
-            .next()
-            .map(|(thread, _, _)| *thread)
+        self.running_commands.iter().next().map(|key| key.thread_id)
     }
 
     pub fn active_native_turn_for_thread(&self, thread: ThreadId) -> Option<&str> {
-        self.active_turns.get(&thread).map(String::as_str)
+        self.active_turns.get(&thread).map(NativeTurnId::as_str)
     }
 
     pub fn clear_active_turn(&mut self, thread: ThreadId) {
         self.active_turns.remove(&thread);
-        self.turn_usage.retain(|(owner, _), _| *owner != thread);
+        self.turn_usage.retain(|key, _| key.thread_id != thread);
         self.turn_context_windows
-            .retain(|(owner, _), _| *owner != thread);
-        self.turn_models.retain(|(owner, _), _| *owner != thread);
+            .retain(|key, _| key.thread_id != thread);
+        self.turn_models.retain(|key, _| key.thread_id != thread);
         self.missing_context_model_turns
-            .retain(|(owner, _)| *owner != thread);
+            .retain(|key| key.thread_id != thread);
         self.invalid_context_window_turns
-            .retain(|(owner, _)| *owner != thread);
+            .retain(|key| key.thread_id != thread);
         self.file_change_previews
-            .retain(|(owner, _, _), _| *owner != thread);
+            .retain(|key, _| key.thread_id != thread);
     }
 
     /// Register the native turn id returned by `turn/start` before notifications start streaming.
@@ -238,7 +236,8 @@ impl CodexMapper {
         if native_turn_id.is_empty() {
             return None;
         }
-        self.active_turns.insert(thread, native_turn_id.to_string());
+        self.active_turns
+            .insert(thread, NativeTurnId::new(native_turn_id.to_string()));
         Some(self.resolve_turn(thread, native_turn_id))
     }
 
@@ -250,7 +249,7 @@ impl CodexMapper {
     ) -> Option<TurnId> {
         let native_turn_id = native_turn_id.trim();
         let turn = self.register_active_turn(thread, native_turn_id)?;
-        let key = (thread, native_turn_id.to_string());
+        let key = NativeTurnKey::new(thread, NativeTurnId::new(native_turn_id.to_string()));
         self.turn_models.insert(key.clone(), model);
         self.missing_context_model_turns.remove(&key);
         Some(turn)
@@ -258,7 +257,7 @@ impl CodexMapper {
 
     fn active_turn_for_thread(&mut self, thread: ThreadId) -> Option<TurnId> {
         let native = self.active_turns.get(&thread).cloned()?;
-        Some(self.resolve_turn(thread, &native))
+        Some(self.resolve_turn(thread, native.as_str()))
     }
 
     fn explicit_or_active_turn(
@@ -271,8 +270,11 @@ impl CodexMapper {
 
     pub fn native_turn_for_process(&self, thread: ThreadId, process_id: &str) -> Option<&str> {
         self.running_command_turns
-            .get(&(thread, process_id.to_owned()))
-            .map(String::as_str)
+            .get(&NativeProcessKey::new(
+                thread,
+                NativeProcessId::new(process_id.to_owned()),
+            ))
+            .map(NativeTurnId::as_str)
     }
 
     /// B4: bind a native thread id to its owned `ThreadId`. Called at `open_thread` for both fresh
@@ -284,7 +286,7 @@ impl CodexMapper {
     ) -> Result<u64, HarnessError> {
         self.routes
             .claim(harness_thread_id, thread)
-            .map(|route| route.epoch)
+            .map(|route| route.epoch.into_inner())
     }
 
     /// Record the native parentage a sub-agent link item attests.
@@ -307,7 +309,7 @@ impl CodexMapper {
         if self
             .native_parents
             .get(parent)
-            .is_some_and(|existing| existing == child)
+            .is_some_and(|existing| existing.as_str() == child)
         {
             debug!(
                 parent_harness_thread_id = parent,
@@ -317,13 +319,16 @@ impl CodexMapper {
             return;
         }
         self.native_parents
-            .entry(child.to_owned())
-            .or_insert_with(|| parent.to_owned());
+            .entry(NativeThreadId::new(child.to_owned()))
+            .or_insert_with(|| NativeThreadId::new(parent.to_owned()));
     }
 
     /// The native parent this harness lifetime has attested for a native thread, if any.
     pub fn native_parent(&self, harness_thread_id: &str) -> Option<String> {
-        self.native_parents.get(harness_thread_id).cloned()
+        self.native_parents
+            .get(harness_thread_id)
+            .cloned()
+            .map(NativeThreadId::into_inner)
     }
 
     #[cfg(test)]
@@ -360,7 +365,10 @@ impl CodexMapper {
         }
         *self
             .turn_ids
-            .entry((thread, native.to_string()))
+            .entry(NativeTurnKey::new(
+                thread,
+                NativeTurnId::new(native.to_string()),
+            ))
             .or_default()
     }
 
@@ -371,7 +379,11 @@ impl CodexMapper {
         }
         *self
             .item_ids
-            .entry((thread, turn, native.to_owned()))
+            .entry(NativeItemKey::new(
+                thread,
+                turn,
+                NativeItemId::new(native.to_owned()),
+            ))
             .or_default()
     }
 
@@ -384,7 +396,7 @@ impl CodexMapper {
             Ok(event) => event,
             Err(error) => {
                 warn!(
-                    native_thread_id = error.native_thread_id,
+                    native_thread_id = error.native_thread_id.as_str(),
                     fallback_thread = %fallback_thread,
                     notification_method = notif.method(),
                     native_turn_id = display_opt(notif.turn_id()),
@@ -405,7 +417,8 @@ impl CodexMapper {
         Ok(match notif {
             Notification::TurnStarted(TurnStartedNotification { thread_id, turn }) => {
                 let thread = self.resolve_thread(thread_id, fallback_thread)?;
-                self.active_turns.insert(thread, turn.id.clone());
+                self.active_turns
+                    .insert(thread, NativeTurnId::new(turn.id.clone()));
                 Some(AgentEvent::TurnStarted {
                     thread,
                     turn: self.resolve_turn(thread, &turn.id),
@@ -417,28 +430,22 @@ impl CodexMapper {
                 if self
                     .active_turns
                     .get(&thread)
-                    .map(|active| active == &turn.id)
+                    .map(|active| active.as_str() == turn.id)
                     .unwrap_or(false)
                 {
                     self.active_turns.remove(&thread);
                 }
                 // Attach the usage cached from the last `thread/tokenUsage/updated` for this turn
                 // (spec §10.1). Defaults to zero if Codex sent no usage update for the turn.
-                let usage = self
-                    .turn_usage
-                    .remove(&(thread, turn.id.clone()))
-                    .unwrap_or_default();
-                self.turn_context_windows.remove(&(thread, turn.id.clone()));
-                self.turn_models.remove(&(thread, turn.id.clone()));
-                self.missing_context_model_turns
-                    .remove(&(thread, turn.id.clone()));
-                self.invalid_context_window_turns
-                    .remove(&(thread, turn.id.clone()));
+                let key = NativeTurnKey::new(thread, NativeTurnId::new(turn.id.clone()));
+                let usage = self.turn_usage.remove(&key).unwrap_or_default();
+                self.turn_context_windows.remove(&key);
+                self.turn_models.remove(&key);
+                self.missing_context_model_turns.remove(&key);
+                self.invalid_context_window_turns.remove(&key);
                 let completed_turn = self.resolve_turn(thread, &turn.id);
                 self.file_change_previews
-                    .retain(|(owner, item_turn, _), _| {
-                        *owner != thread || *item_turn != completed_turn
-                    });
+                    .retain(|key, _| key.thread_id != thread || key.turn_id != completed_turn);
                 let status = map_turn_status(&turn.status);
                 Some(AgentEvent::TurnCompleted {
                     thread,
@@ -455,14 +462,16 @@ impl CodexMapper {
                 }
                 // Codex replays historical usage after resume. It is metadata for the thread,
                 // not usage belonging to a newly active Giskard turn.
-                if self.active_turns.get(&thread) != Some(&n.turn_id) {
+                if self.active_turns.get(&thread).map(NativeTurnId::as_str)
+                    != Some(n.turn_id.as_str())
+                {
                     debug!(%thread, native_thread_id = %n.thread_id,
                         native_turn_id = %n.turn_id,
                         active_native_turn_id = display_opt(self.active_turns.get(&thread)),
                         "routing Codex usage outside the active turn ledger");
                     return Ok(None);
                 }
-                let key = (thread, n.turn_id.clone());
+                let key = NativeTurnKey::new(thread, NativeTurnId::new(n.turn_id.clone()));
                 self.turn_usage
                     .insert(key.clone(), breakdown_to_usage(&n.token_usage.last));
 
@@ -524,8 +533,10 @@ impl CodexMapper {
                 let thread = self.resolve_thread(thread_id, fallback_thread)?;
                 let turn = self.resolve_turn(thread, turn_id);
                 if let codex_codes::ThreadItem::FileChange { id, changes, .. } = item {
-                    self.file_change_previews
-                        .insert((thread, turn, id.clone()), map_file_changes(changes));
+                    self.file_change_previews.insert(
+                        NativeItemKey::new(thread, turn, NativeItemId::new(id.clone())),
+                        map_file_changes(changes),
+                    );
                 }
                 let (harness_item_id, kind, command, tool) =
                     map_thread_item_start(item, *started_at_ms);
@@ -609,7 +620,7 @@ impl CodexMapper {
                 let thread = self.resolve_thread(&n.thread_id, fallback_thread)?;
                 let turn = self.resolve_turn(thread, &n.turn_id);
                 self.file_change_previews.insert(
-                    (thread, turn, n.item_id.clone()),
+                    NativeItemKey::new(thread, turn, NativeItemId::new(n.item_id.clone())),
                     map_file_changes(&n.changes),
                 );
                 self.map_text_delta(&n.thread_id, &n.turn_id, &n.item_id, &text, fallback_thread)?
@@ -837,17 +848,23 @@ impl CodexMapper {
             .map(command_status_is_running)
             .unwrap_or(true)
         {
-            self.running_commands
-                .insert((thread, turn, harness_item_id.to_owned()));
+            self.running_commands.insert(NativeItemKey::new(
+                thread,
+                turn,
+                NativeItemId::new(harness_item_id.to_owned()),
+            ));
             if let Some(process_id) = &command.process_id {
                 let turn_id = if native_turn_id.is_empty() {
-                    self.active_turns.get(&thread).cloned().unwrap_or_default()
+                    self.active_turns.get(&thread).cloned()
                 } else {
-                    native_turn_id.to_owned()
-                };
-                if !turn_id.is_empty() {
-                    self.running_command_turns
-                        .insert((thread, process_id.clone()), turn_id);
+                    Some(NativeTurnId::new(native_turn_id.to_owned()))
+                }
+                .filter(|turn_id| !turn_id.as_str().is_empty());
+                if let Some(turn_id) = turn_id {
+                    self.running_command_turns.insert(
+                        NativeProcessKey::new(thread, NativeProcessId::new(process_id.clone())),
+                        turn_id,
+                    );
                 }
             }
         }
@@ -871,20 +888,30 @@ impl CodexMapper {
             .map(command_status_is_running)
             .unwrap_or(false)
         {
-            self.running_commands
-                .insert((thread, turn, item.harness_item_id.clone()));
+            self.running_commands.insert(NativeItemKey::new(
+                thread,
+                turn,
+                NativeItemId::new(item.harness_item_id.clone()),
+            ));
             if let Some(process_id) = process_id
                 && !native_turn_id.is_empty()
             {
-                self.running_command_turns
-                    .insert((thread, process_id.clone()), native_turn_id.to_owned());
+                self.running_command_turns.insert(
+                    NativeProcessKey::new(thread, NativeProcessId::new(process_id.clone())),
+                    NativeTurnId::new(native_turn_id.to_owned()),
+                );
             }
         } else {
-            self.running_commands
-                .remove(&(thread, turn, item.harness_item_id.clone()));
+            self.running_commands.remove(&NativeItemKey::new(
+                thread,
+                turn,
+                NativeItemId::new(item.harness_item_id.clone()),
+            ));
             if let Some(process_id) = process_id {
-                self.running_command_turns
-                    .remove(&(thread, process_id.clone()));
+                self.running_command_turns.remove(&NativeProcessKey::new(
+                    thread,
+                    NativeProcessId::new(process_id.clone()),
+                ));
             }
         }
     }
@@ -951,7 +978,7 @@ impl CodexMapper {
             Err(error) => {
                 let scope = server_request_native_scope(request);
                 warn!(
-                    native_thread_id = error.native_thread_id,
+                    native_thread_id = error.native_thread_id.as_str(),
                     fallback_thread = %fallback_thread,
                     request_method = request.method(),
                     request_id = %request_id_to_string(id),
@@ -1015,7 +1042,11 @@ impl CodexMapper {
                 let turn = self.resolve_turn(thread, &params.turn_id);
                 let preview = self
                     .file_change_previews
-                    .get(&(thread, turn, params.item_id.clone()))
+                    .get(&NativeItemKey::new(
+                        thread,
+                        turn,
+                        NativeItemId::new(params.item_id.clone()),
+                    ))
                     .cloned()
                     .unwrap_or_default();
                 let preview_path = preview
@@ -4636,7 +4667,10 @@ mod tests {
             .map_notification(&refresh, first_thread)
             .expect("patch refresh should map");
         assert_eq!(
-            mapper.file_change_previews[&(first_thread, first_turn, "file1".into())][0].path,
+            mapper.file_change_previews
+                [&NativeItemKey::new(first_thread, first_turn, NativeItemId::new("file1".into()),)]
+                [0]
+            .path,
             PathBuf::from("src/refreshed.rs")
         );
 
@@ -4657,7 +4691,7 @@ mod tests {
             mapper
                 .file_change_previews
                 .keys()
-                .all(|(thread, _, _)| *thread == second_thread)
+                .all(|key| key.thread_id == second_thread)
         );
     }
 
@@ -5292,6 +5326,19 @@ mod tests {
         let first_id = item_id(first);
         assert_eq!(item_id(repeated), first_id);
         assert_ne!(item_id(second_turn), first_id);
+    }
+
+    #[test]
+    fn empty_native_item_ids_are_not_correlated() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+
+        let first = mapper.resolve_item(thread, turn, "");
+        let second = mapper.resolve_item(thread, turn, "");
+
+        assert_ne!(first, second);
+        assert!(mapper.item_ids.is_empty());
     }
 
     #[test]
@@ -6202,11 +6249,18 @@ mod tests {
         assert!(mapper.map_notification(&part, fallback).is_none());
         let turn = *mapper
             .turn_ids
-            .get(&(fallback, "t1".into()))
+            .get(&NativeTurnKey::new(
+                fallback,
+                NativeTurnId::new("t1".into()),
+            ))
             .expect("summary part should bind native turn id");
         let expected_item = *mapper
             .item_ids
-            .get(&(fallback, turn, "reasoning1".into()))
+            .get(&NativeItemKey::new(
+                fallback,
+                turn,
+                NativeItemId::new("reasoning1".into()),
+            ))
             .expect("summary part should bind native item id");
 
         let delta = Notification::ReasoningDelta(
