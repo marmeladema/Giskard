@@ -3,8 +3,6 @@
 //! thread under it — but only when the harness *confirms* the switch. An unconfirmed switch is
 //! rejected with `thread_provider_switch_ignored` and persists nothing.
 
-mod common;
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -23,8 +21,6 @@ use giskard_persist::store::{ProjectConfig, ThreadFile, ThreadGitWorkspace, Thre
 use giskard_proto::ClientMessage;
 use giskard_server::{AppState, HarnessFactory, build_app};
 use tokio::sync::{Mutex, broadcast};
-
-use common::fake_native_model;
 
 const DEAD_PROVIDER: &str = "cloudflare-litellm";
 const NEW_PROVIDER: &str = "opencodex";
@@ -53,9 +49,8 @@ impl AgentHarness for SwitchHarness {
             .lock()
             .await
             .push(opts.workspace_root.to_string_lossy().into_owned());
-        // An import names no model, so the fake answers with the one it is already on —
-        // the same thing a real harness reports from its own record.
-        let mut effective = opts.initial_model.clone().unwrap_or_else(fake_native_model);
+        // Echo the requested model as the effective model a real harness reports from its record.
+        let mut effective = opts.initial_model.clone();
         if effective.provider == DEAD_PROVIDER {
             return Err(HarnessError::Transport(format!(
                 "JSON-RPC error (-32600): failed to load configuration: Model provider \
@@ -66,7 +61,7 @@ impl AgentHarness for SwitchHarness {
         if let Some(provider) = &self.report_provider {
             effective.provider = provider.clone();
         }
-        let thread = opts.thread.unwrap_or_default();
+        let thread = opts.thread;
         Ok(ThreadHandle {
             resumed_model: Some(effective),
             ..ThreadHandle::opened(

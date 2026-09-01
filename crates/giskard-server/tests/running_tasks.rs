@@ -2,6 +2,8 @@
 //! real server path (registry forward → broadcast → WebSocket), the same way commands do (TK1).
 
 mod common;
+#[path = "common/thread_fixture.rs"]
+mod thread_fixture;
 
 use std::sync::Arc;
 
@@ -25,6 +27,7 @@ use tokio::sync::{Mutex, broadcast};
 use tokio::time::{Duration, Instant};
 
 use common::fake_native_model;
+use thread_fixture::persist_primary_thread;
 
 /// Harness that, on `start_turn`, emits `TurnStarted` + an in-progress tool `ItemStarted` and
 /// leaves the turn open (the tool blocks the turn), so the server keeps a running tool task.
@@ -68,12 +71,9 @@ impl AgentHarness for ToolHarness {
     }
 
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
-        let thread = opts.thread.unwrap_or_default();
+        let thread = opts.thread;
         Ok(ThreadHandle {
-            resumed_model: opts
-                .initial_model
-                .clone()
-                .or_else(|| Some(fake_native_model())),
+            resumed_model: Some(opts.initial_model.clone()),
             ..ThreadHandle::opened(
                 thread,
                 opts.resume.unwrap_or_else(|| "tool_harness".into()),
@@ -237,19 +237,23 @@ async fn running_tool_call_surfaces_in_running_tasks_snapshot() {
         .await
         .unwrap();
 
-    let thread_id: ThreadId = {
-        let resp: serde_json::Value = client
-            .post(format!("{base}/api/projects/{pid}/threads"))
-            .header("cookie", &cookie)
-            .json(&serde_json::json!({ "resume": "th_tool" }))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        serde_json::from_value(resp["thread_id"].clone()).unwrap()
-    };
+    let thread_id = persist_primary_thread(
+        &state.store,
+        pid,
+        ThreadId::new(),
+        "th_tool",
+        fake_native_model(),
+    )
+    .await;
+    client
+        .post(format!("{base}/api/projects/{pid}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({ "thread_id": thread_id }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
 
     let ws_request = tokio_tungstenite::tungstenite::http::Request::builder()
         .uri(format!("ws://127.0.0.1:{port}/api/ws"))

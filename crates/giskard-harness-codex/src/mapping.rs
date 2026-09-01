@@ -338,16 +338,6 @@ impl CodexMapper {
         }
     }
 
-    /// The `ThreadId` already bound to a native thread, if any.
-    ///
-    /// Lets a caller that has no durable id of its own reuse the one this thread is already known
-    /// by, instead of inventing a second identity for it.
-    pub fn thread_for_native(&self, harness_thread_id: &str) -> Option<ThreadId> {
-        self.routes
-            .route_for_native(harness_thread_id)
-            .map(|route| route.thread_id)
-    }
-
     /// Resolve a native thread id to its owned `ThreadId`.
     ///
     /// Codex legitimately omits `threadId` on a few global messages; those keep using the caller's

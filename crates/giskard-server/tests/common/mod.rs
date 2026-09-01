@@ -7,9 +7,7 @@
 
 use giskard_core::model::ModelRef;
 
-/// The model a fake harness reports for a thread it is asked to import. A real harness answers this
-/// from the thread itself; an import names no model, so the fake stands in with a fixed one rather
-/// than claiming not to know.
+/// The authoritative model used when a persisted test thread is reopened through a fake harness.
 pub fn fake_native_model() -> ModelRef {
     ModelRef {
         provider: "openai".into(),

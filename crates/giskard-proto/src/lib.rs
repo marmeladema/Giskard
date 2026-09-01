@@ -515,8 +515,7 @@ pub struct ListThreadsResponse {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenThreadRequest {
-    pub thread_id: Option<ThreadId>,
-    pub resume: Option<String>,
+    pub thread_id: ThreadId,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -790,23 +789,42 @@ mod tests {
     }
 
     #[test]
-    fn open_thread_request_rejects_client_asserted_subagent_metadata() {
-        let result = serde_json::from_value::<OpenThreadRequest>(serde_json::json!({
-            "thread_id": null,
-            "resume": "native-child",
-            "subagent_action": "spawned",
-            "subagent_status": "completed",
-            "subagent_message": "done"
-        }));
-        assert!(result.is_err());
+    fn open_thread_request_requires_thread_id() {
+        assert!(serde_json::from_value::<OpenThreadRequest>(serde_json::json!({})).is_err());
+    }
 
+    #[test]
+    fn open_thread_request_rejects_native_resume() {
+        assert!(
+            serde_json::from_value::<OpenThreadRequest>(serde_json::json!({
+                "thread_id": ThreadId::new(),
+                "resume": "native-thread"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn open_thread_request_rejects_client_asserted_subagent_metadata() {
+        assert!(
+            serde_json::from_value::<OpenThreadRequest>(serde_json::json!({
+                "thread_id": ThreadId::new(),
+                "subagent_action": "spawned",
+                "subagent_status": "completed",
+                "subagent_message": "done"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn open_thread_request_accepts_giskard_thread_id() {
+        let thread_id = ThreadId::new();
         let request: OpenThreadRequest = serde_json::from_value(serde_json::json!({
-            "thread_id": null,
-            "resume": "native-child"
+            "thread_id": thread_id
         }))
         .unwrap();
-        assert_eq!(request.thread_id, None);
-        assert_eq!(request.resume.as_deref(), Some("native-child"));
+        assert_eq!(request.thread_id, thread_id);
     }
 
     #[test]

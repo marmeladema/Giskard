@@ -17,6 +17,9 @@ use giskard_persist::store::ProjectConfig;
 use giskard_proto::ClientMessage;
 use giskard_server::{AppState, HarnessFactory, build_app};
 
+use common::fake_native_model;
+use thread_fixture::persist_primary_thread;
+
 /// Harness factory that wraps a replay harness with a diff-containing fixture.
 struct DiffFactory {
     fixture: ReplayFixture,
@@ -233,20 +236,25 @@ session_days = 30
             .to_string()
     };
 
-    let open_resp: serde_json::Value = http_client
+    let thread_id = persist_primary_thread(
+        &state.store,
+        pid,
+        ThreadId::new(),
+        "th_diff",
+        fake_native_model(),
+    )
+    .await;
+    http_client
         .post(format!(
             "http://127.0.0.1:{port}/api/projects/{pid}/threads"
         ))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"resume": "th_diff"}))
+        .json(&serde_json::json!({"thread_id": thread_id}))
         .send()
         .await
         .unwrap()
-        .json()
-        .await
+        .error_for_status()
         .unwrap();
-
-    let thread_id: ThreadId = serde_json::from_value(open_resp["thread_id"].clone()).unwrap();
 
     let ws_base = format!("ws://127.0.0.1:{port}");
     let ws_request = tokio_tungstenite::tungstenite::http::Request::builder()
@@ -399,3 +407,6 @@ session_days = 30
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     }
 }
+mod common;
+#[path = "common/thread_fixture.rs"]
+mod thread_fixture;

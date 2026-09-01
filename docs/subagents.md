@@ -49,9 +49,10 @@ parent. Malformed or dangling records remain visible in the main sidebar so they
 deleted instead of disappearing with managed children.
 
 A native identity observed before its relationship is authoritative is persisted under one final
-ID as `kind = orphan`. It is hidden and read-only, cannot be adopted as a primary, and retains
-explicit `unknown` model/mode values rather than parent-derived guesses. Its only classification is
-an expected-revision `orphan -> subagent` update on that same ID once parent evidence arrives.
+ID as `kind = orphan`. It is hidden and read-only, so ordinary thread opens do not expose it, and it
+retains explicit `unknown` model/mode values rather than parent-derived guesses. Its only
+classification is an expected-revision `orphan -> subagent` update on that same ID once parent
+evidence arrives.
 
 ## Supported Codex spawning events
 
@@ -169,9 +170,9 @@ that trusted item instead of accepting those values from the client. A reverse c
 returns the existing parent. Unknown items, non-link items, invalid ownership, and mismatched native
 parents are rejected.
 
-`POST /api/projects/{project_id}/threads` remains the normal open/resume endpoint and accepts only
-`thread_id` or `resume`; it cannot fabricate sub-agent ownership. Harness-observed and explicit
-link-open materialization share one per-project lifecycle lock, while linked evidence from one
+`POST /api/projects/{project_id}/threads` opens an existing persisted thread and requires its
+`thread_id`; it cannot fabricate sub-agent ownership. Harness-observed and explicit link-open
+materialization share one per-project lifecycle lock, while linked evidence from one
 parent is processed through a FIFO. Concurrent attempts therefore cannot persist two Giskard
 threads for one native child or install competing owners. Browser HTTP operations
 waiting on that lifecycle serialization return `503 Service Unavailable` after five seconds rather

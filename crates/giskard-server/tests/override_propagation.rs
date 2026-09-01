@@ -5,6 +5,8 @@
 //! must reach the harness (§9). A capturing harness records every `TurnOverrides` it is handed.
 
 mod common;
+#[path = "common/thread_fixture.rs"]
+mod thread_fixture;
 
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -29,20 +31,21 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::broadcast;
 
 use common::fake_native_model;
+use thread_fixture::persist_primary_thread;
 
 /// Harness that records the overrides passed to `start_turn` and emits a trivial completed turn.
 struct CapturingHarness {
     captured: Arc<TokioMutex<Vec<TurnOverrides>>>,
     tx: broadcast::Sender<AgentEvent>,
     thread_id: StdMutex<Option<ThreadId>>,
-    /// What each `open_thread` asked for. `None` means the caller left the model to the harness.
-    requested_models: Arc<StdMutex<Vec<Option<ModelRef>>>>,
+    /// What each `open_thread` asked for.
+    requested_models: Arc<StdMutex<Vec<ModelRef>>>,
 }
 
 impl CapturingHarness {
     fn with_requests(
         captured: Arc<TokioMutex<Vec<TurnOverrides>>>,
-        requested_models: Arc<StdMutex<Vec<Option<ModelRef>>>>,
+        requested_models: Arc<StdMutex<Vec<ModelRef>>>,
     ) -> Self {
         let (tx, _) = broadcast::channel(64);
         Self {
@@ -79,17 +82,14 @@ impl AgentHarness for CapturingHarness {
     }
 
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
-        let tid = opts.thread.unwrap_or_default();
+        let tid = opts.thread;
         *self.thread_id.lock().unwrap() = Some(tid);
         self.requested_models
             .lock()
             .unwrap()
             .push(opts.initial_model.clone());
         Ok(ThreadHandle {
-            resumed_model: opts
-                .initial_model
-                .clone()
-                .or_else(|| Some(fake_native_model())),
+            resumed_model: Some(opts.initial_model.clone()),
             ..ThreadHandle::opened(
                 tid,
                 opts.resume.unwrap_or_else(|| "cap".into()),
@@ -152,7 +152,7 @@ impl AgentHarness for CapturingHarness {
 
 struct CapFactory {
     captured: Arc<TokioMutex<Vec<TurnOverrides>>>,
-    requested_models: Arc<StdMutex<Vec<Option<ModelRef>>>>,
+    requested_models: Arc<StdMutex<Vec<ModelRef>>>,
 }
 
 impl CapFactory {
@@ -263,47 +263,31 @@ session_days = 30
             .to_string()
     };
 
-    let thread_id: ThreadId = {
-        let resp: serde_json::Value = client
-            .post(format!(
-                "http://127.0.0.1:{port}/api/projects/{pid}/threads"
-            ))
-            .header("cookie", &cookie)
-            .json(&serde_json::json!({ "resume": "th_cap" }))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        serde_json::from_value(resp["thread_id"].clone()).unwrap()
-    };
-
-    // Importing a native thread must not name a model. Codex treats `model`/`modelProvider` on
-    // `thread/resume` as an override and stops applying the thread's own persisted model, so
-    // requesting one here would silently move an existing conversation onto a different model.
-    // The thread's model is whatever the harness reports back.
-    assert_eq!(
-        requested_models.lock().unwrap().as_slice(),
-        &[None],
-        "importing a thread by native id asks the harness for no particular model"
-    );
-    let imported = state
-        .store
-        .load_thread(pid, thread_id)
+    let thread_id = persist_primary_thread(
+        &state.store,
+        pid,
+        ThreadId::new(),
+        "th_cap",
+        fake_native_model(),
+    )
+    .await;
+    client
+        .post(format!(
+            "http://127.0.0.1:{port}/api/projects/{pid}/threads"
+        ))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({ "thread_id": thread_id }))
+        .send()
         .await
         .unwrap()
+        .error_for_status()
         .unwrap();
-    assert_eq!(
-        imported.current_model,
-        giskard_core::turn::TurnModel::Known(ModelRef {
-            provider: "openai".into(),
-            model: "gpt-5.5".into(),
-            reasoning_effort: None,
-        }),
-        "the imported thread takes the model the harness reported for it"
-    );
 
+    assert_eq!(
+        requested_models.lock().unwrap().as_slice(),
+        &[fake_native_model()],
+        "reopening a persisted thread passes its effective model"
+    );
     let ws_request = tokio_tungstenite::tungstenite::http::Request::builder()
         .uri(format!("ws://127.0.0.1:{port}/api/ws"))
         .header("host", format!("127.0.0.1:{port}"))

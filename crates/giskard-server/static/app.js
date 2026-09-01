@@ -2537,7 +2537,7 @@ async function openThread(pid, tid, title, opts) {
   }
   let res;
   try {
-    res = await api("POST",`/api/projects/${pid}/threads`,{ thread_id:tid, resume:null });
+    res = await api("POST",`/api/projects/${pid}/threads`,{ thread_id:tid });
     tid = res.thread_id || tid;
   } catch (e) {
     if (opts.silent) { localStorage.removeItem("giskard.lastThread"); return; }

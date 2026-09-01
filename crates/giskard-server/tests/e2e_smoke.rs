@@ -1,4 +1,6 @@
 mod common;
+#[path = "common/thread_fixture.rs"]
+mod thread_fixture;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -34,6 +36,7 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::prelude::*;
 
 use common::fake_native_model;
+use thread_fixture::persist_primary_thread;
 
 #[derive(Clone, Debug)]
 struct CapturedRegistryEvent {
@@ -275,9 +278,8 @@ struct CountingOpenHarness {
     start_calls: AtomicUsize,
     delete_calls: AtomicUsize,
     shutdown_calls: AtomicUsize,
-    /// What each `open_thread` requested — `None` when the caller left the model to the
-    /// harness, which is how an imported thread keeps the model it was already on.
-    opened_models: tokio::sync::Mutex<Vec<Option<ModelRef>>>,
+    /// What each `open_thread` requested.
+    opened_models: tokio::sync::Mutex<Vec<ModelRef>>,
     started_models: tokio::sync::Mutex<Vec<Option<ModelRef>>>,
     started_inputs: tokio::sync::Mutex<Vec<String>>,
     start_error: tokio::sync::Mutex<Option<HarnessError>>,
@@ -639,7 +641,7 @@ impl CountingOpenHarness {
         self.claim_calls.load(Ordering::SeqCst)
     }
 
-    async fn opened_models(&self) -> Vec<Option<ModelRef>> {
+    async fn opened_models(&self) -> Vec<ModelRef> {
         self.opened_models.lock().await.clone()
     }
 
@@ -693,14 +695,11 @@ impl AgentHarness for UnsupportedCompactionHarness {
     }
 
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
-        let thread = opts.thread.unwrap_or_default();
+        let thread = opts.thread;
         let (tx, _) = tokio::sync::broadcast::channel(16);
         self.threads.lock().await.insert(thread, tx);
         Ok(ThreadHandle {
-            resumed_model: opts
-                .initial_model
-                .clone()
-                .or_else(|| Some(fake_native_model())),
+            resumed_model: Some(opts.initial_model.clone()),
             ..ThreadHandle::opened(
                 thread,
                 opts.resume.unwrap_or_else(|| format!("test_{thread}")),
@@ -786,14 +785,11 @@ impl AgentHarness for SlowCompactionHarness {
     }
 
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
-        let thread = opts.thread.unwrap_or_default();
+        let thread = opts.thread;
         let (tx, _) = tokio::sync::broadcast::channel(32);
         self.threads.lock().await.insert(thread, tx);
         Ok(ThreadHandle {
-            resumed_model: opts
-                .initial_model
-                .clone()
-                .or_else(|| Some(fake_native_model())),
+            resumed_model: Some(opts.initial_model.clone()),
             ..ThreadHandle::opened(
                 thread,
                 opts.resume.unwrap_or_else(|| format!("test_{thread}")),
@@ -969,17 +965,14 @@ impl AgentHarness for ActivityHarness {
                 tokio::task::yield_now().await;
             }
         }
-        let thread = opts.thread.unwrap_or_default();
+        let thread = opts.thread;
         let (tx, _) = tokio::sync::broadcast::channel(32);
         self.threads.lock().await.insert(thread, tx);
         let harness_thread_id = opts.resume.unwrap_or_else(|| format!("test_{thread}"));
         let agent_name = (harness_thread_id == "native-collab-child").then(|| "James".to_string());
         let parent_harness_thread_id = attested_native_parent(&harness_thread_id);
         Ok(ThreadHandle {
-            resumed_model: opts
-                .initial_model
-                .clone()
-                .or_else(|| Some(fake_native_model())),
+            resumed_model: Some(opts.initial_model.clone()),
             agent_name,
             parent_harness_thread_id,
             ..ThreadHandle::opened(thread, harness_thread_id, opts.workspace_root.clone())
@@ -1480,14 +1473,11 @@ impl AgentHarness for SlowStartHarness {
     }
 
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
-        let thread = opts.thread.unwrap_or_default();
+        let thread = opts.thread;
         let (tx, _) = tokio::sync::broadcast::channel(32);
         self.threads.lock().await.insert(thread, tx);
         Ok(ThreadHandle {
-            resumed_model: opts
-                .initial_model
-                .clone()
-                .or_else(|| Some(fake_native_model())),
+            resumed_model: Some(opts.initial_model.clone()),
             ..ThreadHandle::opened(
                 thread,
                 opts.resume.unwrap_or_else(|| format!("test_{thread}")),
@@ -1611,7 +1601,7 @@ impl AgentHarness for CountingOpenHarness {
 
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
         let open_call = self.open_calls.fetch_add(1, Ordering::SeqCst) + 1;
-        let thread = opts.thread.unwrap_or_default();
+        let thread = opts.thread;
         self.opened_models
             .lock()
             .await
@@ -1619,10 +1609,7 @@ impl AgentHarness for CountingOpenHarness {
         let (tx, _) = tokio::sync::broadcast::channel(16);
         self.threads.lock().await.insert(thread, tx);
         Ok(ThreadHandle {
-            resumed_model: opts
-                .initial_model
-                .clone()
-                .or_else(|| Some(fake_native_model())),
+            resumed_model: Some(opts.initial_model.clone()),
             ..ThreadHandle::opened(
                 thread,
                 opts.resume
@@ -2362,27 +2349,37 @@ async fn connect_ws(
 }
 
 async fn create_project_and_thread(
+    state: &AppState,
     client: &reqwest::Client,
     base: &str,
     cookie: &str,
 ) -> (ProjectId, ThreadId) {
     let project_id = create_project_only(client, base, cookie).await;
+    let thread_id = persist_primary_thread(
+        &state.store,
+        project_id,
+        ThreadId::new(),
+        "th_test",
+        fake_native_model(),
+    )
+    .await;
 
     let thread_resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", cookie)
-        .json(&serde_json::json!({"resume": "th_test"}))
+        .json(&serde_json::json!({"thread_id": thread_id}))
         .send()
         .await
         .unwrap();
     assert_eq!(thread_resp.status(), 200);
-    let thread_id: ThreadId = thread_resp.json::<serde_json::Value>().await.unwrap()["thread_id"]
+    let opened: ThreadId = thread_resp.json::<serde_json::Value>().await.unwrap()["thread_id"]
         .as_str()
         .unwrap()
         .parse()
         .unwrap();
+    assert_eq!(opened, thread_id);
 
-    (project_id, thread_id)
+    (project_id, opened)
 }
 
 async fn create_project_only(client: &reqwest::Client, base: &str, cookie: &str) -> ProjectId {
@@ -2864,11 +2861,11 @@ fn is_turn_completed_activity(kind: &ThreadActivityKind) -> bool {
 #[tokio::test]
 async fn send_input_rejects_second_turn_before_turn_started() {
     let harness = Arc::new(SlowStartHarness::new());
-    let (_tmp, _state, port) = start_slow_start_server_on_available_port(harness.clone()).await;
+    let (_tmp, state, port) = start_slow_start_server_on_available_port(harness.clone()).await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
-    let (_, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    let (_, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
     let mut first = connect_ws(port, &cookie).await;
     let mut second = connect_ws(port, &cookie).await;
 
@@ -2944,7 +2941,7 @@ async fn cancelling_start_turn_caller_does_not_abandon_admitted_operation() {
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
-    let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    let (project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
     let thread = state
         .store
         .load_thread(project_id, thread_id)
@@ -3005,7 +3002,7 @@ async fn cancelling_compaction_caller_does_not_abandon_admitted_operation() {
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
-    let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    let (project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
     let thread = state
         .store
         .load_thread(project_id, thread_id)
@@ -3061,12 +3058,11 @@ async fn subscribe_thread_state_reports_a_turn_that_ended_before_the_socket_atta
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
-    let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    let (project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
 
     // The whole turn happens with no socket subscribed to this thread — the window the browser
     // races when it starts a turn over HTTP and only then opens the thread. Driven through the
-    // registry rather than `POST /threads/start` because the replay harness only streams a fixture
-    // into a thread opened with that fixture's resume key, which that endpoint does not do.
+    // registry rather than `POST /threads/start` so the test can control when the turn completes.
     let thread_file = state
         .store
         .load_thread(project_id, thread_id)
@@ -3125,7 +3121,7 @@ async fn subscribe_thread_state_reports_a_turn_the_harness_has_not_streamed_yet(
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
-    let (_, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    let (_, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
 
     let mut sender = connect_ws(port, &cookie).await;
     sender
@@ -3191,7 +3187,7 @@ async fn send_input_rejects_same_thread_during_compaction() {
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
-    let (_, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    let (_, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
     let mut ws = connect_ws(port, &cookie).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -3249,7 +3245,7 @@ async fn compact_context_streams_and_persists_compaction_turn() {
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
-    let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    let (project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
     let mut ws = connect_ws(port, &cookie).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -3346,7 +3342,7 @@ async fn wire_turn_id_matches_persisted_turn_id() {
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
-    let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    let (project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
     let mut ws = connect_ws(port, &cookie).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -3402,7 +3398,7 @@ async fn new_turn_start_replaces_stale_live_buffer_without_dropping_events() {
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
-    let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    let (project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
     let stale_turn = TurnId::new();
     state
         .registry
@@ -3468,10 +3464,12 @@ async fn compact_context_does_not_block_turns_on_other_threads_or_projects() {
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
-    let (project_id, compacting_thread) = create_project_and_thread(&client, &base, &cookie).await;
+    let (project_id, compacting_thread) =
+        create_project_and_thread(&state, &client, &base, &cookie).await;
     let other_thread =
-        open_thread_with_resume(&client, &base, &cookie, project_id, "other_thread").await;
-    let (_, other_project_thread) = create_project_and_thread(&client, &base, &cookie).await;
+        open_thread_with_resume(&state, &client, &base, &cookie, project_id, "other_thread").await;
+    let (_, other_project_thread) =
+        create_project_and_thread(&state, &client, &base, &cookie).await;
     let mut ws = connect_ws(port, &cookie).await;
 
     for thread_id in [compacting_thread, other_thread, other_project_thread] {
@@ -3581,13 +3579,21 @@ async fn compact_context_does_not_block_turns_on_other_threads_or_projects() {
 
 #[tokio::test]
 async fn inactive_thread_progress_sends_activity_without_full_event_subscription() {
-    let (_tmp, _state, port) = start_slow_compaction_server_on_available_port().await;
+    let (_tmp, state, port) = start_slow_compaction_server_on_available_port().await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
-    let (project_id, active_thread) = create_project_and_thread(&client, &base, &cookie).await;
-    let inactive_thread =
-        open_thread_with_resume(&client, &base, &cookie, project_id, "inactive_thread").await;
+    let (project_id, active_thread) =
+        create_project_and_thread(&state, &client, &base, &cookie).await;
+    let inactive_thread = open_thread_with_resume(
+        &state,
+        &client,
+        &base,
+        &cookie,
+        project_id,
+        "inactive_thread",
+    )
+    .await;
     let mut ws = connect_ws(port, &cookie).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -3702,13 +3708,21 @@ async fn inactive_thread_progress_sends_activity_without_full_event_subscription
 #[tokio::test]
 async fn inactive_thread_requests_send_activity_and_route_responses() {
     let harness = Arc::new(ActivityHarness::default());
-    let (_tmp, _state, port) = start_activity_server_on_available_port(harness.clone()).await;
+    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
-    let (project_id, active_thread) = create_project_and_thread(&client, &base, &cookie).await;
-    let inactive_thread =
-        open_thread_with_resume(&client, &base, &cookie, project_id, "inactive_requests").await;
+    let (project_id, active_thread) =
+        create_project_and_thread(&state, &client, &base, &cookie).await;
+    let inactive_thread = open_thread_with_resume(
+        &state,
+        &client,
+        &base,
+        &cookie,
+        project_id,
+        "inactive_requests",
+    )
+    .await;
     let mut ws = connect_ws(port, &cookie).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -3834,11 +3848,11 @@ async fn inactive_thread_requests_send_activity_and_route_responses() {
 #[tokio::test]
 async fn approval_decision_broadcasts_resolution_to_other_tabs() {
     let harness = Arc::new(ActivityHarness::default());
-    let (_tmp, _state, port) = start_activity_server_on_available_port(harness.clone()).await;
+    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
-    let (_project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    let (_project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
     let mut first_ws = connect_ws(port, &cookie).await;
     let mut second_ws = connect_ws(port, &cookie).await;
 
@@ -3895,11 +3909,11 @@ async fn approval_decision_broadcasts_resolution_to_other_tabs() {
 
 #[tokio::test]
 async fn compact_context_unsupported_harness_returns_structured_error() {
-    let (_tmp, _state, port) = start_unsupported_compaction_server_on_available_port().await;
+    let (_tmp, state, port) = start_unsupported_compaction_server_on_available_port().await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
-    let (_, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    let (_, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
     let mut ws = connect_ws(port, &cookie).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -3923,11 +3937,11 @@ async fn compact_context_unsupported_harness_returns_structured_error() {
 
 #[tokio::test]
 async fn mcp_status_routes_surface_empty_replay_status_and_reload() {
-    let (_tmp, _state, port) = start_server_with_extra_config_on_available_port("").await;
+    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
-    let (project_id, _) = create_project_and_thread(&client, &base, &cookie).await;
+    let (project_id, _) = create_project_and_thread(&state, &client, &base, &cookie).await;
 
     let status: serde_json::Value = client
         .get(format!("{base}/api/projects/{project_id}/mcp"))
@@ -3997,11 +4011,11 @@ async fn mcp_status_routes_surface_unsupported_capabilities_without_failing() {
 
 #[tokio::test]
 async fn mcp_oauth_login_rejects_empty_and_unsupported_requests() {
-    let (_tmp, _state, port) = start_server_with_extra_config_on_available_port("").await;
+    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
-    let (project_id, _) = create_project_and_thread(&client, &base, &cookie).await;
+    let (project_id, _) = create_project_and_thread(&state, &client, &base, &cookie).await;
 
     let empty = client
         .post(format!("{base}/api/projects/{project_id}/mcp/oauth-login"))
@@ -4032,11 +4046,11 @@ async fn mcp_oauth_login_rejects_empty_and_unsupported_requests() {
 
 #[tokio::test]
 async fn thread_archive_unarchive_updates_thread_summary() {
-    let (_tmp, _state, port) = start_server_with_extra_config_on_available_port("").await;
+    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
-    let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    let (project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
 
     let archived: serde_json::Value = client
         .post(format!(
@@ -4085,7 +4099,7 @@ async fn thread_rename_updates_thread_summary_and_persistence() {
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
-    let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    let (project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
 
     let renamed = client
         .patch(format!(
@@ -4154,7 +4168,7 @@ async fn importing_subagent_thread_records_parent_and_reuses_native_child() {
     let parent_resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"resume": "native-parent"}))
+        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap();
@@ -4319,7 +4333,7 @@ async fn route_and_forwarder_import_same_native_child_once() {
     let parent_resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"resume": "native-parent"}))
+        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap();
@@ -4448,7 +4462,7 @@ async fn passive_subagent_command_start_streams_before_completion() {
     let parent_resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"resume": "native-parent"}))
+        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap();
@@ -4728,7 +4742,7 @@ async fn collab_agent_spawn_start_imports_subagent_thread() {
     let parent_resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"resume": "native-parent"}))
+        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap();
@@ -4826,7 +4840,7 @@ async fn collab_agent_spawn_uses_tool_input_prompt_when_link_prompt_is_missing()
     let parent_resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"resume": "native-parent"}))
+        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap();
@@ -4943,7 +4957,7 @@ async fn passive_subagent_prompt_updates_when_spawn_metadata_arrives_late() {
     let parent_resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"resume": "native-parent"}))
+        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap();
@@ -5047,7 +5061,7 @@ async fn server_resolved_subagent_link_uses_agent_name_prompt_and_turn() {
     let parent_resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"resume": "native-parent"}))
+        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap();
@@ -5179,7 +5193,7 @@ async fn subagent_link_open_rejects_unknown_and_non_link_items() {
     let parent: serde_json::Value = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"resume": "native-parent"}))
+        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap()
@@ -5246,7 +5260,7 @@ async fn terminal_subagent_link_does_not_synthesize_a_fallback_turn() {
     let parent_resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"resume": "native-parent"}))
+        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap();
@@ -5346,7 +5360,7 @@ async fn persisted_or_interrupted_subagent_keeps_one_event_owner() {
     let parent_resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"resume": "native-parent"}))
+        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap();
@@ -5526,7 +5540,7 @@ async fn reverse_subagent_activity_preserves_parent_and_uses_one_forwarder() {
     let parent_resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"resume": "native-parent"}))
+        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap();
@@ -5793,7 +5807,7 @@ async fn route_rejects_native_child_with_a_different_parent() {
     let parent_resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"resume": "native-parent"}))
+        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap();
@@ -5841,7 +5855,7 @@ async fn parent_deletion_cascades_to_all_descendants_leaf_first() {
     let parent: serde_json::Value = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"resume": "native-parent"}))
+        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap()
@@ -5964,7 +5978,7 @@ async fn parent_deletion_rejects_active_descendant_before_deleting_anything() {
     let parent: serde_json::Value = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"resume": "native-parent"}))
+        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap()
@@ -6101,7 +6115,7 @@ async fn thread_delete_removes_native_and_persisted_thread() {
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
-    let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    let (project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
     assert_eq!(
         state
             .registry
@@ -6173,7 +6187,7 @@ async fn project_remove_shuts_down_harness_and_removes_giskard_data_only() {
     let thread_resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"resume": "th_remove_project"}))
+        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "th_remove_project", fake_native_model()).await}))
         .send()
         .await
         .unwrap();
@@ -6252,7 +6266,7 @@ async fn thread_archive_and_delete_reject_active_turns() {
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
-    let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    let (project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
     state
         .registry
         .thread_runtime(thread_id)
@@ -6288,7 +6302,7 @@ async fn project_remove_rejects_active_turns() {
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
-    let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    let (project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
     state
         .registry
         .thread_runtime(thread_id)
@@ -6321,7 +6335,7 @@ async fn thread_archive_and_delete_reject_running_commands() {
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
-    let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    let (project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
 
     // Track a running command without starting a turn, so only the running-command branch of the
     // guard can trip (not the live-turn branch).
@@ -6383,7 +6397,7 @@ async fn project_remove_rejects_running_commands() {
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
-    let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
+    let (project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
 
     let runtime = state.registry.thread_runtime(thread_id).await.unwrap();
     runtime.apply_event_for_test(
@@ -6439,9 +6453,9 @@ async fn threads_in_a_project_keep_independent_permission_presets() {
     let cookie = login_cookie(&client, &base).await;
     let project_id = create_project_only(&client, &base, &cookie).await;
     let thread_a =
-        open_thread_with_resume(&client, &base, &cookie, project_id, "th_policy_a").await;
+        open_thread_with_resume(&state, &client, &base, &cookie, project_id, "th_policy_a").await;
     let thread_b =
-        open_thread_with_resume(&client, &base, &cookie, project_id, "th_policy_b").await;
+        open_thread_with_resume(&state, &client, &base, &cookie, project_id, "th_policy_b").await;
 
     // New threads default to `ask_first`.
     assert_eq!(
@@ -6496,25 +6510,36 @@ async fn threads_in_a_project_keep_independent_permission_presets() {
 }
 
 async fn open_thread_with_resume(
+    state: &AppState,
     client: &reqwest::Client,
     base: &str,
     cookie: &str,
     project_id: ProjectId,
     resume: &str,
 ) -> ThreadId {
+    let thread_id = persist_primary_thread(
+        &state.store,
+        project_id,
+        ThreadId::new(),
+        resume,
+        fake_native_model(),
+    )
+    .await;
     let resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", cookie)
-        .json(&serde_json::json!({ "resume": resume }))
+        .json(&serde_json::json!({ "thread_id": thread_id }))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    resp.json::<serde_json::Value>().await.unwrap()["thread_id"]
+    let opened = resp.json::<serde_json::Value>().await.unwrap()["thread_id"]
         .as_str()
         .unwrap()
         .parse()
-        .unwrap()
+        .unwrap();
+    assert_eq!(opened, thread_id);
+    opened
 }
 
 async fn load_policy(
@@ -6734,7 +6759,7 @@ async fn websocket_serializes_harness_error_events() {
     let resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"resume": "th_test"}))
+        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id.parse().unwrap(), ThreadId::new(), "th_test", fake_native_model()).await}))
         .send()
         .await
         .unwrap();
@@ -6813,7 +6838,9 @@ async fn websocket_serializes_harness_error_events() {
                 }
                 other => panic!("expected error event, got {other:?}"),
             },
-            ServerMessage::LiveTurnSnapshot(_) | ServerMessage::RunningTasks { .. } => continue,
+            ServerMessage::HistoryDelta { .. }
+            | ServerMessage::LiveTurnSnapshot(_)
+            | ServerMessage::RunningTasks { .. } => continue,
             other => panic!("expected event, got {other:?}"),
         }
     }
@@ -7053,7 +7080,7 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
     let resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": tid, "resume": null}))
+        .json(&serde_json::json!({"thread_id": tid}))
         .send()
         .await
         .unwrap();
@@ -7259,7 +7286,7 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
     let resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": tid, "resume": null}))
+        .json(&serde_json::json!({"thread_id": tid}))
         .send()
         .await
         .unwrap();
@@ -7483,7 +7510,7 @@ async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
     let resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": tid, "resume": null}))
+        .json(&serde_json::json!({"thread_id": tid}))
         .send()
         .await
         .unwrap();
@@ -7622,11 +7649,12 @@ async fn failed_turn_is_persisted_with_error_message() {
         .to_string();
     let pid: ProjectId = project_id.parse().unwrap();
 
-    // Open the thread (resume triggers the replay fixture).
+    persist_primary_thread(&state.store, pid, tid, "th_fail", fake_native_model()).await;
+    // Open the persisted thread to trigger the replay fixture.
     let resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"resume": "th_fail"}))
+        .json(&serde_json::json!({"thread_id": tid}))
         .send()
         .await
         .unwrap();
@@ -7725,7 +7753,7 @@ async fn notice_event_is_delivered_to_client() {
     let tid = ThreadId::new();
     let turn = TurnId::new();
     let fixture = notice_fixture(tid, turn);
-    let (_tmp, _state, port) =
+    let (_tmp, state, port) =
         start_server_with_fixture_and_extra_config_on_available_port(fixture, "").await;
     let base = format!("http://127.0.0.1:{port}");
     let ws_base = format!("ws://127.0.0.1:{port}");
@@ -7765,11 +7793,13 @@ async fn notice_event_is_delivered_to_client() {
         .as_str()
         .unwrap()
         .to_string();
+    let pid: ProjectId = project_id.parse().unwrap();
+    persist_primary_thread(&state.store, pid, tid, "th_notice", fake_native_model()).await;
 
     let resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"resume": "th_notice"}))
+        .json(&serde_json::json!({"thread_id": tid}))
         .send()
         .await
         .unwrap();
@@ -7932,7 +7962,7 @@ async fn open_thread_normalizes_stale_provider_from_configured_model() {
     let resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": tid, "resume": null}))
+        .json(&serde_json::json!({"thread_id": tid}))
         .send()
         .await
         .unwrap();
@@ -7953,7 +7983,7 @@ async fn open_thread_normalizes_stale_provider_from_configured_model() {
     let resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": tid, "resume": null}))
+        .json(&serde_json::json!({"thread_id": tid}))
         .send()
         .await
         .unwrap();
@@ -8040,9 +8070,9 @@ async fn open_thread_normalization_reuses_live_handle() {
         .open_thread(
             &project_config,
             "/tmp/test",
-            Some(tid),
+            tid,
             Some("th_live".into()),
-            Some(stale_model),
+            stale_model,
         )
         .await
         .unwrap();
@@ -8051,7 +8081,7 @@ async fn open_thread_normalization_reuses_live_handle() {
     let resp = client
         .post(format!("{base}/api/projects/{pid}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": tid, "resume": null}))
+        .json(&serde_json::json!({"thread_id": tid}))
         .send()
         .await
         .unwrap();
@@ -8095,16 +8125,16 @@ async fn concurrent_cold_opens_install_one_native_owner() {
     let first = state.registry.open_thread(
         &config,
         "/tmp/test",
-        Some(thread_id),
+        thread_id,
         Some("native-thread".into()),
-        Some(model.clone()),
+        model.clone(),
     );
     let second = state.registry.open_thread(
         &config,
         "/tmp/test",
-        Some(thread_id),
+        thread_id,
         Some("native-thread".into()),
-        Some(model),
+        model,
     );
     let (first, second) = tokio::join!(first, second);
     assert_eq!(first.unwrap().harness_thread_id, "native-thread");
@@ -8190,7 +8220,7 @@ async fn concurrent_subagent_cold_opens_install_one_native_owner() {
 }
 
 #[tokio::test]
-async fn blank_thread_creation_without_resume_is_rejected() {
+async fn removed_resume_field_is_rejected_before_harness_io() {
     let harness = Arc::new(CountingOpenHarness::default());
     let (_tmp, _state, port) = start_custom_server_with_extra_config_on_available_port(
         Arc::new(CountingOpenFactory {
@@ -8215,9 +8245,9 @@ async fn blank_thread_creation_without_resume_is_rejected() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("creating a new thread requires an initial message"));
+    assert!(body.contains("resume"));
     assert_eq!(harness.open_calls(), 0);
 }
 
@@ -8281,7 +8311,7 @@ async fn start_thread_with_initial_message_uses_selected_provider_and_starts_tur
     assert_eq!(harness.open_calls(), 1);
     assert_eq!(harness.start_calls(), 1);
     let opened = harness.opened_models().await;
-    let opened_first = opened[0].as_ref().expect("a fresh thread names its model");
+    let opened_first = &opened[0];
     assert_eq!(opened_first.provider, "proxy");
     assert_eq!(opened_first.model, "glm-5.2-workers-ai");
     let started_models = harness.started_models().await;
@@ -8383,7 +8413,7 @@ async fn select_model_rejects_provider_change_on_non_empty_thread() {
         .build()
         .unwrap();
     let cookie = login_cookie(&client, &base).await;
-    let (pid, tid) = create_project_and_thread(&client, &base, &cookie).await;
+    let (pid, tid) = create_project_and_thread(&state, &client, &base, &cookie).await;
     let now = chrono::Utc::now();
     let openai_model = ModelRef {
         provider: "openai".into(),
@@ -8481,7 +8511,7 @@ async fn send_input_rejects_persisted_provider_mismatch_on_non_empty_thread() {
         .build()
         .unwrap();
     let cookie = login_cookie(&client, &base).await;
-    let (pid, tid) = create_project_and_thread(&client, &base, &cookie).await;
+    let (pid, tid) = create_project_and_thread(&state, &client, &base, &cookie).await;
     let now = chrono::Utc::now();
     let openai_model = ModelRef {
         provider: "openai".into(),
@@ -8552,7 +8582,7 @@ async fn send_input_rejects_persisted_provider_mismatch_on_non_empty_thread() {
 #[tokio::test]
 async fn login_project_thread_message() {
     let port = 18787;
-    let (_tmp, _state) = start_server(port).await;
+    let (_tmp, state) = start_server(port).await;
     let base = format!("http://127.0.0.1:{port}");
     let ws_base = format!("ws://127.0.0.1:{port}");
 
@@ -8612,11 +8642,20 @@ async fn login_project_thread_message() {
     let list: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(list["projects"].as_array().unwrap().len(), 1);
 
-    // 4. Open thread (with resume to trigger replay fixture)
+    let pid: ProjectId = project_id.parse().unwrap();
+    let seeded_thread = persist_primary_thread(
+        &state.store,
+        pid,
+        ThreadId::new(),
+        "th_test",
+        fake_native_model(),
+    )
+    .await;
+    // 4. Open the persisted thread to trigger the replay fixture.
     let resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie_val)
-        .json(&serde_json::json!({"resume": "th_test"}))
+        .json(&serde_json::json!({"thread_id": seeded_thread}))
         .send()
         .await
         .unwrap();

@@ -16,6 +16,9 @@ use giskard_persist::store::ProjectConfig;
 use giskard_proto::{ClientMessage, ErrorSeverity, ServerMessage};
 use giskard_server::{AppState, HarnessFactory, build_app};
 
+use common::fake_native_model;
+use thread_fixture::persist_primary_thread;
+
 struct DiffFactory {
     fixture: ReplayFixture,
 }
@@ -197,19 +200,23 @@ async fn history_pagination_over_http() {
         .unwrap();
 
     // Open (register) the thread, then seed 5 turns directly into the authoritative history.
-    let tid: ThreadId = {
-        let resp: serde_json::Value = client
-            .post(format!("{base}/api/projects/{pid}/threads"))
-            .header("cookie", &cookie)
-            .json(&serde_json::json!({"resume": "th_tok"}))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        serde_json::from_value(resp["thread_id"].clone()).unwrap()
-    };
+    let tid = persist_primary_thread(
+        &state.store,
+        pid,
+        ThreadId::new(),
+        "th_tok",
+        fake_native_model(),
+    )
+    .await;
+    client
+        .post(format!("{base}/api/projects/{pid}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"thread_id": tid}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
     let mut ids = Vec::new();
     for i in 0..5 {
         let t = make_turn(&format!("turn {i}"));
@@ -340,19 +347,23 @@ async fn resync_delta_over_websocket() {
         .await
         .unwrap();
 
-    let tid: ThreadId = {
-        let resp: serde_json::Value = client
-            .post(format!("{base}/api/projects/{pid}/threads"))
-            .header("cookie", &cookie)
-            .json(&serde_json::json!({"resume": "th_tok"}))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        serde_json::from_value(resp["thread_id"].clone()).unwrap()
-    };
+    let tid = persist_primary_thread(
+        &state.store,
+        pid,
+        ThreadId::new(),
+        "th_tok",
+        fake_native_model(),
+    )
+    .await;
+    client
+        .post(format!("{base}/api/projects/{pid}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"thread_id": tid}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
     let mut ids = Vec::new();
     for i in 0..5 {
         let t = make_turn(&format!("turn {i}"));
@@ -486,19 +497,23 @@ async fn subscribe_corrupt_history_returns_structured_error() {
         .await
         .unwrap();
 
-    let tid: ThreadId = {
-        let resp: serde_json::Value = client
-            .post(format!("{base}/api/projects/{pid}/threads"))
-            .header("cookie", &cookie)
-            .json(&serde_json::json!({"resume": "th_tok"}))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        serde_json::from_value(resp["thread_id"].clone()).unwrap()
-    };
+    let tid = persist_primary_thread(
+        &state.store,
+        pid,
+        ThreadId::new(),
+        "th_tok",
+        fake_native_model(),
+    )
+    .await;
+    client
+        .post(format!("{base}/api/projects/{pid}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"thread_id": tid}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
 
     // A bad **interior** line of the history index is real corruption, not a torn final append.
     let valid_turn = serde_json::to_string(&make_turn("valid after corrupt line")).unwrap();
@@ -562,3 +577,6 @@ async fn subscribe_corrupt_history_returns_structured_error() {
 
     panic!("subscribe did not return a structured persistence error");
 }
+mod common;
+#[path = "common/thread_fixture.rs"]
+mod thread_fixture;
