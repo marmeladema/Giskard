@@ -161,7 +161,7 @@ the adapter. Both native spawning protocols are supported:
   so the server uses its explicit `Sub-agent turn` fallback rather than misidentifying an inherited
   parent turn as the task.
 
-The server imports the child from either representation and installs one long-lived native event
+The server materializes the child from either representation and installs one long-lived native event
 owner for it. Parent lifecycle evidence establishes or refreshes the relationship only; it does not
 start a second monitor, synthesize a fallback turn, or stop the owner after a timeout. The browser
 addresses links by Giskard parent-thread and item IDs; the server resolves native routing metadata
@@ -483,23 +483,18 @@ thread's own persisted model stops being applied. Supplying one therefore moves
 an existing conversation onto a different model rather than expressing a
 preference.
 
-`OpenThreadOptions::initial_model` is consequently optional, and the adapter
-omits both keys when it is `None`:
+`OpenThreadOptions::initial_model` remains optional. When the adapter issues a native open:
 
-- **Importing** a native thread Giskard has no record of passes `None`, and the
-  thread keeps the model Codex reports for it.
-- **Reopening** a thread Giskard already tracks passes its persisted model — that
-  override is also the mechanism for switching a thread's provider.
+- **Reopening** a thread Giskard already tracks passes its persisted model — that override is also
+  the mechanism for switching a thread's provider.
 - **Starting** a fresh thread requires one (`fresh_model`); there is no existing
   thread whose model Codex could report. The resume-failed recovery path that
   starts a replacement therefore returns the resume error instead when no model
   was named.
 
 `thread/resume` also reports `reasoningEffort`, and a reported effort wins over a
-requested one — an imported thread must show the effort it is actually running,
-not "Default". `thread/start` reports none, so there the request is the only
-source. When Codex reports an empty model or provider the adapter logs and
-returns no effective model, and the server refuses the import rather than
+requested one. `thread/start` reports none, so there the request is the only source. When Codex
+reports an empty model or provider, the adapter logs and returns no effective model rather than
 guessing.
 
 ## Runtime context window

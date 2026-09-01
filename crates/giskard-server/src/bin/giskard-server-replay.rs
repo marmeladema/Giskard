@@ -475,7 +475,7 @@ impl AgentHarness for ScriptedHarness {
     }
 
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
-        let thread = opts.thread.unwrap_or_default();
+        let thread = opts.thread;
         let harness_thread_id = opts
             .resume
             .clone()
@@ -490,10 +490,7 @@ impl AgentHarness for ScriptedHarness {
             self.attach_thread(thread, &harness_thread_id).await;
 
         Ok(ThreadHandle {
-            resumed_model: opts
-                .initial_model
-                .clone()
-                .or_else(|| Some(fake_native_model())),
+            resumed_model: Some(opts.initial_model.clone()),
             agent_name: parent_harness_thread_id.as_ref().map(|_| {
                 if blocks_on_approval {
                     SCRIPTED_APPROVAL_SUBAGENT_AGENT_NAME.to_string()
@@ -1208,17 +1205,4 @@ fn run_git_seed<const N: usize>(workspace: &Path, args: [&str; N]) -> Result<(),
     } else {
         stderr
     })
-}
-
-/// The model a fake harness reports for a thread it is asked to import. A real harness answers this
-/// from the thread itself; an import names no model, so the fake stands in with a fixed one rather
-/// than claiming not to know.
-fn fake_native_model() -> giskard_core::model::ModelRef {
-    // The identity this server actually advertises, in `[providers.<id>]` and `list_providers` alike.
-    // Reporting anything else would bind an imported thread to a provider the picker never offers.
-    giskard_core::model::ModelRef {
-        provider: "replay".into(),
-        model: "replay-model".into(),
-        reasoning_effort: None,
-    }
 }

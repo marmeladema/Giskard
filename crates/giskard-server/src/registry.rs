@@ -782,9 +782,9 @@ impl HarnessRegistry {
         &self,
         config: &ProjectConfig,
         workspace_root: &str,
-        thread: Option<ThreadId>,
+        thread: ThreadId,
         resume: Option<String>,
-        initial_model: Option<ModelRef>,
+        initial_model: ModelRef,
     ) -> Result<ThreadHandle, HarnessError> {
         self.open_primary_thread(config, workspace_root, thread, resume, initial_model)
             .await
@@ -814,31 +814,25 @@ impl HarnessRegistry {
         &self,
         config: &ProjectConfig,
         workspace_root: &str,
-        thread: Option<ThreadId>,
+        thread: ThreadId,
         resume: Option<String>,
-        initial_model: Option<ModelRef>,
+        initial_model: ModelRef,
     ) -> Result<ThreadHandle, HarnessError> {
         debug!(
             project_id = %config.id,
-            thread_id = display_opt(thread),
+            thread_id = %thread,
             resume = display_opt(resume.as_deref()),
             "opening harness thread"
         );
         // Serialize the cold check and native open for an already-known thread. Locking only when
         // publishing the owner is too late: two callers could both open the native thread and the
         // losing open may invalidate the stream already owned by the winner.
-        let owner_guard = if let Some(thread_id) = thread {
-            Some(lock_thread_owner_after_drain(&self.shared, thread_id).await)
-        } else {
-            None
-        };
-        if let Some(thread_id) = thread
-            && let Some(existing) = self.shared.coordinator(thread_id).await
-        {
+        let _owner_guard = lock_thread_owner_after_drain(&self.shared, thread).await;
+        if let Some(existing) = self.shared.coordinator(thread).await {
             return existing
                 .reusable_handle(
                     config.id,
-                    thread_id,
+                    thread,
                     resume.as_deref(),
                     ClassificationPhase::Primary,
                 )
@@ -846,18 +840,12 @@ impl HarnessRegistry {
         }
         let harness = self.get_or_create_harness(config.id, config).await?;
         let (updates, update_stream) = thread_update_channel();
-        let authority = match thread {
-            Some(thread_id) => Some(
-                self.shared
-                    .intern_thread_authority(thread_id, config.id)
-                    .await
-                    .map_err(|error| HarnessError::Protocol(error.to_string()))?,
-            ),
-            None => None,
-        };
-        let restore_permit = authority
-            .as_ref()
-            .map(|authority| self.shared.runtime.restoration_permit(authority));
+        let authority = self
+            .shared
+            .intern_thread_authority(thread, config.id)
+            .await
+            .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+        let restore_permit = self.shared.runtime.restoration_permit(&authority);
 
         let handle = harness
             .open_thread(OpenThreadOptions {
@@ -869,19 +857,12 @@ impl HarnessRegistry {
                 updates,
             })
             .await?;
-        // A known thread can begin another lifecycle while its harness open is in flight, so its
-        // permit was captured above. A newly imported thread is not exposed until after this
-        // function returns, making the harness-returned identity safe to capture here.
-        let authority = match authority {
-            Some(authority) => authority,
-            None => self
-                .shared
-                .intern_thread_authority(handle.thread, config.id)
-                .await
-                .map_err(|error| HarnessError::Protocol(error.to_string()))?,
-        };
-        let restore_permit =
-            restore_permit.unwrap_or_else(|| self.shared.runtime.restoration_permit(&authority));
+        if handle.thread != thread {
+            return Err(HarnessError::Protocol(format!(
+                "harness opened thread {} instead of requested thread {thread}",
+                handle.thread
+            )));
+        }
 
         // Bind the model the harness reports as effective when it says so — Codex can ignore
         // resume overrides for a loaded thread, and the binding must reflect reality, not the
@@ -889,29 +870,19 @@ impl HarnessRegistry {
         let native_model = handle
             .resumed_model
             .clone()
-            .or_else(|| initial_model.clone());
+            .unwrap_or_else(|| initial_model.clone());
         let binding = LoadedThreadBinding {
             project_id: config.id,
             handle: handle.clone(),
-            native_model,
+            native_model: Some(native_model),
         };
-        let owner_installed = if owner_guard.is_some() {
-            install_event_owner_locked(
-                &self.shared,
-                &harness,
-                binding,
-                ClassificationPhase::Primary,
-            )
-            .await?
-        } else {
-            install_event_owner(
-                &self.shared,
-                &harness,
-                binding,
-                ClassificationPhase::Primary,
-            )
-            .await?
-        };
+        let owner_installed = install_event_owner_locked(
+            &self.shared,
+            &harness,
+            binding,
+            ClassificationPhase::Primary,
+        )
+        .await?;
         if owner_installed {
             drop(spawn_thread_update_forwarder(
                 self.shared.clone(),
@@ -925,8 +896,8 @@ impl HarnessRegistry {
             project_id = %config.id,
             thread_id = %handle.thread,
             harness_thread_id = %handle.harness_thread_id,
-            provider = initial_model.as_ref().map(|m| m.provider.as_str()).unwrap_or("<harness>"),
-            model = initial_model.as_ref().map(|m| m.model.as_str()).unwrap_or("<harness>"),
+            provider = %initial_model.provider,
+            model = %initial_model.model,
             warning = handle.warning.as_ref().map(|w| w.code.as_str()).unwrap_or(""),
             "harness thread opened"
         );
@@ -4646,9 +4617,8 @@ mod tests {
                 self.opened_before_bound.fetch_add(1, Ordering::SeqCst);
             }
             let shared = self.authority_probe.lock().unwrap().clone();
-            if let (Some(shared), Some(thread_id)) =
-                (shared.and_then(|weak| weak.upgrade()), opts.thread)
-                && let Some(authority) = shared.thread_authority(thread_id).await
+            if let Some(shared) = shared.and_then(|weak| weak.upgrade())
+                && let Some(authority) = shared.thread_authority(opts.thread).await
                 && authority.runtime_entry().is_some()
                 && authority.coordinator().await.is_none()
             {
@@ -4832,10 +4802,14 @@ mod tests {
                     let _ = h
                         .open_thread(giskard_harness::OpenThreadOptions {
                             project: project_id,
-                            thread: None,
+                            thread: ThreadId::new(),
                             workspace_root: "/tmp/test".into(),
                             resume: Some("native-child".into()),
-                            initial_model: None,
+                            initial_model: ModelRef {
+                                provider: "openai".into(),
+                                model: "gpt-test".into(),
+                                reasoning_effort: None,
+                            },
                             updates,
                         })
                         .await;
@@ -4880,7 +4854,17 @@ mod tests {
         let thread_id = ThreadId::new();
 
         let result = registry
-            .open_thread(&config, "/tmp/test", Some(thread_id), None, None)
+            .open_thread(
+                &config,
+                "/tmp/test",
+                thread_id,
+                None,
+                ModelRef {
+                    provider: "openai".into(),
+                    model: "gpt-test".into(),
+                    reasoning_effort: None,
+                },
+            )
             .await;
 
         assert!(result.is_err());

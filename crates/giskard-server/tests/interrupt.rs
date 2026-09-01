@@ -2,6 +2,8 @@
 //! protocol.
 
 mod common;
+#[path = "common/thread_fixture.rs"]
+mod thread_fixture;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -30,6 +32,7 @@ use tokio::sync::{Mutex, broadcast};
 use tokio::time::{Duration, Instant};
 
 use common::fake_native_model;
+use thread_fixture::persist_primary_thread;
 
 type TestWs =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -162,12 +165,9 @@ impl AgentHarness for InterruptHarness {
     }
 
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
-        let thread = opts.thread.unwrap_or_default();
+        let thread = opts.thread;
         Ok(ThreadHandle {
-            resumed_model: opts
-                .initial_model
-                .clone()
-                .or_else(|| Some(fake_native_model())),
+            resumed_model: Some(opts.initial_model.clone()),
             ..ThreadHandle::opened(
                 thread,
                 opts.resume.unwrap_or_else(|| "interrupt_harness".into()),
@@ -391,19 +391,23 @@ async fn spawn_test_app() -> TestApp {
             .to_string()
     };
 
-    let thread_id = {
-        let resp: serde_json::Value = client
-            .post(format!("http://{addr}/api/projects/{pid}/threads"))
-            .header("cookie", &cookie)
-            .json(&serde_json::json!({ "resume": "interrupt_thread" }))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        serde_json::from_value(resp["thread_id"].clone()).unwrap()
-    };
+    let thread_id = persist_primary_thread(
+        &state.store,
+        pid,
+        ThreadId::new(),
+        "interrupt_thread",
+        fake_native_model(),
+    )
+    .await;
+    client
+        .post(format!("http://{addr}/api/projects/{pid}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({ "thread_id": thread_id }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
 
     TestApp {
         _store_dir: tmp,

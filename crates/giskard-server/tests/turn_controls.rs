@@ -1,5 +1,8 @@
 //! Per-turn control integration tests: modes, model selection, permission preset, and plan dump.
 
+#[path = "common/thread_fixture.rs"]
+mod thread_fixture;
+
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -19,6 +22,8 @@ use giskard_proto::{
 };
 use giskard_server::{AppState, HarnessFactory, build_app};
 
+use thread_fixture::persist_primary_thread;
+
 struct TestFactory {
     fixture: ReplayFixture,
 }
@@ -30,18 +35,7 @@ impl HarnessFactory for TestFactory {
         _config: &ProjectConfig,
         _bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
-        // The thread is imported by native id, so the model it starts on is the harness's to
-        // report. This test's config only offers `cloudflare-litellm`, and it goes on to select a
-        // different model on that same provider.
-        Ok(Arc::new(
-            ReplayHarness::from_fixture(self.fixture.clone()).with_imported_model(
-                giskard_core::model::ModelRef {
-                    provider: "cloudflare-litellm".into(),
-                    model: "gpt-5.5".into(),
-                    reasoning_effort: None,
-                },
-            ),
-        ))
+        Ok(Arc::new(ReplayHarness::from_fixture(self.fixture.clone())))
     }
 }
 
@@ -240,11 +234,25 @@ async fn modes_models_approvals_and_plan_dump() {
         .unwrap()
         .to_string();
 
+    let pid: ProjectId = project_id.parse().unwrap();
+    let tid = persist_primary_thread(
+        &state.store,
+        pid,
+        ThreadId::new(),
+        "th_test",
+        ModelRef {
+            provider: "cloudflare-litellm".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: None,
+        },
+    )
+    .await;
+
     // Open thread.
     let resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"resume": "th_test"}))
+        .json(&serde_json::json!({"thread_id": tid}))
         .send()
         .await
         .unwrap();
@@ -253,8 +261,8 @@ async fn modes_models_approvals_and_plan_dump() {
         .unwrap()
         .to_string();
 
-    let pid: ProjectId = project_id.parse().unwrap();
-    let tid: ThreadId = thread_id.parse().unwrap();
+    let returned_tid: ThreadId = thread_id.parse().unwrap();
+    assert_eq!(returned_tid, tid);
 
     // Connect WS.
     use tokio_tungstenite::tungstenite::http::Request;

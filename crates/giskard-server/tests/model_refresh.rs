@@ -6,6 +6,9 @@
 //! harness's own provider table (§8.2), so every test here goes through
 //! `GET /api/projects/{id}/models` rather than the no-project baseline.
 
+#[path = "common/thread_fixture.rs"]
+mod thread_fixture;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,14 +24,14 @@ use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 use giskard_persist::store::ProjectConfig;
 use giskard_server::{AppState, HarnessFactory, build_app};
 
+use thread_fixture::persist_primary_thread;
+
 struct DiffFactory {
     fixture: ReplayFixture,
     /// Stands in for Codex's `[model_providers]` table: the endpoint and key location Giskard
     /// resolves discovery against. Empty ⇒ the harness does not advertise provider listing at all,
     /// which is a different thing from advertising an empty table.
     providers: Vec<HarnessProvider>,
-    /// The model the harness reports for a thread imported by native id, when a test asserts on it.
-    imported_model: Option<giskard_core::model::ModelRef>,
     /// The version the harness reports, sent to a provider's `/models` as `client_version`.
     client_version: Option<String>,
     /// What the harness's own catalog (`model/list`) reports.
@@ -47,10 +50,6 @@ impl HarnessFactory for DiffFactory {
             harness
         } else {
             harness.with_providers(self.providers.clone())
-        };
-        let harness = match &self.imported_model {
-            Some(model) => harness.with_imported_model(model.clone()),
-            None => harness,
         };
         let harness = match &self.client_version {
             Some(version) => harness.with_client_version(version.clone()),
@@ -215,13 +214,6 @@ model_listing = true
         store.clone(),
         Arc::new(DiffFactory {
             fixture: make_fixture(),
-            // The thread below is imported by native id, and this test asserts it carries the
-            // *discovered* model's context window — so that is the model the harness reports.
-            imported_model: Some(giskard_core::model::ModelRef {
-                provider: "mock".into(),
-                model: "dyn-model-1".into(),
-                reasoning_effort: None,
-            }),
             providers: vec![HarnessProvider {
                 id: "mock".into(),
                 name: Some("Mock".into()),
@@ -303,20 +295,33 @@ model_listing = true
         .parse()
         .unwrap();
 
+    let thread_id = persist_primary_thread(
+        &store,
+        project_id,
+        ThreadId::new(),
+        "native-dynamic-model",
+        giskard_core::model::ModelRef {
+            provider: "mock".into(),
+            model: "dyn-model-1".into(),
+            reasoning_effort: None,
+        },
+    )
+    .await;
     let resume_response = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"resume": "native-dynamic-model"}))
+        .json(&serde_json::json!({"thread_id": thread_id}))
         .send()
         .await
         .unwrap();
     assert_eq!(resume_response.status(), reqwest::StatusCode::OK);
-    let thread_id: ThreadId =
+    let reopened: ThreadId =
         resume_response.json::<serde_json::Value>().await.unwrap()["thread_id"]
             .as_str()
             .unwrap()
             .parse()
             .unwrap();
+    assert_eq!(reopened, thread_id);
     let imported = store
         .load_thread(project_id, thread_id)
         .await
@@ -394,7 +399,6 @@ model_listing = true
         store,
         Arc::new(DiffFactory {
             fixture: make_fixture(),
-            imported_model: None,
             client_version: None,
             harness_models: Vec::new(),
             providers: vec![HarnessProvider {
@@ -481,7 +485,6 @@ model_listing = true
         store,
         Arc::new(DiffFactory {
             fixture: make_fixture(),
-            imported_model: None,
             client_version: None,
             harness_models: Vec::new(),
             providers: vec![HarnessProvider {
@@ -561,7 +564,6 @@ session_days = 30
         store,
         Arc::new(DiffFactory {
             fixture: make_fixture(),
-            imported_model: None,
             client_version: None,
             harness_models: Vec::new(),
             // The harness knows "openai" — nothing named "typoed".
@@ -650,7 +652,6 @@ session_days = 30
         // No `with_providers` ⇒ the replay harness leaves `provider_listing` off.
         Arc::new(DiffFactory {
             fixture: make_fixture(),
-            imported_model: None,
             client_version: None,
             harness_models: Vec::new(),
             providers: Vec::new(),
@@ -720,7 +721,6 @@ model_listing = true
         // No provider table: the replay harness leaves `provider_listing` off.
         Arc::new(DiffFactory {
             fixture: make_fixture(),
-            imported_model: None,
             client_version: None,
             harness_models: Vec::new(),
             providers: Vec::new(),
@@ -908,7 +908,6 @@ model_listing = true
         store,
         Arc::new(DiffFactory {
             fixture: make_fixture(),
-            imported_model: None,
             client_version: None,
             harness_models: Vec::new(),
             providers: vec![HarnessProvider {
@@ -1067,7 +1066,6 @@ session_days = 30
         store,
         Arc::new(DiffFactory {
             fixture: make_fixture(),
-            imported_model: None,
             providers: vec![HarnessProvider {
                 id: "opencodex".into(),
                 name: Some("OpenCodex".into()),
@@ -1292,7 +1290,6 @@ async fn a_stock_harness_catalog_fills_the_picker_on_its_own() {
         store,
         Arc::new(DiffFactory {
             fixture: make_fixture(),
-            imported_model: None,
             client_version: None,
             harness_models: vec![giskard_core::model::ModelDescriptor {
                 provider: "openai".into(),
@@ -1366,7 +1363,6 @@ async fn an_empty_picker_explains_itself() {
         store,
         Arc::new(DiffFactory {
             fixture: make_fixture(),
-            imported_model: None,
             client_version: None,
             harness_models: Vec::new(),
             providers: vec![HarnessProvider {

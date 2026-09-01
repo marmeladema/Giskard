@@ -17,7 +17,7 @@ use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{Item, ItemPayload};
 use giskard_core::mcp::McpServerStatus;
-use giskard_core::model::{ModelDescriptor, ModelRef};
+use giskard_core::model::ModelDescriptor;
 use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::TurnOverrides;
@@ -77,7 +77,6 @@ struct ThreadState {
 }
 
 struct PreloadedFixture {
-    thread_id: ThreadId,
     events: Vec<AgentEvent>,
 }
 
@@ -122,11 +121,6 @@ pub struct ReplayHarness {
     /// Version reported by `client_version`, standing in for a real harness's own. `None` by
     /// default: a harness that cannot say must not have one invented for it.
     client_version: Option<String>,
-    /// The model reported for a thread imported by native id, where the caller names none and a
-    /// real harness answers from the thread's own record. Defaults to `openai/gpt-5.5`; a test
-    /// whose config does not offer that model sets its own with
-    /// [`ReplayHarness::with_imported_model`].
-    imported_model: ModelRef,
     shutdown_called: AtomicBool,
 }
 
@@ -160,11 +154,6 @@ impl ReplayHarness {
             providers: Vec::new(),
             providers_error: None,
             client_version: None,
-            imported_model: ModelRef {
-                provider: "openai".into(),
-                model: "gpt-5.5".into(),
-                reasoning_effort: None,
-            },
             shutdown_called: AtomicBool::new(false),
         }
     }
@@ -209,35 +198,24 @@ impl ReplayHarness {
         self
     }
 
-    /// Set the model this harness reports for a thread imported by native id — the stand-in for
-    /// the model that thread was already on. Tests whose configured providers do not include the
-    /// default `openai/gpt-5.5` need this, or the imported thread lands on a provider their config
-    /// never declared.
-    pub fn with_imported_model(mut self, model: ModelRef) -> Self {
-        self.imported_model = model;
-        self
-    }
-
     /// Load a fixture and create a harness pre-loaded with those events
     /// for a single thread.
     pub fn from_fixture(fixture: ReplayFixture) -> Self {
-        let (thread_id, harness_thread_id) = fixture
+        let harness_thread_id = fixture
             .events
             .iter()
             .find_map(|e| match e {
                 AgentEvent::ThreadOpened {
-                    thread,
-                    harness_thread_id,
-                } => Some((*thread, harness_thread_id.clone())),
+                    harness_thread_id, ..
+                } => Some(harness_thread_id.clone()),
                 _ => None,
             })
-            .unwrap_or_else(|| (ThreadId::new(), format!("replay_{}", ThreadId::new())));
+            .unwrap_or_else(|| format!("replay_{}", ThreadId::new()));
 
         let mut fixtures = HashMap::new();
         fixtures.insert(
             ReplayNativeThreadId::new(harness_thread_id),
             PreloadedFixture {
-                thread_id,
                 events: fixture.events,
             },
         );
@@ -292,12 +270,12 @@ impl AgentHarness for ReplayHarness {
         let (thread_id, mut pending) = if let Some(resume) = &opts.resume {
             let mut fixtures = self.fixtures.lock().await;
             if let Some(fixture) = fixtures.remove(resume.as_str()) {
-                (opts.thread.unwrap_or(fixture.thread_id), fixture.events)
+                (opts.thread, fixture.events)
             } else {
-                (opts.thread.unwrap_or_default(), Vec::new())
+                (opts.thread, Vec::new())
             }
         } else {
-            (opts.thread.unwrap_or_default(), Vec::new())
+            (opts.thread, Vec::new())
         };
         for event in &mut pending {
             remap_event_thread(event, thread_id);
@@ -316,13 +294,7 @@ impl AgentHarness for ReplayHarness {
         Ok(ThreadHandle {
             // A deterministic replay applies exactly the requested model, so echo it as
             // effective — this is what lets server tests exercise verified provider switches.
-            // An import names no model, and a harness answers that from the thread itself, so
-            // the fake stands in with its configured one rather than reporting nothing.
-            resumed_model: Some(
-                opts.initial_model
-                    .clone()
-                    .unwrap_or_else(|| self.imported_model.clone()),
-            ),
+            resumed_model: Some(opts.initial_model.clone()),
             ..ThreadHandle::opened(thread_id, harness_thread_id, opts.workspace_root.clone())
         })
     }
@@ -562,15 +534,15 @@ mod tests {
         let handle = harness
             .open_thread(giskard_harness::OpenThreadOptions {
                 project: giskard_core::ProjectId::new(),
-                thread: None,
+                thread: _thread_id,
                 workspace_root: "/tmp".into(),
                 resume: Some("th_test".into()),
                 updates: giskard_harness::thread_update_channel().0,
-                initial_model: Some(ModelRef {
+                initial_model: ModelRef {
                     provider: "openai".into(),
                     model: "gpt-5.5".into(),
                     reasoning_effort: None,
-                }),
+                },
             })
             .await
             .unwrap();
@@ -625,15 +597,15 @@ mod tests {
         let handle = harness
             .open_thread(giskard_harness::OpenThreadOptions {
                 project: giskard_core::ProjectId::new(),
-                thread: Some(requested_thread),
+                thread: requested_thread,
                 workspace_root: "/tmp".into(),
                 resume: Some("th_test".into()),
                 updates: giskard_harness::thread_update_channel().0,
-                initial_model: Some(ModelRef {
+                initial_model: ModelRef {
                     provider: "openai".into(),
                     model: "gpt-5.5".into(),
                     reasoning_effort: None,
-                }),
+                },
             })
             .await
             .unwrap();

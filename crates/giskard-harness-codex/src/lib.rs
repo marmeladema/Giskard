@@ -969,7 +969,7 @@ impl CodexHarness {
         command: HarnessCommand,
     ) -> Result<(), HarnessError> {
         let (project_id, thread_id) = match &command {
-            HarnessCommand::OpenThread { opts, .. } => (Some(opts.project), opts.thread),
+            HarnessCommand::OpenThread { opts, .. } => (Some(opts.project), Some(opts.thread)),
             HarnessCommand::StartTurn { thread, .. } => (None, Some(thread.thread)),
         };
         let token =
@@ -2362,18 +2362,7 @@ async fn handle_open_thread(
     senders: &SenderMap,
 ) -> Result<OpenThreadOutcome, HarnessError> {
     let cwd = opts.workspace_root.to_string_lossy().to_string();
-    // An explicit id wins — the caller knows this thread's durable identity. Otherwise, if the
-    // native thread being resumed is already bound, reuse that binding rather than inventing an
-    // id: a caller passing `None` is saying it has no opinion, not that this is a new thread, and
-    // minting here would give one thread two identities for everything downstream to reconcile.
-    let thread_id = opts
-        .thread
-        .or_else(|| {
-            opts.resume
-                .as_deref()
-                .and_then(|native| mapper.thread_for_native(native))
-        })
-        .unwrap_or_default();
+    let thread_id = opts.thread;
 
     // Track whether resume-by-id failed and we fell back to a fresh native thread (C5), so we can
     // warn the caller that agent context was lost while keeping the Giskard-side history.
@@ -2383,19 +2372,8 @@ async fn handle_open_thread(
         let context = CodexOperationContext::for_project("thread_resume", opts.project)
             .with_thread_id(thread_id)
             .with_harness_thread_id(resume_id);
-        match resume_thread(
-            client,
-            context,
-            resume_id,
-            &cwd,
-            opts.initial_model.as_ref(),
-        )
-        .await
-        {
+        match resume_thread(client, context, resume_id, &cwd, &opts.initial_model).await {
             Ok(opened) => opened,
-            // Recovery needs a model to start on, and importing a thread by native id supplies
-            // none — the model was the resumed thread's to report. Nothing sensible to start.
-            Err(error) if opts.initial_model.is_none() => return Err(error),
             Err(e) => {
                 // C5: Codex thread store purged/rotated. Start fresh instead of hard-failing.
                 resume_warning = Some(HarnessNotice {
@@ -2410,13 +2388,13 @@ async fn handle_open_thread(
                     opts.project,
                 )
                 .with_thread_id(thread_id);
-                start_thread(client, context, &cwd, &fresh_model(opts)?).await?
+                start_thread(client, context, &cwd, &opts.initial_model).await?
             }
         }
     } else {
         let context = CodexOperationContext::for_project("thread_start", opts.project)
             .with_thread_id(thread_id);
-        start_thread(client, context, &cwd, &fresh_model(opts)?).await?
+        start_thread(client, context, &cwd, &opts.initial_model).await?
     };
 
     // B4: bind the (possibly re-established) native id to the durable ThreadId.
@@ -2568,17 +2546,13 @@ async fn resume_thread(
     context: CodexOperationContext<'_>,
     resume_id: &str,
     cwd: &str,
-    model: Option<&giskard_core::model::ModelRef>,
+    model: &giskard_core::model::ModelRef,
 ) -> Result<OpenedNativeThread, HarnessError> {
-    // `model`/`modelProvider` are overrides, not preferences: Codex stops applying the thread's
-    // own persisted model the moment either is present (`merge_persisted_resume_metadata` returns
-    // early on `has_model_resume_override`). Omitting them is how a caller says "keep whatever this
-    // thread was already using".
     let params = codex_codes::ThreadResumeParams {
         thread_id: resume_id.to_owned(),
         cwd: Some(cwd.to_owned()),
-        model: model.map(|model| model.model.clone()),
-        model_provider: model.map(|model| model.provider.clone()),
+        model: Some(model.model.clone()),
+        model_provider: Some(model.provider.clone()),
         ..Default::default()
     };
     let resp: codex_codes::ThreadResumeResponse = codex_request(
@@ -2594,7 +2568,7 @@ async fn resume_thread(
         resp.reasoning_effort
             .as_ref()
             .map(|effort| giskard_core::model::Effort::new(effort.0.clone())),
-        model,
+        Some(model),
         context,
         &resp.thread.id,
     );
@@ -2614,14 +2588,6 @@ async fn resume_thread(
             .and_then(trimmed_non_empty)
             .map(ToOwned::to_owned),
     })
-}
-
-/// The model a *fresh* native thread starts on. Unlike a resume, there is no existing thread whose
-/// model Codex could report, so the caller has to have named one.
-fn fresh_model(opts: &OpenThreadOptions) -> Result<giskard_core::model::ModelRef, HarnessError> {
-    opts.initial_model
-        .clone()
-        .ok_or_else(|| HarnessError::Protocol("starting a new thread requires a model".into()))
 }
 
 async fn start_thread(
@@ -4374,14 +4340,14 @@ mod tests {
         })
     }
 
-    fn open_opts(thread: Option<ThreadId>, resume: Option<&str>) -> OpenThreadOptions {
+    fn open_opts(thread: ThreadId, resume: Option<&str>) -> OpenThreadOptions {
         let (updates, _) = giskard_harness::thread_update_channel();
         OpenThreadOptions {
             project: ProjectId::new(),
             thread,
             workspace_root: PathBuf::from("/tmp"),
             resume: resume.map(str::to_owned),
-            initial_model: Some(test_model(None)),
+            initial_model: test_model(None),
             updates,
         }
     }
@@ -4407,61 +4373,6 @@ mod tests {
         )
         .expect("fake harness should spawn");
         (harness, controller)
-    }
-
-    /// A sub-agent Giskard persisted in an earlier run already has a `ThreadId` — the one its
-    /// history is filed under. Handing that binding over before anything opens means the adapter
-    /// reuses it rather than inventing a second identity for the same thread.
-    #[tokio::test]
-    async fn a_known_binding_is_reused_instead_of_inventing_a_second_identity() {
-        let persisted = ThreadId::new();
-        let (harness, _controller) = spawn_fake_harness_with_bootstrap(HarnessBootstrap {
-            known_threads: vec![giskard_harness::KnownThreadBinding {
-                harness_thread_id: "native-child".to_owned(),
-                thread_id: persisted,
-            }],
-        });
-
-        // The caller has no id to offer — it is resuming by native id alone.
-        let opened = harness
-            .open_thread(open_opts(None, Some("native-child")))
-            .await
-            .expect("child resumes");
-
-        assert_eq!(
-            opened.thread, persisted,
-            "a thread Giskard already named must not be given a second id"
-        );
-    }
-
-    /// The converse, and the property that makes reuse safe rather than merely convenient: a
-    /// native thread nobody has bound gets a fresh id, and *that* id is then the binding — so
-    /// reopening the same native thread keeps it, while a different one gets its own.
-    #[tokio::test]
-    async fn an_unbound_native_thread_gets_one_id_and_then_keeps_it() {
-        let (harness, _controller) = spawn_fake_harness();
-
-        let first = harness
-            .open_thread(open_opts(None, Some("native-unbound")))
-            .await
-            .expect("thread opens");
-        let reopened = harness
-            .open_thread(open_opts(None, Some("native-unbound")))
-            .await
-            .expect("thread reopens");
-        assert_eq!(
-            reopened.thread, first.thread,
-            "the id chosen on the first open is the thread's identity from then on"
-        );
-
-        let other = harness
-            .open_thread(open_opts(None, Some("native-other")))
-            .await
-            .expect("other thread opens");
-        assert_ne!(
-            other.thread, first.thread,
-            "a different native thread must not inherit another's id"
-        );
     }
 
     #[tokio::test]
@@ -4882,7 +4793,10 @@ mod tests {
     #[tokio::test]
     async fn codex_worker_opens_new_thread_while_turn_is_active() {
         let (harness, controller) = spawn_fake_harness();
-        let first = harness.open_thread(open_opts(None, None)).await.unwrap();
+        let first = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
         harness
             .start_turn(
                 &first,
@@ -4894,7 +4808,7 @@ mod tests {
 
         let second = timeout(
             Duration::from_secs(1),
-            harness.open_thread(open_opts(None, None)),
+            harness.open_thread(open_opts(ThreadId::new(), None)),
         )
         .await
         .expect("opening another thread must not wait for the active turn")
@@ -4915,7 +4829,10 @@ mod tests {
     #[tokio::test]
     async fn codex_worker_ignores_non_json_stdout_during_an_active_turn() {
         let (harness, controller) = spawn_fake_harness();
-        let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
         harness
             .start_turn(
                 &thread,
@@ -4963,7 +4880,7 @@ mod tests {
 
         let second = timeout(
             Duration::from_secs(1),
-            harness.open_thread(open_opts(None, None)),
+            harness.open_thread(open_opts(ThreadId::new(), None)),
         )
         .await
         .expect("the worker must continue accepting thread operations")
@@ -4974,7 +4891,10 @@ mod tests {
     #[tokio::test]
     async fn fatal_stream_error_closes_worker_with_only_pending_compaction() {
         let (harness, controller) = spawn_fake_harness();
-        let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
         controller
             .send_stream_error(CodexStreamError::Fatal(HarnessError::Transport(
                 "connection lost".into(),
@@ -4999,7 +4919,10 @@ mod tests {
     #[tokio::test]
     async fn codex_worker_resumes_thread_while_turn_is_active() {
         let (harness, controller) = spawn_fake_harness();
-        let first = harness.open_thread(open_opts(None, None)).await.unwrap();
+        let first = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
         harness
             .start_turn(
                 &first,
@@ -5012,7 +4935,7 @@ mod tests {
 
         let resumed = timeout(
             Duration::from_secs(1),
-            harness.open_thread(open_opts(Some(resumed_thread), Some("native-existing"))),
+            harness.open_thread(open_opts(resumed_thread, Some("native-existing"))),
         )
         .await
         .expect("resuming another thread must not wait for the active turn")
@@ -5027,7 +4950,17 @@ mod tests {
         assert!(controller.requests().await.iter().any(|req| {
             req.method == codex_codes::protocol::methods::THREAD_RESUME
                 && req.params["threadId"] == "native-existing"
+                && req.params["model"] == "gpt-5.5"
+                && req.params["modelProvider"] == "openai"
         }));
+        assert_eq!(
+            resumed.resumed_model,
+            Some(ModelRef {
+                provider: "openai".into(),
+                model: "gpt-5.5".into(),
+                reasoning_effort: Some(Effort::new("high")),
+            })
+        );
     }
 
     #[tokio::test]
@@ -5036,7 +4969,7 @@ mod tests {
         controller.fail_thread_resume_missing_rollout(1).await;
 
         let opened = harness
-            .open_thread(open_opts(None, Some("native-missing")))
+            .open_thread(open_opts(ThreadId::new(), Some("native-missing")))
             .await
             .unwrap();
 
@@ -5065,8 +4998,14 @@ mod tests {
     #[tokio::test]
     async fn codex_worker_starts_other_thread_turn_while_first_turn_is_active() {
         let (harness, controller) = spawn_fake_harness();
-        let first = harness.open_thread(open_opts(None, None)).await.unwrap();
-        let second = harness.open_thread(open_opts(None, None)).await.unwrap();
+        let first = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        let second = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
         harness
             .start_turn(
                 &first,
@@ -5099,7 +5038,10 @@ mod tests {
     #[tokio::test]
     async fn codex_worker_pending_server_request_does_not_block_other_thread_start() {
         let (harness, controller) = spawn_fake_harness();
-        let first = harness.open_thread(open_opts(None, None)).await.unwrap();
+        let first = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
         let first_turn = harness
             .start_turn(&first, UserInput::text("ask later"), build_turn_overrides())
             .await
@@ -5129,7 +5071,10 @@ mod tests {
         .await;
         assert!(matches!(event, AgentEvent::ServerRequestReceived { .. }));
 
-        let second = harness.open_thread(open_opts(None, None)).await.unwrap();
+        let second = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
         timeout(
             Duration::from_secs(1),
             harness.start_turn(
@@ -5146,8 +5091,14 @@ mod tests {
     #[tokio::test]
     async fn codex_worker_routes_server_request_response_while_other_thread_is_active() {
         let (harness, controller) = spawn_fake_harness();
-        let first = harness.open_thread(open_opts(None, None)).await.unwrap();
-        let second = harness.open_thread(open_opts(None, None)).await.unwrap();
+        let first = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        let second = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
         harness
             .start_turn(
                 &first,
@@ -5213,7 +5164,10 @@ mod tests {
     #[tokio::test]
     async fn codex_worker_terminates_numeric_process_with_background_terminal_api() {
         let (harness, controller) = spawn_fake_harness();
-        let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
 
         timeout(
             Duration::from_secs(1),
@@ -5238,7 +5192,10 @@ mod tests {
     #[tokio::test]
     async fn codex_worker_terminates_non_numeric_process_with_command_exec_api() {
         let (harness, controller) = spawn_fake_harness();
-        let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
 
         timeout(
             Duration::from_secs(1),
@@ -5260,51 +5217,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn importing_a_thread_takes_its_model_and_effort_from_codex() {
-        let (harness, controller) = spawn_fake_harness();
-
-        // No model named: this is importing a native thread whose model is Codex's to report.
-        let handle = timeout(
-            Duration::from_secs(1),
-            harness.open_thread(OpenThreadOptions {
-                project: ProjectId::new(),
-                thread: Some(ThreadId::new()),
-                workspace_root: PathBuf::from("/tmp"),
-                resume: Some("native-existing".into()),
-                initial_model: None,
-                updates: giskard_harness::thread_update_channel().0,
-            }),
-        )
-        .await
-        .expect("open_thread should complete")
-        .expect("open_thread should succeed");
-
-        assert_eq!(
-            handle.resumed_model,
-            Some(giskard_core::model::ModelRef {
-                provider: "resumed-provider".into(),
-                model: "resumed-model".into(),
-                // The picker has to land on the effort the thread is actually running, not
-                // "Default": Codex reports it on resume, so dropping it would understate the
-                // thread's own settings.
-                reasoning_effort: Some(giskard_core::model::Effort::new("high")),
-            })
-        );
-
-        let resume = controller
-            .requests()
-            .await
-            .into_iter()
-            .find(|req| req.method == codex_codes::protocol::methods::THREAD_RESUME)
-            .expect("a thread/resume request");
-        assert!(
-            resume.params.get("model").is_none() && resume.params.get("modelProvider").is_none(),
-            "an import must send no model override, which would suppress the thread's own: {:?}",
-            resume.params
-        );
-    }
-
-    #[tokio::test]
     async fn resumed_usage_is_forwarded_as_a_turnless_thread_update() {
         let (harness, controller) = spawn_fake_harness();
         let (updates, mut update_stream) = giskard_harness::thread_update_channel();
@@ -5312,10 +5224,10 @@ mod tests {
         harness
             .open_thread(OpenThreadOptions {
                 project: ProjectId::new(),
-                thread: Some(thread),
+                thread,
                 workspace_root: PathBuf::from("/tmp"),
                 resume: Some("native-existing".into()),
-                initial_model: Some(test_model(None)),
+                initial_model: test_model(None),
                 updates,
             })
             .await
@@ -5568,7 +5480,10 @@ mod tests {
     #[tokio::test]
     async fn codex_delete_is_idempotent_when_matching_rollout_is_missing() {
         let (harness, controller) = spawn_fake_harness();
-        let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
         controller
             .fail_thread_delete(&format!(
                 "JSON-RPC error (-32600): no rollout found for thread id {}",
@@ -5590,7 +5505,10 @@ mod tests {
     #[tokio::test]
     async fn codex_delete_preserves_nonmatching_transport_failure() {
         let (harness, controller) = spawn_fake_harness();
-        let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
         controller
             .fail_thread_delete(
                 "JSON-RPC error (-32600): no rollout found for thread id different-thread",
@@ -5614,7 +5532,10 @@ mod tests {
         controller
             .fail_command_exec_terminate("no active command/exec for process id 123")
             .await;
-        let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
         harness
             .start_turn(
                 &thread,
@@ -5655,8 +5576,14 @@ mod tests {
     #[tokio::test]
     async fn codex_worker_routes_approval_response_while_other_thread_is_active() {
         let (harness, controller) = spawn_fake_harness();
-        let first = harness.open_thread(open_opts(None, None)).await.unwrap();
-        let second = harness.open_thread(open_opts(None, None)).await.unwrap();
+        let first = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        let second = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
         harness
             .start_turn(
                 &first,
@@ -5711,8 +5638,14 @@ mod tests {
     #[tokio::test]
     async fn codex_worker_interrupt_rejects_only_interrupted_thread_requests() {
         let (harness, controller) = spawn_fake_harness();
-        let first = harness.open_thread(open_opts(None, None)).await.unwrap();
-        let second = harness.open_thread(open_opts(None, None)).await.unwrap();
+        let first = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        let second = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
         harness
             .start_turn(
                 &first,
@@ -5828,7 +5761,10 @@ mod tests {
         controller
             .hang_method(codex_codes::protocol::methods::TURN_INTERRUPT)
             .await;
-        let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
         harness
             .start_turn(&thread, UserInput::text("first"), build_turn_overrides())
             .await
@@ -5854,7 +5790,10 @@ mod tests {
     #[tokio::test]
     async fn codex_worker_recovers_after_hung_turn_start_request() {
         let (harness, controller) = spawn_fake_harness();
-        let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
         controller
             .hang_method(codex_codes::protocol::methods::TURN_START)
             .await;
@@ -5885,7 +5824,10 @@ mod tests {
     #[tokio::test]
     async fn codex_worker_recovers_after_hung_approval_response() {
         let (harness, controller) = spawn_fake_harness();
-        let thread = harness.open_thread(open_opts(None, None)).await.unwrap();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
         harness
             .start_turn(
                 &thread,
@@ -5925,7 +5867,7 @@ mod tests {
 
         timeout(
             Duration::from_secs(1),
-            harness.open_thread(open_opts(None, None)),
+            harness.open_thread(open_opts(ThreadId::new(), None)),
         )
         .await
         .expect("worker must keep processing commands after a hung approval response")
@@ -5945,7 +5887,7 @@ mod tests {
 
         let err = timeout(
             Duration::from_secs(1),
-            harness.open_thread(open_opts(None, None)),
+            harness.open_thread(open_opts(ThreadId::new(), None)),
         )
         .await
         .expect("bounded shutdown should eventually drop the worker receiver")

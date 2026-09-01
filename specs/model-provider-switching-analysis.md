@@ -216,11 +216,11 @@ native Codex thread has confirmed that provider.
 
 Giskard-side tests should cover:
 
-- blank thread creation is rejected unless an explicit native resume/import id is supplied;
+- opening a persisted thread requires its Giskard thread ID;
 - first-message creation starts the native thread with the selected provider/model;
 - first-message `turn/start` rejection cleans up the just-created local/native thread;
 - non-empty cold-resume provider switch succeeds and updates the registry binding;
-- non-empty resume returns old provider/model and Giskard surfaces a structured error;
+- a cold provider-switch resume returning the old provider/model surfaces a structured error;
 - active turn rejects provider switch before calling Codex;
 - running task or pending approval/request rejects provider switch before calling Codex;
 - send path cannot proceed with a persisted provider mismatch unless the native switch is verified.

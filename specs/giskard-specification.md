@@ -415,9 +415,9 @@ runtime overview; the hoisting and notification behavior remains current.
 
 **Changelog (1.54 → 1.55), harness-neutral sub-agent support:**
 - **SA1:** Giskard models harness-neutral sub-agent links and linked child threads. Thread metadata
-  carries `parent_thread_id`, `spawned_by_turn_id`, and `kind = subagent`; native imports reuse an
-  existing `harness_thread_id`; and transcript links can idempotently resolve, import, and open a
-  child. Rendering history alone never imports a thread.
+  carries `parent_thread_id`, `spawned_by_turn_id`, and `kind = subagent`; native materialization
+  reuses an existing `harness_thread_id`; and transcript links can idempotently resolve,
+  materialize, and open a child. Rendering history alone never materializes a thread.
 
   The Codex adapter maps both legacy `multi_agent_v1` (`collabAgentToolCall/spawnAgent`) and current
   collaboration v2 (`subAgentActivity` with `kind = started`) into that model. A real legacy spawn
@@ -474,7 +474,8 @@ runtime overview; the hoisting and notification behavior remains current.
   harness and local persistence in leaf-first order. The server preflights the entire subtree, and
   an active turn or running task anywhere returns `409 Conflict` before deletion begins. The browser
   confirms descendant count, native scope, and irreversibility, then clears any deleted active view.
-  HTTP imports, asynchronously observed imports, and deletion share one project lifecycle lock;
+  Explicit link-open materialization, asynchronously observed materialization, and deletion share
+  one project lifecycle lock;
   HTTP contention is bounded to five seconds and returns `503 Service Unavailable`. Linked
   lifecycle evidence is processed through a per-parent FIFO so terminal evidence cannot overtake
   earlier active evidence. Materialization runs outside the parent event-forwarding path and
@@ -626,8 +627,7 @@ authoritative replacement runtime overview.
   WebSocket, so a harness-attach failure there returned a 500 and the UI aborted before RO1's
   subscribe-side degrade could ever run. The endpoint now answers 200 with the persisted
   `harness_thread_id` and a `thread_read_only` warning, letting the client proceed to the
-  (already degrading) subscribe. New-thread creation and explicit resume imports still fail hard
-  (§13.6).
+  (already degrading) subscribe. New-thread creation still fails hard (§13.6).
 - **PS1:** Selecting a model from a different provider is now allowed on a **cold** thread (one
   not loaded in any harness process this server run — e.g. after a restart, or a read-only thread
   whose provider was removed from config). The switch performs a native `thread/resume` with the
@@ -729,8 +729,8 @@ authoritative replacement runtime overview.
   model/provider, reasoning effort, mode, and permission preset. The server creates the native Codex
   thread with `thread/start`, persists the Giskard thread, and starts the first turn as one
   server-owned operation.
-- **LT3:** Blank `POST /api/projects/{id}/threads` creation is rejected. That endpoint opens
-  existing persisted threads and supports explicit native-id resume/import flows only.
+- **LT3:** `POST /api/projects/{id}/threads` requires a Giskard `thread_id` and opens that existing
+  persisted thread. Native identifiers are not accepted from the live HTTP client.
 - **LT4:** If native thread creation fails, no local thread is persisted. If persistence or
   synchronous `turn/start` fails after native creation, Giskard best-effort deletes the native
   thread, removes any local partial thread, logs cleanup failures, and surfaces the original
@@ -2994,16 +2994,12 @@ are wrong.
   route. Discovery and the harness catalog both need a provider's endpoint, which only a harness
   knows (§8.2), and no harness exists before a project does — so a project-less list could only
   repeat `config.toml` back, which is not a model list worth serving.
-- **Importing a native thread takes that thread's model, not a chosen one.** Importing a harness
-  thread Giskard has no record of must not name a model: on Codex, `model`/`modelProvider` on
-  `thread/resume` are overrides that suppress the thread's own persisted model
-  (`merge_persisted_resume_metadata` returns early once either is present), so naming one silently
-  moves an existing conversation onto a different model. The imported thread takes the model **and
-  reasoning effort** the harness reports — `thread/resume` answers with both, and the picker has to
-  land on what the thread is actually running rather than showing "Default" for a thread mid-flight
-  at another effort. If the harness reports no model, the thread cannot be imported. Reopening a
-  thread Giskard already tracks is the opposite case and does name its persisted model — that
-  override is also how a thread's provider is switched (§8.2).
+- **Reopening a persisted thread names its stored model.** On Codex, `model`/`modelProvider` on
+  `thread/resume` are overrides that suppress the native thread's own persisted model
+  (`merge_persisted_resume_metadata` returns early once either is present). Giskard uses that
+  behavior only for a thread it already tracks: reopening names its persisted model, and the same
+  verified override switches a cold thread's provider (§8.2). The harness-reported model and
+  reasoning effort remain authoritative when they are present.
 - **A new thread's starting model is derived, never stored.** A project record carries no default
   model. The model a draft starts on is taken from the project's catalog at the moment the draft
   opens — the model the harness marks as its default (Codex's `model/list` `isDefault`), else the
@@ -3517,17 +3513,17 @@ write lock. A mutation which changes no durable domain value performs no write a
 revision. Because the paired browser compares JSON numbers, allocation stops at JavaScript's
 maximum safe integer; revision exhaustion is an error, never a wrap or saturation. Recency is an
 explicit mutation intent: successful user-visible setting changes touch `updated_at`; successful
-turn completion records activity; normalization, imports, native-id repair, model cache updates,
-and context-window restoration preserve it. Crash aggregate repair may advance recency only to the
+turn completion records activity; normalization, sub-agent materialization, native-id repair, model
+cache updates, and context-window restoration preserve it. Crash aggregate repair may advance recency only to the
 latest persisted turn timestamp; it never uses the repair time.
 
 - **One WebSocket per browser client**, multiplexing all projects/threads (chosen for lowest
   CPU/memory: one connection, one server-side fan-out task, no per-thread sockets).
 - Messages are tagged with `project_id` / `thread_id`. Defined once in `giskard-proto`.
-- **Thread open/create is REST-backed:** `POST /api/projects/{project_id}/threads` accepts
-  `{ thread_id?: ThreadId, resume?: String }` and opens/reattaches persisted threads or explicit
-  native resume/import flows. Unknown fields are rejected, so this endpoint cannot fabricate
-  linked ownership or lifecycle evidence. Blank creation is rejected. New first-message creation uses
+- **Thread open/create is REST-backed:** `POST /api/projects/{project_id}/threads` requires
+  `{ thread_id: ThreadId }` and opens or reattaches that persisted thread. Unknown fields are
+  rejected, so the endpoint accepts neither native routing identifiers nor client-asserted linked
+  ownership or lifecycle evidence. New first-message creation uses
   `POST /api/projects/{project_id}/threads/start` with
   `{ text, attachments?, model_ref, mode, permission_preset }` and returns
   `{ thread_id, harness_thread_id, turn_id, warning? }`.

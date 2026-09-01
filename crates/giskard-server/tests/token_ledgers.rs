@@ -16,6 +16,9 @@ use giskard_persist::store::ProjectConfig;
 use giskard_proto::ClientMessage;
 use giskard_server::{AppState, HarnessFactory, build_app};
 
+use common::fake_native_model;
+use thread_fixture::persist_primary_thread;
+
 struct DiffFactory {
     fixture: ReplayFixture,
 }
@@ -148,19 +151,23 @@ async fn token_ledgers_and_dashboard() {
         .await
         .unwrap();
 
-    let thread_id: ThreadId = {
-        let resp: serde_json::Value = client
-            .post(format!("{base}/api/projects/{pid}/threads"))
-            .header("cookie", &cookie)
-            .json(&serde_json::json!({"resume": "th_tok"}))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        serde_json::from_value(resp["thread_id"].clone()).unwrap()
-    };
+    let thread_id = persist_primary_thread(
+        &state.store,
+        pid,
+        ThreadId::new(),
+        "th_tok",
+        fake_native_model(),
+    )
+    .await;
+    client
+        .post(format!("{base}/api/projects/{pid}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"thread_id": thread_id}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
 
     // Drive one turn over WS.
     let ws_req = tokio_tungstenite::tungstenite::http::Request::builder()
@@ -232,3 +239,6 @@ async fn token_ledgers_and_dashboard() {
     assert_eq!(project["total"]["input"].as_u64(), Some(100));
     assert_eq!(project["total"]["output"].as_u64(), Some(50));
 }
+mod common;
+#[path = "common/thread_fixture.rs"]
+mod thread_fixture;

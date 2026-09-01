@@ -289,20 +289,13 @@ async fn run_auth_command(auth: &ProviderAuthCommand) -> Result<String, Provider
 #[derive(Debug, Clone)]
 pub struct OpenThreadOptions {
     pub project: ProjectId,
-    pub thread: Option<ThreadId>,
+    pub thread: ThreadId,
     pub workspace_root: PathBuf,
     /// Some(native id) ⇒ resume; None ⇒ fresh thread.
     pub resume: Option<String>,
-    /// The model to open on, or `None` to take whatever the harness already has for a resumed
-    /// thread.
-    ///
-    /// `None` is only meaningful together with `resume`: importing a native thread Giskard has no
-    /// record of, where the harness is the only one who knows which model that thread was using.
-    /// Requesting one there does not express a preference, it *overrides* — Codex stops applying
-    /// the thread's persisted model as soon as `model`/`modelProvider` is supplied — so a guess
-    /// would silently move an existing conversation onto a different model. Starting a fresh
-    /// thread, and reopening one Giskard already tracks, both pass `Some`.
-    pub initial_model: Option<ModelRef>,
+    /// The model to open on. For a resume this is an explicit override; the harness reports the
+    /// effective model in the returned handle so callers can detect a provider that ignored it.
+    pub initial_model: ModelRef,
     /// Bounded, non-blocking destination for metadata discovered after open returns.
     pub updates: ThreadUpdateSink,
 }

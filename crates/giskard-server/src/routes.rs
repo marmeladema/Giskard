@@ -24,9 +24,8 @@ use futures::{SinkExt, StreamExt};
 use giskard_core::error::{HarnessError, PersistError};
 use giskard_core::ids::{ProjectId, ThreadId};
 use giskard_core::model::{ModelDescriptor, ModelRef};
-use giskard_core::text::trimmed_non_empty;
 use giskard_core::thread::ThreadKind;
-use giskard_core::turn::{Mode, PermissionPreset, TurnMode, TurnModel, TurnOverrides};
+use giskard_core::turn::{TurnMode, TurnModel, TurnOverrides};
 use giskard_core::user_input::UserInput;
 use giskard_git_parser::{
     GitNumstatEntry, apply_numstat_counts, index_numstat, parse_git_numstat, parse_git_status,
@@ -47,7 +46,7 @@ use crate::auth::{
 };
 use crate::thread_graph::{
     descendant_deletion_order, effective_thread_workspace_root as effective_workspace_root,
-    graph_issue, load_thread_graph, should_refresh_subagent_title,
+    graph_issue, load_thread_graph,
 };
 
 const HARNESS_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -624,22 +623,6 @@ async fn list_threads(
     Ok(Json(ListThreadsResponse { threads }))
 }
 
-async fn find_thread_by_harness_id(
-    state: &AppState,
-    project_id: ProjectId,
-    harness_thread_id: &str,
-) -> Result<Option<ThreadFile>, ApiError> {
-    for tid in state.store.list_threads(project_id).await? {
-        let Some(tf) = state.store.load_thread(project_id, tid).await? else {
-            continue;
-        };
-        if tf.harness_thread_id == harness_thread_id {
-            return Ok(Some(tf));
-        }
-    }
-    Ok(None)
-}
-
 async fn open_thread(
     State(state): State<AppState>,
     AxumPath(project_id): AxumPath<ProjectId>,
@@ -651,286 +634,144 @@ async fn open_thread(
         .load_project(project_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let project_ws_root = project_config
-        .workspace_root
-        .as_deref()
-        .unwrap_or(&project_config.dir);
     debug!(
         %project_id,
-        thread_id = display_opt(req.thread_id),
-        resume = display_opt(req.resume.as_deref()),
+        thread_id = %req.thread_id,
         action = "open_thread",
         "open thread request"
     );
 
-    if let Some(thread_id) = req.thread_id {
-        if state
-            .store
-            .load_thread(project_id, thread_id)
-            .await?
-            .is_none()
-        {
-            return Err(ApiError::NotFound);
-        }
-        let catalog = project_model_catalog(&state, &project_config, &app_config).await;
-        let thread_file =
-            normalize_persisted_thread_model(&state, project_id, thread_id, &app_config, &catalog)
-                .await?
-                .ok_or(ApiError::NotFound)?;
-        if thread_file.kind == ThreadKind::Orphan {
-            return Err(ApiError::NotFound);
-        }
-        let current_model = thread_file.current_model.as_known().cloned();
-        if thread_file.kind == ThreadKind::Primary && current_model.is_none() {
-            return Err(ApiError::Internal(format!(
-                "primary thread {thread_id} has no authoritative model"
-            )));
-        }
-        if let Some(binding) = state.registry.loaded_thread_binding(thread_id).await {
-            let handle = binding.handle();
-            return Ok(Json(OpenThreadResponse {
-                thread_id: handle.thread,
-                harness_thread_id: handle.harness_thread_id.clone(),
-                warning: None,
-            }));
-        }
-
-        // A thread with a worktree is opened against that worktree, not the project's checkout — and
-        // a sub-agent against its parent's, which is where the harness ran it. Resolved after the
-        // early return above: an already-attached thread is the common case for this endpoint, and
-        // the lookup walks the ownership chain reading persisted parents to answer.
-        let ws_root = effective_workspace_root(&state.store, &project_config, &thread_file).await?;
-
-        // Opening an existing thread must not hard-fail when the harness can't attach — most
-        // often because the thread's provider was removed from config. The browser opens a
-        // thread through this endpoint *before* subscribing over the WebSocket, so a 500 here
-        // would make the whole thread unviewable. Degrade to a read-only open instead: the
-        // client proceeds to subscribe and the persisted history loads; only new turns fail.
-        let open_result = if thread_file.kind == ThreadKind::Subagent {
-            state
-                .registry
-                .attach_subagent_thread(&project_config, &thread_file)
-                .await
-        } else {
-            state
-                .registry
-                .open_thread(
-                    &project_config,
-                    &ws_root,
-                    Some(thread_id),
-                    Some(thread_file.harness_thread_id.clone()),
-                    current_model.clone(),
-                )
-                .await
-        };
-        let handle = match open_result {
-            Ok(handle) => handle,
-            Err(error) => {
-                warn!(
-                    %project_id,
-                    %thread_id,
-                    harness_thread_id = %thread_file.harness_thread_id,
-                    %error,
-                    action = "open_thread",
-                    "harness attach failed; opening thread read-only"
-                );
-                let context = if let Some(current_model) = current_model.as_ref() {
-                    Some(ReadOnlyProviderContext {
-                        provider: current_model.provider.clone(),
-                        configured: provider_is_known(
-                            &state,
-                            &project_config,
-                            Some(&app_config),
-                            &current_model.provider,
-                        )
-                        .await,
-                    })
-                } else {
-                    None
-                };
-                return Ok(Json(OpenThreadResponse {
-                    thread_id,
-                    harness_thread_id: thread_file.harness_thread_id,
-                    warning: Some(read_only_info(
-                        context.as_ref(),
-                        Some(error.to_string()),
-                        thread_id,
-                        "open_thread",
-                    )),
-                }));
-            }
-        };
-
-        if handle.thread != thread_id {
-            return Err(ApiError::Internal(format!(
-                "harness resumed wrong thread: expected {thread_id}, got {}",
-                handle.thread
-            )));
-        }
-
-        if handle.harness_thread_id != thread_file.harness_thread_id {
-            state
-                .thread_metadata
-                .mutate(project_id, thread_id, |tf| {
-                    tf.harness_thread_id = handle.harness_thread_id.clone();
-                })
-                .await?;
-        }
-
-        let warning = handle.warning.as_ref().map(|warning| {
-            warning_info(
-                warning.code.clone(),
-                warning.message.clone(),
-                warning.detail.clone(),
-                thread_id,
-                "open_thread",
-            )
-        });
-
-        return Ok(Json(OpenThreadResponse {
-            thread_id,
-            harness_thread_id: handle.harness_thread_id,
-            warning,
-        }));
+    let thread_id = req.thread_id;
+    if state
+        .store
+        .load_thread(project_id, thread_id)
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::NotFound);
     }
-
-    let Some(resume) = req.resume else {
-        return Err(ApiError::BadRequest(
-            "creating a new thread requires an initial message".into(),
-        ));
-    };
-    let _lifecycle_guard = state
-        .registry
-        .lock_project_lifecycle_with_timeout(project_id, PROJECT_LIFECYCLE_LOCK_TIMEOUT)
-        .await
-        .map_err(harness_api_error)?;
-
-    if let Some(existing) = find_thread_by_harness_id(&state, project_id, &resume).await? {
-        if existing.kind == ThreadKind::Orphan {
-            return Err(ApiError::Conflict(format!(
-                "native thread {resume} is already retained as a hidden orphan and cannot be adopted as a primary"
-            )));
-        }
-        let (handle, warning) =
-            if let Some(binding) = state.registry.loaded_thread_binding(existing.id).await {
-                (binding.handle().clone(), None)
-            } else {
-                let ws_root =
-                    effective_workspace_root(&state.store, &project_config, &existing).await?;
-                let handle = if existing.kind == ThreadKind::Subagent {
-                    state
-                        .registry
-                        .attach_subagent_thread(&project_config, &existing)
-                        .await
-                } else {
-                    state
-                        .registry
-                        .open_thread(
-                            &project_config,
-                            &ws_root,
-                            Some(existing.id),
-                            Some(existing.harness_thread_id.clone()),
-                            existing.current_model.as_known().cloned(),
-                        )
-                        .await
-                }
-                .map_err(harness_api_error)?;
-                let warning = handle.warning.as_ref().map(|warning| {
-                    warning_info(
-                        warning.code.clone(),
-                        warning.message.clone(),
-                        warning.detail.clone(),
-                        handle.thread,
-                        "open_thread",
-                    )
-                });
-                (handle, warning)
-            };
-        refresh_route_imported_subagent_title(
-            &state,
-            project_id,
-            existing.id,
-            handle.agent_name.as_deref(),
-        )
-        .await?;
+    let catalog = project_model_catalog(&state, &project_config, &app_config).await;
+    let thread_file =
+        normalize_persisted_thread_model(&state, project_id, thread_id, &app_config, &catalog)
+            .await?
+            .ok_or(ApiError::NotFound)?;
+    if thread_file.kind == ThreadKind::Orphan {
+        return Err(ApiError::NotFound);
+    }
+    let current_model = thread_file.current_model.as_known().cloned();
+    if thread_file.kind == ThreadKind::Primary && current_model.is_none() {
+        return Err(ApiError::Internal(format!(
+            "primary thread {thread_id} has no authoritative model"
+        )));
+    }
+    if let Some(binding) = state.registry.loaded_thread_binding(thread_id).await {
+        let handle = binding.handle();
         return Ok(Json(OpenThreadResponse {
             thread_id: handle.thread,
-            harness_thread_id: handle.harness_thread_id,
-            warning,
+            harness_thread_id: handle.harness_thread_id.clone(),
+            warning: None,
         }));
     }
 
-    // Importing a native thread Giskard has no record of: the model is the thread's, and only the
-    // harness knows it. Naming one here would not express a preference — Codex treats
-    // `model`/`modelProvider` on resume as an override and stops applying the thread's own
-    // persisted model — so it would silently move an existing conversation onto another model.
-    let handle = state
-        .registry
-        .open_thread(&project_config, project_ws_root, None, Some(resume), None)
-        .await
-        // Not `Internal`: the usual reason is that this thread's provider is no longer in the
-        // harness's config, which is a conflict with the current state of the world and fixable by
-        // the user. Answering 500 would both blame the server and log at error, alerting on a
-        // config edit.
-        .map_err(|e| ApiError::Conflict(e.to_string()))?;
+    // A thread with a worktree is opened against that worktree, not the project's checkout — and
+    // a sub-agent against its parent's, which is where the harness ran it. Resolved after the
+    // early return above: an already-attached thread is the common case for this endpoint, and
+    // the lookup walks the ownership chain reading persisted parents to answer.
+    let ws_root = effective_workspace_root(&state.store, &project_config, &thread_file).await?;
 
-    let current_model = handle.resumed_model.clone().ok_or_else(|| {
-        // Nothing to fall back to: this thread's model was never ours to choose, and starting it
-        // on a guess would bind it to a provider it was not using (LT7).
-        ApiError::Conflict(
-            "the harness did not report which model this thread is using; it cannot be imported"
-                .into(),
-        )
-    })?;
-    let catalog = project_model_catalog(&state, &project_config, &app_config).await;
-    let descriptor =
-        crate::models::resolve_catalog_descriptor(&catalog, &app_config, &current_model);
-    let context_window = descriptor.context_window;
-    let now = Utc::now();
-    let title = "New thread".to_owned();
-    let thread_file = ThreadFile {
-        revision: 0,
-        version: giskard_persist::store::THREAD_METADATA_VERSION,
-        id: handle.thread,
-        project_id,
-        title,
-        harness_thread_id: handle.harness_thread_id.clone(),
-        parent_thread_id: None,
-        spawned_by_turn_id: None,
-        kind: ThreadKind::Primary,
-        mode: TurnMode::Known(Mode::Build),
-        current_model: TurnModel::Known(current_model.clone()),
-        context_window,
-        model_context_windows: std::collections::HashMap::new(),
-        permission_preset: PermissionPreset::AskFirst,
-        model_efforts: std::collections::HashMap::new(),
-        tokens: giskard_core::token::TokenLedger::default(),
-        created_at: now,
-        updated_at: now,
-        archived: false,
-        git_workspace: None,
+    // Opening an existing thread must not hard-fail when the harness can't attach — most
+    // often because the thread's provider was removed from config. The browser opens a
+    // thread through this endpoint *before* subscribing over the WebSocket, so a 500 here
+    // would make the whole thread unviewable. Degrade to a read-only open instead: the
+    // client proceeds to subscribe and the persisted history loads; only new turns fail.
+    let open_result = if thread_file.kind == ThreadKind::Subagent {
+        state
+            .registry
+            .attach_subagent_thread(&project_config, &thread_file)
+            .await
+    } else {
+        let current_model = current_model.clone().ok_or_else(|| {
+            ApiError::Internal(format!(
+                "primary thread {thread_id} has no authoritative model"
+            ))
+        })?;
+        state
+            .registry
+            .open_thread(
+                &project_config,
+                &ws_root,
+                thread_id,
+                Some(thread_file.harness_thread_id.clone()),
+                current_model,
+            )
+            .await
     };
-    let thread_file = state
-        .thread_metadata
-        .create(project_id, thread_file)
-        .await?;
-    state
-        .thread_metadata
-        .publish_created(project_id, &thread_file)
-        .await;
+    let handle = match open_result {
+        Ok(handle) => handle,
+        Err(error) => {
+            warn!(
+                %project_id,
+                %thread_id,
+                harness_thread_id = %thread_file.harness_thread_id,
+                %error,
+                action = "open_thread",
+                "harness attach failed; opening thread read-only"
+            );
+            let context = if let Some(current_model) = current_model.as_ref() {
+                Some(ReadOnlyProviderContext {
+                    provider: current_model.provider.clone(),
+                    configured: provider_is_known(
+                        &state,
+                        &project_config,
+                        Some(&app_config),
+                        &current_model.provider,
+                    )
+                    .await,
+                })
+            } else {
+                None
+            };
+            return Ok(Json(OpenThreadResponse {
+                thread_id,
+                harness_thread_id: thread_file.harness_thread_id,
+                warning: Some(read_only_info(
+                    context.as_ref(),
+                    Some(error.to_string()),
+                    thread_id,
+                    "open_thread",
+                )),
+            }));
+        }
+    };
+
+    if handle.thread != thread_id {
+        return Err(ApiError::Internal(format!(
+            "harness resumed wrong thread: expected {thread_id}, got {}",
+            handle.thread
+        )));
+    }
+
+    if handle.harness_thread_id != thread_file.harness_thread_id {
+        state
+            .thread_metadata
+            .mutate(project_id, thread_id, |tf| {
+                tf.harness_thread_id = handle.harness_thread_id.clone();
+            })
+            .await?;
+    }
 
     let warning = handle.warning.as_ref().map(|warning| {
         warning_info(
             warning.code.clone(),
             warning.message.clone(),
             warning.detail.clone(),
-            handle.thread,
+            thread_id,
             "open_thread",
         )
     });
 
     Ok(Json(OpenThreadResponse {
-        thread_id: handle.thread,
+        thread_id,
         harness_thread_id: handle.harness_thread_id,
         warning,
     }))
@@ -1047,13 +888,7 @@ async fn start_thread_with_message(
 
     let handle = match state
         .registry
-        .open_thread(
-            &project_config,
-            ws_root,
-            Some(thread_id),
-            None,
-            Some(model_ref.clone()),
-        )
+        .open_thread(&project_config, ws_root, thread_id, None, model_ref.clone())
         .await
     {
         Ok(handle) => handle,
@@ -1867,29 +1702,6 @@ fn normalize_thread_title(raw: &str) -> Result<String, ApiError> {
         )));
     }
     Ok(title)
-}
-
-async fn refresh_route_imported_subagent_title(
-    state: &AppState,
-    project_id: ProjectId,
-    thread_id: ThreadId,
-    agent_name: Option<&str>,
-) -> Result<(), ApiError> {
-    let Some(agent_name) = agent_name.and_then(trimmed_non_empty) else {
-        return Ok(());
-    };
-    let desired = normalize_thread_title(&format!("Sub-agent: {agent_name}"))?;
-    state
-        .thread_metadata
-        .mutate(project_id, thread_id, |thread| {
-            if thread.kind == ThreadKind::Subagent
-                && should_refresh_subagent_title(&thread.title, &desired)
-            {
-                thread.title = desired.clone();
-            }
-        })
-        .await?;
-    Ok(())
 }
 
 async fn archive_thread(
@@ -5749,12 +5561,21 @@ async fn ensure_thread_open(
             .attach_subagent_thread(&project_config, &thread_file)
             .await
     } else {
+        let current_model = current_model.ok_or_else(|| {
+            WsError::new(
+                "thread_metadata_invalid",
+                ErrorSeverity::Error,
+                "Primary thread has no authoritative model.",
+            )
+            .thread(thread_id)
+            .action(action)
+        })?;
         state
             .registry
             .open_thread(
                 &project_config,
                 &ws_root,
-                Some(thread_id),
+                thread_id,
                 Some(thread_file.harness_thread_id.clone()),
                 current_model,
             )
@@ -6165,9 +5986,9 @@ async fn switch_provider_cold(
         .open_thread(
             &project_config,
             &ws_root,
-            Some(thread_id),
+            thread_id,
             Some(thread_file.harness_thread_id.clone()),
-            Some(requested.clone()),
+            requested.clone(),
         )
         .await
         .map_err(|e| WsError::from_harness(e, "select_model", Some(thread_id)))?;

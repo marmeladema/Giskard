@@ -34,14 +34,6 @@ reach stale JavaScript.
 stores no model at all. The model a new thread starts on is derived from the project's catalog when
 the draft opens (the harness's default when it marks one, else the first entry), so it tracks the
 current provider and harness configuration rather than caching a choice that can go stale.
-When `POST /api/projects/{id}/threads` imports a native harness thread (see below), it asks for
-**no** model: the model is that thread's, and only the harness knows it. Requesting one there is an
-override, not a preference — Codex stops applying the thread's persisted model as soon as
-`model`/`modelProvider` is supplied — so the imported thread takes whatever the harness reports
-back, and the call answers 409 if the harness reports nothing. A harness that refuses the resume
-outright — most often because the thread's provider is no longer in its own config — is also a 409:
-the server is fine and the state is user-fixable, so it is neither a 500 nor an error-level log.
-
 `GET /api/projects/{id}/models` is the only model-listing endpoint: the declared
 `[[providers.<id>.models]]` entries, plus each listing-enabled provider's `/v1/models` discovery and the
 harness's own catalog, with unknown provider ids and per-provider discovery failures reported in
@@ -68,12 +60,12 @@ into a randomized per-turn directory under the harness host's temporary director
 directory after turn completion, upload/start failure, stream loss, channel closure, or shutdown;
 it never writes uploads into the project workspace.
 
-`POST /api/projects/{id}/threads` opens an existing local thread when `thread_id` is provided, or
-imports/resumes a native harness thread when `resume` is provided. Linked transcript items use the
-dedicated parent/item endpoint above; the server resolves native routing, ownership, provenance,
-prompt, and lifecycle evidence from its authoritative item rather than accepting those fields from
-the browser. Thread summaries include the effective `workspace_root` the thread uses for file
-reads, Git status and diffs — the project's workspace for shared threads, the inherited worktree
+`POST /api/projects/{id}/threads` requires `thread_id` and opens that existing persisted local
+thread. Linked transcript items use the dedicated parent/item endpoint above; the server resolves
+native routing, ownership, provenance, prompt, and lifecycle evidence from its authoritative item
+rather than accepting those fields from the browser. Thread summaries include the effective
+`workspace_root` the thread uses for file reads, Git status and diffs — the project's workspace for
+shared threads, the inherited worktree
 workspace for isolated threads and their sub-agents. Thread summaries and browser-facing sub-agent
 payloads omit native harness thread IDs. Every summary carries the thread's durable metadata
 `revision`. The WebSocket's typed `ThreadState` carries the same revision with title, mode, selected

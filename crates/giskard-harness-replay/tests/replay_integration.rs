@@ -111,15 +111,15 @@ async fn open_thread_one_turn_assert_state() {
     let handle = harness
         .open_thread(OpenThreadOptions {
             project: giskard_core::ProjectId::new(),
-            thread: None,
+            thread: expected_thread,
             workspace_root: "/tmp/test".into(),
             resume: Some("th_test_001".into()),
             updates: giskard_harness::thread_update_channel().0,
-            initial_model: Some(ModelRef {
+            initial_model: ModelRef {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
-            }),
+            },
         })
         .await
         .expect("open_thread failed");
@@ -247,15 +247,15 @@ async fn replay_persisted_state_roundtrip() {
     let handle = harness
         .open_thread(OpenThreadOptions {
             project: giskard_core::ProjectId::new(),
-            thread: None,
+            thread: thread_id,
             workspace_root: "/tmp/test".into(),
             resume: Some("th_test_001".into()),
             updates: giskard_harness::thread_update_channel().0,
-            initial_model: Some(ModelRef {
+            initial_model: ModelRef {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
-            }),
+            },
         })
         .await
         .unwrap();

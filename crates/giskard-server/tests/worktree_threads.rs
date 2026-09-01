@@ -4,8 +4,6 @@
 //! strategy must be opened against the worktree rather than the project's checkout, and must still
 //! be after a restart. Everything here therefore records the workspace root the harness was handed.
 
-mod common;
-
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -25,8 +23,6 @@ use giskard_harness::{
 use giskard_persist::store::{ProjectConfig, ThreadGitWorkspace};
 use giskard_server::{AppState, HarnessFactory, build_app};
 use tokio::sync::Mutex;
-
-use common::fake_native_model;
 
 /// Saving a plan writes a file into the workspace and then offers it back as a link. For an
 /// isolated thread that has to be the worktree: writing to the project's checkout would put the
@@ -266,14 +262,11 @@ impl AgentHarness for RecordingHarness {
             .lock()
             .await
             .push(opts.workspace_root.to_string_lossy().into_owned());
-        let thread = opts.thread.unwrap_or_default();
+        let thread = opts.thread;
         let (tx, _) = tokio::sync::broadcast::channel(16);
         self.threads.lock().unwrap().push((thread, tx));
         Ok(ThreadHandle {
-            resumed_model: opts
-                .initial_model
-                .clone()
-                .or_else(|| Some(fake_native_model())),
+            resumed_model: Some(opts.initial_model.clone()),
             ..ThreadHandle::opened(
                 thread,
                 opts.resume.unwrap_or_else(|| format!("native-{thread}")),
@@ -963,7 +956,7 @@ async fn reopening_an_isolated_thread_returns_to_its_worktree() {
         .client
         .post(format!("{base}/api/projects/{}/threads", server.project_id))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({ "thread_id": thread_id, "resume": null }))
+        .json(&serde_json::json!({ "thread_id": thread_id }))
         .send()
         .await
         .unwrap();
@@ -1276,7 +1269,7 @@ async fn opening_a_subagent_attaches_in_its_parents_worktree() {
             server.base, server.project_id
         ))
         .header("cookie", &server.cookie)
-        .json(&serde_json::json!({ "thread_id": child, "resume": null }))
+        .json(&serde_json::json!({ "thread_id": child }))
         .send()
         .await
         .unwrap();

@@ -272,7 +272,7 @@ session_days = 30
     let resp = client
         .post(format!("{base}/api/projects/{pid}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": tid, "resume": null}))
+        .json(&serde_json::json!({"thread_id": tid}))
         .send()
         .await
         .unwrap();
@@ -415,7 +415,7 @@ session_days = 30
     let resp = client
         .post(format!("{base}/api/projects/{pid}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": tid, "resume": null}))
+        .json(&serde_json::json!({"thread_id": tid}))
         .send()
         .await
         .unwrap();
