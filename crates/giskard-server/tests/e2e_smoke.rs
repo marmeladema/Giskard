@@ -3409,7 +3409,7 @@ async fn new_turn_start_replaces_stale_live_buffer_without_dropping_events() {
         .thread_runtime(thread_id)
         .await
         .unwrap()
-        .replace_live_turn(stale_turn, Some(UserInput::text("stale interrupted turn")));
+        .replace_live_turn_for_test(stale_turn, Some(UserInput::text("stale interrupted turn")));
     let mut ws = connect_ws(port, &cookie).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -6258,7 +6258,7 @@ async fn thread_archive_and_delete_reject_active_turns() {
         .thread_runtime(thread_id)
         .await
         .unwrap()
-        .replace_live_turn(TurnId::new(), None);
+        .replace_live_turn_for_test(TurnId::new(), None);
 
     let archive = client
         .post(format!(
@@ -6294,7 +6294,7 @@ async fn project_remove_rejects_active_turns() {
         .thread_runtime(thread_id)
         .await
         .unwrap()
-        .replace_live_turn(TurnId::new(), None);
+        .replace_live_turn_for_test(TurnId::new(), None);
 
     let resp = client
         .delete(format!("{base}/api/projects/{project_id}"))
@@ -6326,7 +6326,7 @@ async fn thread_archive_and_delete_reject_running_commands() {
     // Track a running command without starting a turn, so only the running-command branch of the
     // guard can trip (not the live-turn branch).
     let runtime = state.registry.thread_runtime(thread_id).await.unwrap();
-    runtime.apply_event(
+    runtime.apply_event_for_test(
         &AgentEvent::ItemStarted {
             thread: thread_id,
             turn: TurnId::new(),
@@ -6386,7 +6386,7 @@ async fn project_remove_rejects_running_commands() {
     let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
 
     let runtime = state.registry.thread_runtime(thread_id).await.unwrap();
-    runtime.apply_event(
+    runtime.apply_event_for_test(
         &AgentEvent::ItemStarted {
             thread: thread_id,
             turn: TurnId::new(),

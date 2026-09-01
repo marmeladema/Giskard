@@ -19,7 +19,7 @@ use crate::hub::Hub;
 ///
 /// Persistence stays independent of WebSockets. Callers cannot publish a candidate which has not
 /// committed because the service derives every message from [`ThreadMutation`].
-pub struct ThreadMetadataService {
+pub(crate) struct ThreadMetadataService {
     store: Arc<PersistStore>,
     hub: Arc<Hub>,
 }
@@ -30,20 +30,20 @@ pub struct ThreadMetadataService {
 /// permission inheritance, but Codex role configuration may put the child on another model, so
 /// `current_model` stays whatever native metadata reported (spec: orphan classification).
 #[derive(Debug, Clone)]
-pub struct OrphanClassification {
-    pub parent_thread_id: ThreadId,
-    pub spawned_by_turn_id: TurnId,
-    pub title: String,
-    pub mode: TurnMode,
-    pub permission_preset: giskard_core::turn::PermissionPreset,
+pub(crate) struct OrphanClassification {
+    pub(crate) parent_thread_id: ThreadId,
+    pub(crate) spawned_by_turn_id: TurnId,
+    pub(crate) title: String,
+    pub(crate) mode: TurnMode,
+    pub(crate) permission_preset: giskard_core::turn::PermissionPreset,
 }
 
 impl ThreadMetadataService {
-    pub fn new(store: Arc<PersistStore>, hub: Arc<Hub>) -> Self {
+    pub(crate) fn new(store: Arc<PersistStore>, hub: Arc<Hub>) -> Self {
         Self { store, hub }
     }
 
-    pub async fn mutate<F>(
+    pub(crate) async fn mutate<F>(
         &self,
         project_id: ProjectId,
         thread_id: ThreadId,
@@ -56,7 +56,7 @@ impl ThreadMetadataService {
             .await
     }
 
-    pub async fn mutate_with_recency<F>(
+    pub(crate) async fn mutate_with_recency<F>(
         &self,
         project_id: ProjectId,
         thread_id: ThreadId,
@@ -74,7 +74,7 @@ impl ThreadMetadataService {
         Ok(mutation)
     }
 
-    pub async fn recompute_aggregates(
+    pub(crate) async fn recompute_aggregates(
         &self,
         project_id: ProjectId,
         thread_id: ThreadId,
@@ -87,17 +87,7 @@ impl ThreadMetadataService {
         Ok(mutation)
     }
 
-    pub async fn append_turn(
-        &self,
-        project_id: ProjectId,
-        thread_id: ThreadId,
-        turn: &Turn,
-    ) -> Result<TurnCommitOutcome, PersistError> {
-        self.append_turn_with_diffs(project_id, thread_id, turn, &[])
-            .await
-    }
-
-    pub async fn append_turn_with_diffs(
+    pub(crate) async fn append_turn_with_diffs(
         &self,
         project_id: ProjectId,
         thread_id: ThreadId,
@@ -114,7 +104,7 @@ impl ThreadMetadataService {
         Ok(outcome)
     }
 
-    pub async fn create(
+    pub(crate) async fn create(
         &self,
         project_id: ProjectId,
         thread: ThreadFile,
@@ -124,7 +114,7 @@ impl ThreadMetadataService {
 
     /// Classify a hidden native identity exactly once. The revision and kind checks execute under
     /// the store's per-thread lock, so racing parent claims cannot both commit.
-    pub async fn classify_orphan(
+    pub(crate) async fn classify_orphan(
         &self,
         project_id: ProjectId,
         thread_id: ThreadId,
@@ -146,12 +136,12 @@ impl ThreadMetadataService {
     }
 
     /// Publish a creation only after its surrounding native/worktree setup has committed.
-    pub async fn publish_created(&self, project_id: ProjectId, thread: &ThreadFile) {
+    pub(crate) async fn publish_created(&self, project_id: ProjectId, thread: &ThreadFile) {
         self.invalidate_thread_catalog(project_id, thread.id, thread.revision)
             .await;
     }
 
-    pub async fn delete(
+    pub(crate) async fn delete(
         &self,
         project_id: ProjectId,
         thread_id: ThreadId,
@@ -162,14 +152,14 @@ impl ThreadMetadataService {
         Ok(())
     }
 
-    pub fn thread_state(thread: &ThreadFile, active_turn: Option<bool>) -> ThreadState {
+    pub(crate) fn thread_state(thread: &ThreadFile, active_turn: Option<bool>) -> ThreadState {
         ThreadState {
             metadata: Self::metadata(thread),
             active_turn,
         }
     }
 
-    pub fn metadata(thread: &ThreadFile) -> ThreadMetadata {
+    pub(crate) fn metadata(thread: &ThreadFile) -> ThreadMetadata {
         ThreadMetadata {
             thread_id: thread.id,
             revision: thread.revision,
@@ -522,7 +512,7 @@ mod tests {
         };
         assert!(matches!(
             service
-                .append_turn(project_id, thread_id, &turn)
+                .append_turn_with_diffs(project_id, thread_id, &turn, &[])
                 .await
                 .unwrap(),
             TurnCommitOutcome::MetadataMutation(ThreadMutation::Changed { .. })

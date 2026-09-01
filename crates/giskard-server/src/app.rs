@@ -7,7 +7,7 @@ use giskard_persist::PersistStore;
 use crate::headers::security_headers_middleware;
 use crate::highlight::Highlighter;
 use crate::hub::Hub;
-use crate::ledger::{self, LedgerHandle};
+use crate::ledger;
 use crate::registry::{HarnessFactory, HarnessRegistry};
 use crate::routes::{http_request_context_middleware, protected_routes, public_routes};
 use crate::thread_metadata::ThreadMetadataService;
@@ -48,11 +48,9 @@ impl AppShutdown {
 pub struct AppState {
     pub store: Arc<PersistStore>,
     pub hub: Arc<Hub>,
-    pub thread_metadata: Arc<ThreadMetadataService>,
+    pub(crate) thread_metadata: Arc<ThreadMetadataService>,
     pub registry: Arc<HarnessRegistry>,
     pub highlighter: Arc<Highlighter>,
-    /// Single-writer token-ledger actor handle (§5.4).
-    pub ledger: LedgerHandle,
     pub session_key: Arc<[u8]>,
     /// Global brute-force throttle for `/api/login`.
     pub login_throttle: Arc<LoginThrottle>,
@@ -95,7 +93,7 @@ impl AppState {
             hub.clone(),
             max_command_output_bytes,
             store.clone(),
-            ledger.clone(),
+            ledger,
         ));
         let thread_metadata = registry.thread_metadata_service();
         Self {
@@ -104,7 +102,6 @@ impl AppState {
             thread_metadata,
             registry,
             highlighter,
-            ledger,
             session_key: session_key.into(),
             login_throttle: Arc::new(LoginThrottle::new()),
             shutdown: AppShutdown::default(),
