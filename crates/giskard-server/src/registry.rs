@@ -55,8 +55,8 @@ mod thread;
 use project::{HarnessTransitions, LifecycleLock, ProjectAuthority, WeakLifecycleLock};
 pub(crate) use thread::ThreadAuthority;
 use thread::{
-    ClassificationPhase, CoordinatorToken, EventOwnerControl, OwnerLock, ThreadBinding,
-    ThreadCoordinator, WeakOwnerLock,
+    ClassificationPhase, CoordinatorToken, EventOwnerControl, ExternalTurnDefaults, OwnerLock,
+    ThreadBinding, ThreadCoordinator, WeakOwnerLock,
 };
 
 #[async_trait]
@@ -80,7 +80,7 @@ struct TurnContext {
     kind: TurnContextKind,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TurnContextKind {
     User,
     ManualCompaction,
@@ -129,25 +129,6 @@ fn turn_reservation(
         mode: ctx.mode,
         model: ctx.model.clone(),
         context_kind: turn_context_kind_label(ctx.kind),
-    }
-}
-
-/// The visible input label for a native turn Giskard did not start.
-///
-/// A promptless external turn still gets one row of presentation metadata, and it may only name
-/// what Giskard has actually established. A classified child is a sub-agent turn; an unclassified
-/// native thread has no proven relationship yet, so its turns must not claim one. A `Primary`
-/// thread never reaches this path with an empty label unless Giskard missed the start, so it keeps
-/// the empty input it has always had.
-///
-/// A turn committed while the thread was unclassified keeps this label after classification, for
-/// the same reason its mode is not rewritten: the label records what was known when the turn was
-/// persisted, not what is known now.
-fn external_turn_input_label(classification: ClassificationPhase) -> UserInput {
-    match classification {
-        ClassificationPhase::Primary => UserInput::text(""),
-        ClassificationPhase::Subagent => UserInput::text("Sub-agent turn"),
-        ClassificationPhase::Orphan => UserInput::text("Unclassified native turn"),
     }
 }
 
@@ -2658,6 +2639,21 @@ async fn install_event_owner_locked(
     Ok(true)
 }
 
+fn external_turn_defaults(
+    binding: &LoadedThreadBinding,
+    persisted: Option<&ThreadFile>,
+) -> ExternalTurnDefaults {
+    ExternalTurnDefaults {
+        model: persisted
+            .map(|thread| thread.current_model.clone())
+            .or_else(|| binding.native_model.clone().map(TurnModel::Known))
+            .unwrap_or(TurnModel::Unknown),
+        mode: persisted
+            .map(|thread| thread.mode)
+            .unwrap_or(TurnMode::Unknown),
+    }
+}
+
 async fn forward_events(
     shared: Arc<RegistryShared>,
     authority: Arc<ThreadAuthority>,
@@ -2674,25 +2670,14 @@ async fn forward_events(
         .await
         .ok()
         .flatten();
-    let classification = coordinator.classification().await;
-    let external_context = TurnContext {
-        user_input: external_turn_input_label(classification),
-        model: persisted
-            .as_ref()
-            .map(|thread| thread.current_model.clone())
-            .or_else(|| binding.native_model.clone().map(TurnModel::Known))
-            .unwrap_or(TurnModel::Unknown),
-        mode: persisted
-            .as_ref()
-            .map(|thread| thread.mode)
-            .unwrap_or(TurnMode::Unknown),
-        kind: match classification {
-            ClassificationPhase::Primary => TurnContextKind::User,
-            ClassificationPhase::Subagent => TurnContextKind::ExternalSubagent,
-            ClassificationPhase::Orphan => TurnContextKind::ExternalOrphan,
-        },
+    let idle_defaults = external_turn_defaults(&binding, persisted.as_ref());
+    let idle_context = TurnContext {
+        user_input: UserInput::text(""),
+        model: idle_defaults.model,
+        mode: idle_defaults.mode,
+        kind: TurnContextKind::User,
     };
-    let mut ctx = external_context.clone();
+    let mut ctx = idle_context.clone();
     let mut turn_gate: Option<ThreadTurnLease> = None;
     let hub = shared.hub.clone();
     let runtime = shared.runtime.clone();
@@ -2790,10 +2775,14 @@ async fn forward_events(
                 } else if let Some(turn) = event_turn
                     && !seen_turn_ids.contains(&turn)
                 {
-                    let claim = match coordinator
-                        .claim_native_turn(turn, external_context.clone())
+                    let persisted = shared
+                        .store
+                        .load_thread(project_id, thread_id)
                         .await
-                    {
+                        .ok()
+                        .flatten();
+                    let external_defaults = external_turn_defaults(&binding, persisted.as_ref());
+                    let claim = match coordinator.claim_native_turn(turn, external_defaults).await {
                         Ok(claim) => claim,
                         Err(error) => {
                             error!(%project_id, %thread_id, %turn, %error,
@@ -2987,9 +2976,6 @@ async fn forward_events(
                             warn!(
                                 %project_id,
                                 %thread_id,
-                                context_kind = turn_context_kind_label(ctx.kind),
-                                mode = ?ctx.mode,
-                                model = ?ctx.model,
                                 error = %error,
                                 turn_gate_held = turn_gate
                                     .as_ref()
@@ -3003,7 +2989,6 @@ async fn forward_events(
                             debug!(
                                 %project_id,
                                 %thread_id,
-                                context_kind = turn_context_kind_label(ctx.kind),
                                 message,
                                 turn_gate_held = turn_gate
                                     .as_ref()
@@ -3019,7 +3004,6 @@ async fn forward_events(
                                 %thread_id,
                                 request_id = %request.id,
                                 method = %request.method,
-                                context_kind = turn_context_kind_label(ctx.kind),
                                 turn_gate_held = turn_gate
                                     .as_ref()
                                     .is_some_and(|lease| !lease.is_released()),
@@ -3309,7 +3293,7 @@ async fn forward_events(
                     turn_gate = None;
                     turn_id = None;
                     owned_turn = None;
-                    ctx = external_context.clone();
+                    ctx = idle_context.clone();
                     started_at = Utc::now();
                     current_turn_items = CurrentTurnItems::default();
                     diffs.clear();
@@ -3410,7 +3394,7 @@ async fn forward_events(
                         turn_gate = None;
                         turn_id = None;
                         owned_turn = None;
-                        ctx = external_context.clone();
+                        ctx = idle_context.clone();
                         started_at = Utc::now();
                         current_turn_items = CurrentTurnItems::default();
                         diffs.clear();
@@ -6720,6 +6704,148 @@ mod tests {
         assert_eq!(saved[0].user_input, UserInput::text("first"));
         assert_eq!(saved[1].id, second_turn);
         assert_eq!(saved[1].user_input, UserInput::text(""));
+    }
+
+    #[tokio::test]
+    async fn long_lived_forwarder_uses_current_external_context_for_each_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let parent_thread_id = ThreadId::new();
+        let initial_model = ModelRef {
+            provider: "openai".into(),
+            model: "initial".into(),
+            reasoning_effort: None,
+        };
+        store
+            .create_project(project_id, "proj", "/tmp/test")
+            .await
+            .unwrap();
+        let now = Utc::now();
+        store
+            .save_thread(
+                project_id,
+                &ThreadFile {
+                    revision: 0,
+                    version: 1,
+                    id: thread_id,
+                    project_id,
+                    title: "orphan".into(),
+                    harness_thread_id: "native-orphan".into(),
+                    parent_thread_id: None,
+                    spawned_by_turn_id: None,
+                    kind: giskard_core::ThreadKind::Orphan,
+                    mode: TurnMode::Known(Mode::Build),
+                    current_model: TurnModel::Known(initial_model.clone()),
+                    context_window: 128_000,
+                    model_context_windows: Default::default(),
+                    permission_preset: PermissionPreset::AskFirst,
+                    model_efforts: Default::default(),
+                    tokens: TokenLedger::default(),
+                    created_at: now,
+                    updated_at: now,
+                    archived: false,
+                    git_workspace: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let (tx, rx) = broadcast::channel(32);
+        let shared = Arc::new(super::RegistryShared::new(
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store.clone()),
+        ));
+        let coordinator = Arc::new(super::ThreadCoordinator::new(
+            super::LoadedThreadBinding {
+                project_id,
+                handle: ThreadHandle::detached(thread_id, "native-orphan".into()),
+                native_model: Some(initial_model),
+            },
+            super::ClassificationPhase::Orphan,
+        ));
+        let authority = Arc::new(super::ThreadAuthority::new_for_test(thread_id, project_id));
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (_completed_tx, completed_rx) = tokio::sync::watch::channel(false);
+        coordinator
+            .activate_owner(super::EventOwnerControl {
+                cancel: cancel_tx,
+                completed: completed_rx,
+            })
+            .await
+            .unwrap();
+        let forwarder = tokio::spawn(forward_events(
+            shared.clone(),
+            authority,
+            coordinator.clone(),
+            AgentEventStream::new(rx),
+            cancel_rx,
+        ));
+        assert_eq!(tx.receiver_count(), 1);
+
+        let first_turn = TurnId::new();
+        for event in turn_events(
+            thread_id,
+            first_turn,
+            "ignored",
+            "first",
+            TokenUsage::new(1, 1),
+        ) {
+            tx.send(event).unwrap();
+        }
+        wait_for_turn_count(&store, project_id, thread_id, 1).await;
+
+        let orphan = store
+            .load_thread(project_id, thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        shared
+            .thread_metadata
+            .classify_orphan(
+                project_id,
+                thread_id,
+                orphan.revision,
+                crate::thread_metadata::OrphanClassification {
+                    parent_thread_id,
+                    spawned_by_turn_id: first_turn,
+                    title: "sub-agent".into(),
+                    mode: TurnMode::Known(Mode::Plan),
+                    permission_preset: PermissionPreset::AskFirst,
+                },
+            )
+            .await
+            .unwrap();
+        coordinator.classify_orphan_as_subagent().await.unwrap();
+
+        let second_turn = TurnId::new();
+        for event in turn_events(
+            thread_id,
+            second_turn,
+            "ignored",
+            "second",
+            TokenUsage::new(2, 2),
+        ) {
+            tx.send(event).unwrap();
+        }
+        wait_for_turn_count(&store, project_id, thread_id, 2).await;
+        assert_eq!(tx.receiver_count(), 1);
+        drop(tx);
+        forwarder.await.unwrap();
+
+        let turns = store.load_all_turns(project_id, thread_id).await.unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].id, first_turn);
+        assert_eq!(
+            turns[0].user_input,
+            UserInput::text("Unclassified native turn")
+        );
+        assert_eq!(turns[0].mode, TurnMode::Known(Mode::Build));
+        assert_eq!(turns[1].id, second_turn);
+        assert_eq!(turns[1].user_input, UserInput::text("Sub-agent turn"));
+        assert_eq!(turns[1].mode, TurnMode::Known(Mode::Plan));
     }
 
     #[tokio::test]
