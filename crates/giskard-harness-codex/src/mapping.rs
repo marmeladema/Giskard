@@ -33,6 +33,7 @@ use codex_codes::protocol::{
 };
 
 use crate::log_fields::display_opt;
+use crate::native_routes::{NativeThreadRoutes, UnknownNativeThread};
 
 // ---- MCP tool-call approval detection (spec §9.2) ----
 //
@@ -56,11 +57,6 @@ const MCP_TOOL_APPROVAL_LABEL_CANCEL: &str = "Cancel";
 type NativeItemKey = (ThreadId, TurnId, String);
 type NativeTurnKey = (ThreadId, String);
 
-#[derive(Debug)]
-struct UnknownNativeThread {
-    native_thread_id: String,
-}
-
 type MappingResult<T> = Result<T, UnknownNativeThread>;
 
 /// Maps Codex app-server messages onto `giskard-core` events, owning the id-translation registries
@@ -70,28 +66,7 @@ type MappingResult<T> = Result<T, UnknownNativeThread>;
 /// reused for every subsequent response, delta, or completion in that turn's item lifecycle.
 pub struct CodexMapper {
     workspace_root: PathBuf,
-    // ENTITY-AUTHORITY-EXCEPTION:
-    // Role: Translate between native Codex thread IDs and Giskard thread IDs.
-    // Source of truth: Provider protocol bindings establish the bijective route claims.
-    // Structural reason: The lower harness adapter must route native protocol identities.
-    // Synchronization: The single Codex background task owns and mutates the mapper.
-    // Invalidation/removal: The mappings live for one harness process and drop on shutdown.
-    thread_ids: HashMap<String, ThreadId>,
-    // ENTITY-AUTHORITY-EXCEPTION:
-    // Role: Provide the reverse Giskard-to-native thread route for harness commands.
-    // Source of truth: This is the reverse half of the mapper's bijective route claims.
-    // Structural reason: The adapter cannot depend on server authority types.
-    // Synchronization: The single Codex background task owns and mutates the mapper.
-    // Invalidation/removal: The mappings live for one harness process and drop on shutdown.
-    native_ids: HashMap<ThreadId, String>,
-    // ENTITY-AUTHORITY-EXCEPTION:
-    // Role: Version authoritative claims for native-thread routing identities.
-    // Source of truth: Successful native route claims advance the stored epoch.
-    // Structural reason: Route epochs implement the provider adapter's protocol contract.
-    // Synchronization: The single Codex background task owns and mutates the mapper.
-    // Invalidation/removal: Epochs live for one harness process and drop on shutdown.
-    route_epochs: HashMap<String, u64>,
-    next_route_epoch: u64,
+    routes: NativeThreadRoutes,
     /// Native parentage the provider attested through its own routing: child native id → parent
     /// native id. See [`CodexMapper::track_native_parentage`].
     // ENTITY-AUTHORITY-EXCEPTION:
@@ -198,10 +173,7 @@ impl CodexMapper {
     pub fn new(workspace_root: PathBuf) -> Self {
         Self {
             workspace_root,
-            thread_ids: HashMap::new(),
-            native_ids: HashMap::new(),
-            route_epochs: HashMap::new(),
-            next_route_epoch: 0,
+            routes: NativeThreadRoutes::default(),
             native_parents: HashMap::new(),
             turn_ids: HashMap::new(),
             item_ids: HashMap::new(),
@@ -310,42 +282,9 @@ impl CodexMapper {
         harness_thread_id: String,
         thread: ThreadId,
     ) -> Result<u64, HarnessError> {
-        let harness_thread_id = harness_thread_id.trim().to_owned();
-        if harness_thread_id.is_empty() {
-            return Err(HarnessError::Protocol(
-                "cannot claim an empty native thread id".into(),
-            ));
-        }
-        if let Some(existing) = self.thread_ids.get(&harness_thread_id) {
-            if *existing != thread {
-                return Err(HarnessError::Protocol(format!(
-                    "native thread {harness_thread_id} is already bound to {existing}, not {thread}"
-                )));
-            }
-            return self
-                .route_epochs
-                .get(&harness_thread_id)
-                .copied()
-                .ok_or_else(|| {
-                    HarnessError::Protocol(format!(
-                        "native thread {harness_thread_id} has no route epoch"
-                    ))
-                });
-        }
-        if let Some(existing) = self.native_ids.get(&thread) {
-            return Err(HarnessError::Protocol(format!(
-                "thread {thread} is already bound to native thread {existing}, not {harness_thread_id}"
-            )));
-        }
-        self.next_route_epoch = self
-            .next_route_epoch
-            .checked_add(1)
-            .ok_or_else(|| HarnessError::Protocol("native route epoch space exhausted".into()))?;
-        let epoch = self.next_route_epoch;
-        self.thread_ids.insert(harness_thread_id.clone(), thread);
-        self.native_ids.insert(thread, harness_thread_id.clone());
-        self.route_epochs.insert(harness_thread_id, epoch);
-        Ok(epoch)
+        self.routes
+            .claim(harness_thread_id, thread)
+            .map(|route| route.epoch)
     }
 
     /// Record the native parentage a sub-agent link item attests.
@@ -399,27 +338,19 @@ impl CodexMapper {
     /// Lets a caller that has no durable id of its own reuse the one this thread is already known
     /// by, instead of inventing a second identity for it.
     pub fn thread_for_native(&self, harness_thread_id: &str) -> Option<ThreadId> {
-        self.thread_ids.get(harness_thread_id).copied()
+        self.routes
+            .route_for_native(harness_thread_id)
+            .map(|route| route.thread_id)
     }
 
     /// Resolve a native thread id to its owned `ThreadId`.
     ///
     /// Codex legitimately omits `threadId` on a few global messages; those keep using the caller's
-    /// scoped fallback. Once at least one native thread is registered, however, a non-empty unknown
-    /// native id is a routing bug and must not be relabeled as the fallback thread.
+    /// scoped fallback. Native IDs are trimmed consistently with route claims, so whitespace-only
+    /// IDs count as omitted. Once at least one native thread is registered, however, an unknown
+    /// normalized native ID is a routing bug and must not be relabeled as the fallback thread.
     fn resolve_thread(&self, native: &str, fallback: ThreadId) -> MappingResult<ThreadId> {
-        if native.is_empty() {
-            return Ok(fallback);
-        }
-        if let Some(thread) = self.thread_ids.get(native).copied() {
-            return Ok(thread);
-        }
-        if self.thread_ids.is_empty() {
-            return Ok(fallback);
-        }
-        Err(UnknownNativeThread {
-            native_thread_id: native.to_owned(),
-        })
+        self.routes.resolve(native, fallback)
     }
 
     /// Resolve (get-or-mint) the owned `TurnId` for a native turn id in one Giskard thread.
@@ -3393,25 +3324,6 @@ mod tests {
             mapper.native_parent("native-child"),
             Some("native-parent".to_owned())
         );
-    }
-
-    #[test]
-    fn native_route_claims_are_idempotent_and_bijective() {
-        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
-        let first = ThreadId::new();
-        let second = ThreadId::new();
-
-        let epoch = mapper.claim_thread("native-a".into(), first).unwrap();
-        assert_eq!(
-            mapper.claim_thread("native-a".into(), first).unwrap(),
-            epoch
-        );
-        assert!(mapper.claim_thread("native-a".into(), second).is_err());
-        assert!(mapper.claim_thread("native-b".into(), first).is_err());
-        assert!(mapper.claim_thread("   ".into(), second).is_err());
-
-        let second_epoch = mapper.claim_thread("native-b".into(), second).unwrap();
-        assert!(second_epoch > epoch);
     }
 
     #[test]
