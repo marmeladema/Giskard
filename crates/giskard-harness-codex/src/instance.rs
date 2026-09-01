@@ -57,13 +57,32 @@ impl<C> CodexInstance<C> {
         thread_id: ThreadId,
     ) -> Result<(), HarnessError> {
         self.mapper.claim_thread(harness_thread_id, thread_id)?;
+        self.ensure_thread_route_sender(thread_id);
+        Ok(())
+    }
+
+    fn replace_thread_route(
+        &mut self,
+        expected_harness_thread_id: String,
+        new_harness_thread_id: String,
+        thread_id: ThreadId,
+    ) -> Result<(), HarnessError> {
+        self.mapper.replace_thread_route(
+            expected_harness_thread_id,
+            new_harness_thread_id,
+            thread_id,
+        )?;
+        self.ensure_thread_route_sender(thread_id);
+        Ok(())
+    }
+
+    fn ensure_thread_route_sender(&self, thread_id: ThreadId) {
         lock_senders(&self.senders)
             .entry(thread_id)
             .or_insert_with(|| {
                 let (sender, _) = broadcast::channel(BROADCAST_CAPACITY);
                 sender
             });
-        Ok(())
     }
 }
 
@@ -314,8 +333,17 @@ where
             start_thread(&mut self.client, context, &cwd, &opts.initial_model).await?
         };
 
-        // B4: bind the (possibly re-established) native id to the durable ThreadId.
-        self.claim_thread_route(opened.harness_thread_id.clone(), thread_id)?;
+        // B4: bind the (possibly re-established) native id to the durable ThreadId. A failed
+        // resume replaces the exact bootstrapped native route with the fresh provider identity.
+        if let (Some(expected_harness_thread_id), Some(_)) = (&opts.resume, &resume_warning) {
+            self.replace_thread_route(
+                expected_harness_thread_id.clone(),
+                opened.harness_thread_id.clone(),
+                thread_id,
+            )?;
+        } else {
+            self.claim_thread_route(opened.harness_thread_id.clone(), thread_id)?;
+        }
 
         let _ = broadcast_event(&self.senders, thread_id, || AgentEvent::ThreadOpened {
             thread: thread_id,

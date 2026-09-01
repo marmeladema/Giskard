@@ -289,6 +289,17 @@ impl CodexMapper {
             .map(|route| route.epoch.into_inner())
     }
 
+    pub(super) fn replace_thread_route(
+        &mut self,
+        expected_harness_thread_id: String,
+        new_harness_thread_id: String,
+        thread: ThreadId,
+    ) -> Result<u64, HarnessError> {
+        self.routes
+            .replace(expected_harness_thread_id, new_harness_thread_id, thread)
+            .map(|route| route.epoch.into_inner())
+    }
+
     /// Record the native parentage a sub-agent link item attests.
     ///
     /// A link item is delivered on its owner's native thread, so the provider is stating that

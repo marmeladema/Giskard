@@ -23,6 +23,9 @@ because synchronous `AgentHarness::subscribe` must read it; `CodexInstance` is i
 lifecycle mutator. It also owns route establishment: durable bootstrap, explicit open/resume, and
 provider-owned child claims all use the same primitive. That operation claims identity before
 publishing the broadcast sender, and an idempotent claim preserves the existing sender.
+When a bootstrapped native resume fails because its rollout disappeared, the instance atomically
+replaces that exact native/Giskard binding with the fresh session identity, advances its route
+epoch, and preserves the delivery sender.
 
 ## Identifier model
 
