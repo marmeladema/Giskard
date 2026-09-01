@@ -9,6 +9,7 @@
 
 mod log_fields;
 mod mapping;
+mod native_routes;
 
 use crate::log_fields::display_opt;
 
