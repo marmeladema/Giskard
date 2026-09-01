@@ -32,7 +32,7 @@ use giskard_proto::{
     ThreadRuntimeSummary, WireApprovalRequest,
 };
 
-pub struct ThreadRuntimeSupport {
+pub(crate) struct ThreadRuntimeSupport {
     // Cross-thread derived projection; entity-local runtime state lives on ThreadAuthority.
     overview: Arc<Mutex<OverviewState>>,
     max_command_output_bytes: usize,
@@ -210,7 +210,7 @@ struct OverviewState {
     summaries: HashMap<ThreadId, ThreadRuntimeSummary>,
 }
 
-pub struct AppliedRuntimeEvent {
+pub(crate) struct AppliedRuntimeEvent {
     pub sequence: Option<u64>,
     pub tasks_changed: bool,
     pub running_tasks_if_changed: Option<RunningTasksProjection>,
@@ -219,7 +219,7 @@ pub struct AppliedRuntimeEvent {
     overview_refresh_needed: bool,
 }
 
-pub struct RunningTasksProjection {
+pub(crate) struct RunningTasksProjection {
     pub revision: u64,
     pub tasks: Vec<RunningTask>,
 }
@@ -309,6 +309,119 @@ pub(crate) struct RestorePermit {
     authority: std::sync::Weak<ThreadAuthority>,
     entry: std::sync::Weak<Mutex<ThreadRuntimeEntry>>,
     lifecycle_revision: u64,
+}
+
+/// Opaque route-facing runtime access bound to one stable thread authority.
+pub struct ResolvedThreadRuntime {
+    support: Arc<ThreadRuntimeSupport>,
+    authority: Arc<ThreadAuthority>,
+}
+
+impl ResolvedThreadRuntime {
+    /// Binds support to an already resolved authority without creating runtime state.
+    pub(crate) fn new(support: Arc<ThreadRuntimeSupport>, authority: Arc<ThreadAuthority>) -> Self {
+        Self { support, authority }
+    }
+
+    /// Reports whether an admitted turn currently owns this thread.
+    pub(crate) fn has_active_turn(&self) -> bool {
+        self.support.has_active_turn(&self.authority)
+    }
+
+    /// Reports whether the reconnect buffer contains an active turn.
+    pub fn live_is_active(&self) -> bool {
+        self.support.live_is_active(&self.authority)
+    }
+
+    /// Returns reconnect state without creating a runtime entry.
+    pub fn live_snapshot(&self) -> Option<LiveTurnSnapshot> {
+        self.support.live_snapshot(&self.authority)
+    }
+
+    /// Reports whether the current runtime entry contains running tasks.
+    pub(crate) fn has_running_tasks(&self) -> bool {
+        self.support.has_running_for_thread(&self.authority)
+    }
+
+    /// Returns the current revisioned running-task projection.
+    pub fn tasks_snapshot(&self) -> (u64, Vec<RunningTask>) {
+        self.support.tasks_snapshot(&self.authority)
+    }
+
+    /// Returns the current request projections from the bound authority.
+    pub(crate) fn request_states(&self) -> Vec<WireRequestState> {
+        self.support.request_states(&self.authority)
+    }
+
+    /// Resolves captured diff content from the current runtime entry.
+    pub(crate) fn captured_diff(&self, turn_id: TurnId, diff_id: &DiffId) -> RuntimeDiffLookup {
+        self.support
+            .captured_diff(&self.authority, turn_id, diff_id)
+    }
+
+    /// Resolves command output from the current runtime entry.
+    pub(crate) fn command_output(
+        &self,
+        turn_id: TurnId,
+        item_id: ItemId,
+    ) -> RuntimeCommandOutputLookup {
+        self.support
+            .command_output(&self.authority, turn_id, item_id)
+    }
+
+    /// Resolves tool output from the current runtime entry.
+    pub(crate) fn tool_output(&self, turn_id: TurnId, item_id: ItemId) -> RuntimeToolOutputLookup {
+        self.support.tool_output(&self.authority, turn_id, item_id)
+    }
+
+    /// Captures an exact-entry permit for caching a persisted output version.
+    pub(crate) fn persisted_command_output_version_permit(
+        &self,
+    ) -> PersistedCommandOutputVersionPermit {
+        self.support
+            .persisted_command_output_version_permit(&self.authority)
+    }
+
+    /// Finds a running task by its provider process identity.
+    pub(crate) fn task_by_process(&self, process_id: &str) -> Option<RunningTask> {
+        self.support.task_by_process(&self.authority, process_id)
+    }
+
+    /// Updates the terminating projection for a matching running task.
+    pub(crate) fn set_task_terminating(&self, process_id: &str, terminating: bool) -> bool {
+        self.support
+            .set_task_terminating(&self.authority, process_id, terminating)
+    }
+
+    /// Removes a matching running task after the provider reports it unmanaged.
+    pub(crate) fn remove_task_by_process(&self, process_id: &str) -> bool {
+        self.support
+            .remove_task_by_process(&self.authority, process_id)
+    }
+
+    /// Replaces reconnect state for integration setup through the bound authority.
+    pub fn replace_live_turn(&self, turn_id: TurnId, user_input: Option<UserInput>) {
+        self.support
+            .replace_live_turn(&self.authority, turn_id, user_input);
+    }
+
+    /// Applies an event without exposing the runtime implementation's transition result.
+    pub fn apply_event(&self, event: &AgentEvent, append_live: bool) {
+        self.support
+            .apply_event(&self.authority, event, append_live);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reserve_turn_for_test(&self, reservation: TurnReservation) -> ThreadTurnLease {
+        self.support
+            .reserve_turn(&self.authority, reservation)
+            .expect("test turn reservation must succeed")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn normalize_command_output_for_test(&self, event: AgentEvent) -> AgentEvent {
+        self.support.normalize_command_output(event)
+    }
 }
 
 impl ThreadRuntimeSupport {
@@ -523,13 +636,13 @@ impl ThreadRuntimeSupport {
             .map(|superseded| superseded.current.clone())
             .map_or(RuntimeDiffLookup::Missing, RuntimeDiffLookup::Superseded)
     }
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with_max_command_output_bytes(
             giskard_persist::config::RetentionConfig::DEFAULT_MAX_COMMAND_OUTPUT_BYTES,
         )
     }
 
-    pub fn with_max_command_output_bytes(max_command_output_bytes: usize) -> Self {
+    pub(crate) fn with_max_command_output_bytes(max_command_output_bytes: usize) -> Self {
         Self {
             overview: Arc::new(Mutex::new(OverviewState::default())),
             max_command_output_bytes,
@@ -575,7 +688,7 @@ impl ThreadRuntimeSupport {
             .is_some_and(|revision| revision == permit.lifecycle_revision)
     }
 
-    pub fn live_is_active(&self, authority: &Arc<ThreadAuthority>) -> bool {
+    pub(crate) fn live_is_active(&self, authority: &Arc<ThreadAuthority>) -> bool {
         let thread_id = authority.thread_id();
         let Some(entry) = self.existing_entry(authority) else {
             return false;
@@ -584,7 +697,10 @@ impl ThreadRuntimeSupport {
         entry.live.is_active(thread_id)
     }
 
-    pub fn live_snapshot(&self, authority: &Arc<ThreadAuthority>) -> Option<LiveTurnSnapshot> {
+    pub(crate) fn live_snapshot(
+        &self,
+        authority: &Arc<ThreadAuthority>,
+    ) -> Option<LiveTurnSnapshot> {
         let thread_id = authority.thread_id();
         let entry = self.existing_entry(authority)?;
         let entry = lock_unpoison(&entry, "thread runtime entry");
@@ -618,7 +734,7 @@ impl ThreadRuntimeSupport {
             .ensure_turn_with_user_input(thread_id, turn_id, user_input)
     }
 
-    pub fn replace_live_turn(
+    pub(crate) fn replace_live_turn(
         &self,
         authority: &Arc<ThreadAuthority>,
         turn_id: TurnId,
@@ -661,7 +777,10 @@ impl ThreadRuntimeSupport {
         entry.live.resolve_server_request(thread_id, request_id);
     }
 
-    pub fn tasks_snapshot(&self, authority: &Arc<ThreadAuthority>) -> (u64, Vec<RunningTask>) {
+    pub(crate) fn tasks_snapshot(
+        &self,
+        authority: &Arc<ThreadAuthority>,
+    ) -> (u64, Vec<RunningTask>) {
         let thread_id = authority.thread_id();
         let Some(entry) = self.existing_entry(authority) else {
             return (0, Vec::new());
@@ -753,7 +872,7 @@ impl ThreadRuntimeSupport {
         changed
     }
 
-    pub fn apply_event(
+    pub(crate) fn apply_event(
         &self,
         authority: &Arc<ThreadAuthority>,
         event: &AgentEvent,

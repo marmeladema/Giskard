@@ -11,7 +11,6 @@ use crate::ledger::{self, LedgerHandle};
 use crate::registry::{HarnessFactory, HarnessRegistry};
 use crate::routes::{http_request_context_middleware, protected_routes, public_routes};
 use crate::thread_metadata::ThreadMetadataService;
-use crate::thread_runtime::ThreadRuntimeSupport;
 use crate::throttle::LoginThrottle;
 
 #[derive(Clone)]
@@ -51,7 +50,6 @@ pub struct AppState {
     pub hub: Arc<Hub>,
     pub thread_metadata: Arc<ThreadMetadataService>,
     pub registry: Arc<HarnessRegistry>,
-    pub runtime: Arc<ThreadRuntimeSupport>,
     pub highlighter: Arc<Highlighter>,
     /// Single-writer token-ledger actor handle (§5.4).
     pub ledger: LedgerHandle,
@@ -83,21 +81,19 @@ impl AppState {
         retention_config: Option<&giskard_persist::config::RetentionConfig>,
     ) -> Self {
         let hub = Arc::new(Hub::new());
-        let runtime = Arc::new(ThreadRuntimeSupport::with_max_command_output_bytes(
-            retention_config.map_or(
-                giskard_persist::config::RetentionConfig::DEFAULT_MAX_COMMAND_OUTPUT_BYTES,
-                |retention| retention.max_command_output_bytes,
-            ),
-        ));
+        let max_command_output_bytes = retention_config.map_or(
+            giskard_persist::config::RetentionConfig::DEFAULT_MAX_COMMAND_OUTPUT_BYTES,
+            |retention| retention.max_command_output_bytes,
+        );
         let highlighter = match viz_config {
             Some(viz) => Arc::new(Highlighter::with_max_size(viz.max_highlight_size)),
             None => Arc::new(Highlighter::new()),
         };
         let ledger = ledger::spawn(store.clone());
-        let registry = Arc::new(HarnessRegistry::new_with_runtime(
+        let registry = Arc::new(HarnessRegistry::new_with_max_command_output_bytes(
             factory,
             hub.clone(),
-            runtime.clone(),
+            max_command_output_bytes,
             store.clone(),
             ledger.clone(),
         ));
@@ -107,7 +103,6 @@ impl AppState {
             hub,
             thread_metadata,
             registry,
-            runtime,
             highlighter,
             ledger,
             session_key: session_key.into(),

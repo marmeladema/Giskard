@@ -480,20 +480,22 @@ async fn delete_project(
         .ok_or(ApiError::NotFound)?;
     let thread_ids = state.store.list_threads(id).await?;
     for thread_id in thread_ids {
-        let authority = state.registry.thread_authority(thread_id).await;
-        if authority
+        let runtime = state.registry.thread_runtime(thread_id).await;
+        if runtime
             .as_ref()
-            .is_some_and(|authority| state.runtime.live_is_active(authority))
-            || state.registry.thread_has_active_turn(thread_id).await
+            .is_some_and(|runtime| runtime.live_is_active())
+            || runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.has_active_turn())
         {
             return Err(ApiError::Conflict(
                 "project has a thread with an active turn; stop it before removing the project"
                     .into(),
             ));
         }
-        if authority
+        if runtime
             .as_ref()
-            .is_some_and(|authority| state.runtime.has_running_for_thread(authority))
+            .is_some_and(|runtime| runtime.has_running_tasks())
         {
             return Err(ApiError::Conflict(
                 "project has a thread with running commands; stop them before removing the project"
@@ -544,19 +546,21 @@ async fn reject_thread_mutation_if_live(
     state: &AppState,
     thread_id: ThreadId,
 ) -> Result<(), ApiError> {
-    let authority = state.registry.thread_authority(thread_id).await;
-    if state.registry.thread_has_active_turn(thread_id).await
-        || authority
+    let runtime = state.registry.thread_runtime(thread_id).await;
+    if runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.has_active_turn())
+        || runtime
             .as_ref()
-            .is_some_and(|authority| state.runtime.live_is_active(authority))
+            .is_some_and(|runtime| runtime.live_is_active())
     {
         return Err(ApiError::Conflict(
             "thread has an active turn; stop it before archiving or deleting".into(),
         ));
     }
-    if authority
+    if runtime
         .as_ref()
-        .is_some_and(|authority| !state.runtime.tasks_snapshot(authority).1.is_empty())
+        .is_some_and(|runtime| !runtime.tasks_snapshot().1.is_empty())
     {
         return Err(ApiError::Conflict(
             "thread has running commands; stop them before archiving or deleting".into(),
@@ -2430,25 +2434,19 @@ mod tests {
             git_workspace: None,
         };
         state.store.save_thread(project_id, &thread).await.unwrap();
-        let authority = state
+        let runtime = state
             .registry
-            .verified_thread_authority(project_id, thread_id)
+            .verified_thread_runtime(project_id, thread_id)
             .await
             .unwrap();
 
-        let _lease = state
-            .runtime
-            .reserve_turn(
-                &authority,
-                crate::thread_runtime::TurnReservation {
-                    project_id,
-                    harness_thread_id: thread.harness_thread_id.clone(),
-                    mode: thread.mode,
-                    model: thread.current_model.clone(),
-                    context_kind: "test",
-                },
-            )
-            .unwrap();
+        let _lease = runtime.reserve_turn_for_test(crate::thread_runtime::TurnReservation {
+            project_id,
+            harness_thread_id: thread.harness_thread_id.clone(),
+            mode: thread.mode,
+            model: thread.current_model.clone(),
+            context_kind: "test",
+        });
 
         let persisted_item = Item {
             id: item_id,
@@ -2491,30 +2489,28 @@ mod tests {
             .await
             .unwrap();
 
-        let runtime_event = state
-            .runtime
-            .normalize_command_output(AgentEvent::ItemCompleted {
-                thread: thread_id,
-                turn: turn_id,
-                item: Item {
-                    id: item_id,
-                    harness_item_id: "runtime-command".into(),
-                    payload: ItemPayload::CommandExecution {
-                        command: "printf runtime".into(),
-                        cwd: workspace.path().to_path_buf(),
-                        output: "runtime output".into(),
-                        output_truncated: false,
-                        output_original_bytes: None,
-                        output_original_lines: None,
-                        exit_code: Some(0),
-                        status: Some("completed".into()),
-                        process_id: None,
-                        duration_ms: Some(2),
-                    },
-                    created_at: now,
+        let runtime_event = runtime.normalize_command_output_for_test(AgentEvent::ItemCompleted {
+            thread: thread_id,
+            turn: turn_id,
+            item: Item {
+                id: item_id,
+                harness_item_id: "runtime-command".into(),
+                payload: ItemPayload::CommandExecution {
+                    command: "printf runtime".into(),
+                    cwd: workspace.path().to_path_buf(),
+                    output: "runtime output".into(),
+                    output_truncated: false,
+                    output_original_bytes: None,
+                    output_original_lines: None,
+                    exit_code: Some(0),
+                    status: Some("completed".into()),
+                    process_id: None,
+                    duration_ms: Some(2),
                 },
-            });
-        state.runtime.apply_event(&authority, &runtime_event, true);
+                created_at: now,
+            },
+        });
+        runtime.apply_event(&runtime_event, true);
 
         let loaded = load_command_output(&state, project_id, thread_id, turn_id, item_id)
             .await
@@ -4259,8 +4255,8 @@ async fn captured_diff(
         return Err(ApiError::NotFound);
     }
     let diff_id = giskard_core::DiffId(diff_id);
-    let runtime_diff = match state.registry.thread_authority(thread_id).await {
-        Some(authority) => state.runtime.captured_diff(&authority, turn_id, &diff_id),
+    let runtime_diff = match state.registry.thread_runtime(thread_id).await {
+        Some(runtime) => runtime.captured_diff(turn_id, &diff_id),
         None => crate::thread_runtime::RuntimeDiffLookup::Missing,
     };
     match runtime_diff {
@@ -4335,13 +4331,13 @@ async fn load_command_output(
     {
         return Err(ApiError::NotFound);
     }
-    let authority = state
+    let runtime = state
         .registry
-        .verified_thread_authority(project_id, thread_id)
+        .verified_thread_runtime(project_id, thread_id)
         .await
         .map_err(harness_api_error)?;
     if let crate::thread_runtime::RuntimeCommandOutputLookup::Found(output) =
-        state.runtime.command_output(&authority, turn_id, item_id)
+        runtime.command_output(turn_id, item_id)
     {
         return Ok(LoadedCommandOutput {
             output: output.output,
@@ -4351,9 +4347,7 @@ async fn load_command_output(
             version: output.version,
         });
     }
-    let version_permit = state
-        .runtime
-        .persisted_command_output_version_permit(&authority);
+    let version_permit = runtime.persisted_command_output_version_permit();
     let output = state
         .store
         .load_command_output(project_id, thread_id, turn_id, item_id)
@@ -4361,7 +4355,7 @@ async fn load_command_output(
         .map_err(|error| ApiError::Internal(error.to_string()))?
         .ok_or(ApiError::NotFound)?;
     if let crate::thread_runtime::RuntimeCommandOutputLookup::Found(output) =
-        state.runtime.command_output(&authority, turn_id, item_id)
+        runtime.command_output(turn_id, item_id)
     {
         return Ok(LoadedCommandOutput {
             output: output.output,
@@ -4393,7 +4387,7 @@ async fn load_command_output(
         })?;
         let (loaded, computed) = output;
         if let crate::thread_runtime::RuntimeCommandOutputLookup::Found(output) =
-            state.runtime.command_output(&authority, turn_id, item_id)
+            runtime.command_output(turn_id, item_id)
         {
             return Ok(LoadedCommandOutput {
                 output: output.output,
@@ -4555,10 +4549,10 @@ async fn tool_output(
     {
         return Err(ApiError::NotFound);
     }
-    let authority = state.registry.thread_authority(thread_id).await;
-    let runtime_output = || match authority
+    let runtime = state.registry.thread_runtime(thread_id).await;
+    let runtime_output = || match runtime
         .as_ref()
-        .map(|authority| state.runtime.tool_output(authority, turn_id, item_id))
+        .map(|runtime| runtime.tool_output(turn_id, item_id))
         .unwrap_or(crate::thread_runtime::RuntimeToolOutputLookup::Missing)
     {
         crate::thread_runtime::RuntimeToolOutputLookup::Found(output) => Some(output),
@@ -4654,7 +4648,7 @@ async fn send_activity_bootstrap(
     client_id: usize,
     tx: &mpsc::Sender<ServerMessage>,
 ) {
-    let overview = state.runtime.current_overview();
+    let overview = state.registry.runtime_overview();
     debug!(
         %client_id,
         revision = overview.revision,
@@ -4990,10 +4984,8 @@ async fn handle_client_msg(
             );
 
             let live_snapshot_started_at = Instant::now();
-            let authority = state.registry.thread_authority(thread_id).await;
-            let live_snapshot = authority
-                .as_ref()
-                .and_then(|authority| state.runtime.live_snapshot(authority));
+            let runtime = state.registry.thread_runtime(thread_id).await;
+            let live_snapshot = runtime.as_ref().and_then(|runtime| runtime.live_snapshot());
             debug!(
                 %project_id,
                 %thread_id,
@@ -5004,9 +4996,9 @@ async fn handle_client_msg(
                 elapsed_ms = live_snapshot_started_at.elapsed().as_millis(),
                 "built subscription live snapshot"
             );
-            let (revision, tasks) = authority.as_ref().map_or((0, Vec::new()), |authority| {
-                state.runtime.tasks_snapshot(authority)
-            });
+            let (revision, tasks) = runtime
+                .as_ref()
+                .map_or((0, Vec::new()), |runtime| runtime.tasks_snapshot());
             let running_tasks = ServerMessage::RunningTasks {
                 thread_id,
                 revision,
@@ -5019,9 +5011,10 @@ async fn handle_client_msg(
                 let _ = tx.send(ServerMessage::LiveTurnSnapshot(snap)).await;
             }
             let _ = tx.send(running_tasks).await;
-            for request in authority.as_ref().map_or_else(Vec::new, |authority| {
-                state.runtime.request_states(authority)
-            }) {
+            for request in runtime
+                .as_ref()
+                .map_or_else(Vec::new, |runtime| runtime.request_states())
+            {
                 let _ = tx.send(ServerMessage::RequestState(request)).await;
             }
         }
@@ -5578,9 +5571,9 @@ async fn handle_client_msg(
             process_id,
         } => {
             let process_id_for_state = process_id.clone();
-            let authority = state
+            let runtime = state
                 .registry
-                .thread_authority(thread_id)
+                .thread_runtime(thread_id)
                 .await
                 .ok_or_else(|| {
                     WsError::from_harness(
@@ -5589,13 +5582,8 @@ async fn handle_client_msg(
                         Some(thread_id),
                     )
                 })?;
-            let existing_command = state
-                .runtime
-                .task_by_process(&authority, &process_id_for_state);
-            if state
-                .runtime
-                .set_task_terminating(&authority, &process_id_for_state, true)
-            {
+            let existing_command = runtime.task_by_process(&process_id_for_state);
+            if runtime.set_task_terminating(&process_id_for_state, true) {
                 broadcast_running_commands(state, thread_id).await;
             }
             let terminate_result = tokio::time::timeout(
@@ -5626,9 +5614,7 @@ async fn handle_client_msg(
                         .map(|cmd| cmd.after_turn)
                         .unwrap_or(false)
                 {
-                    let removed = state
-                        .runtime
-                        .remove_task_by_process(&authority, &process_id_for_state);
+                    let removed = runtime.remove_task_by_process(&process_id_for_state);
                     if removed {
                         broadcast_running_commands(state, thread_id).await;
                     }
@@ -5658,10 +5644,7 @@ async fn handle_client_msg(
                     return Ok(());
                 }
 
-                if state
-                    .runtime
-                    .set_task_terminating(&authority, &process_id_for_state, false)
-                {
+                if runtime.set_task_terminating(&process_id_for_state, false) {
                     broadcast_running_commands(state, thread_id).await;
                 }
                 return Err(
@@ -6385,10 +6368,10 @@ async fn load_thread(
 }
 
 async fn broadcast_running_commands(state: &AppState, thread_id: ThreadId) {
-    let Some(authority) = state.registry.thread_authority(thread_id).await else {
+    let Some(runtime) = state.registry.thread_runtime(thread_id).await else {
         return;
     };
-    let (revision, tasks) = state.runtime.tasks_snapshot(&authority);
+    let (revision, tasks) = runtime.tasks_snapshot();
     state
         .hub
         .broadcast(

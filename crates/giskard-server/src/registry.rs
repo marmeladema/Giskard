@@ -34,7 +34,7 @@ use giskard_harness::{
 };
 use giskard_persist::PersistStore;
 use giskard_persist::store::{ProjectConfig, ThreadFile, ThreadMutation, TurnCommitOutcome};
-use giskard_proto::{RunningTask, ServerMessage, WireAgentEvent, WireItem};
+use giskard_proto::{RunningTask, ServerMessage, ThreadRuntimeOverview, WireAgentEvent, WireItem};
 
 use crate::hub::Hub;
 use crate::ledger::LedgerHandle;
@@ -45,15 +45,15 @@ use crate::thread_graph::{
 };
 use crate::thread_metadata::ThreadMetadataService;
 use crate::thread_runtime::{
-    AppliedRuntimeEvent, RequestResolution, RequestTransition, RestorePermit, RuntimeRequestId,
-    ThreadRuntimeSupport, ThreadTurnLease, TurnReservation,
+    AppliedRuntimeEvent, RequestResolution, RequestTransition, ResolvedThreadRuntime,
+    RestorePermit, RuntimeRequestId, ThreadRuntimeSupport, ThreadTurnLease, TurnReservation,
 };
 
 mod project;
 mod thread;
 
 use project::{HarnessTransitions, LifecycleLock, ProjectAuthority, WeakLifecycleLock};
-pub use thread::ThreadAuthority;
+pub(crate) use thread::ThreadAuthority;
 use thread::{OwnerLock, WeakOwnerLock};
 
 #[async_trait]
@@ -900,12 +900,17 @@ impl RegistryShared {
 
     #[cfg(test)]
     fn new(hub: Arc<Hub>, store: Arc<PersistStore>, ledger: LedgerHandle) -> Self {
-        Self::new_with_runtime(hub, Arc::new(ThreadRuntimeSupport::new()), store, ledger)
+        Self::new_with_max_command_output_bytes(
+            hub,
+            giskard_persist::config::RetentionConfig::DEFAULT_MAX_COMMAND_OUTPUT_BYTES,
+            store,
+            ledger,
+        )
     }
 
-    fn new_with_runtime(
+    fn new_with_max_command_output_bytes(
         hub: Arc<Hub>,
-        runtime: Arc<ThreadRuntimeSupport>,
+        max_command_output_bytes: usize,
         store: Arc<PersistStore>,
         ledger: LedgerHandle,
     ) -> Self {
@@ -916,7 +921,9 @@ impl RegistryShared {
             threads: Arc::new(Mutex::new(ThreadIndex::default())),
             background_tasks: Arc::new(RegistryTaskTracker::default()),
             hub,
-            runtime,
+            runtime: Arc::new(ThreadRuntimeSupport::with_max_command_output_bytes(
+                max_command_output_bytes,
+            )),
             store,
             thread_metadata,
             ledger,
@@ -994,8 +1001,13 @@ fn spawn_thread_update_forwarder(
 }
 
 impl HarnessRegistry {
-    pub async fn thread_authority(&self, thread_id: ThreadId) -> Option<Arc<ThreadAuthority>> {
-        self.shared.thread_authority(thread_id).await
+    /// Resolves a bound runtime view without interning a thread authority.
+    pub async fn thread_runtime(&self, thread_id: ThreadId) -> Option<ResolvedThreadRuntime> {
+        let authority = self.shared.thread_authority(thread_id).await?;
+        Some(ResolvedThreadRuntime::new(
+            self.shared.runtime.clone(),
+            authority,
+        ))
     }
 
     pub async fn loaded_thread_binding(&self, thread_id: ThreadId) -> Option<LoadedThreadBinding> {
@@ -1005,15 +1017,26 @@ impl HarnessRegistry {
             .map(|resolved| resolved.binding)
     }
 
-    pub(crate) async fn verified_thread_authority(
+    /// Resolves or interns a project-verified authority and returns its bound runtime view.
+    pub(crate) async fn verified_thread_runtime(
         &self,
         project_id: ProjectId,
         thread_id: ThreadId,
-    ) -> Result<Arc<ThreadAuthority>, HarnessError> {
-        self.shared
+    ) -> Result<ResolvedThreadRuntime, HarnessError> {
+        let authority = self
+            .shared
             .intern_thread_authority(thread_id, project_id)
             .await
-            .map_err(|error| HarnessError::Protocol(error.to_string()))
+            .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+        Ok(ResolvedThreadRuntime::new(
+            self.shared.runtime.clone(),
+            authority,
+        ))
+    }
+
+    /// Returns the current cross-thread runtime overview projection.
+    pub(crate) fn runtime_overview(&self) -> ThreadRuntimeOverview {
+        self.shared.runtime.current_overview()
     }
 
     pub async fn ensure_thread_writable(
@@ -1049,16 +1072,20 @@ impl HarnessRegistry {
         }
     }
 
-    pub fn new_with_runtime(
+    /// Constructs the registry-owned runtime support with the configured output limit.
+    pub fn new_with_max_command_output_bytes(
         factory: Arc<dyn HarnessFactory>,
         hub: Arc<Hub>,
-        runtime: Arc<ThreadRuntimeSupport>,
+        max_command_output_bytes: usize,
         store: Arc<PersistStore>,
         ledger: LedgerHandle,
     ) -> Self {
         Self {
-            shared: Arc::new(RegistryShared::new_with_runtime(
-                hub, runtime, store, ledger,
+            shared: Arc::new(RegistryShared::new_with_max_command_output_bytes(
+                hub,
+                max_command_output_bytes,
+                store,
+                ledger,
             )),
             factory,
         }
@@ -6378,6 +6405,44 @@ mod tests {
                 .await
                 .into_iter()
                 .all(|(candidate, _)| candidate != thread_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_facade_resolves_one_registry_owned_support() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let registry = super::HarnessRegistry::new(
+            Arc::new(UnusedHarnessFactory),
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store),
+        );
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+
+        assert!(registry.thread_runtime(thread_id).await.is_none());
+        assert!(registry.shared.thread_authority(thread_id).await.is_none());
+
+        let first = registry
+            .verified_thread_runtime(project_id, thread_id)
+            .await
+            .unwrap();
+        let handle = ThreadHandle::detached(thread_id, "facade-native".into());
+        let _lease = first.reserve_turn_for_test(turn_reservation(
+            project_id,
+            &handle,
+            &test_turn_context(),
+        ));
+
+        let later = registry.thread_runtime(thread_id).await.unwrap();
+        assert!(later.has_active_turn());
+        assert!(
+            registry
+                .runtime_overview()
+                .threads
+                .iter()
+                .any(|summary| summary.thread_id == thread_id)
         );
     }
 
