@@ -94,9 +94,9 @@ Cargo workspace with 8 crates under `crates/`:
   transport, mapper, active turns, pending compactions, and pending context restores must remain
   task-owned. Do not share them through `Arc<Mutex<_>>`, `Arc<RwLock<_>>`, or independent
   state-mutating workers; helper futures may borrow this state only through `&mut self`.
-- Every production Codex thread route must be established through
-  `CodexInstance::claim_thread_route`; do not claim mapper identity and publish its event sender as
-  separate operations.
+- Every production Codex thread route must be established through the `CodexInstance` route
+  methods; do not claim or replace mapper identity and publish its event sender as separate
+  operations. Resume-fallback replacement must require the exact prior native/Giskard binding.
 - Atomic writes for all persistence (temp file + fsync + rename).
 - The store's per-thread locks are in-process `Mutex`es and order nothing between binaries. Anything
   that rewrites or deletes store files from outside `giskard-server` must hold the advisory

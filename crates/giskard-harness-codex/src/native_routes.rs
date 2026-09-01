@@ -79,6 +79,63 @@ impl NativeThreadRoutes {
         Ok(route)
     }
 
+    /// Atomically replaces one exact native/Giskard route with a new native identity.
+    pub(super) fn replace(
+        &mut self,
+        expected_native_thread_id: String,
+        new_native_thread_id: String,
+        thread_id: ThreadId,
+    ) -> Result<NativeRoute, HarnessError> {
+        let expected_native_thread_id =
+            NativeThreadId::new(expected_native_thread_id.trim().to_owned());
+        let new_native_thread_id = NativeThreadId::new(new_native_thread_id.trim().to_owned());
+        if expected_native_thread_id.as_str().is_empty() || new_native_thread_id.as_str().is_empty()
+        {
+            return Err(HarnessError::Protocol(
+                "cannot replace a route with an empty native thread id".into(),
+            ));
+        }
+        let Some(expected_route) = self.by_native.get(&expected_native_thread_id) else {
+            return Err(HarnessError::Protocol(format!(
+                "native thread {expected_native_thread_id} is not bound to thread {thread_id}"
+            )));
+        };
+        if expected_route.thread_id != thread_id {
+            return Err(HarnessError::Protocol(format!(
+                "native thread {expected_native_thread_id} is already bound to {}, not {thread_id}",
+                expected_route.thread_id
+            )));
+        }
+        if self.native_by_thread.get(&thread_id) != Some(&expected_native_thread_id) {
+            return Err(HarnessError::Protocol(format!(
+                "thread {thread_id} is not bound to expected native thread {expected_native_thread_id}"
+            )));
+        }
+        if new_native_thread_id != expected_native_thread_id
+            && let Some(existing) = self.by_native.get(&new_native_thread_id)
+        {
+            return Err(HarnessError::Protocol(format!(
+                "native thread {new_native_thread_id} is already bound to {}, not {thread_id}",
+                existing.thread_id
+            )));
+        }
+
+        let next_epoch = self
+            .next_epoch
+            .checked_next()
+            .ok_or_else(|| HarnessError::Protocol("native route epoch space exhausted".into()))?;
+        let route = NativeRoute {
+            thread_id,
+            epoch: next_epoch,
+        };
+        self.by_native.remove(&expected_native_thread_id);
+        self.by_native.insert(new_native_thread_id.clone(), route);
+        self.native_by_thread
+            .insert(thread_id, new_native_thread_id);
+        self.next_epoch = next_epoch;
+        Ok(route)
+    }
+
     /// Returns the route for a normalized native ID when one is established.
     pub(super) fn route_for_native(&self, native_thread_id: &str) -> Option<NativeRoute> {
         self.by_native.get(native_thread_id.trim()).copied()
@@ -126,5 +183,38 @@ mod tests {
 
         let second_route = routes.claim("native-b".into(), second).unwrap();
         assert!(second_route.epoch > route.epoch);
+    }
+
+    #[test]
+    fn native_route_replacement_is_exact_atomic_and_advances_epoch() {
+        let mut routes = NativeThreadRoutes::default();
+        let thread = ThreadId::new();
+        let other = ThreadId::new();
+        let original = routes.claim("native-old".into(), thread).unwrap();
+        routes.claim("native-other".into(), other).unwrap();
+
+        assert!(
+            routes
+                .replace("native-wrong".into(), "native-new".into(), thread)
+                .is_err()
+        );
+        assert!(
+            routes
+                .replace("native-old".into(), "native-other".into(), thread)
+                .is_err()
+        );
+        assert_eq!(routes.route_for_native("native-old"), Some(original));
+        assert!(routes.route_for_native("native-new").is_none());
+
+        let replacement = routes
+            .replace("native-old".into(), "native-new".into(), thread)
+            .unwrap();
+        assert!(replacement.epoch > original.epoch);
+        assert!(routes.route_for_native("native-old").is_none());
+        assert_eq!(routes.route_for_native("native-new"), Some(replacement));
+        assert_eq!(
+            routes.claim("native-new".into(), thread).unwrap(),
+            replacement
+        );
     }
 }

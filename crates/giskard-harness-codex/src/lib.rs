@@ -4298,15 +4298,28 @@ mod tests {
 
     #[tokio::test]
     async fn normal_resume_keeps_fresh_thread_recovery_after_missing_rollout() {
-        let (harness, controller) = spawn_fake_harness();
+        let thread = ThreadId::new();
+        let bootstrap = HarnessBootstrap {
+            known_threads: vec![giskard_harness::KnownThreadBinding {
+                harness_thread_id: "native-missing".into(),
+                thread_id: thread,
+            }],
+        };
+        let (harness, controller) = spawn_fake_harness_with_bootstrap(bootstrap);
+        let original_sender =
+            sender_for_thread(&harness.senders, thread).expect("bootstrap sender exists");
         controller.fail_thread_resume_missing_rollout(1).await;
 
         let opened = harness
-            .open_thread(open_opts(ThreadId::new(), Some("native-missing")))
+            .open_thread(open_opts(thread, Some("native-missing")))
             .await
             .unwrap();
 
+        assert_eq!(opened.thread, thread);
         assert_eq!(opened.harness_thread_id, "native-thread-1");
+        assert!(original_sender.same_channel(
+            &sender_for_thread(&harness.senders, thread).expect("replacement sender exists")
+        ));
         assert_eq!(
             opened.warning.as_ref().map(|warning| warning.code.as_str()),
             Some("codex_resume_failed")
