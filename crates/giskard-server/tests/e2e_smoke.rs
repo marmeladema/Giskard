@@ -2413,8 +2413,11 @@ async fn wait_for_live_item_id(
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     loop {
         if let Some(item_id) = state
-            .runtime
-            .live_snapshot(&state.registry.thread_authority(thread_id).await.unwrap())
+            .registry
+            .thread_runtime(thread_id)
+            .await
+            .unwrap()
+            .live_snapshot()
             .and_then(|snapshot| {
                 snapshot
                     .accumulated
@@ -3151,8 +3154,11 @@ async fn subscribe_thread_state_reports_a_turn_the_harness_has_not_streamed_yet(
     harness.wait_for_start_calls(1).await;
     assert!(
         !state
-            .runtime
-            .live_is_active(&state.registry.thread_authority(thread_id).await.unwrap(),),
+            .registry
+            .thread_runtime(thread_id)
+            .await
+            .unwrap()
+            .live_is_active(),
         "the harness is still inside start_turn, so there is nothing buffered for this turn"
     );
 
@@ -3208,8 +3214,11 @@ async fn send_input_rejects_same_thread_during_compaction() {
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     while !state
-        .runtime
-        .live_is_active(&state.registry.thread_authority(thread_id).await.unwrap())
+        .registry
+        .thread_runtime(thread_id)
+        .await
+        .unwrap()
+        .live_is_active()
     {
         if tokio::time::Instant::now() >= deadline {
             panic!("compaction thread did not become active");
@@ -3395,11 +3404,12 @@ async fn new_turn_start_replaces_stale_live_buffer_without_dropping_events() {
     let cookie = login_cookie(&client, &base).await;
     let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
     let stale_turn = TurnId::new();
-    state.runtime.replace_live_turn(
-        &state.registry.thread_authority(thread_id).await.unwrap(),
-        stale_turn,
-        Some(UserInput::text("stale interrupted turn")),
-    );
+    state
+        .registry
+        .thread_runtime(thread_id)
+        .await
+        .unwrap()
+        .replace_live_turn(stale_turn, Some(UserInput::text("stale interrupted turn")));
     let mut ws = connect_ws(port, &cookie).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -3426,8 +3436,11 @@ async fn new_turn_start_replaces_stale_live_buffer_without_dropping_events() {
     wait_for_turn_completed(&mut ws, thread_id).await;
     assert!(
         state
-            .runtime
-            .live_snapshot(&state.registry.thread_authority(thread_id).await.unwrap(),)
+            .registry
+            .thread_runtime(thread_id)
+            .await
+            .unwrap()
+            .live_snapshot()
             .is_none()
     );
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
@@ -3485,13 +3498,13 @@ async fn compact_context_does_not_block_turns_on_other_threads_or_projects() {
     .unwrap();
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-    while !state.runtime.live_is_active(
-        &state
-            .registry
-            .thread_authority(compacting_thread)
-            .await
-            .unwrap(),
-    ) {
+    while !state
+        .registry
+        .thread_runtime(compacting_thread)
+        .await
+        .unwrap()
+        .live_is_active()
+    {
         if tokio::time::Instant::now() >= deadline {
             panic!("compaction thread did not become active");
         }
@@ -3556,13 +3569,12 @@ async fn compact_context_does_not_block_turns_on_other_threads_or_projects() {
         "a compaction turn must not block another project from completing work"
     );
     assert!(
-        state.runtime.live_is_active(
-            &state
-                .registry
-                .thread_authority(compacting_thread)
-                .await
-                .unwrap(),
-        ),
+        state
+            .registry
+            .thread_runtime(compacting_thread)
+            .await
+            .unwrap()
+            .live_is_active(),
         "precondition check: compaction should still be active while the other thread completed"
     );
 }
@@ -4637,8 +4649,11 @@ async fn passive_subagent_command_start_streams_before_completion() {
     );
 
     let snapshot = state
-        .runtime
-        .live_snapshot(&state.registry.thread_authority(child_id).await.unwrap())
+        .registry
+        .thread_runtime(child_id)
+        .await
+        .unwrap()
+        .live_snapshot()
         .expect("sub-agent live turn should remain buffered before completion");
     assert_eq!(snapshot.thread_id, child_id);
     assert_eq!(snapshot.turn_id, external_turn);
@@ -5101,8 +5116,11 @@ async fn server_resolved_subagent_link_uses_agent_name_prompt_and_turn() {
         Some("Sub-agent turn")
     );
     let snapshot = state
-        .runtime
-        .live_snapshot(&state.registry.thread_authority(child_id).await.unwrap())
+        .registry
+        .thread_runtime(child_id)
+        .await
+        .unwrap()
+        .live_snapshot()
         .expect("server-resolved sub-agent live turn should remain buffered before completion");
     assert_eq!(
         snapshot.user_input.as_ref().and_then(UserInput::as_text),
@@ -6235,11 +6253,12 @@ async fn thread_archive_and_delete_reject_active_turns() {
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
     let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
-    state.runtime.replace_live_turn(
-        &state.registry.thread_authority(thread_id).await.unwrap(),
-        TurnId::new(),
-        None,
-    );
+    state
+        .registry
+        .thread_runtime(thread_id)
+        .await
+        .unwrap()
+        .replace_live_turn(TurnId::new(), None);
 
     let archive = client
         .post(format!(
@@ -6270,11 +6289,12 @@ async fn project_remove_rejects_active_turns() {
     let client = reqwest::Client::new();
     let cookie = login_cookie(&client, &base).await;
     let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
-    state.runtime.replace_live_turn(
-        &state.registry.thread_authority(thread_id).await.unwrap(),
-        TurnId::new(),
-        None,
-    );
+    state
+        .registry
+        .thread_runtime(thread_id)
+        .await
+        .unwrap()
+        .replace_live_turn(TurnId::new(), None);
 
     let resp = client
         .delete(format!("{base}/api/projects/{project_id}"))
@@ -6305,35 +6325,33 @@ async fn thread_archive_and_delete_reject_running_commands() {
 
     // Track a running command without starting a turn, so only the running-command branch of the
     // guard can trip (not the live-turn branch).
-    let tracked = state
-        .runtime
-        .apply_event(
-            &state.registry.thread_authority(thread_id).await.unwrap(),
-            &AgentEvent::ItemStarted {
-                thread: thread_id,
-                turn: TurnId::new(),
-                item: ItemStart {
-                    id: ItemId::new(),
-                    harness_item_id: "cmd_guard".into(),
-                    kind: ItemKind::CommandExecution,
-                    command: Some(CommandExecutionStart {
-                        command: "sleep 60".into(),
-                        cwd: "/tmp/thread-actions".into(),
-                        status: Some("in_progress".into()),
-                        process_id: Some("proc_guard".into()),
-                        started_at_ms: None,
-                    }),
-                    tool: None,
-                },
+    let runtime = state.registry.thread_runtime(thread_id).await.unwrap();
+    runtime.apply_event(
+        &AgentEvent::ItemStarted {
+            thread: thread_id,
+            turn: TurnId::new(),
+            item: ItemStart {
+                id: ItemId::new(),
+                harness_item_id: "cmd_guard".into(),
+                kind: ItemKind::CommandExecution,
+                command: Some(CommandExecutionStart {
+                    command: "sleep 60".into(),
+                    cwd: "/tmp/thread-actions".into(),
+                    status: Some("in_progress".into()),
+                    process_id: Some("proc_guard".into()),
+                    started_at_ms: None,
+                }),
+                tool: None,
             },
-            false,
-        )
-        .tasks_changed;
-    assert!(tracked, "command should be tracked as running");
+        },
+        false,
+    );
     assert!(
-        !state
-            .runtime
-            .live_is_active(&state.registry.thread_authority(thread_id).await.unwrap(),),
+        !runtime.tasks_snapshot().1.is_empty(),
+        "command should be tracked as running"
+    );
+    assert!(
+        !runtime.live_is_active(),
         "precondition: no live turn — only a running command"
     );
 
@@ -6367,31 +6385,31 @@ async fn project_remove_rejects_running_commands() {
     let cookie = login_cookie(&client, &base).await;
     let (project_id, thread_id) = create_project_and_thread(&client, &base, &cookie).await;
 
-    let tracked = state
-        .runtime
-        .apply_event(
-            &state.registry.thread_authority(thread_id).await.unwrap(),
-            &AgentEvent::ItemStarted {
-                thread: thread_id,
-                turn: TurnId::new(),
-                item: ItemStart {
-                    id: ItemId::new(),
-                    harness_item_id: "cmd_project_guard".into(),
-                    kind: ItemKind::CommandExecution,
-                    command: Some(CommandExecutionStart {
-                        command: "sleep 60".into(),
-                        cwd: "/tmp/thread-actions".into(),
-                        status: Some("in_progress".into()),
-                        process_id: Some("proc_project_guard".into()),
-                        started_at_ms: None,
-                    }),
-                    tool: None,
-                },
+    let runtime = state.registry.thread_runtime(thread_id).await.unwrap();
+    runtime.apply_event(
+        &AgentEvent::ItemStarted {
+            thread: thread_id,
+            turn: TurnId::new(),
+            item: ItemStart {
+                id: ItemId::new(),
+                harness_item_id: "cmd_project_guard".into(),
+                kind: ItemKind::CommandExecution,
+                command: Some(CommandExecutionStart {
+                    command: "sleep 60".into(),
+                    cwd: "/tmp/thread-actions".into(),
+                    status: Some("in_progress".into()),
+                    process_id: Some("proc_project_guard".into()),
+                    started_at_ms: None,
+                }),
+                tool: None,
             },
-            false,
-        )
-        .tasks_changed;
-    assert!(tracked, "command should be tracked as running");
+        },
+        false,
+    );
+    assert!(
+        !runtime.tasks_snapshot().1.is_empty(),
+        "command should be tracked as running"
+    );
 
     let resp = client
         .delete(format!("{base}/api/projects/{project_id}"))

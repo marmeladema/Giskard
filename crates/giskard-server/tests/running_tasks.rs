@@ -331,8 +331,11 @@ async fn running_tool_call_surfaces_in_running_tasks_snapshot() {
         {
             assert!(
                 state
-                    .runtime
-                    .tasks_snapshot(&state.registry.thread_authority(thread_id).await.unwrap())
+                    .registry
+                    .thread_runtime(thread_id)
+                    .await
+                    .unwrap()
+                    .tasks_snapshot()
                     .1
                     .is_empty()
             );

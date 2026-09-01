@@ -571,14 +571,11 @@ async fn websocket_terminate_running_command_marks_terminating_until_terminal_ev
     wait_for_terminating_command(&mut ws).await;
     let snapshot = app
         .state
-        .runtime
-        .tasks_snapshot(
-            &app.state
-                .registry
-                .thread_authority(thread_id)
-                .await
-                .unwrap(),
-        )
+        .registry
+        .thread_runtime(thread_id)
+        .await
+        .unwrap()
+        .tasks_snapshot()
         .1;
     assert_eq!(snapshot.len(), 1);
     assert!(snapshot[0].terminating);
@@ -587,14 +584,11 @@ async fn websocket_terminate_running_command_marks_terminating_until_terminal_ev
     wait_for_completed_command_after_interrupted_turn(&mut ws).await;
     assert!(
         app.state
-            .runtime
-            .tasks_snapshot(
-                &app.state
-                    .registry
-                    .thread_authority(thread_id)
-                    .await
-                    .unwrap()
-            )
+            .registry
+            .thread_runtime(thread_id)
+            .await
+            .unwrap()
+            .tasks_snapshot()
             .1
             .is_empty()
     );
@@ -710,14 +704,11 @@ async fn no_active_for_after_turn_command_clears_stale_snapshot(behavior: Termin
     wait_for_interrupted_turn(&mut ws).await;
     assert!(
         app.state
-            .runtime
-            .tasks_snapshot(
-                &app.state
-                    .registry
-                    .thread_authority(thread_id)
-                    .await
-                    .unwrap()
-            )
+            .registry
+            .thread_runtime(thread_id)
+            .await
+            .unwrap()
+            .tasks_snapshot()
             .1[0]
             .after_turn
     );
@@ -739,14 +730,11 @@ async fn no_active_for_after_turn_command_clears_stale_snapshot(behavior: Termin
     }));
     assert!(
         app.state
-            .runtime
-            .tasks_snapshot(
-                &app.state
-                    .registry
-                    .thread_authority(thread_id)
-                    .await
-                    .unwrap()
-            )
+            .registry
+            .thread_runtime(thread_id)
+            .await
+            .unwrap()
+            .tasks_snapshot()
             .1
             .is_empty()
     );
@@ -804,14 +792,11 @@ async fn terminate_failure_preserves_snapshot(behavior: TerminateBehavior, expec
     assert_eq!(error.process_id.as_deref(), Some("proc_1"));
     let snapshot = app
         .state
-        .runtime
-        .tasks_snapshot(
-            &app.state
-                .registry
-                .thread_authority(thread_id)
-                .await
-                .unwrap(),
-        )
+        .registry
+        .thread_runtime(thread_id)
+        .await
+        .unwrap()
+        .tasks_snapshot()
         .1;
     assert_eq!(snapshot.len(), 1);
     assert_eq!(snapshot[0].process_id.as_deref(), Some("proc_1"));

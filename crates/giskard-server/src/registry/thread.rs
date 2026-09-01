@@ -69,7 +69,7 @@ struct MaterializationSlot {
 }
 
 /// Owns immutable identity and all process-local state for one verified thread.
-pub struct ThreadAuthority {
+pub(crate) struct ThreadAuthority {
     thread_id: ThreadId,
     project_id: ProjectId,
     owner: OwnerLock,
