@@ -53,6 +53,52 @@ pub(crate) struct ThreadRuntimeEntry {
     persisted_command_output_versions: HashMap<(TurnId, ItemId), String>,
 }
 
+/// Optional runtime-entry storage owned by a thread authority.
+pub(crate) struct ThreadRuntimeSlot {
+    current: Mutex<Option<Arc<Mutex<ThreadRuntimeEntry>>>>,
+}
+
+impl ThreadRuntimeSlot {
+    /// Creates an empty runtime slot without allocating an entry.
+    pub(crate) fn new() -> Self {
+        Self {
+            current: Mutex::new(None),
+        }
+    }
+
+    /// Clones the current entry without creating one.
+    pub(crate) fn current(&self) -> Option<Arc<Mutex<ThreadRuntimeEntry>>> {
+        lock_unpoison(&self.current, "thread runtime slot").clone()
+    }
+
+    /// Returns the current entry or installs one while holding the slot lock.
+    pub(crate) fn get_or_create(&self) -> Arc<Mutex<ThreadRuntimeEntry>> {
+        let mut slot = lock_unpoison(&self.current, "thread runtime slot");
+        slot.get_or_insert_with(Default::default).clone()
+    }
+
+    /// Removes and returns the current entry.
+    pub(crate) fn take(&self) -> Option<Arc<Mutex<ThreadRuntimeEntry>>> {
+        lock_unpoison(&self.current, "thread runtime slot").take()
+    }
+
+    /// Invokes `callback` with both non-reentrant slot and entry locks held. The callback must not
+    /// re-enter this slot through the authority's runtime-entry operations.
+    pub(crate) fn with_exact_current<R>(
+        &self,
+        expected: &Arc<Mutex<ThreadRuntimeEntry>>,
+        callback: impl FnOnce(&mut ThreadRuntimeEntry) -> R,
+    ) -> Option<R> {
+        let slot = lock_unpoison(&self.current, "thread runtime slot");
+        let current = slot.as_ref()?;
+        if !Arc::ptr_eq(current, expected) {
+            return None;
+        }
+        let mut entry = lock_unpoison(current, "thread runtime entry");
+        Some(callback(&mut entry))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RuntimeCommandOutput {
     pub output: String,
@@ -312,7 +358,7 @@ impl ThreadRuntimeSupport {
         authority: &Arc<ThreadAuthority>,
         mut event: AgentEvent,
     ) -> AgentEvent {
-        let thread_id = authority.thread_id;
+        let thread_id = authority.thread_id();
         let entry = self.entry_or_create(authority);
         let mut entry = lock_unpoison(&entry, "thread runtime entry");
         match &mut event {
@@ -510,7 +556,7 @@ impl ThreadRuntimeSupport {
     ) -> RestorePermit {
         let revision = lock_unpoison(&entry, "thread runtime entry").lifecycle_revision;
         RestorePermit {
-            thread_id: authority.thread_id,
+            thread_id: authority.thread_id(),
             authority: Arc::downgrade(authority),
             entry: Arc::downgrade(&entry),
             lifecycle_revision: revision,
@@ -524,19 +570,13 @@ impl ThreadRuntimeSupport {
         let Some(authority) = permit.authority.upgrade() else {
             return false;
         };
-        let slot = lock_unpoison(&authority.runtime, "thread runtime slot");
-        let Some(current) = slot.as_ref() else {
-            return false;
-        };
-        if !Arc::ptr_eq(&expected, current) {
-            return false;
-        }
-        let current_revision = lock_unpoison(current, "thread runtime entry").lifecycle_revision;
-        current_revision == permit.lifecycle_revision
+        authority
+            .with_exact_runtime_entry(&expected, |entry| entry.lifecycle_revision)
+            .is_some_and(|revision| revision == permit.lifecycle_revision)
     }
 
     pub fn live_is_active(&self, authority: &Arc<ThreadAuthority>) -> bool {
-        let thread_id = authority.thread_id;
+        let thread_id = authority.thread_id();
         let Some(entry) = self.existing_entry(authority) else {
             return false;
         };
@@ -545,7 +585,7 @@ impl ThreadRuntimeSupport {
     }
 
     pub fn live_snapshot(&self, authority: &Arc<ThreadAuthority>) -> Option<LiveTurnSnapshot> {
-        let thread_id = authority.thread_id;
+        let thread_id = authority.thread_id();
         let entry = self.existing_entry(authority)?;
         let entry = lock_unpoison(&entry, "thread runtime entry");
         entry.live.snapshot(thread_id)
@@ -556,7 +596,7 @@ impl ThreadRuntimeSupport {
         authority: &Arc<ThreadAuthority>,
         item_id: ItemId,
     ) -> Vec<AgentEvent> {
-        let thread_id = authority.thread_id;
+        let thread_id = authority.thread_id();
         let Some(entry) = self.existing_entry(authority) else {
             return Vec::new();
         };
@@ -570,7 +610,7 @@ impl ThreadRuntimeSupport {
         turn_id: TurnId,
         user_input: Option<UserInput>,
     ) -> Result<(), TurnId> {
-        let thread_id = authority.thread_id;
+        let thread_id = authority.thread_id();
         let entry = self.entry_or_create(authority);
         let mut entry = lock_unpoison(&entry, "thread runtime entry");
         entry
@@ -584,7 +624,7 @@ impl ThreadRuntimeSupport {
         turn_id: TurnId,
         user_input: Option<UserInput>,
     ) {
-        let thread_id = authority.thread_id;
+        let thread_id = authority.thread_id();
         let entry = self.entry_or_create(authority);
         let mut entry = lock_unpoison(&entry, "thread runtime entry");
         entry
@@ -598,7 +638,7 @@ impl ThreadRuntimeSupport {
         approval_id: ApprovalId,
         decision: ApprovalDecision,
     ) {
-        let thread_id = authority.thread_id;
+        let thread_id = authority.thread_id();
         let Some(entry) = self.existing_entry(authority) else {
             return;
         };
@@ -613,7 +653,7 @@ impl ThreadRuntimeSupport {
         authority: &Arc<ThreadAuthority>,
         request_id: ServerRequestId,
     ) {
-        let thread_id = authority.thread_id;
+        let thread_id = authority.thread_id();
         let Some(entry) = self.existing_entry(authority) else {
             return;
         };
@@ -622,7 +662,7 @@ impl ThreadRuntimeSupport {
     }
 
     pub fn tasks_snapshot(&self, authority: &Arc<ThreadAuthority>) -> (u64, Vec<RunningTask>) {
-        let thread_id = authority.thread_id;
+        let thread_id = authority.thread_id();
         let Some(entry) = self.existing_entry(authority) else {
             return (0, Vec::new());
         };
@@ -636,7 +676,7 @@ impl ThreadRuntimeSupport {
         authority: &Arc<ThreadAuthority>,
         turn_id: TurnId,
     ) -> bool {
-        let thread_id = authority.thread_id;
+        let thread_id = authority.thread_id();
         let Some(entry) = self.existing_entry(authority) else {
             return false;
         };
@@ -645,7 +685,7 @@ impl ThreadRuntimeSupport {
     }
 
     pub(crate) fn has_running_for_thread(&self, authority: &Arc<ThreadAuthority>) -> bool {
-        let thread_id = authority.thread_id;
+        let thread_id = authority.thread_id();
         let Some(entry) = self.existing_entry(authority) else {
             return false;
         };
@@ -658,7 +698,7 @@ impl ThreadRuntimeSupport {
         authority: &Arc<ThreadAuthority>,
         process_id: &str,
     ) -> Option<RunningTask> {
-        let thread_id = authority.thread_id;
+        let thread_id = authority.thread_id();
         let entry = self.existing_entry(authority)?;
         let entry = lock_unpoison(&entry, "thread runtime entry");
         entry.tasks.get_by_process(thread_id, process_id)
@@ -670,7 +710,7 @@ impl ThreadRuntimeSupport {
         turn_id: TurnId,
         item_id: ItemId,
     ) -> Option<RunningTask> {
-        let thread_id = authority.thread_id;
+        let thread_id = authority.thread_id();
         let entry = self.existing_entry(authority)?;
         let entry = lock_unpoison(&entry, "thread runtime entry");
         entry.tasks.get_by_item(thread_id, turn_id, item_id)
@@ -682,7 +722,7 @@ impl ThreadRuntimeSupport {
         process_id: &str,
         terminating: bool,
     ) -> bool {
-        let thread_id = authority.thread_id;
+        let thread_id = authority.thread_id();
         let Some(entry) = self.existing_entry(authority) else {
             return false;
         };
@@ -701,7 +741,7 @@ impl ThreadRuntimeSupport {
         authority: &Arc<ThreadAuthority>,
         process_id: &str,
     ) -> bool {
-        let thread_id = authority.thread_id;
+        let thread_id = authority.thread_id();
         let Some(entry) = self.existing_entry(authority) else {
             return false;
         };
@@ -719,7 +759,7 @@ impl ThreadRuntimeSupport {
         event: &AgentEvent,
         append_live: bool,
     ) -> AppliedRuntimeEvent {
-        let thread_id = authority.thread_id;
+        let thread_id = authority.thread_id();
         let event_thread_id = event.thread_id();
         if event_thread_id != thread_id {
             warn!(
@@ -740,7 +780,7 @@ impl ThreadRuntimeSupport {
         append_live: bool,
         prepared_output: Option<PreparedItemOutput>,
     ) -> AppliedRuntimeEvent {
-        let thread_id = authority.thread_id;
+        let thread_id = authority.thread_id();
         if event.thread_id() != thread_id {
             return self.apply_event(authority, event, append_live);
         }
@@ -767,25 +807,21 @@ impl ThreadRuntimeSupport {
         }
         let expected = permit.entry.upgrade()?;
         let authority = permit.authority.upgrade()?;
-        // Keep the registry locked until application completes. Retirement therefore either wins
+        // Keep the runtime slot locked until application completes. Retirement therefore either wins
         // before this check, or removes the fully-applied entry afterward; it cannot be followed by
         // stale prepared work recreating authority.
-        let slot = lock_unpoison(&authority.runtime, "thread runtime slot");
-        let current = slot.as_ref()?;
-        if !Arc::ptr_eq(&expected, current) {
-            return None;
-        }
-        let mut entry = lock_unpoison(current, "thread runtime entry");
-        if entry.lifecycle_revision != permit.lifecycle_revision {
-            return None;
-        }
-        Some(self.apply_prepared_event_to_entry(
-            permit.thread_id,
-            event,
-            append_live,
-            prepared_output,
-            &mut entry,
-        ))
+        authority.with_exact_runtime_entry(&expected, |entry| {
+            if entry.lifecycle_revision != permit.lifecycle_revision {
+                return None;
+            }
+            Some(self.apply_prepared_event_to_entry(
+                permit.thread_id,
+                event,
+                append_live,
+                prepared_output,
+                entry,
+            ))
+        })?
     }
 
     fn apply_prepared_event_to_entry(
@@ -911,7 +947,7 @@ impl ThreadRuntimeSupport {
         event: &AgentEvent,
         persisted_turn: Option<(Turn, String)>,
     ) -> AppliedRuntimeEvent {
-        let thread_id = authority.thread_id;
+        let thread_id = authority.thread_id();
         let entry = self.entry_or_create(authority);
         let mut entry = lock_unpoison(&entry, "thread runtime entry");
         let mut applied = self.apply_event_locked(thread_id, event, true, None, &mut entry);
@@ -963,7 +999,7 @@ impl ThreadRuntimeSupport {
         authority: &Arc<ThreadAuthority>,
         reservation: TurnReservation,
     ) -> Result<ThreadTurnLease, HarnessError> {
-        let thread_id = authority.thread_id;
+        let thread_id = authority.thread_id();
         let entry = self.entry_or_create(authority);
         let mut entry = lock_unpoison(&entry, "thread runtime entry");
         if let Some(existing) = &entry.active_turn {
@@ -1010,7 +1046,7 @@ impl ThreadRuntimeSupport {
         authority: &Arc<ThreadAuthority>,
         turn_id: TurnId,
     ) -> Option<ThreadRuntimeOverview> {
-        let thread_id = authority.thread_id;
+        let thread_id = authority.thread_id();
         let entry = self.entry_or_create(authority);
         let mut entry = lock_unpoison(&entry, "thread runtime entry");
         let Some(owner) = entry.active_turn.as_mut() else {
@@ -1022,7 +1058,7 @@ impl ThreadRuntimeSupport {
     }
 
     fn release_turn(&self, authority: &Arc<ThreadAuthority>) -> Option<ThreadRuntimeOverview> {
-        let thread_id = authority.thread_id;
+        let thread_id = authority.thread_id();
         let entry = self.existing_entry(authority)?;
         let mut entry = lock_unpoison(&entry, "thread runtime entry");
         if let Some(owner) = entry.active_turn.take() {
@@ -1043,7 +1079,7 @@ impl ThreadRuntimeSupport {
         authority: &Arc<ThreadAuthority>,
         request: ApprovalRequest,
     ) {
-        let thread_id = authority.thread_id;
+        let thread_id = authority.thread_id();
         let entry = self.entry_or_create(authority);
         let mut entry = lock_unpoison(&entry, "thread runtime entry");
         register_request(
@@ -1060,7 +1096,7 @@ impl ThreadRuntimeSupport {
         authority: &Arc<ThreadAuthority>,
         request_id: RuntimeRequestId,
     ) -> Result<(RequestClaim, RequestTransition), HarnessError> {
-        let thread_id = authority.thread_id;
+        let thread_id = authority.thread_id();
         let entry = self.entry_or_create(authority);
         let mut entry = lock_unpoison(&entry, "thread runtime entry");
         let record = entry.requests.get_mut(&request_id).ok_or_else(|| {
@@ -1096,10 +1132,10 @@ impl ThreadRuntimeSupport {
     pub(crate) fn forget_threads(&self, authorities: &[Arc<ThreadAuthority>]) {
         let thread_ids = authorities
             .iter()
-            .map(|authority| authority.thread_id)
+            .map(|authority| authority.thread_id())
             .collect::<std::collections::HashSet<_>>();
         for authority in authorities {
-            lock_unpoison(&authority.runtime, "thread runtime slot").take();
+            authority.take_runtime_entry();
         }
         let mut overview = lock_unpoison(&self.overview, "runtime overview");
         let before = overview.summaries.len();
@@ -1114,7 +1150,7 @@ impl ThreadRuntimeSupport {
         authority: &Arc<ThreadAuthority>,
         request_id: &RuntimeRequestId,
     ) -> Option<WireRequestState> {
-        let thread_id = authority.thread_id;
+        let thread_id = authority.thread_id();
         let entry = self.existing_entry(authority)?;
         lock_unpoison(&entry, "thread runtime entry")
             .requests
@@ -1123,7 +1159,7 @@ impl ThreadRuntimeSupport {
     }
 
     pub(crate) fn request_states(&self, authority: &Arc<ThreadAuthority>) -> Vec<WireRequestState> {
-        let thread_id = authority.thread_id;
+        let thread_id = authority.thread_id();
         let Some(entry) = self.existing_entry(authority) else {
             return Vec::new();
         };
@@ -1172,16 +1208,14 @@ impl ThreadRuntimeSupport {
     }
 
     fn entry_or_create(&self, authority: &Arc<ThreadAuthority>) -> Arc<Mutex<ThreadRuntimeEntry>> {
-        let mut slot = lock_unpoison(&authority.runtime, "thread runtime slot");
-        slot.get_or_insert_with(|| Arc::new(Mutex::new(ThreadRuntimeEntry::default())))
-            .clone()
+        authority.runtime_entry_or_create()
     }
 
     fn existing_entry(
         &self,
         authority: &Arc<ThreadAuthority>,
     ) -> Option<Arc<Mutex<ThreadRuntimeEntry>>> {
-        lock_unpoison(&authority.runtime, "thread runtime slot").clone()
+        authority.runtime_entry()
     }
 }
 
@@ -1875,11 +1909,7 @@ mod tests {
     use giskard_core::turn::{Mode, TurnMode, TurnModel, TurnStatus, TurnStatusKind};
 
     fn test_authority(thread_id: ThreadId) -> Arc<ThreadAuthority> {
-        Arc::new(ThreadAuthority::new(
-            thread_id,
-            ProjectId::new(),
-            Arc::new(tokio::sync::Mutex::new(())),
-        ))
+        Arc::new(ThreadAuthority::new_for_test(thread_id, ProjectId::new()))
     }
 
     fn approval(id: &str) -> ApprovalRequest {
@@ -2372,7 +2402,7 @@ mod tests {
         assert_eq!(runtime.tasks_snapshot(&authority), (0, Vec::new()));
         assert!(!runtime.has_running_for_thread(&authority));
         assert!(runtime.request_states(&authority).is_empty());
-        assert!(lock_unpoison(&authority.runtime, "thread runtime slot").is_none());
+        assert!(authority.runtime_entry().is_none());
     }
 
     #[test]
@@ -2399,8 +2429,8 @@ mod tests {
         assert!(applied.request_state.is_none());
         assert!(runtime.request_states(&authority).is_empty());
         assert!(runtime.request_states(&event_authority).is_empty());
-        assert!(lock_unpoison(&authority.runtime, "thread runtime slot").is_none());
-        assert!(lock_unpoison(&event_authority.runtime, "thread runtime slot").is_none());
+        assert!(authority.runtime_entry().is_none());
+        assert!(event_authority.runtime_entry().is_none());
     }
 
     #[test]
