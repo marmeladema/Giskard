@@ -279,7 +279,7 @@ impl CodexMapper {
 
     /// B4: bind a native thread id to its owned `ThreadId`. Called at `open_thread` for both fresh
     /// `thread/start` and `thread/resume` (and re-bound after a resume-fallback, §4.7/C5).
-    pub fn claim_thread(
+    pub(super) fn claim_thread(
         &mut self,
         harness_thread_id: String,
         thread: ThreadId,

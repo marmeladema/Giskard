@@ -906,25 +906,33 @@ impl CodexHarness {
     where
         C: CodexTransport + 'static,
     {
-        let mut mapper = CodexMapper::new(workspace_root.clone());
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (control_tx, control_rx) = mpsc::channel(64);
         let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
-        for binding in bootstrap.known_threads {
-            mapper.claim_thread(binding.harness_thread_id, binding.thread_id)?;
-            let (sender, _) = broadcast::channel(BROADCAST_CAPACITY);
-            ensure_thread_sender(&senders, binding.thread_id, sender);
-        }
         let worker_queue = Arc::new(WorkerQueueWatchdog::new());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (worker_done_tx, worker_done) = watch::channel(false);
 
+        let instance = CodexInstance::new(
+            client,
+            WorkerReceivers {
+                commands: cmd_rx,
+                controls: control_rx,
+                shutdown: shutdown_rx,
+                done: worker_done_tx,
+            },
+            senders.clone(),
+            worker_queue.clone(),
+            workspace_root.clone(),
+            writable_roots,
+            bootstrap,
+        )?;
         let harness = Arc::new(Self {
-            workspace_root: workspace_root.clone(),
+            workspace_root,
             client_version,
             cmd_tx,
             control_tx,
-            senders: senders.clone(),
+            senders,
             worker_queue: worker_queue.clone(),
             shutdown_tx,
             worker_done,
@@ -946,20 +954,6 @@ impl CodexHarness {
         });
 
         tokio::spawn(run_worker_queue_watchdog(Arc::downgrade(&worker_queue)));
-        let instance = CodexInstance::new(
-            client,
-            WorkerReceivers {
-                commands: cmd_rx,
-                controls: control_rx,
-                shutdown: shutdown_rx,
-                done: worker_done_tx,
-            },
-            senders,
-            worker_queue,
-            workspace_root,
-            writable_roots,
-            mapper,
-        );
         tokio::spawn(instance.run());
         Ok(harness)
     }
@@ -1785,89 +1779,6 @@ fn is_context_compaction_activity(item: &giskard_core::item::Item) -> bool {
     )
 }
 
-async fn handle_open_thread(
-    client: &mut dyn CodexTransport,
-    mapper: &mut CodexMapper,
-    opts: &OpenThreadOptions,
-    senders: &SenderMap,
-) -> Result<OpenThreadOutcome, HarnessError> {
-    let cwd = opts.workspace_root.to_string_lossy().to_string();
-    let thread_id = opts.thread;
-
-    // Track whether resume-by-id failed and we fell back to a fresh native thread (C5), so we can
-    // warn the caller that agent context was lost while keeping the Giskard-side history.
-    let mut resume_warning = None;
-
-    let opened = if let Some(ref resume_id) = opts.resume {
-        let context = CodexOperationContext::for_project("thread_resume", opts.project)
-            .with_thread_id(thread_id)
-            .with_harness_thread_id(resume_id);
-        match resume_thread(client, context, resume_id, &cwd, &opts.initial_model).await {
-            Ok(opened) => opened,
-            Err(e) => {
-                // C5: Codex thread store purged/rotated. Start fresh instead of hard-failing.
-                resume_warning = Some(HarnessNotice {
-                    code: "codex_resume_failed".into(),
-                    message:
-                        "Agent context was lost; started a fresh Codex session. History is intact."
-                            .into(),
-                    detail: Some(e.to_string()),
-                });
-                let context = CodexOperationContext::for_project(
-                    "thread_start_after_resume_failed",
-                    opts.project,
-                )
-                .with_thread_id(thread_id);
-                start_thread(client, context, &cwd, &opts.initial_model).await?
-            }
-        }
-    } else {
-        let context = CodexOperationContext::for_project("thread_start", opts.project)
-            .with_thread_id(thread_id);
-        start_thread(client, context, &cwd, &opts.initial_model).await?
-    };
-
-    // B4: bind the (possibly re-established) native id to the durable ThreadId.
-    mapper.claim_thread(opened.harness_thread_id.clone(), thread_id)?;
-
-    let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
-    ensure_thread_sender(senders, thread_id, tx);
-
-    let _ = broadcast_event(senders, thread_id, || AgentEvent::ThreadOpened {
-        thread: thread_id,
-        harness_thread_id: opened.harness_thread_id.clone(),
-    })
-    .await;
-
-    if let Some(warning) = &resume_warning {
-        let message = warning.message.clone();
-        let _ = broadcast_event(senders, thread_id, || AgentEvent::Error {
-            thread: thread_id,
-            turn: None,
-            error: HarnessError::Transport(message),
-        })
-        .await;
-    }
-
-    let resume_replay_model = (opts.resume.is_some() && resume_warning.is_none())
-        .then(|| opened.model.clone())
-        .flatten();
-    Ok(OpenThreadOutcome {
-        handle: ThreadHandle {
-            warning: resume_warning,
-            resumed_model: opened.model,
-            agent_name: opened.agent_name,
-            parent_harness_thread_id: opened.parent_harness_thread_id,
-            ..ThreadHandle::opened(
-                thread_id,
-                opened.harness_thread_id,
-                opts.workspace_root.clone(),
-            )
-        },
-        resume_replay_model,
-    })
-}
-
 fn observe_pending_context_restore(
     pending: &mut HashMap<NativeThreadId, PendingContextRestore>,
     message: &codex_codes::ServerMessage,
@@ -2394,14 +2305,6 @@ fn sender_for_thread(
     thread: ThreadId,
 ) -> Option<broadcast::Sender<AgentEvent>> {
     lock_senders(senders).get(&thread).cloned()
-}
-
-fn ensure_thread_sender(
-    senders: &SenderMap,
-    thread: ThreadId,
-    sender: broadcast::Sender<AgentEvent>,
-) {
-    lock_senders(senders).entry(thread).or_insert(sender);
 }
 
 async fn respond_unroutable_server_request(
@@ -5379,27 +5282,102 @@ mod tests {
         assert_eq!(controller.shutdowns().await, 1);
     }
 
-    #[test]
-    fn opening_thread_preserves_existing_sender() {
+    #[tokio::test]
+    async fn opening_thread_preserves_existing_sender() {
         let thread = ThreadId::new();
-        let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
-        let (first_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
-        let mut first_rx = first_tx.subscribe();
-        ensure_thread_sender(&senders, thread, first_tx);
+        let (harness, _controller) = spawn_fake_harness();
+        let opened = harness
+            .open_thread(open_opts(thread, Some("native-existing")))
+            .await
+            .unwrap();
+        let mut first_rx = harness.subscribe(&opened);
 
-        let (replacement_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
-        ensure_thread_sender(&senders, thread, replacement_tx);
+        harness
+            .claim_native_thread(thread, "native-existing".into(), PathBuf::from("/tmp"))
+            .await
+            .unwrap();
 
         let turn = TurnId::new();
-        sender_for_thread(&senders, thread)
+        sender_for_thread(&harness.senders, thread)
             .expect("sender exists")
             .send(AgentEvent::TurnStarted { thread, turn })
             .unwrap();
         assert!(matches!(
-            first_rx.try_recv(),
+            first_rx.recv().await,
             Ok(AgentEvent::TurnStarted { thread: got_thread, turn: got_turn })
                 if got_thread == thread && got_turn == turn
         ));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_installs_identity_and_sender_before_returning() {
+        let thread = ThreadId::new();
+        let bootstrap = HarnessBootstrap {
+            known_threads: vec![giskard_harness::KnownThreadBinding {
+                harness_thread_id: "native-bootstrap".into(),
+                thread_id: thread,
+            }],
+        };
+        let (harness, _controller) = spawn_fake_harness_with_bootstrap(bootstrap);
+
+        assert!(sender_for_thread(&harness.senders, thread).is_some());
+        assert!(
+            harness
+                .claim_native_thread(
+                    ThreadId::new(),
+                    "native-bootstrap".into(),
+                    PathBuf::from("/tmp"),
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_claim_installs_route_and_preserves_sender() {
+        let thread = ThreadId::new();
+        let (harness, _controller) = spawn_fake_harness();
+
+        harness
+            .claim_native_thread(thread, "native-child".into(), PathBuf::from("/tmp"))
+            .await
+            .unwrap();
+        let first = sender_for_thread(&harness.senders, thread).expect("sender exists after claim");
+
+        harness
+            .claim_native_thread(thread, "native-child".into(), PathBuf::from("/tmp"))
+            .await
+            .unwrap();
+        let repeated =
+            sender_for_thread(&harness.senders, thread).expect("sender survives repeated claim");
+        assert!(first.same_channel(&repeated));
+    }
+
+    #[tokio::test]
+    async fn conflicting_route_claim_does_not_publish_sender() {
+        let accepted_thread = ThreadId::new();
+        let rejected_thread = ThreadId::new();
+        let (harness, _controller) = spawn_fake_harness();
+        harness
+            .claim_native_thread(
+                accepted_thread,
+                "native-child".into(),
+                PathBuf::from("/tmp"),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            harness
+                .claim_native_thread(
+                    rejected_thread,
+                    "native-child".into(),
+                    PathBuf::from("/tmp"),
+                )
+                .await
+                .is_err()
+        );
+        assert!(sender_for_thread(&harness.senders, rejected_thread).is_none());
     }
 
     #[test]
@@ -5449,7 +5427,7 @@ mod tests {
         let thread = ThreadId::new();
         let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
         let (tx, mut rx) = broadcast::channel(BROADCAST_CAPACITY);
-        ensure_thread_sender(&senders, thread, tx);
+        lock_senders(&senders).insert(thread, tx);
 
         emit_incomplete_turn(&senders, thread, None, "stream ended").await;
 
@@ -5473,7 +5451,7 @@ mod tests {
         let turn = TurnId::new();
         let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
         let (tx, mut rx) = broadcast::channel(BROADCAST_CAPACITY);
-        ensure_thread_sender(&senders, thread, tx);
+        lock_senders(&senders).insert(thread, tx);
 
         emit_incomplete_turn(&senders, thread, Some(turn), "stream failed").await;
 
@@ -5500,7 +5478,7 @@ mod tests {
         let turn = TurnId::new();
         let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
         let (tx, mut rx) = broadcast::channel(BROADCAST_CAPACITY);
-        ensure_thread_sender(&senders, thread, tx);
+        lock_senders(&senders).insert(thread, tx);
 
         assert!(emit_fatal_turn_completion(&senders, thread, Some(turn), "quota exceeded").await);
 
@@ -5526,7 +5504,7 @@ mod tests {
         let thread = ThreadId::new();
         let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
         let (tx, mut rx) = broadcast::channel(BROADCAST_CAPACITY);
-        ensure_thread_sender(&senders, thread, tx);
+        lock_senders(&senders).insert(thread, tx);
 
         assert!(!emit_fatal_turn_completion(&senders, thread, None, "quota exceeded").await);
 
